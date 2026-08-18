@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -19,6 +22,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       has_cargo: ${{ steps.rust_workspace.outputs.has_cargo }}
+      has_prototype: ${{ steps.prototype.outputs.has_prototype }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -51,6 +55,16 @@ jobs:
             echo "has_cargo=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Detect interactive prototype
+        id: prototype
+        shell: bash
+        run: |
+          if [[ -f prototype/package-lock.json ]]; then
+            echo "has_prototype=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_prototype=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: Rust
     needs: foundation
@@ -80,3 +94,32 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
+
+  prototype:
+    name: Interactive prototype
+    needs: foundation
+    if: ${{ needs.foundation.outputs.has_prototype == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: prototype
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: prototype/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Build prototype
+        run: npm run build
+
+      - name: Test Sites package
+        run: npm run test:sites

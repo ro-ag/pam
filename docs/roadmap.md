@@ -86,7 +86,8 @@ progress, and hand its compact verified result to an agent.
 
 Deliverables:
 
-- selected GPUI visual direction and design tokens;
+- approved Project Current direction and Baywatch visual tokens translated to
+  GPUI;
 - daemon start/stop and health;
 - project switcher, queue, active run, approval, and solved-result views;
 - models, access, certificates, configuration, and evidence surfaces;

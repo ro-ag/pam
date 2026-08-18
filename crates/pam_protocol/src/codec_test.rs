@@ -1,10 +1,13 @@
-use pam_core::{CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
 use serde::Serialize;
 
 use super::{
-    CodecError, Event, EventEnvelope, Failure, FailureCode, MAX_FRAME_SIZE, PROTOCOL_VERSION,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ServerMessage, decode_request,
-    decode_server_message, encode,
+    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
+    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
+    MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, ReplayResult, RequestEnvelope,
+    RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability,
+    decode_request, decode_server_message, encode,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -16,12 +19,409 @@ fn status_request() -> RequestEnvelope {
     )
 }
 
+fn evidence_handle() -> EvidenceHandle {
+    EvidenceHandle::parse("evidence://ci/1842/failure").unwrap()
+}
+
+fn brief_result() -> BriefResult {
+    let handle = evidence_handle();
+    let item = |text: &str, truth| BriefItem {
+        text: text.to_owned(),
+        truth,
+        evidence: vec![handle.clone()],
+    };
+    BriefResult {
+        goal: Some(item("Ship durable continuity", OperationTruth::Observed)),
+        decisions: vec![item("Use SQLite", OperationTruth::Observed)],
+        verified: vec![item("Protocol tests pass", OperationTruth::Verified)],
+        next: vec![item("Wire the daemon", OperationTruth::Unresolved)],
+        provenance: vec![
+            BriefProvenance {
+                source: "pam".to_owned(),
+                availability: SourceAvailability::Available,
+                truth: OperationTruth::Verified,
+                evidence: Some(handle.clone()),
+                detail: None,
+            },
+            BriefProvenance {
+                source: "ptrack".to_owned(),
+                availability: SourceAvailability::Partial,
+                truth: OperationTruth::Observed,
+                evidence: Some(handle),
+                detail: Some("bounded context snapshot".to_owned()),
+            },
+            BriefProvenance {
+                source: "connector".to_owned(),
+                availability: SourceAvailability::Unavailable,
+                truth: OperationTruth::Unresolved,
+                evidence: None,
+                detail: Some("source is not configured".to_owned()),
+            },
+        ],
+    }
+}
+
 #[test]
 fn request_round_trips_through_named_messagepack() {
     let expected = status_request();
     let bytes = encode(&expected).unwrap();
 
     assert_eq!(decode_request(&bytes).unwrap(), expected);
+}
+
+#[test]
+fn cancel_target_round_trips_without_replacing_observer_correlation() {
+    let expected = RequestEnvelope::cancel(
+        RequestId::from("cancel-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("cancel-1"),
+        RequestId::from("target-1"),
+    );
+
+    let actual = decode_request(&encode(&expected).unwrap()).unwrap();
+
+    assert_eq!(actual.request_id.as_str(), "cancel-observer-1");
+    assert_eq!(actual.payload, expected.payload);
+}
+
+#[test]
+fn replay_after_sequence_round_trips_through_named_messagepack() {
+    let expected = RequestEnvelope::replay(
+        RequestId::from("replay-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("replay-1"),
+        RequestId::from("target-1"),
+        12,
+    );
+
+    assert_eq!(
+        decode_request(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn read_only_request_variants_round_trip_through_named_messagepack() {
+    let handle = evidence_handle();
+    let requests = [
+        RequestEnvelope::brief(
+            RequestId::from("brief-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("brief-1"),
+        ),
+        RequestEnvelope::wait_for_result(
+            RequestId::from("wait-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("wait-1"),
+            RequestId::from("target-1"),
+            12,
+        ),
+        RequestEnvelope::get_result(
+            RequestId::from("result-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("result-1"),
+            RequestId::from("target-1"),
+        ),
+        RequestEnvelope::inspect_evidence(
+            RequestId::from("inspect-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("inspect-1"),
+            handle.clone(),
+        ),
+        RequestEnvelope::read_evidence(
+            RequestId::from("read-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("read-1"),
+            handle,
+            512,
+            1024,
+        )
+        .unwrap(),
+    ];
+
+    for expected in requests {
+        assert_eq!(
+            decode_request(&encode(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn invalid_evidence_read_lengths_are_rejected_during_decode() {
+    for length in [0, MAX_EVIDENCE_CHUNK_SIZE as u64 + 1] {
+        let request = RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("read-observer-1"),
+            caller_id: CallerId::from("cli-1"),
+            project_id: ProjectId::from("project-1"),
+            capability: Capability::ReadEvidence,
+            idempotency_key: IdempotencyKey::from("read-1"),
+            deadline_unix_ms: None,
+            payload: RequestPayload::ReadEvidence {
+                handle: evidence_handle(),
+                offset: 0,
+                length,
+            },
+        };
+
+        assert!(matches!(
+            decode_request(&encode(&request).unwrap()),
+            Err(CodecError::Decode(_))
+        ));
+    }
+}
+
+#[test]
+fn durable_result_payloads_round_trip_through_named_messagepack() {
+    let results = [
+        ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("cancel-observer-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Success {
+                truth: OperationTruth::Changed,
+                payload: ResultPayload::Cancellation(CancellationResult {
+                    target_request_id: RequestId::from("target-1"),
+                    disposition: CancellationDisposition::Requested,
+                }),
+            },
+        }),
+        ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("replay-observer-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Success {
+                truth: OperationTruth::Observed,
+                payload: ResultPayload::Replay(ReplayResult {
+                    target_request_id: RequestId::from("target-1"),
+                    through_sequence: 12,
+                    pending: true,
+                }),
+            },
+        }),
+    ];
+
+    for expected in results {
+        assert_eq!(
+            decode_server_message(&encode(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn read_only_result_variants_round_trip_through_named_messagepack() {
+    let mut results = vec![ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("brief-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::Brief(brief_result()),
+        },
+    })];
+    for retention in [
+        EvidenceRetention::Session,
+        EvidenceRetention::Project,
+        EvidenceRetention::Persistent,
+    ] {
+        for redaction in [EvidenceRedaction::Unredacted, EvidenceRedaction::Redacted] {
+            results.push(ServerMessage::Result(ResultEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: RequestId::from("inspect-observer-1"),
+                project_id: ProjectId::from("project-1"),
+                body: ResultBody::Success {
+                    truth: OperationTruth::Observed,
+                    payload: ResultPayload::EvidenceMetadata(EvidenceMetadata {
+                        handle: evidence_handle(),
+                        digest: ContentDigest::from_sha256([0xab; 32]),
+                        size_bytes: 3,
+                        media_type: "text/plain".to_owned(),
+                        retention: retention.clone(),
+                        redaction,
+                        created_at_unix_ms: 1_700_000_000_000,
+                    }),
+                },
+            }));
+        }
+    }
+    results.push(ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("read-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::EvidenceChunk(
+                EvidenceChunk::new(evidence_handle(), 512, vec![1, 2, 3], true).unwrap(),
+            ),
+        },
+    }));
+
+    for expected in results {
+        assert_eq!(
+            decode_server_message(&encode(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn brief_named_fields_preserve_presentation_order() {
+    let bytes = encode(&brief_result()).unwrap();
+    let positions = ["goal", "decisions", "verified", "next", "provenance"].map(|field| {
+        bytes
+            .windows(field.len())
+            .position(|window| window == field.as_bytes())
+            .unwrap()
+    });
+
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[derive(Serialize)]
+struct UnboundedEvidenceChunk {
+    handle: EvidenceHandle,
+    offset: u64,
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UnboundedResultPayload {
+    EvidenceChunk(UnboundedEvidenceChunk),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UnboundedResultBody {
+    Success {
+        truth: OperationTruth,
+        payload: UnboundedResultPayload,
+    },
+}
+
+#[derive(Serialize)]
+struct UnboundedResultEnvelope {
+    protocol_version: u16,
+    request_id: RequestId,
+    project_id: ProjectId,
+    body: UnboundedResultBody,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "message_type", rename_all = "snake_case")]
+enum UnboundedServerMessage {
+    Result(UnboundedResultEnvelope),
+}
+
+#[test]
+fn oversized_evidence_chunks_are_rejected_during_decode() {
+    let message = UnboundedServerMessage::Result(UnboundedResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("read-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: UnboundedResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: UnboundedResultPayload::EvidenceChunk(UnboundedEvidenceChunk {
+                handle: evidence_handle(),
+                offset: 0,
+                bytes: vec![0; MAX_EVIDENCE_CHUNK_SIZE + 1],
+                eof: true,
+            }),
+        },
+    });
+
+    assert!(matches!(
+        decode_server_message(&encode(&message).unwrap()),
+        Err(CodecError::Decode(_))
+    ));
+}
+
+#[test]
+fn maximum_evidence_chunk_fits_the_protocol_frame_and_round_trips() {
+    let expected = ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("read-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::EvidenceChunk(
+                EvidenceChunk::new(
+                    evidence_handle(),
+                    0,
+                    vec![u8::MAX; MAX_EVIDENCE_CHUNK_SIZE],
+                    true,
+                )
+                .unwrap(),
+            ),
+        },
+    });
+
+    let bytes = encode(&expected).unwrap();
+    assert!(bytes.len() < MAX_FRAME_SIZE);
+    assert_eq!(decode_server_message(&bytes).unwrap(), expected);
+}
+
+#[test]
+fn durable_failures_round_trip_as_distinct_typed_codes() {
+    for code in [
+        FailureCode::NotFound,
+        FailureCode::Pending,
+        FailureCode::IdempotencyConflict,
+        FailureCode::Cancelled,
+        FailureCode::LeaseConflict,
+    ] {
+        let expected = ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("observer-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Failure(Failure {
+                message: format!("{code:?}"),
+                code,
+                recovery: None,
+            }),
+        });
+
+        assert_eq!(
+            decode_server_message(&encode(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn durable_lifecycle_events_round_trip_through_named_messagepack() {
+    for (sequence, event) in [
+        Event::LeaseExpired,
+        Event::CancellationRequested,
+        Event::Cancelled,
+        Event::Failed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected = ServerMessage::Event(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("target-1"),
+            project_id: ProjectId::from("project-1"),
+            sequence: sequence as u64 + 1,
+            event,
+        });
+
+        assert_eq!(
+            decode_server_message(&encode(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -85,7 +485,7 @@ struct ExtendedRequest {
     request_id: RequestId,
     caller_id: CallerId,
     project_id: ProjectId,
-    capability: super::Capability,
+    capability: Capability,
     idempotency_key: IdempotencyKey,
     deadline_unix_ms: Option<u64>,
     payload: RequestPayload,

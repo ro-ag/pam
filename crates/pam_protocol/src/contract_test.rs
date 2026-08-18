@@ -1,8 +1,11 @@
-use pam_core::{CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
 
 use super::{
-    FailureCode, OperationTruth, PROTOCOL_VERSION, RequestEnvelope, ResultBody, ResultPayload,
-    StatusResult,
+    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
+    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, OperationTruth, PROTOCOL_VERSION,
+    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
+    ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -37,6 +40,322 @@ fn unsupported_versions_produce_a_correlated_typed_failure() {
         panic!("expected protocol failure")
     };
     assert_eq!(failure.code, FailureCode::UnsupportedProtocolVersion);
+}
+
+#[test]
+fn cancel_request_keeps_observer_and_target_correlation_separate() {
+    let request = RequestEnvelope::cancel(
+        RequestId::from("cancel-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("cancel-1"),
+        RequestId::from("target-1"),
+    );
+
+    assert_eq!(request.request_id.as_str(), "cancel-observer-1");
+    assert_eq!(request.capability, Capability::CancelRequest);
+    assert_eq!(
+        request.payload,
+        RequestPayload::Cancel {
+            target_request_id: RequestId::from("target-1"),
+        }
+    );
+}
+
+#[test]
+fn replay_request_resumes_exclusively_after_the_observed_sequence() {
+    let request = RequestEnvelope::replay(
+        RequestId::from("replay-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("replay-1"),
+        RequestId::from("target-1"),
+        41,
+    );
+
+    assert_eq!(request.request_id.as_str(), "replay-observer-1");
+    assert_eq!(request.capability, Capability::ReplayEvents);
+    assert_eq!(
+        request.payload,
+        RequestPayload::Replay {
+            target_request_id: RequestId::from("target-1"),
+            after_sequence: 41,
+        }
+    );
+}
+
+#[test]
+fn read_only_request_constructors_preserve_observer_and_target_identity() {
+    let wait = RequestEnvelope::wait_for_result(
+        RequestId::from("wait-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("wait-1"),
+        RequestId::from("target-1"),
+        7,
+    );
+    let result = RequestEnvelope::get_result(
+        RequestId::from("result-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("result-1"),
+        RequestId::from("target-1"),
+    );
+
+    assert_eq!(wait.capability, Capability::WaitForResult);
+    assert_eq!(wait.request_id.as_str(), "wait-observer-1");
+    assert_eq!(
+        wait.payload,
+        RequestPayload::WaitForResult {
+            target_request_id: RequestId::from("target-1"),
+            after_sequence: 7,
+        }
+    );
+    assert_eq!(result.capability, Capability::GetResult);
+    assert_eq!(result.request_id.as_str(), "result-observer-1");
+    assert_eq!(
+        result.payload,
+        RequestPayload::GetResult {
+            target_request_id: RequestId::from("target-1"),
+        }
+    );
+}
+
+#[test]
+fn observed_terminal_results_remap_only_the_envelope_correlation() {
+    let observer_request_id = RequestId::from("wait-observer-1");
+    let original = ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("target-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Failure(super::Failure {
+            code: FailureCode::Cancelled,
+            message: "request was cancelled".to_owned(),
+            recovery: None,
+        }),
+    };
+    let observed = ResultEnvelope {
+        protocol_version: original.protocol_version,
+        request_id: observer_request_id.clone(),
+        project_id: original.project_id.clone(),
+        body: original.body.clone(),
+    };
+
+    assert_eq!(observed.request_id, observer_request_id);
+    assert_ne!(observed.request_id, original.request_id);
+    assert_eq!(observed.project_id, original.project_id);
+    assert_eq!(observed.body, original.body);
+}
+
+#[test]
+fn brief_and_evidence_constructors_are_read_only_typed_requests() {
+    let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
+    let brief = RequestEnvelope::brief(
+        RequestId::from("brief-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("brief-1"),
+    );
+    let inspect = RequestEnvelope::inspect_evidence(
+        RequestId::from("inspect-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("inspect-1"),
+        handle.clone(),
+    );
+    let read = RequestEnvelope::read_evidence(
+        RequestId::from("read-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("read-1"),
+        handle.clone(),
+        512,
+        1024,
+    )
+    .unwrap();
+
+    assert_eq!(brief.capability, Capability::Brief);
+    assert_eq!(brief.payload, RequestPayload::Brief);
+    assert_eq!(inspect.capability, Capability::InspectEvidence);
+    assert_eq!(inspect.payload, RequestPayload::InspectEvidence { handle });
+    assert_eq!(read.capability, Capability::ReadEvidence);
+    assert!(matches!(
+        read.payload,
+        RequestPayload::ReadEvidence {
+            offset: 512,
+            length: 1024,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evidence_reads_and_chunks_enforce_the_protocol_bound() {
+    let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
+    let request = |length| {
+        RequestEnvelope::read_evidence(
+            RequestId::from("read-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("read-1"),
+            handle.clone(),
+            0,
+            length,
+        )
+    };
+
+    assert!(request(MAX_EVIDENCE_CHUNK_SIZE as u64).is_ok());
+    assert!(matches!(
+        request(0),
+        Err(ProtocolContractError::InvalidEvidenceReadLength { .. })
+    ));
+    assert!(matches!(
+        request(MAX_EVIDENCE_CHUNK_SIZE as u64 + 1),
+        Err(ProtocolContractError::InvalidEvidenceReadLength { .. })
+    ));
+    assert!(EvidenceChunk::new(handle.clone(), 0, vec![0; MAX_EVIDENCE_CHUNK_SIZE], true,).is_ok());
+    assert!(matches!(
+        EvidenceChunk::new(handle, 0, vec![0; MAX_EVIDENCE_CHUNK_SIZE + 1], true,),
+        Err(ProtocolContractError::EvidenceChunkTooLarge { .. })
+    ));
+}
+
+#[test]
+fn terminal_replay_separates_snapshot_from_the_original_result() {
+    let target_request_id = RequestId::from("target-1");
+    let request = RequestEnvelope::replay(
+        RequestId::from("replay-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("replay-1"),
+        target_request_id.clone(),
+        2,
+    );
+    let replayed_event = EventEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: target_request_id.clone(),
+        project_id: request.project_id.clone(),
+        sequence: 3,
+        event: Event::Completed,
+    };
+    let replay_snapshot = ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request.request_id.clone(),
+        project_id: request.project_id.clone(),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::Replay(ReplayResult {
+                target_request_id: target_request_id.clone(),
+                through_sequence: 3,
+                pending: false,
+            }),
+        },
+    };
+    let original_result = ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: target_request_id.clone(),
+        project_id: request.project_id.clone(),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::Status(StatusResult {
+                ready: true,
+                healthy: true,
+                daemon_version: "0.1.0".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                queue_depth: 0,
+            }),
+        },
+    };
+    let stored_original_result = original_result.clone();
+
+    assert_ne!(request.request_id, target_request_id);
+    assert_eq!(replayed_event.request_id, target_request_id);
+    assert_eq!(replay_snapshot.request_id, request.request_id);
+    assert_eq!(original_result.request_id, target_request_id);
+    assert_eq!(original_result, stored_original_result);
+}
+
+#[test]
+fn durable_operation_results_retain_target_state() {
+    let cancellation = ResultPayload::Cancellation(CancellationResult {
+        target_request_id: RequestId::from("target-1"),
+        disposition: CancellationDisposition::AlreadyCancelled,
+    });
+    let replay = ResultPayload::Replay(ReplayResult {
+        target_request_id: RequestId::from("target-1"),
+        through_sequence: 41,
+        pending: true,
+    });
+
+    assert!(matches!(cancellation, ResultPayload::Cancellation(_)));
+    assert!(matches!(replay, ResultPayload::Replay(_)));
+}
+
+#[test]
+fn brief_contract_orders_truthful_sections_and_reports_source_availability() {
+    let handle = EvidenceHandle::parse("evidence://ptrack/context/current").unwrap();
+    let item = |text: &str, truth| BriefItem {
+        text: text.to_owned(),
+        truth,
+        evidence: vec![handle.clone()],
+    };
+    let brief = BriefResult {
+        goal: Some(item("Ship durable continuity", OperationTruth::Observed)),
+        decisions: vec![item("Use SQLite", OperationTruth::Observed)],
+        verified: vec![item("Protocol tests pass", OperationTruth::Verified)],
+        next: vec![item("Wire the daemon", OperationTruth::Unresolved)],
+        provenance: vec![
+            BriefProvenance {
+                source: "pam".to_owned(),
+                availability: SourceAvailability::Available,
+                truth: OperationTruth::Verified,
+                evidence: Some(handle.clone()),
+                detail: None,
+            },
+            BriefProvenance {
+                source: "ptrack".to_owned(),
+                availability: SourceAvailability::Partial,
+                truth: OperationTruth::Observed,
+                evidence: Some(handle),
+                detail: Some("bounded context snapshot".to_owned()),
+            },
+            BriefProvenance {
+                source: "connector".to_owned(),
+                availability: SourceAvailability::Unavailable,
+                truth: OperationTruth::Unresolved,
+                evidence: None,
+                detail: Some("source is not configured".to_owned()),
+            },
+        ],
+    };
+
+    assert_eq!(brief.goal.unwrap().text, "Ship durable continuity");
+    assert_eq!(brief.decisions[0].text, "Use SQLite");
+    assert_eq!(brief.verified[0].truth, OperationTruth::Verified);
+    assert_eq!(brief.next[0].truth, OperationTruth::Unresolved);
+    assert_eq!(brief.provenance.len(), 3);
+}
+
+#[test]
+fn evidence_result_contract_carries_exact_metadata_and_bounded_bytes() {
+    let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
+    let metadata = EvidenceMetadata {
+        handle: handle.clone(),
+        digest: ContentDigest::from_sha256([0xab; 32]),
+        size_bytes: 3,
+        media_type: "text/plain".to_owned(),
+        retention: EvidenceRetention::Project,
+        redaction: EvidenceRedaction::Redacted,
+        created_at_unix_ms: 1_700_000_000_000,
+    };
+    let chunk = EvidenceChunk::new(handle, 12, vec![1, 2, 3], true).unwrap();
+
+    assert_eq!(metadata.size_bytes, 3);
+    assert_eq!(metadata.retention, EvidenceRetention::Project);
+    assert_eq!(metadata.redaction, EvidenceRedaction::Redacted);
+    assert_eq!(chunk.offset, 12);
+    assert_eq!(chunk.bytes(), &[1, 2, 3]);
+    assert!(chunk.eof);
 }
 
 #[test]

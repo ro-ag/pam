@@ -1,9 +1,10 @@
 # PAM
 
-PAM is a local lifeguard for developers and AI agents working inside corporate
-environments. It keeps durable project context, turns noisy evidence into
-compact answers, safely brokers approved tools, and runs repeatable flows
-without sending the developer's workspace to a hosted control plane.
+PAM is Baywatch for developers and AI agents working inside corporate
+environments: always on watch, confident, and ready with the verified project
+story. It keeps durable context, turns noisy evidence into compact answers,
+safely brokers approved tools, and runs repeatable flows without sending the
+developer's workspace to a hosted control plane.
 
 PAM is designed as one Rust binary with three faces:
 
@@ -53,10 +54,24 @@ PAM should help an agent answer:
 
 ## Current status
 
-PAM is in product-foundation stage. The repository currently contains the
-research, product contract, architecture, implementation roadmap, and a cheap
-CI baseline. Runtime scaffolding follows after the first native UI direction is
-selected and the highest-risk technical spikes are resolved.
+PAM is in product-foundation stage. The repository contains the research,
+product contract, architecture, implementation roadmap, a cheap CI baseline,
+and the approved interactive control-center prototype. Runtime scaffolding
+follows after the highest-risk technical spikes are resolved.
+
+The prototype translates the approved "Project Current" direction into a
+responsive, interactive screen with project switching, daemon control, agent
+handoff, evidence inspection, and flow/access states:
+
+```sh
+cd prototype
+npm install
+npm run dev
+```
+
+See the [prototype visual QA](prototype/design-qa.md) for the source target and
+comparison evidence. The prototype is a design contract; production UI remains
+native GPUI.
 
 Read next:
 

@@ -1,5 +1,7 @@
 # PAM
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 PAM is Baywatch for developers and AI agents working inside corporate
 environments: always on watch, confident, and ready with the verified project
 story. It keeps durable context, turns noisy evidence into compact answers,
@@ -85,5 +87,6 @@ Read next:
 
 The design is intentionally open before implementation hardens it. Please start
 with the product brief and roadmap, then open an issue describing the user
-problem, expected evidence, and security boundary. A project license has not
-yet been selected; until one is added, normal copyright restrictions apply.
+problem, expected evidence, and security boundary. PAM is licensed under the
+[Apache License 2.0](LICENSE). By contributing, you agree that your contributions
+will be licensed under the same terms.

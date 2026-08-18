@@ -6,6 +6,7 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 
 | Concern | Choice | Why | Guardrail |
 | --- | --- | --- | --- |
+| Repository license | Apache-2.0 | Permissive for corporate adoption, with explicit patent and contribution terms. | Preserve required notices and inventory dependency and model licenses. |
 | Language | Rust 2024 edition | One native binary, strong type boundaries, predictable resource use, and good macOS/Linux/Windows reach. | Keep unsafe code isolated to audited FFI adapters. |
 | Async runtime | Tokio | Matches the selected ZeroMQ implementation and connector ecosystem. | Blocking database, process, and model work use bounded workers. |
 | CLI | clap | Mature derive-based command contract and shell completion support. | Domain operations do not depend on CLI types. |
@@ -115,7 +116,6 @@ boundary is proven.
 ## Open decisions
 
 - Minimum supported macOS version and signing/notarization identity.
-- Open-source license for the public repository.
 - MessagePack library and evolution rules after protocol fixture spike.
 - Exact llama.cpp binding after the measured Mac spike.
 - Whether the OpenAI-compatible local API ships in the first preview or the

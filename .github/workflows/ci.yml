@@ -32,6 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           required=(
+            LICENSE
             README.md
             docs/product-brief.md
             docs/research.md

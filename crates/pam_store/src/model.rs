@@ -1,0 +1,182 @@
+use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+
+pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EVIDENCE_RANGE_BYTES: u64 = 1024 * 1024;
+pub const MAX_EVIDENCE_MEDIA_TYPE_BYTES: usize = 255;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceRetention {
+    Session,
+    Project,
+    Persistent,
+}
+
+impl EvidenceRetention {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceRedaction {
+    Unredacted,
+    Redacted,
+}
+
+impl EvidenceRedaction {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unredacted => "unredacted",
+            Self::Redacted => "redacted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PutEvidence {
+    pub handle: EvidenceHandle,
+    pub project_id: ProjectId,
+    pub media_type: String,
+    pub retention: EvidenceRetention,
+    pub redaction: EvidenceRedaction,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceMetadata {
+    pub handle: EvidenceHandle,
+    pub digest: ContentDigest,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub project_id: ProjectId,
+    pub retention: EvidenceRetention,
+    pub redaction: EvidenceRedaction,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptRequest {
+    pub request_id: RequestId,
+    pub caller_id: CallerId,
+    pub project_id: ProjectId,
+    pub idempotency_key: IdempotencyKey,
+    pub operation_kind: String,
+    pub operation: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcceptOutcome {
+    Created {
+        request_id: RequestId,
+        queue_sequence: u64,
+    },
+    Existing {
+        request_id: RequestId,
+        state: RequestState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestState {
+    Queued,
+    Leased,
+    CancellationRequested,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl RequestState {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::CancellationRequested => "cancellation_requested",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalState {
+    Succeeded,
+    Failed,
+}
+
+impl TerminalState {
+    pub(super) const fn request_state(self) -> RequestState {
+        match self {
+            Self::Succeeded => RequestState::Succeeded,
+            Self::Failed => RequestState::Failed,
+        }
+    }
+
+    pub(super) const fn event_kind(self) -> &'static str {
+        match self {
+            Self::Succeeded => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Lease {
+    pub request_id: RequestId,
+    pub project_id: ProjectId,
+    pub owner: String,
+    pub token: String,
+    pub attempt: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeasedRequest {
+    pub lease: Lease,
+    pub queue_sequence: u64,
+    pub operation_kind: String,
+    pub operation: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutcome {
+    Cancelled,
+    CancellationRequested,
+    AlreadyTerminal(RequestState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventRecord {
+    pub sequence: u64,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredResult {
+    pub state: RequestState,
+    pub payload: Vec<u8>,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Replay {
+    pub events: Vec<EventRecord>,
+    pub result: Option<StoredResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestSnapshot {
+    pub request_id: RequestId,
+    pub project_id: ProjectId,
+    pub queue_sequence: u64,
+    pub state: RequestState,
+    pub attempt: u64,
+    pub lease_expires_at_ms: Option<u64>,
+}

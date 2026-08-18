@@ -12,9 +12,13 @@ pub use codec::{
     CodecError, decode_request, decode_request_envelope, decode_server_message, encode,
 };
 pub use contract::{
-    Capability, Event, EventEnvelope, Failure, FailureCode, OperationTruth, RequestEnvelope,
-    RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, StatusResult,
+    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
+    EvidenceRetention, Failure, FailureCode, OperationTruth, ProtocolContractError, ReplayResult,
+    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
+    SourceAvailability, StatusResult,
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 256 * 1024;

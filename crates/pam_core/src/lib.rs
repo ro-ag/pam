@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
 
+mod evidence;
 mod identity;
 mod queue;
 
+#[cfg(test)]
+mod evidence_test;
 #[cfg(test)]
 mod identity_test;
 #[cfg(test)]
 mod queue_test;
 
+pub use evidence::{
+    ContentDigest, EvidenceHandle, EvidenceReference, InvalidContentDigest, InvalidEvidenceHandle,
+};
 pub use identity::{CallerId, IdempotencyKey, ProjectId, RequestId};
 pub use queue::{ProjectPermit, ProjectQueue};
 

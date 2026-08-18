@@ -5,11 +5,11 @@ use std::{
 };
 
 use pam_core::{CallerId, IdempotencyKey, ProjectId, RequestId};
-use pam_daemon::{DaemonConfig, request_status, serve_until};
+use pam_daemon::{DaemonConfig, request_exchange, request_status, serve_until};
 use pam_platform::LocalEndpoint;
 use pam_protocol::{
     Event, FailureCode, MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, RequestEnvelope,
-    ResultBody, ResultPayload,
+    ResultBody, ResultPayload, SourceAvailability,
 };
 use tokio::{sync::oneshot, task::JoinHandle};
 use zeromq::{DealerSocket, Socket, SocketSend, ZmqMessage};
@@ -31,6 +31,47 @@ fn test_runtime(name: &str) -> PathBuf {
     ))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn brief_crosses_transport_with_explicit_unavailable_provenance() {
+    let runtime = test_runtime("brief-round-trip");
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let (shutdown, daemon) = start_daemon(endpoint.clone());
+    for _ in 0..40 {
+        if endpoint.socket_path().is_some_and(std::path::Path::exists) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let request = RequestEnvelope::brief(
+        RequestId::from("brief-round-trip"),
+        CallerId::from("integration-test"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::from("brief-round-trip"),
+    );
+
+    let exchange = request_exchange(&endpoint, &request, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(exchange.events.is_empty());
+    let ResultBody::Success {
+        truth,
+        payload: ResultPayload::Brief(brief),
+    } = exchange.result.body
+    else {
+        panic!("brief should return a typed result")
+    };
+    assert_eq!(brief.provenance.len(), 1);
+    assert_eq!(
+        brief.provenance[0].availability,
+        SourceAvailability::Unavailable
+    );
+    assert_eq!(truth, OperationTruth::Unresolved);
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
 fn status_request() -> RequestEnvelope {
     RequestEnvelope::status(
         RequestId::from("request-round-trip"),
@@ -47,10 +88,13 @@ fn start_daemon(
     JoinHandle<Result<(), pam_daemon::DaemonError>>,
 ) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state_path = endpoint.runtime_dir().join("state.sqlite3");
     let daemon = tokio::spawn(serve_until(
         DaemonConfig {
             endpoint,
             recover: false,
+            state_path: Some(state_path),
+            brief_provider: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -113,7 +157,9 @@ async fn status_crosses_transport_queue_events_and_result() {
         panic!("status should succeed")
     };
     assert_eq!(truth, OperationTruth::Observed);
-    let ResultPayload::Status(status) = payload;
+    let ResultPayload::Status(status) = payload else {
+        panic!("status should return a status payload")
+    };
     assert!(status.ready);
     assert!(status.healthy);
     assert_eq!(status.queue_depth, 0);

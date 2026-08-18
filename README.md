@@ -56,16 +56,19 @@ PAM should help an agent answer:
 
 ## Current status
 
-The product foundation and walking skeleton are complete. The repository now
-contains a pinned Rust workspace and one `pam` executable with client, daemon,
-status, and GUI-shell modes. `pam status` crosses the local ZeroMQ transport,
-enters an in-memory project queue, and returns versioned events plus a compact
-health result. Durable SQLite state, authenticated callers, policy, flows,
-models, connectors, and the full GPUI control center remain later roadmap
-slices. Managed-environment field validation remains optional future work; no
-interviews or live workflow observations have been conducted or are claimed.
+The product foundation, walking skeleton, and durable project-continuity slice
+are complete. The repository contains a pinned Rust workspace and one `pam`
+executable with client, daemon, status, brief, wait, result, evidence, and
+GUI-shell modes. The daemon durably schedules per-project work in SQLite,
+recovers leases after restart, replays ordered events, retains exact
+content-addressed evidence, compacts logs deterministically, and obtains project
+context from `ptrack` only through its supported JSON CLI. Authentication,
+policy, flows, models, connectors, and the full GPUI control center remain later
+roadmap slices. Managed-environment field validation remains optional future
+work; no interviews or live workflow observations have been conducted or are
+claimed.
 
-Run the walking skeleton from two terminals:
+Run the daemon from an initialized project in one terminal:
 
 ```sh
 cargo run -p pam_cli -- daemon
@@ -73,13 +76,19 @@ cargo run -p pam_cli -- daemon
 
 ```sh
 cargo run -p pam_cli -- status
+cargo run -p pam_cli -- brief
 ```
 
 The daemon runs in the foreground and shuts down cleanly on Ctrl-C. If an
 interrupted daemon leaves stale local endpoint state, recover it explicitly
 with `cargo run -p pam_cli -- daemon --recover`. The native GUI boundary is
 available as `cargo run -p pam_cli -- gui`; the production GPUI surface lands
-in the native-control-center roadmap slice.
+in the native-control-center roadmap slice. `pam brief` requires `ptrack` to be
+installed and initialized for that exact project root; otherwise it reports the
+source as unavailable. Durable request observers use `pam wait <request-id>` and
+`pam result <request-id>`. A brief's exact source can be inspected with
+`pam evidence show <evidence-handle>` or written byte-for-byte with
+`--raw`/`--output`.
 
 Local quality gates match the portable Linux checks:
 

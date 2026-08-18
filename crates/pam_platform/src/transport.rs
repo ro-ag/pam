@@ -8,6 +8,7 @@ use zeromq::{
 use crate::{LocalEndpoint, TransportError, TransportErrorKind};
 use pam_protocol::MAX_FRAME_SIZE;
 
+#[derive(Clone)]
 pub struct IncomingRequest {
     route: Vec<u8>,
     payload: Vec<u8>,

@@ -169,10 +169,12 @@ original source available by handle.
 ## Research risks
 
 Public issue trackers overrepresent failure cases, and community discussions are
-not population-level evidence. Recruitment has not started. Before broad
-implementation, interview five to eight developers in managed environments and
-observe one real CI diagnosis and one approval-heavy task. Validate willingness
-to run a daemon, acceptable audit retention, company policy around local
-models, and whether the primary control surface should emphasize queues, flows,
-or access policy. Until those sessions meet the study's explicit completion
-gate, the managed-environment findings remain provisional.
+not population-level evidence. Recruitment has not started: the field-research
+record contains zero participants, zero interviews, and zero live observations.
+Future multi-user validation should interview five to eight developers in
+managed environments and observe one real CI diagnosis and one approval-heavy
+task before PAM makes participant-derived or population claims. That work
+should validate willingness to run a daemon, acceptable audit retention,
+company policy around local models, and whether the primary control surface
+should emphasize queues, flows, or access policy. Until then, the
+managed-environment findings remain provisional.

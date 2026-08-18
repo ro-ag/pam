@@ -135,7 +135,13 @@ preview, approval, idempotency, and verification.
 - Validate GPUI accessibility and packaging constraints.
 - Complete the llama.cpp binding benchmark.
 - Define the first flow schema and protocol golden fixture.
-- Recruit five to eight managed-environment developers for workflow interviews.
+
+## Future multi-user validation
+
+- If PAM expands beyond the solo-maintainer foundation, recruit five to eight
+  managed-environment developers for workflow interviews and direct observation
+  before treating public-source inferences as participant-validated or making
+  population-level claims.
 
 ## Definition of done for every slice
 

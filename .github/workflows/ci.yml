@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  foundation:
+    name: Foundation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.rust_workspace.outputs.has_cargo }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate repository foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            README.md
+            docs/product-brief.md
+            docs/research.md
+            docs/architecture.md
+            docs/stack.md
+            docs/roadmap.md
+          )
+          for path in "${required[@]}"; do
+            test -s "$path"
+          done
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD
+
+      - name: Detect Rust workspace
+        id: rust_workspace
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  rust:
+    name: Rust
+    needs: foundation
+    if: ${{ needs.foundation.outputs.has_cargo == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked

@@ -19,3 +19,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - hits: 2026-08-18
 - cost: 0
 - status: watching
+
+## complete-selected-ptrack-plan
+- kind: habit
+- scope: project
+- rule: When asked to pick an available ptrack plan, complete every open task in that plan rather than stopping after the first task.
+- fix: Inspect the full plan, continue through all open tasks, and mark the plan done only when each task has genuine completion evidence.
+- hits: 2026-08-18
+- cost: 0
+- status: watching

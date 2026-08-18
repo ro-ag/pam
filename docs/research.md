@@ -1,9 +1,14 @@
 # Research synthesis
 
-Research date: 2026-08-17
+Research date: 2026-08-18
 
 Method: review of official product documentation, current project sources, and
 public issue reports; community discussions are supporting anecdotes only.
+
+The public-source baseline and the still-empty field-research record are kept
+in the [managed-environment research synthesis](managed-environment-interviews/synthesis.md).
+Its status is **recruitment not started**: none of the public authors cited
+there are treated as interview participants or observation sessions.
 
 ## Executive synthesis
 
@@ -32,6 +37,30 @@ behind small interfaces.
 | 5 | Automation reports activity instead of outcomes, leaving users unsure what was fixed or verified. | High | Frequent | Medium-high | Durable state machine and explicit solved/changed/verified/unresolved/blocked fields. |
 | 6 | Local models are difficult to acquire, size, run, and share safely on developer hardware. | Medium-high | Occasional setup, continuous use | High | Model catalog/import, memory estimate, `llama.cpp` adapter, user-owned paths, authenticated compatible API. |
 | 7 | Context switching creates mental fatigue and makes repeated operational sequences error-prone. | Medium-high | Daily | Medium-high | GUI flow builder, event timeline, resumable runs, reusable policies and evidence packs. |
+
+## Managed-environment public observations
+
+Fresh public reports add specificity to the managed-Mac problem without
+closing the validation gap:
+
+- Codex users describe active work becoming invisible or impossible to resume
+  across restarts and authentication events. This strengthens the continuity
+  hypothesis, but does not establish how often it affects corporate developers.
+- Corporate proxy reports show that a CA trusted by macOS may still be absent
+  from Node.js, Python, Java, or other tool-specific trust stores.
+- Platform SSO documentation and administrator reports show that local
+  password, FileVault, IdP, VPN, token freshness, and offline policy form an
+  authentication chain rather than one login state.
+- Standard-user deployments can move administrator prompts from installation
+  into later helper-tool updates or integrations, while MDM can make some
+  capabilities unavailable by policy.
+- Internal-tool access and visible agent activity do not by themselves prove
+  identity propagation, causal history, or a verified result.
+
+These are reported observations, public discussions, and documented platform
+capabilities—not interviews. Their direct citations, evidence classes,
+counterevidence rules, and provisional product implications are maintained in
+the [living study report](managed-environment-interviews/synthesis.md).
 
 ## Evidence map
 
@@ -140,8 +169,10 @@ original source available by handle.
 ## Research risks
 
 Public issue trackers overrepresent failure cases, and community discussions are
-not population-level evidence. Before broad implementation, interview five to
-eight developers in managed environments and observe one real CI diagnosis and
-one approval-heavy task. Validate willingness to run a daemon, acceptable audit
-retention, company policy around local models, and whether the primary control
-surface should emphasize queues, flows, or access policy.
+not population-level evidence. Recruitment has not started. Before broad
+implementation, interview five to eight developers in managed environments and
+observe one real CI diagnosis and one approval-heavy task. Validate willingness
+to run a daemon, acceptable audit retention, company policy around local
+models, and whether the primary control surface should emphasize queues, flows,
+or access policy. Until those sessions meet the study's explicit completion
+gate, the managed-environment findings remain provisional.

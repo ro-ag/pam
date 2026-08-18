@@ -23,9 +23,12 @@ jobs:
     outputs:
       has_cargo: ${{ steps.rust_workspace.outputs.has_cargo }}
       has_prototype: ${{ steps.prototype.outputs.has_prototype }}
+      rust_changed: ${{ steps.rust_changes.outputs.changed }}
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 2
 
       - name: Validate repository foundation
         shell: bash
@@ -55,6 +58,31 @@ jobs:
           else
             echo "has_cargo=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Detect Rust changes
+        id: rust_changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          changed=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            changed=true
+          elif [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]] \
+            || ! git cat-file -e "$BEFORE_SHA^{commit}"; then
+            changed=true
+          else
+            while IFS= read -r path; do
+              case "$path" in
+                Cargo.toml|Cargo.lock|rust-toolchain.toml|crates/*|.github/workflows/ci.yml)
+                  changed=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
       - name: Detect interactive prototype
         id: prototype
@@ -95,6 +123,25 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
+
+  macos-developer-build:
+    name: macOS developer build
+    needs: [foundation, rust]
+    if: ${{ needs.foundation.outputs.rust_changed == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Build developer workspace
+        run: cargo build --workspace --all-features --locked
 
   prototype:
     name: Interactive prototype

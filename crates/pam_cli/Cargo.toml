@@ -1,0 +1,22 @@
+[package]
+name = "pam_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pam"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pam_core.workspace = true
+pam_daemon.workspace = true
+pam_gui.workspace = true
+pam_platform.workspace = true
+pam_protocol.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -131,7 +131,6 @@ preview, approval, idempotency, and verification.
 
 ## Immediate decision tasks
 
-- Choose the repository's open-source license.
 - Set the minimum supported macOS release.
 - Validate GPUI accessibility and packaging constraints.
 - Complete the llama.cpp binding benchmark.

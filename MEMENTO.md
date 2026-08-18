@@ -10,3 +10,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - hits: 2026-08-17
 - cost: 0
 - status: watching
+
+## license-exact-compare
+- kind: habit
+- scope: project
+- rule: When claiming an exact file match, compare the complete unnormalized files byte-for-byte.
+- fix: Use cmp on full files; report normalized or body-only comparisons explicitly instead of calling them exact.
+- hits: 2026-08-18
+- cost: 0
+- status: watching

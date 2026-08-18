@@ -581,7 +581,9 @@ fn same_directory(left: &Dir, right: &Dir) -> Result<bool, StoreError> {
 
 #[cfg(unix)]
 fn sync_directory(directory: &Dir) -> Result<(), StoreError> {
-    directory.try_clone()?.into_std_file().sync_all()?;
+    // `cap_std::Dir` may hold an `O_PATH` descriptor on Linux. Reopen `.` with
+    // read access so `fsync` receives a syncable directory descriptor.
+    directory.open(".")?.sync_all()?;
     Ok(())
 }
 

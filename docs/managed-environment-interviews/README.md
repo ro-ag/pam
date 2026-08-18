@@ -1,16 +1,19 @@
 # Managed-environment developer study
 
-Status: draft; recruitment blocked until consent administration fields are resolved
+Status: public-source baseline and optional study kit complete for the
+solo-maintainer product foundation; recruitment and field validation have never
+started
 
 ## Objective
 
-Learn how developers on company-managed machines resume work, diagnose CI
-failures, and cross approval boundaries while using coding agents and corporate
-tools. The study must test PAM's product assumptions with real behavior before
-task #5 or the Product foundation and UX plan can be completed.
+The public-source baseline documents how developers on company-managed machines
+resume work, diagnose CI failures, and cross approval boundaries while using
+coding agents and corporate tools. The optional study kit prepares a future
+field study that can test PAM's product assumptions with real behavior.
 
 Public issue reports and prototype scenarios may inform the interview guide, but
-they do not count as interviews or observations.
+they do not count as interviews or observations. No participants have been
+recruited, and no interviews or workflow observations have occurred.
 
 ## Eligibility and cohort
 
@@ -74,13 +77,15 @@ quietly substituting an ineligible participant.
    confirm what may appear in a redacted synthesis, and explain how deletion of
    private material can be requested.
 
-## Required observed workflows
+## Future field-study workflow gates
 
-Across the cohort, observe both of these workflows at least once:
+If the future field study proceeds, observe both of these workflows at least
+once across the cohort:
 
-Both completion gates require live direct observation. A participant-driven
-replay or recollection of a recent case may provide supplemental interview
-evidence, but it does not satisfy either required workflow observation.
+Both field-study completion gates require live direct observation. A
+participant-driven replay or recollection of a recent case may provide
+supplemental interview evidence, but it does not satisfy either required
+workflow observation.
 
 1. **Real CI diagnosis.** A participant investigates an actual failing CI run
    for work they are authorized to show, from notification or run discovery
@@ -135,9 +140,11 @@ only when both occur naturally and each has distinct evidence.
 - Honor participant withdrawal and deletion requests according to the consent
   agreement before publishing or retaining a synthesis.
 
-## Completion checklist
+## Future field-study completion checklist
 
-Preparation does not satisfy this checklist. Leave every item unchecked until
+The public-source baseline and optional study kit complete the solo-maintainer
+foundation deliverable, but they do not satisfy this future field-study
+checklist. Recruitment has never started, so leave every item unchecked until
 the referenced real evidence exists and has been reviewed.
 
 - [ ] Five to eight eligible participants completed the protocol, including at
@@ -156,5 +163,3 @@ the referenced real evidence exists and has been reviewed.
   employer-confidential data.
 - [ ] `docs/research.md` and any affected product or roadmap claims are updated
   to distinguish validated findings from remaining assumptions.
-- [ ] Task #5 has an evidence-backed decision note before it and plan #1 are
-  marked done in `ptrack`.

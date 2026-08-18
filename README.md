@@ -56,10 +56,12 @@ PAM should help an agent answer:
 
 ## Current status
 
-PAM is in product-foundation stage. The repository contains the research,
-product contract, architecture, implementation roadmap, a cheap CI baseline,
-and the approved interactive control-center prototype. Runtime scaffolding
-follows after the highest-risk technical spikes are resolved.
+The product-foundation baseline is complete for the solo-maintainer scope. The
+repository contains the research, product contract, architecture,
+implementation roadmap, a cheap CI baseline, and the approved interactive
+control-center prototype. Runtime implementation is next. Managed-environment
+field validation remains optional future work; no interviews or live workflow
+observations have been conducted or are claimed.
 
 The prototype translates the approved "Project Current" direction into a
 responsive, interactive screen with project switching, daemon control, agent

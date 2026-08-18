@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/pam_cli",
+    "crates/pam_core",
+    "crates/pam_protocol",
+    "crates/pam_platform",
+    "crates/pam_daemon",
+    "crates/pam_gui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+
+[workspace.dependencies]
+clap = { version = "=4.6.6", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+rmp-serde = "=1.3.1"
+zeromq = { version = "=0.6.0", default-features = false, features = ["ipc-transport", "tcp-transport", "tokio-runtime"] }
+
+pam_cli = { path = "crates/pam_cli" }
+pam_core = { path = "crates/pam_core" }
+pam_protocol = { path = "crates/pam_protocol" }
+pam_platform = { path = "crates/pam_platform" }
+pam_daemon = { path = "crates/pam_daemon" }
+pam_gui = { path = "crates/pam_gui" }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

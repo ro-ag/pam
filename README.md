@@ -56,12 +56,39 @@ PAM should help an agent answer:
 
 ## Current status
 
-The product-foundation baseline is complete for the solo-maintainer scope. The
-repository contains the research, product contract, architecture,
-implementation roadmap, a cheap CI baseline, and the approved interactive
-control-center prototype. Runtime implementation is next. Managed-environment
-field validation remains optional future work; no interviews or live workflow
-observations have been conducted or are claimed.
+The product foundation and walking skeleton are complete. The repository now
+contains a pinned Rust workspace and one `pam` executable with client, daemon,
+status, and GUI-shell modes. `pam status` crosses the local ZeroMQ transport,
+enters an in-memory project queue, and returns versioned events plus a compact
+health result. Durable SQLite state, authenticated callers, policy, flows,
+models, connectors, and the full GPUI control center remain later roadmap
+slices. Managed-environment field validation remains optional future work; no
+interviews or live workflow observations have been conducted or are claimed.
+
+Run the walking skeleton from two terminals:
+
+```sh
+cargo run -p pam_cli -- daemon
+```
+
+```sh
+cargo run -p pam_cli -- status
+```
+
+The daemon runs in the foreground and shuts down cleanly on Ctrl-C. If an
+interrupted daemon leaves stale local endpoint state, recover it explicitly
+with `cargo run -p pam_cli -- daemon --recover`. The native GUI boundary is
+available as `cargo run -p pam_cli -- gui`; the production GPUI surface lands
+in the native-control-center roadmap slice.
+
+Local quality gates match the portable Linux checks:
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
 
 The prototype translates the approved "Project Current" direction into a
 responsive, interactive screen with project switching, daemon control, agent

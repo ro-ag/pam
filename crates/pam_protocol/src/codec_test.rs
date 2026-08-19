@@ -1,13 +1,16 @@
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+};
 use serde::Serialize;
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
-    MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, ReplayResult, RequestEnvelope,
-    RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability,
-    decode_request, decode_server_message, encode,
+    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, NetworkDiagnosticsResult, OperationTruth,
+    PROTOCOL_VERSION, PacState, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
+    ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, decode_request,
+    decode_server_message, encode,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -70,6 +73,27 @@ fn request_round_trips_through_named_messagepack() {
 }
 
 #[test]
+fn authenticated_request_round_trips_without_debug_disclosure() {
+    let secret = "caller-secret-that-must-not-appear";
+    let expected = status_request().authenticated(CallerCredential::new(secret));
+    let bytes = encode(&expected).unwrap();
+    let actual = decode_request(&bytes).unwrap();
+
+    assert_eq!(actual, expected);
+    assert!(!format!("{actual:?}").contains(secret));
+}
+
+#[test]
+fn approval_receipt_round_trips_as_an_additive_request_field() {
+    let expected = status_request().with_approval(pam_core::ApprovalId::from("approval-1"));
+
+    assert_eq!(
+        decode_request(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn cancel_target_round_trips_without_replacing_observer_correlation() {
     let expected = RequestEnvelope::cancel(
         RequestId::from("cancel-observer-1"),
@@ -112,6 +136,13 @@ fn read_only_request_variants_round_trip_through_named_messagepack() {
             ProjectId::from("project-1"),
             IdempotencyKey::from("brief-1"),
         ),
+        RequestEnvelope::network_diagnostics(
+            RequestId::from("network-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("network-1"),
+        )
+        .authenticated(CallerCredential::new("network-credential")),
         RequestEnvelope::wait_for_result(
             RequestId::from("wait-observer-1"),
             CallerId::from("cli-1"),
@@ -161,6 +192,8 @@ fn invalid_evidence_read_lengths_are_rejected_during_decode() {
             protocol_version: PROTOCOL_VERSION,
             request_id: RequestId::from("read-observer-1"),
             caller_id: CallerId::from("cli-1"),
+            authentication: None,
+            approval_id: None,
             project_id: ProjectId::from("project-1"),
             capability: Capability::ReadEvidence,
             idempotency_key: IdempotencyKey::from("read-1"),
@@ -228,6 +261,21 @@ fn read_only_result_variants_round_trip_through_named_messagepack() {
             payload: ResultPayload::Brief(brief_result()),
         },
     })];
+    results.push(ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("network-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::NetworkDiagnostics(NetworkDiagnosticsResult {
+                platform_roots_enabled: true,
+                system_proxy_discovery_enabled: true,
+                proxy_environment_presence: ConfigurationPresence::Configured,
+                no_proxy_presence: ConfigurationPresence::NotConfigured,
+                pac_state: PacState::DetectedUnsupported,
+            }),
+        },
+    }));
     for retention in [
         EvidenceRetention::Session,
         EvidenceRetention::Project,
@@ -388,6 +436,7 @@ fn durable_failures_round_trip_as_distinct_typed_codes() {
                 message: format!("{code:?}"),
                 code,
                 recovery: None,
+                approval: None,
             }),
         });
 
@@ -470,6 +519,7 @@ fn unsupported_version_failures_are_decodable_across_versions() {
             code: FailureCode::UnsupportedProtocolVersion,
             message: "supported protocol version is 1".to_owned(),
             recovery: None,
+            approval: None,
         }),
     });
 
@@ -484,6 +534,8 @@ struct ExtendedRequest {
     protocol_version: u16,
     request_id: RequestId,
     caller_id: CallerId,
+    authentication: Option<CallerCredential>,
+    approval_id: Option<pam_core::ApprovalId>,
     project_id: ProjectId,
     capability: Capability,
     idempotency_key: IdempotencyKey,
@@ -499,6 +551,8 @@ fn unknown_named_fields_are_ignored_for_compatible_evolution() {
         protocol_version: request.protocol_version,
         request_id: request.request_id.clone(),
         caller_id: request.caller_id.clone(),
+        authentication: request.authentication.clone(),
+        approval_id: request.approval_id.clone(),
         project_id: request.project_id.clone(),
         capability: request.capability.clone(),
         idempotency_key: request.idempotency_key.clone(),

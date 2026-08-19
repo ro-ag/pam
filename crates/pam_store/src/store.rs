@@ -1,7 +1,14 @@
 use std::{path::Path, sync::mpsc, thread, time::Duration};
 
-use pam_core::{EvidenceHandle, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
+};
+use pam_policy::{
+    ApprovalRequirement, Decision, Effect, EffectFingerprint, Grant, ResourceName, ResourceScope,
+    evaluate, redact_audit_detail,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use uuid::Uuid;
 
@@ -10,18 +17,31 @@ use std::path::PathBuf;
 
 use crate::evidence::{self, EvidenceFiles};
 use crate::{
-    AcceptOutcome, AcceptRequest, CancelOutcome, EventRecord, EvidenceMetadata, Lease,
-    LeasedRequest, PutEvidence, Replay, RequestSnapshot, RequestState, StoreError, StoredResult,
-    TerminalState,
+    AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
+    ApprovalDecisionOutcome, AuditEventRecord, AuditExport, AuditPruneOutcome, AuthorizationAudit,
+    AuthorizationOutcome, AuthorizationRequest, CallerAuthentication, CallerRegistration,
+    CallerRevocation, CancelOutcome, EventRecord, EvidenceMetadata, EvidencePruneOutcome,
+    EvidenceRetention, GrantRevocation, Lease, LeasedRequest, MAX_AUDIT_ACTION_BYTES,
+    MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES, MAX_AUDIT_DECISION_BYTES,
+    MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
+    MAX_AUDIT_PROJECT_ID_BYTES, ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot,
+    RequestState, StoreError, StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 2;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 6;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
+    (3, include_str!("../migrations/0003_callers.sql")),
+    (4, include_str!("../migrations/0004_policy.sql")),
+    (5, include_str!("../migrations/0005_audit.sql")),
+    (
+        6,
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+    ),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -33,6 +53,263 @@ pub struct Store {
 }
 
 impl Store {
+    /// Registers a caller credential. Existing caller IDs are never replaced implicitly.
+    ///
+    /// Only the SHA-256 verifier is persisted; the credential is not written to `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid credential, duplicate caller, invalid timestamp,
+    /// or unavailable durable state.
+    pub async fn register_caller(
+        &self,
+        caller_id: CallerId,
+        credential: CallerCredential,
+        now_ms: u64,
+    ) -> Result<CallerRegistration, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Register {
+            caller_id,
+            credential,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Authenticates one caller without disclosing whether a verifier matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable state is unavailable.
+    pub async fn authenticate_caller(
+        &self,
+        caller_id: CallerId,
+        credential: CallerCredential,
+    ) -> Result<CallerAuthentication, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Authenticate {
+            caller_id,
+            credential,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Revokes a caller immediately and idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timestamp or unavailable durable state.
+    pub async fn revoke_caller(
+        &self,
+        caller_id: CallerId,
+        now_ms: u64,
+    ) -> Result<CallerRevocation, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Revoke {
+            caller_id,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Adds one project-scoped capability grant and advances the policy version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate grants, unknown callers, invalid timestamps,
+    /// or unavailable durable state.
+    pub async fn put_grant(&self, grant: PutGrant) -> Result<ProjectPolicy, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::PutGrant {
+            grant,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Revokes a grant idempotently and advances the project policy version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timestamp or unavailable durable state.
+    pub async fn revoke_grant(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+    ) -> Result<GrantRevocation, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::RevokeGrant {
+            grant_id,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Evaluates default-deny project policy and atomically consumes exact approvals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timing, corrupt policy state, or unavailable
+    /// durable state.
+    pub async fn authorize(
+        &self,
+        request: AuthorizationRequest,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+    ) -> Result<AuthorizationOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::Authorize {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Evaluates policy and appends its audit outcome in the same transaction.
+    ///
+    /// Approval creation, expiry, or one-time consumption is rolled back if the
+    /// audit event cannot be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timing or audit metadata, corrupt policy
+    /// state, or unavailable durable state.
+    pub async fn authorize_audited(
+        &self,
+        request: AuthorizationRequest,
+        audit: AuthorizationAudit,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+    ) -> Result<AuthorizationOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::AuthorizeAudited {
+            request,
+            audit,
+            now_ms,
+            approval_ttl_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Applies a human approval decision to a pending exact effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval is missing, no longer pending, the
+    /// timestamp is invalid, or durable state is unavailable.
+    pub async fn decide_approval(
+        &self,
+        approval_id: ApprovalId,
+        approver_id: CallerId,
+        decision: ApprovalDecision,
+        now_ms: u64,
+    ) -> Result<ApprovalDecisionOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::DecideApproval {
+            approval_id,
+            approver_id,
+            decision,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Appends one event to the durable audit ledger.
+    ///
+    /// Callers should redact secrets as close to collection as possible. The
+    /// store reapplies bounded audit-detail redaction before validation,
+    /// idempotency comparison, and persistence as a final safety boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized fields, a duplicate stable event
+    /// ID, invalid timestamps, or unavailable durable state.
+    pub async fn append_audit_event(
+        &self,
+        event: AppendAuditEvent,
+    ) -> Result<AuditEventRecord, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Append {
+            event,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Exports one bounded project-scoped page after an exclusive global cursor.
+    ///
+    /// Records are returned in ascending global sequence order through a versioned
+    /// typed seam suitable for deterministic serialization by protocol adapters.
+    /// Pass `None` on the first page to capture a stable high-water sequence, then
+    /// pass the returned `through_sequence` on every subsequent page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid project ID, cursor, batch limit, corrupt
+    /// stored state, or unavailable durable state.
+    pub async fn export_audit_events(
+        &self,
+        project_id: ProjectId,
+        after_sequence: u64,
+        through_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<AuditExport, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Export {
+            project_id,
+            after_sequence,
+            through_sequence,
+            limit,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Prunes at most `limit` retained events for one project.
+    ///
+    /// Events whose retention timestamp is equal to `now_ms` are eligible. Calls
+    /// are deterministic, bounded, project-scoped, and idempotent once no eligible
+    /// records remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid project ID, timestamp, batch limit, or
+    /// unavailable durable state.
+    pub async fn prune_audit_events(
+        &self,
+        project_id: ProjectId,
+        now_ms: u64,
+        limit: u32,
+    ) -> Result<AuditPruneOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Prune {
+            project_id,
+            now_ms,
+            limit,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Opens a file-backed store and starts isolated scheduler and evidence workers.
     ///
     /// # Errors
@@ -358,6 +635,36 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Deletes one bounded page of non-persistent evidence for a project.
+    ///
+    /// The retention class and inclusive creation-time cutoff are explicit.
+    /// Persistent evidence is never eligible through this API. Cleanup after
+    /// committed handle deletion is best-effort: exact committed counts,
+    /// known pending items, and unresolved cleanup state are returned together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for persistent retention, an invalid cutoff or limit, or
+    /// unavailable durable state before logical deletion commits.
+    pub async fn prune_evidence(
+        &self,
+        project_id: ProjectId,
+        retention: EvidenceRetention,
+        created_before_unix_ms: u64,
+        limit: u32,
+    ) -> Result<EvidencePruneOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_evidence(EvidenceCommand::Prune {
+            project_id,
+            retention,
+            created_before_unix_ms,
+            limit,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Inspects a project-scoped evidence handle and verifies its exact blob.
     ///
     /// # Errors
@@ -460,6 +767,9 @@ async fn receive<T>(response: oneshot::Receiver<Result<T, StoreError>>) -> Resul
 }
 
 enum Command {
+    Caller(CallerCommand),
+    Policy(PolicyCommand),
+    Audit(AuditCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -525,6 +835,77 @@ enum Command {
     Shutdown(Response<()>),
 }
 
+enum CallerCommand {
+    Register {
+        caller_id: CallerId,
+        credential: CallerCredential,
+        now_ms: u64,
+        response: Response<CallerRegistration>,
+    },
+    Authenticate {
+        caller_id: CallerId,
+        credential: CallerCredential,
+        response: Response<CallerAuthentication>,
+    },
+    Revoke {
+        caller_id: CallerId,
+        now_ms: u64,
+        response: Response<CallerRevocation>,
+    },
+}
+
+enum PolicyCommand {
+    PutGrant {
+        grant: PutGrant,
+        response: Response<ProjectPolicy>,
+    },
+    RevokeGrant {
+        grant_id: GrantId,
+        now_ms: u64,
+        response: Response<GrantRevocation>,
+    },
+    Authorize {
+        request: AuthorizationRequest,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+        response: Response<AuthorizationOutcome>,
+    },
+    AuthorizeAudited {
+        request: AuthorizationRequest,
+        audit: AuthorizationAudit,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+        response: Response<AuthorizationOutcome>,
+    },
+    DecideApproval {
+        approval_id: ApprovalId,
+        approver_id: CallerId,
+        decision: ApprovalDecision,
+        now_ms: u64,
+        response: Response<ApprovalDecisionOutcome>,
+    },
+}
+
+enum AuditCommand {
+    Append {
+        event: AppendAuditEvent,
+        response: Response<AuditEventRecord>,
+    },
+    Export {
+        project_id: ProjectId,
+        after_sequence: u64,
+        through_sequence: Option<u64>,
+        limit: u32,
+        response: Response<AuditExport>,
+    },
+    Prune {
+        project_id: ProjectId,
+        now_ms: u64,
+        limit: u32,
+        response: Response<AuditPruneOutcome>,
+    },
+}
+
 enum EvidenceCommand {
     Put {
         evidence: PutEvidence,
@@ -543,6 +924,13 @@ enum EvidenceCommand {
         length: u64,
         response: Response<Vec<u8>>,
     },
+    Prune {
+        project_id: ProjectId,
+        retention: EvidenceRetention,
+        created_before_unix_ms: u64,
+        limit: u32,
+        response: Response<EvidencePruneOutcome>,
+    },
     #[cfg(test)]
     Hold {
         entered: mpsc::SyncSender<()>,
@@ -554,6 +942,9 @@ enum EvidenceCommand {
 fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Command>) {
     while let Some(command) = commands.blocking_recv() {
         match command {
+            Command::Caller(command) => run_caller_command(&mut connection, command),
+            Command::Policy(command) => run_policy_command(&mut connection, command),
+            Command::Audit(command) => run_audit_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -637,6 +1028,887 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
     }
 }
 
+fn run_caller_command(connection: &mut Connection, command: CallerCommand) {
+    match command {
+        CallerCommand::Register {
+            caller_id,
+            credential,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            register_caller(connection, caller_id, &credential, now_ms),
+        ),
+        CallerCommand::Authenticate {
+            caller_id,
+            credential,
+            response,
+        } => respond(
+            response,
+            authenticate_caller(connection, &caller_id, &credential),
+        ),
+        CallerCommand::Revoke {
+            caller_id,
+            now_ms,
+            response,
+        } => respond(response, revoke_caller(connection, &caller_id, now_ms)),
+    }
+}
+
+fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
+    match command {
+        PolicyCommand::PutGrant { grant, response } => {
+            respond(response, put_grant(connection, grant));
+        }
+        PolicyCommand::RevokeGrant {
+            grant_id,
+            now_ms,
+            response,
+        } => respond(response, revoke_grant(connection, &grant_id, now_ms)),
+        PolicyCommand::Authorize {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response,
+        } => respond(
+            response,
+            authorize(connection, &request, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::AuthorizeAudited {
+            request,
+            audit,
+            now_ms,
+            approval_ttl_ms,
+            response,
+        } => respond(
+            response,
+            authorize_audited(connection, &request, audit, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::DecideApproval {
+            approval_id,
+            approver_id,
+            decision,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            decide_approval(connection, &approval_id, &approver_id, decision, now_ms),
+        ),
+    }
+}
+
+fn run_audit_command(connection: &mut Connection, command: AuditCommand) {
+    match command {
+        AuditCommand::Append { event, response } => {
+            respond(response, append_audit_event(connection, event));
+        }
+        AuditCommand::Export {
+            project_id,
+            after_sequence,
+            through_sequence,
+            limit,
+            response,
+        } => respond(
+            response,
+            export_audit_events(
+                connection,
+                &project_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            ),
+        ),
+        AuditCommand::Prune {
+            project_id,
+            now_ms,
+            limit,
+            response,
+        } => respond(
+            response,
+            prune_audit_events(connection, &project_id, now_ms, limit),
+        ),
+    }
+}
+
+fn append_audit_event(
+    connection: &mut Connection,
+    event: AppendAuditEvent,
+) -> Result<AuditEventRecord, StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let record = append_audit_event_tx(&transaction, event)?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+fn append_audit_event_tx(
+    transaction: &Transaction<'_>,
+    mut event: AppendAuditEvent,
+) -> Result<AuditEventRecord, StoreError> {
+    event.redacted_detail = redact_audit_detail(event.redacted_detail.as_bytes());
+    validate_audit_event(&event)?;
+    let occurred_at = sql_integer(event.occurred_at_ms)?;
+    let retain_until = sql_integer(event.retain_until_ms)?;
+    let existing = transaction
+        .query_row(
+            "SELECT sequence, event_id, project_id, caller_id, action, decision, outcome,
+                    redacted_detail, occurred_at_ms, retain_until_ms
+             FROM audit_events WHERE event_id = ?1",
+            [event.event_id.as_str()],
+            stored_audit_event,
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing = existing.into_record()?;
+        if audit_event_matches(&existing, &event) {
+            return Ok(existing);
+        }
+        return Err(StoreError::AuditEventAlreadyExists);
+    }
+    transaction.execute(
+        "INSERT INTO audit_events(
+            event_id, project_id, caller_id, action, decision, outcome,
+            redacted_detail, occurred_at_ms, retain_until_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.event_id,
+            event.project_id.as_str(),
+            event.caller_id.as_str(),
+            event.action,
+            event.decision,
+            event.outcome,
+            event.redacted_detail,
+            occurred_at,
+            retain_until,
+        ],
+    )?;
+    let sequence = unsigned_integer(transaction.last_insert_rowid())?;
+    Ok(AuditEventRecord {
+        sequence,
+        event_id: event.event_id,
+        project_id: event.project_id,
+        caller_id: event.caller_id,
+        action: event.action,
+        decision: event.decision,
+        outcome: event.outcome,
+        redacted_detail: event.redacted_detail,
+        occurred_at_ms: event.occurred_at_ms,
+        retain_until_ms: event.retain_until_ms,
+    })
+}
+
+fn export_audit_events(
+    connection: &Connection,
+    project_id: &ProjectId,
+    after_sequence: u64,
+    through_sequence: Option<u64>,
+    limit: u32,
+) -> Result<AuditExport, StoreError> {
+    validate_audit_identifier(
+        project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_limit(limit)?;
+    let after = i64::try_from(after_sequence)
+        .map_err(|_| StoreError::AuditCursorOutOfRange(after_sequence))?;
+    if through_sequence.is_some_and(|through| through < after_sequence) {
+        return Err(StoreError::InvalidAuditCursorRange {
+            after: after_sequence,
+            through: through_sequence.expect("checked optional high-water"),
+        });
+    }
+    let maximum: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM audit_events",
+        [],
+        |row| row.get(0),
+    )?;
+    let maximum_sequence = unsigned_integer(maximum)?;
+    let (through_sequence, through) = if let Some(sequence) = through_sequence {
+        if sequence > maximum_sequence {
+            return Err(StoreError::AuditHighWaterAhead {
+                through: sequence,
+                maximum: maximum_sequence,
+            });
+        }
+        (
+            sequence,
+            i64::try_from(sequence).map_err(|_| StoreError::AuditCursorOutOfRange(sequence))?,
+        )
+    } else {
+        (maximum_sequence, maximum)
+    };
+    if through_sequence < after_sequence {
+        return Err(StoreError::InvalidAuditCursorRange {
+            after: after_sequence,
+            through: through_sequence,
+        });
+    }
+    let fetch_limit = i64::from(limit) + 1;
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_id, project_id, caller_id, action, decision, outcome,
+                redacted_detail, occurred_at_ms, retain_until_ms
+         FROM audit_events
+         WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3
+         ORDER BY sequence ASC
+         LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![project_id.as_str(), after, through, fetch_limit],
+        stored_audit_event,
+    )?;
+    let mut events = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(StoredAuditEvent::into_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let page_length = usize::try_from(limit).expect("u32 fits usize on supported platforms");
+    let has_more = events.len() > page_length;
+    events.truncate(page_length);
+    let next_after_sequence = events.last().map_or(after_sequence, |event| event.sequence);
+    Ok(AuditExport {
+        version: AUDIT_EXPORT_VERSION,
+        project_id: project_id.clone(),
+        after_sequence,
+        through_sequence,
+        next_after_sequence,
+        has_more,
+        events,
+    })
+}
+
+struct StoredAuditEvent {
+    sequence: i64,
+    event_id: String,
+    project_id: String,
+    caller_id: String,
+    action: String,
+    decision: String,
+    outcome: String,
+    redacted_detail: String,
+    occurred_at_ms: i64,
+    retain_until_ms: i64,
+}
+
+fn stored_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAuditEvent> {
+    Ok(StoredAuditEvent {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        project_id: row.get(2)?,
+        caller_id: row.get(3)?,
+        action: row.get(4)?,
+        decision: row.get(5)?,
+        outcome: row.get(6)?,
+        redacted_detail: row.get(7)?,
+        occurred_at_ms: row.get(8)?,
+        retain_until_ms: row.get(9)?,
+    })
+}
+
+impl StoredAuditEvent {
+    fn into_record(self) -> Result<AuditEventRecord, StoreError> {
+        Ok(AuditEventRecord {
+            sequence: unsigned_integer(self.sequence)?,
+            event_id: self.event_id,
+            project_id: ProjectId::from(self.project_id),
+            caller_id: CallerId::from(self.caller_id),
+            action: self.action,
+            decision: self.decision,
+            outcome: self.outcome,
+            redacted_detail: self.redacted_detail,
+            occurred_at_ms: unsigned_integer(self.occurred_at_ms)?,
+            retain_until_ms: unsigned_integer(self.retain_until_ms)?,
+        })
+    }
+}
+
+fn audit_event_matches(record: &AuditEventRecord, event: &AppendAuditEvent) -> bool {
+    record.event_id == event.event_id
+        && record.project_id == event.project_id
+        && record.caller_id == event.caller_id
+        && record.action == event.action
+        && record.decision == event.decision
+        && record.outcome == event.outcome
+        && record.redacted_detail == event.redacted_detail
+        && record.occurred_at_ms == event.occurred_at_ms
+        && record.retain_until_ms == event.retain_until_ms
+}
+
+fn prune_audit_events(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+    now_ms: u64,
+    limit: u32,
+) -> Result<AuditPruneOutcome, StoreError> {
+    validate_audit_identifier(
+        project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_limit(limit)?;
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let deleted = transaction.execute(
+        "DELETE FROM audit_events
+         WHERE sequence IN (
+             SELECT sequence FROM audit_events
+             WHERE project_id = ?1 AND retain_until_ms <= ?2
+             ORDER BY sequence ASC
+             LIMIT ?3
+         )",
+        params![project_id.as_str(), now, i64::from(limit)],
+    )?;
+    let has_more = transaction
+        .query_row(
+            "SELECT 1 FROM audit_events
+             WHERE project_id = ?1 AND retain_until_ms <= ?2
+             LIMIT 1",
+            params![project_id.as_str(), now],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    transaction.commit()?;
+    Ok(AuditPruneOutcome {
+        deleted: u32::try_from(deleted).expect("bounded audit deletion count fits u32"),
+        has_more,
+    })
+}
+
+fn validate_audit_event(event: &AppendAuditEvent) -> Result<(), StoreError> {
+    validate_audit_identifier(&event.event_id, MAX_AUDIT_EVENT_ID_BYTES, "event ID")?;
+    validate_audit_identifier(
+        event.project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_identifier(
+        event.caller_id.as_str(),
+        MAX_AUDIT_CALLER_ID_BYTES,
+        "caller ID",
+    )?;
+    validate_audit_identifier(&event.action, MAX_AUDIT_ACTION_BYTES, "action")?;
+    validate_audit_identifier(&event.decision, MAX_AUDIT_DECISION_BYTES, "decision")?;
+    validate_audit_identifier(&event.outcome, MAX_AUDIT_OUTCOME_BYTES, "outcome")?;
+    if event.redacted_detail.len() > MAX_AUDIT_DETAIL_BYTES
+        || event.redacted_detail.chars().any(is_unsafe_audit_character)
+    {
+        return Err(StoreError::InvalidAuditEvent("detail"));
+    }
+    if event.retain_until_ms < event.occurred_at_ms {
+        return Err(StoreError::InvalidAuditEvent(
+            "retention precedes occurrence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_identifier(
+    value: &str,
+    maximum_bytes: usize,
+    field: &'static str,
+) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value.chars().any(is_unsafe_audit_character)
+    {
+        Err(StoreError::InvalidAuditEvent(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_unsafe_audit_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+}
+
+fn validate_audit_limit(limit: u32) -> Result<(), StoreError> {
+    if limit == 0 || limit > MAX_AUDIT_BATCH_SIZE {
+        Err(StoreError::InvalidAuditBatchLimit {
+            limit,
+            maximum: MAX_AUDIT_BATCH_SIZE,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn put_grant(connection: &mut Connection, put: PutGrant) -> Result<ProjectPolicy, StoreError> {
+    let created_at = sql_integer(put.created_at_ms)?;
+    let grant = put.grant;
+    let expires_at = grant.expires_at_ms.map(sql_integer).transpose()?;
+    let revoked_at = grant.revoked_at_ms.map(sql_integer).transpose()?;
+    let (resource_kind, resource) = match &grant.resource {
+        ResourceScope::Any => ("any", None),
+        ResourceScope::Exact(resource) => ("exact", Some(resource.as_str())),
+    };
+    let effect = match grant.effect {
+        Effect::Allow => "allow",
+        Effect::Deny => "deny",
+    };
+    let approval = match grant.approval {
+        ApprovalRequirement::None => "none",
+        ApprovalRequirement::Once => "once",
+    };
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM capability_grants WHERE grant_id = ?1",
+            [grant.id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Err(StoreError::GrantAlreadyExists(grant.id));
+    }
+    transaction.execute(
+        "INSERT INTO projects(project_id) VALUES (?1)
+         ON CONFLICT(project_id) DO NOTHING",
+        [grant.project.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+         VALUES (?1, 1, 'deny', ?2)
+         ON CONFLICT(project_id) DO UPDATE SET
+             version = project_policies.version + 1,
+             updated_at_ms = excluded.updated_at_ms",
+        params![grant.project.as_str(), created_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO capability_grants(
+            grant_id, caller_id, project_id, capability, resource_kind, resource,
+            effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            grant.id.as_str(),
+            grant.caller.as_str(),
+            grant.project.as_str(),
+            grant.capability.as_str(),
+            resource_kind,
+            resource,
+            effect,
+            approval,
+            expires_at,
+            revoked_at,
+            created_at,
+        ],
+    )?;
+    let version: i64 = transaction.query_row(
+        "SELECT version FROM project_policies WHERE project_id = ?1",
+        [grant.project.as_str()],
+        |row| row.get(0),
+    )?;
+    transaction.commit()?;
+    Ok(ProjectPolicy {
+        project_id: grant.project,
+        version: unsigned_integer(version)?,
+        updated_at_ms: put.created_at_ms,
+    })
+}
+
+fn revoke_grant(
+    connection: &mut Connection,
+    grant_id: &GrantId,
+    now_ms: u64,
+) -> Result<GrantRevocation, StoreError> {
+    let revoked_at = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let grant = transaction
+        .query_row(
+            "SELECT project_id, revoked_at_ms FROM capability_grants WHERE grant_id = ?1",
+            [grant_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((project_id, previous_revocation)) = grant else {
+        return Ok(GrantRevocation::UnknownGrant);
+    };
+    if previous_revocation.is_some() {
+        return Ok(GrantRevocation::AlreadyRevoked);
+    }
+    transaction.execute(
+        "UPDATE capability_grants SET revoked_at_ms = ?2 WHERE grant_id = ?1",
+        params![grant_id.as_str(), revoked_at],
+    )?;
+    transaction.execute(
+        "UPDATE project_policies SET version = version + 1, updated_at_ms = ?2
+         WHERE project_id = ?1",
+        params![project_id, revoked_at],
+    )?;
+    transaction.commit()?;
+    Ok(GrantRevocation::Revoked)
+}
+
+fn authorize(
+    connection: &mut Connection,
+    request: &AuthorizationRequest,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = authorize_tx(&transaction, request, now, now_ms, approval_ttl_ms)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn authorize_audited(
+    connection: &mut Connection,
+    request: &AuthorizationRequest,
+    audit: AuthorizationAudit,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = authorize_tx(&transaction, request, now, now_ms, approval_ttl_ms)?;
+    let (decision, audit_outcome) = authorization_audit_outcome(&outcome);
+    append_audit_event_tx(
+        &transaction,
+        AppendAuditEvent {
+            event_id: audit.event_id,
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: audit.action,
+            decision: decision.to_owned(),
+            outcome: audit_outcome.to_owned(),
+            redacted_detail: audit.redacted_detail,
+            occurred_at_ms: now_ms,
+            retain_until_ms: audit.retain_until_ms,
+        },
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn authorize_tx(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let active_caller = transaction
+        .query_row(
+            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+            [request.caller_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !active_caller {
+        return Ok(AuthorizationOutcome::Denied);
+    }
+    let grants = load_grants(transaction, request)?;
+    let decision = evaluate(
+        &grants,
+        &request.caller_id,
+        &request.project_id,
+        &request.capability,
+        &request.resource,
+        now_ms,
+    );
+    let outcome = match decision {
+        Decision::Allowed => AuthorizationOutcome::Allowed,
+        Decision::Denied => AuthorizationOutcome::Denied,
+        Decision::ApprovalRequired => {
+            authorize_with_approval(transaction, request, now, now_ms, approval_ttl_ms)?
+        }
+    };
+    Ok(outcome)
+}
+
+const fn authorization_audit_outcome(
+    outcome: &AuthorizationOutcome,
+) -> (&'static str, &'static str) {
+    match outcome {
+        AuthorizationOutcome::Allowed => ("allow", "authorized"),
+        AuthorizationOutcome::Denied => ("deny", "forbidden"),
+        AuthorizationOutcome::ApprovalRequired { .. } => ("challenge", "approval_required"),
+        AuthorizationOutcome::ApprovalDenied => ("deny", "approval_denied"),
+        AuthorizationOutcome::ApprovalExpired => ("deny", "approval_expired"),
+    }
+}
+
+fn load_grants(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+) -> Result<Vec<Grant>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT grant_id, resource_kind, resource, effect, approval,
+                expires_at_ms, revoked_at_ms
+         FROM capability_grants
+         WHERE caller_id = ?1 AND project_id = ?2 AND capability = ?3",
+    )?;
+    let rows = statement.query_map(
+        params![
+            request.caller_id.as_str(),
+            request.project_id.as_str(),
+            request.capability.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        },
+    )?;
+    let mut grants = Vec::new();
+    for row in rows {
+        let (id, resource_kind, resource, effect, approval, expires_at, revoked_at) = row?;
+        grants.push(Grant {
+            id: GrantId::from(id),
+            caller: request.caller_id.clone(),
+            project: request.project_id.clone(),
+            capability: request.capability.clone(),
+            resource: parse_resource_scope(&resource_kind, resource)?,
+            effect: parse_effect(&effect)?,
+            approval: parse_approval_requirement(&approval)?,
+            expires_at_ms: expires_at.map(unsigned_integer).transpose()?,
+            revoked_at_ms: revoked_at.map(unsigned_integer).transpose()?,
+        });
+    }
+    Ok(grants)
+}
+
+fn parse_resource_scope(kind: &str, resource: Option<String>) -> Result<ResourceScope, StoreError> {
+    match (kind, resource) {
+        ("any", None) => Ok(ResourceScope::Any),
+        ("exact", Some(resource)) => ResourceName::parse(resource)
+            .map(ResourceScope::Exact)
+            .map_err(|_| StoreError::InvalidState("invalid stored policy resource".to_owned())),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored policy resource scope".to_owned(),
+        )),
+    }
+}
+
+fn parse_effect(effect: &str) -> Result<Effect, StoreError> {
+    match effect {
+        "allow" => Ok(Effect::Allow),
+        "deny" => Ok(Effect::Deny),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored grant effect".to_owned(),
+        )),
+    }
+}
+
+fn parse_approval_requirement(value: &str) -> Result<ApprovalRequirement, StoreError> {
+    match value {
+        "none" => Ok(ApprovalRequirement::None),
+        "once" => Ok(ApprovalRequirement::Once),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored approval requirement".to_owned(),
+        )),
+    }
+}
+
+fn authorize_with_approval(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let fingerprint = EffectFingerprint::compute(
+        &request.caller_id,
+        &request.project_id,
+        &request.capability,
+        &request.resource,
+    );
+    let Some(approval_id) = &request.approval_id else {
+        if approval_ttl_ms == 0 {
+            return Err(StoreError::InvalidState(
+                "approval lifetime must be non-zero".to_owned(),
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(approval_ttl_ms)
+            .ok_or(StoreError::ApprovalExpiryOverflow)?;
+        let expires_at = sql_integer(expires_at_ms)?;
+        let approval_id = ApprovalId::new(Uuid::new_v4().to_string());
+        transaction.execute(
+            "INSERT INTO approvals(
+                approval_id, caller_id, project_id, capability, resource,
+                effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'requested', ?7, ?8)",
+            params![
+                approval_id.as_str(),
+                request.caller_id.as_str(),
+                request.project_id.as_str(),
+                request.capability.as_str(),
+                request.resource.as_str(),
+                fingerprint.as_bytes().as_slice(),
+                now,
+                expires_at,
+            ],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        });
+    };
+    resolve_approval(transaction, approval_id, request, &fingerprint, now, now_ms)
+}
+
+fn resolve_approval(
+    transaction: &Transaction<'_>,
+    approval_id: &ApprovalId,
+    request: &AuthorizationRequest,
+    fingerprint: &EffectFingerprint,
+    now: i64,
+    now_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let approval = transaction
+        .query_row(
+            "SELECT caller_id, project_id, capability, resource,
+                    effect_fingerprint, state, expires_at_ms
+             FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((caller, project, capability, resource, stored_fingerprint, state, expires_at)) =
+        approval
+    else {
+        return Ok(AuthorizationOutcome::Denied);
+    };
+    if caller != request.caller_id.as_str()
+        || project != request.project_id.as_str()
+        || capability != request.capability.as_str()
+        || resource != request.resource.as_str()
+        || !constant_time_equal(&stored_fingerprint, fingerprint.as_bytes())
+    {
+        return Ok(AuthorizationOutcome::Denied);
+    }
+    let expires_at_ms = unsigned_integer(expires_at)?;
+    if now_ms >= expires_at_ms && matches!(state.as_str(), "requested" | "approved") {
+        transaction.execute(
+            "UPDATE approvals SET state = 'expired' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalExpired);
+    }
+    match state.as_str() {
+        "requested" => Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id: approval_id.clone(),
+            expires_at_ms,
+        }),
+        "approved" => {
+            let updated = transaction.execute(
+                "UPDATE approvals SET state = 'consumed', consumed_at_ms = ?2
+                 WHERE approval_id = ?1 AND state = 'approved'",
+                params![approval_id.as_str(), now],
+            )?;
+            if updated == 1 {
+                Ok(AuthorizationOutcome::Allowed)
+            } else {
+                Ok(AuthorizationOutcome::Denied)
+            }
+        }
+        "denied" => Ok(AuthorizationOutcome::ApprovalDenied),
+        "expired" => Ok(AuthorizationOutcome::ApprovalExpired),
+        "consumed" => Ok(AuthorizationOutcome::Denied),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored approval state".to_owned(),
+        )),
+    }
+}
+
+fn decide_approval(
+    connection: &mut Connection,
+    approval_id: &ApprovalId,
+    approver_id: &CallerId,
+    decision: ApprovalDecision,
+    now_ms: u64,
+) -> Result<ApprovalDecisionOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_approver = transaction
+        .query_row(
+            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+            [approver_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !active_approver {
+        return Err(StoreError::InvalidApprovalState);
+    }
+    let approval = transaction
+        .query_row(
+            "SELECT state, expires_at_ms FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((state, expires_at)) = approval else {
+        return Err(StoreError::ApprovalNotFound(approval_id.clone()));
+    };
+    if state != "requested" {
+        return Err(StoreError::InvalidApprovalState);
+    }
+    if now_ms >= unsigned_integer(expires_at)? {
+        transaction.execute(
+            "UPDATE approvals SET state = 'expired' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        transaction.commit()?;
+        return Ok(ApprovalDecisionOutcome::Expired);
+    }
+    let (state, outcome) = match decision {
+        ApprovalDecision::Approve => ("approved", ApprovalDecisionOutcome::Approved),
+        ApprovalDecision::Deny => ("denied", ApprovalDecisionOutcome::Denied),
+    };
+    transaction.execute(
+        "UPDATE approvals
+         SET state = ?2, decided_by = ?3, decided_at_ms = ?4
+         WHERE approval_id = ?1 AND state = 'requested'",
+        params![approval_id.as_str(), state, approver_id.as_str(), now],
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
 fn open_evidence_worker(path: &Path) -> Result<(Connection, EvidenceFiles), StoreError> {
     let connection = open_connection(path)?;
     let files = EvidenceFiles::open(path)?;
@@ -676,6 +1948,30 @@ fn run_evidence_worker(
                 response,
                 evidence::read_range(&connection, &files, &project_id, &handle, offset, length),
             ),
+            EvidenceCommand::Prune {
+                project_id,
+                retention,
+                created_before_unix_ms,
+                limit,
+                response,
+            } => respond(
+                response,
+                evidence::prune(
+                    &mut connection,
+                    &files,
+                    &project_id,
+                    retention,
+                    created_before_unix_ms,
+                    limit,
+                )
+                .map(|outcome| EvidencePruneOutcome {
+                    handles_deleted: outcome.handles_deleted,
+                    blobs_deleted: outcome.blobs_deleted,
+                    blobs_pending: outcome.blobs_pending,
+                    cleanup_unresolved: outcome.cleanup_unresolved,
+                    has_more: outcome.has_more,
+                }),
+            ),
             #[cfg(test)]
             EvidenceCommand::Hold { entered, release } => {
                 let _ = entered.send(());
@@ -693,6 +1989,130 @@ fn run_evidence_worker(
 
 fn respond<T>(response: Response<T>, result: Result<T, StoreError>) {
     let _ = response.send(result);
+}
+
+fn register_caller(
+    connection: &mut Connection,
+    caller_id: CallerId,
+    credential: &CallerCredential,
+    now_ms: u64,
+) -> Result<CallerRegistration, StoreError> {
+    if !credential.is_valid() {
+        return Err(StoreError::InvalidCallerCredential);
+    }
+    let registered_at = sql_integer(now_ms)?;
+    let digest = credential_digest(credential);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing_revocation = transaction
+        .query_row(
+            "SELECT revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    match existing_revocation {
+        None => {
+            transaction.execute(
+                "INSERT INTO callers(
+                    caller_id, credential_digest, registered_at_ms, revoked_at_ms
+                 ) VALUES (?1, ?2, ?3, NULL)",
+                params![caller_id.as_str(), digest.as_slice(), registered_at],
+            )?;
+        }
+        Some(None) => return Err(StoreError::CallerAlreadyRegistered(caller_id)),
+        Some(Some(_)) => {
+            transaction.execute(
+                "UPDATE callers
+                 SET credential_digest = ?2, registered_at_ms = ?3, revoked_at_ms = NULL
+                 WHERE caller_id = ?1",
+                params![caller_id.as_str(), digest.as_slice(), registered_at],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(CallerRegistration {
+        caller_id,
+        registered_at_ms: now_ms,
+        revoked_at_ms: None,
+    })
+}
+
+fn authenticate_caller(
+    connection: &Connection,
+    caller_id: &CallerId,
+    credential: &CallerCredential,
+) -> Result<CallerAuthentication, StoreError> {
+    if !credential.is_valid() {
+        return Ok(CallerAuthentication::InvalidCredential);
+    }
+    let registration = connection
+        .query_row(
+            "SELECT credential_digest, revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((expected, revoked_at)) = registration else {
+        return Ok(CallerAuthentication::UnknownCaller);
+    };
+    if revoked_at.is_some() {
+        return Ok(CallerAuthentication::Revoked);
+    }
+    let supplied = credential_digest(credential);
+    if constant_time_equal(&expected, supplied.as_slice()) {
+        Ok(CallerAuthentication::Authenticated)
+    } else {
+        Ok(CallerAuthentication::InvalidCredential)
+    }
+}
+
+fn revoke_caller(
+    connection: &mut Connection,
+    caller_id: &CallerId,
+    now_ms: u64,
+) -> Result<CallerRevocation, StoreError> {
+    let revoked_at = sql_integer(now_ms)?;
+    let state = connection
+        .query_row(
+            "SELECT registered_at_ms, revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((registered_at, previous_revocation)) = state else {
+        return Ok(CallerRevocation::UnknownCaller);
+    };
+    if previous_revocation.is_some() {
+        return Ok(CallerRevocation::AlreadyRevoked);
+    }
+    if revoked_at < registered_at {
+        return Err(StoreError::InvalidState(
+            "caller revocation predates registration".to_owned(),
+        ));
+    }
+    connection.execute(
+        "UPDATE callers SET revoked_at_ms = ?2
+         WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+        params![caller_id.as_str(), revoked_at],
+    )?;
+    Ok(CallerRevocation::Revoked)
+}
+
+fn credential_digest(credential: &CallerCredential) -> [u8; 32] {
+    Sha256::digest(credential.expose_secret().as_bytes()).into()
+}
+
+fn constant_time_equal(expected: &[u8], supplied: &[u8]) -> bool {
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(supplied)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 pub(super) fn open_connection(path: &Path) -> Result<Connection, StoreError> {

@@ -12,9 +12,10 @@ pub use codec::{
     CodecError, decode_request, decode_request_envelope, decode_server_message, encode,
 };
 pub use contract::{
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, Failure, FailureCode, OperationTruth, ProtocolContractError, ReplayResult,
+    ApprovalChallenge, BriefItem, BriefProvenance, BriefResult, CancellationDisposition,
+    CancellationResult, Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    NetworkDiagnosticsResult, OperationTruth, PacState, ProtocolContractError, ReplayResult,
     RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
     SourceAvailability, StatusResult,
 };

@@ -1,25 +1,710 @@
 use std::{
     io::{self, Write},
     path::Path,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{EvidenceHandle, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
+};
 use pam_daemon::{ClientExchange, StatusError};
-use pam_platform::{IdentityError, LocalEndpoint};
+use pam_platform::{
+    CallerKind, IdentityError, LocalEndpoint, caller_id, discover_project_id, user_data_dir,
+};
+use pam_policy::{
+    ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope,
+    redact_audit_detail,
+};
 use pam_protocol::{ResultBody, ResultPayload};
+use pam_store::{
+    AppendAuditEvent, ApprovalDecision, ApprovalDecisionOutcome, AuditPruneOutcome,
+    AuthorizationAudit, AuthorizationOutcome, AuthorizationRequest, CallerAuthentication,
+    CallerRevocation, EvidencePruneOutcome, EvidenceRetention, GrantRevocation, PutGrant, Store,
+};
+use uuid::Uuid;
 
 use crate::{
+    audit::encode_audit_export,
+    command::{CallerKindArg, RetentionScopeArg},
     evidence::{EvidenceError, download_evidence, write_new_output},
     render::{EXIT_OPERATION_FAILED, Presentation, escape_text, present_result, render_events},
-    request::RequestContext,
+    request::{
+        NativeCredentialError, RequestContext, RequestContextError, delete_native_credential,
+        load_native_credential, store_native_credential,
+    },
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const AUDIT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+const APPROVAL_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 
-pub(crate) async fn status() -> i32 {
-    let Some(context) = discover_context() else {
+fn open_local_administrative_store() -> Result<(ProjectId, CallerId, Store), i32> {
+    let project_id = discover_project_id(".").map_err(|error| {
+        report_identity_error(&error);
+        EXIT_OPERATION_FAILED
+    })?;
+    let caller_id = caller_id(CallerKind::Cli).map_err(|error| {
+        report_identity_error(&error);
+        EXIT_OPERATION_FAILED
+    })?;
+    let data_dir = user_data_dir().map_err(|error| {
+        report_identity_error(&error);
+        EXIT_OPERATION_FAILED
+    })?;
+    let store =
+        Store::open(data_dir.join("state.sqlite3")).map_err(|error| report_store_error(&error))?;
+    Ok((project_id, caller_id, store))
+}
+
+pub(crate) async fn audit_export(
+    output: &Path,
+    after_sequence: u64,
+    through_sequence: Option<u64>,
+    approval_id: Option<ApprovalId>,
+    limit: usize,
+) -> i32 {
+    if through_sequence.is_some_and(|through| through < after_sequence) {
+        eprintln!("Audit high-water sequence cannot precede the after sequence.");
+        return EXIT_OPERATION_FAILED;
+    }
+    if i64::try_from(after_sequence).is_err()
+        || through_sequence.is_some_and(|through| i64::try_from(through).is_err())
+    {
+        eprintln!("Audit sequence exceeds the supported storage range.");
+        return EXIT_OPERATION_FAILED;
+    }
+    let (project_id, caller_id, store) = match open_local_administrative_store() {
+        Ok(context) => context,
+        Err(exit_code) => return exit_code,
+    };
+    let resource = ResourceName::parse(format!(
+        "audit:export:after={after_sequence}:through={}:limit={limit}",
+        through_sequence.map_or_else(|| "capture".to_owned(), |value| value.to_string())
+    ))
+    .expect("bounded numeric audit export resource is valid");
+    if let Err(exit_code) = authorize_local_operation(
+        &store,
+        &caller_id,
+        &project_id,
+        CapabilityName::parse("audit.export").expect("static capability is valid"),
+        resource,
+        approval_id,
+        "audit.export",
+    )
+    .await
+    {
+        let _ = store.shutdown().await;
+        return exit_code;
+    }
+    let page = match store
+        .export_audit_events(
+            project_id.clone(),
+            after_sequence,
+            through_sequence,
+            u32::try_from(limit).expect("CLI audit limit fits u32"),
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            let _ = store.shutdown().await;
+            return report_store_error(&error);
+        }
+    };
+    let bytes = encode_audit_export(&page);
+    if let Err(error) = write_new_output(output, &bytes) {
+        let _ = store.shutdown().await;
+        eprintln!("{}", escape_text(&error.to_string()));
+        if let Some(source) = std::error::Error::source(&error) {
+            eprintln!("Details: {}", escape_text(&source.to_string()));
+        }
+        return EXIT_OPERATION_FAILED;
+    }
+    if let Err(error) = store.shutdown().await {
+        return report_store_error(&error);
+    }
+    println!(
+        "Wrote {} redacted audit events to {} (through_sequence={}, next_after_sequence={}, has_more={}).",
+        page.events.len(),
+        escape_text(&output.display().to_string()),
+        page.through_sequence,
+        page.next_after_sequence,
+        page.has_more
+    );
+    0
+}
+
+pub(crate) async fn retention_prune(
+    scope: RetentionScopeArg,
+    created_before_unix_ms: u64,
+    approval_id: Option<ApprovalId>,
+    limit: usize,
+) -> i32 {
+    if i64::try_from(created_before_unix_ms).is_err() {
+        eprintln!("Retention cutoff exceeds the supported storage range.");
+        return EXIT_OPERATION_FAILED;
+    }
+    let (project_id, caller_id, store) = match open_local_administrative_store() {
+        Ok(context) => context,
+        Err(exit_code) => return exit_code,
+    };
+    let now = now_ms();
+    let retention = match scope {
+        RetentionScopeArg::Session => EvidenceRetention::Session,
+        RetentionScopeArg::Project => EvidenceRetention::Project,
+    };
+    let limit = u32::try_from(limit).expect("CLI retention limit fits u32");
+    let resource = ResourceName::parse(format!(
+        "retention:evidence:scope={}:before={created_before_unix_ms}:limit={limit}",
+        retention_label(retention)
+    ))
+    .expect("bounded numeric retention resource is valid");
+    if let Err(exit_code) = authorize_local_operation(
+        &store,
+        &caller_id,
+        &project_id,
+        CapabilityName::parse("retention.prune").expect("static capability is valid"),
+        resource,
+        approval_id,
+        "retention.prune",
+    )
+    .await
+    {
+        let _ = store.shutdown().await;
+        return exit_code;
+    }
+    let evidence = match store
+        .prune_evidence(project_id.clone(), retention, created_before_unix_ms, limit)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = store.shutdown().await;
+            return report_store_error(&error);
+        }
+    };
+    if let Err(error) = record_evidence_retention(
+        &store,
+        project_id.clone(),
+        caller_id.clone(),
+        retention,
+        created_before_unix_ms,
+        evidence,
+    )
+    .await
+    {
+        eprintln!(
+            "Evidence retention changed {} handles and removed {} blobs; {} blobs remain pending safe cleanup (cleanup_unresolved={}).",
+            evidence.handles_deleted,
+            evidence.blobs_deleted,
+            evidence.blobs_pending,
+            evidence.cleanup_unresolved
+        );
+        let _ = store.shutdown().await;
+        return report_store_error(&error);
+    }
+    let audit = match store
+        .prune_audit_events(project_id.clone(), now, limit)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!(
+                "Evidence retention completed (handles_deleted={}, blobs_deleted={}, blobs_pending={}, cleanup_unresolved={}), but audit retention did not complete.",
+                evidence.handles_deleted,
+                evidence.blobs_deleted,
+                evidence.blobs_pending,
+                evidence.cleanup_unresolved
+            );
+            let _ = store.shutdown().await;
+            return report_store_error(&error);
+        }
+    };
+    if let Err(error) = record_audit_retention(&store, project_id, caller_id, audit).await {
+        eprintln!(
+            "Retention completed (handles_deleted={}, blobs_deleted={}, blobs_pending={}, cleanup_unresolved={}, expired_audit_events_deleted={}), but PAM could not append the completion event.",
+            evidence.handles_deleted,
+            evidence.blobs_deleted,
+            evidence.blobs_pending,
+            evidence.cleanup_unresolved,
+            audit.deleted
+        );
+        let _ = store.shutdown().await;
+        return report_store_error(&error);
+    }
+    if let Err(error) = store.shutdown().await {
+        return report_store_error(&error);
+    }
+    report_retention_outcome(evidence, audit)
+}
+
+fn report_retention_outcome(evidence: EvidencePruneOutcome, audit: AuditPruneOutcome) -> i32 {
+    let summary = format!(
+        "Pruned {} evidence handles, removed {} unreferenced blobs, left {} blobs pending safe cleanup, and pruned {} expired audit events (cleanup_unresolved={}, has_more={}).",
+        evidence.handles_deleted,
+        evidence.blobs_deleted,
+        evidence.blobs_pending,
+        audit.deleted,
+        evidence.cleanup_unresolved,
+        evidence.has_more || audit.has_more
+    );
+    if evidence.cleanup_unresolved {
+        eprintln!("{summary}");
+        eprintln!("Recovery: retry the same bounded retention command.");
+        EXIT_OPERATION_FAILED
+    } else {
+        println!("{summary}");
+        0
+    }
+}
+
+async fn record_evidence_retention(
+    store: &Store,
+    project_id: ProjectId,
+    caller_id: CallerId,
+    retention: EvidenceRetention,
+    created_before_unix_ms: u64,
+    outcome: EvidencePruneOutcome,
+) -> Result<(), pam_store::StoreError> {
+    let detail = format!(
+        "scope={} created_before_unix_ms={created_before_unix_ms} handles_deleted={} blobs_deleted={} blobs_pending={} cleanup_unresolved={} has_more={}",
+        retention_label(retention),
+        outcome.handles_deleted,
+        outcome.blobs_deleted,
+        outcome.blobs_pending,
+        outcome.cleanup_unresolved,
+        outcome.has_more
+    );
+    store
+        .append_audit_event(audit_event(
+            project_id,
+            caller_id,
+            "retention.evidence_pruned",
+            "apply",
+            if outcome.cleanup_unresolved {
+                "cleanup_unresolved"
+            } else if outcome.blobs_pending > 0 {
+                "cleanup_pending"
+            } else if outcome.handles_deleted == 0 && outcome.blobs_deleted == 0 {
+                "unchanged"
+            } else {
+                "changed"
+            },
+            &detail,
+            now_ms(),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn record_audit_retention(
+    store: &Store,
+    project_id: ProjectId,
+    caller_id: CallerId,
+    outcome: AuditPruneOutcome,
+) -> Result<(), pam_store::StoreError> {
+    let detail = format!(
+        "expired_events_deleted={} has_more={}",
+        outcome.deleted, outcome.has_more
+    );
+    store
+        .append_audit_event(audit_event(
+            project_id,
+            caller_id,
+            "retention.audit_pruned",
+            "apply",
+            if outcome.deleted == 0 {
+                "unchanged"
+            } else {
+                "changed"
+            },
+            &detail,
+            now_ms(),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn authorize_local_operation(
+    store: &Store,
+    caller_id: &CallerId,
+    project_id: &ProjectId,
+    capability: CapabilityName,
+    resource: ResourceName,
+    approval_id: Option<ApprovalId>,
+    action: &str,
+) -> Result<(), i32> {
+    let credential = match load_native_credential(caller_id.clone()).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            record_local_authentication_failure(
+                store,
+                caller_id.clone(),
+                project_id.clone(),
+                action,
+                &capability,
+                &resource,
+                "credential_unavailable",
+            )
+            .await
+            .map_err(|audit_error| report_store_error(&audit_error))?;
+            return Err(report_native_credential_error(&error));
+        }
+    };
+    let authentication = store
+        .authenticate_caller(caller_id.clone(), credential)
+        .await
+        .map_err(|error| report_store_error(&error))?;
+    if authentication != CallerAuthentication::Authenticated {
+        record_local_authentication_failure(
+            store,
+            caller_id.clone(),
+            project_id.clone(),
+            action,
+            &capability,
+            &resource,
+            "unauthenticated",
+        )
+        .await
+        .map_err(|error| report_store_error(&error))?;
+        eprintln!("Caller authentication failed.");
+        eprintln!("Recovery: pam caller register");
+        return Err(EXIT_OPERATION_FAILED);
+    }
+
+    let now = now_ms();
+    let detail = format!(
+        "capability={} resource={} detail=local administrative policy evaluated",
+        capability.as_str(),
+        resource.as_str()
+    );
+    let outcome = store
+        .authorize_audited(
+            AuthorizationRequest {
+                caller_id: caller_id.clone(),
+                project_id: project_id.clone(),
+                capability: capability.clone(),
+                resource: resource.clone(),
+                approval_id,
+            },
+            AuthorizationAudit {
+                event_id: Uuid::new_v4().to_string(),
+                action: action.to_owned(),
+                redacted_detail: redact_audit_detail(detail.as_bytes()),
+                retain_until_ms: now.saturating_add(AUDIT_RETENTION_MS).min(i64::MAX as u64),
+            },
+            now,
+            APPROVAL_LIFETIME_MS,
+        )
+        .await
+        .map_err(|error| report_store_error(&error))?;
+    match outcome {
+        AuthorizationOutcome::Allowed => Ok(()),
+        AuthorizationOutcome::Denied => {
+            eprintln!(
+                "Project policy denied {}.",
+                escape_text(capability.as_str())
+            );
+            eprintln!(
+                "Recovery: pam access grant {} --resource {}",
+                escape_text(capability.as_str()),
+                escape_text(resource.as_str())
+            );
+            Err(EXIT_OPERATION_FAILED)
+        }
+        AuthorizationOutcome::ApprovalRequired { approval_id, .. } => {
+            eprintln!("This exact operation requires approval {approval_id}.");
+            eprintln!(
+                "Recovery: pam approval approve {approval_id}, then retry with --approval-id {approval_id}"
+            );
+            Err(EXIT_OPERATION_FAILED)
+        }
+        AuthorizationOutcome::ApprovalDenied => {
+            eprintln!("The exact-effect approval was denied.");
+            Err(EXIT_OPERATION_FAILED)
+        }
+        AuthorizationOutcome::ApprovalExpired => {
+            eprintln!("The exact-effect approval expired.");
+            Err(EXIT_OPERATION_FAILED)
+        }
+    }
+}
+
+async fn record_local_authentication_failure(
+    store: &Store,
+    caller_id: CallerId,
+    project_id: ProjectId,
+    action: &str,
+    capability: &CapabilityName,
+    resource: &ResourceName,
+    outcome: &str,
+) -> Result<(), pam_store::StoreError> {
+    let occurred_at_ms = now_ms();
+    let detail = format!(
+        "capability={} resource={} detail=local administrative authentication failed",
+        capability.as_str(),
+        resource.as_str()
+    );
+    store
+        .append_audit_event(audit_event(
+            project_id,
+            caller_id,
+            action,
+            "deny",
+            outcome,
+            &detail,
+            occurred_at_ms,
+        ))
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn caller_register(kind: CallerKindArg) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let credential = CallerCredential::new(format!(
+        "pam_{}_{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    ));
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let previous_credential = match load_native_credential(caller_id.clone()).await {
+        Ok(credential) => Some(credential),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => {
+            let _ = store.shutdown().await;
+            return report_native_credential_error(&error);
+        }
+    };
+    if let Err(error) = store_native_credential(caller_id.clone(), credential.clone()).await {
+        let _ = store.shutdown().await;
+        return report_native_credential_error(&error);
+    }
+    let result = store
+        .register_caller(caller_id.clone(), credential.clone(), now_ms())
+        .await;
+    let shutdown = store.shutdown().await;
+    let registration = match result {
+        Ok(registration) => registration,
+        Err(error) => {
+            restore_native_credential(caller_id, previous_credential).await;
+            return report_store_error(&error);
+        }
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+
+    println!("Registered caller {}.", registration.caller_id);
+    println!("Credential stored in the operating system's native credential store.");
+    0
+}
+
+pub(crate) async fn caller_revoke(kind: CallerKindArg) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store.revoke_caller(caller_id.clone(), now_ms()).await;
+    let shutdown = store.shutdown().await;
+    let revocation = match result {
+        Ok(revocation) => revocation,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match revocation {
+        CallerRevocation::Revoked => {
+            println!("Revoked caller {caller_id}.");
+            delete_revoked_native_credential(caller_id).await
+        }
+        CallerRevocation::AlreadyRevoked => {
+            println!("Caller {caller_id} is already revoked.");
+            delete_revoked_native_credential(caller_id).await
+        }
+        CallerRevocation::UnknownCaller => {
+            eprintln!("Caller {caller_id} is not registered.");
+            EXIT_OPERATION_FAILED
+        }
+    }
+}
+
+pub(crate) async fn access_grant(
+    kind: CallerKindArg,
+    capability: CapabilityName,
+    resource: Option<ResourceName>,
+    deny: bool,
+    require_approval: bool,
+    expires_at_ms: Option<u64>,
+) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let project_id = match discover_project_id(".") {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let grant_id = GrantId::new(Uuid::new_v4().to_string());
+    let created_at_ms = now_ms();
+    let result = store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: grant_id.clone(),
+                caller: caller_id,
+                project: project_id,
+                capability,
+                resource: resource.map_or(ResourceScope::Any, ResourceScope::Exact),
+                effect: if deny { Effect::Deny } else { Effect::Allow },
+                approval: if require_approval {
+                    ApprovalRequirement::Once
+                } else {
+                    ApprovalRequirement::None
+                },
+                expires_at_ms,
+                revoked_at_ms: None,
+            },
+            created_at_ms,
+        })
+        .await;
+    let shutdown = store.shutdown().await;
+    let policy = match result {
+        Ok(policy) => policy,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    println!(
+        "Added grant {grant_id} to project policy version {}.",
+        policy.version
+    );
+    0
+}
+
+pub(crate) async fn access_revoke(grant_id: GrantId) -> i32 {
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store.revoke_grant(grant_id.clone(), now_ms()).await;
+    let shutdown = store.shutdown().await;
+    let revocation = match result {
+        Ok(revocation) => revocation,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match revocation {
+        GrantRevocation::Revoked => println!("Revoked grant {grant_id}."),
+        GrantRevocation::AlreadyRevoked => println!("Grant {grant_id} is already revoked."),
+        GrantRevocation::UnknownGrant => {
+            eprintln!("Grant {grant_id} does not exist.");
+            return EXIT_OPERATION_FAILED;
+        }
+    }
+    0
+}
+
+pub(crate) async fn approval_decide(approval_id: ApprovalId, decision: ApprovalDecision) -> i32 {
+    let approver_id = match caller_id(CallerKind::Cli) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store
+        .decide_approval(approval_id.clone(), approver_id, decision, now_ms())
+        .await;
+    let shutdown = store.shutdown().await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match outcome {
+        ApprovalDecisionOutcome::Approved => println!("Approved {approval_id}."),
+        ApprovalDecisionOutcome::Denied => println!("Denied {approval_id}."),
+        ApprovalDecisionOutcome::Expired => {
+            eprintln!("Approval {approval_id} expired before the decision.");
+            return EXIT_OPERATION_FAILED;
+        }
+    }
+    0
+}
+
+pub(crate) async fn status(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.status(), STATUS_TIMEOUT).await {
@@ -39,8 +724,8 @@ pub(crate) async fn status() -> i32 {
     }
 }
 
-pub(crate) async fn brief() -> i32 {
-    let Some(context) = discover_context() else {
+pub(crate) async fn brief(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.brief(), READ_TIMEOUT).await {
@@ -61,8 +746,35 @@ pub(crate) async fn brief() -> i32 {
     }
 }
 
-pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -> i32 {
-    let Some(context) = discover_context() else {
+pub(crate) async fn network_diagnostics(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    match exchange(&context.network_diagnostics(), READ_TIMEOUT).await {
+        Ok(exchange) if !exchange.events.is_empty() => unexpected_events("network diagnostics"),
+        Ok(exchange)
+            if matches!(
+                exchange.result.body,
+                ResultBody::Success {
+                    payload: ResultPayload::NetworkDiagnostics(_),
+                    ..
+                } | ResultBody::Failure(_)
+            ) =>
+        {
+            emit(present_result(&exchange.result.body))
+        }
+        Ok(_) => unexpected_result("network diagnostics"),
+        Err(error) => report_exchange_error(&error),
+    }
+}
+
+pub(crate) async fn wait(
+    request_id: RequestId,
+    after: u64,
+    timeout: Duration,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     let request = context.wait(request_id, after);
@@ -75,8 +787,8 @@ pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -
     }
 }
 
-pub(crate) async fn result(request_id: RequestId) -> i32 {
-    let Some(context) = discover_context() else {
+pub(crate) async fn result(request_id: RequestId, approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.result(request_id), READ_TIMEOUT).await {
@@ -87,7 +799,7 @@ pub(crate) async fn result(request_id: RequestId) -> i32 {
 }
 
 pub(crate) async fn evidence_show(handle: EvidenceHandle, raw: bool, output: Option<&Path>) -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context(None).await else {
         return EXIT_OPERATION_FAILED;
     };
     let download = match download_evidence(
@@ -150,19 +862,106 @@ async fn exchange(
     pam_daemon::request_exchange(&LocalEndpoint::default_for_user(), request, timeout).await
 }
 
-fn discover_context() -> Option<RequestContext> {
-    match RequestContext::discover() {
+async fn discover_context(approval_id: Option<ApprovalId>) -> Option<RequestContext> {
+    match RequestContext::discover(approval_id).await {
         Ok(context) => Some(context),
-        Err(error) => {
+        Err(RequestContextError::Identity(error)) => {
             report_identity_error(&error);
+            None
+        }
+        Err(RequestContextError::Credential(error)) => {
+            report_native_credential_error(&error);
             None
         }
     }
 }
 
+async fn restore_native_credential(caller_id: CallerId, previous: Option<CallerCredential>) {
+    let result = match previous {
+        Some(credential) => store_native_credential(caller_id, credential).await,
+        None => delete_native_credential(caller_id).await,
+    };
+    if let Err(error) = result
+        && !error.is_not_found()
+    {
+        eprintln!(
+            "PAM could not restore the previous native credential after registration failed."
+        );
+        eprintln!("Details: {}", escape_text(&error.to_string()));
+    }
+}
+
+async fn delete_revoked_native_credential(caller_id: CallerId) -> i32 {
+    match delete_native_credential(caller_id).await {
+        Ok(()) => 0,
+        Err(error) if error.is_not_found() => 0,
+        Err(error) => report_native_credential_error(&error),
+    }
+}
+
+fn report_native_credential_error(error: &NativeCredentialError) -> i32 {
+    eprintln!("{}", escape_text(&error.to_string()));
+    EXIT_OPERATION_FAILED
+}
+
 fn report_identity_error(error: &IdentityError) {
     eprintln!("{}", escape_text(&error.to_string()));
     eprintln!("Details: {}", escape_text(error.diagnostic()));
+}
+
+fn report_store_error(error: &pam_store::StoreError) -> i32 {
+    eprintln!("{}", escape_text(&error.to_string()));
+    EXIT_OPERATION_FAILED
+}
+
+const fn caller_kind(kind: CallerKindArg) -> CallerKind {
+    match kind {
+        CallerKindArg::Cli => CallerKind::Cli,
+        CallerKindArg::Gui => CallerKind::Gui,
+        CallerKindArg::CodingAgent => CallerKind::CodingAgent,
+        CallerKindArg::LocalApplication => CallerKind::LocalApplication,
+    }
+}
+
+const fn retention_label(retention: EvidenceRetention) -> &'static str {
+    match retention {
+        EvidenceRetention::Session => "session",
+        EvidenceRetention::Project => "project",
+        EvidenceRetention::Persistent => "persistent",
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn audit_event(
+    project_id: ProjectId,
+    caller_id: CallerId,
+    action: &str,
+    decision: &str,
+    outcome: &str,
+    detail: &str,
+    occurred_at_ms: u64,
+) -> AppendAuditEvent {
+    AppendAuditEvent {
+        event_id: Uuid::new_v4().to_string(),
+        project_id,
+        caller_id,
+        action: action.to_owned(),
+        decision: decision.to_owned(),
+        outcome: outcome.to_owned(),
+        redacted_detail: redact_audit_detail(detail.as_bytes()),
+        occurred_at_ms,
+        retain_until_ms: occurred_at_ms
+            .saturating_add(AUDIT_RETENTION_MS)
+            .min(i64::MAX as u64),
+    }
 }
 
 fn report_exchange_error(error: &StatusError) -> i32 {

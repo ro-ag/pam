@@ -1,11 +1,15 @@
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
+    ProjectId, RequestId,
+};
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, OperationTruth, PROTOCOL_VERSION,
-    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
-    ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
+    Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
+    EvidenceRedaction, EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ProtocolContractError,
+    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
+    SourceAvailability, StatusResult,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -24,8 +28,52 @@ fn status_request_populates_the_versioned_identity_contract() {
     assert_eq!(request.protocol_version, PROTOCOL_VERSION);
     assert_eq!(request.request_id.as_str(), "request-1");
     assert_eq!(request.caller_id.as_str(), "cli-1");
+    assert!(request.authentication.is_none());
     assert_eq!(request.project_id.as_str(), "project-1");
     assert_eq!(request.idempotency_key.as_str(), "status-1");
+}
+
+#[test]
+fn request_authentication_is_explicit_and_redacted() {
+    let secret = "credential-secret";
+    let request = status_request().authenticated(CallerCredential::new(secret));
+
+    assert_eq!(
+        request
+            .authentication
+            .as_ref()
+            .expect("credential is attached")
+            .expose_secret(),
+        secret
+    );
+    assert!(!format!("{request:?}").contains(secret));
+}
+
+#[test]
+fn request_approval_receipt_is_explicit_and_one_effect_scoped() {
+    let request = status_request().with_approval(ApprovalId::from("approval-1"));
+
+    assert_eq!(
+        request.approval_id.as_ref().map(ApprovalId::as_str),
+        Some("approval-1")
+    );
+    assert_eq!(request.capability.policy_name(), "daemon.status");
+}
+
+#[test]
+fn network_diagnostics_request_is_authenticated_read_only_and_policy_named() {
+    let request = RequestEnvelope::network_diagnostics(
+        RequestId::from("network-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("network-1"),
+    )
+    .authenticated(CallerCredential::new("network-diagnostics-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::NetworkDiagnostics);
+    assert_eq!(request.capability.policy_name(), "network.diagnostics");
+    assert_eq!(request.payload, RequestPayload::NetworkDiagnostics);
 }
 
 #[test]
@@ -132,6 +180,7 @@ fn observed_terminal_results_remap_only_the_envelope_correlation() {
             code: FailureCode::Cancelled,
             message: "request was cancelled".to_owned(),
             recovery: None,
+            approval: None,
         }),
     };
     let observed = ResultEnvelope {
@@ -356,6 +405,32 @@ fn evidence_result_contract_carries_exact_metadata_and_bounded_bytes() {
     assert_eq!(chunk.offset, 12);
     assert_eq!(chunk.bytes(), &[1, 2, 3]);
     assert!(chunk.eof);
+}
+
+#[test]
+fn network_diagnostics_result_exposes_only_sanitized_configuration_facts() {
+    let result = NetworkDiagnosticsResult {
+        platform_roots_enabled: true,
+        system_proxy_discovery_enabled: true,
+        proxy_environment_presence: ConfigurationPresence::Configured,
+        no_proxy_presence: ConfigurationPresence::Invalid,
+        pac_state: PacState::DetectedUnsupported,
+    };
+
+    assert!(result.platform_roots_enabled);
+    assert!(result.system_proxy_discovery_enabled);
+    assert_eq!(
+        result.proxy_environment_presence,
+        ConfigurationPresence::Configured
+    );
+    assert_eq!(result.no_proxy_presence, ConfigurationPresence::Invalid);
+    assert_eq!(result.pac_state, PacState::DetectedUnsupported);
+    assert_ne!(
+        ConfigurationPresence::NotConfigured,
+        ConfigurationPresence::Configured
+    );
+    assert_ne!(PacState::NotDetected, PacState::DetectedUnsupported);
+    assert_ne!(PacState::NotDetected, PacState::InspectionUnavailable);
 }
 
 #[test]

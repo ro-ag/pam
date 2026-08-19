@@ -6,26 +6,37 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{APPLICATION_VERSION, EvidenceHandle, ProjectId, RequestId};
-use pam_platform::{
-    IncomingRequest, LocalEndpoint, ServerTransport, TransportError, TransportErrorKind,
-    user_data_dir,
+use pam_core::{
+    APPLICATION_VERSION, ApprovalId, ContentDigest, EvidenceHandle, ProjectId, RequestId,
 };
+use pam_platform::{
+    CorporateHttpClientFactory, CorporateHttpClientRequirements, IncomingRequest, LocalEndpoint,
+    PacDiagnostic, ProxyBypassDiagnostic, ProxyDiagnosticStatus, ProxyEnvironmentVariable,
+    ProxyInputIssueKind, ProxyRouteDiagnostic, ProxySource, ReqwestCorporateHttpClientFactory,
+    ServerTransport, TransportError, TransportErrorKind, diagnose_process_proxy, user_data_dir,
+};
+use pam_policy::{CapabilityName, InvalidResourceName, ResourceName, redact_audit_detail};
 use pam_protocol::{
-    BriefProvenance, BriefResult, CancellationDisposition, CancellationResult, Capability,
-    CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, Failure, FailureCode, OperationTruth, PROTOCOL_VERSION, ReplayResult,
+    ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
     RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
     SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
 };
 use pam_store::{
-    AcceptOutcome, AcceptRequest, CancelOutcome, EventRecord, LeasedRequest, Replay, RequestState,
-    Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, AppendAuditEvent, AuthorizationAudit, AuthorizationOutcome,
+    AuthorizationRequest, CallerAuthentication, CancelOutcome, EventRecord, LeasedRequest, Replay,
+    RequestState, Store, StoreError, TerminalState,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -39,6 +50,9 @@ const SCHEDULER_CAPACITY: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(3);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
+const APPROVAL_LIFETIME: Duration = Duration::from_mins(5);
+const AUDIT_RETENTION: Duration = Duration::from_hours(30 * 24);
+static AUDIT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 // UUIDs and current semantic IDs fit comfortably; this also leaves ample room for
 // a maximum evidence chunk and its response envelope in the 1 MiB protocol frame.
 const MAX_REQUEST_IDENTIFIER_BYTES: usize = 256;
@@ -87,6 +101,10 @@ pub struct DaemonConfig {
     pub state_path: Option<PathBuf>,
     /// Supplies planning context for read-only brief requests.
     pub brief_provider: Option<Arc<dyn BriefProvider>>,
+    #[cfg(test)]
+    pub(crate) bypass_authentication: bool,
+    #[cfg(test)]
+    pub(crate) bypass_policy: bool,
 }
 
 impl Default for DaemonConfig {
@@ -96,6 +114,10 @@ impl Default for DaemonConfig {
             recover: false,
             state_path: None,
             brief_provider: None,
+            #[cfg(test)]
+            bypass_authentication: false,
+            #[cfg(test)]
+            bypass_policy: false,
         }
     }
 }
@@ -205,6 +227,14 @@ where
         .brief_provider
         .clone()
         .unwrap_or_else(|| Arc::new(UnavailableBriefProvider));
+    #[cfg(test)]
+    let authentication_required = !config.bypass_authentication;
+    #[cfg(not(test))]
+    let authentication_required = true;
+    #[cfg(test)]
+    let policy_required = !config.bypass_policy;
+    #[cfg(not(test))]
+    let policy_required = true;
     let mut server = ServerTransport::bind(&config.endpoint).await?;
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(RESPONSE_CAPACITY);
     let (scheduler_tx, scheduler_rx) = mpsc::channel::<()>(SCHEDULER_CAPACITY);
@@ -248,6 +278,8 @@ where
                         request_outbound,
                         request_scheduler,
                         request_brief_provider,
+                        authentication_required,
+                        policy_required,
                     )
                     .await
                 });
@@ -387,6 +419,7 @@ fn oversized_response_failure(message: &ServerMessage) -> ServerMessage {
             code: FailureCode::FrameTooLarge,
             message: "response exceeded the local protocol frame limit".to_owned(),
             recovery: None,
+            approval: None,
         }),
     })
 }
@@ -454,6 +487,8 @@ async fn handle_incoming(
     outbound: mpsc::Sender<Outbound>,
     scheduler: mpsc::Sender<()>,
     brief_provider: Arc<dyn BriefProvider>,
+    authentication_required: bool,
+    policy_required: bool,
 ) -> Result<(), DaemonError> {
     let Ok(request) = decode_request_envelope(incoming.payload()) else {
         return Ok(());
@@ -465,7 +500,7 @@ async fn handle_incoming(
             vec![ServerMessage::Result(failure_result(
                 &request,
                 FailureCode::InvalidRequest,
-                "request identifiers must contain 1 to 256 UTF-8 bytes",
+                "request identifiers must contain 1 to 256 UTF-8 bytes without control characters",
             ))],
             None,
         )
@@ -473,6 +508,18 @@ async fn handle_incoming(
         return Ok(());
     }
     if let Some(failure) = request.unsupported_version_failure() {
+        send_routed(
+            &outbound,
+            incoming,
+            vec![ServerMessage::Result(failure)],
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(failure) =
+        request_preflight(&request, &store, authentication_required, policy_required).await?
+    {
         send_routed(
             &outbound,
             incoming,
@@ -528,6 +575,351 @@ async fn handle_incoming(
     }
 }
 
+pub(super) async fn request_preflight(
+    request: &RequestEnvelope,
+    store: &Store,
+    authentication_required: bool,
+    policy_required: bool,
+) -> Result<Option<ResultEnvelope>, StoreError> {
+    if !request_shape_is_valid(request) {
+        return Ok(Some(failure_result(
+            request,
+            FailureCode::InvalidRequest,
+            "capability and payload do not match",
+        )));
+    }
+    let Ok(resource) = policy_resource(request) else {
+        return Ok(Some(failure_result(
+            request,
+            FailureCode::InvalidRequest,
+            "request cannot be represented as a policy resource",
+        )));
+    };
+    if authentication_required
+        && !matches!(
+            authenticate_request(request, store).await?,
+            CallerAuthentication::Authenticated
+        )
+    {
+        append_request_audit(
+            store,
+            request,
+            &resource,
+            "deny",
+            "unauthenticated",
+            "authentication failed",
+        )
+        .await?;
+        let mut failure = failure_result(
+            request,
+            FailureCode::Unauthenticated,
+            "caller authentication failed",
+        );
+        if let ResultBody::Failure(body) = &mut failure.body {
+            body.recovery = Some("pam caller register".to_owned());
+        }
+        return Ok(Some(failure));
+    }
+    if policy_required {
+        let outcome = authorize_request(request, resource, store).await?;
+        if !matches!(outcome, AuthorizationOutcome::Allowed) {
+            return Ok(Some(authorization_failure(request, outcome)));
+        }
+    } else if authentication_required {
+        append_request_audit(
+            store,
+            request,
+            &resource,
+            "allow",
+            "authenticated",
+            "authentication succeeded; policy enforcement disabled",
+        )
+        .await?;
+    }
+    Ok(None)
+}
+
+fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
+    matches!(
+        (&request.capability, &request.payload),
+        (Capability::DaemonStatus, RequestPayload::Status)
+            | (Capability::CancelRequest, RequestPayload::Cancel { .. })
+            | (Capability::ReplayEvents, RequestPayload::Replay { .. })
+            | (Capability::Brief, RequestPayload::Brief)
+            | (
+                Capability::NetworkDiagnostics,
+                RequestPayload::NetworkDiagnostics
+            )
+            | (
+                Capability::WaitForResult,
+                RequestPayload::WaitForResult { .. }
+            )
+            | (Capability::GetResult, RequestPayload::GetResult { .. })
+            | (
+                Capability::InspectEvidence,
+                RequestPayload::InspectEvidence { .. }
+            )
+            | (
+                Capability::ReadEvidence,
+                RequestPayload::ReadEvidence { .. }
+            )
+    )
+}
+
+async fn append_request_audit(
+    store: &Store,
+    request: &RequestEnvelope,
+    resource: &ResourceName,
+    decision: &str,
+    outcome: &str,
+    detail: &str,
+) -> Result<(), StoreError> {
+    let occurred_at_ms = now_ms();
+    let redacted_detail = redact_audit_detail(
+        format!(
+            "capability={} resource={} detail={detail}",
+            request.capability.policy_name(),
+            resource.as_str()
+        )
+        .as_bytes(),
+    );
+    store
+        .append_audit_event(AppendAuditEvent {
+            event_id: request_audit_event_id(request, "authentication", occurred_at_ms),
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: "request.preflight".to_owned(),
+            decision: decision.to_owned(),
+            outcome: outcome.to_owned(),
+            redacted_detail,
+            occurred_at_ms,
+            retain_until_ms: occurred_at_ms
+                .saturating_add(duration_ms(AUDIT_RETENTION))
+                .min(i64::MAX as u64),
+        })
+        .await?;
+    Ok(())
+}
+
+pub(super) fn request_audit_event_id(
+    request: &RequestEnvelope,
+    stage: &str,
+    occurred_at_ms: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        request.request_id.as_str(),
+        request.project_id.as_str(),
+        request.caller_id.as_str(),
+        request.idempotency_key.as_str(),
+        request.capability.policy_name(),
+        stage,
+    ] {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    if let Some(approval_id) = &request.approval_id {
+        hasher.update(approval_id.as_str().as_bytes());
+    }
+    hasher.update(occurred_at_ms.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        AUDIT_EVENT_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    hasher.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    let digest = ContentDigest::from_sha256(hasher.finalize().into());
+    format!("request-preflight-{}", digest.sha256_hex())
+}
+
+async fn authenticate_request(
+    request: &RequestEnvelope,
+    store: &Store,
+) -> Result<CallerAuthentication, StoreError> {
+    let Some(credential) = request.authentication.clone() else {
+        return Ok(CallerAuthentication::InvalidCredential);
+    };
+    store
+        .authenticate_caller(request.caller_id.clone(), credential)
+        .await
+}
+
+async fn authorize_request(
+    request: &RequestEnvelope,
+    resource: ResourceName,
+    store: &Store,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let capability = CapabilityName::parse(request.capability.policy_name())
+        .expect("protocol capability names are statically valid");
+    let now = now_ms();
+    let detail = redact_audit_detail(
+        format!(
+            "capability={} resource={} detail=project policy evaluated",
+            capability.as_str(),
+            resource.as_str()
+        )
+        .as_bytes(),
+    );
+    store
+        .authorize_audited(
+            AuthorizationRequest {
+                caller_id: request.caller_id.clone(),
+                project_id: request.project_id.clone(),
+                capability,
+                resource,
+                approval_id: request.approval_id.clone(),
+            },
+            AuthorizationAudit {
+                event_id: request_audit_event_id(request, "policy", now),
+                action: "request.preflight".to_owned(),
+                redacted_detail: detail,
+                retain_until_ms: now
+                    .saturating_add(duration_ms(AUDIT_RETENTION))
+                    .min(i64::MAX as u64),
+            },
+            now,
+            duration_ms(APPROVAL_LIFETIME),
+        )
+        .await
+}
+
+pub(super) fn policy_resource(
+    request: &RequestEnvelope,
+) -> Result<ResourceName, InvalidResourceName> {
+    let resource = match &request.payload {
+        RequestPayload::Status => "daemon".to_owned(),
+        RequestPayload::Brief => format!("project:{}", request.project_id),
+        RequestPayload::NetworkDiagnostics => "network:configuration".to_owned(),
+        RequestPayload::Cancel { target_request_id }
+        | RequestPayload::GetResult { target_request_id } => {
+            format!("request:{target_request_id}")
+        }
+        RequestPayload::Replay {
+            target_request_id,
+            after_sequence,
+        }
+        | RequestPayload::WaitForResult {
+            target_request_id,
+            after_sequence,
+        } => format!("request:{target_request_id}:after={after_sequence}"),
+        RequestPayload::InspectEvidence { handle } => format!("evidence:{handle}"),
+        RequestPayload::ReadEvidence {
+            handle,
+            offset,
+            length,
+        } => format!("evidence:{handle}:offset={offset}:length={length}"),
+    };
+    ResourceName::parse(resource)
+}
+
+fn authorization_failure(
+    request: &RequestEnvelope,
+    outcome: AuthorizationOutcome,
+) -> ResultEnvelope {
+    let (code, message, recovery, approval) = match outcome {
+        AuthorizationOutcome::Allowed => unreachable!("allowed requests are dispatched"),
+        AuthorizationOutcome::Denied => (
+            FailureCode::Forbidden,
+            "project policy denied this capability".to_owned(),
+            Some(grant_recovery(
+                &request.capability,
+                &policy_resource(request),
+            )),
+            None,
+        ),
+        AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        } => {
+            let recovery = approval_recovery(&request.capability, &approval_id);
+            (
+                FailureCode::ApprovalRequired,
+                "this exact effect requires approval".to_owned(),
+                Some(recovery),
+                Some(ApprovalChallenge {
+                    approval_id,
+                    expires_at_unix_ms: expires_at_ms,
+                }),
+            )
+        }
+        AuthorizationOutcome::ApprovalDenied => (
+            FailureCode::ApprovalDenied,
+            "approval was denied".to_owned(),
+            None,
+            None,
+        ),
+        AuthorizationOutcome::ApprovalExpired => (
+            FailureCode::ApprovalExpired,
+            "approval expired before use".to_owned(),
+            None,
+            None,
+        ),
+    };
+    ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request.request_id.clone(),
+        project_id: request.project_id.clone(),
+        body: ResultBody::Failure(Failure {
+            code,
+            message,
+            recovery,
+            approval,
+        }),
+    }
+}
+
+pub(super) fn approval_recovery(capability: &Capability, approval_id: &ApprovalId) -> String {
+    match capability {
+        Capability::DaemonStatus
+        | Capability::Brief
+        | Capability::NetworkDiagnostics
+        | Capability::WaitForResult
+        | Capability::GetResult => format!(
+            "pam approval approve {approval_id}, then retry the original command with --approval-id {approval_id}"
+        ),
+        Capability::InspectEvidence | Capability::ReadEvidence => format!(
+            "pam approval approve {approval_id}; pam evidence show spans inspection and range reads, so this one-request receipt must be retried by a protocol client against the exact challenged request"
+        ),
+        Capability::CancelRequest | Capability::ReplayEvents => format!(
+            "pam approval approve {approval_id}; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request"
+        ),
+    }
+}
+
+pub(super) fn grant_recovery(
+    capability: &Capability,
+    resource: &Result<ResourceName, InvalidResourceName>,
+) -> String {
+    let capability = capability.policy_name();
+    let Ok(resource) = resource else {
+        return "review the denied capability and resource before adding a grant".to_owned();
+    };
+    if shell_safe_policy_argument(capability) && shell_safe_policy_argument(resource.as_str()) {
+        format!(
+            "pam access grant {capability} --resource {}",
+            resource.as_str()
+        )
+    } else {
+        "run pam access grant with the denied capability and exact resource, quoted for your shell"
+            .to_owned()
+    }
+}
+
+fn shell_safe_policy_argument(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'=' | b'+')
+        })
+}
+
 async fn handle_read_only(
     request: &RequestEnvelope,
     incoming: IncomingRequest,
@@ -538,6 +930,9 @@ async fn handle_read_only(
     match (&request.capability, &request.payload) {
         (Capability::Brief, RequestPayload::Brief) => {
             handle_brief(request, incoming, store, outbound, brief_provider).await
+        }
+        (Capability::NetworkDiagnostics, RequestPayload::NetworkDiagnostics) => {
+            handle_network_diagnostics(request, incoming, store, outbound).await
         }
         (
             Capability::WaitForResult,
@@ -602,6 +997,155 @@ async fn handle_read_only(
             .await;
             Ok(())
         }
+    }
+}
+
+async fn handle_network_diagnostics(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let (truth, result) = tokio::task::spawn_blocking(collect_network_diagnostics)
+        .await
+        .map_err(DaemonError::Handler)?;
+    let occurred_at_ms = now_ms();
+    let detail = format!(
+        "platform_roots={} system_proxy={} proxy_environment={} no_proxy={} pac={}",
+        result.platform_roots_enabled,
+        result.system_proxy_discovery_enabled,
+        configuration_presence_label(result.proxy_environment_presence),
+        configuration_presence_label(result.no_proxy_presence),
+        pac_state_label(result.pac_state)
+    );
+    store
+        .append_audit_event(AppendAuditEvent {
+            event_id: request_audit_event_id(request, "network-observation", occurred_at_ms),
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: "network.diagnostics".to_owned(),
+            decision: "observe".to_owned(),
+            outcome: truth_label(&truth).to_owned(),
+            redacted_detail: redact_audit_detail(detail.as_bytes()),
+            occurred_at_ms,
+            retain_until_ms: occurred_at_ms
+                .saturating_add(duration_ms(AUDIT_RETENTION))
+                .min(i64::MAX as u64),
+        })
+        .await?;
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            truth,
+            ResultPayload::NetworkDiagnostics(result),
+        ))],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+const fn configuration_presence_label(value: ConfigurationPresence) -> &'static str {
+    match value {
+        ConfigurationPresence::Configured => "configured",
+        ConfigurationPresence::NotConfigured => "not_configured",
+        ConfigurationPresence::Invalid => "invalid",
+    }
+}
+
+const fn pac_state_label(value: PacState) -> &'static str {
+    match value {
+        PacState::NotDetected => "not_detected",
+        PacState::DetectedUnsupported => "detected_unsupported",
+        PacState::InspectionUnavailable => "inspection_unavailable",
+    }
+}
+
+const fn truth_label(value: &OperationTruth) -> &'static str {
+    match value {
+        OperationTruth::Observed => "observed",
+        OperationTruth::Changed => "changed",
+        OperationTruth::Verified => "verified",
+        OperationTruth::Unresolved => "unresolved",
+        OperationTruth::Blocked => "blocked",
+    }
+}
+
+fn collect_network_diagnostics() -> (OperationTruth, NetworkDiagnosticsResult) {
+    let proxy = diagnose_process_proxy();
+    let client_ready = ReqwestCorporateHttpClientFactory
+        .build(CorporateHttpClientRequirements::secure_default())
+        .is_ok();
+    let proxy_environment_presence = proxy_environment_presence(&proxy);
+    let no_proxy_presence = no_proxy_presence(&proxy);
+    let truth = if client_ready && proxy.status == ProxyDiagnosticStatus::Observed {
+        OperationTruth::Observed
+    } else {
+        OperationTruth::Unresolved
+    };
+    let result = NetworkDiagnosticsResult {
+        platform_roots_enabled: client_ready,
+        system_proxy_discovery_enabled: client_ready,
+        proxy_environment_presence,
+        no_proxy_presence,
+        pac_state: match proxy.pac {
+            PacDiagnostic::DetectedButUnsupported => PacState::DetectedUnsupported,
+            PacDiagnostic::NotDetected => PacState::NotDetected,
+            PacDiagnostic::InspectionUnavailable(_) => PacState::InspectionUnavailable,
+        },
+    };
+    (truth, result)
+}
+
+fn proxy_environment_presence(proxy: &pam_platform::ProxyDiagnostic) -> ConfigurationPresence {
+    let environment_route = |route| {
+        matches!(
+            route,
+            ProxyRouteDiagnostic::Configured {
+                source: ProxySource::Environment(_),
+                ..
+            }
+        )
+    };
+    if environment_route(proxy.http) || environment_route(proxy.https) {
+        ConfigurationPresence::Configured
+    } else if proxy.ignored_inputs.iter().any(|issue| {
+        issue.kind == ProxyInputIssueKind::Malformed
+            && matches!(
+                issue.variable,
+                ProxyEnvironmentVariable::HttpProxyUpper
+                    | ProxyEnvironmentVariable::HttpProxyLower
+                    | ProxyEnvironmentVariable::HttpsProxyUpper
+                    | ProxyEnvironmentVariable::HttpsProxyLower
+                    | ProxyEnvironmentVariable::AllProxyUpper
+                    | ProxyEnvironmentVariable::AllProxyLower
+            )
+    }) {
+        ConfigurationPresence::Invalid
+    } else {
+        ConfigurationPresence::NotConfigured
+    }
+}
+
+const fn no_proxy_presence(proxy: &pam_platform::ProxyDiagnostic) -> ConfigurationPresence {
+    match proxy.bypass {
+        ProxyBypassDiagnostic::Configured {
+            source: ProxySource::Environment(_),
+        } => ConfigurationPresence::Configured,
+        ProxyBypassDiagnostic::Malformed {
+            source: ProxySource::Environment(_),
+        } => ConfigurationPresence::Invalid,
+        ProxyBypassDiagnostic::NotConfigured
+        | ProxyBypassDiagnostic::Configured {
+            source: ProxySource::System,
+        }
+        | ProxyBypassDiagnostic::Malformed {
+            source: ProxySource::System,
+        }
+        | ProxyBypassDiagnostic::SuppressedByCgi
+        | ProxyBypassDiagnostic::Unresolved(_) => ConfigurationPresence::NotConfigured,
     }
 }
 
@@ -729,6 +1273,7 @@ async fn handle_cancel(
             code: FailureCode::Cancelled,
             message: "request was cancelled".to_owned(),
             recovery: None,
+            approval: None,
         }),
     };
     let stored = encode(&ServerMessage::Result(cancelled_result))?;
@@ -1239,13 +1784,44 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
         | RequestPayload::GetResult { target_request_id } => Some(target_request_id),
         RequestPayload::Status
         | RequestPayload::Brief
+        | RequestPayload::NetworkDiagnostics
         | RequestPayload::InspectEvidence { .. }
         | RequestPayload::ReadEvidence { .. } => None,
     }
 }
 
 fn identifier_is_bounded(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_REQUEST_IDENTIFIER_BYTES
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_IDENTIFIER_BYTES
+        && !value.chars().any(is_unsafe_identifier_character)
+}
+
+fn is_unsafe_identifier_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
 }
 
 fn brief_is_bounded(brief: &BriefResult) -> bool {
@@ -1469,6 +2045,7 @@ async fn process_leased(
                     code: FailureCode::InvalidRequest,
                     message: format!("unknown durable operation {}", leased.operation_kind),
                     recovery: None,
+                    approval: None,
                 }),
             },
         )
@@ -1566,6 +2143,7 @@ fn failure_result(request: &RequestEnvelope, code: FailureCode, message: &str) -
             code,
             message: message.to_owned(),
             recovery: None,
+            approval: None,
         }),
     }
 }

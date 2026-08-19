@@ -1,6 +1,9 @@
 use std::{error::Error, fmt};
 
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
+    ProjectId, RequestId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{MAX_EVIDENCE_CHUNK_SIZE, PROTOCOL_VERSION};
@@ -10,6 +13,10 @@ pub struct RequestEnvelope {
     pub protocol_version: u16,
     pub request_id: RequestId,
     pub caller_id: CallerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<CallerCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
     pub project_id: ProjectId,
     pub capability: Capability,
     pub idempotency_key: IdempotencyKey,
@@ -29,6 +36,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::DaemonStatus,
             idempotency_key,
@@ -54,6 +63,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::CancelRequest,
             idempotency_key,
@@ -81,6 +92,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::ReplayEvents,
             idempotency_key,
@@ -104,11 +117,35 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::Brief,
             idempotency_key,
             deadline_unix_ms: None,
             payload: RequestPayload::Brief,
+        }
+    }
+
+    /// Creates an authenticated, policy-gated read-only network diagnostics request.
+    #[must_use]
+    pub fn network_diagnostics(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::NetworkDiagnostics,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::NetworkDiagnostics,
         }
     }
 
@@ -130,6 +167,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::WaitForResult,
             idempotency_key,
@@ -158,6 +197,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::GetResult,
             idempotency_key,
@@ -179,6 +220,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::InspectEvidence,
             idempotency_key,
@@ -207,6 +250,8 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::ReadEvidence,
             idempotency_key,
@@ -217,6 +262,20 @@ impl RequestEnvelope {
                 length,
             },
         })
+    }
+
+    /// Attaches the revocable caller credential used to authenticate this request.
+    #[must_use]
+    pub fn authenticated(mut self, credential: CallerCredential) -> Self {
+        self.authentication = Some(credential);
+        self
+    }
+
+    /// Attaches a previously approved exact-effect receipt for one-time use.
+    #[must_use]
+    pub fn with_approval(mut self, approval_id: ApprovalId) -> Self {
+        self.approval_id = Some(approval_id);
+        self
     }
 
     #[must_use]
@@ -232,6 +291,7 @@ impl RequestEnvelope {
                     self.protocol_version
                 ),
                 recovery: None,
+                approval: None,
             }),
         })
     }
@@ -244,10 +304,28 @@ pub enum Capability {
     CancelRequest,
     ReplayEvents,
     Brief,
+    NetworkDiagnostics,
     WaitForResult,
     GetResult,
     InspectEvidence,
     ReadEvidence,
+}
+
+impl Capability {
+    #[must_use]
+    pub const fn policy_name(&self) -> &'static str {
+        match self {
+            Self::DaemonStatus => "daemon.status",
+            Self::CancelRequest => "request.cancel",
+            Self::ReplayEvents => "request.replay",
+            Self::Brief => "brief.read",
+            Self::NetworkDiagnostics => "network.diagnostics",
+            Self::WaitForResult => "request.wait",
+            Self::GetResult => "request.result.read",
+            Self::InspectEvidence => "evidence.inspect",
+            Self::ReadEvidence => "evidence.read",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,6 +340,7 @@ pub enum RequestPayload {
         after_sequence: u64,
     },
     Brief,
+    NetworkDiagnostics,
     WaitForResult {
         target_request_id: RequestId,
         after_sequence: u64,
@@ -315,6 +394,7 @@ pub enum ResultPayload {
     Cancellation(CancellationResult),
     Replay(ReplayResult),
     Brief(BriefResult),
+    NetworkDiagnostics(NetworkDiagnosticsResult),
     EvidenceMetadata(EvidenceMetadata),
     EvidenceChunk(EvidenceChunk),
 }
@@ -524,16 +604,58 @@ pub struct StatusResult {
     pub queue_depth: u64,
 }
 
+/// Sanitized network configuration facts safe to return across the caller boundary.
+///
+/// The contract deliberately cannot carry proxy URLs, hosts, usernames, or
+/// free-form backend diagnostics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkDiagnosticsResult {
+    pub platform_roots_enabled: bool,
+    pub system_proxy_discovery_enabled: bool,
+    pub proxy_environment_presence: ConfigurationPresence,
+    pub no_proxy_presence: ConfigurationPresence,
+    pub pac_state: PacState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationPresence {
+    NotConfigured,
+    Configured,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacState {
+    NotDetected,
+    DetectedUnsupported,
+    InspectionUnavailable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Failure {
     pub code: FailureCode,
     pub message: String,
     pub recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalChallenge>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalChallenge {
+    pub approval_id: ApprovalId,
+    pub expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
+    Unauthenticated,
+    Forbidden,
+    ApprovalRequired,
+    ApprovalDenied,
+    ApprovalExpired,
     UnsupportedProtocolVersion,
     InvalidRequest,
     FrameTooLarge,

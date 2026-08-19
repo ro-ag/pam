@@ -55,6 +55,48 @@ Caller identity and project identity are separate.
 - A **request** carries protocol version, request ID, caller ID, project ID,
   capability, idempotency key, deadline, and payload.
 
+Caller labels remain non-secret routing identities. A separate high-entropy
+credential authenticates every request; PAM stores only its SHA-256 verifier and
+uses a constant-time comparison. Registration and revocation are local-user
+administrative operations against the protected per-user state database, not
+network-reachable protocol capabilities. Revocation is immediate for subsequent
+requests, survives daemon restart, and deliberately returns the same external
+failure as an unknown caller or invalid credential. Re-registering a revoked
+caller issues a new credential and invalidates the old one.
+
+The CLI keeps that credential exclusively in the current user's native secure
+store: login Keychain on macOS, Credential Manager on Windows, or Secret Service
+on Linux. A caller-scoped, domain-separated hash is the native account key; the
+caller label and credential do not enter project TOML. Native-store access is
+lazy and runs on a blocking worker because an OS keyring may wait for a desktop
+service or prompt the user. Headless or unavailable keyrings fail closed with
+no plaintext fallback.
+
+Corporate HTTP clients use rustls with the operating system's certificate
+verifier, environment plus supported static system-proxy discovery, bounded
+connect/request timeouts, and no certificate-bypass mode. The authenticated
+`network.diagnostics` capability reports only configuration presence and safe
+state codes: it never returns proxy URLs, hosts, userinfo, bypass-list contents,
+or backend error text. PAC scripts are not evaluated by the selected HTTP stack;
+PAC is reported as detected-but-unsupported when an injected native inspector
+can establish its presence, and otherwise as inspection-unavailable rather than
+claimed to be honored. Repository tests prove client wiring and redaction, not
+live behavior in an authorized managed corporate environment.
+
+Project policy is default-deny. Grants bind one caller, project, capability, and
+either an exact resource or an explicit any-resource scope. Active explicit
+denies override allows; expiry and revocation take effect at their recorded
+millisecond boundary. Each grant mutation advances a durable project-policy
+version.
+
+Approval-required grants create a durable request bound to a collision-safe
+SHA-256 fingerprint of the caller, project, capability, and exact resource.
+Only a registered active local approver can approve or deny it. Approved
+receipts are consumed transactionally at the policy gate, exactly once, before
+the effect; mismatched, denied, expired, or previously consumed receipts never
+authorize work. Protocol failures carry the approval ID and expiry without
+exposing credentials.
+
 Each project has one durable ordered queue. The scheduler serializes stateful or
 conflicting operations. A flow can declare read-only collection steps safe for
 parallel execution, but their results rejoin the ordered project event stream.
@@ -91,6 +133,33 @@ Potentially large or sensitive evidence lives in a content-addressed blob
 directory with checksums, size/type metadata, project ownership, retention, and
 redaction state. A compact result stores references into this evidence graph.
 Deletion and retention are explicit operations with audit events.
+
+The durable audit ledger uses a global monotonic sequence while every export is
+restricted to one project. The first bounded export page captures an inclusive
+high-water sequence; later pages reuse it so concurrent appends cannot make an
+export chase a moving tail. This is an append fence, not a long-lived database
+snapshot: an operator should finish paging before running retention pruning.
+The CLI emits versioned deterministic NDJSON to a new file with atomic
+publication and no overwrite. Audit detail is redacted and made terminal-safe
+before persistence, with both input-inspection and stored output bounds; the
+store rejects controls and Unicode format characters in all ledger text fields.
+
+Retention is explicit and bounded. Expired audit rows are deleted at their
+inclusive retention timestamp. Evidence pruning requires a project, either the
+`session` or `project` retention class, an inclusive creation-time cutoff, and a
+batch limit; `persistent` evidence is deliberately excluded. The current
+`session` label has no implicit process-lifetime identity, so PAM does not claim
+automatic session expiry. Evidence handle deletion commits before physical CAS
+cleanup. Blob cleanup then rechecks for references under SQLite writer
+exclusion, never follows symlinks, and reports bytes it could not safely remove
+as pending for a later bounded reconciliation pass. A durable install-intent
+journal gives each put attempt ownership of its exact temporary file and makes
+a blob published before a failed handle transaction discoverable after a crash,
+while cleanup-attempt ordering prevents one unsafe entry from starving later
+removable blobs. Cleanup reports exact committed counts separately from an
+explicit unresolved state; it never converts an unknown amount into a numeric
+claim. This ordering prevents a database rollback from restoring a live handle
+after its blob was unlinked.
 
 PAM integrates with `ptrack` through its supported command or future protocol.
 It does not read or mutate `ptrack`'s database schema directly.

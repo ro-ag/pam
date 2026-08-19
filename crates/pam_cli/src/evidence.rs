@@ -419,15 +419,15 @@ pub(crate) enum OutputFinalizationStage {
 impl fmt::Display for OutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidTarget => formatter.write_str("evidence output target must name a file"),
+            Self::InvalidTarget => formatter.write_str("output target must name a file"),
             Self::AlreadyExists(path) => write!(
                 formatter,
-                "evidence output target already exists: {}",
+                "output target already exists: {}",
                 path.display()
             ),
             Self::Published { path, stage, .. } => write!(
                 formatter,
-                "evidence was written to {}, but PAM could not {}",
+                "output was written to {}, but PAM could not {}",
                 path.display(),
                 match stage {
                     OutputFinalizationStage::TemporaryCleanup => {
@@ -438,7 +438,7 @@ impl fmt::Display for OutputError {
                     }
                 }
             ),
-            Self::Io(_) => formatter.write_str("PAM could not safely write the evidence output"),
+            Self::Io(_) => formatter.write_str("PAM could not safely write the output"),
         }
     }
 }
@@ -458,7 +458,7 @@ impl From<std::io::Error> for OutputError {
     }
 }
 
-/// Persists verified evidence atomically without replacing an existing target.
+/// Persists bytes atomically without replacing an existing target.
 pub(crate) fn write_new_output(path: &Path, bytes: &[u8]) -> Result<(), OutputError> {
     let Some(file_name) = path.file_name() else {
         return Err(OutputError::InvalidTarget);

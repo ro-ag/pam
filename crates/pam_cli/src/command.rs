@@ -1,10 +1,13 @@
 use std::{path::PathBuf, time::Duration};
 
-use clap::{Parser, Subcommand};
-use pam_core::{EvidenceHandle, RequestId};
+use clap::{Parser, Subcommand, ValueEnum};
+use pam_core::{ApprovalId, EvidenceHandle, GrantId, RequestId};
+use pam_policy::{CapabilityName, ResourceName};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
+const DEFAULT_AUDIT_EXPORT_LIMIT: usize = 500;
+const MAX_AUDIT_EXPORT_LIMIT: usize = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "pam", version, about = "Local project continuity companion")]
@@ -16,9 +19,17 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report daemon health through the local protocol.
-    Status,
+    Status {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
     /// Print a compact, provenance-backed project handoff.
-    Brief,
+    Brief {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
     /// Replay a request and wait for its durable result.
     Wait {
         /// Durable request to observe.
@@ -30,17 +41,53 @@ enum Command {
         /// Stop observing after this bounded duration (for example, 500ms, 30s, 5m, or 1h).
         #[arg(long, default_value = DEFAULT_WAIT_TIMEOUT, value_parser = parse_wait_timeout)]
         timeout: Duration,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
     },
     /// Print a request's durable result without waiting.
     Result {
         /// Durable request to inspect.
         #[arg(value_parser = parse_request_id)]
         request_id: RequestId,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
     },
     /// Inspect retained project evidence.
     Evidence {
         #[command(subcommand)]
         command: EvidenceCommand,
+    },
+    /// Manage revocable local caller credentials.
+    Caller {
+        #[command(subcommand)]
+        command: CallerCommand,
+    },
+    /// Manage project-scoped capability grants.
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
+    /// Decide exact-effect approval requests.
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+    /// Inspect native trust and proxy configuration without exposing endpoints.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
+    /// Export the current project's redacted audit ledger.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+    /// Apply explicit project evidence-retention controls.
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
     },
     /// Run the foreground daemon.
     Daemon {
@@ -68,23 +115,193 @@ enum EvidenceCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CallerCommand {
+    /// Register a caller and save its credential in the native secure store.
+    Register {
+        /// Local caller surface to register.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+    /// Revoke a caller immediately.
+    Revoke {
+        /// Local caller surface to revoke.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessCommand {
+    /// Add an allow or explicit-deny grant for the current project.
+    Grant {
+        /// Stable capability name, such as daemon.status or evidence.read.
+        #[arg(value_parser = parse_capability_name)]
+        capability: CapabilityName,
+        /// Exact resource; omit to match any resource.
+        #[arg(long, value_parser = parse_resource_name)]
+        resource: Option<ResourceName>,
+        /// Create an explicit deny instead of an allow.
+        #[arg(long)]
+        deny: bool,
+        /// Require a one-time exact-effect approval before use.
+        #[arg(long, conflicts_with = "deny")]
+        require_approval: bool,
+        /// Optional absolute expiration time in Unix milliseconds.
+        #[arg(long)]
+        expires_at_unix_ms: Option<u64>,
+        /// Local caller surface receiving the grant.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+    /// Revoke an existing grant.
+    Revoke {
+        #[arg(value_parser = parse_grant_id)]
+        grant_id: GrantId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalCommand {
+    /// Approve a pending exact effect.
+    Approve {
+        #[arg(value_parser = parse_approval_id)]
+        approval_id: ApprovalId,
+    },
+    /// Deny a pending exact effect.
+    Deny {
+        #[arg(value_parser = parse_approval_id)]
+        approval_id: ApprovalId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NetworkCommand {
+    /// Report sanitized native trust, proxy, and PAC configuration facts.
+    Diagnostics {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Write bounded, deterministic NDJSON without overwriting an existing file.
+    Export {
+        /// New output path; existing files are never overwritten.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Export events strictly after this global sequence.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Reuse the first page's inclusive high-water sequence on later pages.
+        #[arg(long)]
+        through: Option<u64>,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+        /// Maximum events in this export page.
+        #[arg(long, default_value_t = DEFAULT_AUDIT_EXPORT_LIMIT, value_parser = parse_audit_limit)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RetentionCommand {
+    /// Delete bounded evidence handles for the selected retention class.
+    Prune {
+        /// Retention class to remove from the current project.
+        #[arg(long, value_enum)]
+        scope: RetentionScopeArg,
+        /// Delete handles created at or before this Unix timestamp in milliseconds.
+        #[arg(long)]
+        before_unix_ms: u64,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+        /// Maximum handles to delete in this invocation.
+        #[arg(long, default_value_t = DEFAULT_AUDIT_EXPORT_LIMIT, value_parser = parse_audit_limit)]
+        limit: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CallerKindArg {
+    Cli,
+    Gui,
+    CodingAgent,
+    LocalApplication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum RetentionScopeArg {
+    Session,
+    Project,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
     Client,
-    Status,
-    Brief,
+    Status {
+        approval_id: Option<ApprovalId>,
+    },
+    Brief {
+        approval_id: Option<ApprovalId>,
+    },
     Wait {
         request_id: RequestId,
         after: u64,
         timeout: Duration,
+        approval_id: Option<ApprovalId>,
     },
     Result {
         request_id: RequestId,
+        approval_id: Option<ApprovalId>,
     },
     EvidenceShow {
         handle: EvidenceHandle,
         raw: bool,
         output: Option<PathBuf>,
+    },
+    CallerRegister {
+        kind: CallerKindArg,
+    },
+    CallerRevoke {
+        kind: CallerKindArg,
+    },
+    AccessGrant {
+        capability: CapabilityName,
+        resource: Option<ResourceName>,
+        deny: bool,
+        require_approval: bool,
+        expires_at_unix_ms: Option<u64>,
+        kind: CallerKindArg,
+    },
+    AccessRevoke {
+        grant_id: GrantId,
+    },
+    ApprovalApprove {
+        approval_id: ApprovalId,
+    },
+    ApprovalDeny {
+        approval_id: ApprovalId,
+    },
+    NetworkDiagnostics {
+        approval_id: Option<ApprovalId>,
+    },
+    AuditExport {
+        output: PathBuf,
+        after: u64,
+        through: Option<u64>,
+        approval_id: Option<ApprovalId>,
+        limit: usize,
+    },
+    RetentionPrune {
+        scope: RetentionScopeArg,
+        before_unix_ms: u64,
+        approval_id: Option<ApprovalId>,
+        limit: usize,
     },
     Daemon {
         recover: bool,
@@ -96,33 +313,110 @@ impl Cli {
     pub(crate) fn mode(self) -> Mode {
         match self.command {
             None => Mode::Client,
-            Some(Command::Status) => Mode::Status,
-            Some(Command::Brief) => Mode::Brief,
+            Some(Command::Status { approval_id }) => Mode::Status { approval_id },
+            Some(Command::Brief { approval_id }) => Mode::Brief { approval_id },
             Some(Command::Wait {
                 request_id,
                 after,
                 timeout,
+                approval_id,
             }) => Mode::Wait {
                 request_id,
                 after,
                 timeout,
+                approval_id,
             },
-            Some(Command::Result { request_id }) => Mode::Result { request_id },
-            Some(Command::Evidence {
+            Some(Command::Result {
+                request_id,
+                approval_id,
+            }) => Mode::Result {
+                request_id,
+                approval_id,
+            },
+            Some(Command::Evidence { command }) => evidence_mode(command),
+            Some(Command::Caller {
+                command: CallerCommand::Register { kind },
+            }) => Mode::CallerRegister { kind },
+            Some(Command::Caller {
+                command: CallerCommand::Revoke { kind },
+            }) => Mode::CallerRevoke { kind },
+            Some(Command::Access {
                 command:
-                    EvidenceCommand::Show {
-                        handle,
-                        raw,
-                        output,
+                    AccessCommand::Grant {
+                        capability,
+                        resource,
+                        deny,
+                        require_approval,
+                        expires_at_unix_ms,
+                        kind,
                     },
-            }) => Mode::EvidenceShow {
-                handle,
-                raw,
+            }) => Mode::AccessGrant {
+                capability,
+                resource,
+                deny,
+                require_approval,
+                expires_at_unix_ms,
+                kind,
+            },
+            Some(Command::Access {
+                command: AccessCommand::Revoke { grant_id },
+            }) => Mode::AccessRevoke { grant_id },
+            Some(Command::Approval {
+                command: ApprovalCommand::Approve { approval_id },
+            }) => Mode::ApprovalApprove { approval_id },
+            Some(Command::Approval {
+                command: ApprovalCommand::Deny { approval_id },
+            }) => Mode::ApprovalDeny { approval_id },
+            Some(Command::Network {
+                command: NetworkCommand::Diagnostics { approval_id },
+            }) => Mode::NetworkDiagnostics { approval_id },
+            Some(Command::Audit {
+                command:
+                    AuditCommand::Export {
+                        output,
+                        after,
+                        through,
+                        approval_id,
+                        limit,
+                    },
+            }) => Mode::AuditExport {
                 output,
+                after,
+                through,
+                approval_id,
+                limit,
+            },
+            Some(Command::Retention {
+                command:
+                    RetentionCommand::Prune {
+                        scope,
+                        before_unix_ms,
+                        approval_id,
+                        limit,
+                    },
+            }) => Mode::RetentionPrune {
+                scope,
+                before_unix_ms,
+                approval_id,
+                limit,
             },
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }
+    }
+}
+
+fn evidence_mode(command: EvidenceCommand) -> Mode {
+    match command {
+        EvidenceCommand::Show {
+            handle,
+            raw,
+            output,
+        } => Mode::EvidenceShow {
+            handle,
+            raw,
+            output,
+        },
     }
 }
 
@@ -141,6 +435,48 @@ fn parse_request_id(value: &str) -> Result<RequestId, String> {
 
 fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {
     EvidenceHandle::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_capability_name(value: &str) -> Result<CapabilityName, String> {
+    CapabilityName::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_resource_name(value: &str) -> Result<ResourceName, String> {
+    ResourceName::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_grant_id(value: &str) -> Result<GrantId, String> {
+    parse_simple_id(value, "grant ID").map(GrantId::from)
+}
+
+fn parse_approval_id(value: &str) -> Result<ApprovalId, String> {
+    parse_simple_id(value, "approval ID").map(ApprovalId::from)
+}
+
+fn parse_simple_id(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || value.len() > 256
+    {
+        return Err(format!(
+            "{label} must contain 1 to 256 bytes with no whitespace or controls"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_audit_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be a positive integer".to_owned())?;
+    if limit == 0 || limit > MAX_AUDIT_EXPORT_LIMIT {
+        return Err(format!(
+            "limit must be between 1 and {MAX_AUDIT_EXPORT_LIMIT}"
+        ));
+    }
+    Ok(limit)
 }
 
 fn parse_wait_timeout(value: &str) -> Result<Duration, String> {

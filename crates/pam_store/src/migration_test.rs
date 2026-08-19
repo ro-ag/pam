@@ -1,6 +1,6 @@
 use std::fs;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use super::{Store, StoreError};
 use crate::store::{
@@ -114,6 +114,390 @@ fn evidence_migration_upgrades_v1_without_replacing_scheduler_data() {
         .unwrap();
     assert_eq!(request_count, 1);
     assert_eq!(evidence_table_count, 2);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn caller_migration_upgrades_v2_without_replacing_scheduler_or_evidence_data() {
+    let (directory, path) = database_path("migration-v2-callers");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_evidence.sql"))
+        .unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('project')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO requests(
+                request_id, caller_id, project_id, idempotency_key,
+                operation_kind, operation, queue_sequence, state, accepted_at_ms
+             ) VALUES (
+                'request', 'caller', 'project', 'key',
+                'test.operation', X'010203', 1, 'queued', 10
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events(request_id, sequence, kind, payload, recorded_at_ms)
+             VALUES ('request', 1, 'accepted', X'040506', 10)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_blobs(digest, size_bytes)
+             VALUES ('sha256:0000000000000000000000000000000000000000000000000000000000000000', 3)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_handles(
+                project_id, handle, digest, media_type, retention, redaction, created_at_ms
+             ) VALUES (
+                'project', 'evidence://preserved',
+                'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                'application/octet-stream', 'project', 'redacted', 11
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let operation: Vec<u8> = connection
+        .query_row(
+            "SELECT operation FROM requests WHERE request_id = 'request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload FROM events WHERE request_id = 'request' AND sequence = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence: (String, i64) = connection
+        .query_row(
+            "SELECT handle, size_bytes
+             FROM evidence_handles JOIN evidence_blobs USING (digest)
+             WHERE project_id = 'project'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let callers_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'callers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+
+    assert_eq!(operation, [1, 2, 3]);
+    assert_eq!(event_payload, [4, 5, 6]);
+    assert_eq!(evidence, ("evidence://preserved".to_owned(), 3));
+    assert_eq!(callers_table_count, 1);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn policy_migration_upgrades_v3_without_replacing_caller_request_or_evidence_data() {
+    let (directory, path) = database_path("migration-v3-policy");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_evidence.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0003_callers.sql"))
+        .unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    connection
+        .execute(
+            "INSERT INTO callers(
+                caller_id, credential_digest, registered_at_ms, revoked_at_ms
+             ) VALUES ('preserved-caller', zeroblob(32), 9, NULL)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('project')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO requests(
+                request_id, caller_id, project_id, idempotency_key,
+                operation_kind, operation, queue_sequence, state, accepted_at_ms
+             ) VALUES (
+                'request', 'preserved-caller', 'project', 'key',
+                'test.operation', X'010203', 1, 'queued', 10
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_blobs(digest, size_bytes)
+             VALUES ('sha256:0000000000000000000000000000000000000000000000000000000000000000', 3)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_handles(
+                project_id, handle, digest, media_type, retention, redaction, created_at_ms
+             ) VALUES (
+                'project', 'evidence://preserved',
+                'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                'application/octet-stream', 'project', 'redacted', 11
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let caller: (Vec<u8>, i64, Option<i64>) = connection
+        .query_row(
+            "SELECT credential_digest, registered_at_ms, revoked_at_ms
+             FROM callers WHERE caller_id = 'preserved-caller'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let operation: Vec<u8> = connection
+        .query_row(
+            "SELECT operation FROM requests WHERE request_id = 'request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence: (String, i64) = connection
+        .query_row(
+            "SELECT handle, size_bytes
+             FROM evidence_handles JOIN evidence_blobs USING (digest)
+             WHERE project_id = 'project'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let policy_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('project_policies', 'capability_grants', 'approvals')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+
+    assert_eq!(caller, (vec![0; 32], 9, None));
+    assert_eq!(operation, [1, 2, 3]);
+    assert_eq!(evidence, ("evidence://preserved".to_owned(), 3));
+    assert_eq!(policy_table_count, 3);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn audit_migration_upgrades_v4_without_replacing_policy_data() {
+    let (directory, path) = database_path("migration-v4-audit");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 4).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO callers(caller_id, credential_digest, registered_at_ms)
+                 VALUES ('preserved-caller', zeroblob(32), 1);
+             INSERT INTO projects(project_id) VALUES ('preserved-project');
+             INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+                 VALUES ('preserved-project', 7, 'deny', 10);
+             INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'preserved-grant', 'preserved-caller', 'preserved-project', 'deploy',
+                 'exact', 'release', 'allow', 'once', NULL, NULL, 10
+             );
+             INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'preserved-approval', 'preserved-caller', 'preserved-project',
+                 'deploy', 'release', zeroblob(32), 'requested', 11, 20
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved: (i64, String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT version FROM project_policies WHERE project_id = 'preserved-project'),
+                 (SELECT effect FROM capability_grants WHERE grant_id = 'preserved-grant'),
+                 (SELECT state FROM approvals WHERE approval_id = 'preserved-approval')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let retention_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('audit_events', 'evidence_install_intents', 'evidence_gc_attempts')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let install_intent_columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('evidence_install_intents') ORDER BY cid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(preserved, (7, "allow".to_owned(), "requested".to_owned()));
+    assert_eq!(retention_table_count, 3);
+    assert_eq!(
+        install_intent_columns,
+        [
+            "attempt_id",
+            "digest",
+            "temporary_name",
+            "size_bytes",
+            "started_at_ms",
+        ]
+    );
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn policy_resource_bound_migration_upgrades_v5_without_replacing_policy_data() {
+    let (directory, path) = database_path("migration-v5-policy-resource-bound");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO callers(caller_id, credential_digest, registered_at_ms)
+                 VALUES ('preserved-caller', zeroblob(32), 1);
+             INSERT INTO projects(project_id) VALUES ('preserved-project');
+             INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+                 VALUES ('preserved-project', 7, 'deny', 10);
+             INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'preserved-grant', 'preserved-caller', 'preserved-project', 'evidence.read',
+                 'exact', 'evidence:short', 'allow', 'once', NULL, NULL, 10
+             );
+             INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'preserved-approval', 'preserved-caller', 'preserved-project',
+                 'evidence.read', 'evidence:short', zeroblob(32), 'requested', 11, 20
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved: (String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT resource FROM capability_grants WHERE grant_id = 'preserved-grant'),
+                 (SELECT resource FROM approvals WHERE approval_id = 'preserved-approval')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        preserved,
+        ("evidence:short".to_owned(), "evidence:short".to_owned())
+    );
+
+    let long_resource = format!("evidence:{}", "a".repeat(600));
+    connection
+        .execute(
+            "INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'long-grant', 'preserved-caller', 'preserved-project', 'evidence.read',
+                 'exact', ?1, 'allow', 'none', NULL, NULL, 12
+             )",
+            params![long_resource],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'long-approval', 'preserved-caller', 'preserved-project',
+                 'evidence.read', ?1, zeroblob(32), 'requested', 13, 20
+             )",
+            params![long_resource],
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
     assert_eq!(version, LATEST_SCHEMA_VERSION);
 
     drop(connection);

@@ -56,17 +56,35 @@ PAM should help an agent answer:
 
 ## Current status
 
-The product foundation, walking skeleton, and durable project-continuity slice
-are complete. The repository contains a pinned Rust workspace and one `pam`
-executable with client, daemon, status, brief, wait, result, evidence, and
+The product foundation, walking skeleton, durable project-continuity, and local
+trust-and-policy slices are complete. The pinned Rust workspace builds one
+`pam` executable with client, daemon, status, brief, wait, result, evidence,
+caller, access, approval, network-diagnostics, audit-export, retention, and
 GUI-shell modes. The daemon durably schedules per-project work in SQLite,
 recovers leases after restart, replays ordered events, retains exact
-content-addressed evidence, compacts logs deterministically, and obtains project
-context from `ptrack` only through its supported JSON CLI. Authentication,
-policy, flows, models, connectors, and the full GPUI control center remain later
-roadmap slices. Managed-environment field validation remains optional future
-work; no interviews or live workflow observations have been conducted or are
-claimed.
+content-addressed evidence, and obtains project context from `ptrack` only
+through its supported JSON CLI. The workspace also contains a tested,
+deterministic log compactor; daemon integration remains future work.
+
+Production requests authenticate a registered, revocable caller whose secret is
+kept in the operating system's native credential store. Project policy is
+default-deny with explicit-deny precedence and exact-effect, one-time approvals.
+Native-trust network diagnostics expose only sanitized configuration facts;
+audit export is project-scoped and redacted; evidence and audit retention are
+explicit, bounded, and crash-recoverable. Flows, models, connectors, service
+manager integration, peer-credential transport hardening, and the full GPUI
+control center remain later roadmap slices. PAC evaluation and live managed
+enterprise CA/proxy behavior are not claimed; no managed-environment interviews
+or workflow observations have been conducted.
+
+Initialize the CLI caller and grant only the capabilities needed for the
+current project:
+
+```sh
+cargo run -p pam_cli -- caller register
+cargo run -p pam_cli -- access grant daemon.status --resource daemon
+cargo run -p pam_cli -- access grant brief.read
+```
 
 Run the daemon from an initialized project in one terminal:
 
@@ -89,6 +107,39 @@ source as unavailable. Durable request observers use `pam wait <request-id>` and
 `pam result <request-id>`. A brief's exact source can be inspected with
 `pam evidence show <evidence-handle>` or written byte-for-byte with
 `--raw`/`--output`.
+
+If policy returns an approval challenge, decide it and retry that same
+operation with the explicit one-time receipt:
+
+```sh
+cargo run -p pam_cli -- approval approve <approval-id>
+cargo run -p pam_cli -- status --approval-id <approval-id>
+```
+
+`--approval-id <ID>` is available on the single-request `status`, `brief`,
+`wait`, `result`, and `network diagnostics` commands. The receipt is attached
+only to the command that explicitly supplies it; PAM does not read approval
+authority from the environment.
+
+`evidence show` deliberately does not accept an approval receipt. One evidence
+download spans an inspection request followed by one or more bounded range-read
+requests, while a one-time receipt authorizes exactly one protocol request and
+cannot be reused across that sequence. A protocol client may retry the exact
+challenged evidence request with its receipt.
+
+## Security model
+
+Local endpoint reachability is not authorization: callers authenticate, policy
+is evaluated for the exact project/capability/resource, and required approvals
+are consumed transactionally immediately before dispatch. PAM nevertheless
+relies on the operating-system account and per-user data-directory protections
+for local administrative CLI operations and direct database access; an
+untrusted process with unrestricted execution as that same user is inside the
+current administrative trust boundary.
+
+See the [local daemon threat model](docs/security/local-daemon-threat-model.md)
+for assets, actors, trust boundaries, current mitigations, planned hardening,
+residual risks, severity calibration, and a test-linked validation matrix.
 
 Local quality gates match the portable Linux checks:
 
@@ -118,6 +169,7 @@ Read next:
 - [Product brief](docs/product-brief.md)
 - [Research synthesis](docs/research.md)
 - [Architecture](docs/architecture.md)
+- [Local daemon threat model](docs/security/local-daemon-threat-model.md)
 - [Stack decisions](docs/stack.md)
 - [Roadmap](docs/roadmap.md)
 

@@ -7,10 +7,11 @@ use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
-    MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, NetworkDiagnosticsResult, OperationTruth,
-    PROTOCOL_VERSION, PacState, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
-    ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, decode_request,
-    decode_server_message, encode,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES,
+    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
+    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
+    SourceAvailability, decode_request, decode_server_message, encode,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -81,6 +82,56 @@ fn authenticated_request_round_trips_without_debug_disclosure() {
 
     assert_eq!(actual, expected);
     assert!(!format!("{actual:?}").contains(secret));
+}
+
+#[test]
+fn direct_model_request_round_trips_with_bounded_messages() {
+    let secret_prompt = "Return exactly PRIVATE-CONTENT.";
+    let expected = RequestEnvelope::model_infer(
+        RequestId::from("model-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("model-1"),
+        "vendor/model",
+        vec![ModelMessage::new(ModelRole::User, secret_prompt).unwrap()],
+        16,
+        42,
+    )
+    .unwrap()
+    .authenticated(CallerCredential::new("model-credential"));
+
+    let decoded = decode_request(&encode(&expected).unwrap()).unwrap();
+    assert_eq!(decoded, expected);
+    assert!(!format!("{decoded:?}").contains(secret_prompt));
+}
+
+#[test]
+fn aggregate_model_prompt_budget_is_enforced_by_the_canonical_decoder() {
+    let request = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("model-observer-1"),
+        caller_id: CallerId::from("cli-1"),
+        authentication: None,
+        approval_id: None,
+        project_id: ProjectId::from("project-1"),
+        capability: Capability::ModelInfer,
+        idempotency_key: IdempotencyKey::from("model-1"),
+        deadline_unix_ms: None,
+        payload: RequestPayload::ModelInfer {
+            model: "vendor/model".to_owned(),
+            messages: (0..5)
+                .map(|_| {
+                    ModelMessage::new(ModelRole::User, "x".repeat(MAX_MODEL_MESSAGE_BYTES)).unwrap()
+                })
+                .collect(),
+            max_output_tokens: 16,
+        },
+    };
+
+    assert!(matches!(
+        decode_request(&encode(&request).unwrap()),
+        Err(CodecError::Contract(_))
+    ));
 }
 
 #[test]
@@ -346,6 +397,15 @@ struct UnboundedEvidenceChunk {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum UnboundedResultPayload {
     EvidenceChunk(UnboundedEvidenceChunk),
+    ModelGeneration(UnboundedModelGenerationResult),
+}
+
+#[derive(Serialize)]
+struct UnboundedModelGenerationResult {
+    model: String,
+    text: String,
+    finish_reason: ModelFinishReason,
+    usage: ModelUsage,
 }
 
 #[derive(Serialize)]
@@ -392,6 +452,63 @@ fn oversized_evidence_chunks_are_rejected_during_decode() {
         decode_server_message(&encode(&message).unwrap()),
         Err(CodecError::Decode(_))
     ));
+}
+
+#[test]
+fn oversized_model_generation_is_rejected_by_the_canonical_decoder() {
+    let message = UnboundedServerMessage::Result(UnboundedResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("model-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: UnboundedResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: UnboundedResultPayload::ModelGeneration(UnboundedModelGenerationResult {
+                model: "vendor/model".to_owned(),
+                text: "x".repeat(MAX_MODEL_OUTPUT_BYTES + 1),
+                finish_reason: ModelFinishReason::Stop,
+                usage: ModelUsage {
+                    input_tokens: 1,
+                    sampled_output_tokens: 1,
+                    emitted_output_tokens: 1,
+                },
+            }),
+        },
+    });
+
+    assert!(matches!(
+        decode_server_message(&encode(&message).unwrap()),
+        Err(CodecError::Decode(_))
+    ));
+}
+
+#[test]
+fn bounded_model_generation_still_round_trips_after_decode_validation() {
+    let expected = ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("model-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::ModelGeneration(
+                ModelGenerationResult::new(
+                    "vendor/model",
+                    "answer",
+                    ModelFinishReason::Stop,
+                    ModelUsage {
+                        input_tokens: 2,
+                        sampled_output_tokens: 1,
+                        emitted_output_tokens: 1,
+                    },
+                )
+                .unwrap(),
+            ),
+        },
+    });
+
+    assert_eq!(
+        decode_server_message(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -517,7 +634,7 @@ fn unsupported_version_failures_are_decodable_across_versions() {
         project_id: ProjectId::from("project-1"),
         body: ResultBody::Failure(Failure {
             code: FailureCode::UnsupportedProtocolVersion,
-            message: "supported protocol version is 1".to_owned(),
+            message: format!("supported protocol version is {PROTOCOL_VERSION}"),
             recovery: None,
             approval: None,
         }),
@@ -568,7 +685,7 @@ fn unknown_named_fields_are_ignored_for_compatible_evolution() {
 }
 
 #[test]
-fn status_request_matches_the_v1_golden_fixture() {
+fn status_request_matches_the_v2_golden_fixture() {
     let bytes = encode(&status_request()).unwrap();
     let actual = bytes
         .iter()
@@ -579,7 +696,7 @@ fn status_request_matches_the_v1_golden_fixture() {
 
     assert_eq!(
         actual,
-        include_str!("../fixtures/status_request_v1.msgpack.hex").trim()
+        include_str!("../fixtures/status_request_v2.msgpack.hex").trim()
     );
 }
 use std::fmt::Write;

@@ -61,13 +61,14 @@ Deliverables:
 
 - llama.cpp binding spike and recorded decision;
 - model import/download, integrity, licensing, memory estimate, and chosen paths;
-- one Qwen-capable profile proven on the M1/32 GB target;
-- bounded inference queue and optional semantic evidence compression;
-- authenticated local compatible API if it passes the preview scope gate.
+- one Qwen-capable profile proven below a 20 GB model-memory ceiling, with
+  M1 Pro/32 GB as the minimum supported Mac and host-specific admission;
+- direct in-process Rust/llama.cpp inference through the authenticated PAM
+  protocol, with a bounded queue and optional semantic evidence compression.
 
 Exit: PAM can compact a retained diagnostic evidence set locally within a safe
-memory budget and another approved app can use the model without direct weight
-or credential management.
+memory budget and another approved PAM caller can use the model without direct
+weight or credential management. No HTTP model endpoint is required.
 
 ### 5. Flows and useful feedback
 

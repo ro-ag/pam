@@ -15,11 +15,17 @@ pub use contract::{
     ApprovalChallenge, BriefItem, BriefProvenance, BriefResult, CancellationDisposition,
     CancellationResult, Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
     NetworkDiagnosticsResult, OperationTruth, PacState, ProtocolContractError, ReplayResult,
     RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
     SourceAvailability, StatusResult,
 };
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 256 * 1024;
+pub const MAX_MODEL_MESSAGES: usize = 32;
+pub const MAX_MODEL_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_MODEL_PROMPT_BYTES: usize = 256 * 1024;
+pub const MAX_MODEL_OUTPUT_TOKENS: u32 = 4_096;
+pub const MAX_MODEL_OUTPUT_BYTES: usize = 512 * 1024;

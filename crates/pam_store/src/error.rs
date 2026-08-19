@@ -75,6 +75,9 @@ pub enum StoreError {
     EvidenceBlobMissing(ContentDigest),
     EvidenceBlobCorrupt(ContentDigest),
     UnsafeEvidencePath,
+    InvalidModelRecord(&'static str),
+    ModelConflict(String),
+    ModelNotFound(String),
 }
 
 impl fmt::Display for StoreError {
@@ -143,24 +146,9 @@ impl fmt::Display for StoreError {
             }
             Self::LeaseDurationZero => formatter.write_str("lease duration must be non-zero"),
             Self::LeaseExpiryOverflow => formatter.write_str("lease expiry overflowed"),
-            Self::EvidenceTooLarge {
-                size_bytes,
-                maximum_bytes,
-            } => write!(
-                formatter,
-                "evidence is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
-            ),
-            Self::EvidenceRangeTooLarge {
-                length,
-                maximum_bytes,
-            } => write!(
-                formatter,
-                "evidence range is {length} bytes; the maximum is {maximum_bytes} bytes"
-            ),
-            Self::EvidenceRangeOutOfBounds { offset, size_bytes } => write!(
-                formatter,
-                "evidence offset {offset} exceeds content size {size_bytes}"
-            ),
+            Self::EvidenceTooLarge { .. }
+            | Self::EvidenceRangeTooLarge { .. }
+            | Self::EvidenceRangeOutOfBounds { .. } => format_evidence_bound_error(self, formatter),
             Self::InvalidEvidenceMediaType => formatter.write_str("evidence media type is invalid"),
             Self::InvalidEvidencePruneRetention => invalid_evidence_prune_retention(formatter),
             Self::InvalidEvidencePruneLimit { .. } => invalid_evidence_prune_limit(formatter),
@@ -178,6 +166,9 @@ impl fmt::Display for StoreError {
                 format_evidence_blob_error(self, formatter)
             }
             Self::UnsafeEvidencePath => formatter.write_str("evidence storage path is unsafe"),
+            Self::InvalidModelRecord(_) | Self::ModelConflict(_) | Self::ModelNotFound(_) => {
+                format_model_error(self, formatter)
+            }
         }
     }
 }
@@ -194,6 +185,49 @@ fn format_evidence_blob_error(
             write!(formatter, "evidence blob {digest} failed verification")
         }
         _ => unreachable!("format_evidence_blob_error requires a blob error"),
+    }
+}
+
+fn format_evidence_bound_error(
+    error: &StoreError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match error {
+        StoreError::EvidenceTooLarge {
+            size_bytes,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "evidence is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::EvidenceRangeTooLarge {
+            length,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "evidence range is {length} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::EvidenceRangeOutOfBounds { offset, size_bytes } => write!(
+            formatter,
+            "evidence offset {offset} exceeds content size {size_bytes}"
+        ),
+        _ => unreachable!("format_evidence_bound_error requires an evidence bound error"),
+    }
+}
+
+fn format_model_error(error: &StoreError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match error {
+        StoreError::InvalidModelRecord(reason) => {
+            write!(formatter, "model metadata is invalid: {reason}")
+        }
+        StoreError::ModelConflict(model_id) => write!(
+            formatter,
+            "model {model_id} is already registered with different metadata"
+        ),
+        StoreError::ModelNotFound(model_id) => {
+            write!(formatter, "model {model_id} is not registered")
+        }
+        _ => unreachable!("format_model_error requires a model error"),
     }
 }
 
@@ -248,7 +282,10 @@ impl Error for StoreError {
             | Self::EvidenceHandleConflict { .. }
             | Self::EvidenceBlobMissing(_)
             | Self::EvidenceBlobCorrupt(_)
-            | Self::UnsafeEvidencePath => None,
+            | Self::UnsafeEvidencePath
+            | Self::InvalidModelRecord(_)
+            | Self::ModelConflict(_)
+            | Self::ModelNotFound(_) => None,
         }
     }
 }

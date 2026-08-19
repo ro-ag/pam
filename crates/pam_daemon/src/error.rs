@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+use pam_model::RuntimeError;
 use pam_platform::{IdentityError, TransportError};
 use pam_protocol::CodecError;
 use pam_store::StoreError;
@@ -11,6 +12,7 @@ pub enum DaemonError {
     Identity(IdentityError),
     StaleState(String),
     Io(std::io::Error),
+    Model(RuntimeError),
     Protocol(CodecError),
     Store(StoreError),
     Transport(TransportError),
@@ -26,6 +28,7 @@ impl DaemonError {
             Self::Handler(_)
             | Self::Identity(_)
             | Self::Io(_)
+            | Self::Model(_)
             | Self::Protocol(_)
             | Self::Store(_) => None,
         }
@@ -42,6 +45,9 @@ impl fmt::Display for DaemonError {
             Self::StaleState(_) => formatter
                 .write_str("PAM daemon endpoint is stale. Recover it with `pam daemon --recover`."),
             Self::Io(_) => formatter.write_str("PAM could not prepare its local runtime state."),
+            Self::Model(_) => {
+                formatter.write_str("PAM could not start the embedded model runtime.")
+            }
             Self::Protocol(_) => formatter.write_str("PAM could not process a protocol message."),
             Self::Store(_) => formatter.write_str("PAM durable state is unavailable."),
             Self::Transport(error) => error.fmt(formatter),
@@ -55,6 +61,7 @@ impl Error for DaemonError {
             Self::Handler(error) => Some(error),
             Self::Identity(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::Model(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Transport(error) => Some(error),
@@ -90,6 +97,12 @@ impl From<IdentityError> for DaemonError {
 impl From<std::io::Error> for DaemonError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<RuntimeError> for DaemonError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Model(error)
     }
 }
 

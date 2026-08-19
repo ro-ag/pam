@@ -3,7 +3,8 @@ use std::{error::Error, fmt};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    FailureCode, MAX_FRAME_SIZE, PROTOCOL_VERSION, RequestEnvelope, ResultBody, ServerMessage,
+    FailureCode, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolContractError, RequestEnvelope,
+    ResultBody, ServerMessage,
 };
 
 #[derive(Debug)]
@@ -11,6 +12,7 @@ pub enum CodecError {
     FrameTooLarge { actual: usize, maximum: usize },
     Decode(rmp_serde::decode::Error),
     Encode(rmp_serde::encode::Error),
+    Contract(ProtocolContractError),
     UnsupportedProtocolVersion { actual: u16, supported: u16 },
 }
 
@@ -22,6 +24,7 @@ impl fmt::Display for CodecError {
             }
             Self::Decode(error) => write!(formatter, "invalid MessagePack frame: {error}"),
             Self::Encode(error) => write!(formatter, "could not encode MessagePack frame: {error}"),
+            Self::Contract(error) => write!(formatter, "invalid protocol contract: {error}"),
             Self::UnsupportedProtocolVersion { actual, supported } => write!(
                 formatter,
                 "protocol version {actual} is unsupported; supported version is {supported}"
@@ -35,6 +38,7 @@ impl Error for CodecError {
         match self {
             Self::Decode(error) => Some(error),
             Self::Encode(error) => Some(error),
+            Self::Contract(error) => Some(error),
             Self::FrameTooLarge { .. } | Self::UnsupportedProtocolVersion { .. } => None,
         }
     }
@@ -61,6 +65,9 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 pub fn decode_request(bytes: &[u8]) -> Result<RequestEnvelope, CodecError> {
     let request = decode_request_envelope(bytes)?;
     enforce_version(request.protocol_version)?;
+    request
+        .validate_model_request()
+        .map_err(CodecError::Contract)?;
     Ok(request)
 }
 

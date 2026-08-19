@@ -1,22 +1,24 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use pam_core::{ApprovalId, EvidenceHandle, GrantId, RequestId};
+use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, GrantId, RequestId};
+use pam_model::ModelKey;
 use pam_policy::{CapabilityName, ResourceName};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
+const MAX_MODEL_TIMEOUT: Duration = Duration::from_mins(10);
 const DEFAULT_AUDIT_EXPORT_LIMIT: usize = 500;
 const MAX_AUDIT_EXPORT_LIMIT: usize = 1_000;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "pam", version, about = "Local project continuity companion")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Command {
     /// Report daemon health through the local protocol.
     Status {
@@ -64,6 +66,11 @@ enum Command {
         #[command(subcommand)]
         command: CallerCommand,
     },
+    /// Register user-owned model metadata and weights.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     /// Manage project-scoped capability grants.
     Access {
         #[command(subcommand)]
@@ -94,6 +101,9 @@ enum Command {
         /// Recover an endpoint left behind by an interrupted daemon.
         #[arg(long)]
         recover: bool,
+        /// Load this registered vendor/name into the embedded llama.cpp runtime.
+        #[arg(long, value_name = "VENDOR/NAME", value_parser = parse_model_key)]
+        model: Option<ModelKey>,
     },
     /// Open the native control-center shell.
     Gui,
@@ -128,6 +138,61 @@ enum CallerCommand {
         /// Local caller surface to revoke.
         #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
         kind: CallerKindArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// Verify and register an existing user-owned GGUF in place.
+    Import {
+        /// Stable model identity.
+        #[arg(value_name = "VENDOR/NAME", value_parser = parse_model_key)]
+        model: ModelKey,
+        /// Absolute path to the existing GGUF.
+        #[arg(long, value_name = "PATH")]
+        path: PathBuf,
+        /// Expected model digest in canonical sha256:<lowercase-hex> form.
+        #[arg(long, value_parser = parse_content_digest)]
+        digest: ContentDigest,
+        /// Expected model file size in bytes.
+        #[arg(long, value_parser = parse_positive_u64)]
+        size_bytes: u64,
+        /// SPDX-style model license identifier.
+        #[arg(long)]
+        license_id: String,
+        /// Canonical HTTPS URL for the accepted license notice.
+        #[arg(long)]
+        license_url: String,
+        /// Digest of the exact accepted license notice.
+        #[arg(long, value_parser = parse_content_digest)]
+        license_notice_digest: ContentDigest,
+        /// Confirm acceptance of the exact model and license metadata above.
+        #[arg(long)]
+        accept_license: bool,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+    /// Generate text with the daemon's directly embedded llama.cpp runtime.
+    Generate {
+        /// Registered model identity selected when the daemon started.
+        #[arg(value_name = "VENDOR/NAME", value_parser = parse_model_key)]
+        model: ModelKey,
+        /// User message sent to the embedded model.
+        #[arg(value_name = "PROMPT")]
+        prompt: String,
+        /// Optional system message prepended to the conversation.
+        #[arg(long)]
+        system: Option<String>,
+        /// Maximum generated tokens.
+        #[arg(long, default_value_t = 128, value_parser = parse_model_output_tokens)]
+        tokens: u32,
+        /// Bound the complete request.
+        #[arg(long, default_value = "5m", value_parser = parse_model_timeout)]
+        timeout: Duration,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
     },
 }
 
@@ -240,7 +305,7 @@ pub(crate) enum RetentionScopeArg {
     Project,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) enum Mode {
     Client,
     Status {
@@ -269,6 +334,25 @@ pub(crate) enum Mode {
     },
     CallerRevoke {
         kind: CallerKindArg,
+    },
+    ModelImport {
+        model: ModelKey,
+        path: PathBuf,
+        digest: ContentDigest,
+        size_bytes: u64,
+        license_id: String,
+        license_url: String,
+        license_notice_digest: ContentDigest,
+        accept_license: bool,
+        approval_id: Option<ApprovalId>,
+    },
+    ModelGenerate {
+        model: ModelKey,
+        prompt: String,
+        system: Option<String>,
+        tokens: u32,
+        timeout: Duration,
+        approval_id: Option<ApprovalId>,
     },
     AccessGrant {
         capability: CapabilityName,
@@ -305,11 +389,108 @@ pub(crate) enum Mode {
     },
     Daemon {
         recover: bool,
+        model: Option<ModelKey>,
     },
     Gui,
 }
 
+impl fmt::Debug for Cli {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cli")
+            .field("command", &self.command)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model { command } => formatter.debug_tuple("Model").field(command).finish(),
+            Self::Status { .. } => formatter.write_str("Status"),
+            Self::Brief { .. } => formatter.write_str("Brief"),
+            Self::Wait { .. } => formatter.write_str("Wait"),
+            Self::Result { .. } => formatter.write_str("Result"),
+            Self::Evidence { .. } => formatter.write_str("Evidence"),
+            Self::Caller { .. } => formatter.write_str("Caller"),
+            Self::Access { .. } => formatter.write_str("Access"),
+            Self::Approval { .. } => formatter.write_str("Approval"),
+            Self::Network { .. } => formatter.write_str("Network"),
+            Self::Audit { .. } => formatter.write_str("Audit"),
+            Self::Retention { .. } => formatter.write_str("Retention"),
+            Self::Daemon { .. } => formatter.write_str("Daemon"),
+            Self::Gui => formatter.write_str("Gui"),
+        }
+    }
+}
+
+impl fmt::Debug for ModelCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Import { .. } => formatter.write_str("Import"),
+            Self::Generate {
+                model,
+                prompt,
+                system,
+                tokens,
+                timeout,
+                approval_id,
+            } => formatter
+                .debug_struct("Generate")
+                .field("model", model)
+                .field("prompt_bytes", &prompt.len())
+                .field("system_bytes", &system.as_ref().map_or(0, String::len))
+                .field("tokens", tokens)
+                .field("timeout", timeout)
+                .field("approval_id", approval_id)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for Mode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModelGenerate {
+                model,
+                prompt,
+                system,
+                tokens,
+                timeout,
+                approval_id,
+            } => formatter
+                .debug_struct("ModelGenerate")
+                .field("model", model)
+                .field("prompt_bytes", &prompt.len())
+                .field("system_bytes", &system.as_ref().map_or(0, String::len))
+                .field("tokens", tokens)
+                .field("timeout", timeout)
+                .field("approval_id", approval_id)
+                .finish(),
+            Self::Client => formatter.write_str("Client"),
+            Self::Status { .. } => formatter.write_str("Status"),
+            Self::Brief { .. } => formatter.write_str("Brief"),
+            Self::Wait { .. } => formatter.write_str("Wait"),
+            Self::Result { .. } => formatter.write_str("Result"),
+            Self::EvidenceShow { .. } => formatter.write_str("EvidenceShow"),
+            Self::CallerRegister { .. } => formatter.write_str("CallerRegister"),
+            Self::CallerRevoke { .. } => formatter.write_str("CallerRevoke"),
+            Self::ModelImport { .. } => formatter.write_str("ModelImport"),
+            Self::AccessGrant { .. } => formatter.write_str("AccessGrant"),
+            Self::AccessRevoke { .. } => formatter.write_str("AccessRevoke"),
+            Self::ApprovalApprove { .. } => formatter.write_str("ApprovalApprove"),
+            Self::ApprovalDeny { .. } => formatter.write_str("ApprovalDeny"),
+            Self::NetworkDiagnostics { .. } => formatter.write_str("NetworkDiagnostics"),
+            Self::AuditExport { .. } => formatter.write_str("AuditExport"),
+            Self::RetentionPrune { .. } => formatter.write_str("RetentionPrune"),
+            Self::Daemon { .. } => formatter.write_str("Daemon"),
+            Self::Gui => formatter.write_str("Gui"),
+        }
+    }
+}
+
 impl Cli {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn mode(self) -> Mode {
         match self.command {
             None => Mode::Client,
@@ -340,6 +521,48 @@ impl Cli {
             Some(Command::Caller {
                 command: CallerCommand::Revoke { kind },
             }) => Mode::CallerRevoke { kind },
+            Some(Command::Model {
+                command:
+                    ModelCommand::Import {
+                        model,
+                        path,
+                        digest,
+                        size_bytes,
+                        license_id,
+                        license_url,
+                        license_notice_digest,
+                        accept_license,
+                        approval_id,
+                    },
+            }) => Mode::ModelImport {
+                model,
+                path,
+                digest,
+                size_bytes,
+                license_id,
+                license_url,
+                license_notice_digest,
+                accept_license,
+                approval_id,
+            },
+            Some(Command::Model {
+                command:
+                    ModelCommand::Generate {
+                        model,
+                        prompt,
+                        system,
+                        tokens,
+                        timeout,
+                        approval_id,
+                    },
+            }) => Mode::ModelGenerate {
+                model,
+                prompt,
+                system,
+                tokens,
+                timeout,
+                approval_id,
+            },
             Some(Command::Access {
                 command:
                     AccessCommand::Grant {
@@ -400,7 +623,7 @@ impl Cli {
                 approval_id,
                 limit,
             },
-            Some(Command::Daemon { recover }) => Mode::Daemon { recover },
+            Some(Command::Daemon { recover, model }) => Mode::Daemon { recover, model },
             Some(Command::Gui) => Mode::Gui,
         }
     }
@@ -439,6 +662,51 @@ fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {
 
 fn parse_capability_name(value: &str) -> Result<CapabilityName, String> {
     CapabilityName::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_model_key(value: &str) -> Result<ModelKey, String> {
+    let Some((vendor, name)) = value.split_once('/') else {
+        return Err("model identity must use vendor/name form".to_owned());
+    };
+    if name.contains('/') {
+        return Err("model identity must contain exactly one slash".to_owned());
+    }
+    ModelKey::new(vendor, name).map_err(|error| error.to_string())
+}
+
+fn parse_content_digest(value: &str) -> Result<ContentDigest, String> {
+    ContentDigest::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned integer".to_owned())?;
+    if value == 0 {
+        return Err("value must be greater than zero".to_owned());
+    }
+    Ok(value)
+}
+
+fn parse_model_output_tokens(value: &str) -> Result<u32, String> {
+    let tokens = value
+        .parse::<u32>()
+        .map_err(|_| "model output tokens must be a positive integer".to_owned())?;
+    if tokens == 0 || tokens > pam_protocol::MAX_MODEL_OUTPUT_TOKENS {
+        return Err(format!(
+            "model output tokens must be between 1 and {}",
+            pam_protocol::MAX_MODEL_OUTPUT_TOKENS
+        ));
+    }
+    Ok(tokens)
+}
+
+fn parse_model_timeout(value: &str) -> Result<Duration, String> {
+    let timeout = parse_wait_timeout(value)?;
+    if timeout.is_zero() || timeout > MAX_MODEL_TIMEOUT {
+        return Err("model timeout must be between 1ms and 10m".to_owned());
+    }
+    Ok(timeout)
 }
 
 fn parse_resource_name(value: &str) -> Result<ResourceName, String> {

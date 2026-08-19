@@ -5,7 +5,7 @@ use pam_platform::{
     CallerKind, IdentityError, NativeSecretBackend, SecretLocator, SecretStore, SecretStoreError,
     SecretStoreErrorKind, caller_id, discover_project_id,
 };
-use pam_protocol::{ProtocolContractError, RequestEnvelope};
+use pam_protocol::{ModelMessage, ProtocolContractError, RequestEnvelope};
 use std::{error::Error, fmt};
 use uuid::Uuid;
 
@@ -74,6 +74,27 @@ impl RequestContext {
             self.project_id.clone(),
             idempotency_key,
         ))
+    }
+
+    pub(crate) fn model_infer(
+        &self,
+        model: String,
+        messages: Vec<ModelMessage>,
+        max_output_tokens: u32,
+        deadline_unix_ms: u64,
+    ) -> Result<RequestEnvelope, ProtocolContractError> {
+        let (request_id, idempotency_key) = operation_ids("model-infer");
+        RequestEnvelope::model_infer(
+            request_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            model,
+            messages,
+            max_output_tokens,
+            deadline_unix_ms,
+        )
+        .map(|request| self.authenticate(request))
     }
 
     pub(crate) fn wait(&self, target_request_id: RequestId, after: u64) -> RequestEnvelope {

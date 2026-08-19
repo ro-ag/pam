@@ -26,4 +26,5 @@ pub use model::{
     ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot, RequestState, StoredResult,
     TerminalState,
 };
+pub use pam_model::{ModelKey, RegisteredModel};
 pub use store::Store;

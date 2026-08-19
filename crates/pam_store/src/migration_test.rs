@@ -505,6 +505,62 @@ fn policy_resource_bound_migration_upgrades_v5_without_replacing_policy_data() {
 }
 
 #[test]
+fn model_registry_migration_upgrades_v6_without_replacing_existing_state() {
+    let (directory, path) = database_path("migration-v6-models");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 6).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('preserved')", [])
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let project_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE project_id = 'preserved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let model_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'models'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let gguf_count_columns: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('models')
+             WHERE name IN ('gguf_tensor_count', 'gguf_metadata_kv_count')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(project_count, 1);
+    assert_eq!(model_table_count, 1);
+    assert_eq!(gguf_count_columns, 2);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

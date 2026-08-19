@@ -1,0 +1,25 @@
+[package]
+name = "pam_model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+pam_core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-4.workspace = true
+llama-cpp-sys-4.workspace = true
+
+[lints]
+workspace = true

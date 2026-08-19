@@ -2,8 +2,8 @@ use pam_core::{ContentDigest, EvidenceHandle, ProjectId, RequestId};
 use pam_protocol::{
     BriefItem, BriefProvenance, BriefResult, ConfigurationPresence, Event, EventEnvelope,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
-    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ResultBody,
-    ResultPayload, SourceAvailability,
+    ModelFinishReason, ModelGenerationResult, ModelUsage, NetworkDiagnosticsResult, OperationTruth,
+    PROTOCOL_VERSION, PacState, ResultBody, ResultPayload, SourceAvailability,
 };
 
 use super::render::{
@@ -31,6 +31,32 @@ fn network_diagnostics_renders_only_sanitized_configuration_facts() {
     assert_eq!(
         presentation.stdout,
         "platform_roots_enabled=true system_proxy_discovery_enabled=true proxy_environment=configured no_proxy=invalid pac=detected_unsupported truth=observed\n"
+    );
+    assert!(presentation.stderr.is_empty());
+}
+
+#[test]
+fn model_output_is_terminal_safe_and_carries_observed_usage() {
+    let presentation = present_result(&ResultBody::Success {
+        truth: OperationTruth::Observed,
+        payload: ResultPayload::ModelGeneration(
+            ModelGenerationResult::new(
+                "qwen/coder",
+                "ok\n\u{1b}[31m",
+                ModelFinishReason::Stop,
+                ModelUsage {
+                    input_tokens: 12,
+                    sampled_output_tokens: 3,
+                    emitted_output_tokens: 2,
+                },
+            )
+            .unwrap(),
+        ),
+    });
+
+    assert_eq!(
+        presentation.stdout,
+        "model=qwen/coder finish_reason=stop input_tokens=12 sampled_output_tokens=3 emitted_output_tokens=2 truth=observed\nOutput:\nok\\n\\u{1b}[31m\n"
     );
     assert!(presentation.stderr.is_empty());
 }

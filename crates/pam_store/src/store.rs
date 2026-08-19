@@ -1,7 +1,16 @@
-use std::{path::Path, sync::mpsc, thread, time::Duration};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use pam_core::{
-    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, ProjectId,
+    RequestId,
+};
+use pam_model::{
+    GgufMetadata, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource, RegisteredModel,
 };
 use pam_policy::{
     ApprovalRequirement, Decision, Effect, EffectFingerprint, Grant, ResourceName, ResourceScope,
@@ -11,9 +20,6 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use uuid::Uuid;
-
-#[cfg(test)]
-use std::path::PathBuf;
 
 use crate::evidence::{self, EvidenceFiles};
 use crate::{
@@ -31,7 +37,7 @@ use crate::{
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 6;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 7;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
@@ -42,6 +48,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
         6,
         include_str!("../migrations/0006_policy_resource_bound.sql"),
     ),
+    (7, include_str!("../migrations/0007_models.sql")),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -356,6 +363,41 @@ impl Store {
             commands: command_tx,
             evidence_commands: evidence_tx,
         })
+    }
+
+    /// Registers verified model metadata without copying weight bytes into PAM state.
+    ///
+    /// An identical record is idempotent. The same model identity or path is never
+    /// replaced implicitly with different metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for conflicting, invalid, out-of-range, or unavailable
+    /// durable state.
+    pub async fn put_model(&self, model: RegisteredModel) -> Result<RegisteredModel, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Model(ModelCommand::Put {
+            model,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Looks up one model's metadata by stable vendor/name identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model is absent, corrupt, or durable state is
+    /// unavailable.
+    pub async fn model(&self, key: ModelKey) -> Result<RegisteredModel, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Model(ModelCommand::Get {
+            key,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
     }
 
     /// Durably accepts an operation or returns its canonical idempotent request.
@@ -770,6 +812,7 @@ enum Command {
     Caller(CallerCommand),
     Policy(PolicyCommand),
     Audit(AuditCommand),
+    Model(ModelCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -833,6 +876,17 @@ enum Command {
         response: Response<u64>,
     },
     Shutdown(Response<()>),
+}
+
+enum ModelCommand {
+    Put {
+        model: RegisteredModel,
+        response: Response<RegisteredModel>,
+    },
+    Get {
+        key: ModelKey,
+        response: Response<RegisteredModel>,
+    },
 }
 
 enum CallerCommand {
@@ -945,6 +999,7 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
             Command::Caller(command) => run_caller_command(&mut connection, command),
             Command::Policy(command) => run_policy_command(&mut connection, command),
             Command::Audit(command) => run_audit_command(&mut connection, command),
+            Command::Model(command) => run_model_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -1128,6 +1183,238 @@ fn run_audit_command(connection: &mut Connection, command: AuditCommand) {
             prune_audit_events(connection, &project_id, now_ms, limit),
         ),
     }
+}
+
+fn run_model_command(connection: &mut Connection, command: ModelCommand) {
+    match command {
+        ModelCommand::Put { model, response } => {
+            respond(response, put_model(connection, model));
+        }
+        ModelCommand::Get { key, response } => {
+            respond(response, get_model(connection, &key));
+        }
+    }
+}
+
+fn put_model(
+    connection: &mut Connection,
+    model: RegisteredModel,
+) -> Result<RegisteredModel, StoreError> {
+    validate_model_record(&model)?;
+    let path = model
+        .path
+        .to_str()
+        .ok_or(StoreError::InvalidModelRecord("path must be Unicode"))?;
+    let model_id = model.key.id();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = transaction
+        .query_row(
+            "SELECT
+                 vendor, name, path, digest, size_bytes, gguf_version,
+                 gguf_tensor_count, gguf_metadata_kv_count,
+                 license_id, license_url, license_digest,
+                 source_kind, source_identity, registered_at_ms
+             FROM models WHERE model_id = ?1 OR path = ?2",
+            params![model_id, path],
+            model_row,
+        )
+        .optional()?
+        .map(decode_model)
+        .transpose()?;
+    if let Some(existing) = existing {
+        if existing == model {
+            return Ok(existing);
+        }
+        return Err(StoreError::ModelConflict(model.key.id()));
+    }
+    let (source_kind, source_identity) = model_source_columns(&model.source)?;
+    transaction.execute(
+        "INSERT INTO models(
+             model_id, vendor, name, path, digest, size_bytes, gguf_version,
+             gguf_tensor_count, gguf_metadata_kv_count,
+             license_id, license_url, license_digest,
+             source_kind, source_identity, registered_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            model.key.id(),
+            model.key.vendor(),
+            model.key.name(),
+            path,
+            model.digest.as_str(),
+            sql_integer(model.size_bytes)?,
+            model.gguf.version,
+            sql_integer(model.gguf.tensor_count)?,
+            sql_integer(model.gguf.metadata_kv_count)?,
+            model.license.identifier(),
+            model.license.notice_url(),
+            model.license.notice_digest().as_str(),
+            source_kind,
+            source_identity,
+            sql_integer(model.registered_at_ms)?,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(model)
+}
+
+fn get_model(connection: &Connection, key: &ModelKey) -> Result<RegisteredModel, StoreError> {
+    connection
+        .query_row(
+            "SELECT
+                 vendor, name, path, digest, size_bytes, gguf_version,
+                 gguf_tensor_count, gguf_metadata_kv_count,
+                 license_id, license_url, license_digest,
+                 source_kind, source_identity, registered_at_ms
+             FROM models WHERE model_id = ?1",
+            params![key.id()],
+            model_row,
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::ModelNotFound(key.id()))
+        .and_then(decode_model)
+}
+
+type StoredModelRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    u32,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
+
+fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredModelRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    ))
+}
+
+fn decode_model(row: StoredModelRow) -> Result<RegisteredModel, StoreError> {
+    let (
+        vendor,
+        name,
+        path,
+        digest,
+        size_bytes,
+        gguf_version,
+        gguf_tensor_count,
+        gguf_metadata_kv_count,
+        license_id,
+        license_url,
+        license_digest,
+        source_kind,
+        source_identity,
+        registered_at_ms,
+    ) = row;
+    let key = ModelKey::new(vendor, name).map_err(|_| invalid_model_record())?;
+    let digest = ContentDigest::parse(digest).map_err(|_| invalid_model_record())?;
+    let license_digest =
+        ContentDigest::parse(license_digest).map_err(|_| invalid_model_record())?;
+    let license = LicenseSnapshot::new(license_id, license_url, license_digest)
+        .map_err(|_| invalid_model_record())?;
+    let source = match (source_kind.as_str(), source_identity) {
+        ("local", None) => ModelSource::Local,
+        ("https", Some(canonical_url)) => {
+            ModelSource::https(canonical_url).map_err(|_| invalid_model_record())?
+        }
+        _ => return Err(invalid_model_record()),
+    };
+    let size_bytes = u64::try_from(size_bytes).map_err(|_| invalid_model_record())?;
+    let tensor_count = u64::try_from(gguf_tensor_count).map_err(|_| invalid_model_record())?;
+    let metadata_kv_count =
+        u64::try_from(gguf_metadata_kv_count).map_err(|_| invalid_model_record())?;
+    let registered_at_ms = u64::try_from(registered_at_ms).map_err(|_| invalid_model_record())?;
+    let model = RegisteredModel {
+        key,
+        path: PathBuf::from(path),
+        digest,
+        size_bytes,
+        gguf: GgufMetadata {
+            version: gguf_version,
+            tensor_count,
+            metadata_kv_count,
+        },
+        license,
+        source,
+        registered_at_ms,
+    };
+    validate_model_record(&model)?;
+    Ok(model)
+}
+
+fn validate_model_record(model: &RegisteredModel) -> Result<(), StoreError> {
+    let path = model
+        .path
+        .to_str()
+        .filter(|path| {
+            model.path.is_absolute()
+                && !path.is_empty()
+                && path.len() <= 4096
+                && !model
+                    .path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+        })
+        .ok_or_else(invalid_model_record)?;
+    if path.chars().any(char::is_control)
+        || !(ModelDescriptor::MIN_SIZE_BYTES..=ModelDescriptor::MAX_SIZE_BYTES)
+            .contains(&model.size_bytes)
+        || !matches!(model.gguf.version, 2 | 3)
+        || !(GgufMetadata::MIN_TENSOR_COUNT..=GgufMetadata::MAX_TENSOR_COUNT)
+            .contains(&model.gguf.tensor_count)
+        || model.gguf.metadata_kv_count > GgufMetadata::MAX_METADATA_KV_COUNT
+        || i64::try_from(model.registered_at_ms).is_err()
+        || ModelKey::new(model.key.vendor(), model.key.name()).is_err()
+        || LicenseSnapshot::new(
+            model.license.identifier(),
+            model.license.notice_url(),
+            model.license.notice_digest().clone(),
+        )
+        .is_err()
+    {
+        return Err(invalid_model_record());
+    }
+    model_source_columns(&model.source)?;
+    Ok(())
+}
+
+fn model_source_columns(source: &ModelSource) -> Result<(&'static str, Option<&str>), StoreError> {
+    match source {
+        ModelSource::Local => Ok(("local", None)),
+        ModelSource::Https { canonical_url } if safe_stored_source(canonical_url) => {
+            Ok(("https", Some(canonical_url)))
+        }
+        ModelSource::Https { .. } => Err(invalid_model_record()),
+    }
+}
+
+fn safe_stored_source(source: &str) -> bool {
+    ModelSource::https(source).is_ok()
+}
+
+fn invalid_model_record() -> StoreError {
+    StoreError::InvalidModelRecord("model metadata failed validation")
 }
 
 fn append_audit_event(

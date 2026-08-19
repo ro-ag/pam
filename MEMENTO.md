@@ -28,3 +28,21 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - hits: 2026-08-18
 - cost: 0
 - status: watching
+
+## defer-windows-implementation
+- kind: project-way
+- scope: project
+- rule: When Windows work is explicitly deferred, preserve clean platform seams without implementing or claiming Windows support.
+- fix: Keep OS-specific operations behind narrow helpers or cfg boundaries, validate the current macOS/Linux targets only, and record Windows execution and durability proof as deferred.
+- hits: 2026-08-18
+- cost: 2
+- status: watching
+
+## pam-benchmark-target-too-rigid
+- kind: habit
+- scope: project
+- rule: When the user authorizes a practical benchmark substitute, do not preserve an inferred hardware blocker; run on the authorized host with the requested resource cap and label the evidence accurately.
+- fix: Reopen task #24, benchmark on the current M4 Max while enforcing a 20 GB maximum model-memory budget, and report the host distinction explicitly.
+- hits: 2026-08-19
+- cost: 0
+- status: watching

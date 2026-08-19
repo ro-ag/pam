@@ -15,7 +15,8 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 | Encoding | Serde + MessagePack | Compact typed envelopes without inventing a serializer. | Explicit limits, schema versions, unknown-field behavior, and golden fixtures. |
 | Durable state | SQLite via rusqlite with bundled SQLite | Transactional queues and audit state in a user-local deployment. | WAL mode, migrations, bounded DB worker, backups, and corruption tests. |
 | Evidence | Content-addressed files + SQLite metadata | Avoids bloating IPC/database while retaining exact proof. | Checksums, ownership, retention, redaction, size limits, atomic writes. |
-| Local inference | llama.cpp behind `ModelRuntime` | GGUF ecosystem and first-class Apple Silicon Metal support. | Benchmark binding options; do not expose FFI or model-specific types to core crates. |
+| Prompt compression | Deterministic compactor first; LLMLingua-2 mBERT as a measured future option | Keeps exact source spans authoritative while allowing a later small extractive semantic stage. | Load on demand in a separately measured phase; require unload proof, fresh Qwen admission, code/log retention tests, and a Rust-compatible implementation before promotion. |
+| Local inference | `llama-cpp-4` 0.6.0 behind `ModelRuntime` | Direct in-process llama.cpp, GGUF support, and Apple Silicon Metal acceleration without an HTTP sidecar. | Pin wrapper/sys and upstream llama.cpp revisions; keep FFI and model-specific types inside `pam_model`. |
 | Model acquisition | Hugging Face-compatible catalog/import | Lets users choose location and weights; no bundled payload. | License notice, size/memory estimate, resumable download, checksum, explicit consent. |
 | HTTP | reqwest + rustls + rustls-platform-verifier | Async connectors with native trust behavior for corporate CAs on macOS/Windows. | Proxy/CA diagnostics, destination policy, timeouts, retry budgets, response limits. |
 | Secrets | keyring-core + platform backends | Native Keychain/Credential Manager/Secret Service behavior. | Store opaque tokens only; never log or return connector credentials. |
@@ -42,10 +43,10 @@ losing or duplicating accepted work.
 
 ## llama.cpp integration decision gate
 
-The Rust binding layer is deliberately not final. `llama-cpp-4` 0.6 is a current
-candidate with Metal support and safe wrappers, but its recent release raises
-maintenance and packaging risk. Before the runtime scaffold commits to it, a
-time-boxed Mac spike must measure:
+The first runtime adapter uses `llama-cpp-4` 0.6.0 with default features
+disabled and only static Metal enabled. The binding remains isolated behind a
+model-neutral contract because its recent release still carries maintenance,
+native-abort, and packaging risk. The measured Mac spike records:
 
 - universal/aarch64 build and codesigning behavior;
 - Metal startup and first-token latency;
@@ -55,19 +56,30 @@ time-boxed Mac spike must measure:
 - model unload/reload safety;
 - binary size and license inventory.
 
-If the binding fails the gate, keep the same `ModelRuntime` contract and compare
-a minimal maintained C-ABI wrapper. Running a separately installed model server
-can be supported as an adapter, but does not replace the one-binary embedded
-goal.
+The available M4 Max/64 GiB host passed the static aarch64 Metal, development
+signing, linkage, startup, first-token, and host-memory gates. Qwen3.6 Q4_K_S
+remains calibration history; the production Qwen3-Coder-30B-A3B-Instruct
+Q4_K_S profile passed the 20 GB model-allocation ceiling at 8,192 context
+tokens. M1 Pro with 32 GB memory is the minimum supported Mac; host-specific
+admission is mandatory, and M1 Pro speed remains unmeasured.
+Universal packaging also remains unproven. PAM will use bounded chunk-boundary
+cancellation and a serialized worker instead of the binding's unsafe abort
+callback. See `docs/benchmarks/llama-cpp-macos.md` for commands, measurements,
+limitations, and the fallback criteria. The preview uses the embedded adapter
+only: no separately installed model server, HTTP listener, or subprocess is
+part of the runtime path.
 
 ## Reference model policy
 
-PAM maintains model capability profiles rather than hard-coding one weight.
-Qwen3.6-35B-A3B GGUF is an initial coding/agent candidate for the target M1 Mac
-with 32 GB RAM. The setup UI should recommend quantization only after estimating
-weights, KV cache, context, and operating-system headroom. A Q4 variant may fit
-but must be proven on the actual target; smaller quantizations are offered with
-an explicit quality trade-off.
+PAM maintains explicit digest-bound model capability profiles. The first
+production profile is Qwen3-Coder-30B-A3B-Instruct Q4_K_S at 8,192 context,
+documented in `docs/model-memory.md`; it is text-only, supports only
+non-thinking mode, and uses the model card's recommended sampling parameters.
+The adapter admits it only after checking weights, context, compute, calibrated
+contingency, operating-system and PAM reserves, live pressure and swap trend,
+and the 20 GB model-allocation ceiling. Other artifacts and quantizations
+require their own exact projection, calibration, and focused quality suite; M4
+timings are not presented as M1 Pro measurements.
 
 The user chooses the download directory. If they do not, PAM proposes:
 
@@ -75,8 +87,14 @@ The user chooses the download directory. If they do not, PAM proposes:
 ~/llm/<vendor>/<model-name>.<extension>
 ```
 
-PAM records paths, hashes, model metadata, and licenses, but weights remain
-user-owned and are never committed, synchronized, or included in releases.
+`pam_model` now implements exact-hash local import and resumable HTTPS
+acquisition with artifact-bound license consent, strict user-owned paths,
+bounded GGUF structure validation, manual redirect policy, and atomic
+no-replace publication. Schema v7 records only the verified path, hash,
+bounded GGUF metadata, license snapshot, and sanitized source identity;
+weights remain user-owned and are never committed, synchronized, or included
+in releases. See `docs/model-acquisition.md` for the security and recovery
+contract.
 
 ## Proposed workspace boundaries
 
@@ -117,6 +135,5 @@ boundary is proven.
 
 - Minimum supported macOS version and signing/notarization identity.
 - MessagePack library and evolution rules after protocol fixture spike.
-- Exact llama.cpp binding after the measured Mac spike.
-- Whether the OpenAI-compatible local API ships in the first preview or the
-  following model-sharing slice.
+- Whether a later model-sharing slice needs another authenticated PAM protocol
+  operation; an HTTP/OpenAI-compatible listener is intentionally out of scope.

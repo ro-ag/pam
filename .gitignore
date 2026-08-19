@@ -13,6 +13,13 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Model weights and resumable acquisition state are always user-owned.
+*.gguf
+*.pam-model.part
+*.pam-model.json
+*.pam-model.lock
+*.pam-model.tmp-*
+
 # Raw interview material must remain private and outside git.
 /research-private/
 

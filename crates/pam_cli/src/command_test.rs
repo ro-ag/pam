@@ -4,7 +4,7 @@ use clap::Parser;
 use pam_core::{ApprovalId, EvidenceHandle, RequestId};
 use pam_policy::{CapabilityName, ResourceName};
 
-use super::command::{CallerKindArg, Cli, Mode};
+use super::command::{CallerKindArg, Cli, Mode, RetentionScopeArg};
 
 #[test]
 fn no_subcommand_selects_client_mode() {
@@ -82,6 +82,61 @@ fn explicit_subcommands_select_runtime_modes() {
             .mode(),
         Mode::NetworkDiagnostics
     );
+}
+
+#[test]
+fn audit_and_retention_subcommands_select_runtime_modes() {
+    assert_eq!(
+        Cli::try_parse_from(["pam", "audit", "export", "--output", "audit.ndjson"])
+            .unwrap()
+            .mode(),
+        Mode::AuditExport {
+            output: PathBuf::from("audit.ndjson"),
+            after: 0,
+            through: None,
+            approval_id: None,
+            limit: 500,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "retention",
+            "prune",
+            "--scope",
+            "session",
+            "--before-unix-ms",
+            "1700000000000",
+            "--limit",
+            "12",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::RetentionPrune {
+            scope: RetentionScopeArg::Session,
+            before_unix_ms: 1_700_000_000_000,
+            approval_id: None,
+            limit: 12,
+        }
+    );
+}
+
+#[test]
+fn audit_and_retention_commands_require_safe_bounded_arguments() {
+    for arguments in [
+        vec!["pam", "audit", "export"],
+        vec![
+            "pam", "audit", "export", "--output", "audit", "--limit", "0",
+        ],
+        vec![
+            "pam", "audit", "export", "--output", "audit", "--limit", "1001",
+        ],
+        vec!["pam", "retention", "prune"],
+        vec!["pam", "retention", "prune", "--scope", "session"],
+        vec!["pam", "retention", "prune", "--scope", "persistent"],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
 }
 
 #[test]

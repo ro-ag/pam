@@ -6,18 +6,21 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{APPLICATION_VERSION, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{APPLICATION_VERSION, ContentDigest, EvidenceHandle, ProjectId, RequestId};
 use pam_platform::{
     CorporateHttpClientFactory, CorporateHttpClientRequirements, IncomingRequest, LocalEndpoint,
     PacDiagnostic, ProxyBypassDiagnostic, ProxyDiagnosticStatus, ProxyEnvironmentVariable,
     ProxyInputIssueKind, ProxyRouteDiagnostic, ProxySource, ReqwestCorporateHttpClientFactory,
     ServerTransport, TransportError, TransportErrorKind, diagnose_process_proxy, user_data_dir,
 };
-use pam_policy::{CapabilityName, ResourceName};
+use pam_policy::{CapabilityName, ResourceName, redact_audit_detail};
 use pam_protocol::{
     ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
@@ -27,10 +30,11 @@ use pam_protocol::{
     SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
 };
 use pam_store::{
-    AcceptOutcome, AcceptRequest, AuthorizationOutcome, AuthorizationRequest, CallerAuthentication,
-    CancelOutcome, EventRecord, LeasedRequest, Replay, RequestState, Store, StoreError,
-    TerminalState,
+    AcceptOutcome, AcceptRequest, AppendAuditEvent, AuthorizationAudit, AuthorizationOutcome,
+    AuthorizationRequest, CallerAuthentication, CancelOutcome, EventRecord, LeasedRequest, Replay,
+    RequestState, Store, StoreError, TerminalState,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -45,6 +49,8 @@ const LEASE_DURATION: Duration = Duration::from_secs(3);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 const APPROVAL_LIFETIME: Duration = Duration::from_mins(5);
+const AUDIT_RETENTION: Duration = Duration::from_hours(30 * 24);
+static AUDIT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 // UUIDs and current semantic IDs fit comfortably; this also leaves ample room for
 // a maximum evidence chunk and its response envelope in the 1 MiB protocol frame.
 const MAX_REQUEST_IDENTIFIER_BYTES: usize = 256;
@@ -492,7 +498,7 @@ async fn handle_incoming(
             vec![ServerMessage::Result(failure_result(
                 &request,
                 FailureCode::InvalidRequest,
-                "request identifiers must contain 1 to 256 UTF-8 bytes",
+                "request identifiers must contain 1 to 256 UTF-8 bytes without control characters",
             ))],
             None,
         )
@@ -567,7 +573,7 @@ async fn handle_incoming(
     }
 }
 
-async fn request_preflight(
+pub(super) async fn request_preflight(
     request: &RequestEnvelope,
     store: &Store,
     authentication_required: bool,
@@ -579,6 +585,14 @@ async fn request_preflight(
             CallerAuthentication::Authenticated
         )
     {
+        append_request_audit(
+            store,
+            request,
+            "deny",
+            "unauthenticated",
+            "authentication failed",
+        )
+        .await?;
         let mut failure = failure_result(
             request,
             FailureCode::Unauthenticated,
@@ -594,8 +608,90 @@ async fn request_preflight(
         if !matches!(outcome, AuthorizationOutcome::Allowed) {
             return Ok(Some(authorization_failure(request, outcome)));
         }
+    } else if authentication_required {
+        append_request_audit(
+            store,
+            request,
+            "allow",
+            "authenticated",
+            "authentication succeeded; policy enforcement disabled",
+        )
+        .await?;
     }
     Ok(None)
+}
+
+async fn append_request_audit(
+    store: &Store,
+    request: &RequestEnvelope,
+    decision: &str,
+    outcome: &str,
+    detail: &str,
+) -> Result<(), StoreError> {
+    let occurred_at_ms = now_ms();
+    let resource = policy_resource(request)?;
+    let redacted_detail = redact_audit_detail(
+        format!(
+            "capability={} resource={} detail={detail}",
+            request.capability.policy_name(),
+            resource.as_str()
+        )
+        .as_bytes(),
+    );
+    store
+        .append_audit_event(AppendAuditEvent {
+            event_id: request_audit_event_id(request, "authentication", occurred_at_ms),
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: "request.preflight".to_owned(),
+            decision: decision.to_owned(),
+            outcome: outcome.to_owned(),
+            redacted_detail,
+            occurred_at_ms,
+            retain_until_ms: occurred_at_ms
+                .saturating_add(duration_ms(AUDIT_RETENTION))
+                .min(i64::MAX as u64),
+        })
+        .await?;
+    Ok(())
+}
+
+pub(super) fn request_audit_event_id(
+    request: &RequestEnvelope,
+    stage: &str,
+    occurred_at_ms: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        request.request_id.as_str(),
+        request.project_id.as_str(),
+        request.caller_id.as_str(),
+        request.idempotency_key.as_str(),
+        request.capability.policy_name(),
+        stage,
+    ] {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    if let Some(approval_id) = &request.approval_id {
+        hasher.update(approval_id.as_str().as_bytes());
+    }
+    hasher.update(occurred_at_ms.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        AUDIT_EVENT_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    hasher.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    let digest = ContentDigest::from_sha256(hasher.finalize().into());
+    format!("request-preflight-{}", digest.sha256_hex())
 }
 
 async fn authenticate_request(
@@ -617,8 +713,17 @@ async fn authorize_request(
     let capability = CapabilityName::parse(request.capability.policy_name())
         .expect("protocol capability names are statically valid");
     let resource = policy_resource(request)?;
+    let now = now_ms();
+    let detail = redact_audit_detail(
+        format!(
+            "capability={} resource={} detail=project policy evaluated",
+            capability.as_str(),
+            resource.as_str()
+        )
+        .as_bytes(),
+    );
     store
-        .authorize(
+        .authorize_audited(
             AuthorizationRequest {
                 caller_id: request.caller_id.clone(),
                 project_id: request.project_id.clone(),
@@ -626,7 +731,15 @@ async fn authorize_request(
                 resource,
                 approval_id: request.approval_id.clone(),
             },
-            now_ms(),
+            AuthorizationAudit {
+                event_id: request_audit_event_id(request, "policy", now),
+                action: "request.preflight".to_owned(),
+                redacted_detail: detail,
+                retain_until_ms: now
+                    .saturating_add(duration_ms(AUDIT_RETENTION))
+                    .min(i64::MAX as u64),
+            },
+            now,
             duration_ms(APPROVAL_LIFETIME),
         )
         .await
@@ -723,7 +836,7 @@ async fn handle_read_only(
             handle_brief(request, incoming, store, outbound, brief_provider).await
         }
         (Capability::NetworkDiagnostics, RequestPayload::NetworkDiagnostics) => {
-            handle_network_diagnostics(request, incoming, outbound).await
+            handle_network_diagnostics(request, incoming, store, outbound).await
         }
         (
             Capability::WaitForResult,
@@ -794,11 +907,36 @@ async fn handle_read_only(
 async fn handle_network_diagnostics(
     request: &RequestEnvelope,
     incoming: IncomingRequest,
+    store: &Store,
     outbound: &mpsc::Sender<Outbound>,
 ) -> Result<(), DaemonError> {
     let (truth, result) = tokio::task::spawn_blocking(collect_network_diagnostics)
         .await
         .map_err(DaemonError::Handler)?;
+    let occurred_at_ms = now_ms();
+    let detail = format!(
+        "platform_roots={} system_proxy={} proxy_environment={} no_proxy={} pac={}",
+        result.platform_roots_enabled,
+        result.system_proxy_discovery_enabled,
+        configuration_presence_label(result.proxy_environment_presence),
+        configuration_presence_label(result.no_proxy_presence),
+        pac_state_label(result.pac_state)
+    );
+    store
+        .append_audit_event(AppendAuditEvent {
+            event_id: request_audit_event_id(request, "network-observation", occurred_at_ms),
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: "network.diagnostics".to_owned(),
+            decision: "observe".to_owned(),
+            outcome: truth_label(&truth).to_owned(),
+            redacted_detail: redact_audit_detail(detail.as_bytes()),
+            occurred_at_ms,
+            retain_until_ms: occurred_at_ms
+                .saturating_add(duration_ms(AUDIT_RETENTION))
+                .min(i64::MAX as u64),
+        })
+        .await?;
     send_routed(
         outbound,
         incoming,
@@ -811,6 +949,32 @@ async fn handle_network_diagnostics(
     )
     .await;
     Ok(())
+}
+
+const fn configuration_presence_label(value: ConfigurationPresence) -> &'static str {
+    match value {
+        ConfigurationPresence::Configured => "configured",
+        ConfigurationPresence::NotConfigured => "not_configured",
+        ConfigurationPresence::Invalid => "invalid",
+    }
+}
+
+const fn pac_state_label(value: PacState) -> &'static str {
+    match value {
+        PacState::NotDetected => "not_detected",
+        PacState::DetectedUnsupported => "detected_unsupported",
+        PacState::InspectionUnavailable => "inspection_unavailable",
+    }
+}
+
+const fn truth_label(value: &OperationTruth) -> &'static str {
+    match value {
+        OperationTruth::Observed => "observed",
+        OperationTruth::Changed => "changed",
+        OperationTruth::Verified => "verified",
+        OperationTruth::Unresolved => "unresolved",
+        OperationTruth::Blocked => "blocked",
+    }
 }
 
 fn collect_network_diagnostics() -> (OperationTruth, NetworkDiagnosticsResult) {
@@ -1531,7 +1695,37 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
 }
 
 fn identifier_is_bounded(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_REQUEST_IDENTIFIER_BYTES
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_IDENTIFIER_BYTES
+        && !value.chars().any(is_unsafe_identifier_character)
+}
+
+fn is_unsafe_identifier_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
 }
 
 fn brief_is_bounded(brief: &BriefResult) -> bool {

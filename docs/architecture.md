@@ -134,6 +134,33 @@ directory with checksums, size/type metadata, project ownership, retention, and
 redaction state. A compact result stores references into this evidence graph.
 Deletion and retention are explicit operations with audit events.
 
+The durable audit ledger uses a global monotonic sequence while every export is
+restricted to one project. The first bounded export page captures an inclusive
+high-water sequence; later pages reuse it so concurrent appends cannot make an
+export chase a moving tail. This is an append fence, not a long-lived database
+snapshot: an operator should finish paging before running retention pruning.
+The CLI emits versioned deterministic NDJSON to a new file with atomic
+publication and no overwrite. Audit detail is redacted and made terminal-safe
+before persistence, with both input-inspection and stored output bounds; the
+store rejects controls and Unicode format characters in all ledger text fields.
+
+Retention is explicit and bounded. Expired audit rows are deleted at their
+inclusive retention timestamp. Evidence pruning requires a project, either the
+`session` or `project` retention class, an inclusive creation-time cutoff, and a
+batch limit; `persistent` evidence is deliberately excluded. The current
+`session` label has no implicit process-lifetime identity, so PAM does not claim
+automatic session expiry. Evidence handle deletion commits before physical CAS
+cleanup. Blob cleanup then rechecks for references under SQLite writer
+exclusion, never follows symlinks, and reports bytes it could not safely remove
+as pending for a later bounded reconciliation pass. A durable install-intent
+journal gives each put attempt ownership of its exact temporary file and makes
+a blob published before a failed handle transaction discoverable after a crash,
+while cleanup-attempt ordering prevents one unsafe entry from starving later
+removable blobs. Cleanup reports exact committed counts separately from an
+explicit unresolved state; it never converts an unknown amount into a numeric
+claim. This ordering prevents a database rollback from restoring a live handle
+after its blob was unlinked.
+
 PAM integrates with `ptrack` through its supported command or future protocol.
 It does not read or mutate `ptrack`'s database schema directly.
 

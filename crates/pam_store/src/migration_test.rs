@@ -329,6 +329,93 @@ fn policy_migration_upgrades_v3_without_replacing_caller_request_or_evidence_dat
 }
 
 #[test]
+fn audit_migration_upgrades_v4_without_replacing_policy_data() {
+    let (directory, path) = database_path("migration-v4-audit");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 4).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO callers(caller_id, credential_digest, registered_at_ms)
+                 VALUES ('preserved-caller', zeroblob(32), 1);
+             INSERT INTO projects(project_id) VALUES ('preserved-project');
+             INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+                 VALUES ('preserved-project', 7, 'deny', 10);
+             INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'preserved-grant', 'preserved-caller', 'preserved-project', 'deploy',
+                 'exact', 'release', 'allow', 'once', NULL, NULL, 10
+             );
+             INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'preserved-approval', 'preserved-caller', 'preserved-project',
+                 'deploy', 'release', zeroblob(32), 'requested', 11, 20
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved: (i64, String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT version FROM project_policies WHERE project_id = 'preserved-project'),
+                 (SELECT effect FROM capability_grants WHERE grant_id = 'preserved-grant'),
+                 (SELECT state FROM approvals WHERE approval_id = 'preserved-approval')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let retention_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('audit_events', 'evidence_install_intents', 'evidence_gc_attempts')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let install_intent_columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('evidence_install_intents') ORDER BY cid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(preserved, (7, "allow".to_owned(), "requested".to_owned()));
+    assert_eq!(retention_table_count, 3);
+    assert_eq!(
+        install_intent_columns,
+        [
+            "attempt_id",
+            "digest",
+            "temporary_name",
+            "size_bytes",
+            "started_at_ms",
+        ]
+    );
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

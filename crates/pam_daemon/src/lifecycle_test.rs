@@ -7,8 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
+    RequestId,
+};
 use pam_platform::{ClientTransport, LocalEndpoint};
+use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
 use pam_protocol::{
     BriefProvenance, BriefResult, CancellationDisposition, Event, EvidenceRedaction,
     EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, OperationTruth,
@@ -17,12 +21,13 @@ use pam_protocol::{
 };
 use pam_store::{
     EvidenceRedaction as StoreEvidenceRedaction, EvidenceRetention as StoreEvidenceRetention,
-    PutEvidence, RequestState, Store, StoreError,
+    PutEvidence, PutGrant, RequestState, Store, StoreError,
 };
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
-    BriefProvider, DaemonConfig, Ownership, prepare_endpoint, serve_until_with_delay,
+    BriefProvider, DaemonConfig, Ownership, prepare_endpoint, request_audit_event_id,
+    request_preflight, serve_until_with_delay,
 };
 use crate::{DaemonError, request_exchange, request_status};
 
@@ -175,6 +180,77 @@ fn network_request(project: &str, suffix: &str) -> RequestEnvelope {
         ProjectId::new(project),
         IdempotencyKey::new(format!("network-{suffix}")),
     )
+}
+
+#[test]
+fn audit_event_ids_are_unique_for_same_millisecond_retries() {
+    let request = network_request("audit-nonce-project", "same-request");
+    let first = request_audit_event_id(&request, "policy", 42);
+    let second = request_audit_event_id(&request, "policy", 42);
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn authenticated_policy_preflight_appends_a_redacted_project_audit_event() {
+    let runtime = test_runtime("preflight-audit");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).unwrap();
+    let store = Store::open(runtime.join("state.sqlite3")).unwrap();
+    let caller = CallerId::from("audit-caller");
+    let project = ProjectId::from("audit-project");
+    let credential = CallerCredential::new("audit-credential");
+    store
+        .register_caller(caller.clone(), credential.clone(), 1)
+        .await
+        .unwrap();
+    store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::from("audit-status-grant"),
+                caller: caller.clone(),
+                project: project.clone(),
+                capability: CapabilityName::parse("daemon.status").unwrap(),
+                resource: ResourceScope::Exact(ResourceName::parse("daemon").unwrap()),
+                effect: Effect::Allow,
+                approval: ApprovalRequirement::None,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: 2,
+        })
+        .await
+        .unwrap();
+    let request = RequestEnvelope::status(
+        RequestId::from("audit-request"),
+        caller,
+        project.clone(),
+        IdempotencyKey::from("audit-idempotency"),
+    )
+    .authenticated(credential);
+
+    assert!(
+        request_preflight(&request, &store, true, true)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let export = store
+        .export_audit_events(project, 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(export.events.len(), 1);
+    let event = &export.events[0];
+    assert_eq!(event.action, "request.preflight");
+    assert_eq!(event.decision, "allow");
+    assert_eq!(event.outcome, "authorized");
+    assert_eq!(
+        event.redacted_detail,
+        "capability=daemon.status resource=daemon detail=project policy evaluated"
+    );
+    assert!(!event.redacted_detail.contains("audit-credential"));
+
+    store.shutdown().await.unwrap();
+    fs::remove_dir_all(runtime).unwrap();
 }
 
 async fn wait_until_ready(endpoint: &LocalEndpoint) {
@@ -352,9 +428,26 @@ async fn network_diagnostics_are_typed_read_only_and_sanitized() {
 
     let observer = Store::open(&state_path).unwrap();
     assert!(matches!(
-        observer.snapshot(request.request_id).await,
+        observer.snapshot(request.request_id.clone()).await,
         Err(StoreError::RequestNotFound(_))
     ));
+    let audit = observer
+        .export_audit_events(request.project_id.clone(), 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(audit.events.len(), 1);
+    let observation = &audit.events[0];
+    assert_eq!(observation.action, "network.diagnostics");
+    assert_eq!(observation.decision, "observe");
+    assert!(matches!(
+        observation.outcome.as_str(),
+        "observed" | "unresolved"
+    ));
+    assert!(observation.redacted_detail.contains("platform_roots=true"));
+    assert!(observation.redacted_detail.contains("system_proxy=true"));
+    assert!(!observation.redacted_detail.contains("http://"));
+    assert!(!observation.redacted_detail.contains("https://"));
+    assert!(!observation.redacted_detail.contains('@'));
     observer.shutdown().await.unwrap();
 
     shutdown.send(()).unwrap();

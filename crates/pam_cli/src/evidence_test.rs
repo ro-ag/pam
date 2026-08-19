@@ -245,7 +245,7 @@ fn post_publication_errors_report_that_the_target_was_written() {
 
     assert_eq!(
         error.to_string(),
-        "evidence was written to evidence.bin, but PAM could not confirm directory durability"
+        "output was written to evidence.bin, but PAM could not confirm directory durability"
     );
     assert_eq!(
         std::error::Error::source(&error).unwrap().to_string(),

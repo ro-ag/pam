@@ -5,8 +5,68 @@ use pam_core::{
 use pam_policy::{CapabilityName, Grant, ResourceName};
 
 pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EVIDENCE_PRUNE_BATCH_SIZE: u32 = 1_000;
 pub const MAX_EVIDENCE_RANGE_BYTES: u64 = 1024 * 1024;
 pub const MAX_EVIDENCE_MEDIA_TYPE_BYTES: usize = 255;
+pub const AUDIT_EXPORT_VERSION: u32 = 1;
+pub const MAX_AUDIT_ACTION_BYTES: usize = 128;
+pub const MAX_AUDIT_BATCH_SIZE: u32 = 1_000;
+pub const MAX_AUDIT_CALLER_ID_BYTES: usize = 256;
+pub const MAX_AUDIT_DECISION_BYTES: usize = 64;
+pub const MAX_AUDIT_DETAIL_BYTES: usize = 16 * 1024;
+pub const MAX_AUDIT_EVENT_ID_BYTES: usize = 256;
+pub const MAX_AUDIT_OUTCOME_BYTES: usize = 64;
+pub const MAX_AUDIT_PROJECT_ID_BYTES: usize = 256;
+
+/// One audit event to append to the durable ledger.
+///
+/// Callers should redact detail as close to collection as possible. The store
+/// applies the bounded audit redactor again at the persistence boundary so a
+/// missed caller-side match cannot write a recognized secret to the ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendAuditEvent {
+    pub event_id: String,
+    pub project_id: ProjectId,
+    pub caller_id: CallerId,
+    pub action: String,
+    pub decision: String,
+    pub outcome: String,
+    pub redacted_detail: String,
+    pub occurred_at_ms: u64,
+    pub retain_until_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEventRecord {
+    pub sequence: u64,
+    pub event_id: String,
+    pub project_id: ProjectId,
+    pub caller_id: CallerId,
+    pub action: String,
+    pub decision: String,
+    pub outcome: String,
+    pub redacted_detail: String,
+    pub occurred_at_ms: u64,
+    pub retain_until_ms: u64,
+}
+
+/// Versioned typed export seam for deterministic protocol serialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditExport {
+    pub version: u32,
+    pub project_id: ProjectId,
+    pub after_sequence: u64,
+    pub through_sequence: u64,
+    pub next_after_sequence: u64,
+    pub has_more: bool,
+    pub events: Vec<AuditEventRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditPruneOutcome {
+    pub deleted: u32,
+    pub has_more: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallerRegistration {
@@ -44,6 +104,15 @@ pub struct AuthorizationRequest {
     pub capability: CapabilityName,
     pub resource: ResourceName,
     pub approval_id: Option<ApprovalId>,
+}
+
+/// Already-redacted metadata appended atomically with one policy evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationAudit {
+    pub event_id: String,
+    pub action: String,
+    pub redacted_detail: String,
+    pub retain_until_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +181,17 @@ impl EvidenceRetention {
 pub enum EvidenceRedaction {
     Unredacted,
     Redacted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidencePruneOutcome {
+    pub handles_deleted: u32,
+    pub blobs_deleted: u32,
+    pub blobs_pending: u32,
+    /// A cleanup operation failed after logical handle deletion, so numeric
+    /// counts remain exact but do not describe every unresolved cleanup item.
+    pub cleanup_unresolved: bool,
+    pub has_more: bool,
 }
 
 impl EvidenceRedaction {

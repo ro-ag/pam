@@ -1,9 +1,14 @@
 mod app;
+mod audit;
 mod command;
 mod evidence;
 mod render;
 mod request;
 
+#[cfg(test)]
+mod app_test;
+#[cfg(test)]
+mod audit_test;
 #[cfg(test)]
 mod command_test;
 #[cfg(test)]
@@ -64,6 +69,19 @@ async fn main() {
             app::approval_decide(approval_id, pam_store::ApprovalDecision::Deny).await
         }
         Mode::NetworkDiagnostics => app::network_diagnostics().await,
+        Mode::AuditExport {
+            output,
+            after,
+            through,
+            approval_id,
+            limit,
+        } => app::audit_export(&output, after, through, approval_id, limit).await,
+        Mode::RetentionPrune {
+            scope,
+            before_unix_ms,
+            approval_id,
+            limit,
+        } => app::retention_prune(scope, before_unix_ms, approval_id, limit).await,
         Mode::Daemon { recover } => match pam_daemon::run(recover).await {
             Ok(()) => 0,
             Err(error) => {

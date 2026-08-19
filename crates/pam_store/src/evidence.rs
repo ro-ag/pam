@@ -1,6 +1,7 @@
 use std::{
     io::{ErrorKind, Read, Write},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use cap_fs_ext::{
@@ -16,10 +17,36 @@ use uuid::Uuid;
 use crate::store::{sql_integer, unsigned_integer};
 use crate::{
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, MAX_EVIDENCE_BYTES,
-    MAX_EVIDENCE_MEDIA_TYPE_BYTES, MAX_EVIDENCE_RANGE_BYTES, PutEvidence, StoreError,
+    MAX_EVIDENCE_MEDIA_TYPE_BYTES, MAX_EVIDENCE_PRUNE_BATCH_SIZE, MAX_EVIDENCE_RANGE_BYTES,
+    PutEvidence, StoreError,
 };
 
 const EVIDENCE_DIRECTORY: &str = "evidence";
+const INSTALL_INTENT_GRACE_MS: u64 = 10 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PruneOutcome {
+    pub(super) handles_deleted: u32,
+    pub(super) blobs_deleted: u32,
+    pub(super) blobs_pending: u32,
+    pub(super) cleanup_unresolved: bool,
+    pub(super) has_more: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstallIntent {
+    attempt_id: String,
+    temporary_name: String,
+}
+
+impl InstallIntent {
+    fn new() -> Self {
+        Self {
+            attempt_id: Uuid::new_v4().hyphenated().to_string(),
+            temporary_name: Uuid::new_v4().hyphenated().to_string(),
+        }
+    }
+}
 
 pub(super) struct EvidenceFiles {
     base: Dir,
@@ -43,6 +70,19 @@ pub(super) fn put(
     evidence: PutEvidence,
     now_ms: u64,
 ) -> Result<EvidenceMetadata, StoreError> {
+    put_after_blob_installed(connection, files, evidence, now_ms, || {})
+}
+
+fn put_after_blob_installed<F>(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    evidence: PutEvidence,
+    now_ms: u64,
+    after_blob_installed: F,
+) -> Result<EvidenceMetadata, StoreError>
+where
+    F: FnOnce(),
+{
     validate_media_type(&evidence.media_type)?;
     let size_bytes =
         u64::try_from(evidence.bytes.len()).map_err(|_| StoreError::EvidenceTooLarge {
@@ -53,15 +93,51 @@ pub(super) fn put(
     let now = sql_integer(now_ms)?;
     let size = sql_integer(size_bytes)?;
     let digest = content_digest(&evidence.bytes);
-
     if let Some(existing) = find_metadata(connection, &evidence.project_id, &evidence.handle)? {
         ensure_same_mapping(&existing, &evidence, &digest)?;
         verify_blob(files, &existing.digest, existing.size_bytes)?;
         return Ok(existing);
     }
 
-    install_blob(files, &digest, &evidence.bytes)?;
+    let intent = InstallIntent::new();
+    record_install_intent(
+        connection,
+        &intent,
+        &digest,
+        size,
+        sql_integer(system_now_ms())?,
+    )?;
+    // Expensive write, sync, and full-content verification happen without a
+    // SQLite writer lock. A stale intent makes a crash orphan discoverable.
+    install_blob(files, &digest, &evidence.bytes, &intent.temporary_name)?;
+    after_blob_installed();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    if let Some(existing) = find_metadata_tx(&transaction, &evidence.project_id, &evidence.handle)?
+    {
+        ensure_same_mapping(&existing, &evidence, &digest)?;
+        ensure_blob_entry(
+            files,
+            &digest,
+            size_bytes,
+            &evidence.bytes,
+            &intent.temporary_name,
+        )?;
+        transaction.commit()?;
+        clear_install_intent(connection, &intent.attempt_id);
+        return Ok(existing);
+    }
+
+    // Pruning uses the same writer exclusion window. If it removed the
+    // optimistic install before this transaction began, reinstall now; otherwise
+    // only bounded metadata is checked while the global writer is held.
+    ensure_blob_entry(
+        files,
+        &digest,
+        size_bytes,
+        &evidence.bytes,
+        &intent.temporary_name,
+    )?;
     transaction.execute(
         "INSERT OR IGNORE INTO projects(project_id) VALUES (?1)",
         [evidence.project_id.as_str()],
@@ -85,6 +161,7 @@ pub(super) fn put(
     {
         ensure_same_mapping(&existing, &evidence, &digest)?;
         transaction.commit()?;
+        clear_install_intent(connection, &intent.attempt_id);
         return Ok(existing);
     }
 
@@ -103,6 +180,7 @@ pub(super) fn put(
         ],
     )?;
     transaction.commit()?;
+    clear_install_intent(connection, &intent.attempt_id);
 
     Ok(EvidenceMetadata {
         handle: evidence.handle,
@@ -114,6 +192,394 @@ pub(super) fn put(
         redaction: evidence.redaction,
         created_at_ms: now_ms,
     })
+}
+
+fn record_install_intent(
+    connection: &Connection,
+    intent: &InstallIntent,
+    digest: &ContentDigest,
+    size_bytes: i64,
+    started_at_ms: i64,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO evidence_install_intents(
+             attempt_id, digest, temporary_name, size_bytes, started_at_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            intent.attempt_id.as_str(),
+            digest.as_str(),
+            intent.temporary_name.as_str(),
+            size_bytes,
+            started_at_ms
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_install_intent(connection: &Connection, attempt_id: &str) {
+    drop(connection.execute(
+        "DELETE FROM evidence_install_intents WHERE attempt_id = ?1",
+        [attempt_id],
+    ));
+}
+
+/// Deletes one deterministic, bounded page of non-persistent evidence handles.
+///
+/// The inclusive cutoff and retention class are explicit because `session` does
+/// not identify a lifecycle by itself. Filesystem unlink and `SQLite` commit are
+/// deliberately not claimed to be atomic; writer exclusion only prevents a
+/// concurrent put from publishing a handle for a blob while it is being pruned.
+pub(super) fn prune(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    project_id: &ProjectId,
+    retention: EvidenceRetention,
+    created_before_unix_ms: u64,
+    limit: u32,
+) -> Result<PruneOutcome, StoreError> {
+    if retention == EvidenceRetention::Persistent {
+        return Err(StoreError::InvalidEvidencePruneRetention);
+    }
+    if !(1..=MAX_EVIDENCE_PRUNE_BATCH_SIZE).contains(&limit) {
+        return Err(StoreError::InvalidEvidencePruneLimit {
+            limit,
+            maximum: MAX_EVIDENCE_PRUNE_BATCH_SIZE,
+        });
+    }
+    let cutoff = sql_integer(created_before_unix_ms)?;
+    let query_limit = i64::from(limit) + 1;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT handle, digest
+             FROM evidence_handles
+             WHERE project_id = ?1 AND retention = ?2 AND created_at_ms <= ?3
+             ORDER BY created_at_ms, handle
+             LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![project_id.as_str(), retention.as_str(), cutoff, query_limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let has_more = candidates.len()
+        > usize::try_from(limit)
+            .map_err(|_| StoreError::InvalidState("evidence prune limit overflow".to_owned()))?;
+    if has_more {
+        candidates.pop();
+    }
+
+    for (handle, _) in &candidates {
+        let deleted = transaction.execute(
+            "DELETE FROM evidence_handles
+             WHERE project_id = ?1 AND handle = ?2 AND retention = ?3
+               AND created_at_ms <= ?4",
+            params![project_id.as_str(), handle, retention.as_str(), cutoff],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "selected evidence handle changed during prune".to_owned(),
+            ));
+        }
+    }
+    transaction.commit()?;
+
+    // Filesystem cleanup is a recoverable phase after logical handle deletion.
+    // Each blob is rechecked under its own writer exclusion window, so a new put
+    // cannot publish a reference between the zero-reference check and unlink.
+    let cleanup_now_ms = system_now_ms();
+    let intent_cleanup = cleanup_stale_install_intents(connection, files, cleanup_now_ms, limit);
+    let blob_cleanup = cleanup_unreferenced_blobs(connection, files, cleanup_now_ms, limit);
+    Ok(PruneOutcome {
+        handles_deleted: u32::try_from(candidates.len())
+            .map_err(|_| StoreError::InvalidState("evidence prune count overflow".to_owned()))?,
+        blobs_deleted: intent_cleanup.deleted.saturating_add(blob_cleanup.deleted),
+        blobs_pending: intent_cleanup.pending.saturating_add(blob_cleanup.pending),
+        cleanup_unresolved: intent_cleanup.unresolved || blob_cleanup.unresolved,
+        has_more: has_more || intent_cleanup.has_more || blob_cleanup.has_more,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobCleanupOutcome {
+    deleted: u32,
+    pending: u32,
+    unresolved: bool,
+    has_more: bool,
+}
+
+impl BlobCleanupOutcome {
+    fn unresolved() -> Self {
+        Self {
+            deleted: 0,
+            pending: 0,
+            unresolved: true,
+            has_more: true,
+        }
+    }
+
+    fn record(&mut self, attempt: CleanupAttempt, digest: &str, connection: &Connection, now: u64) {
+        if attempt.blob_removed {
+            self.deleted += 1;
+        }
+        if !attempt.resolved {
+            self.pending += 1;
+            self.unresolved = true;
+            self.has_more = true;
+            drop(record_gc_attempt(connection, digest, now));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupAttempt {
+    blob_removed: bool,
+    resolved: bool,
+}
+
+fn cleanup_unreferenced_blobs(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    now_ms: u64,
+    limit: u32,
+) -> BlobCleanupOutcome {
+    let query_limit = i64::from(limit) + 1;
+    let selected = (|| -> Result<Vec<String>, StoreError> {
+        let mut statement = connection.prepare(
+            "SELECT evidence_blobs.digest FROM evidence_blobs
+             LEFT JOIN evidence_gc_attempts
+               ON evidence_gc_attempts.digest = evidence_blobs.digest
+             WHERE NOT EXISTS(
+                 SELECT 1 FROM evidence_handles WHERE evidence_handles.digest = evidence_blobs.digest
+             )
+             ORDER BY COALESCE(evidence_gc_attempts.last_attempt_ms, 0), evidence_blobs.digest
+             LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([query_limit], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    })();
+    let Ok(mut digests) = selected else {
+        return BlobCleanupOutcome::unresolved();
+    };
+    let has_more = digests.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    if has_more {
+        digests.pop();
+    }
+
+    let mut outcome = BlobCleanupOutcome {
+        deleted: 0,
+        pending: 0,
+        unresolved: false,
+        has_more,
+    };
+    for stored_digest in digests {
+        let attempt = cleanup_unreferenced_blob(connection, files, &stored_digest);
+        outcome.record(attempt, &stored_digest, connection, now_ms);
+    }
+    outcome.has_more |= outcome.pending > 0;
+    outcome
+}
+
+fn cleanup_unreferenced_blob(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    stored_digest: &str,
+) -> CleanupAttempt {
+    let mut blob_removed = false;
+    let result = (|| -> Result<(), StoreError> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let referenced: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evidence_handles WHERE digest = ?1)",
+            [stored_digest],
+            |row| row.get(0),
+        )?;
+        if referenced {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let digest = ContentDigest::parse(stored_digest.to_owned())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        blob_removed = remove_blob(files, &digest)? == BlobRemoval::Removed;
+        let row_count = transaction.execute(
+            "DELETE FROM evidence_blobs
+             WHERE digest = ?1
+               AND NOT EXISTS(SELECT 1 FROM evidence_handles WHERE digest = ?1)",
+            [stored_digest],
+        )?;
+        if row_count != 1 {
+            return Err(StoreError::InvalidState(
+                "unreferenced evidence blob changed during prune".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM evidence_gc_attempts WHERE digest = ?1",
+            [stored_digest],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    CleanupAttempt {
+        blob_removed,
+        resolved: result.is_ok(),
+    }
+}
+
+type StoredInstallIntent = (String, String, String);
+
+fn cleanup_stale_install_intents(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    now_ms: u64,
+    limit: u32,
+) -> BlobCleanupOutcome {
+    let Ok(stale_before) = sql_integer(now_ms.saturating_sub(INSTALL_INTENT_GRACE_MS)) else {
+        return BlobCleanupOutcome::unresolved();
+    };
+    let query_limit = i64::from(limit) + 1;
+    let selected = (|| -> Result<Vec<StoredInstallIntent>, StoreError> {
+        let mut statement = connection.prepare(
+            "SELECT evidence_install_intents.attempt_id,
+                    evidence_install_intents.digest,
+                    evidence_install_intents.temporary_name
+             FROM evidence_install_intents
+             LEFT JOIN evidence_gc_attempts
+               ON evidence_gc_attempts.digest = evidence_install_intents.digest
+             WHERE evidence_install_intents.started_at_ms <= ?1
+             ORDER BY COALESCE(evidence_gc_attempts.last_attempt_ms, 0),
+                      evidence_install_intents.started_at_ms,
+                      evidence_install_intents.attempt_id
+             LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![stale_before, query_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    })();
+    let Ok(mut intents) = selected else {
+        return BlobCleanupOutcome::unresolved();
+    };
+    let has_more = intents.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    if has_more {
+        intents.pop();
+    }
+
+    let mut outcome = BlobCleanupOutcome {
+        deleted: 0,
+        pending: 0,
+        unresolved: false,
+        has_more,
+    };
+    for (attempt_id, stored_digest, temporary_name) in intents {
+        let attempt = cleanup_stale_install_intent(
+            connection,
+            files,
+            &attempt_id,
+            &stored_digest,
+            &temporary_name,
+            stale_before,
+        );
+        outcome.record(attempt, &stored_digest, connection, now_ms);
+    }
+    outcome.has_more |= outcome.pending > 0;
+    outcome
+}
+
+fn cleanup_stale_install_intent(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    attempt_id: &str,
+    selected_digest: &str,
+    selected_temporary_name: &str,
+    stale_before: i64,
+) -> CleanupAttempt {
+    let mut blob_removed = false;
+    let result = (|| -> Result<(), StoreError> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = transaction
+            .query_row(
+                "SELECT digest, temporary_name
+                 FROM evidence_install_intents
+                 WHERE attempt_id = ?1 AND started_at_ms <= ?2",
+                params![attempt_id, stale_before],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, temporary_name)) = stored else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        if stored_digest != selected_digest || temporary_name != selected_temporary_name {
+            return Err(StoreError::InvalidState(
+                "evidence install intent changed during cleanup".to_owned(),
+            ));
+        }
+
+        remove_temporary(files, &temporary_name)?;
+        let tracked: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evidence_blobs WHERE digest = ?1)",
+            [&stored_digest],
+            |row| row.get(0),
+        )?;
+        let another_attempt: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM evidence_install_intents
+                 WHERE digest = ?1 AND attempt_id <> ?2
+             )",
+            params![stored_digest, attempt_id],
+            |row| row.get(0),
+        )?;
+        if !tracked && !another_attempt {
+            let digest = ContentDigest::parse(stored_digest.clone())
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            blob_removed = remove_blob(files, &digest)? == BlobRemoval::Removed;
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM evidence_install_intents
+             WHERE attempt_id = ?1 AND started_at_ms <= ?2",
+            params![attempt_id, stale_before],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::InvalidState(
+                "evidence install intent changed during cleanup".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM evidence_gc_attempts
+             WHERE digest = ?1
+               AND NOT EXISTS(
+                   SELECT 1 FROM evidence_install_intents WHERE digest = ?1
+               )",
+            [&stored_digest],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    CleanupAttempt {
+        blob_removed,
+        resolved: result.is_ok(),
+    }
+}
+
+fn record_gc_attempt(connection: &Connection, digest: &str, now_ms: u64) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO evidence_gc_attempts(digest, last_attempt_ms) VALUES (?1, ?2)
+         ON CONFLICT(digest) DO UPDATE SET last_attempt_ms = excluded.last_attempt_ms",
+        params![digest, sql_integer(now_ms)?],
+    )?;
+    Ok(())
+}
+
+fn system_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub(super) fn inspect(
@@ -315,14 +781,42 @@ fn install_blob(
     files: &EvidenceFiles,
     digest: &ContentDigest,
     bytes: &[u8],
+    temporary_name: &str,
 ) -> Result<(), StoreError> {
-    install_blob_after_directories_opened(files, digest, bytes, || {})
+    install_blob_after_directories_opened(files, digest, bytes, temporary_name, || {})
+}
+
+fn ensure_blob_entry(
+    files: &EvidenceFiles,
+    digest: &ContentDigest,
+    size_bytes: u64,
+    bytes: &[u8],
+    temporary_name: &str,
+) -> Result<(), StoreError> {
+    let directories = match BlobDirectories::open(files, digest, false) {
+        Ok(directories) => directories,
+        Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+            return install_blob(files, digest, bytes, temporary_name);
+        }
+        Err(error) => return Err(error),
+    };
+    directories.ensure_current(files)?;
+    match directories.shard.symlink_metadata(digest.sha256_hex()) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == size_bytes => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StoreError::UnsafeEvidencePath),
+        Ok(_) => Err(StoreError::EvidenceBlobCorrupt(digest.clone())),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            install_blob(files, digest, bytes, temporary_name)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn install_blob_after_directories_opened<F>(
     files: &EvidenceFiles,
     digest: &ContentDigest,
     bytes: &[u8],
+    temporary_name: &str,
     after_directories_opened: F,
 ) -> Result<(), StoreError>
 where
@@ -340,14 +834,14 @@ where
         Err(error) => return Err(error),
     }
 
-    let temporary_name = Uuid::new_v4().hyphenated().to_string();
-    let temporary = TemporaryFile::new(&directories.tmp, &temporary_name);
+    validate_temporary_name(temporary_name)?;
+    let temporary = TemporaryFile::new(&directories.tmp, temporary_name);
     let mut options = OpenOptions::new();
     options
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
-    let mut file = directories.tmp.open_with(&temporary_name, &options)?;
+    let mut file = directories.tmp.open_with(temporary_name, &options)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(StoreError::UnsafeEvidencePath);
@@ -356,11 +850,10 @@ where
     file.sync_all()?;
     drop(file);
 
-    match directories.tmp.hard_link(
-        &temporary_name,
-        &directories.blob.shard,
-        digest.sha256_hex(),
-    ) {
+    match directories
+        .tmp
+        .hard_link(temporary_name, &directories.blob.shard, digest.sha256_hex())
+    {
         Ok(()) => sync_directory(&directories.blob.shard)?,
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
@@ -369,6 +862,18 @@ where
     directories.blob.ensure_current(files)?;
     drop(temporary);
     Ok(())
+}
+
+fn validate_temporary_name(temporary_name: &str) -> Result<(), StoreError> {
+    let parsed = Uuid::parse_str(temporary_name)
+        .map_err(|_| StoreError::InvalidState("invalid evidence temporary name".to_owned()))?;
+    if parsed.hyphenated().to_string() == temporary_name {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidState(
+            "invalid evidence temporary name".to_owned(),
+        ))
+    }
 }
 
 struct TemporaryFile<'a> {
@@ -414,6 +919,66 @@ fn verified_blob(
     let bytes = verified_blob_from_shard(&directories.shard, digest, size_bytes)?;
     directories.ensure_current(files)?;
     Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobRemoval {
+    Removed,
+    AlreadyAbsent,
+}
+
+fn remove_temporary(
+    files: &EvidenceFiles,
+    temporary_name: &str,
+) -> Result<BlobRemoval, StoreError> {
+    validate_temporary_name(temporary_name)?;
+    let directories = match TemporaryDirectories::open(files, false) {
+        Ok(directories) => directories,
+        Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+            return Ok(BlobRemoval::AlreadyAbsent);
+        }
+        Err(error) => return Err(error),
+    };
+    directories.ensure_current(files)?;
+    match directories.tmp.symlink_metadata(temporary_name) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(StoreError::UnsafeEvidencePath),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(BlobRemoval::AlreadyAbsent);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    directories.tmp.remove_file(temporary_name)?;
+    sync_directory(&directories.tmp)?;
+    directories.ensure_current(files)?;
+    Ok(BlobRemoval::Removed)
+}
+
+fn remove_blob(files: &EvidenceFiles, digest: &ContentDigest) -> Result<BlobRemoval, StoreError> {
+    let directories = match BlobDirectories::open(files, digest, false) {
+        Ok(directories) => directories,
+        Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+            return Ok(BlobRemoval::AlreadyAbsent);
+        }
+        Err(error) => return Err(error),
+    };
+    directories.ensure_current(files)?;
+    let name = digest.sha256_hex();
+    match directories.shard.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StoreError::UnsafeEvidencePath);
+        }
+        Ok(_) => return Err(StoreError::EvidenceBlobCorrupt(digest.clone())),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(BlobRemoval::AlreadyAbsent);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    directories.shard.remove_file(name)?;
+    sync_directory(&directories.shard)?;
+    directories.ensure_current(files)?;
+    Ok(BlobRemoval::Removed)
 }
 
 fn verified_blob_from_shard(
@@ -507,6 +1072,24 @@ impl BlobDirectories {
 struct WriteDirectories {
     blob: BlobDirectories,
     tmp: Dir,
+}
+
+struct TemporaryDirectories {
+    root: Dir,
+    tmp: Dir,
+}
+
+impl TemporaryDirectories {
+    fn open(files: &EvidenceFiles, create: bool) -> Result<Self, StoreError> {
+        let root = open_directory(&files.base, EVIDENCE_DIRECTORY, create)?;
+        let tmp = open_directory(&root, "tmp", create)?;
+        Ok(Self { root, tmp })
+    }
+
+    fn ensure_current(&self, files: &EvidenceFiles) -> Result<(), StoreError> {
+        ensure_same_directory(&files.base, EVIDENCE_DIRECTORY, &self.root)?;
+        ensure_same_directory(&self.root, "tmp", &self.tmp)
+    }
 }
 
 impl WriteDirectories {
@@ -609,6 +1192,20 @@ pub(super) fn evidence_blob_path(
 }
 
 #[cfg(test)]
+pub(super) fn evidence_temporary_path(
+    database_path: &Path,
+    temporary_name: &str,
+) -> std::path::PathBuf {
+    database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(EVIDENCE_DIRECTORY)
+        .join("tmp")
+        .join(temporary_name)
+}
+
+#[cfg(test)]
 pub(super) fn install_blob_with_namespace_swap<F>(
     files: &EvidenceFiles,
     digest: &ContentDigest,
@@ -618,5 +1215,20 @@ pub(super) fn install_blob_with_namespace_swap<F>(
 where
     F: FnOnce(),
 {
-    install_blob_after_directories_opened(files, digest, bytes, swap)
+    let temporary_name = Uuid::new_v4().hyphenated().to_string();
+    install_blob_after_directories_opened(files, digest, bytes, &temporary_name, swap)
+}
+
+#[cfg(test)]
+pub(super) fn put_with_install_hook<F>(
+    connection: &mut Connection,
+    files: &EvidenceFiles,
+    evidence: PutEvidence,
+    now_ms: u64,
+    after_blob_installed: F,
+) -> Result<EvidenceMetadata, StoreError>
+where
+    F: FnOnce(),
+{
+    put_after_blob_installed(connection, files, evidence, now_ms, after_blob_installed)
 }

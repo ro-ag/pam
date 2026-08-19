@@ -5,7 +5,7 @@ use pam_core::{
 };
 use pam_policy::{
     ApprovalRequirement, Decision, Effect, EffectFingerprint, Grant, ResourceName, ResourceScope,
-    evaluate,
+    evaluate, redact_audit_detail,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -17,22 +17,27 @@ use std::path::PathBuf;
 
 use crate::evidence::{self, EvidenceFiles};
 use crate::{
-    AcceptOutcome, AcceptRequest, ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome,
-    AuthorizationRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
-    CancelOutcome, EventRecord, EvidenceMetadata, GrantRevocation, Lease, LeasedRequest,
-    ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot, RequestState, StoreError,
-    StoredResult, TerminalState,
+    AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
+    ApprovalDecisionOutcome, AuditEventRecord, AuditExport, AuditPruneOutcome, AuthorizationAudit,
+    AuthorizationOutcome, AuthorizationRequest, CallerAuthentication, CallerRegistration,
+    CallerRevocation, CancelOutcome, EventRecord, EvidenceMetadata, EvidencePruneOutcome,
+    EvidenceRetention, GrantRevocation, Lease, LeasedRequest, MAX_AUDIT_ACTION_BYTES,
+    MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES, MAX_AUDIT_DECISION_BYTES,
+    MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
+    MAX_AUDIT_PROJECT_ID_BYTES, ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot,
+    RequestState, StoreError, StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 4;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 5;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
     (3, include_str!("../migrations/0003_callers.sql")),
     (4, include_str!("../migrations/0004_policy.sql")),
+    (5, include_str!("../migrations/0005_audit.sql")),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -168,6 +173,34 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Evaluates policy and appends its audit outcome in the same transaction.
+    ///
+    /// Approval creation, expiry, or one-time consumption is rolled back if the
+    /// audit event cannot be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timing or audit metadata, corrupt policy
+    /// state, or unavailable durable state.
+    pub async fn authorize_audited(
+        &self,
+        request: AuthorizationRequest,
+        audit: AuthorizationAudit,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+    ) -> Result<AuthorizationOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::AuthorizeAudited {
+            request,
+            audit,
+            now_ms,
+            approval_ttl_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Applies a human approval decision to a pending exact effect.
     ///
     /// # Errors
@@ -187,6 +220,85 @@ impl Store {
             approver_id,
             decision,
             now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Appends one already-redacted event to the durable audit ledger.
+    ///
+    /// The event detail is stored exactly as supplied. The caller is responsible
+    /// for redacting secrets and sensitive content before invoking this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized fields, a duplicate stable event
+    /// ID, invalid timestamps, or unavailable durable state.
+    pub async fn append_audit_event(
+        &self,
+        event: AppendAuditEvent,
+    ) -> Result<AuditEventRecord, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Append {
+            event,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Exports one bounded project-scoped page after an exclusive global cursor.
+    ///
+    /// Records are returned in ascending global sequence order through a versioned
+    /// typed seam suitable for deterministic serialization by protocol adapters.
+    /// Pass `None` on the first page to capture a stable high-water sequence, then
+    /// pass the returned `through_sequence` on every subsequent page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid project ID, cursor, batch limit, corrupt
+    /// stored state, or unavailable durable state.
+    pub async fn export_audit_events(
+        &self,
+        project_id: ProjectId,
+        after_sequence: u64,
+        through_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<AuditExport, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Export {
+            project_id,
+            after_sequence,
+            through_sequence,
+            limit,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Prunes at most `limit` retained events for one project.
+    ///
+    /// Events whose retention timestamp is equal to `now_ms` are eligible. Calls
+    /// are deterministic, bounded, project-scoped, and idempotent once no eligible
+    /// records remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid project ID, timestamp, batch limit, or
+    /// unavailable durable state.
+    pub async fn prune_audit_events(
+        &self,
+        project_id: ProjectId,
+        now_ms: u64,
+        limit: u32,
+    ) -> Result<AuditPruneOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Prune {
+            project_id,
+            now_ms,
+            limit,
             response: response_tx,
         }))
         .await?;
@@ -518,6 +630,36 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Deletes one bounded page of non-persistent evidence for a project.
+    ///
+    /// The retention class and inclusive creation-time cutoff are explicit.
+    /// Persistent evidence is never eligible through this API. Cleanup after
+    /// committed handle deletion is best-effort: exact committed counts,
+    /// known pending items, and unresolved cleanup state are returned together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for persistent retention, an invalid cutoff or limit, or
+    /// unavailable durable state before logical deletion commits.
+    pub async fn prune_evidence(
+        &self,
+        project_id: ProjectId,
+        retention: EvidenceRetention,
+        created_before_unix_ms: u64,
+        limit: u32,
+    ) -> Result<EvidencePruneOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_evidence(EvidenceCommand::Prune {
+            project_id,
+            retention,
+            created_before_unix_ms,
+            limit,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Inspects a project-scoped evidence handle and verifies its exact blob.
     ///
     /// # Errors
@@ -622,6 +764,7 @@ async fn receive<T>(response: oneshot::Receiver<Result<T, StoreError>>) -> Resul
 enum Command {
     Caller(CallerCommand),
     Policy(PolicyCommand),
+    Audit(AuditCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -722,12 +865,39 @@ enum PolicyCommand {
         approval_ttl_ms: u64,
         response: Response<AuthorizationOutcome>,
     },
+    AuthorizeAudited {
+        request: AuthorizationRequest,
+        audit: AuthorizationAudit,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+        response: Response<AuthorizationOutcome>,
+    },
     DecideApproval {
         approval_id: ApprovalId,
         approver_id: CallerId,
         decision: ApprovalDecision,
         now_ms: u64,
         response: Response<ApprovalDecisionOutcome>,
+    },
+}
+
+enum AuditCommand {
+    Append {
+        event: AppendAuditEvent,
+        response: Response<AuditEventRecord>,
+    },
+    Export {
+        project_id: ProjectId,
+        after_sequence: u64,
+        through_sequence: Option<u64>,
+        limit: u32,
+        response: Response<AuditExport>,
+    },
+    Prune {
+        project_id: ProjectId,
+        now_ms: u64,
+        limit: u32,
+        response: Response<AuditPruneOutcome>,
     },
 }
 
@@ -749,6 +919,13 @@ enum EvidenceCommand {
         length: u64,
         response: Response<Vec<u8>>,
     },
+    Prune {
+        project_id: ProjectId,
+        retention: EvidenceRetention,
+        created_before_unix_ms: u64,
+        limit: u32,
+        response: Response<EvidencePruneOutcome>,
+    },
     #[cfg(test)]
     Hold {
         entered: mpsc::SyncSender<()>,
@@ -762,6 +939,7 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
         match command {
             Command::Caller(command) => run_caller_command(&mut connection, command),
             Command::Policy(command) => run_policy_command(&mut connection, command),
+            Command::Audit(command) => run_audit_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -891,6 +1069,16 @@ fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
             response,
             authorize(connection, &request, now_ms, approval_ttl_ms),
         ),
+        PolicyCommand::AuthorizeAudited {
+            request,
+            audit,
+            now_ms,
+            approval_ttl_ms,
+            response,
+        } => respond(
+            response,
+            authorize_audited(connection, &request, audit, now_ms, approval_ttl_ms),
+        ),
         PolicyCommand::DecideApproval {
             approval_id,
             approver_id,
@@ -901,6 +1089,365 @@ fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
             response,
             decide_approval(connection, &approval_id, &approver_id, decision, now_ms),
         ),
+    }
+}
+
+fn run_audit_command(connection: &mut Connection, command: AuditCommand) {
+    match command {
+        AuditCommand::Append { event, response } => {
+            respond(response, append_audit_event(connection, event));
+        }
+        AuditCommand::Export {
+            project_id,
+            after_sequence,
+            through_sequence,
+            limit,
+            response,
+        } => respond(
+            response,
+            export_audit_events(
+                connection,
+                &project_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            ),
+        ),
+        AuditCommand::Prune {
+            project_id,
+            now_ms,
+            limit,
+            response,
+        } => respond(
+            response,
+            prune_audit_events(connection, &project_id, now_ms, limit),
+        ),
+    }
+}
+
+fn append_audit_event(
+    connection: &mut Connection,
+    event: AppendAuditEvent,
+) -> Result<AuditEventRecord, StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let record = append_audit_event_tx(&transaction, event)?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+fn append_audit_event_tx(
+    transaction: &Transaction<'_>,
+    mut event: AppendAuditEvent,
+) -> Result<AuditEventRecord, StoreError> {
+    event.redacted_detail = redact_audit_detail(event.redacted_detail.as_bytes());
+    validate_audit_event(&event)?;
+    let occurred_at = sql_integer(event.occurred_at_ms)?;
+    let retain_until = sql_integer(event.retain_until_ms)?;
+    let existing = transaction
+        .query_row(
+            "SELECT sequence, event_id, project_id, caller_id, action, decision, outcome,
+                    redacted_detail, occurred_at_ms, retain_until_ms
+             FROM audit_events WHERE event_id = ?1",
+            [event.event_id.as_str()],
+            stored_audit_event,
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing = existing.into_record()?;
+        if audit_event_matches(&existing, &event) {
+            return Ok(existing);
+        }
+        return Err(StoreError::AuditEventAlreadyExists);
+    }
+    transaction.execute(
+        "INSERT INTO audit_events(
+            event_id, project_id, caller_id, action, decision, outcome,
+            redacted_detail, occurred_at_ms, retain_until_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.event_id,
+            event.project_id.as_str(),
+            event.caller_id.as_str(),
+            event.action,
+            event.decision,
+            event.outcome,
+            event.redacted_detail,
+            occurred_at,
+            retain_until,
+        ],
+    )?;
+    let sequence = unsigned_integer(transaction.last_insert_rowid())?;
+    Ok(AuditEventRecord {
+        sequence,
+        event_id: event.event_id,
+        project_id: event.project_id,
+        caller_id: event.caller_id,
+        action: event.action,
+        decision: event.decision,
+        outcome: event.outcome,
+        redacted_detail: event.redacted_detail,
+        occurred_at_ms: event.occurred_at_ms,
+        retain_until_ms: event.retain_until_ms,
+    })
+}
+
+fn export_audit_events(
+    connection: &Connection,
+    project_id: &ProjectId,
+    after_sequence: u64,
+    through_sequence: Option<u64>,
+    limit: u32,
+) -> Result<AuditExport, StoreError> {
+    validate_audit_identifier(
+        project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_limit(limit)?;
+    let after = i64::try_from(after_sequence)
+        .map_err(|_| StoreError::AuditCursorOutOfRange(after_sequence))?;
+    if through_sequence.is_some_and(|through| through < after_sequence) {
+        return Err(StoreError::InvalidAuditCursorRange {
+            after: after_sequence,
+            through: through_sequence.expect("checked optional high-water"),
+        });
+    }
+    let maximum: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM audit_events",
+        [],
+        |row| row.get(0),
+    )?;
+    let maximum_sequence = unsigned_integer(maximum)?;
+    let (through_sequence, through) = if let Some(sequence) = through_sequence {
+        if sequence > maximum_sequence {
+            return Err(StoreError::AuditHighWaterAhead {
+                through: sequence,
+                maximum: maximum_sequence,
+            });
+        }
+        (
+            sequence,
+            i64::try_from(sequence).map_err(|_| StoreError::AuditCursorOutOfRange(sequence))?,
+        )
+    } else {
+        (maximum_sequence, maximum)
+    };
+    if through_sequence < after_sequence {
+        return Err(StoreError::InvalidAuditCursorRange {
+            after: after_sequence,
+            through: through_sequence,
+        });
+    }
+    let fetch_limit = i64::from(limit) + 1;
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_id, project_id, caller_id, action, decision, outcome,
+                redacted_detail, occurred_at_ms, retain_until_ms
+         FROM audit_events
+         WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3
+         ORDER BY sequence ASC
+         LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![project_id.as_str(), after, through, fetch_limit],
+        stored_audit_event,
+    )?;
+    let mut events = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(StoredAuditEvent::into_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let page_length = usize::try_from(limit).expect("u32 fits usize on supported platforms");
+    let has_more = events.len() > page_length;
+    events.truncate(page_length);
+    let next_after_sequence = events.last().map_or(after_sequence, |event| event.sequence);
+    Ok(AuditExport {
+        version: AUDIT_EXPORT_VERSION,
+        project_id: project_id.clone(),
+        after_sequence,
+        through_sequence,
+        next_after_sequence,
+        has_more,
+        events,
+    })
+}
+
+struct StoredAuditEvent {
+    sequence: i64,
+    event_id: String,
+    project_id: String,
+    caller_id: String,
+    action: String,
+    decision: String,
+    outcome: String,
+    redacted_detail: String,
+    occurred_at_ms: i64,
+    retain_until_ms: i64,
+}
+
+fn stored_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAuditEvent> {
+    Ok(StoredAuditEvent {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        project_id: row.get(2)?,
+        caller_id: row.get(3)?,
+        action: row.get(4)?,
+        decision: row.get(5)?,
+        outcome: row.get(6)?,
+        redacted_detail: row.get(7)?,
+        occurred_at_ms: row.get(8)?,
+        retain_until_ms: row.get(9)?,
+    })
+}
+
+impl StoredAuditEvent {
+    fn into_record(self) -> Result<AuditEventRecord, StoreError> {
+        Ok(AuditEventRecord {
+            sequence: unsigned_integer(self.sequence)?,
+            event_id: self.event_id,
+            project_id: ProjectId::from(self.project_id),
+            caller_id: CallerId::from(self.caller_id),
+            action: self.action,
+            decision: self.decision,
+            outcome: self.outcome,
+            redacted_detail: self.redacted_detail,
+            occurred_at_ms: unsigned_integer(self.occurred_at_ms)?,
+            retain_until_ms: unsigned_integer(self.retain_until_ms)?,
+        })
+    }
+}
+
+fn audit_event_matches(record: &AuditEventRecord, event: &AppendAuditEvent) -> bool {
+    record.event_id == event.event_id
+        && record.project_id == event.project_id
+        && record.caller_id == event.caller_id
+        && record.action == event.action
+        && record.decision == event.decision
+        && record.outcome == event.outcome
+        && record.redacted_detail == event.redacted_detail
+        && record.occurred_at_ms == event.occurred_at_ms
+        && record.retain_until_ms == event.retain_until_ms
+}
+
+fn prune_audit_events(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+    now_ms: u64,
+    limit: u32,
+) -> Result<AuditPruneOutcome, StoreError> {
+    validate_audit_identifier(
+        project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_limit(limit)?;
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let deleted = transaction.execute(
+        "DELETE FROM audit_events
+         WHERE sequence IN (
+             SELECT sequence FROM audit_events
+             WHERE project_id = ?1 AND retain_until_ms <= ?2
+             ORDER BY sequence ASC
+             LIMIT ?3
+         )",
+        params![project_id.as_str(), now, i64::from(limit)],
+    )?;
+    let has_more = transaction
+        .query_row(
+            "SELECT 1 FROM audit_events
+             WHERE project_id = ?1 AND retain_until_ms <= ?2
+             LIMIT 1",
+            params![project_id.as_str(), now],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    transaction.commit()?;
+    Ok(AuditPruneOutcome {
+        deleted: u32::try_from(deleted).expect("bounded audit deletion count fits u32"),
+        has_more,
+    })
+}
+
+fn validate_audit_event(event: &AppendAuditEvent) -> Result<(), StoreError> {
+    validate_audit_identifier(&event.event_id, MAX_AUDIT_EVENT_ID_BYTES, "event ID")?;
+    validate_audit_identifier(
+        event.project_id.as_str(),
+        MAX_AUDIT_PROJECT_ID_BYTES,
+        "project ID",
+    )?;
+    validate_audit_identifier(
+        event.caller_id.as_str(),
+        MAX_AUDIT_CALLER_ID_BYTES,
+        "caller ID",
+    )?;
+    validate_audit_identifier(&event.action, MAX_AUDIT_ACTION_BYTES, "action")?;
+    validate_audit_identifier(&event.decision, MAX_AUDIT_DECISION_BYTES, "decision")?;
+    validate_audit_identifier(&event.outcome, MAX_AUDIT_OUTCOME_BYTES, "outcome")?;
+    if event.redacted_detail.len() > MAX_AUDIT_DETAIL_BYTES
+        || event.redacted_detail.chars().any(is_unsafe_audit_character)
+    {
+        return Err(StoreError::InvalidAuditEvent("detail"));
+    }
+    if event.retain_until_ms < event.occurred_at_ms {
+        return Err(StoreError::InvalidAuditEvent(
+            "retention precedes occurrence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_identifier(
+    value: &str,
+    maximum_bytes: usize,
+    field: &'static str,
+) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || value.chars().any(is_unsafe_audit_character)
+    {
+        Err(StoreError::InvalidAuditEvent(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_unsafe_audit_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+}
+
+fn validate_audit_limit(limit: u32) -> Result<(), StoreError> {
+    if limit == 0 || limit > MAX_AUDIT_BATCH_SIZE {
+        Err(StoreError::InvalidAuditBatchLimit {
+            limit,
+            maximum: MAX_AUDIT_BATCH_SIZE,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -1019,6 +1566,47 @@ fn authorize(
 ) -> Result<AuthorizationOutcome, StoreError> {
     let now = sql_integer(now_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = authorize_tx(&transaction, request, now, now_ms, approval_ttl_ms)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn authorize_audited(
+    connection: &mut Connection,
+    request: &AuthorizationRequest,
+    audit: AuthorizationAudit,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = authorize_tx(&transaction, request, now, now_ms, approval_ttl_ms)?;
+    let (decision, audit_outcome) = authorization_audit_outcome(&outcome);
+    append_audit_event_tx(
+        &transaction,
+        AppendAuditEvent {
+            event_id: audit.event_id,
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: audit.action,
+            decision: decision.to_owned(),
+            outcome: audit_outcome.to_owned(),
+            redacted_detail: audit.redacted_detail,
+            occurred_at_ms: now_ms,
+            retain_until_ms: audit.retain_until_ms,
+        },
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn authorize_tx(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
     let active_caller = transaction
         .query_row(
             "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
@@ -1028,10 +1616,9 @@ fn authorize(
         .optional()?
         .is_some();
     if !active_caller {
-        transaction.commit()?;
         return Ok(AuthorizationOutcome::Denied);
     }
-    let grants = load_grants(&transaction, request)?;
+    let grants = load_grants(transaction, request)?;
     let decision = evaluate(
         &grants,
         &request.caller_id,
@@ -1044,11 +1631,22 @@ fn authorize(
         Decision::Allowed => AuthorizationOutcome::Allowed,
         Decision::Denied => AuthorizationOutcome::Denied,
         Decision::ApprovalRequired => {
-            authorize_with_approval(&transaction, request, now, now_ms, approval_ttl_ms)?
+            authorize_with_approval(transaction, request, now, now_ms, approval_ttl_ms)?
         }
     };
-    transaction.commit()?;
     Ok(outcome)
+}
+
+const fn authorization_audit_outcome(
+    outcome: &AuthorizationOutcome,
+) -> (&'static str, &'static str) {
+    match outcome {
+        AuthorizationOutcome::Allowed => ("allow", "authorized"),
+        AuthorizationOutcome::Denied => ("deny", "forbidden"),
+        AuthorizationOutcome::ApprovalRequired { .. } => ("challenge", "approval_required"),
+        AuthorizationOutcome::ApprovalDenied => ("deny", "approval_denied"),
+        AuthorizationOutcome::ApprovalExpired => ("deny", "approval_expired"),
+    }
 }
 
 fn load_grants(
@@ -1344,6 +1942,30 @@ fn run_evidence_worker(
             } => respond(
                 response,
                 evidence::read_range(&connection, &files, &project_id, &handle, offset, length),
+            ),
+            EvidenceCommand::Prune {
+                project_id,
+                retention,
+                created_before_unix_ms,
+                limit,
+                response,
+            } => respond(
+                response,
+                evidence::prune(
+                    &mut connection,
+                    &files,
+                    &project_id,
+                    retention,
+                    created_before_unix_ms,
+                    limit,
+                )
+                .map(|outcome| EvidencePruneOutcome {
+                    handles_deleted: outcome.handles_deleted,
+                    blobs_deleted: outcome.blobs_deleted,
+                    blobs_pending: outcome.blobs_pending,
+                    cleanup_unresolved: outcome.cleanup_unresolved,
+                    has_more: outcome.has_more,
+                }),
             ),
             #[cfg(test)]
             EvidenceCommand::Hold { entered, release } => {

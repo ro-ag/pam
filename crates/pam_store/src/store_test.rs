@@ -7,9 +7,12 @@ use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceNam
 use rusqlite::Connection;
 
 use super::{
-    AcceptOutcome, AcceptRequest, ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome,
+    AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
+    ApprovalDecisionOutcome, AuditPruneOutcome, AuthorizationAudit, AuthorizationOutcome,
     AuthorizationRequest, CallerAuthentication, CallerRevocation, CancelOutcome, GrantRevocation,
-    PutGrant, RequestState, Store, StoreError, TerminalState,
+    MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
+    MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
+    MAX_AUDIT_PROJECT_ID_BYTES, PutGrant, RequestState, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -71,6 +74,35 @@ fn authorization(
         capability: capability(capability_name),
         resource: resource(resource_name),
         approval_id,
+    }
+}
+
+fn audit_event(
+    event_id: &str,
+    project_id: &str,
+    caller_id: &str,
+    occurred_at_ms: u64,
+    retain_until_ms: u64,
+) -> AppendAuditEvent {
+    AppendAuditEvent {
+        event_id: event_id.to_owned(),
+        project_id: ProjectId::from(project_id),
+        caller_id: CallerId::from(caller_id),
+        action: "policy.authorize".to_owned(),
+        decision: "allow".to_owned(),
+        outcome: "completed".to_owned(),
+        redacted_detail: format!("event={event_id}"),
+        occurred_at_ms,
+        retain_until_ms,
+    }
+}
+
+fn authorization_audit(event_id: &str, retain_until_ms: u64) -> AuthorizationAudit {
+    AuthorizationAudit {
+        event_id: event_id.to_owned(),
+        action: "policy.authorize".to_owned(),
+        redacted_detail: "bounded redacted policy detail".to_owned(),
+        retain_until_ms,
     }
 }
 
@@ -1515,6 +1547,91 @@ async fn approvals_are_exact_durable_and_consumed_atomically_once() {
 }
 
 #[tokio::test]
+async fn audit_failure_rolls_back_approval_creation() {
+    let (directory, path, store) = open_approval_store("audit-approval-create-rollback").await;
+    store
+        .append_audit_event(audit_event("collision", "other", "other", 10, 100))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .authorize_audited(
+                authorization(
+                    "approval-subject",
+                    "approval-project",
+                    "deploy",
+                    "release-a",
+                    None,
+                ),
+                authorization_audit("collision", 200),
+                100,
+                20,
+            )
+            .await,
+        Err(StoreError::AuditEventAlreadyExists)
+    ));
+    store.shutdown().await.unwrap();
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM approvals", [], |row| row
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn audit_failure_rolls_back_one_time_approval_consumption() {
+    let (directory, _path, store) = open_approval_store("audit-approval-consume-rollback").await;
+    let request = authorization(
+        "approval-subject",
+        "approval-project",
+        "deploy",
+        "release-a",
+        None,
+    );
+    let AuthorizationOutcome::ApprovalRequired { approval_id, .. } =
+        store.authorize(request.clone(), 100, 20).await.unwrap()
+    else {
+        panic!("approval-requiring grant should return an approval ID")
+    };
+    store
+        .decide_approval(
+            approval_id.clone(),
+            CallerId::from("approval-reviewer"),
+            ApprovalDecision::Approve,
+            101,
+        )
+        .await
+        .unwrap();
+    store
+        .append_audit_event(audit_event("collision", "other", "other", 10, 100))
+        .await
+        .unwrap();
+    let mut approved = request;
+    approved.approval_id = Some(approval_id);
+    assert!(matches!(
+        store
+            .authorize_audited(
+                approved.clone(),
+                authorization_audit("collision", 200),
+                102,
+                20,
+            )
+            .await,
+        Err(StoreError::AuditEventAlreadyExists)
+    ));
+    assert_eq!(
+        store.authorize(approved, 103, 20).await.unwrap(),
+        AuthorizationOutcome::Allowed
+    );
+    close(store, &directory).await;
+}
+
+#[tokio::test]
 async fn approval_decisions_return_denied_and_expired_outcomes() {
     let (directory, _path, store) = open_approval_store("approval-outcomes").await;
     let exact_request = authorization(
@@ -1590,5 +1707,406 @@ async fn approval_decisions_return_denied_and_expired_outcomes() {
         AuthorizationOutcome::ApprovalExpired
     );
 
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_sequence_event_identity_and_records_survive_restart() {
+    let (directory, path) = database_path("audit-restart");
+    let store = Store::open(&path).unwrap();
+    let first = store
+        .append_audit_event(audit_event("event-a1", "project-a", "caller-a", 10, 100))
+        .await
+        .unwrap();
+    let second = store
+        .append_audit_event(audit_event("event-b1", "project-b", "caller-b", 11, 101))
+        .await
+        .unwrap();
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.event_id, "event-a1");
+    assert_eq!(first.redacted_detail, "event=event-a1");
+    assert_eq!(second.sequence, 2);
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    let third = reopened
+        .append_audit_event(audit_event("event-a2", "project-a", "caller-a", 12, 102))
+        .await
+        .unwrap();
+    assert_eq!(third.sequence, 3);
+    let export = reopened
+        .export_audit_events(ProjectId::from("project-a"), 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        export
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.event_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "event-a1"), (3, "event-a2")]
+    );
+    assert_eq!(export.events[0], first);
+    assert_eq!(export.events[1], third);
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_export_is_project_scoped_ordered_paginated_and_deterministic() {
+    let (directory, path) = database_path("audit-export");
+    let store = Store::open(&path).unwrap();
+    for (event_id, project_id, now_ms) in [
+        ("a-1", "project-a", 10),
+        ("b-1", "project-b", 11),
+        ("a-2", "project-a", 12),
+        ("a-3", "project-a", 13),
+    ] {
+        store
+            .append_audit_event(audit_event(event_id, project_id, "caller", now_ms, 100))
+            .await
+            .unwrap();
+    }
+
+    let first_page = store
+        .export_audit_events(ProjectId::from("project-a"), 0, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first_page.version, AUDIT_EXPORT_VERSION);
+    assert_eq!(first_page.project_id, ProjectId::from("project-a"));
+    assert_eq!(first_page.after_sequence, 0);
+    assert_eq!(first_page.through_sequence, 4);
+    assert_eq!(first_page.next_after_sequence, 3);
+    assert!(first_page.has_more);
+    assert_eq!(
+        first_page
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.event_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "a-1"), (3, "a-2")]
+    );
+    assert_eq!(
+        store
+            .export_audit_events(ProjectId::from("project-a"), 0, None, 2)
+            .await
+            .unwrap(),
+        first_page
+    );
+    store
+        .append_audit_event(audit_event("a-4", "project-a", "caller", 14, 100))
+        .await
+        .unwrap();
+
+    let second_page = store
+        .export_audit_events(
+            ProjectId::from("project-a"),
+            first_page.next_after_sequence,
+            Some(first_page.through_sequence),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.next_after_sequence, 4);
+    assert!(!second_page.has_more);
+    assert_eq!(second_page.events[0].event_id, "a-3");
+    let other_project = store
+        .export_audit_events(ProjectId::from("project-b"), 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(other_project.events.len(), 1);
+    assert_eq!(other_project.events[0].event_id, "b-1");
+    assert!(
+        other_project
+            .events
+            .iter()
+            .all(|event| event.project_id == ProjectId::from("project-b"))
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_pruning_is_project_scoped_bounded_inclusive_and_idempotent() {
+    let (directory, path) = database_path("audit-prune");
+    let store = Store::open(&path).unwrap();
+    for (event_id, project_id, retain_until_ms) in [
+        ("a-expired-1", "project-a", 20),
+        ("b-expired", "project-b", 20),
+        ("a-expired-2", "project-a", 20),
+        ("a-future", "project-a", 21),
+    ] {
+        store
+            .append_audit_event(audit_event(
+                event_id,
+                project_id,
+                "caller",
+                10,
+                retain_until_ms,
+            ))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .prune_audit_events(ProjectId::from("project-a"), 19, 1)
+            .await
+            .unwrap(),
+        AuditPruneOutcome {
+            deleted: 0,
+            has_more: false,
+        }
+    );
+    assert_eq!(
+        store
+            .prune_audit_events(ProjectId::from("project-a"), 20, 1)
+            .await
+            .unwrap(),
+        AuditPruneOutcome {
+            deleted: 1,
+            has_more: true,
+        }
+    );
+    let remaining = store
+        .export_audit_events(ProjectId::from("project-a"), 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining
+            .events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a-expired-2", "a-future"]
+    );
+    let other_project = store
+        .export_audit_events(ProjectId::from("project-b"), 0, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(other_project.events[0].event_id, "b-expired");
+
+    assert_eq!(
+        store
+            .prune_audit_events(ProjectId::from("project-a"), 20, 1)
+            .await
+            .unwrap(),
+        AuditPruneOutcome {
+            deleted: 1,
+            has_more: false,
+        }
+    );
+    assert_eq!(
+        store
+            .prune_audit_events(ProjectId::from("project-a"), 20, 1)
+            .await
+            .unwrap(),
+        AuditPruneOutcome {
+            deleted: 0,
+            has_more: false,
+        }
+    );
+    assert_eq!(
+        store
+            .prune_audit_events(ProjectId::from("project-a"), 21, 10)
+            .await
+            .unwrap()
+            .deleted,
+        1
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_fields_cursors_limits_and_timestamps_are_validated_before_storage() {
+    let (directory, path) = database_path("audit-validation");
+    let store = Store::open(&path).unwrap();
+    let valid = audit_event("valid", "project", "caller", 10, 20);
+    let invalid = [
+        AppendAuditEvent {
+            event_id: String::new(),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            event_id: "x".repeat(MAX_AUDIT_EVENT_ID_BYTES + 1),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            project_id: ProjectId::from("x".repeat(MAX_AUDIT_PROJECT_ID_BYTES + 1)),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            caller_id: CallerId::from("x".repeat(MAX_AUDIT_CALLER_ID_BYTES + 1)),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            action: "x".repeat(MAX_AUDIT_ACTION_BYTES + 1),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            decision: "x".repeat(MAX_AUDIT_DECISION_BYTES + 1),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            outcome: "x".repeat(MAX_AUDIT_OUTCOME_BYTES + 1),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            retain_until_ms: 9,
+            ..valid.clone()
+        },
+    ];
+    for event in invalid {
+        assert!(matches!(
+            store.append_audit_event(event).await,
+            Err(StoreError::InvalidAuditEvent(_))
+        ));
+    }
+    for event in [
+        AppendAuditEvent {
+            occurred_at_ms: u64::MAX,
+            retain_until_ms: u64::MAX,
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            retain_until_ms: u64::MAX,
+            ..valid.clone()
+        },
+    ] {
+        assert!(matches!(
+            store.append_audit_event(event).await,
+            Err(StoreError::TimestampOutOfRange(_))
+        ));
+    }
+    assert!(matches!(
+        store
+            .export_audit_events(ProjectId::from("project"), 0, None, 0)
+            .await,
+        Err(StoreError::InvalidAuditBatchLimit { .. })
+    ));
+    assert!(matches!(
+        store
+            .prune_audit_events(ProjectId::from("project"), 20, MAX_AUDIT_BATCH_SIZE + 1,)
+            .await,
+        Err(StoreError::InvalidAuditBatchLimit { .. })
+    ));
+    assert!(matches!(
+        store
+            .export_audit_events(ProjectId::from("project"), u64::MAX, None, 1)
+            .await,
+        Err(StoreError::AuditCursorOutOfRange(u64::MAX))
+    ));
+    let stored = store.append_audit_event(valid.clone()).await.unwrap();
+    assert_eq!(stored.sequence, 1);
+    assert_eq!(
+        store.append_audit_event(valid.clone()).await.unwrap(),
+        stored
+    );
+    let conflicting = AppendAuditEvent {
+        outcome: "changed".to_owned(),
+        ..valid
+    };
+    assert!(matches!(
+        store.append_audit_event(conflicting).await,
+        Err(StoreError::AuditEventAlreadyExists)
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_export_rejects_a_high_water_before_the_exclusive_cursor() {
+    let (directory, path) = database_path("audit-cursor-order");
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store
+            .export_audit_events(ProjectId::from("project"), 2, Some(1), 1)
+            .await,
+        Err(StoreError::InvalidAuditCursorRange {
+            after: 2,
+            through: 1
+        })
+    ));
+    assert!(matches!(
+        store
+            .export_audit_events(ProjectId::from("project"), 0, Some(1), 1)
+            .await,
+        Err(StoreError::AuditHighWaterAhead {
+            through: 1,
+            maximum: 0
+        })
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn audit_rejects_control_and_format_characters_in_every_text_field() {
+    let (directory, path) = database_path("audit-injection");
+    let store = Store::open(&path).unwrap();
+    let valid = audit_event("valid", "project", "caller", 10, 20);
+    let injected = [
+        AppendAuditEvent {
+            event_id: "bad\n".to_owned(),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            project_id: ProjectId::from("bad\r"),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            caller_id: CallerId::from("bad\t"),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            action: "bad\u{202e}".to_owned(),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            decision: "bad\u{200d}".to_owned(),
+            ..valid.clone()
+        },
+        AppendAuditEvent {
+            outcome: "bad\u{00ad}".to_owned(),
+            ..valid.clone()
+        },
+    ];
+    for event in injected {
+        assert!(matches!(
+            store.append_audit_event(event).await,
+            Err(StoreError::InvalidAuditEvent(_))
+        ));
+    }
+    for (event_id, detail) in [
+        ("detail-control", "bad\n"),
+        ("detail-format", "bad\u{2066}"),
+        ("detail-secret", "Authorization: Bearer LeakedSecret"),
+    ] {
+        store
+            .append_audit_event(AppendAuditEvent {
+                event_id: event_id.to_owned(),
+                redacted_detail: detail.to_owned(),
+                ..valid.clone()
+            })
+            .await
+            .unwrap();
+    }
+    let events = store
+        .export_audit_events(ProjectId::from("project"), 0, None, 10)
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(|event| {
+        !event
+            .redacted_detail
+            .chars()
+            .any(|character| character.is_control() || character == '\u{2066}')
+    }));
+    let secret = events
+        .iter()
+        .find(|event| event.event_id == "detail-secret")
+        .unwrap();
+    assert!(secret.redacted_detail.contains("[REDACTED]"));
+    assert!(!secret.redacted_detail.contains("LeakedSecret"));
     close(store, &directory).await;
 }

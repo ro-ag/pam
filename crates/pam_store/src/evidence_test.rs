@@ -5,15 +5,15 @@ use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    EvidenceRedaction, EvidenceRetention, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_RANGE_BYTES,
-    PutEvidence, Store, StoreError,
+    EvidenceRedaction, EvidenceRetention, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_PRUNE_BATCH_SIZE,
+    MAX_EVIDENCE_RANGE_BYTES, PutEvidence, Store, StoreError,
 };
 use crate::{
     evidence::{
-        EvidenceFiles, content_digest, evidence_blob_path, install_blob_with_namespace_swap,
-        validate_size,
+        EvidenceFiles, content_digest, evidence_blob_path, evidence_temporary_path, inspect,
+        install_blob_with_namespace_swap, prune, put_with_install_hook, validate_size,
     },
-    store::database_path,
+    store::{database_path, open_connection},
 };
 
 fn evidence(handle: &str, project: &str, bytes: &[u8]) -> PutEvidence {
@@ -24,6 +24,109 @@ fn evidence(handle: &str, project: &str, bytes: &[u8]) -> PutEvidence {
         retention: EvidenceRetention::Project,
         redaction: EvidenceRedaction::Unredacted,
         bytes: bytes.to_vec(),
+    }
+}
+
+fn retained_evidence(
+    handle: &str,
+    project: &str,
+    retention: EvidenceRetention,
+    bytes: &[u8],
+) -> PutEvidence {
+    PutEvidence {
+        retention,
+        ..evidence(handle, project, bytes)
+    }
+}
+
+fn insert_install_intent(
+    connection: &Connection,
+    attempt_id: &str,
+    digest: &ContentDigest,
+    temporary_name: &str,
+    size_bytes: usize,
+    started_at_ms: i64,
+) {
+    connection
+        .execute(
+            "INSERT INTO evidence_install_intents(
+                 attempt_id, digest, temporary_name, size_bytes, started_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                attempt_id,
+                digest.as_str(),
+                temporary_name,
+                i64::try_from(size_bytes).unwrap(),
+                started_at_ms
+            ],
+        )
+        .unwrap();
+}
+
+fn write_crash_temporary(path: &std::path::Path, temporary_name: &str, bytes: &[u8]) {
+    let temporary = evidence_temporary_path(path, temporary_name);
+    fs::create_dir_all(temporary.parent().unwrap()).unwrap();
+    fs::write(temporary, bytes).unwrap();
+}
+
+async fn put_retention_scope_fixtures(store: &Store) {
+    for (request, created_at_ms) in [
+        (
+            retained_evidence(
+                "evidence://retention/old",
+                "project-a",
+                EvidenceRetention::Project,
+                b"old",
+            ),
+            10,
+        ),
+        (
+            retained_evidence(
+                "evidence://retention/boundary",
+                "project-a",
+                EvidenceRetention::Project,
+                b"boundary",
+            ),
+            20,
+        ),
+        (
+            retained_evidence(
+                "evidence://retention/new",
+                "project-a",
+                EvidenceRetention::Project,
+                b"new",
+            ),
+            21,
+        ),
+        (
+            retained_evidence(
+                "evidence://retention/session",
+                "project-a",
+                EvidenceRetention::Session,
+                b"session",
+            ),
+            1,
+        ),
+        (
+            retained_evidence(
+                "evidence://retention/persistent",
+                "project-a",
+                EvidenceRetention::Persistent,
+                b"persistent",
+            ),
+            1,
+        ),
+        (
+            retained_evidence(
+                "evidence://retention/other-project",
+                "project-b",
+                EvidenceRetention::Project,
+                b"other",
+            ),
+            1,
+        ),
+    ] {
+        store.put_evidence(request, created_at_ms).await.unwrap();
     }
 }
 
@@ -531,4 +634,736 @@ fn content_digest_helper_preserves_sha256_identity() {
         content_digest(b"abc").as_str(),
         "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
+}
+
+#[tokio::test]
+async fn retention_prune_is_bounded_inclusive_and_strictly_scoped() {
+    let (directory, path) = database_path("evidence-retention-scope");
+    let store = Store::open(&path).unwrap();
+    put_retention_scope_fixtures(&store).await;
+    store.shutdown().await.unwrap();
+
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let first = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project-a"),
+        EvidenceRetention::Project,
+        20,
+        1,
+    )
+    .unwrap();
+    assert_eq!(first.handles_deleted, 1);
+    assert_eq!(first.blobs_deleted, 1);
+    assert_eq!(first.blobs_pending, 0);
+    assert!(first.has_more);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_handles
+                 WHERE project_id = 'project-a' AND handle = 'evidence://retention/old'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    let second = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project-a"),
+        EvidenceRetention::Project,
+        20,
+        1,
+    )
+    .unwrap();
+    assert_eq!(second.handles_deleted, 1);
+    assert_eq!(second.blobs_deleted, 1);
+    assert_eq!(second.blobs_pending, 0);
+    assert!(!second.has_more);
+
+    let remaining: Vec<String> = connection
+        .prepare("SELECT handle FROM evidence_handles ORDER BY handle")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        remaining,
+        vec![
+            "evidence://retention/new",
+            "evidence://retention/other-project",
+            "evidence://retention/persistent",
+            "evidence://retention/session",
+        ]
+    );
+
+    assert_eq!(
+        prune(
+            &mut connection,
+            &files,
+            &ProjectId::from("project-a"),
+            EvidenceRetention::Project,
+            20,
+            1,
+        )
+        .unwrap(),
+        crate::evidence::PruneOutcome {
+            handles_deleted: 0,
+            blobs_deleted: 0,
+            blobs_pending: 0,
+            cleanup_unresolved: false,
+            has_more: false,
+        }
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn shared_blob_is_removed_only_after_its_last_handle() {
+    let (directory, path) = database_path("evidence-retention-shared");
+    let store = Store::open(&path).unwrap();
+    let first = store
+        .put_evidence(
+            evidence("evidence://retention/shared-a", "project-a", b"shared"),
+            10,
+        )
+        .await
+        .unwrap();
+    store
+        .put_evidence(
+            evidence("evidence://retention/shared-b", "project-b", b"shared"),
+            10,
+        )
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let blob_path = evidence_blob_path(&path, &first.digest);
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let first_prune = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project-a"),
+        EvidenceRetention::Project,
+        10,
+        10,
+    )
+    .unwrap();
+    assert_eq!(first_prune.handles_deleted, 1);
+    assert_eq!(first_prune.blobs_deleted, 0);
+    assert_eq!(first_prune.blobs_pending, 0);
+    assert!(blob_path.is_file());
+
+    let last_prune = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project-b"),
+        EvidenceRetention::Project,
+        10,
+        10,
+    )
+    .unwrap();
+    assert_eq!(last_prune.handles_deleted, 1);
+    assert_eq!(last_prune.blobs_deleted, 1);
+    assert_eq!(last_prune.blobs_pending, 0);
+    assert!(!blob_path.exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_blobs", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        prune(
+            &mut connection,
+            &files,
+            &ProjectId::from("project-b"),
+            EvidenceRetention::Project,
+            10,
+            10,
+        )
+        .unwrap()
+        .handles_deleted,
+        0
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retention_prune_reports_symlinked_blob_cleanup_pending_without_following_target() {
+    use std::os::unix::fs::symlink;
+
+    let (directory, path) = database_path("evidence-retention-symlink");
+    let store = Store::open(&path).unwrap();
+    let stored = store
+        .put_evidence(
+            evidence(
+                "evidence://retention/symlinked-blob",
+                "project",
+                b"original",
+            ),
+            10,
+        )
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let outside = directory.join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    let blob = evidence_blob_path(&path, &stored.digest);
+    fs::remove_file(&blob).unwrap();
+    symlink(&outside, &blob).unwrap();
+
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let outcome = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        10,
+        10,
+    )
+    .unwrap();
+    assert_eq!(outcome.handles_deleted, 1);
+    assert_eq!(outcome.blobs_deleted, 0);
+    assert_eq!(outcome.blobs_pending, 1);
+    assert!(outcome.has_more);
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_handles", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+    let retry = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        10,
+        10,
+    )
+    .unwrap();
+    assert_eq!(retry.handles_deleted, 0);
+    assert_eq!(retry.blobs_pending, 1);
+    assert!(retry.has_more);
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn retention_prune_recovers_a_crash_orphan_tracked_by_an_install_intent() {
+    let (directory, path) = database_path("evidence-retention-install-intent");
+    let store = Store::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let bytes = b"installed before metadata commit";
+    let digest = content_digest(bytes);
+    install_blob_with_namespace_swap(&files, &digest, bytes, || {}).unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_install_intents(
+                 attempt_id, digest, temporary_name, size_bytes, started_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![
+                "10000000-0000-4000-8000-000000000001",
+                digest.as_str(),
+                "20000000-0000-4000-8000-000000000001",
+                i64::try_from(bytes.len()).unwrap()
+            ],
+        )
+        .unwrap();
+    let blob = evidence_blob_path(&path, &digest);
+    assert!(blob.is_file());
+
+    let outcome = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(outcome.handles_deleted, 0);
+    assert_eq!(outcome.blobs_deleted, 1);
+    assert_eq!(outcome.blobs_pending, 0);
+    assert!(!outcome.cleanup_unresolved);
+    assert!(!blob.exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_install_intents", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn stale_intent_removes_its_exact_crash_temp_before_hardlink_idempotently() {
+    let (directory, path) = database_path("evidence-retention-crash-temp");
+    let store = Store::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let bytes = b"crash before hardlink";
+    let digest = content_digest(bytes);
+    let attempt_id = "10000000-0000-4000-8000-000000000002";
+    let temporary_name = "20000000-0000-4000-8000-000000000002";
+
+    insert_install_intent(
+        &connection,
+        attempt_id,
+        &digest,
+        temporary_name,
+        bytes.len(),
+        0,
+    );
+    write_crash_temporary(&path, temporary_name, bytes);
+    let temporary = evidence_temporary_path(&path, temporary_name);
+    assert!(temporary.is_file());
+    assert!(!evidence_blob_path(&path, &digest).exists());
+
+    let first = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(first.blobs_deleted, 0);
+    assert_eq!(first.blobs_pending, 0);
+    assert!(!first.cleanup_unresolved);
+    assert!(!temporary.exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_install_intents", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+
+    let repeated = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(repeated.blobs_deleted, 0);
+    assert_eq!(repeated.blobs_pending, 0);
+    assert!(!repeated.cleanup_unresolved);
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn stale_same_digest_attempt_cannot_clear_or_delete_a_non_stale_attempt() {
+    let (directory, path) = database_path("evidence-retention-concurrent-intents");
+    let store = Store::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let bytes = b"same digest concurrent attempts";
+    let digest = content_digest(bytes);
+    install_blob_with_namespace_swap(&files, &digest, bytes, || {}).unwrap();
+    let blob = evidence_blob_path(&path, &digest);
+    let stale_attempt = "10000000-0000-4000-8000-000000000003";
+    let stale_temporary = "20000000-0000-4000-8000-000000000003";
+    let active_attempt = "10000000-0000-4000-8000-000000000004";
+    let active_temporary = "20000000-0000-4000-8000-000000000004";
+    insert_install_intent(
+        &connection,
+        stale_attempt,
+        &digest,
+        stale_temporary,
+        bytes.len(),
+        0,
+    );
+    insert_install_intent(
+        &connection,
+        active_attempt,
+        &digest,
+        active_temporary,
+        bytes.len(),
+        i64::MAX,
+    );
+    write_crash_temporary(&path, stale_temporary, bytes);
+    write_crash_temporary(&path, active_temporary, bytes);
+
+    let first = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(first.blobs_deleted, 0);
+    assert_eq!(first.blobs_pending, 0);
+    assert!(!first.cleanup_unresolved);
+    assert!(!evidence_temporary_path(&path, stale_temporary).exists());
+    assert!(evidence_temporary_path(&path, active_temporary).is_file());
+    assert!(blob.is_file());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT attempt_id FROM evidence_install_intents",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        active_attempt
+    );
+
+    connection
+        .execute(
+            "UPDATE evidence_install_intents SET started_at_ms = 0 WHERE attempt_id = ?1",
+            [active_attempt],
+        )
+        .unwrap();
+    let final_cleanup = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(final_cleanup.blobs_deleted, 1);
+    assert_eq!(final_cleanup.blobs_pending, 0);
+    assert!(!final_cleanup.cleanup_unresolved);
+    assert!(!evidence_temporary_path(&path, active_temporary).exists());
+    assert!(!blob.exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_install_intents", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_blob_cleanup_does_not_starve_later_unreferenced_blobs() {
+    use std::os::unix::fs::symlink;
+
+    let (directory, path) = database_path("evidence-retention-pending-fairness");
+    let store = Store::open(&path).unwrap();
+    let first = store
+        .put_evidence(
+            evidence("evidence://retention/fair-a", "project", b"first"),
+            1,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_evidence(
+            evidence("evidence://retention/fair-b", "project", b"second"),
+            2,
+        )
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let (pending_digest, removable_digest) = if first.digest.as_str() < second.digest.as_str() {
+        (first.digest, second.digest)
+    } else {
+        (second.digest, first.digest)
+    };
+    let outside = directory.join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    let pending_blob = evidence_blob_path(&path, &pending_digest);
+    fs::remove_file(&pending_blob).unwrap();
+    symlink(&outside, &pending_blob).unwrap();
+    let removable_blob = evidence_blob_path(&path, &removable_digest);
+
+    let mut connection = open_connection(&path).unwrap();
+    connection
+        .execute("DELETE FROM evidence_handles", [])
+        .unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+    let first_pass = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        2,
+        1,
+    )
+    .unwrap();
+    assert_eq!(first_pass.blobs_pending, 1);
+    assert!(removable_blob.is_file());
+
+    let second_pass = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        2,
+        1,
+    )
+    .unwrap();
+    assert_eq!(second_pass.blobs_deleted, 1);
+    assert!(!removable_blob.exists());
+    assert_eq!(fs::read(outside).unwrap(), b"outside");
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_reports_committed_removals_when_a_later_database_step_fails() {
+    let (directory, path) = database_path("evidence-retention-partial-cleanup");
+    let store = Store::open(&path).unwrap();
+    let first = store
+        .put_evidence(
+            evidence("evidence://retention/partial-a", "project", b"first"),
+            1,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_evidence(
+            evidence("evidence://retention/partial-b", "project", b"second"),
+            2,
+        )
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let (first_digest, later_digest) = if first.digest.as_str() < second.digest.as_str() {
+        (first.digest, second.digest)
+    } else {
+        (second.digest, first.digest)
+    };
+
+    let mut connection = open_connection(&path).unwrap();
+    connection
+        .execute("DELETE FROM evidence_handles", [])
+        .unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_later_blob_delete
+             BEFORE DELETE ON evidence_blobs
+             WHEN OLD.digest = '{}'
+             BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;",
+            later_digest.as_str()
+        ))
+        .unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+
+    let outcome = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        2,
+        10,
+    )
+    .unwrap();
+    assert_eq!(outcome.handles_deleted, 0);
+    assert_eq!(outcome.blobs_deleted, 2);
+    assert_eq!(outcome.blobs_pending, 1);
+    assert!(outcome.cleanup_unresolved);
+    assert!(outcome.has_more);
+    assert!(!evidence_blob_path(&path, &first_digest).exists());
+    assert!(!evidence_blob_path(&path, &later_digest).exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_blobs", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        1
+    );
+
+    connection
+        .execute("DROP TRIGGER fail_later_blob_delete", [])
+        .unwrap();
+    let retry = prune(
+        &mut connection,
+        &files,
+        &ProjectId::from("project"),
+        EvidenceRetention::Project,
+        2,
+        10,
+    )
+    .unwrap();
+    assert_eq!(retry.blobs_deleted, 0);
+    assert_eq!(retry.blobs_pending, 0);
+    assert!(!retry.cleanup_unresolved);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM evidence_blobs", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn retention_prune_rejects_persistent_unbounded_and_invalid_cutoffs() {
+    let (directory, path) = database_path("evidence-retention-validation");
+    let store = Store::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let mut connection = open_connection(&path).unwrap();
+    let files = EvidenceFiles::open(&path).unwrap();
+
+    assert!(matches!(
+        prune(
+            &mut connection,
+            &files,
+            &ProjectId::from("project"),
+            EvidenceRetention::Persistent,
+            10,
+            1,
+        ),
+        Err(StoreError::InvalidEvidencePruneRetention)
+    ));
+    for limit in [0, MAX_EVIDENCE_PRUNE_BATCH_SIZE + 1] {
+        assert!(matches!(
+            prune(
+                &mut connection,
+                &files,
+                &ProjectId::from("project"),
+                EvidenceRetention::Project,
+                10,
+                limit,
+            ),
+            Err(StoreError::InvalidEvidencePruneLimit { limit: actual, maximum })
+                if actual == limit && maximum == MAX_EVIDENCE_PRUNE_BATCH_SIZE
+        ));
+    }
+    assert!(matches!(
+        prune(
+            &mut connection,
+            &files,
+            &ProjectId::from("project"),
+            EvidenceRetention::Project,
+            u64::MAX,
+            1,
+        ),
+        Err(StoreError::TimestampOutOfRange(value)) if value == u64::MAX
+    ));
+
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn put_recovers_when_prune_removes_optimistic_install_before_handle_publish() {
+    let (directory, path) = database_path("evidence-put-prune-exclusion");
+    let store = Store::open(&path).unwrap();
+    store.shutdown().await.unwrap();
+    let (installed_tx, installed_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let put_path = path.clone();
+    let put_thread = std::thread::spawn(move || {
+        let mut connection = open_connection(&put_path).unwrap();
+        let files = EvidenceFiles::open(&put_path).unwrap();
+        put_with_install_hook(
+            &mut connection,
+            &files,
+            evidence("evidence://retention/concurrent-put", "project", b"new"),
+            100,
+            || {
+                installed_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        )
+        .unwrap();
+    });
+    installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let prune_path = path.clone();
+    let (attempting_tx, attempting_rx) = mpsc::sync_channel(1);
+    let (pruned_tx, pruned_rx) = mpsc::sync_channel(1);
+    let prune_thread = std::thread::spawn(move || {
+        let mut connection = open_connection(&prune_path).unwrap();
+        let files = EvidenceFiles::open(&prune_path).unwrap();
+        attempting_tx.send(()).unwrap();
+        let outcome = prune(
+            &mut connection,
+            &files,
+            &ProjectId::from("project"),
+            EvidenceRetention::Project,
+            99,
+            10,
+        )
+        .unwrap();
+        pruned_tx.send(outcome).unwrap();
+    });
+    attempting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let outcome = pruned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(outcome.handles_deleted, 0);
+    assert_eq!(outcome.blobs_deleted, 0);
+    assert_eq!(outcome.blobs_pending, 0);
+    assert!(!outcome.cleanup_unresolved);
+    prune_thread.join().unwrap();
+    release_tx.send(()).unwrap();
+    put_thread.join().unwrap();
+
+    let connection = open_connection(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_handles
+                 WHERE project_id = 'project'
+                   AND handle = 'evidence://retention/concurrent-put'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let files = EvidenceFiles::open(&path).unwrap();
+    assert!(
+        inspect(
+            &connection,
+            &files,
+            &ProjectId::from("project"),
+            &EvidenceHandle::parse("evidence://retention/concurrent-put").unwrap(),
+        )
+        .is_ok()
+    );
+    drop(connection);
+    drop(files);
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -6,8 +6,17 @@ use pam_core::{ApprovalId, CallerId, GrantId, ProjectId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod redaction;
+
 #[cfg(test)]
 mod lib_test;
+#[cfg(test)]
+mod redaction_test;
+
+pub use redaction::{
+    MAX_AUDIT_DETAIL_INPUT_BYTES, MAX_AUDIT_DETAIL_OUTPUT_BYTES, REDACTION_MARKER,
+    TRUNCATION_MARKER, redact_audit_detail,
+};
 
 pub const MAX_CAPABILITY_NAME_BYTES: usize = 128;
 pub const MAX_RESOURCE_NAME_BYTES: usize = 512;

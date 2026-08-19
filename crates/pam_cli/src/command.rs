@@ -6,6 +6,8 @@ use pam_policy::{CapabilityName, ResourceName};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
+const DEFAULT_AUDIT_EXPORT_LIMIT: usize = 500;
+const MAX_AUDIT_EXPORT_LIMIT: usize = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "pam", version, about = "Local project continuity companion")]
@@ -62,6 +64,16 @@ enum Command {
     Network {
         #[command(subcommand)]
         command: NetworkCommand,
+    },
+    /// Export the current project's redacted audit ledger.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+    /// Apply explicit project evidence-retention controls.
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
     },
     /// Run the foreground daemon.
     Daemon {
@@ -155,12 +167,59 @@ enum NetworkCommand {
     Diagnostics,
 }
 
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Write bounded, deterministic NDJSON without overwriting an existing file.
+    Export {
+        /// New output path; existing files are never overwritten.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Export events strictly after this global sequence.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// Reuse the first page's inclusive high-water sequence on later pages.
+        #[arg(long)]
+        through: Option<u64>,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+        /// Maximum events in this export page.
+        #[arg(long, default_value_t = DEFAULT_AUDIT_EXPORT_LIMIT, value_parser = parse_audit_limit)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RetentionCommand {
+    /// Delete bounded evidence handles for the selected retention class.
+    Prune {
+        /// Retention class to remove from the current project.
+        #[arg(long, value_enum)]
+        scope: RetentionScopeArg,
+        /// Delete handles created at or before this Unix timestamp in milliseconds.
+        #[arg(long)]
+        before_unix_ms: u64,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+        /// Maximum handles to delete in this invocation.
+        #[arg(long, default_value_t = DEFAULT_AUDIT_EXPORT_LIMIT, value_parser = parse_audit_limit)]
+        limit: usize,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum CallerKindArg {
     Cli,
     Gui,
     CodingAgent,
     LocalApplication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum RetentionScopeArg {
+    Session,
+    Project,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -205,6 +264,19 @@ pub(crate) enum Mode {
         approval_id: ApprovalId,
     },
     NetworkDiagnostics,
+    AuditExport {
+        output: PathBuf,
+        after: u64,
+        through: Option<u64>,
+        approval_id: Option<ApprovalId>,
+        limit: usize,
+    },
+    RetentionPrune {
+        scope: RetentionScopeArg,
+        before_unix_ms: u64,
+        approval_id: Option<ApprovalId>,
+        limit: usize,
+    },
     Daemon {
         recover: bool,
     },
@@ -275,6 +347,36 @@ impl Cli {
             Some(Command::Network {
                 command: NetworkCommand::Diagnostics,
             }) => Mode::NetworkDiagnostics,
+            Some(Command::Audit {
+                command:
+                    AuditCommand::Export {
+                        output,
+                        after,
+                        through,
+                        approval_id,
+                        limit,
+                    },
+            }) => Mode::AuditExport {
+                output,
+                after,
+                through,
+                approval_id,
+                limit,
+            },
+            Some(Command::Retention {
+                command:
+                    RetentionCommand::Prune {
+                        scope,
+                        before_unix_ms,
+                        approval_id,
+                        limit,
+                    },
+            }) => Mode::RetentionPrune {
+                scope,
+                before_unix_ms,
+                approval_id,
+                limit,
+            },
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }
@@ -326,6 +428,18 @@ fn parse_simple_id(value: &str, label: &str) -> Result<String, String> {
         ));
     }
     Ok(value.to_owned())
+}
+
+fn parse_audit_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be a positive integer".to_owned())?;
+    if limit == 0 || limit > MAX_AUDIT_EXPORT_LIMIT {
+        return Err(format!(
+            "limit must be between 1 and {MAX_AUDIT_EXPORT_LIMIT}"
+        ));
+    }
+    Ok(limit)
 }
 
 fn parse_wait_timeout(value: &str) -> Result<Duration, String> {

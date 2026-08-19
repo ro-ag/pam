@@ -56,24 +56,27 @@ native-abort, and packaging risk. The measured Mac spike records:
 - binary size and license inventory.
 
 The available M4 Max/64 GiB host passed the static aarch64 Metal, development
-signing, linkage, startup, first-token, and host-memory gates. Universal
-packaging and the M1/32 GiB profile remain unproven. PAM will use bounded
-chunk-boundary cancellation and a serialized worker instead of the binding's
-unsafe abort callback. See `docs/benchmarks/llama-cpp-macos.md` for commands,
-measurements, limitations, and the fallback criteria. Running a separately
-installed model server can be supported as an adapter, but does not replace the
-one-binary embedded goal.
+signing, linkage, startup, first-token, and host-memory gates. The exact
+Qwen3.6-35B-A3B Q4_K_S 3.80 bpw profile also passed a 20 GB model-memory ceiling
+through 65,536 context tokens. M1 Pro with 32 GB memory is the minimum supported
+Mac; host-specific admission is mandatory, and M1 Pro speed remains unmeasured.
+Universal packaging also remains unproven. PAM will use bounded chunk-boundary
+cancellation and a serialized worker instead of the binding's unsafe abort
+callback. See `docs/benchmarks/llama-cpp-macos.md` for commands, measurements,
+limitations, and the fallback criteria. Running a separately installed model
+server can be supported as an adapter, but does not replace the one-binary
+embedded goal.
 
 ## Reference model policy
 
 PAM maintains model capability profiles rather than hard-coding one weight.
-Qwen3.6-35B-A3B GGUF is an initial coding/agent candidate for the target M1 Mac
-with 32 GB RAM. The setup UI should recommend quantization only after estimating
-weights, KV cache, context, and operating-system headroom. A Q4 variant may fit
-but must be proven on the actual target; smaller quantizations are offered with
-an explicit quality trade-off. `docs/model-memory.md` defines the runtime-owned
-projection boundary, conservative admission inputs, and task-#24 candidate
-screen without claiming an M1 measurement.
+The first measured profile is the exact digest-bound Qwen3.6-35B-A3B Q4_K_S
+3.80 bpw artifact documented in `docs/model-memory.md`. The setup UI recommends
+it only after checking weights, KV/recurrent state, context, compute,
+operating-system reserve, live pressure, and the 20 GB model-memory ceiling.
+Other quantizations remain explicit quality/capacity trade-offs and require
+their own digest-bound projection and calibration; M4 timings are not presented
+as M1 Pro measurements.
 
 The user chooses the download directory. If they do not, PAM proposes:
 

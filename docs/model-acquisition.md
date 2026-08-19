@@ -90,4 +90,5 @@ Hugging Face credentials, infer legal compatibility, decode tensor payloads,
 recommend quantization, or expose inference. Memory estimation is task #23;
 the completed accounting and candidate screen are documented in
 `docs/model-memory.md`.
-Target-machine profiling is task #24; runtime/API ownership is task #25.
+The selected 20 GB target profile is documented there as task #24 evidence;
+runtime/API ownership remains task #25.

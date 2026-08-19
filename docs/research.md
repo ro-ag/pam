@@ -134,8 +134,9 @@ original source available by handle.
   stage, not the foundation of PAM's loss-aware log reduction.
 - [Qwen3.6-35B-A3B](https://github.com/QwenLM/Qwen3.6) is a current open MoE
   coding/agent model with 35B total and 3B active parameters. Quantized GGUF
-  variants are candidates for an M1 Mac with 32 GB RAM, but PAM should benchmark
-  memory, context size, and tokens per second rather than hard-code one model.
+  variants are candidates for an M1 Pro Mac with 32 GB RAM. PAM selected one
+  exact Q4_K_S profile through measured memory, context, and quality evidence;
+  other artifacts still require their own digest-bound benchmark.
 
 ## Opportunity map
 
@@ -148,7 +149,8 @@ original source available by handle.
 - GPUI can deliver a credible daemon/queue/approval shell on the minimum macOS
   version.
 - Embedded `llama.cpp` can load one candidate GGUF within a safe memory budget
-  on the target M1/32 GB machine.
+  under a 20 GB model-memory ceiling, with M1 Pro/32 GB as the minimum supported
+  Mac and host-specific admission.
 
 ### Build this quarter
 

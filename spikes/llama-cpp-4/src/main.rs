@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use llama_cpp_4::ChatTemplateError;
 use llama_cpp_4::prelude::{
-    AddBos, LlamaBackend, LlamaBatch, LlamaContext, LlamaContextParams, LlamaFlashAttnType,
-    LlamaModel, LlamaModelParams, LlamaSampler, LlamaToken, Special,
+    AddBos, LlamaBackend, LlamaBatch, LlamaChatMessage, LlamaContext, LlamaContextParams,
+    LlamaFlashAttnType, LlamaModel, LlamaModelParams, LlamaSampler, LlamaToken, Special,
 };
 use llama_cpp_4::quantize::GgmlType;
 use serde::Serialize;
@@ -25,8 +26,11 @@ const DEFAULT_PROMPT: &str = "Summarize why durable evidence matters in one sent
 const DEFAULT_GENERATION_TOKENS: usize = 32;
 const MAX_GENERATION_TOKENS: usize = 4096;
 const MIN_CONTEXT_TOKENS: u32 = 512;
+const RUNTIME_BATCH_TOKENS: u32 = 512;
+const INITIAL_CHAT_TEMPLATE_BYTES: usize = 4 * 1024;
+const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 
-const USAGE: &str = "Usage:\n  pam-llama-cpp-4-spike --model <PATH.gguf> [--prompt <TEXT>] [--tokens <COUNT>] [--context <COUNT>]\n\nOptions:\n  --model <PATH.gguf>  Required local GGUF path; the spike never downloads weights\n  --prompt <TEXT>      Prompt text (default: a short evidence-summary prompt)\n  --tokens <COUNT>     Maximum generated tokens, 1..=4096 (default: 32)\n  --context <COUNT>    Context tokens, 512..=model training context (default: prompt + generation, at least 512)\n  -h, --help           Show this help";
+const USAGE: &str = "Usage:\n  pam-llama-cpp-4-spike --model <PATH.gguf> [--prompt <TEXT>] [--chat] [--tokens <COUNT>] [--context <COUNT>] [--max-projected-bytes <BYTES>]\n\nOptions:\n  --model <PATH.gguf>          Required local GGUF path; the spike never downloads weights\n  --prompt <TEXT>              Prompt text, at most 512 tokens after optional chat templating (default: a short evidence-summary prompt)\n  --chat                       Apply the GGUF's embedded tokenizer.chat_template to one user message and add an assistant prompt\n  --tokens <COUNT>             Maximum generated tokens, 1..=4096 (default: 32)\n  --context <COUNT>            Context tokens, 512..=model training context (default: prompt + generation, at least 512)\n  --max-projected-bytes <BYTES>  Fail before model load when the fixed-profile projection exceeds this positive byte cap; requires --context\n  -h, --help                   Show this help";
 
 #[derive(Debug)]
 struct AppError(String);
@@ -51,8 +55,10 @@ type AppResult<T> = Result<T, AppError>;
 struct Config {
     model_path: PathBuf,
     prompt: String,
+    chat: bool,
     generation_tokens: usize,
     context_tokens: Option<u32>,
+    max_projected_bytes: Option<u64>,
 }
 
 enum ParsedArgs {
@@ -67,8 +73,10 @@ impl Config {
 
         let mut model_path = None;
         let mut prompt = None;
+        let mut chat = false;
         let mut generation_tokens = None;
         let mut context_tokens = None;
+        let mut max_projected_bytes = None;
 
         while let Some(argument) = args.next() {
             let flag = argument
@@ -88,6 +96,12 @@ impl Config {
                         .into_string()
                         .map_err(|_| AppError::new("--prompt must be valid UTF-8"))?;
                     set_once(&mut prompt, value, "--prompt")?;
+                }
+                "--chat" => {
+                    if chat {
+                        return Err(AppError::new("--chat may only be specified once"));
+                    }
+                    chat = true;
                 }
                 "--tokens" => {
                     let value = next_value(&mut args, "--tokens")?
@@ -117,19 +131,42 @@ impl Config {
                     }
                     set_once(&mut context_tokens, count, "--context")?;
                 }
+                "--max-projected-bytes" => {
+                    let value = next_value(&mut args, "--max-projected-bytes")?
+                        .into_string()
+                        .map_err(|_| AppError::new("--max-projected-bytes must be valid UTF-8"))?;
+                    let bytes = value.parse::<u64>().map_err(|error| {
+                        AppError::new(format!(
+                            "invalid --max-projected-bytes value {value:?}: {error}"
+                        ))
+                    })?;
+                    if bytes == 0 {
+                        return Err(AppError::new(
+                            "--max-projected-bytes must be greater than zero",
+                        ));
+                    }
+                    set_once(&mut max_projected_bytes, bytes, "--max-projected-bytes")?;
+                }
                 "-h" | "--help" => return Ok(ParsedArgs::Help),
                 unknown => return Err(AppError::new(format!("unknown option {unknown:?}"))),
             }
         }
 
         let model_path = model_path.ok_or_else(|| AppError::new("--model is required"))?;
+        if max_projected_bytes.is_some() && context_tokens.is_none() {
+            return Err(AppError::new(
+                "--max-projected-bytes requires an explicit --context",
+            ));
+        }
         validate_model_path(&model_path)?;
 
         Ok(ParsedArgs::Run(Self {
             model_path,
             prompt: prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_owned()),
+            chat,
             generation_tokens: generation_tokens.unwrap_or(DEFAULT_GENERATION_TOKENS),
             context_tokens,
+            max_projected_bytes,
         }))
     }
 }
@@ -232,6 +269,8 @@ struct ModelReport {
 #[derive(Serialize)]
 struct RequestReport {
     prompt: String,
+    chat_template_applied: bool,
+    chat_template_source: Option<&'static str>,
     prompt_tokens: usize,
     requested_generation_tokens: usize,
     requested_context_tokens: Option<u32>,
@@ -253,6 +292,13 @@ struct ProjectedMemoryReport {
     model_gpu_layers: u32,
     model_training_context_tokens: u32,
     model_expert_count: u32,
+    admission: ProjectionAdmissionReport,
+}
+
+#[derive(Serialize)]
+struct ProjectionAdmissionReport {
+    configured_max_bytes: Option<u64>,
+    result: &'static str,
 }
 
 #[derive(Serialize)]
@@ -328,6 +374,12 @@ struct GenerationMeasurement {
     generated_bytes: Vec<u8>,
 }
 
+struct RuntimeProjection {
+    context_params: LlamaContextParams,
+    elapsed: Duration,
+    report: ProjectedMemoryReport,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -376,19 +428,36 @@ fn benchmark(config: Config) -> AppResult<BenchmarkReport> {
     let backend_init = backend_start.elapsed();
 
     let model_params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+    let preflight_projection = if let Some(maximum_bytes) = config.max_projected_bytes {
+        let context_tokens = config
+            .context_tokens
+            .ok_or_else(|| AppError::new("--max-projected-bytes requires an explicit --context"))?;
+        Some(project_runtime_memory(
+            &model_path,
+            &model_params,
+            context_tokens,
+            "after_backend_init_before_model_load",
+            Some(maximum_bytes),
+        )?)
+    } else {
+        None
+    };
+
     let model_load_start = Instant::now();
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .map_err(|error| AppError::new(format!("model load failed: {error}")))?;
     let model_load = model_load_start.elapsed();
 
+    let tokenization_prompt = prepare_tokenization_prompt(&config, &model)?;
     let tokenize_start = Instant::now();
     let prompt_tokens = model
-        .str_to_token(&config.prompt, AddBos::Always)
+        .str_to_token(&tokenization_prompt, AddBos::Always)
         .map_err(|error| AppError::new(format!("prompt tokenization failed: {error}")))?;
     let prompt_tokenize = tokenize_start.elapsed();
     if prompt_tokens.is_empty() {
         return Err(AppError::new("prompt tokenization produced no tokens"));
     }
+    validate_prompt_batch_size(prompt_tokens.len())?;
 
     let prompt_token_count = u32::try_from(prompt_tokens.len())
         .map_err(|_| AppError::new("prompt token count exceeds llama.cpp limits"))?;
@@ -409,32 +478,21 @@ fn benchmark(config: Config) -> AppResult<BenchmarkReport> {
         required_context_tokens,
         training_context_tokens,
     )?;
-    let batch_tokens = prompt_token_count.max(MIN_CONTEXT_TOKENS);
-    let physical_batch_tokens = batch_tokens.min(MIN_CONTEXT_TOKENS);
-    let context_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(context_tokens))
-        .with_n_batch(batch_tokens)
-        .with_n_ubatch(physical_batch_tokens)
-        .with_n_seq_max(1)
-        .with_flash_attn_type(LlamaFlashAttnType::Auto)
-        .with_cache_type_k(GgmlType::F16)
-        .with_cache_type_v(GgmlType::F16)
-        .with_kv_unified(false);
-
-    let memory_projection_start = Instant::now();
-    let projected_memory = llama_cpp_4::fit::get_device_memory_data(
-        &model_path,
-        &model_params,
-        &context_params,
-        llama_cpp_sys_4::GGML_LOG_LEVEL_ERROR,
-    )
-    .map_err(|error| AppError::new(format!("memory projection failed: {error}")))?;
-    let memory_projection = memory_projection_start.elapsed();
-    let projected_memory = projected_memory_report(projected_memory)?;
+    let runtime_projection = if let Some(projection) = preflight_projection {
+        projection
+    } else {
+        project_runtime_memory(
+            &model_path,
+            &model_params,
+            context_tokens,
+            "after_model_load_before_context_create",
+            None,
+        )?
+    };
 
     let context_create_start = Instant::now();
     let mut context = model
-        .new_context(&backend, context_params)
+        .new_context(&backend, runtime_projection.context_params)
         .map_err(|error| AppError::new(format!("context creation failed: {error}")))?;
     let context_create = context_create_start.elapsed();
 
@@ -453,11 +511,96 @@ fn benchmark(config: Config) -> AppResult<BenchmarkReport> {
         backend_init,
         model_load,
         prompt_tokenize,
-        memory_projection,
+        memory_projection: runtime_projection.elapsed,
         context_create,
-        projected_memory,
+        projected_memory: runtime_projection.report,
     };
     assemble_report(setup, &model, &context, &generation)
+}
+
+fn prepare_tokenization_prompt(config: &Config, model: &LlamaModel) -> AppResult<String> {
+    if !config.chat {
+        return Ok(config.prompt.clone());
+    }
+
+    let message = LlamaChatMessage::new("user".to_owned(), config.prompt.clone())
+        .map_err(|error| AppError::new(format!("chat message creation failed: {error}")))?;
+    let template = embedded_chat_template(model)?;
+    model
+        .apply_chat_template(Some(&template), &[message], true)
+        .map_err(|error| AppError::new(format!("chat template application failed: {error}")))
+}
+
+fn embedded_chat_template(model: &LlamaModel) -> AppResult<String> {
+    match model.get_chat_template(INITIAL_CHAT_TEMPLATE_BYTES) {
+        Ok(template) => Ok(template),
+        Err(ChatTemplateError::BuffSizeError(required)) => {
+            let required = bounded_chat_template_retry_size(required)?;
+            model.get_chat_template(required).map_err(|error| {
+                AppError::new(format!(
+                    "embedded chat template retrieval failed after retry: {error}"
+                ))
+            })
+        }
+        Err(error) => Err(AppError::new(format!(
+            "embedded chat template retrieval failed: {error}"
+        ))),
+    }
+}
+
+fn bounded_chat_template_retry_size(required: usize) -> AppResult<usize> {
+    if required == 0 {
+        return Err(AppError::new(
+            "embedded chat template reported an invalid required buffer size of zero",
+        ));
+    }
+    if required > MAX_CHAT_TEMPLATE_BYTES {
+        return Err(AppError::new(format!(
+            "embedded chat template requires {required} bytes, exceeding the {MAX_CHAT_TEMPLATE_BYTES}-byte safety limit"
+        )));
+    }
+    Ok(required)
+}
+
+fn fixed_runtime_context_params(context_tokens: u32) -> LlamaContextParams {
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context_tokens))
+        .with_n_batch(RUNTIME_BATCH_TOKENS)
+        .with_n_ubatch(RUNTIME_BATCH_TOKENS)
+        .with_n_seq_max(1)
+        .with_flash_attn_type(LlamaFlashAttnType::Auto)
+        .with_cache_type_k(GgmlType::F16)
+        .with_cache_type_v(GgmlType::F16)
+        .with_kv_unified(false)
+}
+
+fn project_runtime_memory(
+    model_path: &std::path::Path,
+    model_params: &LlamaModelParams,
+    context_tokens: u32,
+    query_point: &'static str,
+    maximum_bytes: Option<u64>,
+) -> AppResult<RuntimeProjection> {
+    let context_params = fixed_runtime_context_params(context_tokens);
+    let started = Instant::now();
+    let projection = llama_cpp_4::fit::get_device_memory_data(
+        model_path,
+        model_params,
+        &context_params,
+        llama_cpp_sys_4::GGML_LOG_LEVEL_ERROR,
+    )
+    .map_err(|error| AppError::new(format!("memory projection failed: {error}")))?;
+    let elapsed = started.elapsed();
+    let report = projected_memory_report(projection, query_point, maximum_bytes)?;
+    if let Some(maximum_bytes) = maximum_bytes {
+        enforce_projected_memory_cap(report.total_projected_bytes, maximum_bytes)?;
+    }
+
+    Ok(RuntimeProjection {
+        context_params,
+        elapsed,
+        report,
+    })
 }
 
 fn select_context_tokens(
@@ -482,6 +625,18 @@ fn select_context_tokens(
         )));
     }
     Ok(selected)
+}
+
+fn validate_prompt_batch_size(prompt_tokens: usize) -> AppResult<()> {
+    let maximum = usize::try_from(RUNTIME_BATCH_TOKENS).map_err(|_| {
+        AppError::new("fixed runtime batch size exceeds the platform integer range")
+    })?;
+    if prompt_tokens > maximum {
+        return Err(AppError::new(format!(
+            "prompt tokenization produced {prompt_tokens} tokens, but the fixed runtime batch supports at most {maximum} prompt tokens"
+        )));
+    }
+    Ok(())
 }
 
 fn measure_generation(
@@ -567,7 +722,7 @@ fn assemble_report(
 ) -> AppResult<BenchmarkReport> {
     let live_memory = live_memory_report(context)?;
     Ok(BenchmarkReport {
-        schema_version: 2,
+        schema_version: 3,
         binding: BindingReport {
             crate_name: "llama-cpp-4",
             crate_version: "0.6.0",
@@ -601,6 +756,8 @@ fn assemble_report(
         },
         request: RequestReport {
             prompt: setup.config.prompt,
+            chat_template_applied: setup.config.chat,
+            chat_template_source: setup.config.chat.then_some("gguf:tokenizer.chat_template"),
             prompt_tokens: setup.prompt_tokens,
             requested_generation_tokens: setup.config.generation_tokens,
             requested_context_tokens: setup.config.context_tokens,
@@ -632,6 +789,8 @@ fn assemble_report(
 
 fn projected_memory_report(
     report: llama_cpp_4::fit::DeviceMemoryReport,
+    query_point: &'static str,
+    maximum_bytes: Option<u64>,
 ) -> AppResult<ProjectedMemoryReport> {
     let entries = report
         .entries
@@ -651,24 +810,51 @@ fn projected_memory_report(
             })
         })
         .collect::<AppResult<Vec<_>>>()?;
-    let total_projected_bytes = entries.iter().try_fold(0usize, |total, entry| {
-        total
-            .checked_add(entry.total_projected_bytes)
-            .ok_or_else(|| {
-                AppError::new("total projected memory exceeded the platform integer range")
-            })
-    })?;
+    let total_projected_bytes =
+        checked_projected_memory_sum(entries.iter().map(|entry| entry.total_projected_bytes))?;
 
     Ok(ProjectedMemoryReport {
         source: "llama_cpp_4::fit::get_device_memory_data",
-        query_point: "after_model_load_before_context_create",
-        availability_semantics: "diagnostic_only_use_fresh_os_snapshot_for_admission",
+        query_point,
+        availability_semantics: if maximum_bytes.is_some() {
+            "projection_cap_enforced_before_model_load_without_os_availability_snapshot"
+        } else {
+            "diagnostic_only_use_fresh_os_snapshot_for_admission"
+        },
         entries,
         total_projected_bytes,
         model_gpu_layers: report.hyperparams.n_gpu_layers,
         model_training_context_tokens: report.hyperparams.n_ctx_train,
         model_expert_count: report.hyperparams.n_expert,
+        admission: ProjectionAdmissionReport {
+            configured_max_bytes: maximum_bytes,
+            result: if maximum_bytes.is_some() {
+                "accepted"
+            } else {
+                "not_requested"
+            },
+        },
     })
+}
+
+fn checked_projected_memory_sum(totals: impl IntoIterator<Item = usize>) -> AppResult<usize> {
+    totals.into_iter().try_fold(0usize, |total, entry| {
+        total.checked_add(entry).ok_or_else(|| {
+            AppError::new("total projected memory exceeded the platform integer range")
+        })
+    })
+}
+
+fn enforce_projected_memory_cap(total_projected_bytes: usize, maximum_bytes: u64) -> AppResult<()> {
+    let total_projected_bytes = u64::try_from(total_projected_bytes).map_err(|_| {
+        AppError::new("total projected memory cannot be represented by the configured byte cap")
+    })?;
+    if total_projected_bytes > maximum_bytes {
+        return Err(AppError::new(format!(
+            "projected runtime memory {total_projected_bytes} bytes exceeds --max-projected-bytes cap of {maximum_bytes} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn live_memory_report(context: &LlamaContext<'_>) -> AppResult<LiveMemoryReport> {

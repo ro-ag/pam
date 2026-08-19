@@ -1,6 +1,6 @@
 # Model memory estimates and admission headroom
 
-Date: 2026-08-18
+Date: 2026-08-19
 
 ## Decision
 
@@ -50,9 +50,9 @@ and
 
 ## Initial macOS headroom policy
 
-The policy inputs remain explicit in code so task #24 can tune them from the
-target Mac rather than turning today's assumptions into hidden constants. The
-conservative starting point for that measurement is:
+The policy inputs remain explicit in code so a new artifact or host does not
+turn today's measurements into hidden constants. The conservative starting
+point for an uncalibrated profile is:
 
 ```text
 core = sum(weight + context + compute across distinct runtime entries)
@@ -65,8 +65,8 @@ require model working set + OS reserve <= physical RAM
 require the same allocation to pass a fresh availability/pressure check
 ```
 
-The 10%, 2 GiB, 8 GiB, and 20% values are conservative task-#24 starting
-policy, not measured constants. The contingency covers mapped-buffer/layout
+The 10%, 2 GiB, 8 GiB, and 20% values are conservative uncalibrated defaults,
+not universal constants. The contingency covers mapped-buffer/layout
 variance, allocator and page-table overhead, Metal pipelines, tokenizer/native
 objects, and projection error. PAM's own daemon/API/UI budget is separate so it
 cannot disappear inside a model estimate. Before load, task #25 must re-run the
@@ -77,15 +77,18 @@ fail closed.
 `UnifiedWorkingSetLimit` distinguishes `NotApplicable`, `Known`, and
 `Unknown`. macOS Metal admission requires `Known`; a failed platform query is
 `Unknown` and returns an error rather than silently behaving like an unlimited
-host. The spike's projection query runs after its live model has loaded, so its
-device free/total values are diagnostic and are omitted from the JSON. A real
-admission decision must take one fresh OS availability snapshot before load and
-must never sum per-device free or total values on unified memory.
+host. The capped spike runs its no-allocation projection after backend
+initialization and before model load, then reuses the exact accepted parameters.
+Device free/total values remain diagnostic and are omitted from the JSON. A
+real admission decision must take one fresh OS availability snapshot before
+load and must never sum per-device free or total values on unified memory.
 
 Metal's recommended maximum working set is a device allocation limit, not
 physical RAM. The measured M4 Max reports 55,662,788,608 bytes while the host
-has 64 GiB of unified physical memory. The M1/32 GiB value is unknown and is a
-required input to task #24, not something PAM extrapolates from the M4.
+has 64 GiB of unified physical memory. M1 Pro with 32 GB memory is PAM's
+minimum supported Mac, but each live host still supplies its own working-set
+limit and pressure snapshot. The M4 results below establish the model-memory
+profile, not M1 Pro throughput.
 
 ## Pinned Qwen projection
 
@@ -129,39 +132,60 @@ At only 512 tokens, the exact Q6 projection is already:
 The schema-v2 release spike reported 32,975,905,344 live allocated bytes for
 the same 512-token configuration, 540,344,320 bytes above the no-allocation
 projection because the live mapped Metal weight buffer is larger. The initial
-2 GiB minimum contingency covers that observed allocation-layout delta; task
-#24 still has to compare the estimate with physical-footprint peak, pressure,
-and swap on the target host.
+2 GiB minimum contingency covers that observed allocation-layout delta. The Q6
+artifact remains rejected under the 20 GB product ceiling.
 
 That leaves only 1,924,177,344 bytes of a 32 GiB physical-memory budget before
 projection contingency, PAM, or the OS. The initial 10% contingency alone
 exceeds the remaining capacity, before applying the 8 GiB OS reserve. Q6_K_XL
-is therefore rejected as a 32 GiB candidate without pretending that this M4
-projection is the missing M1 benchmark.
+is therefore rejected as a 32 GiB candidate.
 
-## Candidate screen for task #24
+## Selected 20 GB Q4 profile
 
-The official Unsloth Hugging Face repository currently lists Qwen3.6-35B-A3B
-GGUF artifact sizes of 24.9 GB for UD-Q5_K_S, 22.1 GB for UD-Q4_K_M, 20.9 GB
-for UD-Q4_K_S, and 17.7 GB for UD-IQ4_XS. These catalog bytes are storage and
-screening facts only; exact runtime projections require each digest.
-[Hugging Face model files](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
+The selected artifact is the Apache-2.0
+[`byteshape/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/byteshape/Qwen3.6-35B-A3B-GGUF/tree/57f6dec8727b4c3f5498ff2564a0333ac1f6624a)
+`Qwen3.6-35B-A3B-Q4_K_S-3.80bpw.gguf`: 16,492,334,496 bytes,
+SHA-256
+`ecc07b85c6c3110d1b210aa85935967c7f29f994e6e1c3a07ee486946ae535c1`.
+PAM does not bundle this user-owned file.
 
-- Q6_K_XL is eliminated for 32 GiB by the exact projection above.
-- Q5_K_S is too close to capacity to justify an M1 benchmark under the initial
-  reserve policy.
-- Q4_K_M remains a tight low-context candidate, matching the publisher's
-  general llama.cpp example, but is not a fit recommendation.
-- Q4_K_S is the preferred task-#24 starting candidate because its smaller
-  storage lower bound leaves more room for runtime and PAM overhead.
-- IQ4_XS is a fallback with more capacity headroom and an explicit quality
-  trade-off; task #24 must measure quality as well as memory and speed.
+The exact profile uses full Metal offload, one sequence, batch and micro-batch
+512, automatic flash attention, f16 K/V cache, and non-unified KV. The measured
+context matrix is:
 
-No candidate becomes a default until the exact digest is projected and then
-measured on the actual M1 with 32 GiB RAM. A safe calibration must cover the
-observed peak physical-footprint increase by at least `max(5%, 256 MiB)` without
-overestimating a calibrated configuration by more than 20%; otherwise the
-contingency is retuned and the candidate remains unavailable.
+| Context tokens | Projected bytes | Live buffer bytes | Peak RSS bytes | Decision |
+| ---: | ---: | ---: | ---: | --- |
+| 512 | 17,084,121,664 | 17,250,992,704 | 16,725,098,496 | Pass |
+| 4,096 | 17,160,649,248 | 17,327,520,288 | 16,793,255,936 | Pass |
+| 8,192 | 17,248,729,632 | 17,415,600,672 | 16,876,404,736 | Pass |
+| 32,768 | 17,777,211,936 | 17,944,082,976 | 17,388,961,792 | Pass |
+| 65,536 | 18,481,855,008 | 18,648,726,048 | 18,052,808,704 | Selected maximum |
+| 131,072 | 19,891,141,152 | 20,058,012,192 | 19,394,084,864 | Reject: live buffers exceed cap |
+| 262,144 | 22,709,713,440 | not loaded | 228,638,720 | Rejected before model load |
+
+Every live run recorded zero process swaps. Snapshots immediately before and
+after the selected chat run report system-free memory moving from 90% to 63%
+and encrypted swap usage unchanged at 610.38 MiB. The no-allocation projection
+under-reported live buffers by 166,871,040 bytes. A calibrated contingency of
+`max(5%, 256 MiB)` is 924,092,751 bytes here, producing a calibrated model
+allocation estimate of 19,405,947,759 bytes before PAM's application budget:
+below the 20,000,000,000-byte model ceiling and above the measured live
+allocation. The larger uncalibrated 10%/2 GiB rule continues to apply to any
+other digest or runtime profile.
+
+On a 32 GiB minimum host, the separate 8 GiB OS reserve plus this calibrated
+model allocation uses 27,995,882,351 bytes before PAM's application budget,
+leaving 6,363,856,017 bytes. Startup still fails closed if the live Metal
+working-set limit, availability, or pressure check is unknown or insufficient.
+
+Quality checks through the embedded GGUF chat template passed arithmetic and a
+one-sentence integrity explanation. A sequence prompt returned the correct
+answer with `/no_think`; exact-format output remained unreliable because the
+model could spend the output budget on visible reasoning. This profile is
+therefore suitable for bounded text generation, but task #25 must expose
+reasoning behavior and validate structured output rather than promise it from
+greedy sampling alone. Full commands and timings are in
+`docs/benchmarks/llama-cpp-macos.md`.
 
 ## Scope and portability
 

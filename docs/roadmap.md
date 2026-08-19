@@ -61,7 +61,8 @@ Deliverables:
 
 - llama.cpp binding spike and recorded decision;
 - model import/download, integrity, licensing, memory estimate, and chosen paths;
-- one Qwen-capable profile proven on the M1/32 GB target;
+- one Qwen-capable profile proven below a 20 GB model-memory ceiling, with
+  M1 Pro/32 GB as the minimum supported Mac and host-specific admission;
 - bounded inference queue and optional semantic evidence compression;
 - authenticated local compatible API if it passes the preview scope gate.
 

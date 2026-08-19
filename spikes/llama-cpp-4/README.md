@@ -9,22 +9,35 @@ cargo run --release --locked \
   --manifest-path spikes/llama-cpp-4/Cargo.toml -- \
   --model /absolute/path/to/model.gguf \
   --prompt "Summarize this retained evidence." \
+  --chat \
   --tokens 32 \
-  --context 8192
+  --context 8192 \
+  --max-projected-bytes 20000000000
 ```
 
 llama.cpp writes native diagnostics to stderr. The spike writes one JSON object
 to stdout. `--context` makes the context allocation explicit; when it is
 omitted, the spike selects prompt plus generation length with a 512-token
 minimum. The selected context may not exceed the training context reported by
-the model.
+the model. `--chat` applies the GGUF's embedded `tokenizer.chat_template` to one
+user message and records the template source in the report; it fails closed if
+the template is missing, invalid, or larger than the bounded retrieval limit.
+Raw-prompt mode remains the default.
+
+`--max-projected-bytes` requires an explicit context. The spike initializes the
+backend, runs llama.cpp's no-allocation projection, sums every device entry with
+checked arithmetic, and rejects an over-budget profile before allocating the
+model. An accepted run reuses the exact projected model and context parameters
+for live inference so admission and execution cannot drift.
 
 The JSON `memory_bytes` object records two views of the same pinned parameters:
 
 - `projected` comes from `llama_cpp_4::fit::get_device_memory_data`, which asks
   the vendored llama.cpp to construct a no-allocation model and context and
-  classify model, context, and compute bytes per device entry. The query runs
-  after the benchmark model has loaded but before its live context is created.
+  classify model, context, and compute bytes per device entry. With
+  `--max-projected-bytes`, the query and cap check run after backend
+  initialization but before model load. Without a cap they remain diagnostic
+  and run after model load but before live context creation.
 - `live` comes from `LlamaContext::memory_breakdown` after inference and
   classifies the buffers actually associated with the live context by backend
   buffer type.
@@ -34,9 +47,10 @@ core allocation with system or Metal working-set limits; host and Metal are not
 independent physical-memory pools. Mapped bytes are not proof that every page is
 resident, so this report is an allocation projection, not a process-footprint
 measurement. The report deliberately omits the fit query's per-device free and
-total snapshots: because the live model is already loaded, those values are
-diagnostic rather than preflight availability. Admission must use one fresh OS
-availability snapshot and must never sum per-entry free or total values.
+total snapshots. Admission must use one fresh OS availability snapshot and must
+never sum per-entry free or total values. A projection cap is not proof of live
+physical footprint, so benchmark evidence must still record live buffers, peak
+RSS, pressure, and swap.
 
 Timing values are monotonic-clock microseconds with these boundaries:
 

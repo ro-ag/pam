@@ -2,11 +2,14 @@
 
 mod acquisition;
 mod error;
+mod memory;
 mod model;
 mod path;
 
 #[cfg(test)]
 mod acquisition_test;
+#[cfg(test)]
+mod memory_test;
 #[cfg(test)]
 mod model_test;
 #[cfg(test)]
@@ -17,6 +20,10 @@ pub use acquisition::{
     TransferRequest, download_https, import_existing,
 };
 pub use error::ModelError;
+pub use memory::{
+    HostMemoryBudget, MemoryEstimate, MemoryEstimateError, MemoryFit, RuntimeMemoryProjection,
+    UnifiedWorkingSetLimit, estimate_memory,
+};
 pub use model::{
     GgufMetadata, LicenseConsent, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource,
     RegisteredModel,

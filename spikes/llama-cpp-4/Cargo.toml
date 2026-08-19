@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 llama-cpp-4 = { version = "=0.6.0", default-features = false, features = ["metal"] }
+llama-cpp-sys-4 = { version = "=0.6.0", default-features = false, features = ["metal"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.145"
 

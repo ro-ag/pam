@@ -71,7 +71,9 @@ Qwen3.6-35B-A3B GGUF is an initial coding/agent candidate for the target M1 Mac
 with 32 GB RAM. The setup UI should recommend quantization only after estimating
 weights, KV cache, context, and operating-system headroom. A Q4 variant may fit
 but must be proven on the actual target; smaller quantizations are offered with
-an explicit quality trade-off.
+an explicit quality trade-off. `docs/model-memory.md` defines the runtime-owned
+projection boundary, conservative admission inputs, and task-#24 candidate
+screen without claiming an M1 measurement.
 
 The user chooses the download directory. If they do not, PAM proposes:
 

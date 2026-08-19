@@ -9,14 +9,40 @@ cargo run --release --locked \
   --manifest-path spikes/llama-cpp-4/Cargo.toml -- \
   --model /absolute/path/to/model.gguf \
   --prompt "Summarize this retained evidence." \
-  --tokens 32
+  --tokens 32 \
+  --context 8192
 ```
 
 llama.cpp writes native diagnostics to stderr. The spike writes one JSON object
-to stdout. Timing values are monotonic-clock microseconds with these boundaries:
+to stdout. `--context` makes the context allocation explicit; when it is
+omitted, the spike selects prompt plus generation length with a 512-token
+minimum. The selected context may not exceed the training context reported by
+the model.
+
+The JSON `memory_bytes` object records two views of the same pinned parameters:
+
+- `projected` comes from `llama_cpp_4::fit::get_device_memory_data`, which asks
+  the vendored llama.cpp to construct a no-allocation model and context and
+  classify model, context, and compute bytes per device entry. The query runs
+  after the benchmark model has loaded but before its live context is created.
+- `live` comes from `LlamaContext::memory_breakdown` after inference and
+  classifies the buffers actually associated with the live context by backend
+  buffer type.
+
+On Apple unified-memory systems, sum every projected entry before comparing the
+core allocation with system or Metal working-set limits; host and Metal are not
+independent physical-memory pools. Mapped bytes are not proof that every page is
+resident, so this report is an allocation projection, not a process-footprint
+measurement. The report deliberately omits the fit query's per-device free and
+total snapshots: because the live model is already loaded, those values are
+diagnostic rather than preflight availability. Admission must use one fresh OS
+availability snapshot and must never sum per-entry free or total values.
+
+Timing values are monotonic-clock microseconds with these boundaries:
 
 - `backend_init`: `LlamaBackend::init` only;
 - `model_load`: `LlamaModel::load_from_file` only;
+- `memory_projection`: the complete pinned no-allocation memory query;
 - `prompt_eval`: the complete prompt `decode` call;
 - `time_to_first_token`: prompt-decode start through the first sampled token;
 - `first_token_after_prompt_eval`: prompt-decode completion through first sample;

@@ -88,4 +88,6 @@ missing bytes trustworthy.
 This slice does not automate gated-model account approval, create or persist
 Hugging Face credentials, infer legal compatibility, decode tensor payloads,
 recommend quantization, or expose inference. Memory estimation is task #23;
-target-machine profiling is task #24; runtime/API ownership is task #25.
+the completed accounting and candidate screen are documented in
+`docs/model-memory.md`.
+Target-machine profiling is task #24; runtime/API ownership is task #25.

@@ -5,11 +5,12 @@ use serde::Serialize;
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
-    MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, ReplayResult, RequestEnvelope,
-    RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability,
-    decode_request, decode_server_message, encode,
+    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, NetworkDiagnosticsResult, OperationTruth,
+    PROTOCOL_VERSION, PacState, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
+    ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, decode_request,
+    decode_server_message, encode,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -135,6 +136,13 @@ fn read_only_request_variants_round_trip_through_named_messagepack() {
             ProjectId::from("project-1"),
             IdempotencyKey::from("brief-1"),
         ),
+        RequestEnvelope::network_diagnostics(
+            RequestId::from("network-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("network-1"),
+        )
+        .authenticated(CallerCredential::new("network-credential")),
         RequestEnvelope::wait_for_result(
             RequestId::from("wait-observer-1"),
             CallerId::from("cli-1"),
@@ -253,6 +261,21 @@ fn read_only_result_variants_round_trip_through_named_messagepack() {
             payload: ResultPayload::Brief(brief_result()),
         },
     })];
+    results.push(ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("network-observer-1"),
+        project_id: ProjectId::from("project-1"),
+        body: ResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: ResultPayload::NetworkDiagnostics(NetworkDiagnosticsResult {
+                platform_roots_enabled: true,
+                system_proxy_discovery_enabled: true,
+                proxy_environment_presence: ConfigurationPresence::Configured,
+                no_proxy_presence: ConfigurationPresence::NotConfigured,
+                pac_state: PacState::DetectedUnsupported,
+            }),
+        },
+    }));
     for retention in [
         EvidenceRetention::Session,
         EvidenceRetention::Project,

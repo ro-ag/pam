@@ -168,6 +168,15 @@ fn request(project: &str, suffix: &str) -> RequestEnvelope {
     )
 }
 
+fn network_request(project: &str, suffix: &str) -> RequestEnvelope {
+    RequestEnvelope::network_diagnostics(
+        RequestId::new(format!("network-{suffix}")),
+        CallerId::from("queue-test"),
+        ProjectId::new(project),
+        IdempotencyKey::new(format!("network-{suffix}")),
+    )
+}
+
 async fn wait_until_ready(endpoint: &LocalEndpoint) {
     for _ in 0..50 {
         if endpoint.socket_path().is_some_and(std::path::Path::exists) {
@@ -301,6 +310,46 @@ async fn brief_baseline_is_honest_read_only_and_provider_neutral() {
             }],
         }
     );
+    let observer = Store::open(&state_path).unwrap();
+    assert!(matches!(
+        observer.snapshot(request.request_id).await,
+        Err(StoreError::RequestNotFound(_))
+    ));
+    observer.shutdown().await.unwrap();
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_diagnostics_are_typed_read_only_and_sanitized() {
+    let runtime = test_runtime("network-diagnostics");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let (shutdown, daemon) = start_daemon(endpoint.clone(), state_path.clone(), Duration::ZERO);
+    wait_until_ready(&endpoint).await;
+    let request = network_request("network-project", "observer");
+
+    let exchange = request_exchange(&endpoint, &request, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(exchange.events.is_empty());
+    let ResultBody::Success {
+        truth,
+        payload: ResultPayload::NetworkDiagnostics(diagnostics),
+    } = exchange.result.body
+    else {
+        panic!("network diagnostics should return a typed success")
+    };
+    assert!(matches!(
+        truth,
+        OperationTruth::Observed | OperationTruth::Unresolved
+    ));
+    assert!(diagnostics.platform_roots_enabled);
+    assert!(diagnostics.system_proxy_discovery_enabled);
+
     let observer = Store::open(&state_path).unwrap();
     assert!(matches!(
         observer.snapshot(request.request_id).await,

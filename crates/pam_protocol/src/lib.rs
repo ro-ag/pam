@@ -13,10 +13,11 @@ pub use codec::{
 };
 pub use contract::{
     ApprovalChallenge, BriefItem, BriefProvenance, BriefResult, CancellationDisposition,
-    CancellationResult, Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, OperationTruth,
-    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
-    ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, StatusResult,
+    CancellationResult, Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    NetworkDiagnosticsResult, OperationTruth, PacState, ProtocolContractError, ReplayResult,
+    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
+    SourceAvailability, StatusResult,
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;

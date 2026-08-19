@@ -5,10 +5,11 @@ use pam_core::{
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, OperationTruth, PROTOCOL_VERSION,
-    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
-    ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
+    Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
+    EvidenceRedaction, EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ProtocolContractError,
+    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
+    SourceAvailability, StatusResult,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -57,6 +58,22 @@ fn request_approval_receipt_is_explicit_and_one_effect_scoped() {
         Some("approval-1")
     );
     assert_eq!(request.capability.policy_name(), "daemon.status");
+}
+
+#[test]
+fn network_diagnostics_request_is_authenticated_read_only_and_policy_named() {
+    let request = RequestEnvelope::network_diagnostics(
+        RequestId::from("network-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("network-1"),
+    )
+    .authenticated(CallerCredential::new("network-diagnostics-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::NetworkDiagnostics);
+    assert_eq!(request.capability.policy_name(), "network.diagnostics");
+    assert_eq!(request.payload, RequestPayload::NetworkDiagnostics);
 }
 
 #[test]
@@ -388,6 +405,32 @@ fn evidence_result_contract_carries_exact_metadata_and_bounded_bytes() {
     assert_eq!(chunk.offset, 12);
     assert_eq!(chunk.bytes(), &[1, 2, 3]);
     assert!(chunk.eof);
+}
+
+#[test]
+fn network_diagnostics_result_exposes_only_sanitized_configuration_facts() {
+    let result = NetworkDiagnosticsResult {
+        platform_roots_enabled: true,
+        system_proxy_discovery_enabled: true,
+        proxy_environment_presence: ConfigurationPresence::Configured,
+        no_proxy_presence: ConfigurationPresence::Invalid,
+        pac_state: PacState::DetectedUnsupported,
+    };
+
+    assert!(result.platform_roots_enabled);
+    assert!(result.system_proxy_discovery_enabled);
+    assert_eq!(
+        result.proxy_environment_presence,
+        ConfigurationPresence::Configured
+    );
+    assert_eq!(result.no_proxy_presence, ConfigurationPresence::Invalid);
+    assert_eq!(result.pac_state, PacState::DetectedUnsupported);
+    assert_ne!(
+        ConfigurationPresence::NotConfigured,
+        ConfigurationPresence::Configured
+    );
+    assert_ne!(PacState::NotDetected, PacState::DetectedUnsupported);
+    assert_ne!(PacState::NotDetected, PacState::InspectionUnavailable);
 }
 
 #[test]

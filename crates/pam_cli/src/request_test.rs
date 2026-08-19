@@ -51,6 +51,15 @@ fn wait_and_result_keep_the_target_separate_from_observer_identity() {
 }
 
 #[test]
+fn network_diagnostics_is_authenticated_and_typed() {
+    let request = context().network_diagnostics();
+
+    assert_eq!(request.capability, Capability::NetworkDiagnostics);
+    assert_eq!(request.payload, RequestPayload::NetworkDiagnostics);
+    assert!(request.authentication.is_some());
+}
+
+#[test]
 fn evidence_requests_are_typed_and_protocol_bounded() {
     let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
     let inspect = context().inspect_evidence(handle.clone());

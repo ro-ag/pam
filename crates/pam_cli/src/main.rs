@@ -63,6 +63,7 @@ async fn main() {
         Mode::ApprovalDeny { approval_id } => {
             app::approval_decide(approval_id, pam_store::ApprovalDecision::Deny).await
         }
+        Mode::NetworkDiagnostics => app::network_diagnostics().await,
         Mode::Daemon { recover } => match pam_daemon::run(recover).await {
             Ok(()) => 0,
             Err(error) => {

@@ -64,6 +64,25 @@ requests, survives daemon restart, and deliberately returns the same external
 failure as an unknown caller or invalid credential. Re-registering a revoked
 caller issues a new credential and invalidates the old one.
 
+The CLI keeps that credential exclusively in the current user's native secure
+store: login Keychain on macOS, Credential Manager on Windows, or Secret Service
+on Linux. A caller-scoped, domain-separated hash is the native account key; the
+caller label and credential do not enter project TOML. Native-store access is
+lazy and runs on a blocking worker because an OS keyring may wait for a desktop
+service or prompt the user. Headless or unavailable keyrings fail closed with
+no plaintext fallback.
+
+Corporate HTTP clients use rustls with the operating system's certificate
+verifier, environment plus supported static system-proxy discovery, bounded
+connect/request timeouts, and no certificate-bypass mode. The authenticated
+`network.diagnostics` capability reports only configuration presence and safe
+state codes: it never returns proxy URLs, hosts, userinfo, bypass-list contents,
+or backend error text. PAC scripts are not evaluated by the selected HTTP stack;
+PAC is reported as detected-but-unsupported when an injected native inspector
+can establish its presence, and otherwise as inspection-unavailable rather than
+claimed to be honored. Repository tests prove client wiring and redaction, not
+live behavior in an authorized managed corporate environment.
+
 Project policy is default-deny. Grants bind one caller, project, capability, and
 either an exact resource or an explicit any-resource scope. Active explicit
 denies override allows; expiry and revocation take effect at their recorded

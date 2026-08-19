@@ -58,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    /// Inspect native trust and proxy configuration without exposing endpoints.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
     /// Run the foreground daemon.
     Daemon {
         /// Recover an endpoint left behind by an interrupted daemon.
@@ -86,7 +91,7 @@ enum EvidenceCommand {
 
 #[derive(Debug, Subcommand)]
 enum CallerCommand {
-    /// Register a caller and issue a credential once.
+    /// Register a caller and save its credential in the native secure store.
     Register {
         /// Local caller surface to register.
         #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
@@ -144,6 +149,12 @@ enum ApprovalCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum NetworkCommand {
+    /// Report sanitized native trust, proxy, and PAC configuration facts.
+    Diagnostics,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum CallerKindArg {
     Cli,
@@ -193,6 +204,7 @@ pub(crate) enum Mode {
     ApprovalDeny {
         approval_id: ApprovalId,
     },
+    NetworkDiagnostics,
     Daemon {
         recover: bool,
     },
@@ -260,6 +272,9 @@ impl Cli {
             Some(Command::Approval {
                 command: ApprovalCommand::Deny { approval_id },
             }) => Mode::ApprovalDeny { approval_id },
+            Some(Command::Network {
+                command: NetworkCommand::Diagnostics,
+            }) => Mode::NetworkDiagnostics,
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }

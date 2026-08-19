@@ -12,17 +12,19 @@ use std::{
 
 use pam_core::{APPLICATION_VERSION, EvidenceHandle, ProjectId, RequestId};
 use pam_platform::{
-    IncomingRequest, LocalEndpoint, ServerTransport, TransportError, TransportErrorKind,
-    user_data_dir,
+    CorporateHttpClientFactory, CorporateHttpClientRequirements, IncomingRequest, LocalEndpoint,
+    PacDiagnostic, ProxyBypassDiagnostic, ProxyDiagnosticStatus, ProxyEnvironmentVariable,
+    ProxyInputIssueKind, ProxyRouteDiagnostic, ProxySource, ReqwestCorporateHttpClientFactory,
+    ServerTransport, TransportError, TransportErrorKind, diagnose_process_proxy, user_data_dir,
 };
 use pam_policy::{CapabilityName, ResourceName};
 use pam_protocol::{
     ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, OperationTruth, PROTOCOL_VERSION,
-    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
-    ServerMessage, SourceAvailability, StatusResult, decode_request_envelope,
-    decode_server_message, encode,
+    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
+    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
+    SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
 };
 use pam_store::{
     AcceptOutcome, AcceptRequest, AuthorizationOutcome, AuthorizationRequest, CallerAuthentication,
@@ -634,6 +636,7 @@ fn policy_resource(request: &RequestEnvelope) -> Result<ResourceName, StoreError
     let resource = match &request.payload {
         RequestPayload::Status => "daemon".to_owned(),
         RequestPayload::Brief => format!("project:{}", request.project_id),
+        RequestPayload::NetworkDiagnostics => "network:configuration".to_owned(),
         RequestPayload::Cancel { target_request_id }
         | RequestPayload::Replay {
             target_request_id, ..
@@ -719,6 +722,9 @@ async fn handle_read_only(
         (Capability::Brief, RequestPayload::Brief) => {
             handle_brief(request, incoming, store, outbound, brief_provider).await
         }
+        (Capability::NetworkDiagnostics, RequestPayload::NetworkDiagnostics) => {
+            handle_network_diagnostics(request, incoming, outbound).await
+        }
         (
             Capability::WaitForResult,
             RequestPayload::WaitForResult {
@@ -782,6 +788,104 @@ async fn handle_read_only(
             .await;
             Ok(())
         }
+    }
+}
+
+async fn handle_network_diagnostics(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let (truth, result) = tokio::task::spawn_blocking(collect_network_diagnostics)
+        .await
+        .map_err(DaemonError::Handler)?;
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            truth,
+            ResultPayload::NetworkDiagnostics(result),
+        ))],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+fn collect_network_diagnostics() -> (OperationTruth, NetworkDiagnosticsResult) {
+    let proxy = diagnose_process_proxy();
+    let client_ready = ReqwestCorporateHttpClientFactory
+        .build(CorporateHttpClientRequirements::secure_default())
+        .is_ok();
+    let proxy_environment_presence = proxy_environment_presence(&proxy);
+    let no_proxy_presence = no_proxy_presence(&proxy);
+    let truth = if client_ready && proxy.status == ProxyDiagnosticStatus::Observed {
+        OperationTruth::Observed
+    } else {
+        OperationTruth::Unresolved
+    };
+    let result = NetworkDiagnosticsResult {
+        platform_roots_enabled: client_ready,
+        system_proxy_discovery_enabled: client_ready,
+        proxy_environment_presence,
+        no_proxy_presence,
+        pac_state: match proxy.pac {
+            PacDiagnostic::DetectedButUnsupported => PacState::DetectedUnsupported,
+            PacDiagnostic::NotDetected => PacState::NotDetected,
+            PacDiagnostic::InspectionUnavailable(_) => PacState::InspectionUnavailable,
+        },
+    };
+    (truth, result)
+}
+
+fn proxy_environment_presence(proxy: &pam_platform::ProxyDiagnostic) -> ConfigurationPresence {
+    let environment_route = |route| {
+        matches!(
+            route,
+            ProxyRouteDiagnostic::Configured {
+                source: ProxySource::Environment(_),
+                ..
+            }
+        )
+    };
+    if environment_route(proxy.http) || environment_route(proxy.https) {
+        ConfigurationPresence::Configured
+    } else if proxy.ignored_inputs.iter().any(|issue| {
+        issue.kind == ProxyInputIssueKind::Malformed
+            && matches!(
+                issue.variable,
+                ProxyEnvironmentVariable::HttpProxyUpper
+                    | ProxyEnvironmentVariable::HttpProxyLower
+                    | ProxyEnvironmentVariable::HttpsProxyUpper
+                    | ProxyEnvironmentVariable::HttpsProxyLower
+                    | ProxyEnvironmentVariable::AllProxyUpper
+                    | ProxyEnvironmentVariable::AllProxyLower
+            )
+    }) {
+        ConfigurationPresence::Invalid
+    } else {
+        ConfigurationPresence::NotConfigured
+    }
+}
+
+const fn no_proxy_presence(proxy: &pam_platform::ProxyDiagnostic) -> ConfigurationPresence {
+    match proxy.bypass {
+        ProxyBypassDiagnostic::Configured {
+            source: ProxySource::Environment(_),
+        } => ConfigurationPresence::Configured,
+        ProxyBypassDiagnostic::Malformed {
+            source: ProxySource::Environment(_),
+        } => ConfigurationPresence::Invalid,
+        ProxyBypassDiagnostic::NotConfigured
+        | ProxyBypassDiagnostic::Configured {
+            source: ProxySource::System,
+        }
+        | ProxyBypassDiagnostic::Malformed {
+            source: ProxySource::System,
+        }
+        | ProxyBypassDiagnostic::SuppressedByCgi
+        | ProxyBypassDiagnostic::Unresolved(_) => ConfigurationPresence::NotConfigured,
     }
 }
 
@@ -1420,6 +1524,7 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
         | RequestPayload::GetResult { target_request_id } => Some(target_request_id),
         RequestPayload::Status
         | RequestPayload::Brief
+        | RequestPayload::NetworkDiagnostics
         | RequestPayload::InspectEvidence { .. }
         | RequestPayload::ReadEvidence { .. } => None,
     }

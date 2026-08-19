@@ -20,7 +20,10 @@ use crate::{
     command::CallerKindArg,
     evidence::{EvidenceError, download_evidence, write_new_output},
     render::{EXIT_OPERATION_FAILED, Presentation, escape_text, present_result, render_events},
-    request::RequestContext,
+    request::{
+        NativeCredentialError, RequestContext, RequestContextError, delete_native_credential,
+        load_native_credential, store_native_credential,
+    },
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,21 +53,35 @@ pub(crate) async fn caller_register(kind: CallerKindArg) -> i32 {
         Ok(store) => store,
         Err(error) => return report_store_error(&error),
     };
+    let previous_credential = match load_native_credential(caller_id.clone()).await {
+        Ok(credential) => Some(credential),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => {
+            let _ = store.shutdown().await;
+            return report_native_credential_error(&error);
+        }
+    };
+    if let Err(error) = store_native_credential(caller_id.clone(), credential.clone()).await {
+        let _ = store.shutdown().await;
+        return report_native_credential_error(&error);
+    }
     let result = store
         .register_caller(caller_id.clone(), credential.clone(), now_ms())
         .await;
     let shutdown = store.shutdown().await;
     let registration = match result {
         Ok(registration) => registration,
-        Err(error) => return report_store_error(&error),
+        Err(error) => {
+            restore_native_credential(caller_id, previous_credential).await;
+            return report_store_error(&error);
+        }
     };
     if let Err(error) = shutdown {
         return report_store_error(&error);
     }
 
     println!("Registered caller {}.", registration.caller_id);
-    println!("Credential (shown once): {}", credential.expose_secret());
-    println!("Set PAM_CALLER_CREDENTIAL for this caller before sending daemon requests.");
+    println!("Credential stored in the operating system's native credential store.");
     0
 }
 
@@ -99,11 +116,11 @@ pub(crate) async fn caller_revoke(kind: CallerKindArg) -> i32 {
     match revocation {
         CallerRevocation::Revoked => {
             println!("Revoked caller {caller_id}.");
-            0
+            delete_revoked_native_credential(caller_id).await
         }
         CallerRevocation::AlreadyRevoked => {
             println!("Caller {caller_id} is already revoked.");
-            0
+            delete_revoked_native_credential(caller_id).await
         }
         CallerRevocation::UnknownCaller => {
             eprintln!("Caller {caller_id} is not registered.");
@@ -256,7 +273,7 @@ pub(crate) async fn approval_decide(approval_id: ApprovalId, decision: ApprovalD
 }
 
 pub(crate) async fn status() -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context().await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.status(), STATUS_TIMEOUT).await {
@@ -277,7 +294,7 @@ pub(crate) async fn status() -> i32 {
 }
 
 pub(crate) async fn brief() -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context().await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.brief(), READ_TIMEOUT).await {
@@ -298,8 +315,30 @@ pub(crate) async fn brief() -> i32 {
     }
 }
 
+pub(crate) async fn network_diagnostics() -> i32 {
+    let Some(context) = discover_context().await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    match exchange(&context.network_diagnostics(), READ_TIMEOUT).await {
+        Ok(exchange) if !exchange.events.is_empty() => unexpected_events("network diagnostics"),
+        Ok(exchange)
+            if matches!(
+                exchange.result.body,
+                ResultBody::Success {
+                    payload: ResultPayload::NetworkDiagnostics(_),
+                    ..
+                } | ResultBody::Failure(_)
+            ) =>
+        {
+            emit(present_result(&exchange.result.body))
+        }
+        Ok(_) => unexpected_result("network diagnostics"),
+        Err(error) => report_exchange_error(&error),
+    }
+}
+
 pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context().await else {
         return EXIT_OPERATION_FAILED;
     };
     let request = context.wait(request_id, after);
@@ -313,7 +352,7 @@ pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -
 }
 
 pub(crate) async fn result(request_id: RequestId) -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context().await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.result(request_id), READ_TIMEOUT).await {
@@ -324,7 +363,7 @@ pub(crate) async fn result(request_id: RequestId) -> i32 {
 }
 
 pub(crate) async fn evidence_show(handle: EvidenceHandle, raw: bool, output: Option<&Path>) -> i32 {
-    let Some(context) = discover_context() else {
+    let Some(context) = discover_context().await else {
         return EXIT_OPERATION_FAILED;
     };
     let download = match download_evidence(
@@ -387,14 +426,49 @@ async fn exchange(
     pam_daemon::request_exchange(&LocalEndpoint::default_for_user(), request, timeout).await
 }
 
-fn discover_context() -> Option<RequestContext> {
-    match RequestContext::discover() {
+async fn discover_context() -> Option<RequestContext> {
+    match RequestContext::discover().await {
         Ok(context) => Some(context),
-        Err(error) => {
+        Err(RequestContextError::Identity(error)) => {
             report_identity_error(&error);
             None
         }
+        Err(RequestContextError::Credential(error)) => {
+            report_native_credential_error(&error);
+            None
+        }
     }
+}
+
+async fn restore_native_credential(
+    caller_id: pam_core::CallerId,
+    previous: Option<CallerCredential>,
+) {
+    let result = match previous {
+        Some(credential) => store_native_credential(caller_id, credential).await,
+        None => delete_native_credential(caller_id).await,
+    };
+    if let Err(error) = result
+        && !error.is_not_found()
+    {
+        eprintln!(
+            "PAM could not restore the previous native credential after registration failed."
+        );
+        eprintln!("Details: {}", escape_text(&error.to_string()));
+    }
+}
+
+async fn delete_revoked_native_credential(caller_id: pam_core::CallerId) -> i32 {
+    match delete_native_credential(caller_id).await {
+        Ok(()) => 0,
+        Err(error) if error.is_not_found() => 0,
+        Err(error) => report_native_credential_error(&error),
+    }
+}
+
+fn report_native_credential_error(error: &NativeCredentialError) -> i32 {
+    eprintln!("{}", escape_text(&error.to_string()));
+    EXIT_OPERATION_FAILED
 }
 
 fn report_identity_error(error: &IdentityError) {

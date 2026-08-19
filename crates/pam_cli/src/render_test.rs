@@ -1,8 +1,9 @@
 use pam_core::{ContentDigest, EvidenceHandle, ProjectId, RequestId};
 use pam_protocol::{
-    BriefItem, BriefProvenance, BriefResult, Event, EventEnvelope, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, OperationTruth, PROTOCOL_VERSION,
-    ResultBody, SourceAvailability,
+    BriefItem, BriefProvenance, BriefResult, ConfigurationPresence, Event, EventEnvelope,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ResultBody,
+    ResultPayload, SourceAvailability,
 };
 
 use super::render::{
@@ -12,6 +13,26 @@ use super::render::{
 
 fn handle() -> EvidenceHandle {
     EvidenceHandle::parse("evidence://ci/1842/failure").unwrap()
+}
+
+#[test]
+fn network_diagnostics_renders_only_sanitized_configuration_facts() {
+    let presentation = present_result(&ResultBody::Success {
+        truth: OperationTruth::Observed,
+        payload: ResultPayload::NetworkDiagnostics(NetworkDiagnosticsResult {
+            platform_roots_enabled: true,
+            system_proxy_discovery_enabled: true,
+            proxy_environment_presence: ConfigurationPresence::Configured,
+            no_proxy_presence: ConfigurationPresence::Invalid,
+            pac_state: PacState::DetectedUnsupported,
+        }),
+    });
+
+    assert_eq!(
+        presentation.stdout,
+        "platform_roots_enabled=true system_proxy_discovery_enabled=true proxy_environment=configured no_proxy=invalid pac=detected_unsupported truth=observed\n"
+    );
+    assert!(presentation.stderr.is_empty());
 }
 
 #[test]
@@ -131,7 +152,7 @@ fn pending_not_found_and_unresolved_have_deterministic_nonzero_exits() {
     assert_eq!(
         present_result(&ResultBody::Success {
             truth: OperationTruth::Unresolved,
-            payload: pam_protocol::ResultPayload::Brief(BriefResult {
+            payload: ResultPayload::Brief(BriefResult {
                 goal: None,
                 decisions: Vec::new(),
                 verified: Vec::new(),

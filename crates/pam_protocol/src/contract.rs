@@ -127,6 +127,28 @@ impl RequestEnvelope {
         }
     }
 
+    /// Creates an authenticated, policy-gated read-only network diagnostics request.
+    #[must_use]
+    pub fn network_diagnostics(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::NetworkDiagnostics,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::NetworkDiagnostics,
+        }
+    }
+
     /// Creates a read-only wait request for `target_request_id`.
     ///
     /// The envelope ID correlates this observer operation. Replayed events retain
@@ -282,6 +304,7 @@ pub enum Capability {
     CancelRequest,
     ReplayEvents,
     Brief,
+    NetworkDiagnostics,
     WaitForResult,
     GetResult,
     InspectEvidence,
@@ -296,6 +319,7 @@ impl Capability {
             Self::CancelRequest => "request.cancel",
             Self::ReplayEvents => "request.replay",
             Self::Brief => "brief.read",
+            Self::NetworkDiagnostics => "network.diagnostics",
             Self::WaitForResult => "request.wait",
             Self::GetResult => "request.result.read",
             Self::InspectEvidence => "evidence.inspect",
@@ -316,6 +340,7 @@ pub enum RequestPayload {
         after_sequence: u64,
     },
     Brief,
+    NetworkDiagnostics,
     WaitForResult {
         target_request_id: RequestId,
         after_sequence: u64,
@@ -369,6 +394,7 @@ pub enum ResultPayload {
     Cancellation(CancellationResult),
     Replay(ReplayResult),
     Brief(BriefResult),
+    NetworkDiagnostics(NetworkDiagnosticsResult),
     EvidenceMetadata(EvidenceMetadata),
     EvidenceChunk(EvidenceChunk),
 }
@@ -576,6 +602,35 @@ pub struct StatusResult {
     pub daemon_version: String,
     pub protocol_version: u16,
     pub queue_depth: u64,
+}
+
+/// Sanitized network configuration facts safe to return across the caller boundary.
+///
+/// The contract deliberately cannot carry proxy URLs, hosts, usernames, or
+/// free-form backend diagnostics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkDiagnosticsResult {
+    pub platform_roots_enabled: bool,
+    pub system_proxy_discovery_enabled: bool,
+    pub proxy_environment_presence: ConfigurationPresence,
+    pub no_proxy_presence: ConfigurationPresence,
+    pub pac_state: PacState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationPresence {
+    NotConfigured,
+    Configured,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacState {
+    NotDetected,
+    DetectedUnsupported,
+    InspectionUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -79,6 +79,72 @@ async fn brief_crosses_transport_with_explicit_unavailable_provenance() {
     let _ = fs::remove_dir_all(runtime);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_diagnostics_require_an_authenticated_project_grant() {
+    let runtime = test_runtime("network-policy");
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = endpoint.runtime_dir().join("state.sqlite3");
+    let (shutdown, daemon) = start_daemon(endpoint.clone()).await;
+    for _ in 0..40 {
+        if endpoint.socket_path().is_some_and(std::path::Path::exists) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let request = |suffix: &str| {
+        RequestEnvelope::network_diagnostics(
+            RequestId::new(format!("network-{suffix}")),
+            CallerId::from("integration-test"),
+            ProjectId::from("project-round-trip"),
+            IdempotencyKey::new(format!("network-{suffix}")),
+        )
+        .authenticated(CallerCredential::new(TEST_CREDENTIAL))
+    };
+
+    let denied = request_exchange(&endpoint, &request("denied"), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        denied.result.body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+    ));
+
+    let store = Store::open(&state_path).unwrap();
+    store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::from("integration-network-diagnostics"),
+                caller: CallerId::from("integration-test"),
+                project: ProjectId::from("project-round-trip"),
+                capability: CapabilityName::parse("network.diagnostics").unwrap(),
+                resource: ResourceScope::Any,
+                effect: Effect::Allow,
+                approval: ApprovalRequirement::None,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: 2,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let allowed = request_exchange(&endpoint, &request("allowed"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed.result.body,
+        ResultBody::Success {
+            payload: ResultPayload::NetworkDiagnostics(_),
+            ..
+        }
+    ));
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
 fn status_request() -> RequestEnvelope {
     RequestEnvelope::status(
         RequestId::from("request-round-trip"),

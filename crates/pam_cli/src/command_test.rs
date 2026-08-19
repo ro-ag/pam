@@ -76,6 +76,12 @@ fn explicit_subcommands_select_runtime_modes() {
             approval_id: ApprovalId::from("approval-1"),
         }
     );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "network", "diagnostics"])
+            .unwrap()
+            .mode(),
+        Mode::NetworkDiagnostics
+    );
 }
 
 #[test]

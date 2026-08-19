@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
 
 use pam_protocol::{
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, Event, EventEnvelope,
-    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode, OperationTruth,
-    ResultBody, ResultPayload, SourceAvailability,
+    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, ConfigurationPresence, Event,
+    EventEnvelope, EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    OperationTruth, PacState, ResultBody, ResultPayload, SourceAvailability,
 };
 
 pub(crate) const EXIT_OK: i32 = 0;
@@ -276,6 +276,15 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             truth_label(truth)
         ),
         ResultPayload::Brief(brief) => render_brief(brief),
+        ResultPayload::NetworkDiagnostics(diagnostics) => format!(
+            "platform_roots_enabled={} system_proxy_discovery_enabled={} proxy_environment={} no_proxy={} pac={} truth={}\n",
+            diagnostics.platform_roots_enabled,
+            diagnostics.system_proxy_discovery_enabled,
+            configuration_presence_label(diagnostics.proxy_environment_presence),
+            configuration_presence_label(diagnostics.no_proxy_presence),
+            pac_state_label(diagnostics.pac_state),
+            truth_label(truth)
+        ),
         ResultPayload::EvidenceMetadata(metadata) => format!(
             "handle={} digest={} size_bytes={} media_type={} retention={} redaction={} created_at_unix_ms={} truth={}\n",
             metadata.handle,
@@ -295,6 +304,22 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             chunk.eof,
             truth_label(truth)
         ),
+    }
+}
+
+const fn configuration_presence_label(presence: ConfigurationPresence) -> &'static str {
+    match presence {
+        ConfigurationPresence::NotConfigured => "not_configured",
+        ConfigurationPresence::Configured => "configured",
+        ConfigurationPresence::Invalid => "invalid",
+    }
+}
+
+const fn pac_state_label(state: PacState) -> &'static str {
+    match state {
+        PacState::NotDetected => "not_detected",
+        PacState::DetectedUnsupported => "detected_unsupported",
+        PacState::InspectionUnavailable => "inspection_unavailable",
     }
 }
 

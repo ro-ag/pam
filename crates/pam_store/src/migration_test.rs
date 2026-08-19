@@ -121,6 +121,107 @@ fn evidence_migration_upgrades_v1_without_replacing_scheduler_data() {
 }
 
 #[test]
+fn caller_migration_upgrades_v2_without_replacing_scheduler_or_evidence_data() {
+    let (directory, path) = database_path("migration-v2-callers");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0002_evidence.sql"))
+        .unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('project')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO requests(
+                request_id, caller_id, project_id, idempotency_key,
+                operation_kind, operation, queue_sequence, state, accepted_at_ms
+             ) VALUES (
+                'request', 'caller', 'project', 'key',
+                'test.operation', X'010203', 1, 'queued', 10
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events(request_id, sequence, kind, payload, recorded_at_ms)
+             VALUES ('request', 1, 'accepted', X'040506', 10)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_blobs(digest, size_bytes)
+             VALUES ('sha256:0000000000000000000000000000000000000000000000000000000000000000', 3)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO evidence_handles(
+                project_id, handle, digest, media_type, retention, redaction, created_at_ms
+             ) VALUES (
+                'project', 'evidence://preserved',
+                'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                'application/octet-stream', 'project', 'redacted', 11
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let operation: Vec<u8> = connection
+        .query_row(
+            "SELECT operation FROM requests WHERE request_id = 'request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload FROM events WHERE request_id = 'request' AND sequence = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence: (String, i64) = connection
+        .query_row(
+            "SELECT handle, size_bytes
+             FROM evidence_handles JOIN evidence_blobs USING (digest)
+             WHERE project_id = 'project'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let callers_table_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'callers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+
+    assert_eq!(operation, [1, 2, 3]);
+    assert_eq!(event_payload, [4, 5, 6]);
+    assert_eq!(evidence, ("evidence://preserved".to_owned(), 3));
+    assert_eq!(callers_table_count, 1);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

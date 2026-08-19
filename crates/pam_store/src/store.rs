@@ -1,7 +1,8 @@
 use std::{path::Path, sync::mpsc, thread, time::Duration};
 
-use pam_core::{EvidenceHandle, ProjectId, RequestId};
+use pam_core::{CallerCredential, CallerId, EvidenceHandle, ProjectId, RequestId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use uuid::Uuid;
 
@@ -10,18 +11,19 @@ use std::path::PathBuf;
 
 use crate::evidence::{self, EvidenceFiles};
 use crate::{
-    AcceptOutcome, AcceptRequest, CancelOutcome, EventRecord, EvidenceMetadata, Lease,
-    LeasedRequest, PutEvidence, Replay, RequestSnapshot, RequestState, StoreError, StoredResult,
-    TerminalState,
+    AcceptOutcome, AcceptRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
+    CancelOutcome, EventRecord, EvidenceMetadata, Lease, LeasedRequest, PutEvidence, Replay,
+    RequestSnapshot, RequestState, StoreError, StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 2;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 3;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
+    (3, include_str!("../migrations/0003_callers.sql")),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -33,6 +35,71 @@ pub struct Store {
 }
 
 impl Store {
+    /// Registers a caller credential. Existing caller IDs are never replaced implicitly.
+    ///
+    /// Only the SHA-256 verifier is persisted; the credential is not written to `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid credential, duplicate caller, invalid timestamp,
+    /// or unavailable durable state.
+    pub async fn register_caller(
+        &self,
+        caller_id: CallerId,
+        credential: CallerCredential,
+        now_ms: u64,
+    ) -> Result<CallerRegistration, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Register {
+            caller_id,
+            credential,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Authenticates one caller without disclosing whether a verifier matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable state is unavailable.
+    pub async fn authenticate_caller(
+        &self,
+        caller_id: CallerId,
+        credential: CallerCredential,
+    ) -> Result<CallerAuthentication, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Authenticate {
+            caller_id,
+            credential,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Revokes a caller immediately and idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timestamp or unavailable durable state.
+    pub async fn revoke_caller(
+        &self,
+        caller_id: CallerId,
+        now_ms: u64,
+    ) -> Result<CallerRevocation, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::Revoke {
+            caller_id,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Opens a file-backed store and starts isolated scheduler and evidence workers.
     ///
     /// # Errors
@@ -460,6 +527,7 @@ async fn receive<T>(response: oneshot::Receiver<Result<T, StoreError>>) -> Resul
 }
 
 enum Command {
+    Caller(CallerCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -525,6 +593,25 @@ enum Command {
     Shutdown(Response<()>),
 }
 
+enum CallerCommand {
+    Register {
+        caller_id: CallerId,
+        credential: CallerCredential,
+        now_ms: u64,
+        response: Response<CallerRegistration>,
+    },
+    Authenticate {
+        caller_id: CallerId,
+        credential: CallerCredential,
+        response: Response<CallerAuthentication>,
+    },
+    Revoke {
+        caller_id: CallerId,
+        now_ms: u64,
+        response: Response<CallerRevocation>,
+    },
+}
+
 enum EvidenceCommand {
     Put {
         evidence: PutEvidence,
@@ -554,6 +641,7 @@ enum EvidenceCommand {
 fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Command>) {
     while let Some(command) = commands.blocking_recv() {
         match command {
+            Command::Caller(command) => run_caller_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -637,6 +725,33 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
     }
 }
 
+fn run_caller_command(connection: &mut Connection, command: CallerCommand) {
+    match command {
+        CallerCommand::Register {
+            caller_id,
+            credential,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            register_caller(connection, caller_id, &credential, now_ms),
+        ),
+        CallerCommand::Authenticate {
+            caller_id,
+            credential,
+            response,
+        } => respond(
+            response,
+            authenticate_caller(connection, &caller_id, &credential),
+        ),
+        CallerCommand::Revoke {
+            caller_id,
+            now_ms,
+            response,
+        } => respond(response, revoke_caller(connection, &caller_id, now_ms)),
+    }
+}
+
 fn open_evidence_worker(path: &Path) -> Result<(Connection, EvidenceFiles), StoreError> {
     let connection = open_connection(path)?;
     let files = EvidenceFiles::open(path)?;
@@ -693,6 +808,130 @@ fn run_evidence_worker(
 
 fn respond<T>(response: Response<T>, result: Result<T, StoreError>) {
     let _ = response.send(result);
+}
+
+fn register_caller(
+    connection: &mut Connection,
+    caller_id: CallerId,
+    credential: &CallerCredential,
+    now_ms: u64,
+) -> Result<CallerRegistration, StoreError> {
+    if !credential.is_valid() {
+        return Err(StoreError::InvalidCallerCredential);
+    }
+    let registered_at = sql_integer(now_ms)?;
+    let digest = credential_digest(credential);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing_revocation = transaction
+        .query_row(
+            "SELECT revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    match existing_revocation {
+        None => {
+            transaction.execute(
+                "INSERT INTO callers(
+                    caller_id, credential_digest, registered_at_ms, revoked_at_ms
+                 ) VALUES (?1, ?2, ?3, NULL)",
+                params![caller_id.as_str(), digest.as_slice(), registered_at],
+            )?;
+        }
+        Some(None) => return Err(StoreError::CallerAlreadyRegistered(caller_id)),
+        Some(Some(_)) => {
+            transaction.execute(
+                "UPDATE callers
+                 SET credential_digest = ?2, registered_at_ms = ?3, revoked_at_ms = NULL
+                 WHERE caller_id = ?1",
+                params![caller_id.as_str(), digest.as_slice(), registered_at],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(CallerRegistration {
+        caller_id,
+        registered_at_ms: now_ms,
+        revoked_at_ms: None,
+    })
+}
+
+fn authenticate_caller(
+    connection: &Connection,
+    caller_id: &CallerId,
+    credential: &CallerCredential,
+) -> Result<CallerAuthentication, StoreError> {
+    if !credential.is_valid() {
+        return Ok(CallerAuthentication::InvalidCredential);
+    }
+    let registration = connection
+        .query_row(
+            "SELECT credential_digest, revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((expected, revoked_at)) = registration else {
+        return Ok(CallerAuthentication::UnknownCaller);
+    };
+    if revoked_at.is_some() {
+        return Ok(CallerAuthentication::Revoked);
+    }
+    let supplied = credential_digest(credential);
+    if constant_time_equal(&expected, supplied.as_slice()) {
+        Ok(CallerAuthentication::Authenticated)
+    } else {
+        Ok(CallerAuthentication::InvalidCredential)
+    }
+}
+
+fn revoke_caller(
+    connection: &mut Connection,
+    caller_id: &CallerId,
+    now_ms: u64,
+) -> Result<CallerRevocation, StoreError> {
+    let revoked_at = sql_integer(now_ms)?;
+    let state = connection
+        .query_row(
+            "SELECT registered_at_ms, revoked_at_ms FROM callers WHERE caller_id = ?1",
+            [caller_id.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((registered_at, previous_revocation)) = state else {
+        return Ok(CallerRevocation::UnknownCaller);
+    };
+    if previous_revocation.is_some() {
+        return Ok(CallerRevocation::AlreadyRevoked);
+    }
+    if revoked_at < registered_at {
+        return Err(StoreError::InvalidState(
+            "caller revocation predates registration".to_owned(),
+        ));
+    }
+    connection.execute(
+        "UPDATE callers SET revoked_at_ms = ?2
+         WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+        params![caller_id.as_str(), revoked_at],
+    )?;
+    Ok(CallerRevocation::Revoked)
+}
+
+fn credential_digest(credential: &CallerCredential) -> [u8; 32] {
+    Sha256::digest(credential.expose_secret().as_bytes()).into()
+}
+
+fn constant_time_equal(expected: &[u8], supplied: &[u8]) -> bool {
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(supplied)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 pub(super) fn open_connection(path: &Path) -> Result<Connection, StoreError> {

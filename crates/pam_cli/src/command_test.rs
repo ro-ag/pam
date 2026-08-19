@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use clap::Parser;
 use pam_core::{EvidenceHandle, RequestId};
 
-use super::command::{Cli, Mode};
+use super::command::{CallerKindArg, Cli, Mode};
 
 #[test]
 fn no_subcommand_selects_client_mode() {
@@ -29,6 +29,22 @@ fn explicit_subcommands_select_runtime_modes() {
     assert_eq!(
         Cli::try_parse_from(["pam", "gui"]).unwrap().mode(),
         Mode::Gui
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "caller", "register"])
+            .unwrap()
+            .mode(),
+        Mode::CallerRegister {
+            kind: CallerKindArg::Cli,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "caller", "revoke", "--kind", "coding-agent"])
+            .unwrap()
+            .mode(),
+        Mode::CallerRevoke {
+            kind: CallerKindArg::CodingAgent,
+        }
     );
 }
 

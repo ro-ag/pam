@@ -1,6 +1,8 @@
 use std::{error::Error, fmt};
 
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{MAX_EVIDENCE_CHUNK_SIZE, PROTOCOL_VERSION};
@@ -10,6 +12,8 @@ pub struct RequestEnvelope {
     pub protocol_version: u16,
     pub request_id: RequestId,
     pub caller_id: CallerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<CallerCredential>,
     pub project_id: ProjectId,
     pub capability: Capability,
     pub idempotency_key: IdempotencyKey,
@@ -29,6 +33,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::DaemonStatus,
             idempotency_key,
@@ -54,6 +59,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::CancelRequest,
             idempotency_key,
@@ -81,6 +87,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::ReplayEvents,
             idempotency_key,
@@ -104,6 +111,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::Brief,
             idempotency_key,
@@ -130,6 +138,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::WaitForResult,
             idempotency_key,
@@ -158,6 +167,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::GetResult,
             idempotency_key,
@@ -179,6 +189,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::InspectEvidence,
             idempotency_key,
@@ -207,6 +218,7 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             caller_id,
+            authentication: None,
             project_id,
             capability: Capability::ReadEvidence,
             idempotency_key,
@@ -217,6 +229,13 @@ impl RequestEnvelope {
                 length,
             },
         })
+    }
+
+    /// Attaches the revocable caller credential used to authenticate this request.
+    #[must_use]
+    pub fn authenticated(mut self, credential: CallerCredential) -> Self {
+        self.authentication = Some(credential);
+        self
     }
 
     #[must_use]
@@ -534,6 +553,7 @@ pub struct Failure {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
+    Unauthenticated,
     UnsupportedProtocolVersion,
     InvalidRequest,
     FrameTooLarge,

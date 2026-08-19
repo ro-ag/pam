@@ -1,15 +1,18 @@
 use std::{
     io::{self, Write},
     path::Path,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{EvidenceHandle, RequestId};
+use pam_core::{CallerCredential, EvidenceHandle, RequestId};
 use pam_daemon::{ClientExchange, StatusError};
-use pam_platform::{IdentityError, LocalEndpoint};
+use pam_platform::{CallerKind, IdentityError, LocalEndpoint, caller_id, user_data_dir};
 use pam_protocol::{ResultBody, ResultPayload};
+use pam_store::{CallerRevocation, Store};
+use uuid::Uuid;
 
 use crate::{
+    command::CallerKindArg,
     evidence::{EvidenceError, download_evidence, write_new_output},
     render::{EXIT_OPERATION_FAILED, Presentation, escape_text, present_result, render_events},
     request::RequestContext,
@@ -17,6 +20,92 @@ use crate::{
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) async fn caller_register(kind: CallerKindArg) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let credential = CallerCredential::new(format!(
+        "pam_{}_{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    ));
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store
+        .register_caller(caller_id.clone(), credential.clone(), now_ms())
+        .await;
+    let shutdown = store.shutdown().await;
+    let registration = match result {
+        Ok(registration) => registration,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+
+    println!("Registered caller {}.", registration.caller_id);
+    println!("Credential (shown once): {}", credential.expose_secret());
+    println!("Set PAM_CALLER_CREDENTIAL for this caller before sending daemon requests.");
+    0
+}
+
+pub(crate) async fn caller_revoke(kind: CallerKindArg) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store.revoke_caller(caller_id.clone(), now_ms()).await;
+    let shutdown = store.shutdown().await;
+    let revocation = match result {
+        Ok(revocation) => revocation,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match revocation {
+        CallerRevocation::Revoked => {
+            println!("Revoked caller {caller_id}.");
+            0
+        }
+        CallerRevocation::AlreadyRevoked => {
+            println!("Caller {caller_id} is already revoked.");
+            0
+        }
+        CallerRevocation::UnknownCaller => {
+            eprintln!("Caller {caller_id} is not registered.");
+            EXIT_OPERATION_FAILED
+        }
+    }
+}
 
 pub(crate) async fn status() -> i32 {
     let Some(context) = discover_context() else {
@@ -163,6 +252,29 @@ fn discover_context() -> Option<RequestContext> {
 fn report_identity_error(error: &IdentityError) {
     eprintln!("{}", escape_text(&error.to_string()));
     eprintln!("Details: {}", escape_text(error.diagnostic()));
+}
+
+fn report_store_error(error: &pam_store::StoreError) -> i32 {
+    eprintln!("{}", escape_text(&error.to_string()));
+    EXIT_OPERATION_FAILED
+}
+
+const fn caller_kind(kind: CallerKindArg) -> CallerKind {
+    match kind {
+        CallerKindArg::Cli => CallerKind::Cli,
+        CallerKindArg::Gui => CallerKind::Gui,
+        CallerKindArg::CodingAgent => CallerKind::CodingAgent,
+        CallerKindArg::LocalApplication => CallerKind::LocalApplication,
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn report_exchange_error(error: &StatusError) -> i32 {

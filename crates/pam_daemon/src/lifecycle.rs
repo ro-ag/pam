@@ -23,8 +23,8 @@ use pam_protocol::{
     SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
 };
 use pam_store::{
-    AcceptOutcome, AcceptRequest, CancelOutcome, EventRecord, LeasedRequest, Replay, RequestState,
-    Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, CallerAuthentication, CancelOutcome, EventRecord, LeasedRequest,
+    Replay, RequestState, Store, StoreError, TerminalState,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -87,6 +87,8 @@ pub struct DaemonConfig {
     pub state_path: Option<PathBuf>,
     /// Supplies planning context for read-only brief requests.
     pub brief_provider: Option<Arc<dyn BriefProvider>>,
+    #[cfg(test)]
+    pub(crate) bypass_authentication: bool,
 }
 
 impl Default for DaemonConfig {
@@ -96,6 +98,8 @@ impl Default for DaemonConfig {
             recover: false,
             state_path: None,
             brief_provider: None,
+            #[cfg(test)]
+            bypass_authentication: false,
         }
     }
 }
@@ -205,6 +209,10 @@ where
         .brief_provider
         .clone()
         .unwrap_or_else(|| Arc::new(UnavailableBriefProvider));
+    #[cfg(test)]
+    let authentication_required = !config.bypass_authentication;
+    #[cfg(not(test))]
+    let authentication_required = true;
     let mut server = ServerTransport::bind(&config.endpoint).await?;
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(RESPONSE_CAPACITY);
     let (scheduler_tx, scheduler_rx) = mpsc::channel::<()>(SCHEDULER_CAPACITY);
@@ -248,6 +256,7 @@ where
                         request_outbound,
                         request_scheduler,
                         request_brief_provider,
+                        authentication_required,
                     )
                     .await
                 });
@@ -454,6 +463,7 @@ async fn handle_incoming(
     outbound: mpsc::Sender<Outbound>,
     scheduler: mpsc::Sender<()>,
     brief_provider: Arc<dyn BriefProvider>,
+    authentication_required: bool,
 ) -> Result<(), DaemonError> {
     let Ok(request) = decode_request_envelope(incoming.payload()) else {
         return Ok(());
@@ -473,6 +483,29 @@ async fn handle_incoming(
         return Ok(());
     }
     if let Some(failure) = request.unsupported_version_failure() {
+        send_routed(
+            &outbound,
+            incoming,
+            vec![ServerMessage::Result(failure)],
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+    if authentication_required
+        && !matches!(
+            authenticate_request(&request, &store).await?,
+            CallerAuthentication::Authenticated
+        )
+    {
+        let mut failure = failure_result(
+            &request,
+            FailureCode::Unauthenticated,
+            "caller authentication failed",
+        );
+        if let ResultBody::Failure(body) = &mut failure.body {
+            body.recovery = Some("pam caller register".to_owned());
+        }
         send_routed(
             &outbound,
             incoming,
@@ -526,6 +559,18 @@ async fn handle_incoming(
             .await
         }
     }
+}
+
+async fn authenticate_request(
+    request: &RequestEnvelope,
+    store: &Store,
+) -> Result<CallerAuthentication, StoreError> {
+    let Some(credential) = request.authentication.clone() else {
+        return Ok(CallerAuthentication::InvalidCredential);
+    };
+    store
+        .authenticate_caller(request.caller_id.clone(), credential)
+        .await
 }
 
 async fn handle_read_only(

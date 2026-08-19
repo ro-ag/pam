@@ -713,6 +713,7 @@ dependencies = [
  "pam_gui",
  "pam_platform",
  "pam_protocol",
+ "pam_store",
  "sha2",
  "tokio",
  "uuid",

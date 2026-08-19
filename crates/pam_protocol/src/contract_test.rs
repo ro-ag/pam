@@ -1,4 +1,6 @@
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+};
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
@@ -24,8 +26,25 @@ fn status_request_populates_the_versioned_identity_contract() {
     assert_eq!(request.protocol_version, PROTOCOL_VERSION);
     assert_eq!(request.request_id.as_str(), "request-1");
     assert_eq!(request.caller_id.as_str(), "cli-1");
+    assert!(request.authentication.is_none());
     assert_eq!(request.project_id.as_str(), "project-1");
     assert_eq!(request.idempotency_key.as_str(), "status-1");
+}
+
+#[test]
+fn request_authentication_is_explicit_and_redacted() {
+    let secret = "credential-secret";
+    let request = status_request().authenticated(CallerCredential::new(secret));
+
+    assert_eq!(
+        request
+            .authentication
+            .as_ref()
+            .expect("credential is attached")
+            .expose_secret(),
+        secret
+    );
+    assert!(!format!("{request:?}").contains(secret));
 }
 
 #[test]

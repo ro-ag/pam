@@ -36,6 +36,8 @@ async fn main() {
             raw,
             output,
         } => app::evidence_show(handle, raw, output.as_deref()).await,
+        Mode::CallerRegister { kind } => app::caller_register(kind).await,
+        Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
         Mode::Daemon { recover } => match pam_daemon::run(recover).await {
             Ok(()) => 0,
             Err(error) => {

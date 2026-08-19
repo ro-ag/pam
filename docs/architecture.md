@@ -55,6 +55,15 @@ Caller identity and project identity are separate.
 - A **request** carries protocol version, request ID, caller ID, project ID,
   capability, idempotency key, deadline, and payload.
 
+Caller labels remain non-secret routing identities. A separate high-entropy
+credential authenticates every request; PAM stores only its SHA-256 verifier and
+uses a constant-time comparison. Registration and revocation are local-user
+administrative operations against the protected per-user state database, not
+network-reachable protocol capabilities. Revocation is immediate for subsequent
+requests, survives daemon restart, and deliberately returns the same external
+failure as an unknown caller or invalid credential. Re-registering a revoked
+caller issues a new credential and invalidates the old one.
+
 Each project has one durable ordered queue. The scheduler serializes stateful or
 conflicting operations. A flow can declare read-only collection steps safe for
 parallel execution, but their results rejoin the ordered project event stream.

@@ -4,6 +4,28 @@ pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EVIDENCE_RANGE_BYTES: u64 = 1024 * 1024;
 pub const MAX_EVIDENCE_MEDIA_TYPE_BYTES: usize = 255;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallerRegistration {
+    pub caller_id: CallerId,
+    pub registered_at_ms: u64,
+    pub revoked_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallerAuthentication {
+    Authenticated,
+    UnknownCaller,
+    Revoked,
+    InvalidCredential,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallerRevocation {
+    Revoked,
+    AlreadyRevoked,
+    UnknownCaller,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceRetention {
     Session,

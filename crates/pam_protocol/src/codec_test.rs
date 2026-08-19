@@ -1,4 +1,6 @@
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+};
 use serde::Serialize;
 
 use super::{
@@ -67,6 +69,17 @@ fn request_round_trips_through_named_messagepack() {
     let bytes = encode(&expected).unwrap();
 
     assert_eq!(decode_request(&bytes).unwrap(), expected);
+}
+
+#[test]
+fn authenticated_request_round_trips_without_debug_disclosure() {
+    let secret = "caller-secret-that-must-not-appear";
+    let expected = status_request().authenticated(CallerCredential::new(secret));
+    let bytes = encode(&expected).unwrap();
+    let actual = decode_request(&bytes).unwrap();
+
+    assert_eq!(actual, expected);
+    assert!(!format!("{actual:?}").contains(secret));
 }
 
 #[test]
@@ -161,6 +174,7 @@ fn invalid_evidence_read_lengths_are_rejected_during_decode() {
             protocol_version: PROTOCOL_VERSION,
             request_id: RequestId::from("read-observer-1"),
             caller_id: CallerId::from("cli-1"),
+            authentication: None,
             project_id: ProjectId::from("project-1"),
             capability: Capability::ReadEvidence,
             idempotency_key: IdempotencyKey::from("read-1"),
@@ -484,6 +498,7 @@ struct ExtendedRequest {
     protocol_version: u16,
     request_id: RequestId,
     caller_id: CallerId,
+    authentication: Option<CallerCredential>,
     project_id: ProjectId,
     capability: Capability,
     idempotency_key: IdempotencyKey,
@@ -499,6 +514,7 @@ fn unknown_named_fields_are_ignored_for_compatible_evolution() {
         protocol_version: request.protocol_version,
         request_id: request.request_id.clone(),
         caller_id: request.caller_id.clone(),
+        authentication: request.authentication.clone(),
         project_id: request.project_id.clone(),
         capability: request.capability.clone(),
         idempotency_key: request.idempotency_key.clone(),

@@ -352,6 +352,7 @@ fn event_label(event: &Event) -> &'static str {
 
 fn failure_code_label(code: &FailureCode) -> &'static str {
     match code {
+        FailureCode::Unauthenticated => "unauthenticated",
         FailureCode::UnsupportedProtocolVersion => "unsupported_protocol_version",
         FailureCode::InvalidRequest => "invalid_request",
         FailureCode::FrameTooLarge => "frame_too_large",

@@ -16,6 +16,7 @@ pam_daemon.workspace = true
 pam_gui.workspace = true
 pam_platform.workspace = true
 pam_protocol.workspace = true
+pam_store.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true

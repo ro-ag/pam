@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use pam_core::{ContentDigest, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{CallerId, ContentDigest, EvidenceHandle, ProjectId, RequestId};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -13,6 +13,8 @@ pub enum StoreError {
     IntegrityCheckFailed(String),
     ForeignKeyCheckFailed(String),
     WorkerStopped,
+    InvalidCallerCredential,
+    CallerAlreadyRegistered(CallerId),
     RequestNotFound(RequestId),
     RequestIdConflict(RequestId),
     IdempotencyConflict {
@@ -65,6 +67,12 @@ impl fmt::Display for StoreError {
                 formatter.write_str("PAM durable state contains an orphaned reference.")
             }
             Self::WorkerStopped => formatter.write_str("PAM's durable state worker stopped."),
+            Self::InvalidCallerCredential => {
+                formatter.write_str("caller credential must contain 1 to 256 bytes")
+            }
+            Self::CallerAlreadyRegistered(caller_id) => {
+                write!(formatter, "caller {caller_id} is already registered")
+            }
             Self::RequestNotFound(request_id) => {
                 write!(formatter, "request {request_id} does not exist")
             }
@@ -140,6 +148,8 @@ impl Error for StoreError {
             | Self::IntegrityCheckFailed(_)
             | Self::ForeignKeyCheckFailed(_)
             | Self::WorkerStopped
+            | Self::InvalidCallerCredential
+            | Self::CallerAlreadyRegistered(_)
             | Self::RequestNotFound(_)
             | Self::RequestIdConflict(_)
             | Self::IdempotencyConflict { .. }

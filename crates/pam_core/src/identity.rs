@@ -2,6 +2,35 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub const MAX_CALLER_CREDENTIAL_LENGTH: usize = 256;
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct CallerCredential(String);
+
+impl CallerCredential {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty() && self.0.len() <= MAX_CALLER_CREDENTIAL_LENGTH
+    }
+}
+
+impl fmt::Debug for CallerCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 macro_rules! identifier {
     ($name:ident) => {
         #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

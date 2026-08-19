@@ -1,4 +1,4 @@
-use pam_core::{CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{CallerCredential, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
 use pam_platform::{CallerKind, IdentityError, caller_id, discover_project_id};
 use pam_protocol::{ProtocolContractError, RequestEnvelope};
 use uuid::Uuid;
@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub(crate) struct RequestContext {
     caller_id: CallerId,
     project_id: ProjectId,
+    credential: Option<CallerCredential>,
 }
 
 impl RequestContext {
@@ -14,6 +15,9 @@ impl RequestContext {
         Ok(Self {
             caller_id: caller_id(CallerKind::Cli)?,
             project_id: discover_project_id(".")?,
+            credential: std::env::var("PAM_CALLER_CREDENTIAL")
+                .ok()
+                .map(CallerCredential::new),
         })
     }
 
@@ -22,61 +26,62 @@ impl RequestContext {
         Self {
             caller_id,
             project_id,
+            credential: Some(CallerCredential::new("test-caller-credential")),
         }
     }
 
     pub(crate) fn status(&self) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("status");
-        RequestEnvelope::status(
+        self.authenticate(RequestEnvelope::status(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
-        )
+        ))
     }
 
     pub(crate) fn brief(&self) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("brief");
-        RequestEnvelope::brief(
+        self.authenticate(RequestEnvelope::brief(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
-        )
+        ))
     }
 
     pub(crate) fn wait(&self, target_request_id: RequestId, after: u64) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("wait");
-        RequestEnvelope::wait_for_result(
+        self.authenticate(RequestEnvelope::wait_for_result(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
             target_request_id,
             after,
-        )
+        ))
     }
 
     pub(crate) fn result(&self, target_request_id: RequestId) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("result");
-        RequestEnvelope::get_result(
+        self.authenticate(RequestEnvelope::get_result(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
             target_request_id,
-        )
+        ))
     }
 
     pub(crate) fn inspect_evidence(&self, handle: EvidenceHandle) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("evidence-inspect");
-        RequestEnvelope::inspect_evidence(
+        self.authenticate(RequestEnvelope::inspect_evidence(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
             handle,
-        )
+        ))
     }
 
     pub(crate) fn read_evidence(
@@ -95,6 +100,14 @@ impl RequestContext {
             offset,
             length,
         )
+        .map(|request| self.authenticate(request))
+    }
+
+    fn authenticate(&self, request: RequestEnvelope) -> RequestEnvelope {
+        match &self.credential {
+            Some(credential) => request.authenticated(credential.clone()),
+            None => request,
+        }
     }
 }
 

@@ -14,7 +14,9 @@ mod queue_test;
 pub use evidence::{
     ContentDigest, EvidenceHandle, EvidenceReference, InvalidContentDigest, InvalidEvidenceHandle,
 };
-pub use identity::{CallerId, IdempotencyKey, ProjectId, RequestId};
+pub use identity::{
+    CallerCredential, CallerId, IdempotencyKey, MAX_CALLER_CREDENTIAL_LENGTH, ProjectId, RequestId,
+};
 pub use queue::{ProjectPermit, ProjectQueue};
 
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");

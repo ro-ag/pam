@@ -15,6 +15,14 @@ fn observer_and_idempotency_ids_are_unique_per_request() {
     assert_ne!(first.request_id, second.request_id);
     assert_ne!(first.idempotency_key, second.idempotency_key);
     assert_ne!(first.request_id.as_str(), first.idempotency_key.as_str());
+    assert_eq!(
+        first
+            .authentication
+            .as_ref()
+            .expect("test context authenticates requests")
+            .expose_secret(),
+        "test-caller-credential"
+    );
 }
 
 #[test]

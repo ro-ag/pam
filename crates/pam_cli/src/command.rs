@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pam_core::{EvidenceHandle, RequestId};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
@@ -42,6 +42,11 @@ enum Command {
         #[command(subcommand)]
         command: EvidenceCommand,
     },
+    /// Manage revocable local caller credentials.
+    Caller {
+        #[command(subcommand)]
+        command: CallerCommand,
+    },
     /// Run the foreground daemon.
     Daemon {
         /// Recover an endpoint left behind by an interrupted daemon.
@@ -68,6 +73,30 @@ enum EvidenceCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CallerCommand {
+    /// Register a caller and issue a credential once.
+    Register {
+        /// Local caller surface to register.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+    /// Revoke a caller immediately.
+    Revoke {
+        /// Local caller surface to revoke.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CallerKindArg {
+    Cli,
+    Gui,
+    CodingAgent,
+    LocalApplication,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
     Client,
@@ -85,6 +114,12 @@ pub(crate) enum Mode {
         handle: EvidenceHandle,
         raw: bool,
         output: Option<PathBuf>,
+    },
+    CallerRegister {
+        kind: CallerKindArg,
+    },
+    CallerRevoke {
+        kind: CallerKindArg,
     },
     Daemon {
         recover: bool,
@@ -120,6 +155,12 @@ impl Cli {
                 raw,
                 output,
             },
+            Some(Command::Caller {
+                command: CallerCommand::Register { kind },
+            }) => Mode::CallerRegister { kind },
+            Some(Command::Caller {
+                command: CallerCommand::Revoke { kind },
+            }) => Mode::CallerRevoke { kind },
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }

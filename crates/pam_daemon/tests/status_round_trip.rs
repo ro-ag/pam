@@ -4,15 +4,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{CallerCredential, CallerId, IdempotencyKey, ProjectId, RequestId};
 use pam_daemon::{DaemonConfig, request_exchange, request_status, serve_until};
 use pam_platform::LocalEndpoint;
 use pam_protocol::{
     Event, FailureCode, MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, RequestEnvelope,
     ResultBody, ResultPayload, SourceAvailability,
 };
+use pam_store::{CallerAuthentication, Store};
 use tokio::{sync::oneshot, task::JoinHandle};
 use zeromq::{DealerSocket, Socket, SocketSend, ZmqMessage};
+
+const TEST_CREDENTIAL: &str = "integration-caller-credential";
 
 fn test_runtime(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -35,7 +38,7 @@ fn test_runtime(name: &str) -> PathBuf {
 async fn brief_crosses_transport_with_explicit_unavailable_provenance() {
     let runtime = test_runtime("brief-round-trip");
     let endpoint = LocalEndpoint::ipc(runtime.clone());
-    let (shutdown, daemon) = start_daemon(endpoint.clone());
+    let (shutdown, daemon) = start_daemon(endpoint.clone()).await;
     for _ in 0..40 {
         if endpoint.socket_path().is_some_and(std::path::Path::exists) {
             break;
@@ -47,7 +50,8 @@ async fn brief_crosses_transport_with_explicit_unavailable_provenance() {
         CallerId::from("integration-test"),
         ProjectId::from("project-round-trip"),
         IdempotencyKey::from("brief-round-trip"),
-    );
+    )
+    .authenticated(CallerCredential::new(TEST_CREDENTIAL));
 
     let exchange = request_exchange(&endpoint, &request, Duration::from_secs(1))
         .await
@@ -79,9 +83,10 @@ fn status_request() -> RequestEnvelope {
         ProjectId::from("project-round-trip"),
         IdempotencyKey::from("status-round-trip"),
     )
+    .authenticated(CallerCredential::new(TEST_CREDENTIAL))
 }
 
-fn start_daemon(
+async fn start_daemon(
     endpoint: LocalEndpoint,
 ) -> (
     oneshot::Sender<()>,
@@ -89,6 +94,21 @@ fn start_daemon(
 ) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state_path = endpoint.runtime_dir().join("state.sqlite3");
+    let store = Store::open(&state_path).unwrap();
+    let caller_id = CallerId::from("integration-test");
+    let credential = CallerCredential::new(TEST_CREDENTIAL);
+    if store
+        .authenticate_caller(caller_id.clone(), credential.clone())
+        .await
+        .unwrap()
+        == CallerAuthentication::UnknownCaller
+    {
+        store
+            .register_caller(caller_id, credential, 1)
+            .await
+            .unwrap();
+    }
+    store.shutdown().await.unwrap();
     let daemon = tokio::spawn(serve_until(
         DaemonConfig {
             endpoint,
@@ -107,7 +127,7 @@ fn start_daemon(
 async fn status_crosses_transport_queue_events_and_result() {
     let runtime = test_runtime("round-trip");
     let endpoint = LocalEndpoint::ipc(runtime.clone());
-    let (shutdown, daemon) = start_daemon(endpoint.clone());
+    let (shutdown, daemon) = start_daemon(endpoint.clone()).await;
 
     for _ in 0..40 {
         if endpoint.socket_path().is_some_and(std::path::Path::exists) {
@@ -184,7 +204,7 @@ async fn status_crosses_transport_queue_events_and_result() {
     assert!(endpoint.ownership_path().exists());
     assert!(endpoint.socket_path().is_none_or(|path| !path.exists()));
 
-    let (second_shutdown, second_daemon) = start_daemon(endpoint.clone());
+    let (second_shutdown, second_daemon) = start_daemon(endpoint.clone()).await;
     for _ in 0..40 {
         if endpoint.socket_path().is_some_and(std::path::Path::exists) {
             break;
@@ -212,5 +232,90 @@ async fn unavailable_daemon_returns_recovery_without_auto_start() {
     assert_eq!(error.recovery_action(), Some("pam daemon"));
     assert!(!endpoint.ownership_path().exists());
     assert!(!endpoint.socket_path().unwrap().exists());
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_rejects_missing_wrong_and_revoked_credentials() {
+    let runtime = test_runtime("authentication");
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = endpoint.runtime_dir().join("state.sqlite3");
+    let (shutdown, daemon) = start_daemon(endpoint.clone()).await;
+    for _ in 0..40 {
+        if endpoint.socket_path().is_some_and(std::path::Path::exists) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let missing = RequestEnvelope::status(
+        RequestId::from("auth-missing"),
+        CallerId::from("integration-test"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::from("auth-missing"),
+    );
+    let wrong = RequestEnvelope::status(
+        RequestId::from("auth-wrong"),
+        CallerId::from("integration-test"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::from("auth-wrong"),
+    )
+    .authenticated(CallerCredential::new("wrong credential"));
+
+    let missing_failure = request_status(&endpoint, &missing, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .result;
+    let wrong_failure = request_status(&endpoint, &wrong, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .result;
+    for result in [missing_failure, wrong_failure] {
+        let ResultBody::Failure(failure) = result.body else {
+            panic!("unauthenticated request should fail")
+        };
+        assert_eq!(failure.code, FailureCode::Unauthenticated);
+        assert_eq!(failure.message, "caller authentication failed");
+        assert_eq!(failure.recovery.as_deref(), Some("pam caller register"));
+    }
+
+    let valid = status_request();
+    assert!(matches!(
+        request_status(&endpoint, &valid, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Success { .. }
+    ));
+
+    let store = Store::open(&state_path).unwrap();
+    assert_eq!(
+        store
+            .revoke_caller(CallerId::from("integration-test"), 2)
+            .await
+            .unwrap(),
+        pam_store::CallerRevocation::Revoked
+    );
+    store.shutdown().await.unwrap();
+    let revoked = RequestEnvelope::status(
+        RequestId::from("auth-revoked"),
+        CallerId::from("integration-test"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::from("auth-revoked"),
+    )
+    .authenticated(CallerCredential::new(TEST_CREDENTIAL));
+    let revoked_result = request_status(&endpoint, &revoked, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .result;
+    let ResultBody::Failure(failure) = revoked_result.body else {
+        panic!("revoked caller should fail")
+    };
+    assert_eq!(failure.code, FailureCode::Unauthenticated);
+    assert_eq!(failure.message, "caller authentication failed");
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(runtime);
 }

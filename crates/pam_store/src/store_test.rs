@@ -1,10 +1,11 @@
 use std::fs;
 
-use pam_core::{CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{CallerCredential, CallerId, IdempotencyKey, ProjectId, RequestId};
 use rusqlite::Connection;
 
 use super::{
-    AcceptOutcome, AcceptRequest, CancelOutcome, RequestState, Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, CallerAuthentication, CallerRevocation, CancelOutcome,
+    RequestState, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -28,6 +29,217 @@ fn request(
 async fn close(store: Store, directory: &std::path::Path) {
     store.shutdown().await.unwrap();
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn caller_authentication_rejects_wrong_unknown_and_duplicate_credentials() {
+    let (directory, path) = database_path("caller-authentication");
+    let store = Store::open(&path).unwrap();
+    let caller_id = CallerId::from("registered-caller");
+    let credential = CallerCredential::new("correct credential");
+
+    let registration = store
+        .register_caller(caller_id.clone(), credential.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(registration.caller_id, caller_id);
+    assert_eq!(registration.registered_at_ms, 10);
+    assert_eq!(registration.revoked_at_ms, None);
+    assert_eq!(
+        store
+            .authenticate_caller(caller_id.clone(), credential.clone())
+            .await
+            .unwrap(),
+        CallerAuthentication::Authenticated
+    );
+    assert_eq!(
+        store
+            .authenticate_caller(caller_id.clone(), CallerCredential::new("wrong credential"))
+            .await
+            .unwrap(),
+        CallerAuthentication::InvalidCredential
+    );
+    assert_eq!(
+        store
+            .authenticate_caller(CallerId::from("unknown-caller"), credential.clone())
+            .await
+            .unwrap(),
+        CallerAuthentication::UnknownCaller
+    );
+
+    assert!(matches!(
+        store
+            .register_caller(
+                caller_id.clone(),
+                CallerCredential::new("replacement credential"),
+                11
+            )
+            .await,
+        Err(StoreError::CallerAlreadyRegistered(existing)) if existing == caller_id
+    ));
+    assert_eq!(
+        store
+            .authenticate_caller(
+                CallerId::from("registered-caller"),
+                CallerCredential::new("replacement credential")
+            )
+            .await
+            .unwrap(),
+        CallerAuthentication::InvalidCredential
+    );
+    assert_eq!(
+        store
+            .authenticate_caller(CallerId::from("registered-caller"), credential)
+            .await
+            .unwrap(),
+        CallerAuthentication::Authenticated
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn empty_and_oversized_caller_credentials_are_rejected() {
+    let (directory, path) = database_path("invalid-caller-credentials");
+    let store = Store::open(&path).unwrap();
+
+    for (caller_id, credential) in [
+        ("empty-credential", CallerCredential::new("")),
+        (
+            "oversized-credential",
+            CallerCredential::new("x".repeat(257)),
+        ),
+    ] {
+        assert!(matches!(
+            store
+                .register_caller(CallerId::from(caller_id), credential.clone(), 10)
+                .await,
+            Err(StoreError::InvalidCallerCredential)
+        ));
+        assert_eq!(
+            store
+                .authenticate_caller(CallerId::from(caller_id), credential)
+                .await
+                .unwrap(),
+            CallerAuthentication::InvalidCredential
+        );
+    }
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn caller_revocation_is_immediate_idempotent_and_persistent() {
+    let (directory, path) = database_path("caller-revocation");
+    let store = Store::open(&path).unwrap();
+    let caller_id = CallerId::from("revoked-caller");
+    let credential = CallerCredential::new("credential to revoke");
+    store
+        .register_caller(caller_id.clone(), credential.clone(), 100)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.revoke_caller(caller_id.clone(), 99).await,
+        Err(StoreError::InvalidState(state))
+            if state == "caller revocation predates registration"
+    ));
+    assert_eq!(
+        store
+            .authenticate_caller(caller_id.clone(), credential.clone())
+            .await
+            .unwrap(),
+        CallerAuthentication::Authenticated
+    );
+    assert_eq!(
+        store.revoke_caller(caller_id.clone(), 101).await.unwrap(),
+        CallerRevocation::Revoked
+    );
+    assert_eq!(
+        store
+            .authenticate_caller(caller_id.clone(), credential.clone())
+            .await
+            .unwrap(),
+        CallerAuthentication::Revoked
+    );
+    assert_eq!(
+        store.revoke_caller(caller_id.clone(), 102).await.unwrap(),
+        CallerRevocation::AlreadyRevoked
+    );
+    assert_eq!(
+        store
+            .revoke_caller(CallerId::from("unknown-caller"), 102)
+            .await
+            .unwrap(),
+        CallerRevocation::UnknownCaller
+    );
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .authenticate_caller(caller_id.clone(), credential)
+            .await
+            .unwrap(),
+        CallerAuthentication::Revoked
+    );
+    assert_eq!(
+        reopened.revoke_caller(caller_id, 103).await.unwrap(),
+        CallerRevocation::AlreadyRevoked
+    );
+
+    let replacement = CallerCredential::new("replacement after revocation");
+    reopened
+        .register_caller(CallerId::from("revoked-caller"), replacement.clone(), 104)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .authenticate_caller(CallerId::from("revoked-caller"), replacement)
+            .await
+            .unwrap(),
+        CallerAuthentication::Authenticated
+    );
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn caller_secret_is_absent_from_storage_and_diagnostics() {
+    let (directory, path) = database_path("caller-secret-redaction");
+    let store = Store::open(&path).unwrap();
+    let caller_id = CallerId::from("secret-redaction-caller");
+    let secret = "raw-caller-secret-90827-must-never-be-persisted";
+    let credential = CallerCredential::new(secret);
+
+    assert!(!format!("{credential:?}").contains(secret));
+    let registration = store
+        .register_caller(caller_id.clone(), credential.clone(), 10)
+        .await
+        .unwrap();
+    assert!(!format!("{registration:?}").contains(secret));
+    let duplicate_error = store
+        .register_caller(caller_id, credential, 11)
+        .await
+        .unwrap_err();
+    assert!(!duplicate_error.to_string().contains(secret));
+    assert!(!format!("{duplicate_error:?}").contains(secret));
+
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let wal_path = std::path::PathBuf::from(wal_path);
+    for storage_path in [&path, &wal_path] {
+        let bytes = fs::read(storage_path).unwrap();
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "raw caller secret found in {}",
+            storage_path.display()
+        );
+    }
+
+    close(store, &directory).await;
 }
 
 #[tokio::test]

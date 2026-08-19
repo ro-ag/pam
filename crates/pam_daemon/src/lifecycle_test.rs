@@ -150,6 +150,7 @@ fn stale_socket_reports_recovery_command() {
         state_path: Some(runtime.join("state.sqlite3")),
         brief_provider: None,
         bypass_authentication: true,
+        bypass_policy: true,
     })
     .unwrap_err();
     assert!(matches!(error, DaemonError::StaleState(_)));
@@ -205,6 +206,7 @@ fn start_daemon_with_provider(
             state_path: Some(state_path),
             brief_provider,
             bypass_authentication: true,
+            bypass_policy: true,
         },
         async {
             let _ = shutdown_rx.await;
@@ -876,6 +878,7 @@ async fn daemon_parallelizes_projects_but_serializes_each_project() {
             state_path: Some(runtime.join("state.sqlite3")),
             brief_provider: None,
             bypass_authentication: true,
+            bypass_policy: true,
         },
         async {
             let _ = shutdown_rx.await;

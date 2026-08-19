@@ -64,6 +64,20 @@ requests, survives daemon restart, and deliberately returns the same external
 failure as an unknown caller or invalid credential. Re-registering a revoked
 caller issues a new credential and invalidates the old one.
 
+Project policy is default-deny. Grants bind one caller, project, capability, and
+either an exact resource or an explicit any-resource scope. Active explicit
+denies override allows; expiry and revocation take effect at their recorded
+millisecond boundary. Each grant mutation advances a durable project-policy
+version.
+
+Approval-required grants create a durable request bound to a collision-safe
+SHA-256 fingerprint of the caller, project, capability, and exact resource.
+Only a registered active local approver can approve or deny it. Approved
+receipts are consumed transactionally at the policy gate, exactly once, before
+the effect; mismatched, denied, expired, or previously consumed receipts never
+authorize work. Protocol failures carry the approval ID and expiry without
+exposing credentials.
+
 Each project has one durable ordered queue. The scheduler serializes stateful or
 conflicting operations. A flow can declare read-only collection steps safe for
 parallel execution, but their results rejoin the ordered project event stream.

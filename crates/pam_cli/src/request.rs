@@ -1,4 +1,6 @@
-use pam_core::{CallerCredential, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+};
 use pam_platform::{CallerKind, IdentityError, caller_id, discover_project_id};
 use pam_protocol::{ProtocolContractError, RequestEnvelope};
 use uuid::Uuid;
@@ -8,6 +10,7 @@ pub(crate) struct RequestContext {
     caller_id: CallerId,
     project_id: ProjectId,
     credential: Option<CallerCredential>,
+    approval_id: Option<ApprovalId>,
 }
 
 impl RequestContext {
@@ -18,6 +21,7 @@ impl RequestContext {
             credential: std::env::var("PAM_CALLER_CREDENTIAL")
                 .ok()
                 .map(CallerCredential::new),
+            approval_id: std::env::var("PAM_APPROVAL_ID").ok().map(ApprovalId::new),
         })
     }
 
@@ -27,6 +31,7 @@ impl RequestContext {
             caller_id,
             project_id,
             credential: Some(CallerCredential::new("test-caller-credential")),
+            approval_id: None,
         }
     }
 
@@ -104,8 +109,12 @@ impl RequestContext {
     }
 
     fn authenticate(&self, request: RequestEnvelope) -> RequestEnvelope {
-        match &self.credential {
+        let request = match &self.credential {
             Some(credential) => request.authenticated(credential.clone()),
+            None => request,
+        };
+        match &self.approval_id {
+            Some(approval_id) => request.with_approval(approval_id.clone()),
             None => request,
         }
     }

@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use pam_core::{EvidenceHandle, RequestId};
+use pam_core::{ApprovalId, EvidenceHandle, RequestId};
+use pam_policy::{CapabilityName, ResourceName};
 
 use super::command::{CallerKindArg, Cli, Mode};
 
@@ -44,6 +45,35 @@ fn explicit_subcommands_select_runtime_modes() {
             .mode(),
         Mode::CallerRevoke {
             kind: CallerKindArg::CodingAgent,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "access",
+            "grant",
+            "evidence.read",
+            "--resource",
+            "evidence:failure",
+            "--require-approval",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::AccessGrant {
+            capability: CapabilityName::parse("evidence.read").unwrap(),
+            resource: Some(ResourceName::parse("evidence:failure").unwrap()),
+            deny: false,
+            require_approval: true,
+            expires_at_unix_ms: None,
+            kind: CallerKindArg::Cli,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "approval", "approve", "approval-1"])
+            .unwrap()
+            .mode(),
+        Mode::ApprovalApprove {
+            approval_id: ApprovalId::from("approval-1"),
         }
     );
 }

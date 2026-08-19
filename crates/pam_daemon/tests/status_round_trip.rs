@@ -4,14 +4,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{CallerCredential, CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, GrantId, IdempotencyKey, ProjectId, RequestId,
+};
 use pam_daemon::{DaemonConfig, request_exchange, request_status, serve_until};
 use pam_platform::LocalEndpoint;
+use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceScope};
 use pam_protocol::{
     Event, FailureCode, MAX_FRAME_SIZE, OperationTruth, PROTOCOL_VERSION, RequestEnvelope,
     ResultBody, ResultPayload, SourceAvailability,
 };
-use pam_store::{CallerAuthentication, Store};
+use pam_store::{ApprovalDecision, CallerAuthentication, PutGrant, Store, StoreError};
 use tokio::{sync::oneshot, task::JoinHandle};
 use zeromq::{DealerSocket, Socket, SocketSend, ZmqMessage};
 
@@ -86,6 +89,50 @@ fn status_request() -> RequestEnvelope {
     .authenticated(CallerCredential::new(TEST_CREDENTIAL))
 }
 
+fn approval_status(request_id: &str, approval_id: Option<ApprovalId>) -> RequestEnvelope {
+    let request = RequestEnvelope::status(
+        RequestId::from(request_id),
+        CallerId::from("approval-caller"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::new(format!("{request_id}-key")),
+    )
+    .authenticated(CallerCredential::new("approval-caller-credential"));
+    match approval_id {
+        Some(approval_id) => request.with_approval(approval_id),
+        None => request,
+    }
+}
+
+async fn seed_approval_caller(state_path: &std::path::Path) {
+    let seed = Store::open(state_path).unwrap();
+    seed.register_caller(
+        CallerId::from("approval-caller"),
+        CallerCredential::new("approval-caller-credential"),
+        1,
+    )
+    .await
+    .unwrap();
+    for capability in ["daemon.status", "brief.read"] {
+        seed.put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::new(format!("approval-{capability}")),
+                caller: CallerId::from("approval-caller"),
+                project: ProjectId::from("project-round-trip"),
+                capability: CapabilityName::parse(capability).unwrap(),
+                resource: ResourceScope::Any,
+                effect: Effect::Allow,
+                approval: ApprovalRequirement::Once,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    }
+    seed.shutdown().await.unwrap();
+}
+
 async fn start_daemon(
     endpoint: LocalEndpoint,
 ) -> (
@@ -107,6 +154,28 @@ async fn start_daemon(
             .register_caller(caller_id, credential, 1)
             .await
             .unwrap();
+    }
+    for capability in ["daemon.status", "brief.read"] {
+        let result = store
+            .put_grant(PutGrant {
+                grant: Grant {
+                    id: GrantId::new(format!("integration-{capability}")),
+                    caller: CallerId::from("integration-test"),
+                    project: ProjectId::from("project-round-trip"),
+                    capability: CapabilityName::parse(capability).unwrap(),
+                    resource: ResourceScope::Any,
+                    effect: Effect::Allow,
+                    approval: ApprovalRequirement::None,
+                    expires_at_ms: None,
+                    revoked_at_ms: None,
+                },
+                created_at_ms: 1,
+            })
+            .await;
+        assert!(
+            result.is_ok() || matches!(result, Err(StoreError::GrantAlreadyExists(_))),
+            "integration grant should be present"
+        );
     }
     store.shutdown().await.unwrap();
     let daemon = tokio::spawn(serve_until(
@@ -314,6 +383,95 @@ async fn authentication_rejects_missing_wrong_and_revoked_credentials() {
     };
     assert_eq!(failure.code, FailureCode::Unauthenticated);
     assert_eq!(failure.message, "caller authentication failed");
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_approval_is_required_bound_to_effect_and_consumed_once() {
+    let runtime = test_runtime("policy-approval");
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = endpoint.runtime_dir().join("state.sqlite3");
+    seed_approval_caller(&state_path).await;
+
+    let (shutdown, daemon) = start_daemon(endpoint.clone()).await;
+    for _ in 0..40 {
+        if endpoint.socket_path().is_some_and(std::path::Path::exists) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let challenge_result = request_status(
+        &endpoint,
+        &approval_status("approval-request", None),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap()
+    .result;
+    let ResultBody::Failure(challenge_failure) = challenge_result.body else {
+        panic!("approval-gated capability should return a challenge")
+    };
+    assert_eq!(challenge_failure.code, FailureCode::ApprovalRequired);
+    let challenge = challenge_failure
+        .approval
+        .expect("typed approval challenge");
+
+    let decision_store = Store::open(&state_path).unwrap();
+    let decision_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    decision_store
+        .decide_approval(
+            challenge.approval_id.clone(),
+            CallerId::from("integration-test"),
+            ApprovalDecision::Approve,
+            decision_time,
+        )
+        .await
+        .unwrap();
+    decision_store.shutdown().await.unwrap();
+
+    let wrong_effect = RequestEnvelope::brief(
+        RequestId::from("approval-wrong-effect"),
+        CallerId::from("approval-caller"),
+        ProjectId::from("project-round-trip"),
+        IdempotencyKey::from("approval-wrong-effect-key"),
+    )
+    .authenticated(CallerCredential::new("approval-caller-credential"))
+    .with_approval(challenge.approval_id.clone());
+    let wrong = request_exchange(&endpoint, &wrong_effect, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        wrong.result.body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+    ));
+
+    let approved = approval_status("approval-approved", Some(challenge.approval_id.clone()));
+    assert!(matches!(
+        request_status(&endpoint, &approved, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Success { .. }
+    ));
+    let replay = approval_status("approval-replay", Some(challenge.approval_id));
+    assert!(matches!(
+        request_status(&endpoint, &replay, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+    ));
 
     shutdown.send(()).unwrap();
     daemon.await.unwrap().unwrap();

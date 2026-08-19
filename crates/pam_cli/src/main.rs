@@ -38,6 +38,31 @@ async fn main() {
         } => app::evidence_show(handle, raw, output.as_deref()).await,
         Mode::CallerRegister { kind } => app::caller_register(kind).await,
         Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
+        Mode::AccessGrant {
+            capability,
+            resource,
+            deny,
+            require_approval,
+            expires_at_unix_ms,
+            kind,
+        } => {
+            app::access_grant(
+                kind,
+                capability,
+                resource,
+                deny,
+                require_approval,
+                expires_at_unix_ms,
+            )
+            .await
+        }
+        Mode::AccessRevoke { grant_id } => app::access_revoke(grant_id).await,
+        Mode::ApprovalApprove { approval_id } => {
+            app::approval_decide(approval_id, pam_store::ApprovalDecision::Approve).await
+        }
+        Mode::ApprovalDeny { approval_id } => {
+            app::approval_decide(approval_id, pam_store::ApprovalDecision::Deny).await
+        }
         Mode::Daemon { recover } => match pam_daemon::run(recover).await {
             Ok(()) => 0,
             Err(error) => {

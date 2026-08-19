@@ -231,6 +231,14 @@ fn present_failure(failure: &Failure) -> Presentation {
         writeln!(stderr, "Recovery: {}", escape_text(recovery))
             .expect("writing to a String cannot fail");
     }
+    if let Some(approval) = &failure.approval {
+        writeln!(
+            stderr,
+            "Approval: {} expires_at_unix_ms={}",
+            approval.approval_id, approval.expires_at_unix_ms
+        )
+        .expect("writing to a String cannot fail");
+    }
     let exit_code = match failure.code {
         FailureCode::Pending => EXIT_PENDING,
         FailureCode::NotFound => EXIT_NOT_FOUND,
@@ -353,6 +361,10 @@ fn event_label(event: &Event) -> &'static str {
 fn failure_code_label(code: &FailureCode) -> &'static str {
     match code {
         FailureCode::Unauthenticated => "unauthenticated",
+        FailureCode::Forbidden => "forbidden",
+        FailureCode::ApprovalRequired => "approval_required",
+        FailureCode::ApprovalDenied => "approval_denied",
+        FailureCode::ApprovalExpired => "approval_expired",
         FailureCode::UnsupportedProtocolVersion => "unsupported_protocol_version",
         FailureCode::InvalidRequest => "invalid_request",
         FailureCode::FrameTooLarge => "frame_too_large",

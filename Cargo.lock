@@ -712,6 +712,7 @@ dependencies = [
  "pam_daemon",
  "pam_gui",
  "pam_platform",
+ "pam_policy",
  "pam_protocol",
  "pam_store",
  "sha2",
@@ -743,6 +744,7 @@ version = "0.1.0"
 dependencies = [
  "pam_core",
  "pam_platform",
+ "pam_policy",
  "pam_protocol",
  "pam_store",
  "serde",
@@ -776,6 +778,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_policy"
+version = "0.1.0"
+dependencies = [
+ "pam_core",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "pam_protocol"
 version = "0.1.0"
 dependencies = [
@@ -792,6 +803,7 @@ dependencies = [
  "cap-std",
  "nix",
  "pam_core",
+ "pam_policy",
  "rusqlite",
  "sha2",
  "tokio",

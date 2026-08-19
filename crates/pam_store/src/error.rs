@@ -1,6 +1,8 @@
 use std::{error::Error, fmt};
 
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerId, ContentDigest, EvidenceHandle, GrantId, ProjectId, RequestId,
+};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -15,6 +17,10 @@ pub enum StoreError {
     WorkerStopped,
     InvalidCallerCredential,
     CallerAlreadyRegistered(CallerId),
+    GrantAlreadyExists(GrantId),
+    ApprovalNotFound(ApprovalId),
+    InvalidApprovalState,
+    ApprovalExpiryOverflow,
     RequestNotFound(RequestId),
     RequestIdConflict(RequestId),
     IdempotencyConflict {
@@ -73,6 +79,16 @@ impl fmt::Display for StoreError {
             Self::CallerAlreadyRegistered(caller_id) => {
                 write!(formatter, "caller {caller_id} is already registered")
             }
+            Self::GrantAlreadyExists(grant_id) => {
+                write!(formatter, "grant {grant_id} already exists")
+            }
+            Self::ApprovalNotFound(approval_id) => {
+                write!(formatter, "approval {approval_id} does not exist")
+            }
+            Self::InvalidApprovalState => {
+                formatter.write_str("approval is not awaiting this decision")
+            }
+            Self::ApprovalExpiryOverflow => formatter.write_str("approval expiry overflowed"),
             Self::RequestNotFound(request_id) => {
                 write!(formatter, "request {request_id} does not exist")
             }
@@ -150,6 +166,10 @@ impl Error for StoreError {
             | Self::WorkerStopped
             | Self::InvalidCallerCredential
             | Self::CallerAlreadyRegistered(_)
+            | Self::GrantAlreadyExists(_)
+            | Self::ApprovalNotFound(_)
+            | Self::InvalidApprovalState
+            | Self::ApprovalExpiryOverflow
             | Self::RequestNotFound(_)
             | Self::RequestIdConflict(_)
             | Self::IdempotencyConflict { .. }

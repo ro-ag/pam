@@ -70,6 +70,8 @@ macro_rules! identifier {
 }
 
 identifier!(CallerId);
+identifier!(ApprovalId);
+identifier!(GrantId);
 identifier!(IdempotencyKey);
 identifier!(ProjectId);
 identifier!(RequestId);

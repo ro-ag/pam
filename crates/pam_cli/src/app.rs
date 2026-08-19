@@ -4,11 +4,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{CallerCredential, EvidenceHandle, RequestId};
+use pam_core::{ApprovalId, CallerCredential, EvidenceHandle, GrantId, RequestId};
 use pam_daemon::{ClientExchange, StatusError};
-use pam_platform::{CallerKind, IdentityError, LocalEndpoint, caller_id, user_data_dir};
+use pam_platform::{
+    CallerKind, IdentityError, LocalEndpoint, caller_id, discover_project_id, user_data_dir,
+};
+use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
 use pam_protocol::{ResultBody, ResultPayload};
-use pam_store::{CallerRevocation, Store};
+use pam_store::{
+    ApprovalDecision, ApprovalDecisionOutcome, CallerRevocation, GrantRevocation, PutGrant, Store,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -105,6 +110,149 @@ pub(crate) async fn caller_revoke(kind: CallerKindArg) -> i32 {
             EXIT_OPERATION_FAILED
         }
     }
+}
+
+pub(crate) async fn access_grant(
+    kind: CallerKindArg,
+    capability: CapabilityName,
+    resource: Option<ResourceName>,
+    deny: bool,
+    require_approval: bool,
+    expires_at_ms: Option<u64>,
+) -> i32 {
+    let caller_id = match caller_id(caller_kind(kind)) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let project_id = match discover_project_id(".") {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let grant_id = GrantId::new(Uuid::new_v4().to_string());
+    let created_at_ms = now_ms();
+    let result = store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: grant_id.clone(),
+                caller: caller_id,
+                project: project_id,
+                capability,
+                resource: resource.map_or(ResourceScope::Any, ResourceScope::Exact),
+                effect: if deny { Effect::Deny } else { Effect::Allow },
+                approval: if require_approval {
+                    ApprovalRequirement::Once
+                } else {
+                    ApprovalRequirement::None
+                },
+                expires_at_ms,
+                revoked_at_ms: None,
+            },
+            created_at_ms,
+        })
+        .await;
+    let shutdown = store.shutdown().await;
+    let policy = match result {
+        Ok(policy) => policy,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    println!(
+        "Added grant {grant_id} to project policy version {}.",
+        policy.version
+    );
+    0
+}
+
+pub(crate) async fn access_revoke(grant_id: GrantId) -> i32 {
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store.revoke_grant(grant_id.clone(), now_ms()).await;
+    let shutdown = store.shutdown().await;
+    let revocation = match result {
+        Ok(revocation) => revocation,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match revocation {
+        GrantRevocation::Revoked => println!("Revoked grant {grant_id}."),
+        GrantRevocation::AlreadyRevoked => println!("Grant {grant_id} is already revoked."),
+        GrantRevocation::UnknownGrant => {
+            eprintln!("Grant {grant_id} does not exist.");
+            return EXIT_OPERATION_FAILED;
+        }
+    }
+    0
+}
+
+pub(crate) async fn approval_decide(approval_id: ApprovalId, decision: ApprovalDecision) -> i32 {
+    let approver_id = match caller_id(CallerKind::Cli) {
+        Ok(caller_id) => caller_id,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let data_dir = match user_data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            report_identity_error(&error);
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let store = match Store::open(data_dir.join("state.sqlite3")) {
+        Ok(store) => store,
+        Err(error) => return report_store_error(&error),
+    };
+    let result = store
+        .decide_approval(approval_id.clone(), approver_id, decision, now_ms())
+        .await;
+    let shutdown = store.shutdown().await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => return report_store_error(&error),
+    };
+    if let Err(error) = shutdown {
+        return report_store_error(&error);
+    }
+    match outcome {
+        ApprovalDecisionOutcome::Approved => println!("Approved {approval_id}."),
+        ApprovalDecisionOutcome::Denied => println!("Denied {approval_id}."),
+        ApprovalDecisionOutcome::Expired => {
+            eprintln!("Approval {approval_id} expired before the decision.");
+            return EXIT_OPERATION_FAILED;
+        }
+    }
+    0
 }
 
 pub(crate) async fn status() -> i32 {

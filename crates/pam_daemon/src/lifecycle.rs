@@ -15,16 +15,19 @@ use pam_platform::{
     IncomingRequest, LocalEndpoint, ServerTransport, TransportError, TransportErrorKind,
     user_data_dir,
 };
+use pam_policy::{CapabilityName, ResourceName};
 use pam_protocol::{
-    BriefProvenance, BriefResult, CancellationDisposition, CancellationResult, Capability,
-    CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, Failure, FailureCode, OperationTruth, PROTOCOL_VERSION, ReplayResult,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
-    SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
+    ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, CodecError, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
+    EvidenceRedaction, EvidenceRetention, Failure, FailureCode, OperationTruth, PROTOCOL_VERSION,
+    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
+    ServerMessage, SourceAvailability, StatusResult, decode_request_envelope,
+    decode_server_message, encode,
 };
 use pam_store::{
-    AcceptOutcome, AcceptRequest, CallerAuthentication, CancelOutcome, EventRecord, LeasedRequest,
-    Replay, RequestState, Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, AuthorizationOutcome, AuthorizationRequest, CallerAuthentication,
+    CancelOutcome, EventRecord, LeasedRequest, Replay, RequestState, Store, StoreError,
+    TerminalState,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -39,6 +42,7 @@ const SCHEDULER_CAPACITY: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(3);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
+const APPROVAL_LIFETIME: Duration = Duration::from_mins(5);
 // UUIDs and current semantic IDs fit comfortably; this also leaves ample room for
 // a maximum evidence chunk and its response envelope in the 1 MiB protocol frame.
 const MAX_REQUEST_IDENTIFIER_BYTES: usize = 256;
@@ -89,6 +93,8 @@ pub struct DaemonConfig {
     pub brief_provider: Option<Arc<dyn BriefProvider>>,
     #[cfg(test)]
     pub(crate) bypass_authentication: bool,
+    #[cfg(test)]
+    pub(crate) bypass_policy: bool,
 }
 
 impl Default for DaemonConfig {
@@ -100,6 +106,8 @@ impl Default for DaemonConfig {
             brief_provider: None,
             #[cfg(test)]
             bypass_authentication: false,
+            #[cfg(test)]
+            bypass_policy: false,
         }
     }
 }
@@ -213,6 +221,10 @@ where
     let authentication_required = !config.bypass_authentication;
     #[cfg(not(test))]
     let authentication_required = true;
+    #[cfg(test)]
+    let policy_required = !config.bypass_policy;
+    #[cfg(not(test))]
+    let policy_required = true;
     let mut server = ServerTransport::bind(&config.endpoint).await?;
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(RESPONSE_CAPACITY);
     let (scheduler_tx, scheduler_rx) = mpsc::channel::<()>(SCHEDULER_CAPACITY);
@@ -257,6 +269,7 @@ where
                         request_scheduler,
                         request_brief_provider,
                         authentication_required,
+                        policy_required,
                     )
                     .await
                 });
@@ -396,6 +409,7 @@ fn oversized_response_failure(message: &ServerMessage) -> ServerMessage {
             code: FailureCode::FrameTooLarge,
             message: "response exceeded the local protocol frame limit".to_owned(),
             recovery: None,
+            approval: None,
         }),
     })
 }
@@ -464,6 +478,7 @@ async fn handle_incoming(
     scheduler: mpsc::Sender<()>,
     brief_provider: Arc<dyn BriefProvider>,
     authentication_required: bool,
+    policy_required: bool,
 ) -> Result<(), DaemonError> {
     let Ok(request) = decode_request_envelope(incoming.payload()) else {
         return Ok(());
@@ -492,20 +507,9 @@ async fn handle_incoming(
         .await;
         return Ok(());
     }
-    if authentication_required
-        && !matches!(
-            authenticate_request(&request, &store).await?,
-            CallerAuthentication::Authenticated
-        )
+    if let Some(failure) =
+        request_preflight(&request, &store, authentication_required, policy_required).await?
     {
-        let mut failure = failure_result(
-            &request,
-            FailureCode::Unauthenticated,
-            "caller authentication failed",
-        );
-        if let ResultBody::Failure(body) = &mut failure.body {
-            body.recovery = Some("pam caller register".to_owned());
-        }
         send_routed(
             &outbound,
             incoming,
@@ -561,6 +565,37 @@ async fn handle_incoming(
     }
 }
 
+async fn request_preflight(
+    request: &RequestEnvelope,
+    store: &Store,
+    authentication_required: bool,
+    policy_required: bool,
+) -> Result<Option<ResultEnvelope>, StoreError> {
+    if authentication_required
+        && !matches!(
+            authenticate_request(request, store).await?,
+            CallerAuthentication::Authenticated
+        )
+    {
+        let mut failure = failure_result(
+            request,
+            FailureCode::Unauthenticated,
+            "caller authentication failed",
+        );
+        if let ResultBody::Failure(body) = &mut failure.body {
+            body.recovery = Some("pam caller register".to_owned());
+        }
+        return Ok(Some(failure));
+    }
+    if policy_required {
+        let outcome = authorize_request(request, store).await?;
+        if !matches!(outcome, AuthorizationOutcome::Allowed) {
+            return Ok(Some(authorization_failure(request, outcome)));
+        }
+    }
+    Ok(None)
+}
+
 async fn authenticate_request(
     request: &RequestEnvelope,
     store: &Store,
@@ -571,6 +606,106 @@ async fn authenticate_request(
     store
         .authenticate_caller(request.caller_id.clone(), credential)
         .await
+}
+
+async fn authorize_request(
+    request: &RequestEnvelope,
+    store: &Store,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let capability = CapabilityName::parse(request.capability.policy_name())
+        .expect("protocol capability names are statically valid");
+    let resource = policy_resource(request)?;
+    store
+        .authorize(
+            AuthorizationRequest {
+                caller_id: request.caller_id.clone(),
+                project_id: request.project_id.clone(),
+                capability,
+                resource,
+                approval_id: request.approval_id.clone(),
+            },
+            now_ms(),
+            duration_ms(APPROVAL_LIFETIME),
+        )
+        .await
+}
+
+fn policy_resource(request: &RequestEnvelope) -> Result<ResourceName, StoreError> {
+    let resource = match &request.payload {
+        RequestPayload::Status => "daemon".to_owned(),
+        RequestPayload::Brief => format!("project:{}", request.project_id),
+        RequestPayload::Cancel { target_request_id }
+        | RequestPayload::Replay {
+            target_request_id, ..
+        }
+        | RequestPayload::WaitForResult {
+            target_request_id, ..
+        }
+        | RequestPayload::GetResult { target_request_id } => {
+            format!("request:{target_request_id}")
+        }
+        RequestPayload::InspectEvidence { handle } => format!("evidence:{handle}"),
+        RequestPayload::ReadEvidence {
+            handle,
+            offset,
+            length,
+        } => format!("evidence:{handle}#{offset}+{length}"),
+    };
+    ResourceName::parse(resource)
+        .map_err(|_| StoreError::InvalidState("invalid policy resource".to_owned()))
+}
+
+fn authorization_failure(
+    request: &RequestEnvelope,
+    outcome: AuthorizationOutcome,
+) -> ResultEnvelope {
+    let (code, message, recovery, approval) = match outcome {
+        AuthorizationOutcome::Allowed => unreachable!("allowed requests are dispatched"),
+        AuthorizationOutcome::Denied => (
+            FailureCode::Forbidden,
+            "project policy denied this capability".to_owned(),
+            Some("pam access grant".to_owned()),
+            None,
+        ),
+        AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        } => {
+            let recovery = format!("pam approval approve {approval_id}");
+            (
+                FailureCode::ApprovalRequired,
+                "this exact effect requires approval".to_owned(),
+                Some(recovery),
+                Some(ApprovalChallenge {
+                    approval_id,
+                    expires_at_unix_ms: expires_at_ms,
+                }),
+            )
+        }
+        AuthorizationOutcome::ApprovalDenied => (
+            FailureCode::ApprovalDenied,
+            "approval was denied".to_owned(),
+            None,
+            None,
+        ),
+        AuthorizationOutcome::ApprovalExpired => (
+            FailureCode::ApprovalExpired,
+            "approval expired before use".to_owned(),
+            None,
+            None,
+        ),
+    };
+    ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request.request_id.clone(),
+        project_id: request.project_id.clone(),
+        body: ResultBody::Failure(Failure {
+            code,
+            message,
+            recovery,
+            approval,
+        }),
+    }
 }
 
 async fn handle_read_only(
@@ -774,6 +909,7 @@ async fn handle_cancel(
             code: FailureCode::Cancelled,
             message: "request was cancelled".to_owned(),
             recovery: None,
+            approval: None,
         }),
     };
     let stored = encode(&ServerMessage::Result(cancelled_result))?;
@@ -1514,6 +1650,7 @@ async fn process_leased(
                     code: FailureCode::InvalidRequest,
                     message: format!("unknown durable operation {}", leased.operation_kind),
                     recovery: None,
+                    approval: None,
                 }),
             },
         )
@@ -1611,6 +1748,7 @@ fn failure_result(request: &RequestEnvelope, code: FailureCode, message: &str) -
             code,
             message: message.to_owned(),
             recovery: None,
+            approval: None,
         }),
     }
 }

@@ -1,6 +1,12 @@
 use std::{path::Path, sync::mpsc, thread, time::Duration};
 
-use pam_core::{CallerCredential, CallerId, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
+};
+use pam_policy::{
+    ApprovalRequirement, Decision, Effect, EffectFingerprint, Grant, ResourceName, ResourceScope,
+    evaluate,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -11,19 +17,22 @@ use std::path::PathBuf;
 
 use crate::evidence::{self, EvidenceFiles};
 use crate::{
-    AcceptOutcome, AcceptRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
-    CancelOutcome, EventRecord, EvidenceMetadata, Lease, LeasedRequest, PutEvidence, Replay,
-    RequestSnapshot, RequestState, StoreError, StoredResult, TerminalState,
+    AcceptOutcome, AcceptRequest, ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome,
+    AuthorizationRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
+    CancelOutcome, EventRecord, EvidenceMetadata, GrantRevocation, Lease, LeasedRequest,
+    ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot, RequestState, StoreError,
+    StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 3;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 4;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
     (3, include_str!("../migrations/0003_callers.sql")),
+    (4, include_str!("../migrations/0004_policy.sql")),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -93,6 +102,90 @@ impl Store {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Caller(CallerCommand::Revoke {
             caller_id,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Adds one project-scoped capability grant and advances the policy version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate grants, unknown callers, invalid timestamps,
+    /// or unavailable durable state.
+    pub async fn put_grant(&self, grant: PutGrant) -> Result<ProjectPolicy, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::PutGrant {
+            grant,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Revokes a grant idempotently and advances the project policy version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timestamp or unavailable durable state.
+    pub async fn revoke_grant(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+    ) -> Result<GrantRevocation, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::RevokeGrant {
+            grant_id,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Evaluates default-deny project policy and atomically consumes exact approvals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timing, corrupt policy state, or unavailable
+    /// durable state.
+    pub async fn authorize(
+        &self,
+        request: AuthorizationRequest,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+    ) -> Result<AuthorizationOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::Authorize {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Applies a human approval decision to a pending exact effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval is missing, no longer pending, the
+    /// timestamp is invalid, or durable state is unavailable.
+    pub async fn decide_approval(
+        &self,
+        approval_id: ApprovalId,
+        approver_id: CallerId,
+        decision: ApprovalDecision,
+        now_ms: u64,
+    ) -> Result<ApprovalDecisionOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::DecideApproval {
+            approval_id,
+            approver_id,
+            decision,
             now_ms,
             response: response_tx,
         }))
@@ -528,6 +621,7 @@ async fn receive<T>(response: oneshot::Receiver<Result<T, StoreError>>) -> Resul
 
 enum Command {
     Caller(CallerCommand),
+    Policy(PolicyCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -612,6 +706,31 @@ enum CallerCommand {
     },
 }
 
+enum PolicyCommand {
+    PutGrant {
+        grant: PutGrant,
+        response: Response<ProjectPolicy>,
+    },
+    RevokeGrant {
+        grant_id: GrantId,
+        now_ms: u64,
+        response: Response<GrantRevocation>,
+    },
+    Authorize {
+        request: AuthorizationRequest,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+        response: Response<AuthorizationOutcome>,
+    },
+    DecideApproval {
+        approval_id: ApprovalId,
+        approver_id: CallerId,
+        decision: ApprovalDecision,
+        now_ms: u64,
+        response: Response<ApprovalDecisionOutcome>,
+    },
+}
+
 enum EvidenceCommand {
     Put {
         evidence: PutEvidence,
@@ -642,6 +761,7 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
     while let Some(command) = commands.blocking_recv() {
         match command {
             Command::Caller(command) => run_caller_command(&mut connection, command),
+            Command::Policy(command) => run_policy_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -750,6 +870,440 @@ fn run_caller_command(connection: &mut Connection, command: CallerCommand) {
             response,
         } => respond(response, revoke_caller(connection, &caller_id, now_ms)),
     }
+}
+
+fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
+    match command {
+        PolicyCommand::PutGrant { grant, response } => {
+            respond(response, put_grant(connection, grant));
+        }
+        PolicyCommand::RevokeGrant {
+            grant_id,
+            now_ms,
+            response,
+        } => respond(response, revoke_grant(connection, &grant_id, now_ms)),
+        PolicyCommand::Authorize {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response,
+        } => respond(
+            response,
+            authorize(connection, &request, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::DecideApproval {
+            approval_id,
+            approver_id,
+            decision,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            decide_approval(connection, &approval_id, &approver_id, decision, now_ms),
+        ),
+    }
+}
+
+fn put_grant(connection: &mut Connection, put: PutGrant) -> Result<ProjectPolicy, StoreError> {
+    let created_at = sql_integer(put.created_at_ms)?;
+    let grant = put.grant;
+    let expires_at = grant.expires_at_ms.map(sql_integer).transpose()?;
+    let revoked_at = grant.revoked_at_ms.map(sql_integer).transpose()?;
+    let (resource_kind, resource) = match &grant.resource {
+        ResourceScope::Any => ("any", None),
+        ResourceScope::Exact(resource) => ("exact", Some(resource.as_str())),
+    };
+    let effect = match grant.effect {
+        Effect::Allow => "allow",
+        Effect::Deny => "deny",
+    };
+    let approval = match grant.approval {
+        ApprovalRequirement::None => "none",
+        ApprovalRequirement::Once => "once",
+    };
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM capability_grants WHERE grant_id = ?1",
+            [grant.id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Err(StoreError::GrantAlreadyExists(grant.id));
+    }
+    transaction.execute(
+        "INSERT INTO projects(project_id) VALUES (?1)
+         ON CONFLICT(project_id) DO NOTHING",
+        [grant.project.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+         VALUES (?1, 1, 'deny', ?2)
+         ON CONFLICT(project_id) DO UPDATE SET
+             version = project_policies.version + 1,
+             updated_at_ms = excluded.updated_at_ms",
+        params![grant.project.as_str(), created_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO capability_grants(
+            grant_id, caller_id, project_id, capability, resource_kind, resource,
+            effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            grant.id.as_str(),
+            grant.caller.as_str(),
+            grant.project.as_str(),
+            grant.capability.as_str(),
+            resource_kind,
+            resource,
+            effect,
+            approval,
+            expires_at,
+            revoked_at,
+            created_at,
+        ],
+    )?;
+    let version: i64 = transaction.query_row(
+        "SELECT version FROM project_policies WHERE project_id = ?1",
+        [grant.project.as_str()],
+        |row| row.get(0),
+    )?;
+    transaction.commit()?;
+    Ok(ProjectPolicy {
+        project_id: grant.project,
+        version: unsigned_integer(version)?,
+        updated_at_ms: put.created_at_ms,
+    })
+}
+
+fn revoke_grant(
+    connection: &mut Connection,
+    grant_id: &GrantId,
+    now_ms: u64,
+) -> Result<GrantRevocation, StoreError> {
+    let revoked_at = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let grant = transaction
+        .query_row(
+            "SELECT project_id, revoked_at_ms FROM capability_grants WHERE grant_id = ?1",
+            [grant_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((project_id, previous_revocation)) = grant else {
+        return Ok(GrantRevocation::UnknownGrant);
+    };
+    if previous_revocation.is_some() {
+        return Ok(GrantRevocation::AlreadyRevoked);
+    }
+    transaction.execute(
+        "UPDATE capability_grants SET revoked_at_ms = ?2 WHERE grant_id = ?1",
+        params![grant_id.as_str(), revoked_at],
+    )?;
+    transaction.execute(
+        "UPDATE project_policies SET version = version + 1, updated_at_ms = ?2
+         WHERE project_id = ?1",
+        params![project_id, revoked_at],
+    )?;
+    transaction.commit()?;
+    Ok(GrantRevocation::Revoked)
+}
+
+fn authorize(
+    connection: &mut Connection,
+    request: &AuthorizationRequest,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_caller = transaction
+        .query_row(
+            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+            [request.caller_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !active_caller {
+        transaction.commit()?;
+        return Ok(AuthorizationOutcome::Denied);
+    }
+    let grants = load_grants(&transaction, request)?;
+    let decision = evaluate(
+        &grants,
+        &request.caller_id,
+        &request.project_id,
+        &request.capability,
+        &request.resource,
+        now_ms,
+    );
+    let outcome = match decision {
+        Decision::Allowed => AuthorizationOutcome::Allowed,
+        Decision::Denied => AuthorizationOutcome::Denied,
+        Decision::ApprovalRequired => {
+            authorize_with_approval(&transaction, request, now, now_ms, approval_ttl_ms)?
+        }
+    };
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn load_grants(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+) -> Result<Vec<Grant>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT grant_id, resource_kind, resource, effect, approval,
+                expires_at_ms, revoked_at_ms
+         FROM capability_grants
+         WHERE caller_id = ?1 AND project_id = ?2 AND capability = ?3",
+    )?;
+    let rows = statement.query_map(
+        params![
+            request.caller_id.as_str(),
+            request.project_id.as_str(),
+            request.capability.as_str(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        },
+    )?;
+    let mut grants = Vec::new();
+    for row in rows {
+        let (id, resource_kind, resource, effect, approval, expires_at, revoked_at) = row?;
+        grants.push(Grant {
+            id: GrantId::from(id),
+            caller: request.caller_id.clone(),
+            project: request.project_id.clone(),
+            capability: request.capability.clone(),
+            resource: parse_resource_scope(&resource_kind, resource)?,
+            effect: parse_effect(&effect)?,
+            approval: parse_approval_requirement(&approval)?,
+            expires_at_ms: expires_at.map(unsigned_integer).transpose()?,
+            revoked_at_ms: revoked_at.map(unsigned_integer).transpose()?,
+        });
+    }
+    Ok(grants)
+}
+
+fn parse_resource_scope(kind: &str, resource: Option<String>) -> Result<ResourceScope, StoreError> {
+    match (kind, resource) {
+        ("any", None) => Ok(ResourceScope::Any),
+        ("exact", Some(resource)) => ResourceName::parse(resource)
+            .map(ResourceScope::Exact)
+            .map_err(|_| StoreError::InvalidState("invalid stored policy resource".to_owned())),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored policy resource scope".to_owned(),
+        )),
+    }
+}
+
+fn parse_effect(effect: &str) -> Result<Effect, StoreError> {
+    match effect {
+        "allow" => Ok(Effect::Allow),
+        "deny" => Ok(Effect::Deny),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored grant effect".to_owned(),
+        )),
+    }
+}
+
+fn parse_approval_requirement(value: &str) -> Result<ApprovalRequirement, StoreError> {
+    match value {
+        "none" => Ok(ApprovalRequirement::None),
+        "once" => Ok(ApprovalRequirement::Once),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored approval requirement".to_owned(),
+        )),
+    }
+}
+
+fn authorize_with_approval(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let fingerprint = EffectFingerprint::compute(
+        &request.caller_id,
+        &request.project_id,
+        &request.capability,
+        &request.resource,
+    );
+    let Some(approval_id) = &request.approval_id else {
+        if approval_ttl_ms == 0 {
+            return Err(StoreError::InvalidState(
+                "approval lifetime must be non-zero".to_owned(),
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(approval_ttl_ms)
+            .ok_or(StoreError::ApprovalExpiryOverflow)?;
+        let expires_at = sql_integer(expires_at_ms)?;
+        let approval_id = ApprovalId::new(Uuid::new_v4().to_string());
+        transaction.execute(
+            "INSERT INTO approvals(
+                approval_id, caller_id, project_id, capability, resource,
+                effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'requested', ?7, ?8)",
+            params![
+                approval_id.as_str(),
+                request.caller_id.as_str(),
+                request.project_id.as_str(),
+                request.capability.as_str(),
+                request.resource.as_str(),
+                fingerprint.as_bytes().as_slice(),
+                now,
+                expires_at,
+            ],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        });
+    };
+    resolve_approval(transaction, approval_id, request, &fingerprint, now, now_ms)
+}
+
+fn resolve_approval(
+    transaction: &Transaction<'_>,
+    approval_id: &ApprovalId,
+    request: &AuthorizationRequest,
+    fingerprint: &EffectFingerprint,
+    now: i64,
+    now_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let approval = transaction
+        .query_row(
+            "SELECT caller_id, project_id, capability, resource,
+                    effect_fingerprint, state, expires_at_ms
+             FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((caller, project, capability, resource, stored_fingerprint, state, expires_at)) =
+        approval
+    else {
+        return Ok(AuthorizationOutcome::Denied);
+    };
+    if caller != request.caller_id.as_str()
+        || project != request.project_id.as_str()
+        || capability != request.capability.as_str()
+        || resource != request.resource.as_str()
+        || !constant_time_equal(&stored_fingerprint, fingerprint.as_bytes())
+    {
+        return Ok(AuthorizationOutcome::Denied);
+    }
+    let expires_at_ms = unsigned_integer(expires_at)?;
+    if now_ms >= expires_at_ms && matches!(state.as_str(), "requested" | "approved") {
+        transaction.execute(
+            "UPDATE approvals SET state = 'expired' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalExpired);
+    }
+    match state.as_str() {
+        "requested" => Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id: approval_id.clone(),
+            expires_at_ms,
+        }),
+        "approved" => {
+            let updated = transaction.execute(
+                "UPDATE approvals SET state = 'consumed', consumed_at_ms = ?2
+                 WHERE approval_id = ?1 AND state = 'approved'",
+                params![approval_id.as_str(), now],
+            )?;
+            if updated == 1 {
+                Ok(AuthorizationOutcome::Allowed)
+            } else {
+                Ok(AuthorizationOutcome::Denied)
+            }
+        }
+        "denied" => Ok(AuthorizationOutcome::ApprovalDenied),
+        "expired" => Ok(AuthorizationOutcome::ApprovalExpired),
+        "consumed" => Ok(AuthorizationOutcome::Denied),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored approval state".to_owned(),
+        )),
+    }
+}
+
+fn decide_approval(
+    connection: &mut Connection,
+    approval_id: &ApprovalId,
+    approver_id: &CallerId,
+    decision: ApprovalDecision,
+    now_ms: u64,
+) -> Result<ApprovalDecisionOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_approver = transaction
+        .query_row(
+            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+            [approver_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !active_approver {
+        return Err(StoreError::InvalidApprovalState);
+    }
+    let approval = transaction
+        .query_row(
+            "SELECT state, expires_at_ms FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((state, expires_at)) = approval else {
+        return Err(StoreError::ApprovalNotFound(approval_id.clone()));
+    };
+    if state != "requested" {
+        return Err(StoreError::InvalidApprovalState);
+    }
+    if now_ms >= unsigned_integer(expires_at)? {
+        transaction.execute(
+            "UPDATE approvals SET state = 'expired' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        transaction.commit()?;
+        return Ok(ApprovalDecisionOutcome::Expired);
+    }
+    let (state, outcome) = match decision {
+        ApprovalDecision::Approve => ("approved", ApprovalDecisionOutcome::Approved),
+        ApprovalDecision::Deny => ("denied", ApprovalDecisionOutcome::Denied),
+    };
+    transaction.execute(
+        "UPDATE approvals
+         SET state = ?2, decided_by = ?3, decided_at_ms = ?4
+         WHERE approval_id = ?1 AND state = 'requested'",
+        params![approval_id.as_str(), state, approver_id.as_str(), now],
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
 }
 
 fn open_evidence_worker(path: &Path) -> Result<(Connection, EvidenceFiles), StoreError> {

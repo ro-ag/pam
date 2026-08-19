@@ -1,11 +1,15 @@
 use std::fs;
 
-use pam_core::{CallerCredential, CallerId, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerCredential, CallerId, GrantId, IdempotencyKey, ProjectId, RequestId,
+};
+use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
 use rusqlite::Connection;
 
 use super::{
-    AcceptOutcome, AcceptRequest, CallerAuthentication, CallerRevocation, CancelOutcome,
-    RequestState, Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome,
+    AuthorizationRequest, CallerAuthentication, CallerRevocation, CancelOutcome, GrantRevocation,
+    PutGrant, RequestState, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -24,6 +28,84 @@ fn request(
         operation_kind: "test.operation".to_owned(),
         operation: operation.to_vec(),
     }
+}
+
+fn capability(value: &str) -> CapabilityName {
+    CapabilityName::parse(value).unwrap()
+}
+
+fn resource(value: &str) -> ResourceName {
+    ResourceName::parse(value).unwrap()
+}
+
+fn grant(
+    grant_id: &str,
+    caller_id: &str,
+    project_id: &str,
+    capability_name: &str,
+    resource_scope: ResourceScope,
+) -> Grant {
+    Grant {
+        id: GrantId::from(grant_id),
+        caller: CallerId::from(caller_id),
+        project: ProjectId::from(project_id),
+        capability: capability(capability_name),
+        resource: resource_scope,
+        effect: Effect::Allow,
+        approval: ApprovalRequirement::None,
+        expires_at_ms: None,
+        revoked_at_ms: None,
+    }
+}
+
+fn authorization(
+    caller_id: &str,
+    project_id: &str,
+    capability_name: &str,
+    resource_name: &str,
+    approval_id: Option<ApprovalId>,
+) -> AuthorizationRequest {
+    AuthorizationRequest {
+        caller_id: CallerId::from(caller_id),
+        project_id: ProjectId::from(project_id),
+        capability: capability(capability_name),
+        resource: resource(resource_name),
+        approval_id,
+    }
+}
+
+async fn open_approval_store(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Store) {
+    let (directory, path) = database_path(name);
+    let store = Store::open(&path).unwrap();
+    for (caller_id, credential) in [
+        ("approval-subject", "subject credential"),
+        ("approval-reviewer", "reviewer credential"),
+    ] {
+        store
+            .register_caller(
+                CallerId::from(caller_id),
+                CallerCredential::new(credential),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let mut approval_grant = grant(
+        "approval-grant",
+        "approval-subject",
+        "approval-project",
+        "deploy",
+        ResourceScope::Any,
+    );
+    approval_grant.approval = ApprovalRequirement::Once;
+    store
+        .put_grant(PutGrant {
+            grant: approval_grant,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    (directory, path, store)
 }
 
 async fn close(store: Store, directory: &std::path::Path) {
@@ -963,4 +1045,550 @@ async fn failed_terminal_event_insert_rolls_back_the_result_transition() {
     assert!(replay.result.is_none());
 
     close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn policy_versions_and_grant_revocation_are_durable_and_idempotent() {
+    let (directory, path) = database_path("policy-version");
+    let store = Store::open(&path).unwrap();
+    store
+        .register_caller(
+            CallerId::from("policy-caller"),
+            CallerCredential::new("policy credential"),
+            1,
+        )
+        .await
+        .unwrap();
+
+    let first = store
+        .put_grant(PutGrant {
+            grant: grant(
+                "grant-1",
+                "policy-caller",
+                "project-a",
+                "read",
+                ResourceScope::Any,
+            ),
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.project_id, ProjectId::from("project-a"));
+    assert_eq!(first.version, 1);
+    assert_eq!(first.updated_at_ms, 10);
+
+    let second = store
+        .put_grant(PutGrant {
+            grant: grant(
+                "grant-2",
+                "policy-caller",
+                "project-a",
+                "write",
+                ResourceScope::Any,
+            ),
+            created_at_ms: 11,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
+    let other_project = store
+        .put_grant(PutGrant {
+            grant: grant(
+                "grant-other-project",
+                "policy-caller",
+                "project-b",
+                "read",
+                ResourceScope::Any,
+            ),
+            created_at_ms: 12,
+        })
+        .await
+        .unwrap();
+    assert_eq!(other_project.version, 1);
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .revoke_grant(GrantId::from("grant-1"), 13)
+            .await
+            .unwrap(),
+        GrantRevocation::Revoked
+    );
+    assert_eq!(
+        reopened
+            .revoke_grant(GrantId::from("grant-1"), 14)
+            .await
+            .unwrap(),
+        GrantRevocation::AlreadyRevoked
+    );
+    assert_eq!(
+        reopened
+            .revoke_grant(GrantId::from("missing-grant"), 14)
+            .await
+            .unwrap(),
+        GrantRevocation::UnknownGrant
+    );
+    let after_revocation = reopened
+        .put_grant(PutGrant {
+            grant: grant(
+                "grant-3",
+                "policy-caller",
+                "project-a",
+                "admin",
+                ResourceScope::Any,
+            ),
+            created_at_ms: 15,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_revocation.version, 4);
+    assert_eq!(after_revocation.updated_at_ms, 15);
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn authorization_is_default_deny_and_matches_exact_policy_dimensions() {
+    let (directory, path) = database_path("policy-matching");
+    let store = Store::open(&path).unwrap();
+    for (caller_id, credential) in [
+        ("scope-caller", "scope credential"),
+        ("other-caller", "other credential"),
+    ] {
+        store
+            .register_caller(
+                CallerId::from(caller_id),
+                CallerCredential::new(credential),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .put_grant(PutGrant {
+            grant: grant(
+                "exact-read",
+                "scope-caller",
+                "scope-project",
+                "read",
+                ResourceScope::Exact(resource("document-1")),
+            ),
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .authorize(
+                authorization("scope-caller", "scope-project", "read", "document-1", None,),
+                20,
+                100,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Allowed
+    );
+    for denied in [
+        authorization("other-caller", "scope-project", "read", "document-1", None),
+        authorization("scope-caller", "other-project", "read", "document-1", None),
+        authorization("scope-caller", "scope-project", "write", "document-1", None),
+        authorization("scope-caller", "scope-project", "read", "document-2", None),
+    ] {
+        assert_eq!(
+            store.authorize(denied, 20, 100).await.unwrap(),
+            AuthorizationOutcome::Denied
+        );
+    }
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn any_scope_allows_every_resource_while_exact_deny_takes_precedence() {
+    let (directory, path) = database_path("policy-any-and-deny");
+    let store = Store::open(&path).unwrap();
+    store
+        .register_caller(
+            CallerId::from("scope-caller"),
+            CallerCredential::new("scope credential"),
+            1,
+        )
+        .await
+        .unwrap();
+    for (grant_id, capability_name, created_at_ms) in [
+        ("any-export", "export", 10),
+        ("allow-delete-any", "delete", 11),
+    ] {
+        store
+            .put_grant(PutGrant {
+                grant: grant(
+                    grant_id,
+                    "scope-caller",
+                    "scope-project",
+                    capability_name,
+                    ResourceScope::Any,
+                ),
+                created_at_ms,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .authorize(
+                authorization(
+                    "scope-caller",
+                    "scope-project",
+                    "export",
+                    "arbitrary-resource",
+                    None,
+                ),
+                20,
+                100,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Allowed
+    );
+
+    let mut deny_exact = grant(
+        "deny-delete-protected",
+        "scope-caller",
+        "scope-project",
+        "delete",
+        ResourceScope::Exact(resource("protected")),
+    );
+    deny_exact.effect = Effect::Deny;
+    store
+        .put_grant(PutGrant {
+            grant: deny_exact,
+            created_at_ms: 12,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .authorize(
+                authorization("scope-caller", "scope-project", "delete", "protected", None,),
+                20,
+                100,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Denied
+    );
+    assert_eq!(
+        store
+            .authorize(
+                authorization("scope-caller", "scope-project", "delete", "ordinary", None,),
+                20,
+                100,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Allowed
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn authorization_honors_inclusive_expiry_and_revocation_boundaries() {
+    let (directory, path) = database_path("policy-boundaries");
+    let store = Store::open(&path).unwrap();
+    store
+        .register_caller(
+            CallerId::from("boundary-caller"),
+            CallerCredential::new("boundary credential"),
+            1,
+        )
+        .await
+        .unwrap();
+
+    let mut expiring = grant(
+        "expiring-grant",
+        "boundary-caller",
+        "boundary-project",
+        "expiring",
+        ResourceScope::Any,
+    );
+    expiring.expires_at_ms = Some(50);
+    store
+        .put_grant(PutGrant {
+            grant: expiring,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    let mut revoked = grant(
+        "revoked-grant",
+        "boundary-caller",
+        "boundary-project",
+        "revoked",
+        ResourceScope::Any,
+    );
+    revoked.revoked_at_ms = Some(70);
+    store
+        .put_grant(PutGrant {
+            grant: revoked,
+            created_at_ms: 11,
+        })
+        .await
+        .unwrap();
+
+    for (capability_name, now_ms, expected) in [
+        ("expiring", 49, AuthorizationOutcome::Allowed),
+        ("expiring", 50, AuthorizationOutcome::Denied),
+        ("revoked", 69, AuthorizationOutcome::Allowed),
+        ("revoked", 70, AuthorizationOutcome::Denied),
+    ] {
+        assert_eq!(
+            store
+                .authorize(
+                    authorization(
+                        "boundary-caller",
+                        "boundary-project",
+                        capability_name,
+                        "resource",
+                        None,
+                    ),
+                    now_ms,
+                    100,
+                )
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn authorization_rechecks_caller_revocation_after_grant_creation() {
+    let (directory, path) = database_path("policy-caller-revocation");
+    let store = Store::open(&path).unwrap();
+    store
+        .register_caller(
+            CallerId::from("revocable-policy-caller"),
+            CallerCredential::new("revocable policy credential"),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .put_grant(PutGrant {
+            grant: grant(
+                "revocable-caller-grant",
+                "revocable-policy-caller",
+                "revocable-project",
+                "operate",
+                ResourceScope::Any,
+            ),
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    let request = authorization(
+        "revocable-policy-caller",
+        "revocable-project",
+        "operate",
+        "resource",
+        None,
+    );
+    assert_eq!(
+        store.authorize(request.clone(), 20, 100).await.unwrap(),
+        AuthorizationOutcome::Allowed
+    );
+    assert_eq!(
+        store
+            .revoke_caller(CallerId::from("revocable-policy-caller"), 21)
+            .await
+            .unwrap(),
+        CallerRevocation::Revoked
+    );
+    assert_eq!(
+        store.authorize(request, 22, 100).await.unwrap(),
+        AuthorizationOutcome::Denied
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn approvals_are_exact_durable_and_consumed_atomically_once() {
+    let (directory, path, store) = open_approval_store("durable-approvals").await;
+    let exact_request = authorization(
+        "approval-subject",
+        "approval-project",
+        "deploy",
+        "release-a",
+        None,
+    );
+    let AuthorizationOutcome::ApprovalRequired {
+        approval_id,
+        expires_at_ms,
+    } = store
+        .authorize(exact_request.clone(), 100, 20)
+        .await
+        .unwrap()
+    else {
+        panic!("approval-requiring grant should return an approval ID")
+    };
+    assert_eq!(expires_at_ms, 120);
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    let mut repeated = exact_request.clone();
+    repeated.approval_id = Some(approval_id.clone());
+    assert_eq!(
+        reopened.authorize(repeated.clone(), 101, 20).await.unwrap(),
+        AuthorizationOutcome::ApprovalRequired {
+            approval_id: approval_id.clone(),
+            expires_at_ms: 120,
+        }
+    );
+    assert_eq!(
+        reopened
+            .authorize(
+                authorization(
+                    "approval-subject",
+                    "approval-project",
+                    "deploy",
+                    "release-b",
+                    Some(approval_id.clone()),
+                ),
+                101,
+                20,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Denied
+    );
+    assert_eq!(
+        reopened
+            .decide_approval(
+                approval_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Approve,
+                102,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Approved
+    );
+
+    let first_store = reopened.clone();
+    let second_store = reopened.clone();
+    let first_request = repeated.clone();
+    let second_request = repeated.clone();
+    let (first, second) = tokio::join!(
+        first_store.authorize(first_request, 103, 20),
+        second_store.authorize(second_request, 103, 20),
+    );
+    let outcomes = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AuthorizationOutcome::Allowed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AuthorizationOutcome::Denied)
+            .count(),
+        1
+    );
+    reopened.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened.authorize(repeated, 104, 20).await.unwrap(),
+        AuthorizationOutcome::Denied
+    );
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn approval_decisions_return_denied_and_expired_outcomes() {
+    let (directory, _path, store) = open_approval_store("approval-outcomes").await;
+    let exact_request = authorization(
+        "approval-subject",
+        "approval-project",
+        "deploy",
+        "release-a",
+        None,
+    );
+    let AuthorizationOutcome::ApprovalRequired {
+        approval_id: denied_id,
+        ..
+    } = store
+        .authorize(exact_request.clone(), 110, 20)
+        .await
+        .unwrap()
+    else {
+        panic!("a new exact effect should request a new approval")
+    };
+    assert_eq!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                111,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Denied
+    );
+    let mut denied_request = exact_request.clone();
+    denied_request.approval_id = Some(denied_id);
+    assert_eq!(
+        store.authorize(denied_request, 112, 20).await.unwrap(),
+        AuthorizationOutcome::ApprovalDenied
+    );
+
+    let AuthorizationOutcome::ApprovalRequired {
+        approval_id: expiring_id,
+        expires_at_ms: 130,
+    } = store.authorize(exact_request, 120, 10).await.unwrap()
+    else {
+        panic!("a new exact effect should request an expiring approval")
+    };
+    assert_eq!(
+        store
+            .decide_approval(
+                expiring_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Approve,
+                130,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Expired
+    );
+    assert_eq!(
+        store
+            .authorize(
+                authorization(
+                    "approval-subject",
+                    "approval-project",
+                    "deploy",
+                    "release-a",
+                    Some(expiring_id),
+                ),
+                131,
+                10,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::ApprovalExpired
+    );
+
+    close(store, &directory).await;
 }

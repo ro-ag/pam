@@ -1,4 +1,8 @@
-use pam_core::{CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use pam_core::{
+    ApprovalId, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
+    RequestId,
+};
+use pam_policy::{CapabilityName, Grant, ResourceName};
 
 pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EVIDENCE_RANGE_BYTES: u64 = 1024 * 1024;
@@ -24,6 +28,67 @@ pub enum CallerRevocation {
     Revoked,
     AlreadyRevoked,
     UnknownCaller,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectPolicy {
+    pub project_id: ProjectId,
+    pub version: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationRequest {
+    pub caller_id: CallerId,
+    pub project_id: ProjectId,
+    pub capability: CapabilityName,
+    pub resource: ResourceName,
+    pub approval_id: Option<ApprovalId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorizationOutcome {
+    Allowed,
+    Denied,
+    ApprovalRequired {
+        approval_id: ApprovalId,
+        expires_at_ms: u64,
+    },
+    ApprovalDenied,
+    ApprovalExpired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecisionOutcome {
+    Approved,
+    Denied,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantRevocation {
+    Revoked,
+    AlreadyRevoked,
+    UnknownGrant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PutGrant {
+    pub grant: Grant,
+    pub created_at_ms: u64,
+}
+
+impl PutGrant {
+    #[must_use]
+    pub fn grant_id(&self) -> &GrantId {
+        &self.grant.id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

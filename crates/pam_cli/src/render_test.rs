@@ -122,6 +122,7 @@ fn pending_not_found_and_unresolved_have_deterministic_nonzero_exits() {
             code,
             message: "not ready".to_owned(),
             recovery: None,
+            approval: None,
         }))
     };
 

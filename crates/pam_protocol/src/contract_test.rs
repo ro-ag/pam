@@ -1,5 +1,6 @@
 use pam_core::{
-    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
+    ProjectId, RequestId,
 };
 
 use super::{
@@ -45,6 +46,17 @@ fn request_authentication_is_explicit_and_redacted() {
         secret
     );
     assert!(!format!("{request:?}").contains(secret));
+}
+
+#[test]
+fn request_approval_receipt_is_explicit_and_one_effect_scoped() {
+    let request = status_request().with_approval(ApprovalId::from("approval-1"));
+
+    assert_eq!(
+        request.approval_id.as_ref().map(ApprovalId::as_str),
+        Some("approval-1")
+    );
+    assert_eq!(request.capability.policy_name(), "daemon.status");
 }
 
 #[test]
@@ -151,6 +163,7 @@ fn observed_terminal_results_remap_only_the_envelope_correlation() {
             code: FailureCode::Cancelled,
             message: "request was cancelled".to_owned(),
             recovery: None,
+            approval: None,
         }),
     };
     let observed = ResultEnvelope {

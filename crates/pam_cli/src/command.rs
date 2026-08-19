@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use pam_core::{EvidenceHandle, RequestId};
+use pam_core::{ApprovalId, EvidenceHandle, GrantId, RequestId};
+use pam_policy::{CapabilityName, ResourceName};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
@@ -47,6 +48,16 @@ enum Command {
         #[command(subcommand)]
         command: CallerCommand,
     },
+    /// Manage project-scoped capability grants.
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
+    /// Decide exact-effect approval requests.
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
     /// Run the foreground daemon.
     Daemon {
         /// Recover an endpoint left behind by an interrupted daemon.
@@ -89,6 +100,50 @@ enum CallerCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AccessCommand {
+    /// Add an allow or explicit-deny grant for the current project.
+    Grant {
+        /// Stable capability name, such as daemon.status or evidence.read.
+        #[arg(value_parser = parse_capability_name)]
+        capability: CapabilityName,
+        /// Exact resource; omit to match any resource.
+        #[arg(long, value_parser = parse_resource_name)]
+        resource: Option<ResourceName>,
+        /// Create an explicit deny instead of an allow.
+        #[arg(long)]
+        deny: bool,
+        /// Require a one-time exact-effect approval before use.
+        #[arg(long, conflicts_with = "deny")]
+        require_approval: bool,
+        /// Optional absolute expiration time in Unix milliseconds.
+        #[arg(long)]
+        expires_at_unix_ms: Option<u64>,
+        /// Local caller surface receiving the grant.
+        #[arg(long, value_enum, default_value_t = CallerKindArg::Cli)]
+        kind: CallerKindArg,
+    },
+    /// Revoke an existing grant.
+    Revoke {
+        #[arg(value_parser = parse_grant_id)]
+        grant_id: GrantId,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalCommand {
+    /// Approve a pending exact effect.
+    Approve {
+        #[arg(value_parser = parse_approval_id)]
+        approval_id: ApprovalId,
+    },
+    /// Deny a pending exact effect.
+    Deny {
+        #[arg(value_parser = parse_approval_id)]
+        approval_id: ApprovalId,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum CallerKindArg {
     Cli,
@@ -120,6 +175,23 @@ pub(crate) enum Mode {
     },
     CallerRevoke {
         kind: CallerKindArg,
+    },
+    AccessGrant {
+        capability: CapabilityName,
+        resource: Option<ResourceName>,
+        deny: bool,
+        require_approval: bool,
+        expires_at_unix_ms: Option<u64>,
+        kind: CallerKindArg,
+    },
+    AccessRevoke {
+        grant_id: GrantId,
+    },
+    ApprovalApprove {
+        approval_id: ApprovalId,
+    },
+    ApprovalDeny {
+        approval_id: ApprovalId,
     },
     Daemon {
         recover: bool,
@@ -161,6 +233,33 @@ impl Cli {
             Some(Command::Caller {
                 command: CallerCommand::Revoke { kind },
             }) => Mode::CallerRevoke { kind },
+            Some(Command::Access {
+                command:
+                    AccessCommand::Grant {
+                        capability,
+                        resource,
+                        deny,
+                        require_approval,
+                        expires_at_unix_ms,
+                        kind,
+                    },
+            }) => Mode::AccessGrant {
+                capability,
+                resource,
+                deny,
+                require_approval,
+                expires_at_unix_ms,
+                kind,
+            },
+            Some(Command::Access {
+                command: AccessCommand::Revoke { grant_id },
+            }) => Mode::AccessRevoke { grant_id },
+            Some(Command::Approval {
+                command: ApprovalCommand::Approve { approval_id },
+            }) => Mode::ApprovalApprove { approval_id },
+            Some(Command::Approval {
+                command: ApprovalCommand::Deny { approval_id },
+            }) => Mode::ApprovalDeny { approval_id },
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }
@@ -182,6 +281,36 @@ fn parse_request_id(value: &str) -> Result<RequestId, String> {
 
 fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {
     EvidenceHandle::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_capability_name(value: &str) -> Result<CapabilityName, String> {
+    CapabilityName::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_resource_name(value: &str) -> Result<ResourceName, String> {
+    ResourceName::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_grant_id(value: &str) -> Result<GrantId, String> {
+    parse_simple_id(value, "grant ID").map(GrantId::from)
+}
+
+fn parse_approval_id(value: &str) -> Result<ApprovalId, String> {
+    parse_simple_id(value, "approval ID").map(ApprovalId::from)
+}
+
+fn parse_simple_id(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || value.len() > 256
+    {
+        return Err(format!(
+            "{label} must contain 1 to 256 bytes with no whitespace or controls"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_wait_timeout(value: &str) -> Result<Duration, String> {

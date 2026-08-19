@@ -15,7 +15,8 @@ pub use evidence::{
     ContentDigest, EvidenceHandle, EvidenceReference, InvalidContentDigest, InvalidEvidenceHandle,
 };
 pub use identity::{
-    CallerCredential, CallerId, IdempotencyKey, MAX_CALLER_CREDENTIAL_LENGTH, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, GrantId, IdempotencyKey, MAX_CALLER_CREDENTIAL_LENGTH,
+    ProjectId, RequestId,
 };
 pub use queue::{ProjectPermit, ProjectQueue};
 

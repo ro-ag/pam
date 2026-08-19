@@ -83,6 +83,16 @@ fn authenticated_request_round_trips_without_debug_disclosure() {
 }
 
 #[test]
+fn approval_receipt_round_trips_as_an_additive_request_field() {
+    let expected = status_request().with_approval(pam_core::ApprovalId::from("approval-1"));
+
+    assert_eq!(
+        decode_request(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn cancel_target_round_trips_without_replacing_observer_correlation() {
     let expected = RequestEnvelope::cancel(
         RequestId::from("cancel-observer-1"),
@@ -175,6 +185,7 @@ fn invalid_evidence_read_lengths_are_rejected_during_decode() {
             request_id: RequestId::from("read-observer-1"),
             caller_id: CallerId::from("cli-1"),
             authentication: None,
+            approval_id: None,
             project_id: ProjectId::from("project-1"),
             capability: Capability::ReadEvidence,
             idempotency_key: IdempotencyKey::from("read-1"),
@@ -402,6 +413,7 @@ fn durable_failures_round_trip_as_distinct_typed_codes() {
                 message: format!("{code:?}"),
                 code,
                 recovery: None,
+                approval: None,
             }),
         });
 
@@ -484,6 +496,7 @@ fn unsupported_version_failures_are_decodable_across_versions() {
             code: FailureCode::UnsupportedProtocolVersion,
             message: "supported protocol version is 1".to_owned(),
             recovery: None,
+            approval: None,
         }),
     });
 
@@ -499,6 +512,7 @@ struct ExtendedRequest {
     request_id: RequestId,
     caller_id: CallerId,
     authentication: Option<CallerCredential>,
+    approval_id: Option<pam_core::ApprovalId>,
     project_id: ProjectId,
     capability: Capability,
     idempotency_key: IdempotencyKey,
@@ -515,6 +529,7 @@ fn unknown_named_fields_are_ignored_for_compatible_evolution() {
         request_id: request.request_id.clone(),
         caller_id: request.caller_id.clone(),
         authentication: request.authentication.clone(),
+        approval_id: request.approval_id.clone(),
         project_id: request.project_id.clone(),
         capability: request.capability.clone(),
         idempotency_key: request.idempotency_key.clone(),

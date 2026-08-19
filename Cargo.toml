@@ -4,6 +4,7 @@ members = [
     "crates/pam_core",
     "crates/pam_protocol",
     "crates/pam_platform",
+    "crates/pam_policy",
     "crates/pam_daemon",
     "crates/pam_gui",
     "crates/pam_store",
@@ -38,6 +39,7 @@ pam_cli = { path = "crates/pam_cli" }
 pam_core = { path = "crates/pam_core" }
 pam_protocol = { path = "crates/pam_protocol" }
 pam_platform = { path = "crates/pam_platform" }
+pam_policy = { path = "crates/pam_policy" }
 pam_daemon = { path = "crates/pam_daemon" }
 pam_gui = { path = "crates/pam_gui" }
 pam_store = { path = "crates/pam_store" }

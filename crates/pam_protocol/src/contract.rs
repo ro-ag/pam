@@ -1,7 +1,8 @@
 use std::{error::Error, fmt};
 
 use pam_core::{
-    CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
+    ProjectId, RequestId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,8 @@ pub struct RequestEnvelope {
     pub caller_id: CallerId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<CallerCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
     pub project_id: ProjectId,
     pub capability: Capability,
     pub idempotency_key: IdempotencyKey,
@@ -34,6 +37,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::DaemonStatus,
             idempotency_key,
@@ -60,6 +64,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::CancelRequest,
             idempotency_key,
@@ -88,6 +93,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::ReplayEvents,
             idempotency_key,
@@ -112,6 +118,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::Brief,
             idempotency_key,
@@ -139,6 +146,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::WaitForResult,
             idempotency_key,
@@ -168,6 +176,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::GetResult,
             idempotency_key,
@@ -190,6 +199,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::InspectEvidence,
             idempotency_key,
@@ -219,6 +229,7 @@ impl RequestEnvelope {
             request_id,
             caller_id,
             authentication: None,
+            approval_id: None,
             project_id,
             capability: Capability::ReadEvidence,
             idempotency_key,
@@ -238,6 +249,13 @@ impl RequestEnvelope {
         self
     }
 
+    /// Attaches a previously approved exact-effect receipt for one-time use.
+    #[must_use]
+    pub fn with_approval(mut self, approval_id: ApprovalId) -> Self {
+        self.approval_id = Some(approval_id);
+        self
+    }
+
     #[must_use]
     pub fn unsupported_version_failure(&self) -> Option<ResultEnvelope> {
         (self.protocol_version != PROTOCOL_VERSION).then(|| ResultEnvelope {
@@ -251,6 +269,7 @@ impl RequestEnvelope {
                     self.protocol_version
                 ),
                 recovery: None,
+                approval: None,
             }),
         })
     }
@@ -267,6 +286,22 @@ pub enum Capability {
     GetResult,
     InspectEvidence,
     ReadEvidence,
+}
+
+impl Capability {
+    #[must_use]
+    pub const fn policy_name(&self) -> &'static str {
+        match self {
+            Self::DaemonStatus => "daemon.status",
+            Self::CancelRequest => "request.cancel",
+            Self::ReplayEvents => "request.replay",
+            Self::Brief => "brief.read",
+            Self::WaitForResult => "request.wait",
+            Self::GetResult => "request.result.read",
+            Self::InspectEvidence => "evidence.inspect",
+            Self::ReadEvidence => "evidence.read",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -548,12 +583,24 @@ pub struct Failure {
     pub code: FailureCode,
     pub message: String,
     pub recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalChallenge>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalChallenge {
+    pub approval_id: ApprovalId,
+    pub expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
     Unauthenticated,
+    Forbidden,
+    ApprovalRequired,
+    ApprovalDenied,
+    ApprovalExpired,
     UnsupportedProtocolVersion,
     InvalidRequest,
     FrameTooLarge,

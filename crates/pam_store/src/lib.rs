@@ -14,9 +14,11 @@ mod store_test;
 
 pub use error::StoreError;
 pub use model::{
-    AcceptOutcome, AcceptRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
-    CancelOutcome, EventRecord, EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Lease,
-    LeasedRequest, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MEDIA_TYPE_BYTES, MAX_EVIDENCE_RANGE_BYTES,
-    PutEvidence, Replay, RequestSnapshot, RequestState, StoredResult, TerminalState,
+    AcceptOutcome, AcceptRequest, ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome,
+    AuthorizationRequest, CallerAuthentication, CallerRegistration, CallerRevocation,
+    CancelOutcome, EventRecord, EvidenceMetadata, EvidenceRedaction, EvidenceRetention,
+    GrantRevocation, Lease, LeasedRequest, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MEDIA_TYPE_BYTES,
+    MAX_EVIDENCE_RANGE_BYTES, ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot,
+    RequestState, StoredResult, TerminalState,
 };
 pub use store::Store;

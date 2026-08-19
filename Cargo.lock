@@ -1563,6 +1563,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_model"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "pam_core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "pam_platform"
 version = "0.1.0"
 dependencies = [
@@ -1609,6 +1625,7 @@ dependencies = [
  "cap-std",
  "nix",
  "pam_core",
+ "pam_model",
  "pam_policy",
  "rusqlite",
  "sha2",

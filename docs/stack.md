@@ -79,8 +79,14 @@ The user chooses the download directory. If they do not, PAM proposes:
 ~/llm/<vendor>/<model-name>.<extension>
 ```
 
-PAM records paths, hashes, model metadata, and licenses, but weights remain
-user-owned and are never committed, synchronized, or included in releases.
+`pam_model` now implements exact-hash local import and resumable HTTPS
+acquisition with artifact-bound license consent, strict user-owned paths,
+bounded GGUF structure validation, manual redirect policy, and atomic
+no-replace publication. Schema v7 records only the verified path, hash,
+bounded GGUF metadata, license snapshot, and sanitized source identity;
+weights remain user-owned and are never committed, synchronized, or included
+in releases. See `docs/model-acquisition.md` for the security and recovery
+contract.
 
 ## Proposed workspace boundaries
 

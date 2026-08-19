@@ -1,7 +1,11 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use pam_core::{
-    ApprovalId, CallerCredential, CallerId, GrantId, IdempotencyKey, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, ContentDigest, GrantId, IdempotencyKey, ProjectId,
+    RequestId,
+};
+use pam_model::{
+    GgufMetadata, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource, RegisteredModel,
 };
 use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
 use rusqlite::Connection;
@@ -106,6 +110,28 @@ fn authorization_audit(event_id: &str, retain_until_ms: u64) -> AuthorizationAud
     }
 }
 
+fn registered_model(path: &Path) -> RegisteredModel {
+    RegisteredModel {
+        key: ModelKey::new("qwen", "qwen3.6-35b").unwrap(),
+        path: path.to_path_buf(),
+        digest: ContentDigest::from_sha256([1; 32]),
+        size_bytes: 32,
+        gguf: GgufMetadata {
+            version: 3,
+            tensor_count: 17,
+            metadata_kv_count: 29,
+        },
+        license: LicenseSnapshot::new(
+            "Apache-2.0",
+            "https://example.test/license",
+            ContentDigest::from_sha256([2; 32]),
+        )
+        .unwrap(),
+        source: ModelSource::https("https://models.example/model.gguf").unwrap(),
+        registered_at_ms: 42,
+    }
+}
+
 async fn open_approval_store(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Store) {
     let (directory, path) = database_path(name);
     let store = Store::open(&path).unwrap();
@@ -140,7 +166,7 @@ async fn open_approval_store(name: &str) -> (std::path::PathBuf, std::path::Path
     (directory, path, store)
 }
 
-async fn close(store: Store, directory: &std::path::Path) {
+async fn close(store: Store, directory: &Path) {
     store.shutdown().await.unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
@@ -2109,4 +2135,155 @@ async fn audit_rejects_control_and_format_characters_in_every_text_field() {
     assert!(secret.redacted_detail.contains("[REDACTED]"));
     assert!(!secret.redacted_detail.contains("LeakedSecret"));
     close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn model_registry_persists_metadata_only_and_rejects_conflicts() {
+    let (directory, path) = database_path("model-registry");
+    let store = Store::open(&path).unwrap();
+    let model = registered_model(&directory.join("user-owned.gguf"));
+
+    assert_eq!(store.put_model(model.clone()).await.unwrap(), model);
+    assert_eq!(store.put_model(model.clone()).await.unwrap(), model);
+    assert_eq!(store.model(model.key.clone()).await.unwrap(), model);
+
+    let conflicting = RegisteredModel {
+        digest: ContentDigest::from_sha256([3; 32]),
+        ..model.clone()
+    };
+    assert!(matches!(
+        store.put_model(conflicting).await,
+        Err(StoreError::ModelConflict(model_id)) if model_id == model.key.id()
+    ));
+
+    store.shutdown().await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let blob_columns: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('models') WHERE upper(type) = 'BLOB'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob_columns, 0);
+    let stored_path: String = connection
+        .query_row("SELECT path FROM models", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored_path, model.path.to_string_lossy());
+    let stored_counts: (i64, i64) = connection
+        .query_row(
+            "SELECT gguf_tensor_count, gguf_metadata_kv_count FROM models",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_counts, (17, 29));
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn model_registry_rejects_invalid_size_and_https_provenance() {
+    let (directory, path) = database_path("model-registry-validation");
+    let store = Store::open(&path).unwrap();
+    let valid = registered_model(&directory.join("user-owned.gguf"));
+
+    for size_bytes in [
+        ModelDescriptor::MIN_SIZE_BYTES - 1,
+        ModelDescriptor::MAX_SIZE_BYTES + 1,
+    ] {
+        let invalid = RegisteredModel {
+            size_bytes,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            store.put_model(invalid).await,
+            Err(StoreError::InvalidModelRecord(_))
+        ));
+    }
+
+    for gguf in [
+        GgufMetadata {
+            tensor_count: 0,
+            ..valid.gguf
+        },
+        GgufMetadata {
+            tensor_count: GgufMetadata::MAX_TENSOR_COUNT + 1,
+            ..valid.gguf
+        },
+        GgufMetadata {
+            metadata_kv_count: GgufMetadata::MAX_METADATA_KV_COUNT + 1,
+            ..valid.gguf
+        },
+    ] {
+        let invalid = RegisteredModel {
+            gguf,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            store.put_model(invalid).await,
+            Err(StoreError::InvalidModelRecord(_))
+        ));
+    }
+
+    let invalid_source = RegisteredModel {
+        source: ModelSource::Https {
+            canonical_url: "https:// ".to_owned(),
+        },
+        ..valid
+    };
+    assert!(matches!(
+        store.put_model(invalid_source).await,
+        Err(StoreError::InvalidModelRecord(_))
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn model_registry_reports_corrupt_stored_https_provenance() {
+    let (directory, path) = database_path("model-registry-corrupt-source");
+    let store = Store::open(&path).unwrap();
+    let model = registered_model(&directory.join("user-owned.gguf"));
+    store.put_model(model.clone()).await.unwrap();
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE models SET source_kind = 'https', source_identity = 'https:// '",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store.model(model.key).await,
+        Err(StoreError::InvalidModelRecord(_))
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn model_registry_reports_corrupt_stored_gguf_counts() {
+    let (directory, path) = database_path("model-registry-corrupt-counts");
+    let store = Store::open(&path).unwrap();
+    let model = registered_model(&directory.join("user-owned.gguf"));
+    store.put_model(model.clone()).await.unwrap();
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    connection
+        .execute("UPDATE models SET gguf_tensor_count = 0", [])
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(&path),
+        Err(StoreError::IntegrityCheckFailed(_))
+    ));
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -42,10 +42,10 @@ losing or duplicating accepted work.
 
 ## llama.cpp integration decision gate
 
-The Rust binding layer is deliberately not final. `llama-cpp-4` 0.6 is a current
-candidate with Metal support and safe wrappers, but its recent release raises
-maintenance and packaging risk. Before the runtime scaffold commits to it, a
-time-boxed Mac spike must measure:
+The first runtime adapter uses `llama-cpp-4` 0.6.0 with default features
+disabled and only static Metal enabled. The binding remains isolated behind a
+model-neutral contract because its recent release still carries maintenance,
+native-abort, and packaging risk. The measured Mac spike records:
 
 - universal/aarch64 build and codesigning behavior;
 - Metal startup and first-token latency;
@@ -55,10 +55,14 @@ time-boxed Mac spike must measure:
 - model unload/reload safety;
 - binary size and license inventory.
 
-If the binding fails the gate, keep the same `ModelRuntime` contract and compare
-a minimal maintained C-ABI wrapper. Running a separately installed model server
-can be supported as an adapter, but does not replace the one-binary embedded
-goal.
+The available M4 Max/64 GiB host passed the static aarch64 Metal, development
+signing, linkage, startup, first-token, and host-memory gates. Universal
+packaging and the M1/32 GiB profile remain unproven. PAM will use bounded
+chunk-boundary cancellation and a serialized worker instead of the binding's
+unsafe abort callback. See `docs/benchmarks/llama-cpp-macos.md` for commands,
+measurements, limitations, and the fallback criteria. Running a separately
+installed model server can be supported as an adapter, but does not replace the
+one-binary embedded goal.
 
 ## Reference model policy
 
@@ -117,6 +121,5 @@ boundary is proven.
 
 - Minimum supported macOS version and signing/notarization identity.
 - MessagePack library and evolution rules after protocol fixture spike.
-- Exact llama.cpp binding after the measured Mac spike.
 - Whether the OpenAI-compatible local API ships in the first preview or the
   following model-sharing slice.

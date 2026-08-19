@@ -19,9 +19,17 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report daemon health through the local protocol.
-    Status,
+    Status {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
     /// Print a compact, provenance-backed project handoff.
-    Brief,
+    Brief {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
     /// Replay a request and wait for its durable result.
     Wait {
         /// Durable request to observe.
@@ -33,12 +41,18 @@ enum Command {
         /// Stop observing after this bounded duration (for example, 500ms, 30s, 5m, or 1h).
         #[arg(long, default_value = DEFAULT_WAIT_TIMEOUT, value_parser = parse_wait_timeout)]
         timeout: Duration,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
     },
     /// Print a request's durable result without waiting.
     Result {
         /// Durable request to inspect.
         #[arg(value_parser = parse_request_id)]
         request_id: RequestId,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
     },
     /// Inspect retained project evidence.
     Evidence {
@@ -164,7 +178,11 @@ enum ApprovalCommand {
 #[derive(Debug, Subcommand)]
 enum NetworkCommand {
     /// Report sanitized native trust, proxy, and PAC configuration facts.
-    Diagnostics,
+    Diagnostics {
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,15 +243,21 @@ pub(crate) enum RetentionScopeArg {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
     Client,
-    Status,
-    Brief,
+    Status {
+        approval_id: Option<ApprovalId>,
+    },
+    Brief {
+        approval_id: Option<ApprovalId>,
+    },
     Wait {
         request_id: RequestId,
         after: u64,
         timeout: Duration,
+        approval_id: Option<ApprovalId>,
     },
     Result {
         request_id: RequestId,
+        approval_id: Option<ApprovalId>,
     },
     EvidenceShow {
         handle: EvidenceHandle,
@@ -263,7 +287,9 @@ pub(crate) enum Mode {
     ApprovalDeny {
         approval_id: ApprovalId,
     },
-    NetworkDiagnostics,
+    NetworkDiagnostics {
+        approval_id: Option<ApprovalId>,
+    },
     AuditExport {
         output: PathBuf,
         after: u64,
@@ -287,30 +313,27 @@ impl Cli {
     pub(crate) fn mode(self) -> Mode {
         match self.command {
             None => Mode::Client,
-            Some(Command::Status) => Mode::Status,
-            Some(Command::Brief) => Mode::Brief,
+            Some(Command::Status { approval_id }) => Mode::Status { approval_id },
+            Some(Command::Brief { approval_id }) => Mode::Brief { approval_id },
             Some(Command::Wait {
                 request_id,
                 after,
                 timeout,
+                approval_id,
             }) => Mode::Wait {
                 request_id,
                 after,
                 timeout,
+                approval_id,
             },
-            Some(Command::Result { request_id }) => Mode::Result { request_id },
-            Some(Command::Evidence {
-                command:
-                    EvidenceCommand::Show {
-                        handle,
-                        raw,
-                        output,
-                    },
-            }) => Mode::EvidenceShow {
-                handle,
-                raw,
-                output,
+            Some(Command::Result {
+                request_id,
+                approval_id,
+            }) => Mode::Result {
+                request_id,
+                approval_id,
             },
+            Some(Command::Evidence { command }) => evidence_mode(command),
             Some(Command::Caller {
                 command: CallerCommand::Register { kind },
             }) => Mode::CallerRegister { kind },
@@ -345,8 +368,8 @@ impl Cli {
                 command: ApprovalCommand::Deny { approval_id },
             }) => Mode::ApprovalDeny { approval_id },
             Some(Command::Network {
-                command: NetworkCommand::Diagnostics,
-            }) => Mode::NetworkDiagnostics,
+                command: NetworkCommand::Diagnostics { approval_id },
+            }) => Mode::NetworkDiagnostics { approval_id },
             Some(Command::Audit {
                 command:
                     AuditCommand::Export {
@@ -380,6 +403,20 @@ impl Cli {
             Some(Command::Daemon { recover }) => Mode::Daemon { recover },
             Some(Command::Gui) => Mode::Gui,
         }
+    }
+}
+
+fn evidence_mode(command: EvidenceCommand) -> Mode {
+    match command {
+        EvidenceCommand::Show {
+            handle,
+            raw,
+            output,
+        } => Mode::EvidenceShow {
+            handle,
+            raw,
+            output,
+        },
     }
 }
 

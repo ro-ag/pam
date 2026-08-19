@@ -1,6 +1,6 @@
 use std::fs;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use super::{Store, StoreError};
 use crate::store::{
@@ -409,6 +409,95 @@ fn audit_migration_upgrades_v4_without_replacing_policy_data() {
             "started_at_ms",
         ]
     );
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn policy_resource_bound_migration_upgrades_v5_without_replacing_policy_data() {
+    let (directory, path) = database_path("migration-v5-policy-resource-bound");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO callers(caller_id, credential_digest, registered_at_ms)
+                 VALUES ('preserved-caller', zeroblob(32), 1);
+             INSERT INTO projects(project_id) VALUES ('preserved-project');
+             INSERT INTO project_policies(project_id, version, default_effect, updated_at_ms)
+                 VALUES ('preserved-project', 7, 'deny', 10);
+             INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'preserved-grant', 'preserved-caller', 'preserved-project', 'evidence.read',
+                 'exact', 'evidence:short', 'allow', 'once', NULL, NULL, 10
+             );
+             INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'preserved-approval', 'preserved-caller', 'preserved-project',
+                 'evidence.read', 'evidence:short', zeroblob(32), 'requested', 11, 20
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved: (String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT resource FROM capability_grants WHERE grant_id = 'preserved-grant'),
+                 (SELECT resource FROM approvals WHERE approval_id = 'preserved-approval')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        preserved,
+        ("evidence:short".to_owned(), "evidence:short".to_owned())
+    );
+
+    let long_resource = format!("evidence:{}", "a".repeat(600));
+    connection
+        .execute(
+            "INSERT INTO capability_grants(
+                 grant_id, caller_id, project_id, capability, resource_kind, resource,
+                 effect, approval, expires_at_ms, revoked_at_ms, created_at_ms
+             ) VALUES (
+                 'long-grant', 'preserved-caller', 'preserved-project', 'evidence.read',
+                 'exact', ?1, 'allow', 'none', NULL, NULL, 12
+             )",
+            params![long_resource],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approvals(
+                 approval_id, caller_id, project_id, capability, resource,
+                 effect_fingerprint, state, requested_at_ms, expires_at_ms
+             ) VALUES (
+                 'long-approval', 'preserved-caller', 'preserved-project',
+                 'evidence.read', ?1, zeroblob(32), 'requested', 13, 20
+             )",
+            params![long_resource],
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
     assert_eq!(version, LATEST_SCHEMA_VERSION);
 
     drop(connection);

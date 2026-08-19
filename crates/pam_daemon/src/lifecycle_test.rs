@@ -4,30 +4,34 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use pam_core::{
-    CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
-    RequestId,
+    ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey,
+    ProjectId, RequestId,
 };
 use pam_platform::{ClientTransport, LocalEndpoint};
-use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
+use pam_policy::{
+    ApprovalRequirement, CapabilityName, Effect, Grant, MAX_RESOURCE_NAME_BYTES, ResourceName,
+    ResourceScope,
+};
 use pam_protocol::{
-    BriefProvenance, BriefResult, CancellationDisposition, Event, EvidenceRedaction,
+    BriefProvenance, BriefResult, CancellationDisposition, Capability, Event, EvidenceRedaction,
     EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, OperationTruth,
-    RequestEnvelope, ResultBody, ResultPayload, ServerMessage, SourceAvailability,
+    RequestEnvelope, RequestPayload, ResultBody, ResultPayload, ServerMessage, SourceAvailability,
     decode_server_message, encode,
 };
 use pam_store::{
-    EvidenceRedaction as StoreEvidenceRedaction, EvidenceRetention as StoreEvidenceRetention,
-    PutEvidence, PutGrant, RequestState, Store, StoreError,
+    AcceptRequest, ApprovalDecision, EvidenceRedaction as StoreEvidenceRedaction,
+    EvidenceRetention as StoreEvidenceRetention, PutEvidence, PutGrant, RequestState, Store,
+    StoreError,
 };
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
-    BriefProvider, DaemonConfig, Ownership, prepare_endpoint, request_audit_event_id,
-    request_preflight, serve_until_with_delay,
+    BriefProvider, DaemonConfig, Ownership, approval_recovery, grant_recovery, policy_resource,
+    prepare_endpoint, request_audit_event_id, request_preflight, serve_until_with_delay,
 };
 use crate::{DaemonError, request_exchange, request_status};
 
@@ -190,6 +194,108 @@ fn audit_event_ids_are_unique_for_same_millisecond_retries() {
     assert_ne!(first, second);
 }
 
+#[test]
+fn denial_recovery_is_executable_only_for_shell_safe_exact_resources() {
+    let caller = CallerId::from("recovery-caller");
+    let project = ProjectId::from("recovery-project");
+    let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
+    let requests = [
+        (
+            RequestEnvelope::status(
+                RequestId::from("recovery-status"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-status"),
+            ),
+            "pam access grant daemon.status --resource daemon".to_owned(),
+        ),
+        (
+            RequestEnvelope::inspect_evidence(
+                RequestId::from("recovery-inspect"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-inspect"),
+                handle.clone(),
+            ),
+            "pam access grant evidence.inspect --resource evidence:evidence://ci/1842/failure"
+                .to_owned(),
+        ),
+        (
+            RequestEnvelope::read_evidence(
+                RequestId::from("recovery-read"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-read"),
+                handle,
+                5,
+                8,
+            )
+            .unwrap(),
+            "pam access grant evidence.read --resource evidence:evidence://ci/1842/failure:offset=5:length=8"
+                .to_owned(),
+        ),
+        (
+            RequestEnvelope::replay(
+                RequestId::from("recovery-replay"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-replay"),
+                RequestId::from("target"),
+                7,
+            ),
+            "pam access grant request.replay --resource request:target:after=7".to_owned(),
+        ),
+    ];
+    for (request, expected) in requests {
+        assert_eq!(
+            grant_recovery(&request.capability, &policy_resource(&request)),
+            expected
+        );
+    }
+
+    let hostile = RequestEnvelope::brief(
+        RequestId::from("recovery-hostile"),
+        caller,
+        ProjectId::from("$(touch_bad)"),
+        IdempotencyKey::from("recovery-hostile"),
+    );
+    assert_eq!(
+        grant_recovery(&hostile.capability, &policy_resource(&hostile)),
+        "run pam access grant with the denied capability and exact resource, quoted for your shell"
+    );
+}
+
+#[test]
+fn approval_recovery_matches_each_capability_retry_surface() {
+    let approval_id = ApprovalId::from("approval-1");
+    let cli_recovery = "pam approval approve approval-1, then retry the original command with --approval-id approval-1";
+    for capability in [
+        Capability::DaemonStatus,
+        Capability::Brief,
+        Capability::NetworkDiagnostics,
+        Capability::WaitForResult,
+        Capability::GetResult,
+    ] {
+        assert_eq!(approval_recovery(&capability, &approval_id), cli_recovery);
+    }
+
+    let evidence_recovery = "pam approval approve approval-1; pam evidence show spans inspection and range reads, so this one-request receipt must be retried by a protocol client against the exact challenged request";
+    for capability in [Capability::InspectEvidence, Capability::ReadEvidence] {
+        assert_eq!(
+            approval_recovery(&capability, &approval_id),
+            evidence_recovery
+        );
+    }
+
+    let protocol_recovery = "pam approval approve approval-1; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request";
+    for capability in [Capability::CancelRequest, Capability::ReplayEvents] {
+        assert_eq!(
+            approval_recovery(&capability, &approval_id),
+            protocol_recovery
+        );
+    }
+}
+
 #[tokio::test]
 async fn authenticated_policy_preflight_appends_a_redacted_project_audit_event() {
     let runtime = test_runtime("preflight-audit");
@@ -299,6 +405,208 @@ fn start_daemon_with_provider(
         delay,
     ));
     (shutdown_tx, daemon)
+}
+
+fn start_secure_daemon(
+    endpoint: LocalEndpoint,
+    state_path: PathBuf,
+    delay: Duration,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), DaemonError>>,
+) {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let daemon = tokio::spawn(serve_until_with_delay(
+        DaemonConfig {
+            endpoint,
+            recover: false,
+            state_path: Some(state_path),
+            brief_provider: None,
+            bypass_authentication: false,
+            bypass_policy: false,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+        delay,
+    ));
+    (shutdown_tx, daemon)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn max_length_evidence_handle(final_byte: char) -> EvidenceHandle {
+    let prefix = "evidence://ci/";
+    assert!(final_byte.is_ascii_lowercase());
+    let path_bytes = 512 - prefix.len();
+    let handle = EvidenceHandle::parse(format!(
+        "{prefix}{}{final_byte}",
+        "a".repeat(path_bytes - 1)
+    ))
+    .unwrap();
+    assert_eq!(handle.as_str().len(), 512);
+    handle
+}
+
+fn evidence_byte_request(
+    request_id: &str,
+    caller: &CallerId,
+    project: &ProjectId,
+    handle: EvidenceHandle,
+    offset: u64,
+) -> RequestEnvelope {
+    RequestEnvelope::read_evidence(
+        RequestId::from(request_id),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from(request_id),
+        handle,
+        offset,
+        1,
+    )
+    .unwrap()
+}
+
+async fn accept_pending_request(store: &Store, request: &RequestEnvelope, now_ms: u64) {
+    store
+        .accept(
+            AcceptRequest {
+                request_id: request.request_id.clone(),
+                caller_id: request.caller_id.clone(),
+                project_id: request.project_id.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                operation_kind: request.capability.policy_name().to_owned(),
+                operation: encode(request).unwrap(),
+            },
+            now_ms,
+        )
+        .await
+        .unwrap();
+}
+
+async fn put_test_grant(
+    store: &Store,
+    grant_id: &str,
+    caller: &CallerId,
+    project: &ProjectId,
+    capability: &str,
+    resource: ResourceScope,
+    approval: ApprovalRequirement,
+) {
+    store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::from(grant_id),
+                caller: caller.clone(),
+                project: project.clone(),
+                capability: CapabilityName::parse(capability).unwrap(),
+                resource,
+                effect: Effect::Allow,
+                approval,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: 2,
+        })
+        .await
+        .unwrap();
+}
+
+async fn approve_required_request(
+    endpoint: &LocalEndpoint,
+    store: &Store,
+    approver: &CallerId,
+    request: &RequestEnvelope,
+) -> ApprovalId {
+    let exchange = request_exchange(endpoint, request, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let ResultBody::Failure(failure) = exchange.result.body else {
+        panic!("request should require approval")
+    };
+    assert_eq!(failure.code, FailureCode::ApprovalRequired);
+    let approval_id = failure.approval.unwrap().approval_id;
+    let expected_recovery = approval_recovery(&request.capability, &approval_id);
+    assert_eq!(
+        failure.recovery.as_deref(),
+        Some(expected_recovery.as_str())
+    );
+    store
+        .decide_approval(
+            approval_id.clone(),
+            approver.clone(),
+            ApprovalDecision::Approve,
+            unix_time_ms(),
+        )
+        .await
+        .unwrap();
+    approval_id
+}
+
+async fn assert_forbidden(endpoint: &LocalEndpoint, request: &RequestEnvelope) {
+    assert!(matches!(
+        request_exchange(endpoint, request, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+    ));
+}
+
+async fn seed_max_evidence_policy_state(
+    state_path: &std::path::Path,
+    caller: &CallerId,
+    credential: &CallerCredential,
+    project: &ProjectId,
+    handle: &EvidenceHandle,
+    allowed_resource: ResourceName,
+) {
+    let seed = Store::open(state_path).unwrap();
+    seed.register_caller(caller.clone(), credential.clone(), 1)
+        .await
+        .unwrap();
+    put_test_grant(
+        &seed,
+        "max-evidence-status",
+        caller,
+        project,
+        "daemon.status",
+        ResourceScope::Exact(ResourceName::parse("daemon").unwrap()),
+        ApprovalRequirement::None,
+    )
+    .await;
+    put_test_grant(
+        &seed,
+        "max-evidence-read",
+        caller,
+        project,
+        "evidence.read",
+        ResourceScope::Exact(allowed_resource),
+        ApprovalRequirement::None,
+    )
+    .await;
+    seed.put_evidence(
+        PutEvidence {
+            handle: handle.clone(),
+            project_id: project.clone(),
+            media_type: "application/octet-stream".to_owned(),
+            retention: StoreEvidenceRetention::Project,
+            redaction: StoreEvidenceRedaction::Unredacted,
+            bytes: vec![7, 8],
+        },
+        4,
+    )
+    .await
+    .unwrap();
+    seed.shutdown().await.unwrap();
 }
 
 async fn wait_for_state(store: &Store, request_id: &RequestId, expected: RequestState) {
@@ -758,6 +1066,286 @@ async fn dropping_wait_observer_does_not_cancel_target_work() {
     let completed = target_observer.await.unwrap().unwrap();
     assert!(matches!(completed.result.body, ResultBody::Success { .. }));
     wait_for_state(&observer, &target.request_id, RequestState::Succeeded).await;
+
+    observer.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_length_evidence_handles_are_safe_and_exactly_policy_bound() {
+    let runtime = test_runtime("max-evidence-policy-resource");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let caller = CallerId::from("max-evidence-caller");
+    let credential = CallerCredential::new("max-evidence-credential");
+    let project = ProjectId::from("max-evidence-project");
+    let handle = max_length_evidence_handle('a');
+    let adjacent_handle = max_length_evidence_handle('b');
+    let allowed_read =
+        evidence_byte_request("max-evidence-read", &caller, &project, handle.clone(), 0)
+            .authenticated(credential.clone());
+    let allowed_resource = policy_resource(&allowed_read).unwrap();
+    assert!(allowed_resource.as_str().len() < MAX_RESOURCE_NAME_BYTES);
+    assert_ne!(
+        allowed_resource,
+        policy_resource(&evidence_byte_request(
+            "adjacent-resource",
+            &caller,
+            &project,
+            adjacent_handle.clone(),
+            0,
+        ))
+        .unwrap(),
+    );
+
+    seed_max_evidence_policy_state(
+        &state_path,
+        &caller,
+        &credential,
+        &project,
+        &handle,
+        allowed_resource,
+    )
+    .await;
+
+    let (shutdown, daemon) = start_secure_daemon(endpoint.clone(), state_path, Duration::ZERO);
+    wait_until_ready(&endpoint).await;
+
+    let unauthenticated = RequestEnvelope::inspect_evidence(
+        RequestId::from("max-evidence-unauthenticated"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("max-evidence-unauthenticated"),
+        handle.clone(),
+    );
+    let denied = request_exchange(&endpoint, &unauthenticated, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(denied.result.request_id, unauthenticated.request_id);
+    assert!(matches!(
+        denied.result.body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Unauthenticated
+    ));
+
+    let allowed = request_exchange(&endpoint, &allowed_read, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed.result.body,
+        ResultBody::Success {
+            payload: ResultPayload::EvidenceChunk(ref chunk),
+            ..
+        } if chunk.bytes() == [7]
+    ));
+
+    for denied_read in [
+        evidence_byte_request(
+            "max-evidence-adjacent",
+            &caller,
+            &project,
+            adjacent_handle,
+            0,
+        )
+        .authenticated(credential.clone()),
+        evidence_byte_request("max-evidence-range", &caller, &project, handle, 1)
+            .authenticated(credential.clone()),
+    ] {
+        assert_forbidden(&endpoint, &denied_read).await;
+    }
+
+    let health = RequestEnvelope::status(
+        RequestId::from("max-evidence-health"),
+        caller,
+        project,
+        IdempotencyKey::from("max-evidence-health"),
+    )
+    .authenticated(credential);
+    assert!(matches!(
+        request_status(&endpoint, &health, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Success { .. }
+    ));
+
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_request_shape_cannot_consume_a_cancel_approval() {
+    let runtime = test_runtime("malformed-shape-approval");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let caller = CallerId::from("shape-caller");
+    let credential = CallerCredential::new("shape-credential");
+    let project = ProjectId::from("shape-project");
+    let target = RequestEnvelope::status(
+        RequestId::from("shape-target"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("shape-target"),
+    );
+    let cancel = |request_id: &str| {
+        RequestEnvelope::cancel(
+            RequestId::from(request_id),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::new(format!("{request_id}-key")),
+            target.request_id.clone(),
+        )
+        .authenticated(credential.clone())
+    };
+    let cancel_resource = policy_resource(&cancel("shape-resource")).unwrap();
+
+    let seed = Store::open(&state_path).unwrap();
+    seed.register_caller(caller.clone(), credential.clone(), 1)
+        .await
+        .unwrap();
+    put_test_grant(
+        &seed,
+        "shape-cancel-grant",
+        &caller,
+        &project,
+        "request.cancel",
+        ResourceScope::Exact(cancel_resource),
+        ApprovalRequirement::Once,
+    )
+    .await;
+    accept_pending_request(&seed, &target, 3).await;
+    seed.shutdown().await.unwrap();
+
+    let (shutdown, daemon) =
+        start_secure_daemon(endpoint.clone(), state_path.clone(), Duration::from_secs(5));
+    wait_until_ready(&endpoint).await;
+    let observer = Store::open(&state_path).unwrap();
+    wait_for_state(&observer, &target.request_id, RequestState::Leased).await;
+
+    let approval_id =
+        approve_required_request(&endpoint, &observer, &caller, &cancel("shape-challenge")).await;
+
+    let mut malformed = cancel("shape-malformed").with_approval(approval_id.clone());
+    malformed.payload = RequestPayload::GetResult {
+        target_request_id: target.request_id.clone(),
+    };
+    let malformed_exchange = request_exchange(&endpoint, &malformed, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(malformed_exchange.result.request_id, malformed.request_id);
+    assert!(matches!(
+        malformed_exchange.result.body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::InvalidRequest
+    ));
+
+    let valid = cancel("shape-valid").with_approval(approval_id.clone());
+    let valid_exchange = request_exchange(&endpoint, &valid, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        valid_exchange.result.body,
+        ResultBody::Success {
+            payload: ResultPayload::Cancellation(ref result),
+            ..
+        } if result.target_request_id == target.request_id
+    ));
+    let replayed_receipt = cancel("shape-consumed").with_approval(approval_id);
+    assert_forbidden(&endpoint, &replayed_receipt).await;
+
+    assert!(!daemon.is_finished());
+
+    observer.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_approval_is_bound_to_the_exact_after_sequence() {
+    let runtime = test_runtime("replay-cursor-approval");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let caller = CallerId::from("cursor-caller");
+    let credential = CallerCredential::new("cursor-credential");
+    let project = ProjectId::from("cursor-project");
+    let target = RequestEnvelope::status(
+        RequestId::from("cursor-target"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("cursor-target"),
+    );
+    let replay = |request_id: &str, after_sequence| {
+        RequestEnvelope::replay(
+            RequestId::from(request_id),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::new(format!("{request_id}-key")),
+            target.request_id.clone(),
+            after_sequence,
+        )
+        .authenticated(credential.clone())
+    };
+    assert_ne!(
+        policy_resource(&replay("cursor-zero-resource", 0)).unwrap(),
+        policy_resource(&replay("cursor-hundred-resource", 100)).unwrap()
+    );
+
+    let seed = Store::open(&state_path).unwrap();
+    seed.register_caller(caller.clone(), credential.clone(), 1)
+        .await
+        .unwrap();
+    put_test_grant(
+        &seed,
+        "cursor-replay-grant",
+        &caller,
+        &project,
+        "request.replay",
+        ResourceScope::Any,
+        ApprovalRequirement::Once,
+    )
+    .await;
+    accept_pending_request(&seed, &target, 3).await;
+    seed.shutdown().await.unwrap();
+
+    let (shutdown, daemon) =
+        start_secure_daemon(endpoint.clone(), state_path.clone(), Duration::from_secs(5));
+    wait_until_ready(&endpoint).await;
+    let observer = Store::open(&state_path).unwrap();
+    wait_for_state(&observer, &target.request_id, RequestState::Leased).await;
+
+    let approval_id = approve_required_request(
+        &endpoint,
+        &observer,
+        &caller,
+        &replay("cursor-challenge", 100),
+    )
+    .await;
+
+    let wrong_cursor = replay("cursor-wrong", 0).with_approval(approval_id.clone());
+    assert_forbidden(&endpoint, &wrong_cursor).await;
+
+    let exact_cursor = replay("cursor-exact", 100).with_approval(approval_id.clone());
+    assert!(matches!(
+        request_exchange(&endpoint, &exact_cursor, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Success {
+            payload: ResultPayload::Replay(_),
+            ..
+        }
+    ));
+    let consumed = replay("cursor-consumed", 100).with_approval(approval_id);
+    assert_forbidden(&endpoint, &consumed).await;
+
+    assert!(!daemon.is_finished());
 
     observer.shutdown().await.unwrap();
     shutdown.send(()).unwrap();

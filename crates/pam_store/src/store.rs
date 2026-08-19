@@ -31,13 +31,17 @@ use crate::{
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 5;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 6;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
     (3, include_str!("../migrations/0003_callers.sql")),
     (4, include_str!("../migrations/0004_policy.sql")),
     (5, include_str!("../migrations/0005_audit.sql")),
+    (
+        6,
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+    ),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -226,10 +230,11 @@ impl Store {
         receive(response_rx).await
     }
 
-    /// Appends one already-redacted event to the durable audit ledger.
+    /// Appends one event to the durable audit ledger.
     ///
-    /// The event detail is stored exactly as supplied. The caller is responsible
-    /// for redacting secrets and sensitive content before invoking this method.
+    /// Callers should redact secrets as close to collection as possible. The
+    /// store reapplies bounded audit-detail redaction before validation,
+    /// idempotency comparison, and persistence as a final safety boundary.
     ///
     /// # Errors
     ///

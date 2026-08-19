@@ -19,7 +19,7 @@ pub use redaction::{
 };
 
 pub const MAX_CAPABILITY_NAME_BYTES: usize = 128;
-pub const MAX_RESOURCE_NAME_BYTES: usize = 512;
+pub const MAX_RESOURCE_NAME_BYTES: usize = 1024;
 
 macro_rules! bounded_name {
     ($name:ident, $error:ident, $maximum:ident, $message:literal) => {
@@ -102,7 +102,7 @@ bounded_name!(
     ResourceName,
     InvalidResourceName,
     MAX_RESOURCE_NAME_BYTES,
-    "resource name must be 1 to 512 UTF-8 bytes with no control characters"
+    "resource name must be 1 to 1024 UTF-8 bytes with no control characters"
 );
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

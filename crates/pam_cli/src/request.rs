@@ -18,7 +18,9 @@ pub(crate) struct RequestContext {
 }
 
 impl RequestContext {
-    pub(crate) async fn discover() -> Result<Self, RequestContextError> {
+    pub(crate) async fn discover(
+        approval_id: Option<ApprovalId>,
+    ) -> Result<Self, RequestContextError> {
         let caller_id = caller_id(CallerKind::Cli).map_err(RequestContextError::Identity)?;
         let project_id = discover_project_id(".").map_err(RequestContextError::Identity)?;
         let credential = load_native_credential(caller_id.clone()).await?;
@@ -26,17 +28,21 @@ impl RequestContext {
             caller_id,
             project_id,
             credential,
-            approval_id: std::env::var("PAM_APPROVAL_ID").ok().map(ApprovalId::new),
+            approval_id,
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn new(caller_id: CallerId, project_id: ProjectId) -> Self {
+    pub(crate) fn new(
+        caller_id: CallerId,
+        project_id: ProjectId,
+        approval_id: Option<ApprovalId>,
+    ) -> Self {
         Self {
             caller_id,
             project_id,
             credential: CallerCredential::new("test-caller-credential"),
-            approval_id: None,
+            approval_id,
         }
     }
 
@@ -95,13 +101,14 @@ impl RequestContext {
 
     pub(crate) fn inspect_evidence(&self, handle: EvidenceHandle) -> RequestEnvelope {
         let (request_id, idempotency_key) = operation_ids("evidence-inspect");
-        self.authenticate(RequestEnvelope::inspect_evidence(
+        RequestEnvelope::inspect_evidence(
             request_id,
             self.caller_id.clone(),
             self.project_id.clone(),
             idempotency_key,
             handle,
-        ))
+        )
+        .authenticated(self.credential.clone())
     }
 
     pub(crate) fn read_evidence(
@@ -120,7 +127,7 @@ impl RequestContext {
             offset,
             length,
         )
-        .map(|request| self.authenticate(request))
+        .map(|request| request.authenticated(self.credential.clone()))
     }
 
     fn authenticate(&self, request: RequestEnvelope) -> RequestEnvelope {

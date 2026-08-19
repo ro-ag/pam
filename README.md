@@ -108,6 +108,25 @@ source as unavailable. Durable request observers use `pam wait <request-id>` and
 `pam evidence show <evidence-handle>` or written byte-for-byte with
 `--raw`/`--output`.
 
+If policy returns an approval challenge, decide it and retry that same
+operation with the explicit one-time receipt:
+
+```sh
+cargo run -p pam_cli -- approval approve <approval-id>
+cargo run -p pam_cli -- status --approval-id <approval-id>
+```
+
+`--approval-id <ID>` is available on the single-request `status`, `brief`,
+`wait`, `result`, and `network diagnostics` commands. The receipt is attached
+only to the command that explicitly supplies it; PAM does not read approval
+authority from the environment.
+
+`evidence show` deliberately does not accept an approval receipt. One evidence
+download spans an inspection request followed by one or more bounded range-read
+requests, while a one-time receipt authorizes exactly one protocol request and
+cannot be reused across that sequence. A protocol client may retry the exact
+challenged evidence request with its receipt.
+
 ## Security model
 
 Local endpoint reachability is not authorization: callers authenticate, policy

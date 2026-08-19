@@ -15,11 +15,11 @@ fn no_subcommand_selects_client_mode() {
 fn explicit_subcommands_select_runtime_modes() {
     assert_eq!(
         Cli::try_parse_from(["pam", "status"]).unwrap().mode(),
-        Mode::Status
+        Mode::Status { approval_id: None }
     );
     assert_eq!(
         Cli::try_parse_from(["pam", "brief"]).unwrap().mode(),
-        Mode::Brief
+        Mode::Brief { approval_id: None }
     );
     assert_eq!(
         Cli::try_parse_from(["pam", "daemon", "--recover"])
@@ -80,7 +80,78 @@ fn explicit_subcommands_select_runtime_modes() {
         Cli::try_parse_from(["pam", "network", "diagnostics"])
             .unwrap()
             .mode(),
-        Mode::NetworkDiagnostics
+        Mode::NetworkDiagnostics { approval_id: None }
+    );
+}
+
+#[test]
+fn daemon_backed_commands_accept_explicit_approval_receipts() {
+    let approval_id = ApprovalId::from("approval-1");
+
+    assert_eq!(
+        Cli::try_parse_from(["pam", "status", "--approval-id", "approval-1"])
+            .unwrap()
+            .mode(),
+        Mode::Status {
+            approval_id: Some(approval_id.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "brief", "--approval-id", "approval-1"])
+            .unwrap()
+            .mode(),
+        Mode::Brief {
+            approval_id: Some(approval_id.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "wait", "request-42", "--approval-id", "approval-1",])
+            .unwrap()
+            .mode(),
+        Mode::Wait {
+            request_id: RequestId::from("request-42"),
+            after: 0,
+            timeout: Duration::from_secs(30),
+            approval_id: Some(approval_id.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "result", "request-42", "--approval-id", "approval-1",])
+            .unwrap()
+            .mode(),
+        Mode::Result {
+            request_id: RequestId::from("request-42"),
+            approval_id: Some(approval_id.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "network",
+            "diagnostics",
+            "--approval-id",
+            "approval-1",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::NetworkDiagnostics {
+            approval_id: Some(approval_id),
+        }
+    );
+}
+
+#[test]
+fn evidence_show_rejects_one_request_approval_receipts() {
+    assert!(
+        Cli::try_parse_from([
+            "pam",
+            "evidence",
+            "show",
+            "evidence://ci/1842/failure",
+            "--approval-id",
+            "approval-1",
+        ])
+        .is_err()
     );
 }
 
@@ -149,6 +220,7 @@ fn wait_selects_request_replay_with_a_bounded_default_timeout() {
             request_id: RequestId::from("request-42"),
             after: 0,
             timeout: Duration::from_secs(30),
+            approval_id: None,
         }
     );
 }
@@ -179,6 +251,7 @@ fn wait_accepts_sequence_and_supported_duration_units() {
                 request_id: RequestId::from("request-42"),
                 after: 7,
                 timeout: expected,
+                approval_id: None,
             }
         );
     }
@@ -192,6 +265,7 @@ fn result_selects_non_blocking_request_inspection() {
             .mode(),
         Mode::Result {
             request_id: RequestId::from("request-42"),
+            approval_id: None,
         }
     );
 }

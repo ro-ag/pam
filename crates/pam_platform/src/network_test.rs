@@ -267,6 +267,28 @@ fn no_proxy_is_reported_by_presence_only() {
 }
 
 #[test]
+fn no_proxy_accepts_reqwest_compatible_entry_whitespace_without_disclosure() {
+    let environment = FakeEnvironment::default().with(
+        ProxyEnvironmentVariable::NoProxyUpper,
+        ProxyEnvironmentValue::text("  localhost, .internal.example , 10.0.0.0/8  "),
+    );
+
+    let diagnostic = diagnose_proxy(&environment, &FakeSystemProxy::direct());
+
+    assert_eq!(
+        diagnostic.bypass,
+        ProxyBypassDiagnostic::Configured {
+            source: ProxySource::Environment(ProxyEnvironmentVariable::NoProxyUpper),
+        }
+    );
+    assert!(diagnostic.ignored_inputs.is_empty());
+    let rendered = format!("{diagnostic:?}");
+    for sensitive in ["localhost", "internal.example", "10.0.0.0"] {
+        assert!(!rendered.contains(sensitive));
+    }
+}
+
+#[test]
 fn malformed_no_proxy_is_typed_and_redacted() {
     let environment = FakeEnvironment::default().with(
         ProxyEnvironmentVariable::NoProxyLower,

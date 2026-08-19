@@ -316,6 +316,16 @@ fn resource_names_enforce_bounds_controls_and_utf8_byte_length() {
 }
 
 #[test]
+fn maximum_evidence_handle_and_range_fit_an_exact_resource_name() {
+    let prefix = "evidence://ci/";
+    let handle = format!("{prefix}{}", "a".repeat(512 - prefix.len()));
+    let resource = format!("evidence:{handle}:offset={}:length={}", u64::MAX, u64::MAX);
+
+    assert!(resource.len() < MAX_RESOURCE_NAME_BYTES);
+    assert_eq!(ResourceName::parse(&resource).unwrap().as_str(), resource);
+}
+
+#[test]
 fn validation_errors_never_echo_rejected_input() {
     let capability_secret = "secret-capability\n";
     let resource_secret = "secret-resource\0";
@@ -326,4 +336,8 @@ fn validation_errors_never_echo_rejected_input() {
     assert!(!format!("{capability_error:?}").contains(capability_secret));
     assert!(!resource_error.to_string().contains(resource_secret));
     assert!(!format!("{resource_error:?}").contains(resource_secret));
+    assert_eq!(
+        resource_error.to_string(),
+        "resource name must be 1 to 1024 UTF-8 bytes with no control characters"
+    );
 }

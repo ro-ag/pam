@@ -28,14 +28,18 @@ async fn main() {
             println!("PAM client ready. Run `pam status` to inspect the daemon.");
             0
         }
-        Mode::Status => app::status().await,
-        Mode::Brief => app::brief().await,
+        Mode::Status { approval_id } => app::status(approval_id).await,
+        Mode::Brief { approval_id } => app::brief(approval_id).await,
         Mode::Wait {
             request_id,
             after,
             timeout,
-        } => app::wait(request_id, after, timeout).await,
-        Mode::Result { request_id } => app::result(request_id).await,
+            approval_id,
+        } => app::wait(request_id, after, timeout, approval_id).await,
+        Mode::Result {
+            request_id,
+            approval_id,
+        } => app::result(request_id, approval_id).await,
         Mode::EvidenceShow {
             handle,
             raw,
@@ -68,7 +72,7 @@ async fn main() {
         Mode::ApprovalDeny { approval_id } => {
             app::approval_decide(approval_id, pam_store::ApprovalDecision::Deny).await
         }
-        Mode::NetworkDiagnostics => app::network_diagnostics().await,
+        Mode::NetworkDiagnostics { approval_id } => app::network_diagnostics(approval_id).await,
         Mode::AuditExport {
             output,
             after,

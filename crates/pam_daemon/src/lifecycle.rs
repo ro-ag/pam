@@ -13,14 +13,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{APPLICATION_VERSION, ContentDigest, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{
+    APPLICATION_VERSION, ApprovalId, ContentDigest, EvidenceHandle, ProjectId, RequestId,
+};
 use pam_platform::{
     CorporateHttpClientFactory, CorporateHttpClientRequirements, IncomingRequest, LocalEndpoint,
     PacDiagnostic, ProxyBypassDiagnostic, ProxyDiagnosticStatus, ProxyEnvironmentVariable,
     ProxyInputIssueKind, ProxyRouteDiagnostic, ProxySource, ReqwestCorporateHttpClientFactory,
     ServerTransport, TransportError, TransportErrorKind, diagnose_process_proxy, user_data_dir,
 };
-use pam_policy::{CapabilityName, ResourceName, redact_audit_detail};
+use pam_policy::{CapabilityName, InvalidResourceName, ResourceName, redact_audit_detail};
 use pam_protocol::{
     ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
@@ -579,6 +581,20 @@ pub(super) async fn request_preflight(
     authentication_required: bool,
     policy_required: bool,
 ) -> Result<Option<ResultEnvelope>, StoreError> {
+    if !request_shape_is_valid(request) {
+        return Ok(Some(failure_result(
+            request,
+            FailureCode::InvalidRequest,
+            "capability and payload do not match",
+        )));
+    }
+    let Ok(resource) = policy_resource(request) else {
+        return Ok(Some(failure_result(
+            request,
+            FailureCode::InvalidRequest,
+            "request cannot be represented as a policy resource",
+        )));
+    };
     if authentication_required
         && !matches!(
             authenticate_request(request, store).await?,
@@ -588,6 +604,7 @@ pub(super) async fn request_preflight(
         append_request_audit(
             store,
             request,
+            &resource,
             "deny",
             "unauthenticated",
             "authentication failed",
@@ -604,7 +621,7 @@ pub(super) async fn request_preflight(
         return Ok(Some(failure));
     }
     if policy_required {
-        let outcome = authorize_request(request, store).await?;
+        let outcome = authorize_request(request, resource, store).await?;
         if !matches!(outcome, AuthorizationOutcome::Allowed) {
             return Ok(Some(authorization_failure(request, outcome)));
         }
@@ -612,6 +629,7 @@ pub(super) async fn request_preflight(
         append_request_audit(
             store,
             request,
+            &resource,
             "allow",
             "authenticated",
             "authentication succeeded; policy enforcement disabled",
@@ -621,15 +639,42 @@ pub(super) async fn request_preflight(
     Ok(None)
 }
 
+fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
+    matches!(
+        (&request.capability, &request.payload),
+        (Capability::DaemonStatus, RequestPayload::Status)
+            | (Capability::CancelRequest, RequestPayload::Cancel { .. })
+            | (Capability::ReplayEvents, RequestPayload::Replay { .. })
+            | (Capability::Brief, RequestPayload::Brief)
+            | (
+                Capability::NetworkDiagnostics,
+                RequestPayload::NetworkDiagnostics
+            )
+            | (
+                Capability::WaitForResult,
+                RequestPayload::WaitForResult { .. }
+            )
+            | (Capability::GetResult, RequestPayload::GetResult { .. })
+            | (
+                Capability::InspectEvidence,
+                RequestPayload::InspectEvidence { .. }
+            )
+            | (
+                Capability::ReadEvidence,
+                RequestPayload::ReadEvidence { .. }
+            )
+    )
+}
+
 async fn append_request_audit(
     store: &Store,
     request: &RequestEnvelope,
+    resource: &ResourceName,
     decision: &str,
     outcome: &str,
     detail: &str,
 ) -> Result<(), StoreError> {
     let occurred_at_ms = now_ms();
-    let resource = policy_resource(request)?;
     let redacted_detail = redact_audit_detail(
         format!(
             "capability={} resource={} detail={detail}",
@@ -708,11 +753,11 @@ async fn authenticate_request(
 
 async fn authorize_request(
     request: &RequestEnvelope,
+    resource: ResourceName,
     store: &Store,
 ) -> Result<AuthorizationOutcome, StoreError> {
     let capability = CapabilityName::parse(request.capability.policy_name())
         .expect("protocol capability names are statically valid");
-    let resource = policy_resource(request)?;
     let now = now_ms();
     let detail = redact_audit_detail(
         format!(
@@ -745,30 +790,33 @@ async fn authorize_request(
         .await
 }
 
-fn policy_resource(request: &RequestEnvelope) -> Result<ResourceName, StoreError> {
+pub(super) fn policy_resource(
+    request: &RequestEnvelope,
+) -> Result<ResourceName, InvalidResourceName> {
     let resource = match &request.payload {
         RequestPayload::Status => "daemon".to_owned(),
         RequestPayload::Brief => format!("project:{}", request.project_id),
         RequestPayload::NetworkDiagnostics => "network:configuration".to_owned(),
         RequestPayload::Cancel { target_request_id }
-        | RequestPayload::Replay {
-            target_request_id, ..
-        }
-        | RequestPayload::WaitForResult {
-            target_request_id, ..
-        }
         | RequestPayload::GetResult { target_request_id } => {
             format!("request:{target_request_id}")
         }
+        RequestPayload::Replay {
+            target_request_id,
+            after_sequence,
+        }
+        | RequestPayload::WaitForResult {
+            target_request_id,
+            after_sequence,
+        } => format!("request:{target_request_id}:after={after_sequence}"),
         RequestPayload::InspectEvidence { handle } => format!("evidence:{handle}"),
         RequestPayload::ReadEvidence {
             handle,
             offset,
             length,
-        } => format!("evidence:{handle}#{offset}+{length}"),
+        } => format!("evidence:{handle}:offset={offset}:length={length}"),
     };
     ResourceName::parse(resource)
-        .map_err(|_| StoreError::InvalidState("invalid policy resource".to_owned()))
 }
 
 fn authorization_failure(
@@ -780,14 +828,17 @@ fn authorization_failure(
         AuthorizationOutcome::Denied => (
             FailureCode::Forbidden,
             "project policy denied this capability".to_owned(),
-            Some("pam access grant".to_owned()),
+            Some(grant_recovery(
+                &request.capability,
+                &policy_resource(request),
+            )),
             None,
         ),
         AuthorizationOutcome::ApprovalRequired {
             approval_id,
             expires_at_ms,
         } => {
-            let recovery = format!("pam approval approve {approval_id}");
+            let recovery = approval_recovery(&request.capability, &approval_id);
             (
                 FailureCode::ApprovalRequired,
                 "this exact effect requires approval".to_owned(),
@@ -822,6 +873,51 @@ fn authorization_failure(
             approval,
         }),
     }
+}
+
+pub(super) fn approval_recovery(capability: &Capability, approval_id: &ApprovalId) -> String {
+    match capability {
+        Capability::DaemonStatus
+        | Capability::Brief
+        | Capability::NetworkDiagnostics
+        | Capability::WaitForResult
+        | Capability::GetResult => format!(
+            "pam approval approve {approval_id}, then retry the original command with --approval-id {approval_id}"
+        ),
+        Capability::InspectEvidence | Capability::ReadEvidence => format!(
+            "pam approval approve {approval_id}; pam evidence show spans inspection and range reads, so this one-request receipt must be retried by a protocol client against the exact challenged request"
+        ),
+        Capability::CancelRequest | Capability::ReplayEvents => format!(
+            "pam approval approve {approval_id}; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request"
+        ),
+    }
+}
+
+pub(super) fn grant_recovery(
+    capability: &Capability,
+    resource: &Result<ResourceName, InvalidResourceName>,
+) -> String {
+    let capability = capability.policy_name();
+    let Ok(resource) = resource else {
+        return "review the denied capability and resource before adding a grant".to_owned();
+    };
+    if shell_safe_policy_argument(capability) && shell_safe_policy_argument(resource.as_str()) {
+        format!(
+            "pam access grant {capability} --resource {}",
+            resource.as_str()
+        )
+    } else {
+        "run pam access grant with the denied capability and exact resource, quoted for your shell"
+            .to_owned()
+    }
+}
+
+fn shell_safe_policy_argument(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'=' | b'+')
+        })
 }
 
 async fn handle_read_only(

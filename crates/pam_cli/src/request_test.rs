@@ -1,10 +1,18 @@
-use pam_core::{CallerId, EvidenceHandle, ProjectId, RequestId};
+use pam_core::{ApprovalId, CallerId, EvidenceHandle, ProjectId, RequestId};
 use pam_protocol::{Capability, RequestPayload};
 
 use super::request::RequestContext;
 
 fn context() -> RequestContext {
-    RequestContext::new(CallerId::from("cli-1"), ProjectId::from("project-1"))
+    context_with_approval(None)
+}
+
+fn context_with_approval(approval_id: Option<ApprovalId>) -> RequestContext {
+    RequestContext::new(
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        approval_id,
+    )
 }
 
 #[test]
@@ -51,6 +59,38 @@ fn wait_and_result_keep_the_target_separate_from_observer_identity() {
 }
 
 #[test]
+fn approved_receipt_is_attached_to_the_exact_retried_request() {
+    let target = RequestId::from("target-1");
+    let original = context().wait(target.clone(), 7);
+    let approval_id = ApprovalId::from("approval-1");
+    let retried = context_with_approval(Some(approval_id.clone())).wait(target, 7);
+
+    assert_eq!(original.approval_id, None);
+    assert_eq!(retried.approval_id, Some(approval_id));
+    assert_eq!(retried.capability, original.capability);
+    assert_eq!(retried.payload, original.payload);
+    assert_eq!(retried.caller_id, original.caller_id);
+    assert_eq!(retried.project_id, original.project_id);
+}
+
+#[test]
+fn explicit_approval_receipt_is_attached_to_each_supported_single_request() {
+    let approval_id = ApprovalId::from("approval-1");
+    let context = context_with_approval(Some(approval_id.clone()));
+    let requests = [
+        context.status(),
+        context.brief(),
+        context.network_diagnostics(),
+        context.wait(RequestId::from("target-1"), 7),
+        context.result(RequestId::from("target-1")),
+    ];
+
+    for request in requests {
+        assert_eq!(request.approval_id.as_ref(), Some(&approval_id));
+    }
+}
+
+#[test]
 fn network_diagnostics_is_authenticated_and_typed() {
     let request = context().network_diagnostics();
 
@@ -60,10 +100,16 @@ fn network_diagnostics_is_authenticated_and_typed() {
 }
 
 #[test]
-fn evidence_requests_are_typed_and_protocol_bounded() {
+fn evidence_requests_are_typed_bounded_and_receipt_free() {
     let handle = EvidenceHandle::parse("evidence://ci/1842/failure").unwrap();
-    let inspect = context().inspect_evidence(handle.clone());
-    let read = context().read_evidence(handle.clone(), 256, 1024).unwrap();
+    let evidence_context = context_with_approval(Some(ApprovalId::from("unused-approval")));
+    let inspect = evidence_context.inspect_evidence(handle.clone());
+    let read = evidence_context
+        .read_evidence(handle.clone(), 256, 1024)
+        .unwrap();
+
+    assert_eq!(inspect.approval_id, None);
+    assert_eq!(read.approval_id, None);
 
     assert_eq!(inspect.capability, Capability::InspectEvidence);
     assert_eq!(

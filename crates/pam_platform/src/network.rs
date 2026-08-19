@@ -438,7 +438,7 @@ fn inspect_bypass_variables(
                 if value.is_empty() {
                     return EnvironmentBypassCandidate::Missing;
                 }
-                if contains_unsafe_text(&value) {
+                if !is_safe_bypass_value(&value) {
                     ignored_inputs.push(ProxyInputIssue {
                         variable,
                         kind: ProxyInputIssueKind::Malformed,
@@ -450,6 +450,24 @@ fn inspect_bypass_variables(
         }
     }
     EnvironmentBypassCandidate::Missing
+}
+
+fn is_safe_bypass_value(value: &str) -> bool {
+    if value.chars().any(char::is_control) {
+        return false;
+    }
+
+    let mut configured = false;
+    for entry in value.split(',').map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        configured = true;
+        if entry.chars().any(char::is_whitespace) {
+            return false;
+        }
+    }
+    configured
 }
 
 fn inspect_proxy_value(value: &str) -> Option<ProxyAuthentication> {

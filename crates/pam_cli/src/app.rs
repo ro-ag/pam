@@ -703,8 +703,8 @@ pub(crate) async fn approval_decide(approval_id: ApprovalId, decision: ApprovalD
     0
 }
 
-pub(crate) async fn status() -> i32 {
-    let Some(context) = discover_context().await else {
+pub(crate) async fn status(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.status(), STATUS_TIMEOUT).await {
@@ -724,8 +724,8 @@ pub(crate) async fn status() -> i32 {
     }
 }
 
-pub(crate) async fn brief() -> i32 {
-    let Some(context) = discover_context().await else {
+pub(crate) async fn brief(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.brief(), READ_TIMEOUT).await {
@@ -746,8 +746,8 @@ pub(crate) async fn brief() -> i32 {
     }
 }
 
-pub(crate) async fn network_diagnostics() -> i32 {
-    let Some(context) = discover_context().await else {
+pub(crate) async fn network_diagnostics(approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.network_diagnostics(), READ_TIMEOUT).await {
@@ -768,8 +768,13 @@ pub(crate) async fn network_diagnostics() -> i32 {
     }
 }
 
-pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -> i32 {
-    let Some(context) = discover_context().await else {
+pub(crate) async fn wait(
+    request_id: RequestId,
+    after: u64,
+    timeout: Duration,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     let request = context.wait(request_id, after);
@@ -782,8 +787,8 @@ pub(crate) async fn wait(request_id: RequestId, after: u64, timeout: Duration) -
     }
 }
 
-pub(crate) async fn result(request_id: RequestId) -> i32 {
-    let Some(context) = discover_context().await else {
+pub(crate) async fn result(request_id: RequestId, approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
         return EXIT_OPERATION_FAILED;
     };
     match exchange(&context.result(request_id), READ_TIMEOUT).await {
@@ -794,7 +799,7 @@ pub(crate) async fn result(request_id: RequestId) -> i32 {
 }
 
 pub(crate) async fn evidence_show(handle: EvidenceHandle, raw: bool, output: Option<&Path>) -> i32 {
-    let Some(context) = discover_context().await else {
+    let Some(context) = discover_context(None).await else {
         return EXIT_OPERATION_FAILED;
     };
     let download = match download_evidence(
@@ -857,8 +862,8 @@ async fn exchange(
     pam_daemon::request_exchange(&LocalEndpoint::default_for_user(), request, timeout).await
 }
 
-async fn discover_context() -> Option<RequestContext> {
-    match RequestContext::discover().await {
+async fn discover_context(approval_id: Option<ApprovalId>) -> Option<RequestContext> {
+    match RequestContext::discover(approval_id).await {
         Ok(context) => Some(context),
         Err(RequestContextError::Identity(error)) => {
             report_identity_error(&error);

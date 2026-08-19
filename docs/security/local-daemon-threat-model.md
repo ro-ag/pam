@@ -9,14 +9,14 @@ capability policy, schedules durable work in SQLite, retains exact evidence in
 a content-addressed store, reads bounded project continuity from `ptrack`, and
 returns typed results over a local ZeroMQ transport. Native credential storage,
 native certificate trust, sanitized proxy diagnostics, a durable audit ledger,
-and explicit retention controls are also implemented.
+explicit retention controls, verified user-owned model registration, and
+bounded direct llama.cpp inference are also implemented.
 
-Flows, connector effects, local model execution, an enabled OpenAI-compatible
-listener, the full GPUI control center, service-manager integration, signed peer
-registration, Unix peer-credential checks, and Windows named pipes are planned,
-not current security controls. This distinction matters: a bug that would
-become remote code execution through a future connector may currently affect
-only local status, continuity, or evidence operations.
+Flows, connector effects, the full GPUI control center, service-manager
+integration, signed peer registration, Unix peer-credential checks, and Windows
+named pipes are planned, not current security controls. Model inference uses the
+existing authenticated PAM IPC protocol and an in-process Rust/llama.cpp
+adapter; there is no HTTP model listener or bearer-token export.
 
 This model covers the whole repository, while concentrating on deployed runtime
 code under `crates/`. The React prototype is a design contract and is not a
@@ -41,8 +41,10 @@ production security boundary.
   credentials, endpoints, bypass lists, and backend diagnostics.
 - Availability and integrity of the local endpoint, SQLite database, evidence
   directories, and native keyring.
-- Future connector credentials, model weights, flow definitions, and external
-  effects. These are design assets but are not yet exposed by production code.
+- User-owned GGUF weights, verified model registrations, exact license consent,
+  and ephemeral model prompts and generated text.
+- Future connector credentials, flow definitions, and external effects. These
+  are design assets but are not yet exposed by production code.
 
 ### Actors and controlled inputs
 
@@ -103,10 +105,12 @@ production security boundary.
    terminal-safe rendering, evidence hashes, and persistence-boundary audit
    redaction limit their effect. Redaction is defense in depth, not a license to
    place arbitrary secrets in audit detail.
-10. **Planned model/flow/connector boundary.** Model and tool output will remain
-    data until typed validation and a policy check at the point of effect. No
-    current model, flow, or connector implementation should be credited as a
-    mitigation.
+10. **Model and planned flow/connector boundary.** Model requests cross the same
+    authenticated, project-scoped policy gate as other PAM protocol operations.
+    The daemon loads only an exact registered digest that passes fresh
+    fail-closed memory admission, serializes native execution, and treats output
+    as untrusted data. Future flows and connectors must still validate that data
+    and re-check policy at the point of every external effect.
 
 ### Security objectives and invariants
 
@@ -132,6 +136,14 @@ production security boundary.
   and unresolved cleanup; they never fabricate a byte-deletion claim.
 - Corporate diagnostics never expose proxy URLs, credentials, hosts, bypass-list
   contents, PAC URLs/scripts, or backend error text.
+- Model weights remain user-owned and are revalidated by size and SHA-256 before
+  load. Prompt and generated text are bounded, excluded from Debug and audit
+  detail, and never persisted by the inference path.
+- Model load fails closed when the exact runtime projection exceeds the 20 GB
+  ceiling or fresh host pressure, availability, swap trend, physical reserve,
+  or Metal working-set evidence is unavailable or insufficient.
+- At most one native inference is active and one is queued; additional callers
+  receive a typed busy result rather than blocking an async executor.
 - Unavailable sources and failed operations are reported as unavailable,
   unresolved, or failed rather than converted into verified facts.
 
@@ -356,17 +368,18 @@ therefore bypasses preview escaping; it is an operator-selected exfiltration and
 terminal-control risk. File export uses new-file-only atomic publication, but
 the user-selected parent directory remains trusted.
 
-### Planned flows, models, connectors, API, and GUI
+### Implemented model boundary and planned flows, connectors, and GUI
 
-These surfaces are not implemented and provide no current mitigation. Before
-shipping them, the design requires typed connector capabilities, destination
-and command allowlists, policy evaluation immediately before every external
-effect, one-time approvals for destructive/publishing actions, bounded API
-bodies/concurrency, authentication on loopback, model-output treatment as
-untrusted data, evidence citations for claims, and no GUI-only bypass around the
-daemon. A future implementation that allows prompt/model/tool output to choose a
-raw shell command, destination, credential, or approval target would cross the
-highest-risk boundaries in this repository.
+The model runtime is embedded directly and reached only through the bounded PAM
+protocol. It has no HTTP/SSE surface, does not disclose a transferable model
+credential, and does not persist prompts or outputs. Before shipping flows,
+connectors, or the full GUI, the design still requires typed connector
+capabilities, destination and command allowlists, policy evaluation immediately
+before every external effect, one-time approvals for destructive/publishing
+actions, evidence citations for claims, and no GUI-only bypass around the
+daemon. Allowing prompt/model/tool output to choose a raw shell command,
+destination, credential, or approval target would cross the highest-risk
+boundaries in this repository.
 
 ## Test-linked validation matrix
 
@@ -382,6 +395,7 @@ repository-relative test-file path in that cell.
 | Policy is default-deny and exact across caller/project/capability/resource | `crates/pam_policy/src/lib.rs::evaluate`; `crates/pam_store/src/store.rs::authorize` | `crates/pam_policy/src/lib_test.rs::no_matching_grant_denies_by_default`; `::explicit_deny_takes_precedence_over_allow`; `crates/pam_store/src/store_test.rs::authorization_is_default_deny_and_matches_exact_policy_dimensions`; `::authorization_rechecks_caller_revocation_after_grant_creation`; `crates/pam_daemon/src/lifecycle_test.rs::max_length_evidence_handles_are_safe_and_exactly_policy_bound` | Administrators can deliberately issue broad any-resource grants |
 | Exact approvals are one-time, explicitly retried for single requests, and audit-atomic | `crates/pam_policy/src/lib.rs::EffectFingerprint`; `crates/pam_store/src/store.rs::authorize_audited`; `crates/pam_cli/src/request.rs::RequestContext` | `crates/pam_policy/src/lib_test.rs::approval_is_bound_to_the_exact_effect_and_consumed_once`; `crates/pam_store/src/store_test.rs::approvals_are_exact_durable_and_consumed_atomically_once`; `::audit_failure_rolls_back_approval_creation`; `::audit_failure_rolls_back_one_time_approval_consumption`; `crates/pam_daemon/tests/status_round_trip.rs::exact_approval_is_required_bound_to_effect_and_consumed_once`; `crates/pam_daemon/src/lifecycle_test.rs::malformed_request_shape_cannot_consume_a_cancel_approval`; `::replay_approval_is_bound_to_the_exact_after_sequence`; `crates/pam_cli/src/request_test.rs::explicit_approval_receipt_is_attached_to_each_supported_single_request` | Approval decisions assume same-user admin authority; multi-request evidence downloads do not accept one reusable receipt |
 | Protocol input and evidence chunks are bounded and versioned | `crates/pam_protocol/src/codec.rs`; `crates/pam_protocol/src/contract.rs` | `crates/pam_protocol/src/codec_test.rs::oversized_frames_are_rejected_before_decode`; `::unsupported_protocol_versions_are_rejected`; `::invalid_evidence_read_lengths_are_rejected_during_decode`; `::maximum_evidence_chunk_fits_the_protocol_frame_and_round_trips` | No per-caller request-rate limiter is documented |
+| Direct model inference is authenticated, bounded, redacted, and capacity-limited | `crates/pam_protocol/src/contract.rs`; `crates/pam_daemon/src/model_service.rs`; `crates/pam_model/src/runtime.rs`; `crates/pam_model/src/llama_cpp_macos.rs` | `crates/pam_protocol/src/codec_test.rs::aggregate_model_prompt_budget_is_enforced_by_the_canonical_decoder`; `::oversized_model_generation_is_rejected_by_the_canonical_decoder`; `crates/pam_daemon/src/model_service_test.rs`; `crates/pam_model/src/runtime_test.rs`; `crates/pam_model/src/llama_cpp_macos_test.rs` | Native live-model qualification is artifact- and macOS-host-specific; model output remains untrusted |
 | Local endpoint ownership/recovery does not replace authentication | `crates/pam_platform/src/endpoint.rs`; `crates/pam_platform/src/transport.rs`; `crates/pam_daemon/src/lifecycle.rs::Ownership` | `crates/pam_daemon/src/lifecycle_test.rs::ownership_rejects_a_second_daemon`; `::stale_socket_reports_recovery_command`; `crates/pam_daemon/tests/status_round_trip.rs::status_crosses_transport_queue_events_and_result` | Predictable fallback lock is symlink-following; peer credentials and hardened service directories are planned |
 | Evidence is immutable, project-scoped, digest-verified, and path-safe | `crates/pam_store/src/evidence.rs` | `crates/pam_store/src/evidence_test.rs::blobs_deduplicate_globally_while_handles_remain_project_scoped`; `::semantic_handle_puts_are_idempotent_but_immutable`; `::missing_and_corrupt_blobs_are_never_returned`; `::symlinked_evidence_directory_is_rejected_before_put`; `::fifo_blob_is_rejected_without_blocking_evidence_requests_or_shutdown`; `::held_directory_handles_prevent_namespace_swap_from_redirecting_publication`; `crates/pam_daemon/src/lifecycle_test.rs::evidence_inspection_and_chunk_reads_are_bounded_and_project_scoped` | Plaintext evidence relies on per-user filesystem isolation |
 | Put/GC races and crash orphans recover without false deletion claims | install intents and prune logic in `crates/pam_store/src/evidence.rs` | `crates/pam_store/src/evidence_test.rs::put_recovers_when_prune_removes_optimistic_install_before_handle_publish`; `::stale_intent_removes_its_exact_crash_temp_before_hardlink_idempotently`; `::stale_same_digest_attempt_cannot_clear_or_delete_a_non_stale_attempt`; `::cleanup_reports_committed_removals_when_a_later_database_step_fails` | Filesystem and SQLite cannot be one atomic unit |
@@ -406,9 +420,9 @@ repository-relative test-file path in that cell.
   privilege. Same-user extraction is still serious but is scoped by the stated
   administrative assumption.
 
-Current impact may be lower when the vulnerable path reaches only status or
-brief functionality because connectors, flows, models, and public APIs are not
-implemented.
+Current impact may be lower when the vulnerable path reaches only status,
+brief, or untrusted local model output because connectors, flows, and public
+network APIs are not implemented.
 
 ### High
 

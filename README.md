@@ -64,18 +64,27 @@ GUI-shell modes. The daemon durably schedules per-project work in SQLite,
 recovers leases after restart, replays ordered events, retains exact
 content-addressed evidence, and obtains project context from `ptrack` only
 through its supported JSON CLI. The workspace also contains a tested,
-deterministic log compactor; daemon integration remains future work.
+deterministic log compactor and a bounded, directly embedded llama.cpp runtime
+behind the existing authenticated PAM protocol; compactor integration remains
+future work. LLMLingua-2 is recorded as a possible staged semantic compressor,
+but is not integrated; it may load on demand and unload before the selected
+model. The 20 GB ceiling applies to the active Qwen profile, not installed
+tools. The model path is text-only, English-first, and intended for coding
+plus Python/SQL data analysis. It does not expose an HTTP model endpoint.
 
 Production requests authenticate a registered, revocable caller whose secret is
 kept in the operating system's native credential store. Project policy is
 default-deny with explicit-deny precedence and exact-effect, one-time approvals.
 Native-trust network diagnostics expose only sanitized configuration facts;
 audit export is project-scoped and redacted; evidence and audit retention are
-explicit, bounded, and crash-recoverable. Flows, models, connectors, service
-manager integration, peer-credential transport hardening, and the full GPUI
-control center remain later roadmap slices. PAC evaluation and live managed
-enterprise CA/proxy behavior are not claimed; no managed-environment interviews
-or workflow observations have been conducted.
+explicit, bounded, and crash-recoverable. Model registration verifies exact
+user-owned bytes and license consent; model loading is disabled unless the
+daemon receives `--model VENDOR/NAME`, then fails closed on the 20 GB profile,
+fresh memory pressure, swap trend, Metal working set, and OS/PAM reserves.
+Flows, connectors, service-manager integration, peer-credential transport
+hardening, and the full GPUI control center remain later roadmap slices. PAC
+evaluation and live managed enterprise CA/proxy behavior are not claimed; no
+managed-environment interviews or workflow observations have been conducted.
 
 Initialize the CLI caller and grant only the capabilities needed for the
 current project:
@@ -95,6 +104,44 @@ cargo run -p pam_cli -- daemon
 ```sh
 cargo run -p pam_cli -- status
 cargo run -p pam_cli -- brief
+```
+
+The first supported embedded model profile is the user-owned
+Qwen3-Coder-30B-A3B-Instruct Q4_K_S artifact documented in
+`docs/model-memory.md`. Register its exact bytes and accepted license snapshot;
+if policy denies the import, run the exact recovery grant printed by PAM and
+retry the same command:
+
+```sh
+cargo run -p pam_cli -- model import \
+  qwen/qwen3-coder-30b-a3b-instruct-q4-k-s \
+  --path /absolute/path/to/Qwen3-Coder-30B-A3B-Instruct-Q4_K_S.gguf \
+  --digest sha256:56a7d00783419bcb0ae566253c371bcb3678261bb79881a553539f5679864db4 \
+  --size-bytes 17456012448 \
+  --license-id Apache-2.0 \
+  --license-url https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/b2cff646eb4bb1d68355c01b18ae02e7cf42d120/LICENSE \
+  --license-notice-digest sha256:832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e \
+  --accept-license
+```
+
+Start the daemon with that profile and invoke it over PAM's authenticated local
+protocol. The first generation is default-denied until its printed exact-effect
+grant is added; retry the identical request after granting it.
+
+Terminal 1:
+
+```sh
+cargo run -p pam_cli -- daemon \
+  --model qwen/qwen3-coder-30b-a3b-instruct-q4-k-s
+```
+
+Terminal 2:
+
+```sh
+cargo run -p pam_cli -- model generate \
+  qwen/qwen3-coder-30b-a3b-instruct-q4-k-s \
+  'Explain this Rust compiler error and propose the smallest safe fix.' \
+  --tokens 256
 ```
 
 The daemon runs in the foreground and shuts down cleanly on Ctrl-C. If an

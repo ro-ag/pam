@@ -15,7 +15,8 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 | Encoding | Serde + MessagePack | Compact typed envelopes without inventing a serializer. | Explicit limits, schema versions, unknown-field behavior, and golden fixtures. |
 | Durable state | SQLite via rusqlite with bundled SQLite | Transactional queues and audit state in a user-local deployment. | WAL mode, migrations, bounded DB worker, backups, and corruption tests. |
 | Evidence | Content-addressed files + SQLite metadata | Avoids bloating IPC/database while retaining exact proof. | Checksums, ownership, retention, redaction, size limits, atomic writes. |
-| Local inference | llama.cpp behind `ModelRuntime` | GGUF ecosystem and first-class Apple Silicon Metal support. | Benchmark binding options; do not expose FFI or model-specific types to core crates. |
+| Prompt compression | Deterministic compactor first; LLMLingua-2 mBERT as a measured future option | Keeps exact source spans authoritative while allowing a later small extractive semantic stage. | Load on demand in a separately measured phase; require unload proof, fresh Qwen admission, code/log retention tests, and a Rust-compatible implementation before promotion. |
+| Local inference | `llama-cpp-4` 0.6.0 behind `ModelRuntime` | Direct in-process llama.cpp, GGUF support, and Apple Silicon Metal acceleration without an HTTP sidecar. | Pin wrapper/sys and upstream llama.cpp revisions; keep FFI and model-specific types inside `pam_model`. |
 | Model acquisition | Hugging Face-compatible catalog/import | Lets users choose location and weights; no bundled payload. | License notice, size/memory estimate, resumable download, checksum, explicit consent. |
 | HTTP | reqwest + rustls + rustls-platform-verifier | Async connectors with native trust behavior for corporate CAs on macOS/Windows. | Proxy/CA diagnostics, destination policy, timeouts, retry budgets, response limits. |
 | Secrets | keyring-core + platform backends | Native Keychain/Credential Manager/Secret Service behavior. | Store opaque tokens only; never log or return connector credentials. |
@@ -56,27 +57,29 @@ native-abort, and packaging risk. The measured Mac spike records:
 - binary size and license inventory.
 
 The available M4 Max/64 GiB host passed the static aarch64 Metal, development
-signing, linkage, startup, first-token, and host-memory gates. The exact
-Qwen3.6-35B-A3B Q4_K_S 3.80 bpw profile also passed a 20 GB model-memory ceiling
-through 65,536 context tokens. M1 Pro with 32 GB memory is the minimum supported
-Mac; host-specific admission is mandatory, and M1 Pro speed remains unmeasured.
+signing, linkage, startup, first-token, and host-memory gates. Qwen3.6 Q4_K_S
+remains calibration history; the production Qwen3-Coder-30B-A3B-Instruct
+Q4_K_S profile passed the 20 GB model-allocation ceiling at 8,192 context
+tokens. M1 Pro with 32 GB memory is the minimum supported Mac; host-specific
+admission is mandatory, and M1 Pro speed remains unmeasured.
 Universal packaging also remains unproven. PAM will use bounded chunk-boundary
 cancellation and a serialized worker instead of the binding's unsafe abort
 callback. See `docs/benchmarks/llama-cpp-macos.md` for commands, measurements,
-limitations, and the fallback criteria. Running a separately installed model
-server can be supported as an adapter, but does not replace the one-binary
-embedded goal.
+limitations, and the fallback criteria. The preview uses the embedded adapter
+only: no separately installed model server, HTTP listener, or subprocess is
+part of the runtime path.
 
 ## Reference model policy
 
-PAM maintains model capability profiles rather than hard-coding one weight.
-The first measured profile is the exact digest-bound Qwen3.6-35B-A3B Q4_K_S
-3.80 bpw artifact documented in `docs/model-memory.md`. The setup UI recommends
-it only after checking weights, KV/recurrent state, context, compute,
-operating-system reserve, live pressure, and the 20 GB model-memory ceiling.
-Other quantizations remain explicit quality/capacity trade-offs and require
-their own digest-bound projection and calibration; M4 timings are not presented
-as M1 Pro measurements.
+PAM maintains explicit digest-bound model capability profiles. The first
+production profile is Qwen3-Coder-30B-A3B-Instruct Q4_K_S at 8,192 context,
+documented in `docs/model-memory.md`; it is text-only, supports only
+non-thinking mode, and uses the model card's recommended sampling parameters.
+The adapter admits it only after checking weights, context, compute, calibrated
+contingency, operating-system and PAM reserves, live pressure and swap trend,
+and the 20 GB model-allocation ceiling. Other artifacts and quantizations
+require their own exact projection, calibration, and focused quality suite; M4
+timings are not presented as M1 Pro measurements.
 
 The user chooses the download directory. If they do not, PAM proposes:
 
@@ -132,5 +135,5 @@ boundary is proven.
 
 - Minimum supported macOS version and signing/notarization identity.
 - MessagePack library and evolution rules after protocol fixture spike.
-- Whether the OpenAI-compatible local API ships in the first preview or the
-  following model-sharing slice.
+- Whether a later model-sharing slice needs another authenticated PAM protocol
+  operation; an HTTP/OpenAI-compatible listener is intentionally out of scope.

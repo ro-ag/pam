@@ -69,10 +69,10 @@ The 10%, 2 GiB, 8 GiB, and 20% values are conservative uncalibrated defaults,
 not universal constants. The contingency covers mapped-buffer/layout
 variance, allocator and page-table overhead, Metal pipelines, tokenizer/native
 objects, and projection error. PAM's own daemon/API/UI budget is separate so it
-cannot disappear inside a model estimate. Before load, task #25 must re-run the
-projection and check normal memory pressure with no rising swap; warning or
-critical pressure, an unknown limit, an overflow, or a projection failure must
-fail closed.
+cannot disappear inside a model estimate. Before load, the macOS adapter re-runs
+the projection and checks normal memory pressure with a stable swapout counter;
+warning or critical pressure, a rising or unknown swap trend, an unknown limit,
+an overflow, or a projection failure fails closed.
 
 `UnifiedWorkingSetLimit` distinguishes `NotApplicable`, `Known`, and
 `Unknown`. macOS Metal admission requires `Known`; a failed platform query is
@@ -140,7 +140,7 @@ projection contingency, PAM, or the OS. The initial 10% contingency alone
 exceeds the remaining capacity, before applying the 8 GiB OS reserve. Q6_K_XL
 is therefore rejected as a 32 GiB candidate.
 
-## Selected 20 GB Q4 profile
+## Calibration 20 GB Q4 profile
 
 The selected artifact is the Apache-2.0
 [`byteshape/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/byteshape/Qwen3.6-35B-A3B-GGUF/tree/57f6dec8727b4c3f5498ff2564a0333ac1f6624a)
@@ -182,16 +182,122 @@ Quality checks through the embedded GGUF chat template passed arithmetic and a
 one-sentence integrity explanation. A sequence prompt returned the correct
 answer with `/no_think`; exact-format output remained unreliable because the
 model could spend the output budget on visible reasoning. This profile is
-therefore suitable for bounded text generation, but task #25 must expose
-reasoning behavior and validate structured output rather than promise it from
-greedy sampling alone. Full commands and timings are in
+therefore retained as calibration evidence, not selected as PAM's coding and
+data-analysis model. Full measurements are in
 `docs/benchmarks/llama-cpp-macos.md`.
+
+## Production coder profile
+
+PAM's first supported runtime profile is the text-only
+[`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct)
+model using the user-owned Unsloth `Q4_K_S` GGUF at revision
+`b17cb02dd882d5b6ab62fc777ad2995f19668350`. The exact file is
+17,456,012,448 bytes with SHA-256
+`56a7d00783419bcb0ae566253c371bcb3678261bb79881a553539f5679864db4`.
+PAM accepts no other size/digest pair for this profile.
+
+The selected configuration is full Metal offload, one sequence, 8,192 context
+tokens, batch and micro-batch 512, automatic flash attention, f16 K/V cache,
+and non-unified KV. The admission matrix from the final release spike is:
+
+| Context tokens | Projected bytes | Live buffer bytes | Peak RSS bytes | Process swaps | Decision |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 512 | 17,824,657,408 | 17,999,687,680 | 17,613,914,112 | 0 | Pass |
+| 4,096 | 18,180,648,960 | 18,355,679,232 | 17,966,153,728 | 0 | Pass |
+| 8,192 | 18,587,496,448 | 18,762,526,720 | 18,372,165,632 | 0 | Selected profile |
+| 32,768 | 21,032,775,680 | not loaded | not measured | not measured | Rejected before model load |
+| 65,536 | 24,287,555,584 | not loaded | not measured | not measured | Rejected before model load |
+| 131,072 | 30,797,115,392 | not loaded | not measured | not measured | Rejected before model load |
+| 262,144 | 43,846,411,776 | not loaded | not measured | not measured | Rejected before model load |
+
+At 8,192 tokens, the projection comprises 17,275,009,024 Metal weight bytes,
+805,306,368 Metal context bytes, 315,359,232 Metal compute bytes,
+175,030,272 Host weight bytes, and 16,791,552 Host compute bytes. The live
+allocation exceeded the no-allocation projection by 175,030,272 bytes. The
+calibrated contingency is `max(ceil(5%), 256 MiB)` = 929,374,823 bytes, so the
+admitted model allocation is 19,516,871,271 bytes. That is 483,128,729 bytes
+below the 20,000,000,000-byte ceiling and 754,344,551 bytes above the measured
+live allocation. PAM and OS reserves remain separate admission requirements.
+
+Quality acceptance uses the GGUF's embedded chat template and the model card's
+recommended non-thinking sampler: temperature 0.7, top-p 0.8, top-k 20, and
+repetition penalty 1.05 over the complete bounded 8,192-token sequence; the
+sampler is seeded with every prompt token and the profile fixes seed 42 for
+reproducibility. Explicit contract prompts passed four focused checks: Python
+filtering/grouping with
+`Decimal`, SQL paid-order aggregation and `DENSE_RANK`, Rust panic diagnosis
+and safe `.first()`, and conversion-rate arithmetic. Earlier implicit prompts
+missed requested output constraints in three of four cases, so generated text
+is untrusted and callers must specify and validate their output contract. The
+model supports only non-thinking mode; PAM exposes no reasoning toggle.
+
+The same final binary was loaded by the production daemon and invoked through
+an authenticated, exact-effect PAM IPC grant. That establishes the adapter and
+policy path on the measured M4 Max. It does not establish M1 Pro throughput;
+M1 Pro with 32 GB remains the minimum supported Mac, and every startup repeats
+host-specific admission before model load.
+
+### Alternatives considered
+
+Qwen3-Coder is the only supported profile in this release, not the only model
+that could ever fit. GLM-4.7-Flash Q4_K_S is the closest future challenger: its
+30B-A3B architecture and approximately 17.2 GB community quant appear capable
+of fitting, but PAM has not verified an exact artifact, projection, chat
+contract, or local quality suite. Devstral Small 2 is coding-specialized and
+targets 32 GB Macs, but its dense 24B runtime is expected to be materially
+slower on M1 Pro and its added vision capability is outside PAM's text-only
+scope. GPT-OSS-20B fits the memory class but requires Harmony formatting and a
+reasoning-oriented contract. Kimi K2.5 is multimodal and its official weight
+repository is hundreds of gigabytes, so it is outside the host envelope.
+
+These are screening decisions, not cross-model quality claims. Promoting any
+alternative requires the same exact-digest memory matrix and coding, Python,
+SQL, and numerical-analysis acceptance suite used for the selected profile.
+
+### Prompt-compression memory equation
+
+LLMLingua is a prompt compressor, not an alternative generation model. The
+20 GB ceiling is the active Qwen generation-profile cap, not a limit on models
+installed on disk or on auxiliary tools loaded in a different phase. For any
+phase with more than one resident model, PAM still accounts for their combined
+allocation:
+
+```text
+concurrent model allocation = coder admission + semantic-compressor weights
+                              + semantic-compressor runtime allocations
+require the Qwen phase allocation <= 20,000,000,000 bytes
+```
+
+The selected coder already admits 19,516,871,271 bytes. Microsoft's smallest
+published LLMLingua-2 MeetingBank repository is about 713 MB before encoder
+activations, so even that pair would be about 20.23 GB and fail the ceiling.
+The 2.25 GB XLM-RoBERTa-large variant is farther outside it. A future semantic
+compressor therefore does not remain resident with Qwen by default. It can load
+on demand in its own separately measured preprocessing phase, fully unload,
+demonstrate recovered memory, and trigger a fresh pressure/swap/admission
+snapshot before the coder loads. Its installed bytes do not consume Qwen's
+runtime ceiling.
+
+Original LLMLingua uses causal-LM perplexity, commonly with GPT-2-small or a
+7B-class model, and is the less attractive local candidate. LLMLingua-2 turns
+compression into extractive token classification with a BERT-level encoder;
+its authors report 3x-6x lower compressor latency and 2x-5x compression in
+their evaluated tasks. PAM would screen the 713 MB mBERT variant first, but it
+is multilingual, trained from MeetingBank seed data, and shipped through a
+Python/Transformers stack. It is not yet evidence for English code, compiler
+logs, paths, hashes, or a single Rust binary.
+
+Accordingly, deterministic source-span compaction remains the production first
+stage. LLMLingua-2 is an optional follow-up experiment only. Promotion requires
+an exact model digest and license, staged load/unload RSS evidence, M1 Pro
+latency, compression-quality tests over coding and data-analysis evidence, and
+an output map back to retained source spans. Original evidence remains
+authoritative; neither compressor output nor Qwen output can replace it.
 
 ## Scope and portability
 
-This slice implements pure component accounting and macOS unified-memory
-admission inputs. It does not implement or claim Windows support. Runtime
-projection, system-memory sampling, unified working-set limits, and pressure
-monitoring remain narrow adapter inputs, so a later Windows implementation can
-supply its own memory pools without changing model acquisition or GGUF domain
-types.
+This slice implements component accounting and production macOS unified-memory
+admission, including fresh physical availability, pressure, Metal working-set,
+and swap-trend checks. It does not implement or claim Windows support. These
+remain narrow adapter inputs so a later Windows implementation can supply its
+own memory pools without changing model acquisition or GGUF domain types.

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::{
     DownloadRequest, DownloadResponse, DownloadTransport, ImportRequest, LicenseConsent,
     LicenseSnapshot, ModelDescriptor, ModelError, ModelKey, ModelSource, TransferRequest,
-    download_https, import_existing,
+    download_https, import_existing, revalidate_registered_model,
 };
 
 struct TestDirectory(PathBuf);
@@ -112,6 +112,30 @@ fn import_hashes_validates_and_registers_the_existing_file_in_place() {
     assert_eq!(record.gguf.metadata_kv_count, 0);
     assert_eq!(record.registered_at_ms, 42);
     assert_eq!(fs::read(path).unwrap(), fixture.bytes);
+}
+
+#[test]
+fn registered_model_revalidation_hashes_the_current_exact_gguf() {
+    let directory = TestDirectory::new("revalidate");
+    let fixture = Fixture::new();
+    let path = directory.0.join("model.gguf");
+    fs::write(&path, &fixture.bytes).unwrap();
+    let record = import_existing(ImportRequest {
+        descriptor: fixture.descriptor,
+        consent: fixture.consent,
+        path: path.clone(),
+        registered_at_ms: 42,
+    })
+    .unwrap();
+
+    revalidate_registered_model(&record).unwrap();
+    let mut changed = fixture.bytes;
+    *changed.last_mut().unwrap() = 1;
+    fs::write(path, changed).unwrap();
+    assert!(matches!(
+        revalidate_registered_model(&record),
+        Err(ModelError::DigestMismatch)
+    ));
 }
 
 #[test]

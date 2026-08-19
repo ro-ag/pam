@@ -11,6 +11,7 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey,
     ProjectId, RequestId,
 };
+use pam_model::{RuntimeFinishReason, RuntimeResponse, RuntimeUsage};
 use pam_platform::{ClientTransport, LocalEndpoint};
 use pam_policy::{
     ApprovalRequirement, CapabilityName, Effect, Grant, MAX_RESOURCE_NAME_BYTES, ResourceName,
@@ -18,9 +19,9 @@ use pam_policy::{
 };
 use pam_protocol::{
     BriefProvenance, BriefResult, CancellationDisposition, Capability, Event, EvidenceRedaction,
-    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, OperationTruth,
-    RequestEnvelope, RequestPayload, ResultBody, ResultPayload, ServerMessage, SourceAvailability,
-    decode_server_message, encode,
+    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, ModelMessage,
+    ModelRole, OperationTruth, RequestEnvelope, RequestPayload, ResultBody, ResultPayload,
+    ServerMessage, SourceAvailability, decode_server_message, encode,
 };
 use pam_store::{
     AcceptRequest, ApprovalDecision, EvidenceRedaction as StoreEvidenceRedaction,
@@ -30,8 +31,9 @@ use pam_store::{
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
-    BriefProvider, DaemonConfig, Ownership, approval_recovery, grant_recovery, policy_resource,
-    prepare_endpoint, request_audit_event_id, request_preflight, serve_until_with_delay,
+    BriefProvider, DaemonConfig, Ownership, approval_recovery, grant_recovery,
+    model_runtime_result, policy_resource, prepare_endpoint, request_audit_event_id,
+    request_preflight, serve_until_with_delay,
 };
 use crate::{DaemonError, request_exchange, request_status};
 
@@ -128,6 +130,148 @@ fn ownership_rejects_a_second_daemon() {
 }
 
 #[test]
+fn model_policy_resource_binds_the_exact_redacted_runtime_effect() {
+    let make = |request_id: &str,
+                model: &str,
+                first_role: ModelRole,
+                prompt: &str,
+                max_output_tokens: u32,
+                deadline_unix_ms: u64| {
+        RequestEnvelope::model_infer(
+            RequestId::from(request_id),
+            CallerId::from("model-caller"),
+            ProjectId::from("model-project"),
+            IdempotencyKey::new(format!("{request_id}-key")),
+            model,
+            vec![
+                ModelMessage::new(first_role, "private setup").unwrap(),
+                ModelMessage::new(ModelRole::User, prompt).unwrap(),
+            ],
+            max_output_tokens,
+            deadline_unix_ms,
+        )
+        .unwrap()
+    };
+    let secret = "private prompt bytes must never enter the policy resource";
+    let baseline = make(
+        "model-effect-1",
+        "vendor/model",
+        ModelRole::System,
+        secret,
+        64,
+        10_000,
+    );
+    let baseline_resource = policy_resource(&baseline).unwrap();
+    assert!(
+        baseline_resource
+            .as_str()
+            .contains("model:vendor/model:effect=sha256:")
+    );
+    assert!(!baseline_resource.as_str().contains(secret));
+    assert!(!baseline_resource.as_str().contains("private setup"));
+    assert_eq!(
+        baseline_resource,
+        policy_resource(&make(
+            "model-effect-2",
+            "vendor/model",
+            ModelRole::System,
+            secret,
+            64,
+            10_000,
+        ))
+        .unwrap(),
+        "observer identity and execution deadline are outside the approved semantic effect"
+    );
+    assert_eq!(
+        baseline_resource,
+        policy_resource(&make(
+            "model-effect-new-deadline",
+            "vendor/model",
+            ModelRole::System,
+            secret,
+            64,
+            10_001,
+        ))
+        .unwrap(),
+        "approval retries may refresh the execution deadline"
+    );
+
+    for changed in [
+        make(
+            "changed-model",
+            "vendor/other",
+            ModelRole::System,
+            secret,
+            64,
+            10_000,
+        ),
+        make(
+            "changed-role",
+            "vendor/model",
+            ModelRole::Assistant,
+            secret,
+            64,
+            10_000,
+        ),
+        make(
+            "changed-prompt",
+            "vendor/model",
+            ModelRole::System,
+            "private prompt bytes must never enter the policy resource!",
+            64,
+            10_000,
+        ),
+        make(
+            "changed-tokens",
+            "vendor/model",
+            ModelRole::System,
+            secret,
+            65,
+            10_000,
+        ),
+    ] {
+        assert_ne!(baseline_resource, policy_resource(&changed).unwrap());
+    }
+}
+
+#[test]
+fn invalid_runtime_generation_becomes_a_bounded_internal_request_failure() {
+    let request = RequestEnvelope::model_infer(
+        RequestId::from("invalid-model-result"),
+        CallerId::from("model-caller"),
+        ProjectId::from("model-project"),
+        IdempotencyKey::from("invalid-model-result-key"),
+        "vendor/model",
+        vec![ModelMessage::new(ModelRole::User, "bounded request").unwrap()],
+        16,
+        10_000,
+    )
+    .unwrap();
+    let (response, outcome, detail) = model_runtime_result(
+        &request,
+        "vendor/model",
+        RuntimeResponse {
+            text: "x".repeat(pam_protocol::MAX_MODEL_OUTPUT_BYTES + 1),
+            finish_reason: RuntimeFinishReason::Stop,
+            usage: RuntimeUsage {
+                input_tokens: 2,
+                sampled_output_tokens: 1,
+                emitted_output_tokens: 1,
+            },
+        },
+    );
+
+    assert!(matches!(
+        response.body,
+        ResultBody::Failure(ref failure)
+            if failure.code == FailureCode::Internal
+                && failure.message == "embedded model returned an invalid result"
+    ));
+    assert_eq!(outcome, "failed");
+    assert_eq!(detail, "model=vendor/model outcome=invalid_result");
+}
+
+#[test]
 fn an_unlocked_persistent_lock_file_is_reclaimed_normally() {
     let runtime = test_runtime("persistent-lock");
     let _ = fs::remove_dir_all(&runtime);
@@ -156,6 +300,7 @@ fn stale_socket_reports_recovery_command() {
     let error = prepare_endpoint(&DaemonConfig {
         endpoint,
         recover: false,
+        model: None,
         state_path: Some(runtime.join("state.sqlite3")),
         brief_provider: None,
         bypass_authentication: true,
@@ -394,6 +539,7 @@ fn start_daemon_with_provider(
         DaemonConfig {
             endpoint,
             recover: false,
+            model: None,
             state_path: Some(state_path),
             brief_provider,
             bypass_authentication: true,
@@ -420,6 +566,7 @@ fn start_secure_daemon(
         DaemonConfig {
             endpoint,
             recover: false,
+            model: None,
             state_path: Some(state_path),
             brief_provider: None,
             bypass_authentication: false,
@@ -1353,6 +1500,90 @@ async fn replay_approval_is_bound_to_the_exact_after_sequence() {
     let _ = fs::remove_dir_all(runtime);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_approval_retry_refreshes_deadline_but_not_the_semantic_effect() {
+    let runtime = test_runtime("model-effect-approval");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let caller = CallerId::from("model-approval-caller");
+    let credential = CallerCredential::new("model-approval-credential");
+    let project = ProjectId::from("model-approval-project");
+    let model_request = |request_id: &str, prompt: &str, deadline_unix_ms: u64| {
+        RequestEnvelope::model_infer(
+            RequestId::from(request_id),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::new(format!("{request_id}-key")),
+            "vendor/model",
+            vec![ModelMessage::new(ModelRole::User, prompt).unwrap()],
+            64,
+            deadline_unix_ms,
+        )
+        .unwrap()
+        .authenticated(credential.clone())
+    };
+
+    let seed = Store::open(&state_path).unwrap();
+    seed.register_caller(caller.clone(), credential.clone(), 1)
+        .await
+        .unwrap();
+    put_test_grant(
+        &seed,
+        "model-approval-grant",
+        &caller,
+        &project,
+        "model.infer",
+        ResourceScope::Any,
+        ApprovalRequirement::Once,
+    )
+    .await;
+    seed.shutdown().await.unwrap();
+
+    let (shutdown, daemon) =
+        start_secure_daemon(endpoint.clone(), state_path.clone(), Duration::ZERO);
+    wait_until_ready(&endpoint).await;
+    let observer = Store::open(&state_path).unwrap();
+    let first_deadline = unix_time_ms().saturating_add(60_000);
+    let approval_id = approve_required_request(
+        &endpoint,
+        &observer,
+        &caller,
+        &model_request("model-approval-challenge", "exact prompt", first_deadline),
+    )
+    .await;
+
+    let wrong_prompt = model_request("model-approval-wrong", "different prompt", first_deadline)
+        .with_approval(approval_id.clone());
+    assert_forbidden(&endpoint, &wrong_prompt).await;
+
+    let refreshed_deadline = unix_time_ms().saturating_add(120_000);
+    let exact_retry = model_request("model-approval-exact", "exact prompt", refreshed_deadline)
+        .with_approval(approval_id.clone());
+    assert!(matches!(
+        request_exchange(&endpoint, &exact_retry, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .result
+            .body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::NotFound
+    ));
+
+    let consumed = model_request(
+        "model-approval-consumed",
+        "exact prompt",
+        refreshed_deadline,
+    )
+    .with_approval(approval_id);
+    assert_forbidden(&endpoint, &consumed).await;
+    assert!(!daemon.is_finished());
+
+    observer.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn evidence_inspection_and_chunk_reads_are_bounded_and_project_scoped() {
     let runtime = test_runtime("evidence-read");
@@ -1605,6 +1836,7 @@ async fn daemon_parallelizes_projects_but_serializes_each_project() {
         DaemonConfig {
             endpoint: endpoint.clone(),
             recover: false,
+            model: None,
             state_path: Some(runtime.join("state.sqlite3")),
             brief_provider: None,
             bypass_authentication: true,

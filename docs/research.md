@@ -35,7 +35,7 @@ behind small interfaces.
 | 3 | CI and build logs are too noisy for economical model input, yet summaries can omit the line that proves the failure. | High | Frequent | High | Deterministic log compaction first, exact evidence handles, optional local semantic compression second. |
 | 4 | Work is split across Git, CI, SonarQube, Jira, Confluence, certificates, and local commands. | High | Daily | High | Per-project queue, connectors behind one protocol, named flows, unified outcome report. |
 | 5 | Automation reports activity instead of outcomes, leaving users unsure what was fixed or verified. | High | Frequent | Medium-high | Durable state machine and explicit solved/changed/verified/unresolved/blocked fields. |
-| 6 | Local models are difficult to acquire, size, run, and share safely on developer hardware. | Medium-high | Occasional setup, continuous use | High | Model catalog/import, memory estimate, `llama.cpp` adapter, user-owned paths, authenticated compatible API. |
+| 6 | Local models are difficult to acquire, size, run, and share safely on developer hardware. | Medium-high | Occasional setup, continuous use | High | Model catalog/import, memory estimate, direct `llama.cpp` adapter, user-owned paths, and authenticated PAM protocol access. |
 | 7 | Context switching creates mental fatigue and makes repeated operational sequences error-prone. | Medium-high | Daily | Medium-high | GUI flow builder, event timeline, resumable runs, reusable policies and evidence packs. |
 
 ## Managed-environment public observations
@@ -129,14 +129,20 @@ original source available by handle.
   [llama-cpp-4](https://docs.rs/llama-cpp-4/latest/llama_cpp_4/) bindings expose
   Metal and server/chat examples, but are new enough to require a measured
   integration spike before adoption.
-- [LLMLingua](https://github.com/microsoft/LLMLingua) is Microsoft's prompt
-  compression project. It is optional inspiration or an external compression
-  stage, not the foundation of PAM's loss-aware log reduction.
-- [Qwen3.6-35B-A3B](https://github.com/QwenLM/Qwen3.6) is a current open MoE
-  coding/agent model with 35B total and 3B active parameters. Quantized GGUF
-  variants are candidates for an M1 Pro Mac with 32 GB RAM. PAM selected one
-  exact Q4_K_S profile through measured memory, context, and quality evidence;
-  other artifacts still require their own digest-bound benchmark.
+- [LLMLingua](https://github.com/microsoft/LLMLingua) uses a small causal LM's
+  perplexity for coarse-to-fine prompt compression. LLMLingua-2 instead uses a
+  distilled BERT-level token classifier; its paper reports 3x-6x faster
+  compression and evaluates 2x-5x ratios. PAM keeps deterministic source-span
+  reduction first and treats LLMLingua-2's 713 MB mBERT MeetingBank model as
+  the only initial semantic-compressor candidate. It may load on demand as a
+  staged, unload-before-Qwen experiment; the 20 GB ceiling governs the active
+  Qwen phase, not installed or nonresident tools. Code/log retention and Rust
+  integration remain unproven.
+- [Qwen3.6-35B-A3B](https://github.com/QwenLM/Qwen3.6) supplied the exact
+  Q4_K_S calibration profile used to establish the 20 GB memory method. PAM's
+  production profile is instead Qwen3-Coder-30B-A3B-Instruct Q4_K_S at 8,192
+  context, selected through exact-digest memory and focused coding/data quality
+  evidence. Every other artifact still requires its own digest-bound benchmark.
 
 ## Opportunity map
 

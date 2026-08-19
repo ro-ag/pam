@@ -8,6 +8,9 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
 };
 use pam_daemon::{ClientExchange, StatusError};
+use pam_model::{
+    ImportRequest, LicenseConsent, LicenseSnapshot, ModelDescriptor, ModelKey, import_existing,
+};
 use pam_platform::{
     CallerKind, IdentityError, LocalEndpoint, caller_id, discover_project_id, user_data_dir,
 };
@@ -15,12 +18,13 @@ use pam_policy::{
     ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope,
     redact_audit_detail,
 };
-use pam_protocol::{ResultBody, ResultPayload};
+use pam_protocol::{ModelMessage, ModelRole, ResultBody, ResultPayload};
 use pam_store::{
     AppendAuditEvent, ApprovalDecision, ApprovalDecisionOutcome, AuditPruneOutcome,
     AuthorizationAudit, AuthorizationOutcome, AuthorizationRequest, CallerAuthentication,
     CallerRevocation, EvidencePruneOutcome, EvidenceRetention, GrantRevocation, PutGrant, Store,
 };
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -514,6 +518,186 @@ pub(crate) async fn caller_register(kind: CallerKindArg) -> i32 {
     println!("Registered caller {}.", registration.caller_id);
     println!("Credential stored in the operating system's native credential store.");
     0
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn model_import(
+    key: ModelKey,
+    path: &Path,
+    digest: pam_core::ContentDigest,
+    size_bytes: u64,
+    license_id: String,
+    license_url: String,
+    license_notice_digest: pam_core::ContentDigest,
+    accept_license: bool,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    if !accept_license {
+        eprintln!("Model import requires --accept-license for the exact supplied metadata.");
+        return EXIT_OPERATION_FAILED;
+    }
+    let Some(filename) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        eprintln!("Model path must end in a Unicode GGUF filename.");
+        return EXIT_OPERATION_FAILED;
+    };
+    let license = match LicenseSnapshot::new(license_id, license_url, license_notice_digest) {
+        Ok(license) => license,
+        Err(error) => {
+            eprintln!("{}", escape_text(&error.to_string()));
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let descriptor = match ModelDescriptor::new(
+        key,
+        filename.to_owned(),
+        digest.clone(),
+        size_bytes,
+        license,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            eprintln!("{}", escape_text(&error.to_string()));
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let (project_id, caller_id, store) = match open_local_administrative_store() {
+        Ok(context) => context,
+        Err(exit_code) => return exit_code,
+    };
+    let resource = model_import_resource(&descriptor);
+    if let Err(exit_code) = authorize_local_operation(
+        &store,
+        &caller_id,
+        &project_id,
+        CapabilityName::parse("model.import").expect("static capability is valid"),
+        resource,
+        approval_id,
+        "model.import",
+    )
+    .await
+    {
+        let _ = store.shutdown().await;
+        return exit_code;
+    }
+    let consent = LicenseConsent::accept(&descriptor);
+    let import_request = ImportRequest {
+        descriptor,
+        consent,
+        path: path.to_path_buf(),
+        registered_at_ms: now_ms(),
+    };
+    let imported = match tokio::task::spawn_blocking(move || import_existing(import_request)).await
+    {
+        Ok(Ok(imported)) => imported,
+        Ok(Err(error)) => {
+            let _ = store.shutdown().await;
+            eprintln!("{}", escape_text(&error.to_string()));
+            return EXIT_OPERATION_FAILED;
+        }
+        Err(_) => {
+            let _ = store.shutdown().await;
+            eprintln!("PAM could not complete model verification.");
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let registered = match store.put_model(imported).await {
+        Ok(registered) => registered,
+        Err(error) => {
+            let _ = store.shutdown().await;
+            return report_store_error(&error);
+        }
+    };
+    if let Err(error) = store.shutdown().await {
+        return report_store_error(&error);
+    }
+    println!(
+        "Registered verified model {} ({} bytes, {}).",
+        registered.key, registered.size_bytes, registered.digest
+    );
+    0
+}
+
+pub(crate) fn model_import_resource(descriptor: &ModelDescriptor) -> ResourceName {
+    let mut hasher = Sha256::new();
+    hash_model_import_field(&mut hasher, b"pam-model-import-effect-v1");
+    hash_model_import_field(&mut hasher, descriptor.key.vendor().as_bytes());
+    hash_model_import_field(&mut hasher, descriptor.key.name().as_bytes());
+    hash_model_import_field(&mut hasher, descriptor.filename.as_bytes());
+    hasher.update(descriptor.expected_size_bytes.to_le_bytes());
+    hash_model_import_field(&mut hasher, descriptor.expected_digest.as_str().as_bytes());
+    hash_model_import_field(&mut hasher, descriptor.license.identifier().as_bytes());
+    hash_model_import_field(&mut hasher, descriptor.license.notice_url().as_bytes());
+    hash_model_import_field(
+        &mut hasher,
+        descriptor.license.notice_digest().as_str().as_bytes(),
+    );
+    let digest = pam_core::ContentDigest::from_sha256(hasher.finalize().into());
+    ResourceName::parse(format!(
+        "model:{}:import-effect={digest}",
+        descriptor.key.id()
+    ))
+    .expect("validated model descriptor forms a bounded policy resource")
+}
+
+fn hash_model_import_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+pub(crate) async fn model_generate(
+    model: ModelKey,
+    prompt: String,
+    system: Option<String>,
+    max_output_tokens: u32,
+    timeout: Duration,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let mut messages = Vec::with_capacity(usize::from(system.is_some()) + 1);
+    if let Some(system) = system {
+        match ModelMessage::new(ModelRole::System, system) {
+            Ok(message) => messages.push(message),
+            Err(error) => {
+                eprintln!("{}", escape_text(&error.to_string()));
+                return EXIT_OPERATION_FAILED;
+            }
+        }
+    }
+    match ModelMessage::new(ModelRole::User, prompt) {
+        Ok(message) => messages.push(message),
+        Err(error) => {
+            eprintln!("{}", escape_text(&error.to_string()));
+            return EXIT_OPERATION_FAILED;
+        }
+    }
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let deadline_unix_ms =
+        now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    let request =
+        match context.model_infer(model.id(), messages, max_output_tokens, deadline_unix_ms) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("{}", escape_text(&error.to_string()));
+                return EXIT_OPERATION_FAILED;
+            }
+        };
+    match exchange(&request, timeout).await {
+        Ok(exchange) if !exchange.events.is_empty() => unexpected_events("model inference"),
+        Ok(exchange)
+            if matches!(
+                exchange.result.body,
+                ResultBody::Success {
+                    payload: ResultPayload::ModelGeneration(_),
+                    ..
+                } | ResultBody::Failure(_)
+            ) =>
+        {
+            emit(present_result(&exchange.result.body))
+        }
+        Ok(_) => unexpected_result("model inference"),
+        Err(error) => report_exchange_error(&error),
+    }
 }
 
 pub(crate) async fn caller_revoke(kind: CallerKindArg) -> i32 {

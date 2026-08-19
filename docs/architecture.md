@@ -11,8 +11,7 @@ flowchart LR
   A["Coding agent"] --> C["pam client\ndefault mode"]
   G --> T["Local transport"]
   C --> T
-  X["Approved local apps"] --> O["Authenticated\nOpenAI-compatible API"]
-  O --> D
+  X["Approved local apps"] --> T
   T --> D["pam daemon"]
   D --> Q["Per-project scheduler"]
   Q --> S["SQLite state +\nevidence index"]
@@ -35,7 +34,7 @@ state.
 | Invocation | Responsibility |
 | --- | --- |
 | `pam …` | Fast client; discovers project and caller, submits requests, streams events, and prints compact results. |
-| `pam daemon` | Owns queues, durable state, connectors, policy, model runtime, and local APIs. |
+| `pam daemon` | Owns queues, durable state, connectors, policy, model runtime, and the authenticated local protocol. |
 | `pam gui` | Native control center for daemon lifecycle, project queues, flows, models, access, certificates, and evidence. |
 
 If the client cannot reach the daemon, it should provide an exact recovery
@@ -212,9 +211,12 @@ the flow itself was previously approved.
 6. **Model boundary:** untrusted prompts and tool output cannot authorize
    capabilities. Model output is data until validated by the engine.
 
-Local API listeners bind only to loopback, require authentication, redact
-secrets from logs, impose body/concurrency limits, and are disabled until the
-user explicitly enables them.
+Model inference uses the existing authenticated PAM IPC protocol and its
+caller/project policy boundary. The daemon embeds llama.cpp in-process through
+the Rust adapter; it does not open an HTTP listener, emulate an OpenAI API, or
+export a bearer credential. Prompt and generated text are bounded, ephemeral,
+excluded from audit detail, and treated as untrusted data. One active inference
+and one queued request are allowed; excess work fails as busy.
 
 ## Portability rules
 

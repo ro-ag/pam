@@ -90,5 +90,8 @@ Hugging Face credentials, infer legal compatibility, decode tensor payloads,
 recommend quantization, or expose inference. Memory estimation is task #23;
 the completed accounting and candidate screen are documented in
 `docs/model-memory.md`.
-The selected 20 GB target profile is documented there as task #24 evidence;
-runtime/API ownership remains task #25.
+The selected 20 GB target profile is documented there as task #24 evidence.
+The runtime slice revalidates the registered size and SHA-256 before every
+model load and reaches the embedded llama.cpp adapter only through PAM's
+authenticated local protocol. It does not add an HTTP model server or transfer
+ownership of the user-selected weights to PAM.

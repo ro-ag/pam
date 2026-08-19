@@ -223,6 +223,35 @@ pub fn import_existing(request: ImportRequest) -> Result<RegisteredModel, ModelE
     ))
 }
 
+/// Reopens and revalidates the exact bytes of a registered GGUF.
+///
+/// This is the runtime boundary check: the current path must still be the
+/// canonical, non-symlink regular file whose size, SHA-256 digest, and bounded
+/// GGUF metadata match the durable registration record.
+///
+/// # Errors
+///
+/// Returns an error when the registered path or its current artifact no longer
+/// matches the registration record.
+pub fn revalidate_registered_model(model: &RegisteredModel) -> Result<(), ModelError> {
+    validate_absolute_unicode_path(&model.path)?;
+    let (parent, name) = open_parent(&model.path, false)?;
+    let inspected = inspect_model(&parent, &name, model.size_bytes)?;
+    if inspected.digest != model.digest {
+        return Err(ModelError::DigestMismatch);
+    }
+    if inspected.gguf != model.gguf {
+        return Err(ModelError::InvalidGguf);
+    }
+    ensure_entry_identity(&parent, &name, &inspected)?;
+    ensure_parent_current(&model.path, &parent)?;
+    let canonical = model.path.canonicalize()?;
+    if canonical != model.path {
+        return Err(ModelError::UnsafePath);
+    }
+    Ok(())
+}
+
 /// Resumes, verifies, and atomically publishes a user-owned HTTPS GGUF.
 ///
 /// The final path is never overwritten and the returned record contains only

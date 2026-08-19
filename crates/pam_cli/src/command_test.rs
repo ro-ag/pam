@@ -12,6 +12,33 @@ fn no_subcommand_selects_client_mode() {
 }
 
 #[test]
+fn model_generation_debug_redacts_prompt_and_system_content() {
+    let secret_prompt = "private-cli-prompt-do-not-log";
+    let secret_system = "private-cli-system-do-not-log";
+    let arguments = [
+        "pam",
+        "model",
+        "generate",
+        "vendor/model",
+        secret_prompt,
+        "--system",
+        secret_system,
+    ];
+    let cli = Cli::try_parse_from(arguments).unwrap();
+    let cli_debug = format!("{cli:?}");
+    assert!(!cli_debug.contains(secret_prompt));
+    assert!(!cli_debug.contains(secret_system));
+    assert!(cli_debug.contains(&format!("prompt_bytes: {}", secret_prompt.len())));
+    assert!(cli_debug.contains(&format!("system_bytes: {}", secret_system.len())));
+
+    let mode_debug = format!("{:?}", Cli::try_parse_from(arguments).unwrap().mode());
+    assert!(!mode_debug.contains(secret_prompt));
+    assert!(!mode_debug.contains(secret_system));
+    assert!(mode_debug.contains(&format!("prompt_bytes: {}", secret_prompt.len())));
+    assert!(mode_debug.contains(&format!("system_bytes: {}", secret_system.len())));
+}
+
+#[test]
 fn explicit_subcommands_select_runtime_modes() {
     assert_eq!(
         Cli::try_parse_from(["pam", "status"]).unwrap().mode(),
@@ -25,7 +52,10 @@ fn explicit_subcommands_select_runtime_modes() {
         Cli::try_parse_from(["pam", "daemon", "--recover"])
             .unwrap()
             .mode(),
-        Mode::Daemon { recover: true }
+        Mode::Daemon {
+            recover: true,
+            model: None,
+        }
     );
     assert_eq!(
         Cli::try_parse_from(["pam", "gui"]).unwrap().mode(),
@@ -69,6 +99,31 @@ fn explicit_subcommands_select_runtime_modes() {
         }
     );
     assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "model",
+            "generate",
+            "byteshape/qwen3.6-q4ks",
+            "What is 37 + 58?",
+            "--system",
+            "Answer briefly.",
+            "--tokens",
+            "64",
+            "--timeout",
+            "2m",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::ModelGenerate {
+            model: pam_model::ModelKey::new("byteshape", "qwen3.6-q4ks").unwrap(),
+            prompt: "What is 37 + 58?".to_owned(),
+            system: Some("Answer briefly.".to_owned()),
+            tokens: 64,
+            timeout: Duration::from_mins(2),
+            approval_id: None,
+        }
+    );
+    assert_eq!(
         Cli::try_parse_from(["pam", "approval", "approve", "approval-1"])
             .unwrap()
             .mode(),
@@ -82,6 +137,91 @@ fn explicit_subcommands_select_runtime_modes() {
             .mode(),
         Mode::NetworkDiagnostics { approval_id: None }
     );
+}
+
+#[test]
+fn direct_model_runtime_and_import_require_explicit_bounded_inputs() {
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    let license_digest = format!("sha256:{}", "cd".repeat(32));
+    let model = pam_model::ModelKey::new("byteshape", "qwen3.6-q4ks").unwrap();
+
+    assert_eq!(
+        Cli::try_parse_from(["pam", "daemon", "--model", "byteshape/qwen3.6-q4ks",])
+            .unwrap()
+            .mode(),
+        Mode::Daemon {
+            recover: false,
+            model: Some(model.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "model",
+            "import",
+            "byteshape/qwen3.6-q4ks",
+            "--path",
+            "/tmp/model.gguf",
+            "--digest",
+            &digest,
+            "--size-bytes",
+            "16492334496",
+            "--license-id",
+            "Apache-2.0",
+            "--license-url",
+            "https://example.test/LICENSE",
+            "--license-notice-digest",
+            &license_digest,
+            "--accept-license",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::ModelImport {
+            model,
+            path: PathBuf::from("/tmp/model.gguf"),
+            digest: pam_core::ContentDigest::parse(digest).unwrap(),
+            size_bytes: 16_492_334_496,
+            license_id: "Apache-2.0".to_owned(),
+            license_url: "https://example.test/LICENSE".to_owned(),
+            license_notice_digest: pam_core::ContentDigest::parse(license_digest).unwrap(),
+            accept_license: true,
+            approval_id: None,
+        }
+    );
+
+    for arguments in [
+        vec!["pam", "daemon", "--model", "bad/model/extra"],
+        vec!["pam", "model", "import", "vendor/model"],
+        vec![
+            "pam",
+            "model",
+            "generate",
+            "vendor/model",
+            "hi",
+            "--tokens",
+            "0",
+        ],
+        vec![
+            "pam",
+            "model",
+            "generate",
+            "vendor/model",
+            "hi",
+            "--tokens",
+            "4097",
+        ],
+        vec![
+            "pam",
+            "model",
+            "generate",
+            "vendor/model",
+            "hi",
+            "--timeout",
+            "11m",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
 }
 
 #[test]

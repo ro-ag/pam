@@ -27,10 +27,12 @@ const DEFAULT_GENERATION_TOKENS: usize = 32;
 const MAX_GENERATION_TOKENS: usize = 4096;
 const MIN_CONTEXT_TOKENS: u32 = 512;
 const RUNTIME_BATCH_TOKENS: u32 = 512;
+const RECOMMENDED_SAMPLING_SEED: u32 = 42;
+const RECOMMENDED_REPETITION_HISTORY_TOKENS: i32 = 8_192;
 const INITIAL_CHAT_TEMPLATE_BYTES: usize = 4 * 1024;
 const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 
-const USAGE: &str = "Usage:\n  pam-llama-cpp-4-spike --model <PATH.gguf> [--prompt <TEXT>] [--chat] [--tokens <COUNT>] [--context <COUNT>] [--max-projected-bytes <BYTES>]\n\nOptions:\n  --model <PATH.gguf>          Required local GGUF path; the spike never downloads weights\n  --prompt <TEXT>              Prompt text, at most 512 tokens after optional chat templating (default: a short evidence-summary prompt)\n  --chat                       Apply the GGUF's embedded tokenizer.chat_template to one user message and add an assistant prompt\n  --tokens <COUNT>             Maximum generated tokens, 1..=4096 (default: 32)\n  --context <COUNT>            Context tokens, 512..=model training context (default: prompt + generation, at least 512)\n  --max-projected-bytes <BYTES>  Fail before model load when the fixed-profile projection exceeds this positive byte cap; requires --context\n  -h, --help                   Show this help";
+const USAGE: &str = "Usage:\n  pam-llama-cpp-4-spike --model <PATH.gguf> [--prompt <TEXT>] [--chat] [--recommended-sampling] [--tokens <COUNT>] [--context <COUNT>] [--max-projected-bytes <BYTES>]\n\nOptions:\n  --model <PATH.gguf>          Required local GGUF path; the spike never downloads weights\n  --prompt <TEXT>              Prompt text, at most 512 tokens after optional chat templating (default: a short evidence-summary prompt)\n  --chat                       Apply the GGUF's embedded tokenizer.chat_template to one user message and add an assistant prompt\n  --recommended-sampling       Use temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.05 over the full 8192-token sequence, and deterministic seed 42\n  --tokens <COUNT>             Maximum generated tokens, 1..=4096 (default: 32)\n  --context <COUNT>            Context tokens, 512..=model training context (default: prompt + generation, at least 512)\n  --max-projected-bytes <BYTES>  Fail before model load when the fixed-profile projection exceeds this positive byte cap; requires --context\n  -h, --help                   Show this help";
 
 #[derive(Debug)]
 struct AppError(String);
@@ -56,6 +58,7 @@ struct Config {
     model_path: PathBuf,
     prompt: String,
     chat: bool,
+    recommended_sampling: bool,
     generation_tokens: usize,
     context_tokens: Option<u32>,
     max_projected_bytes: Option<u64>,
@@ -67,6 +70,7 @@ enum ParsedArgs {
 }
 
 impl Config {
+    #[allow(clippy::too_many_lines)]
     fn parse(args: impl IntoIterator<Item = OsString>) -> AppResult<ParsedArgs> {
         let mut args = args.into_iter();
         let _program = args.next();
@@ -74,6 +78,7 @@ impl Config {
         let mut model_path = None;
         let mut prompt = None;
         let mut chat = false;
+        let mut recommended_sampling = false;
         let mut generation_tokens = None;
         let mut context_tokens = None;
         let mut max_projected_bytes = None;
@@ -102,6 +107,14 @@ impl Config {
                         return Err(AppError::new("--chat may only be specified once"));
                     }
                     chat = true;
+                }
+                "--recommended-sampling" => {
+                    if recommended_sampling {
+                        return Err(AppError::new(
+                            "--recommended-sampling may only be specified once",
+                        ));
+                    }
+                    recommended_sampling = true;
                 }
                 "--tokens" => {
                     let value = next_value(&mut args, "--tokens")?
@@ -164,6 +177,7 @@ impl Config {
             model_path,
             prompt: prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_owned()),
             chat,
+            recommended_sampling,
             generation_tokens: generation_tokens.unwrap_or(DEFAULT_GENERATION_TOKENS),
             context_tokens,
             max_projected_bytes,
@@ -245,6 +259,7 @@ struct RuntimeReport {
     kv_cache_k_type: &'static str,
     kv_cache_v_type: &'static str,
     kv_cache_unified: bool,
+    sampling: &'static str,
 }
 
 #[derive(Serialize)]
@@ -501,6 +516,7 @@ fn benchmark(config: Config) -> AppResult<BenchmarkReport> {
         &model,
         &prompt_tokens,
         config.generation_tokens,
+        config.recommended_sampling,
     )?;
     let setup = SetupMeasurement {
         config,
@@ -644,6 +660,7 @@ fn measure_generation(
     model: &LlamaModel,
     prompt_tokens: &[LlamaToken],
     generation_tokens: usize,
+    recommended_sampling: bool,
 ) -> AppResult<GenerationMeasurement> {
     let mut batch = LlamaBatch::new(prompt_tokens.len(), 1);
     batch
@@ -655,7 +672,7 @@ fn measure_generation(
         .decode(&mut batch)
         .map_err(|error| AppError::new(format!("prompt evaluation failed: {error}")))?;
     let prompt_eval_finished = Instant::now();
-    let sampler = LlamaSampler::greedy();
+    let sampler = fixed_sampler(model, recommended_sampling, prompt_tokens);
     let mut first_token_at = None;
     let mut generated_bytes = Vec::new();
     let mut sampled_tokens = 0usize;
@@ -714,6 +731,31 @@ fn measure_generation(
     })
 }
 
+fn fixed_sampler(
+    model: &LlamaModel,
+    recommended_sampling: bool,
+    prompt_tokens: &[LlamaToken],
+) -> LlamaSampler {
+    if !recommended_sampling {
+        return LlamaSampler::greedy();
+    }
+    LlamaSampler::chain(
+        [
+            LlamaSampler::penalties_simple(
+                model.n_vocab(),
+                RECOMMENDED_REPETITION_HISTORY_TOKENS,
+                1.05,
+            ),
+            LlamaSampler::top_k(20),
+            LlamaSampler::top_p(0.8, 1),
+            LlamaSampler::temp(0.7),
+            LlamaSampler::dist(RECOMMENDED_SAMPLING_SEED),
+        ],
+        true,
+    )
+    .with_tokens(prompt_tokens)
+}
+
 fn assemble_report(
     setup: SetupMeasurement,
     model: &LlamaModel,
@@ -722,7 +764,7 @@ fn assemble_report(
 ) -> AppResult<BenchmarkReport> {
     let live_memory = live_memory_report(context)?;
     Ok(BenchmarkReport {
-        schema_version: 3,
+        schema_version: 4,
         binding: BindingReport {
             crate_name: "llama-cpp-4",
             crate_version: "0.6.0",
@@ -743,6 +785,11 @@ fn assemble_report(
             kv_cache_k_type: "f16",
             kv_cache_v_type: "f16",
             kv_cache_unified: false,
+            sampling: if setup.config.recommended_sampling {
+                "temperature=0.7,top_p=0.8,top_k=20,repetition_penalty=1.05,repetition_history=full_8192,seed=42"
+            } else {
+                "greedy"
+            },
         },
         model: ModelReport {
             path: setup.model_path.to_string_lossy().into_owned(),

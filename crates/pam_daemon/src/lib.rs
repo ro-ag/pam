@@ -2,11 +2,18 @@
 
 mod error;
 mod lifecycle;
+#[cfg(target_os = "macos")]
+mod macos_admission;
+mod model_service;
 mod ptrack;
 mod status;
 
 #[cfg(test)]
 mod lifecycle_test;
+#[cfg(all(test, target_os = "macos"))]
+mod macos_admission_test;
+#[cfg(test)]
+mod model_service_test;
 #[cfg(test)]
 mod ptrack_test;
 

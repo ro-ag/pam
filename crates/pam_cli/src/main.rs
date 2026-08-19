@@ -22,6 +22,7 @@ use clap::Parser;
 use command::{Cli, Mode};
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     let exit_code = match Cli::parse().mode() {
         Mode::Client => {
@@ -47,6 +48,38 @@ async fn main() {
         } => app::evidence_show(handle, raw, output.as_deref()).await,
         Mode::CallerRegister { kind } => app::caller_register(kind).await,
         Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
+        Mode::ModelImport {
+            model,
+            path,
+            digest,
+            size_bytes,
+            license_id,
+            license_url,
+            license_notice_digest,
+            accept_license,
+            approval_id,
+        } => {
+            app::model_import(
+                model,
+                &path,
+                digest,
+                size_bytes,
+                license_id,
+                license_url,
+                license_notice_digest,
+                accept_license,
+                approval_id,
+            )
+            .await
+        }
+        Mode::ModelGenerate {
+            model,
+            prompt,
+            system,
+            tokens,
+            timeout,
+            approval_id,
+        } => app::model_generate(model, prompt, system, tokens, timeout, approval_id).await,
         Mode::AccessGrant {
             capability,
             resource,
@@ -86,7 +119,7 @@ async fn main() {
             approval_id,
             limit,
         } => app::retention_prune(scope, before_unix_ms, approval_id, limit).await,
-        Mode::Daemon { recover } => match pam_daemon::run(recover).await {
+        Mode::Daemon { recover, model } => match pam_daemon::run(recover, model).await {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("{error}");

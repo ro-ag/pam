@@ -1,5 +1,5 @@
 use pam_core::{ApprovalId, CallerId, EvidenceHandle, ProjectId, RequestId};
-use pam_protocol::{Capability, RequestPayload};
+use pam_protocol::{Capability, ModelMessage, ModelRole, RequestPayload};
 
 use super::request::RequestContext;
 
@@ -97,6 +97,28 @@ fn network_diagnostics_is_authenticated_and_typed() {
     assert_eq!(request.capability, Capability::NetworkDiagnostics);
     assert_eq!(request.payload, RequestPayload::NetworkDiagnostics);
     assert!(request.authentication.is_some());
+}
+
+#[test]
+fn model_inference_is_authenticated_bounded_and_deadlined() {
+    let secret_prompt = "analyze this private table";
+    let message = ModelMessage::new(ModelRole::User, secret_prompt).unwrap();
+    let request = context()
+        .model_infer("qwen/coder".to_owned(), vec![message.clone()], 256, 42)
+        .unwrap();
+
+    assert_eq!(request.capability, Capability::ModelInfer);
+    assert_eq!(request.deadline_unix_ms, Some(42));
+    assert!(request.authentication.is_some());
+    assert_eq!(
+        request.payload,
+        RequestPayload::ModelInfer {
+            model: "qwen/coder".to_owned(),
+            messages: vec![message],
+            max_output_tokens: 256,
+        }
+    );
+    assert!(!format!("{request:?}").contains(secret_prompt));
 }
 
 #[test]

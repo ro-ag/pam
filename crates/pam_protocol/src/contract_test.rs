@@ -7,9 +7,11 @@ use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
     EvidenceRedaction, EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
-    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ProtocolContractError,
-    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
-    SourceAvailability, StatusResult,
+    MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS, ModelFinishReason,
+    ModelGenerationResult, ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult,
+    OperationTruth, PROTOCOL_VERSION, PacState, ProtocolContractError, ReplayResult,
+    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, SourceAvailability,
+    StatusResult,
 };
 
 fn status_request() -> RequestEnvelope {
@@ -74,6 +76,144 @@ fn network_diagnostics_request_is_authenticated_read_only_and_policy_named() {
     assert_eq!(request.capability, Capability::NetworkDiagnostics);
     assert_eq!(request.capability.policy_name(), "network.diagnostics");
     assert_eq!(request.payload, RequestPayload::NetworkDiagnostics);
+}
+
+#[test]
+fn model_generation_contract_is_bounded_authenticated_and_policy_named() {
+    let secret_prompt = "private prompt that must stay redacted";
+    let messages = vec![
+        ModelMessage::new(ModelRole::System, "Answer briefly.").unwrap(),
+        ModelMessage::new(ModelRole::User, secret_prompt).unwrap(),
+    ];
+    let request = RequestEnvelope::model_infer(
+        RequestId::from("model-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("model-1"),
+        "byteshape/qwen3.6-q4ks",
+        messages.clone(),
+        64,
+        42,
+    )
+    .unwrap()
+    .authenticated(CallerCredential::new("model-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::ModelInfer);
+    assert_eq!(request.capability.policy_name(), "model.infer");
+    assert_eq!(
+        request.payload,
+        RequestPayload::ModelInfer {
+            model: "byteshape/qwen3.6-q4ks".to_owned(),
+            messages,
+            max_output_tokens: 64,
+        }
+    );
+    assert!(request.validate_model_request().is_ok());
+    assert!(!format!("{request:?}").contains(secret_prompt));
+}
+
+#[test]
+fn model_generation_rejects_invalid_conversations_and_bounds() {
+    let make = |messages, max_output_tokens| {
+        RequestEnvelope::model_infer(
+            RequestId::from("model-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("model-1"),
+            "vendor/model",
+            messages,
+            max_output_tokens,
+            42,
+        )
+    };
+
+    assert!(matches!(
+        make(Vec::new(), 1),
+        Err(ProtocolContractError::InvalidModelConversation)
+    ));
+    assert!(matches!(
+        make(
+            vec![ModelMessage::new(ModelRole::Assistant, "done").unwrap()],
+            1,
+        ),
+        Err(ProtocolContractError::InvalidModelConversation)
+    ));
+    assert!(matches!(
+        ModelMessage::new(ModelRole::User, "x".repeat(MAX_MODEL_MESSAGE_BYTES + 1)),
+        Err(ProtocolContractError::InvalidModelMessage)
+    ));
+    assert!(matches!(
+        ModelMessage::new(ModelRole::User, "not\0valid"),
+        Err(ProtocolContractError::InvalidModelMessage)
+    ));
+    let oversized = (0..5)
+        .map(|index| {
+            ModelMessage::new(
+                if index == 4 {
+                    ModelRole::User
+                } else {
+                    ModelRole::System
+                },
+                "x".repeat(MAX_MODEL_MESSAGE_BYTES),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(matches!(
+        make(oversized, 1),
+        Err(ProtocolContractError::ModelPromptTooLarge { .. })
+    ));
+    assert!(matches!(
+        make(
+            vec![ModelMessage::new(ModelRole::User, "hi").unwrap()],
+            MAX_MODEL_OUTPUT_TOKENS + 1,
+        ),
+        Err(ProtocolContractError::InvalidModelOutputTokens { .. })
+    ));
+    assert!(matches!(
+        RequestEnvelope::model_infer(
+            RequestId::from("model-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("model-1"),
+            "vendor/model",
+            vec![ModelMessage::new(ModelRole::User, "hi").unwrap()],
+            1,
+            0,
+        ),
+        Err(ProtocolContractError::InvalidModelDeadline)
+    ));
+
+    let mut missing_deadline =
+        make(vec![ModelMessage::new(ModelRole::User, "hi").unwrap()], 1).unwrap();
+    missing_deadline.deadline_unix_ms = None;
+    assert!(matches!(
+        missing_deadline.validate_model_request(),
+        Err(ProtocolContractError::InvalidModelDeadline)
+    ));
+}
+
+#[test]
+fn model_generation_result_enforces_transport_output_bound() {
+    let usage = ModelUsage {
+        input_tokens: 2,
+        sampled_output_tokens: 1,
+        emitted_output_tokens: 1,
+    };
+    let result =
+        ModelGenerationResult::new("vendor/model", "95", ModelFinishReason::Stop, usage).unwrap();
+    assert_eq!(result.text(), "95");
+    assert!(!format!("{result:?}").contains("95"));
+    assert!(matches!(
+        ModelGenerationResult::new(
+            "vendor/model",
+            "x".repeat(MAX_MODEL_OUTPUT_BYTES + 1),
+            ModelFinishReason::Length,
+            usage,
+        ),
+        Err(ProtocolContractError::ModelOutputTooLarge { .. })
+    ));
 }
 
 #[test]

@@ -10,6 +10,7 @@ cargo run --release --locked \
   --model /absolute/path/to/model.gguf \
   --prompt "Summarize this retained evidence." \
   --chat \
+  --recommended-sampling \
   --tokens 32 \
   --context 8192 \
   --max-projected-bytes 20000000000
@@ -22,7 +23,11 @@ minimum. The selected context may not exceed the training context reported by
 the model. `--chat` applies the GGUF's embedded `tokenizer.chat_template` to one
 user message and records the template source in the report; it fails closed if
 the template is missing, invalid, or larger than the bounded retrieval limit.
-Raw-prompt mode remains the default.
+Raw-prompt mode remains the default. Sampling also defaults to greedy for
+historical comparisons. `--recommended-sampling` selects the fixed Qwen3-Coder
+profile: temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.05 over the
+complete 8,192-token sequence (initialized with every prompt token), and seed
+42. Schema-v4 JSON records the selected sampling mode.
 
 `--max-projected-bytes` requires an explicit context. The spike initializes the
 backend, runs llama.cpp's no-allocation projection, sums every device entry with
@@ -63,10 +68,11 @@ Timing values are monotonic-clock microseconds with these boundaries:
 - `total_generation`: prompt-decode completion through the last sampled token;
 - `total_inference`: prompt-decode start through the last sampled token.
 
-The greedy sampler makes repeated runs comparable. The final sampled token is
-not decoded back into the context when the requested limit is reached, because
-there is no subsequent token to prepare. `sampled_generation_tokens` includes an
-end-of-generation token; `emitted_generation_tokens` does not.
+Greedy mode and the fixed seed in recommended mode make repeated runs
+comparable. The final sampled token is not decoded back into the context when
+the requested limit is reached, because there is no subsequent token to
+prepare. `sampled_generation_tokens` includes an end-of-generation token;
+`emitted_generation_tokens` does not.
 
 `LlamaSampler::sample` takes the logits-enabled native batch slot and does not
 return an error for a wrong slot; llama.cpp aborts the process instead. The

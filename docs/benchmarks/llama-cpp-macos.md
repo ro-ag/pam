@@ -238,8 +238,97 @@ single-token decode. The production adapter must keep this index handling
 private and cover it with subprocess-level fault tests where feasible.
 
 The spike supports both raw prompts and an explicit embedded-chat-template
-path. Model profiles and the local API still own reasoning controls, sampling,
-structured-output validation, and user-visible quality decisions.
+path. Model profiles and the local API own sampling, structured-output
+validation, and user-visible quality decisions.
+
+## Production Qwen3-Coder profile
+
+Date: 2026-08-19
+
+The first production profile is the user-owned
+[`Qwen3-Coder-30B-A3B-Instruct-Q4_K_S.gguf`](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/blob/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q4_K_S.gguf)
+from Unsloth revision `b17cb02dd882d5b6ab62fc777ad2995f19668350`:
+17,456,012,448 bytes, SHA-256
+`56a7d00783419bcb0ae566253c371bcb3678261bb79881a553539f5679864db4`.
+The source model is Apache-2.0 and text-only; the exact license notice snapshot
+used for registration has SHA-256
+`832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e`.
+
+The final schema-v4 release spike projected every context without allocating
+the model by intentionally setting a one-byte cap:
+
+```sh
+PAM_CODER_MODEL=/absolute/path/to/Qwen3-Coder-30B-A3B-Instruct-Q4_K_S.gguf
+PAM_SPIKE_TARGET=$(cargo metadata --no-deps --format-version 1 \
+  --manifest-path spikes/llama-cpp-4/Cargo.toml | jq -r .target_directory)
+
+for PAM_CODER_CONTEXT in 512 4096 8192 32768 65536 131072 262144; do
+  "$PAM_SPIKE_TARGET/release/pam-llama-cpp-4-spike" \
+    --model "$PAM_CODER_MODEL" \
+    --prompt 'Return exactly OK.' \
+    --tokens 16 \
+    --context "$PAM_CODER_CONTEXT" \
+    --max-projected-bytes 1 \
+    > "/tmp/pam-coder-projection-$PAM_CODER_CONTEXT.json" \
+    2> "/tmp/pam-coder-projection-$PAM_CODER_CONTEXT.stderr"
+done
+```
+
+Only contexts whose projection could satisfy the calibrated 20 GB allocation
+were loaded:
+
+```sh
+for PAM_CODER_CONTEXT in 512 4096 8192; do
+  /usr/bin/time -lp \
+    "$PAM_SPIKE_TARGET/release/pam-llama-cpp-4-spike" \
+    --model "$PAM_CODER_MODEL" \
+    --prompt 'Return exactly OK.' \
+    --chat \
+    --recommended-sampling \
+    --tokens 16 \
+    --context "$PAM_CODER_CONTEXT" \
+    --max-projected-bytes 20000000000 \
+    > "/tmp/pam-coder-live-$PAM_CODER_CONTEXT.json" \
+    2> "/tmp/pam-coder-live-$PAM_CODER_CONTEXT.stderr"
+done
+```
+
+| Context tokens | Projected bytes | Live buffer bytes | Peak RSS bytes | Process swaps | Decision |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 512 | 17,824,657,408 | 17,999,687,680 | 17,613,914,112 | 0 | Pass |
+| 4,096 | 18,180,648,960 | 18,355,679,232 | 17,966,153,728 | 0 | Pass |
+| 8,192 | 18,587,496,448 | 18,762,526,720 | 18,372,165,632 | 0 | Selected profile |
+| 32,768 | 21,032,775,680 | not loaded | not measured | not measured | Rejected before load |
+| 65,536 | 24,287,555,584 | not loaded | not measured | not measured | Rejected before load |
+| 131,072 | 30,797,115,392 | not loaded | not measured | not measured | Rejected before load |
+| 262,144 | 43,846,411,776 | not loaded | not measured | not measured | Rejected before load |
+
+At the selected 8,192 context, final-binary backend initialization took
+59.515 ms, model load 771.028 ms, and context creation 50.194 ms on the M4 Max. The calibrated
+5% contingency is 929,374,823 bytes, producing a 19,516,871,271-byte admission
+value. Snapshots around the quality suite found unchanged encrypted swap usage
+at 602.38 MiB, an unchanged `vm_stat` Swapouts counter of 43,160, and system
+free-memory pressure moving from 91% to 70%. These are M4 Max measurements, not
+an M1 Pro speed claim.
+
+Quality runs used `--chat --recommended-sampling`, the embedded GGUF template,
+and the selected 8,192 context. The repetition sampler was initialized with all
+prompt tokens and retained the complete bounded 8,192-token sequence. Initial
+short prompts correctly solved the analysis case but missed important requested constraints in the Rust, Python,
+and SQL cases. Four revised prompts that made their acceptance contract
+explicit all passed: Rust used `.first()` and explained the panic, Python
+filtered paid rows and returned ISO-date `Decimal` totals in sorted order, SQL
+filtered paid orders and used `DENSE_RANK() <= 3`, and the numerical case
+returned 2.4%, 2.76%, 0.36 percentage points, and 15% relative lift. This is a
+focused smoke suite, not a general quality ranking. Applications must treat
+model output as untrusted and validate any required structure.
+
+The production proof then registered the exact digest and license notice,
+started `pam daemon --model qwen/qwen3-coder-30b-a3b-instruct-q4-k-s`, received
+a default-deny response for the first inference, granted only its exact effect
+hash, and successfully retried the same request through PAM's authenticated
+local IPC. No HTTP listener, sidecar model server, or subprocess runtime was
+used.
 
 ## Scope boundary
 

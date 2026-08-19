@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use pam_protocol::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, ConfigurationPresence, Event,
     EventEnvelope, EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
-    OperationTruth, PacState, ResultBody, ResultPayload, SourceAvailability,
+    ModelFinishReason, OperationTruth, PacState, ResultBody, ResultPayload, SourceAvailability,
 };
 
 pub(crate) const EXIT_OK: i32 = 0;
@@ -304,6 +304,23 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             chunk.eof,
             truth_label(truth)
         ),
+        ResultPayload::ModelGeneration(result) => format!(
+            "model={} finish_reason={} input_tokens={} sampled_output_tokens={} emitted_output_tokens={} truth={}\nOutput:\n{}\n",
+            escape_text(&result.model),
+            model_finish_reason_label(result.finish_reason),
+            result.usage.input_tokens,
+            result.usage.sampled_output_tokens,
+            result.usage.emitted_output_tokens,
+            truth_label(truth),
+            escape_text(result.text())
+        ),
+    }
+}
+
+const fn model_finish_reason_label(reason: ModelFinishReason) -> &'static str {
+    match reason {
+        ModelFinishReason::Stop => "stop",
+        ModelFinishReason::Length => "length",
     }
 }
 
@@ -398,6 +415,7 @@ fn failure_code_label(code: &FailureCode) -> &'static str {
         FailureCode::IdempotencyConflict => "idempotency_conflict",
         FailureCode::Cancelled => "cancelled",
         FailureCode::LeaseConflict => "lease_conflict",
+        FailureCode::Busy => "busy",
         FailureCode::Internal => "internal",
     }
 }

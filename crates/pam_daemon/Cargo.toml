@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 pam_core.workspace = true
+pam_model.workspace = true
 pam_platform.workspace = true
 pam_policy.workspace = true
 pam_protocol.workspace = true

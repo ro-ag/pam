@@ -17,5 +17,9 @@ tokio = { workspace = true, features = ["fs"] }
 url.workspace = true
 uuid.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-4.workspace = true
+llama-cpp-sys-4.workspace = true
+
 [lints]
 workspace = true

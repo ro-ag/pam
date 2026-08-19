@@ -248,6 +248,7 @@ async fn start_daemon(
         DaemonConfig {
             endpoint,
             recover: false,
+            model: None,
             state_path: Some(state_path),
             brief_provider: None,
         },

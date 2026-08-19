@@ -10,11 +10,17 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use pam_core::{
     APPLICATION_VERSION, ApprovalId, ContentDigest, EvidenceHandle, ProjectId, RequestId,
+};
+#[cfg(target_os = "macos")]
+use pam_model::{MacosLlamaCppRuntime, ModelRuntime};
+use pam_model::{
+    ModelKey, RuntimeError, RuntimeFinishReason, RuntimeMessage, RuntimeMessageRole,
+    RuntimeRequest, RuntimeResponse,
 };
 use pam_platform::{
     CorporateHttpClientFactory, CorporateHttpClientRequirements, IncomingRequest, LocalEndpoint,
@@ -27,6 +33,7 @@ use pam_protocol::{
     ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
+    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
     NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
     RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
     SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
@@ -43,6 +50,9 @@ use tokio::{
 };
 
 use crate::DaemonError;
+#[cfg(target_os = "macos")]
+use crate::macos_admission::MacosRuntimeHostAdmission;
+use crate::model_service::{ModelService, ModelServiceError, ModelWorker};
 use crate::ptrack::PtrackBriefProvider;
 
 const RESPONSE_CAPACITY: usize = 64;
@@ -62,6 +72,14 @@ const MAX_BRIEF_TEXT_BYTES: usize = 4 * 1024;
 const MAX_BRIEF_EVIDENCE_HANDLES: usize = 4;
 const MAX_BRIEF_SOURCE_BYTES: usize = 256;
 const MAX_BRIEF_DETAIL_BYTES: usize = 4 * 1024;
+const DEFAULT_MODEL_DEADLINE: Duration = Duration::from_mins(5);
+const MAX_MODEL_DEADLINE: Duration = Duration::from_mins(10);
+
+#[derive(Clone)]
+struct LoadedModelService {
+    key: ModelKey,
+    service: ModelService,
+}
 
 enum Outbound {
     Routed {
@@ -97,6 +115,9 @@ struct Subscription {
 pub struct DaemonConfig {
     pub endpoint: LocalEndpoint,
     pub recover: bool,
+    /// Selects one registered model for the embedded runtime. No model is
+    /// loaded and inference remains unavailable when this is absent.
+    pub model: Option<ModelKey>,
     /// Overrides the durable `SQLite` path, primarily for isolated tests.
     pub state_path: Option<PathBuf>,
     /// Supplies planning context for read-only brief requests.
@@ -112,6 +133,7 @@ impl Default for DaemonConfig {
         Self {
             endpoint: LocalEndpoint::default_for_user(),
             recover: false,
+            model: None,
             state_path: None,
             brief_provider: None,
             #[cfg(test)]
@@ -169,7 +191,7 @@ impl BriefProvider for UnavailableBriefProvider {
 ///
 /// Returns [`DaemonError`] when ownership, durable state, endpoint preparation,
 /// transport, or protocol handling fails.
-pub async fn run(recover: bool) -> Result<(), DaemonError> {
+pub async fn run(recover: bool, model: Option<ModelKey>) -> Result<(), DaemonError> {
     let brief_provider = std::env::current_dir()
         .ok()
         .and_then(|directory| {
@@ -185,6 +207,7 @@ pub async fn run(recover: bool) -> Result<(), DaemonError> {
         .map(|provider| provider as Arc<dyn BriefProvider>);
     let config = DaemonConfig {
         recover,
+        model,
         brief_provider,
         ..DaemonConfig::default()
     };
@@ -207,6 +230,7 @@ where
     serve_until_with_delay(config, shutdown, Duration::ZERO).await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn serve_until_with_delay<F>(
     config: DaemonConfig,
     shutdown: F,
@@ -236,6 +260,7 @@ where
     #[cfg(not(test))]
     let policy_required = true;
     let mut server = ServerTransport::bind(&config.endpoint).await?;
+    let (loaded_model, model_worker) = start_model_service(&store, config.model.clone()).await?;
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Outbound>(RESPONSE_CAPACITY);
     let (scheduler_tx, scheduler_rx) = mpsc::channel::<()>(SCHEDULER_CAPACITY);
     let mut handlers = JoinSet::new();
@@ -247,7 +272,14 @@ where
     ));
     let mut subscriptions = HashMap::<RequestId, Vec<Subscription>>::new();
 
-    println!("PAM daemon ready (version {APPLICATION_VERSION}, protocol {PROTOCOL_VERSION}).");
+    if let Some(model) = &loaded_model {
+        println!(
+            "PAM daemon ready (version {APPLICATION_VERSION}, protocol {PROTOCOL_VERSION}, model {}).",
+            model.key
+        );
+    } else {
+        println!("PAM daemon ready (version {APPLICATION_VERSION}, protocol {PROTOCOL_VERSION}).");
+    }
 
     let _ = scheduler_tx.try_send(());
     tokio::pin!(shutdown);
@@ -271,6 +303,7 @@ where
                 let request_outbound = outbound_tx.clone();
                 let request_scheduler = scheduler_tx.clone();
                 let request_brief_provider = Arc::clone(&brief_provider);
+                let request_model = loaded_model.clone();
                 handlers.spawn(async move {
                     handle_incoming(
                         incoming,
@@ -278,6 +311,7 @@ where
                         request_outbound,
                         request_scheduler,
                         request_brief_provider,
+                        request_model,
                         authentication_required,
                         policy_required,
                     )
@@ -312,11 +346,51 @@ where
     drop(scheduler_tx);
     scheduler.abort();
     let _ = scheduler.await;
+    if let Some(worker) = model_worker {
+        worker.shutdown().await;
+    }
     drop(outbound_tx);
     server.close().await?;
     store.shutdown().await?;
     drop(ownership);
     result
+}
+
+#[cfg(target_os = "macos")]
+async fn start_model_service(
+    store: &Store,
+    key: Option<ModelKey>,
+) -> Result<(Option<LoadedModelService>, Option<ModelWorker>), DaemonError> {
+    let Some(key) = key else {
+        return Ok((None, None));
+    };
+    let registered = store.model(key.clone()).await?;
+    let runtime = tokio::task::spawn_blocking(move || {
+        MacosLlamaCppRuntime::load(registered, Arc::new(MacosRuntimeHostAdmission))
+    })
+    .await
+    .map_err(DaemonError::Handler)??;
+    let runtime: Arc<dyn ModelRuntime> = Arc::new(runtime);
+    let (service, worker) = ModelService::start(runtime);
+    Ok((
+        Some(LoadedModelService {
+            key,
+            service: service.clone(),
+        }),
+        Some(worker),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn start_model_service(
+    store: &Store,
+    key: Option<ModelKey>,
+) -> Result<(Option<LoadedModelService>, Option<ModelWorker>), DaemonError> {
+    let Some(key) = key else {
+        return Ok((None, None));
+    };
+    let _ = store.model(key).await?;
+    Err(RuntimeError::InitializationFailed("embedded llama.cpp is available only on macOS").into())
 }
 
 async fn deliver_outbound(
@@ -481,12 +555,14 @@ fn remap_messages(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     incoming: IncomingRequest,
     store: Store,
     outbound: mpsc::Sender<Outbound>,
     scheduler: mpsc::Sender<()>,
     brief_provider: Arc<dyn BriefProvider>,
+    loaded_model: Option<LoadedModelService>,
     authentication_required: bool,
     policy_required: bool,
 ) -> Result<(), DaemonError> {
@@ -569,6 +645,7 @@ async fn handle_incoming(
                 &store,
                 &outbound,
                 brief_provider.as_ref(),
+                loaded_model.as_ref(),
             )
             .await
         }
@@ -640,7 +717,7 @@ pub(super) async fn request_preflight(
 }
 
 fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
-    matches!(
+    let capability_matches = matches!(
         (&request.capability, &request.payload),
         (Capability::DaemonStatus, RequestPayload::Status)
             | (Capability::CancelRequest, RequestPayload::Cancel { .. })
@@ -663,7 +740,9 @@ fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
                 Capability::ReadEvidence,
                 RequestPayload::ReadEvidence { .. }
             )
-    )
+            | (Capability::ModelInfer, RequestPayload::ModelInfer { .. })
+    );
+    capability_matches && request.validate_model_request().is_ok()
 }
 
 async fn append_request_audit(
@@ -815,8 +894,46 @@ pub(super) fn policy_resource(
             offset,
             length,
         } => format!("evidence:{handle}:offset={offset}:length={length}"),
+        RequestPayload::ModelInfer {
+            model,
+            messages,
+            max_output_tokens,
+        } => {
+            let digest = model_infer_effect_digest(model, messages, *max_output_tokens);
+            format!("model:{model}:effect={digest}")
+        }
     };
     ResourceName::parse(resource)
+}
+
+fn model_infer_effect_digest(
+    model: &str,
+    messages: &[ModelMessage],
+    max_output_tokens: u32,
+) -> ContentDigest {
+    let mut hasher = Sha256::new();
+    hash_effect_field(&mut hasher, b"pam-model-infer-effect-v1");
+    hash_effect_field(&mut hasher, model.as_bytes());
+    hasher.update(
+        u64::try_from(messages.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for message in messages {
+        hasher.update([match message.role() {
+            ModelRole::System => 0,
+            ModelRole::User => 1,
+            ModelRole::Assistant => 2,
+        }]);
+        hash_effect_field(&mut hasher, message.content().as_bytes());
+    }
+    hasher.update(max_output_tokens.to_le_bytes());
+    ContentDigest::from_sha256(hasher.finalize().into())
+}
+
+fn hash_effect_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn authorization_failure(
@@ -881,7 +998,8 @@ pub(super) fn approval_recovery(capability: &Capability, approval_id: &ApprovalI
         | Capability::Brief
         | Capability::NetworkDiagnostics
         | Capability::WaitForResult
-        | Capability::GetResult => format!(
+        | Capability::GetResult
+        | Capability::ModelInfer => format!(
             "pam approval approve {approval_id}, then retry the original command with --approval-id {approval_id}"
         ),
         Capability::InspectEvidence | Capability::ReadEvidence => format!(
@@ -926,6 +1044,7 @@ async fn handle_read_only(
     store: &Store,
     outbound: &mpsc::Sender<Outbound>,
     brief_provider: &dyn BriefProvider,
+    loaded_model: Option<&LoadedModelService>,
 ) -> Result<(), DaemonError> {
     match (&request.capability, &request.payload) {
         (Capability::Brief, RequestPayload::Brief) => {
@@ -933,6 +1052,9 @@ async fn handle_read_only(
         }
         (Capability::NetworkDiagnostics, RequestPayload::NetworkDiagnostics) => {
             handle_network_diagnostics(request, incoming, store, outbound).await
+        }
+        (Capability::ModelInfer, RequestPayload::ModelInfer { .. }) => {
+            handle_model_infer(request, incoming, store, outbound, loaded_model).await
         }
         (
             Capability::WaitForResult,
@@ -997,6 +1119,245 @@ async fn handle_read_only(
             .await;
             Ok(())
         }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_model_infer(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+    loaded: Option<&LoadedModelService>,
+) -> Result<(), DaemonError> {
+    let RequestPayload::ModelInfer {
+        model,
+        messages,
+        max_output_tokens,
+    } = &request.payload
+    else {
+        unreachable!("model inference is dispatched only for its matching payload")
+    };
+    let Some(loaded) = loaded.filter(|loaded| loaded.key.id() == *model) else {
+        let mut failure = failure_result(
+            request,
+            FailureCode::NotFound,
+            "the requested model is not loaded in this daemon",
+        );
+        if let ResultBody::Failure(body) = &mut failure.body {
+            body.recovery = Some(format!("restart PAM with `pam daemon --model {model}`"));
+        }
+        send_routed(
+            outbound,
+            incoming,
+            vec![ServerMessage::Result(failure)],
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+    let deadline = match model_deadline(request.deadline_unix_ms) {
+        Ok(deadline) => deadline,
+        Err((code, message)) => {
+            send_routed(
+                outbound,
+                incoming,
+                vec![ServerMessage::Result(failure_result(
+                    request, code, message,
+                ))],
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let Ok(runtime_messages) = messages
+        .iter()
+        .map(|message| {
+            RuntimeMessage::new(
+                match message.role() {
+                    ModelRole::System => RuntimeMessageRole::System,
+                    ModelRole::User => RuntimeMessageRole::User,
+                    ModelRole::Assistant => RuntimeMessageRole::Assistant,
+                },
+                message.content(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        send_routed(
+            outbound,
+            incoming,
+            vec![ServerMessage::Result(failure_result(
+                request,
+                FailureCode::InvalidRequest,
+                "model messages are invalid",
+            ))],
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+    let Ok(runtime_request) = RuntimeRequest::new(runtime_messages, *max_output_tokens) else {
+        send_routed(
+            outbound,
+            incoming,
+            vec![ServerMessage::Result(failure_result(
+                request,
+                FailureCode::InvalidRequest,
+                "model request is invalid",
+            ))],
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+    let result = loaded.service.infer(runtime_request, deadline).await;
+    let (response, audit_outcome, audit_detail) = match result {
+        Ok(result) => model_runtime_result(request, model, result),
+        Err(error) => {
+            let (code, message, outcome) = model_service_failure(&error);
+            (
+                failure_result(request, code, message),
+                outcome,
+                format!("model={model} outcome={outcome}"),
+            )
+        }
+    };
+    append_model_audit(store, request, audit_outcome, &audit_detail).await?;
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(response)],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+pub(super) fn model_runtime_result(
+    request: &RequestEnvelope,
+    model: &str,
+    result: RuntimeResponse,
+) -> (ResultEnvelope, &'static str, String) {
+    let finish_reason = match result.finish_reason {
+        RuntimeFinishReason::Stop => ModelFinishReason::Stop,
+        RuntimeFinishReason::Length => ModelFinishReason::Length,
+    };
+    let usage = ModelUsage {
+        input_tokens: result.usage.input_tokens,
+        sampled_output_tokens: result.usage.sampled_output_tokens,
+        emitted_output_tokens: result.usage.emitted_output_tokens,
+    };
+    match ModelGenerationResult::new(model, result.text, finish_reason, usage) {
+        Ok(generation) => (
+            success_result(
+                request,
+                OperationTruth::Observed,
+                ResultPayload::ModelGeneration(generation),
+            ),
+            "observed",
+            format!(
+                "model={model} finish={} input_tokens={} sampled_output_tokens={} emitted_output_tokens={}",
+                model_finish_label(finish_reason),
+                usage.input_tokens,
+                usage.sampled_output_tokens,
+                usage.emitted_output_tokens,
+            ),
+        ),
+        Err(_) => (
+            failure_result(
+                request,
+                FailureCode::Internal,
+                "embedded model returned an invalid result",
+            ),
+            "failed",
+            format!("model={model} outcome=invalid_result"),
+        ),
+    }
+}
+
+fn model_deadline(deadline_unix_ms: Option<u64>) -> Result<Instant, (FailureCode, &'static str)> {
+    let now_unix_ms = now_ms();
+    let deadline_unix_ms = deadline_unix_ms
+        .unwrap_or_else(|| now_unix_ms.saturating_add(duration_ms(DEFAULT_MODEL_DEADLINE)));
+    if deadline_unix_ms <= now_unix_ms {
+        return Err((FailureCode::Cancelled, "model request deadline has elapsed"));
+    }
+    let remaining_ms = deadline_unix_ms - now_unix_ms;
+    if remaining_ms > duration_ms(MAX_MODEL_DEADLINE) {
+        return Err((
+            FailureCode::InvalidRequest,
+            "model request deadline exceeds the 10 minute limit",
+        ));
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(remaining_ms))
+        .ok_or((
+            FailureCode::InvalidRequest,
+            "model request deadline is invalid",
+        ))
+}
+
+fn model_service_failure(error: &ModelServiceError) -> (FailureCode, &'static str, &'static str) {
+    match error {
+        ModelServiceError::Busy | ModelServiceError::Runtime(RuntimeError::Busy) => (
+            FailureCode::Busy,
+            "the embedded model worker is busy",
+            "busy",
+        ),
+        ModelServiceError::DeadlineExceeded => (
+            FailureCode::Cancelled,
+            "model request deadline elapsed",
+            "deadline_exceeded",
+        ),
+        ModelServiceError::Runtime(RuntimeError::Cancelled) => (
+            FailureCode::Cancelled,
+            "model inference was cancelled",
+            "cancelled",
+        ),
+        ModelServiceError::Runtime(RuntimeError::InvalidRequest(_)) => (
+            FailureCode::InvalidRequest,
+            "model request is invalid",
+            "invalid_request",
+        ),
+        ModelServiceError::Runtime(_) | ModelServiceError::Unavailable => (
+            FailureCode::Internal,
+            "embedded model inference failed",
+            "failed",
+        ),
+    }
+}
+
+async fn append_model_audit(
+    store: &Store,
+    request: &RequestEnvelope,
+    outcome: &str,
+    detail: &str,
+) -> Result<(), StoreError> {
+    let occurred_at_ms = now_ms();
+    store
+        .append_audit_event(AppendAuditEvent {
+            event_id: request_audit_event_id(request, "model-inference", occurred_at_ms),
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: "model.infer".to_owned(),
+            decision: "execute".to_owned(),
+            outcome: outcome.to_owned(),
+            redacted_detail: redact_audit_detail(detail.as_bytes()),
+            occurred_at_ms,
+            retain_until_ms: occurred_at_ms
+                .saturating_add(duration_ms(AUDIT_RETENTION))
+                .min(i64::MAX as u64),
+        })
+        .await?;
+    Ok(())
+}
+
+const fn model_finish_label(reason: ModelFinishReason) -> &'static str {
+    match reason {
+        ModelFinishReason::Stop => "stop",
+        ModelFinishReason::Length => "length",
     }
 }
 
@@ -1786,7 +2147,8 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
         | RequestPayload::Brief
         | RequestPayload::NetworkDiagnostics
         | RequestPayload::InspectEvidence { .. }
-        | RequestPayload::ReadEvidence { .. } => None,
+        | RequestPayload::ReadEvidence { .. }
+        | RequestPayload::ModelInfer { .. } => None,
     }
 }
 

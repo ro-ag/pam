@@ -6,7 +6,10 @@ use pam_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_EVIDENCE_CHUNK_SIZE, PROTOCOL_VERSION};
+use crate::{
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_MESSAGES, MAX_MODEL_OUTPUT_BYTES,
+    MAX_MODEL_OUTPUT_TOKENS, MAX_MODEL_PROMPT_BYTES, PROTOCOL_VERSION,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
@@ -146,6 +149,64 @@ impl RequestEnvelope {
             idempotency_key,
             deadline_unix_ms: None,
             payload: RequestPayload::NetworkDiagnostics,
+        }
+    }
+
+    /// Creates an authenticated, policy-gated request for direct embedded inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contract error when the model identity, chat messages, prompt byte
+    /// budget, output-token bound, or absolute deadline is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn model_infer(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        model: impl Into<String>,
+        messages: Vec<ModelMessage>,
+        max_output_tokens: u32,
+        deadline_unix_ms: u64,
+    ) -> Result<Self, ProtocolContractError> {
+        let model = model.into();
+        validate_model_generation(&model, &messages, max_output_tokens)?;
+        validate_model_deadline(Some(deadline_unix_ms))?;
+        Ok(Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::ModelInfer,
+            idempotency_key,
+            deadline_unix_ms: Some(deadline_unix_ms),
+            payload: RequestPayload::ModelInfer {
+                model,
+                messages,
+                max_output_tokens,
+            },
+        })
+    }
+
+    /// Revalidates the bounded direct-inference payload after deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contract error for a malformed or over-budget model request.
+    pub fn validate_model_request(&self) -> Result<(), ProtocolContractError> {
+        match &self.payload {
+            RequestPayload::ModelInfer {
+                model,
+                messages,
+                max_output_tokens,
+                ..
+            } => {
+                validate_model_generation(model, messages, *max_output_tokens)?;
+                validate_model_deadline(self.deadline_unix_ms)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -309,6 +370,7 @@ pub enum Capability {
     GetResult,
     InspectEvidence,
     ReadEvidence,
+    ModelInfer,
 }
 
 impl Capability {
@@ -324,6 +386,7 @@ impl Capability {
             Self::GetResult => "request.result.read",
             Self::InspectEvidence => "evidence.inspect",
             Self::ReadEvidence => "evidence.read",
+            Self::ModelInfer => "model.infer",
         }
     }
 }
@@ -356,6 +419,11 @@ pub enum RequestPayload {
         offset: u64,
         #[serde(deserialize_with = "deserialize_evidence_read_length")]
         length: u64,
+    },
+    ModelInfer {
+        model: String,
+        messages: Vec<ModelMessage>,
+        max_output_tokens: u32,
     },
 }
 
@@ -397,6 +465,164 @@ pub enum ResultPayload {
     NetworkDiagnostics(NetworkDiagnosticsResult),
     EvidenceMetadata(EvidenceMetadata),
     EvidenceChunk(EvidenceChunk),
+    ModelGeneration(ModelGenerationResult),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ModelMessage {
+    role: ModelRole,
+    content: String,
+}
+
+impl<'de> Deserialize<'de> for ModelMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            role: ModelRole,
+            content: String,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(fields.role, fields.content).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for ModelMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelMessage")
+            .field("role", &self.role)
+            .field("content_bytes", &self.content.len())
+            .finish()
+    }
+}
+
+impl ModelMessage {
+    /// Creates one bounded text-only chat message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolContractError::InvalidModelMessage`] for empty or
+    /// over-budget content.
+    pub fn new(role: ModelRole, content: impl Into<String>) -> Result<Self, ProtocolContractError> {
+        let content = content.into();
+        validate_model_message(&content)?;
+        Ok(Self { role, content })
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> ModelRole {
+        self.role
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFinishReason {
+    Stop,
+    Length,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelUsage {
+    pub input_tokens: u32,
+    pub sampled_output_tokens: u32,
+    pub emitted_output_tokens: u32,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ModelGenerationResult {
+    pub model: String,
+    text: String,
+    pub finish_reason: ModelFinishReason,
+    pub usage: ModelUsage,
+}
+
+impl<'de> Deserialize<'de> for ModelGenerationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            model: String,
+            text: String,
+            finish_reason: ModelFinishReason,
+            usage: ModelUsage,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.model,
+            fields.text,
+            fields.finish_reason,
+            fields.usage,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for ModelGenerationResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelGenerationResult")
+            .field("model", &self.model)
+            .field("text_bytes", &self.text.len())
+            .field("finish_reason", &self.finish_reason)
+            .field("usage", &self.usage)
+            .finish()
+    }
+}
+
+impl ModelGenerationResult {
+    /// Creates one bounded direct-runtime result for protocol transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model identity or output byte bound is invalid.
+    pub fn new(
+        model: impl Into<String>,
+        text: impl Into<String>,
+        finish_reason: ModelFinishReason,
+        usage: ModelUsage,
+    ) -> Result<Self, ProtocolContractError> {
+        let model = model.into();
+        let text = text.into();
+        validate_model_id(&model)?;
+        if text.len() > MAX_MODEL_OUTPUT_BYTES {
+            return Err(ProtocolContractError::ModelOutputTooLarge {
+                actual: text.len(),
+                maximum: MAX_MODEL_OUTPUT_BYTES,
+            });
+        }
+        Ok(Self {
+            model,
+            text,
+            finish_reason,
+            usage,
+        })
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// A compact continuity snapshot in stable presentation order.
@@ -514,6 +740,13 @@ impl EvidenceChunk {
 pub enum ProtocolContractError {
     InvalidEvidenceReadLength { actual: u64, maximum: u64 },
     EvidenceChunkTooLarge { actual: usize, maximum: usize },
+    InvalidModelIdentity,
+    InvalidModelMessage,
+    InvalidModelConversation,
+    InvalidModelDeadline,
+    ModelPromptTooLarge { actual: usize, maximum: usize },
+    InvalidModelOutputTokens { actual: u32, maximum: u32 },
+    ModelOutputTooLarge { actual: usize, maximum: usize },
 }
 
 impl fmt::Display for ProtocolContractError {
@@ -527,11 +760,110 @@ impl fmt::Display for ProtocolContractError {
                 formatter,
                 "evidence chunk is {actual} bytes; maximum is {maximum}"
             ),
+            Self::InvalidModelIdentity => {
+                formatter.write_str("model identity must use bounded vendor/name form")
+            }
+            Self::InvalidModelMessage => write!(
+                formatter,
+                "model messages must contain 1 to {MAX_MODEL_MESSAGE_BYTES} bytes"
+            ),
+            Self::InvalidModelConversation => write!(
+                formatter,
+                "model conversations must contain 1 to {MAX_MODEL_MESSAGES} messages and end with a user message"
+            ),
+            Self::InvalidModelDeadline => {
+                formatter.write_str("model inference requires a positive absolute deadline")
+            }
+            Self::ModelPromptTooLarge { actual, maximum } => write!(
+                formatter,
+                "model prompt is {actual} bytes; maximum is {maximum} bytes"
+            ),
+            Self::InvalidModelOutputTokens { actual, maximum } => write!(
+                formatter,
+                "model output token bound is {actual}; it must be between 1 and {maximum}"
+            ),
+            Self::ModelOutputTooLarge { actual, maximum } => write!(
+                formatter,
+                "model output is {actual} bytes; maximum is {maximum} bytes"
+            ),
         }
     }
 }
 
 impl Error for ProtocolContractError {}
+
+fn validate_model_generation(
+    model: &str,
+    messages: &[ModelMessage],
+    max_output_tokens: u32,
+) -> Result<(), ProtocolContractError> {
+    validate_model_id(model)?;
+    if messages.is_empty()
+        || messages.len() > MAX_MODEL_MESSAGES
+        || messages.last().map(ModelMessage::role) != Some(ModelRole::User)
+    {
+        return Err(ProtocolContractError::InvalidModelConversation);
+    }
+    let mut total = 0_usize;
+    for message in messages {
+        validate_model_message(message.content())?;
+        total = total.checked_add(message.content().len()).ok_or(
+            ProtocolContractError::ModelPromptTooLarge {
+                actual: usize::MAX,
+                maximum: MAX_MODEL_PROMPT_BYTES,
+            },
+        )?;
+        if total > MAX_MODEL_PROMPT_BYTES {
+            return Err(ProtocolContractError::ModelPromptTooLarge {
+                actual: total,
+                maximum: MAX_MODEL_PROMPT_BYTES,
+            });
+        }
+    }
+    if max_output_tokens == 0 || max_output_tokens > MAX_MODEL_OUTPUT_TOKENS {
+        return Err(ProtocolContractError::InvalidModelOutputTokens {
+            actual: max_output_tokens,
+            maximum: MAX_MODEL_OUTPUT_TOKENS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_model_deadline(deadline_unix_ms: Option<u64>) -> Result<(), ProtocolContractError> {
+    if deadline_unix_ms.is_some_and(|deadline| deadline > 0) {
+        Ok(())
+    } else {
+        Err(ProtocolContractError::InvalidModelDeadline)
+    }
+}
+
+fn validate_model_message(content: &str) -> Result<(), ProtocolContractError> {
+    if content.is_empty() || content.len() > MAX_MODEL_MESSAGE_BYTES || content.contains('\0') {
+        Err(ProtocolContractError::InvalidModelMessage)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_model_id(model: &str) -> Result<(), ProtocolContractError> {
+    let Some((vendor, name)) = model.split_once('/') else {
+        return Err(ProtocolContractError::InvalidModelIdentity);
+    };
+    if name.contains('/') || !valid_model_segment(vendor) || !valid_model_segment(name) {
+        return Err(ProtocolContractError::InvalidModelIdentity);
+    }
+    Ok(())
+}
+
+fn valid_model_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 fn validate_evidence_read_length(length: u64) -> Result<(), ProtocolContractError> {
     let maximum = MAX_EVIDENCE_CHUNK_SIZE as u64;
@@ -664,6 +996,7 @@ pub enum FailureCode {
     IdempotencyConflict,
     Cancelled,
     LeaseConflict,
+    Busy,
     Internal,
 }
 

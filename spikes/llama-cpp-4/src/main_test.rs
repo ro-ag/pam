@@ -93,6 +93,35 @@ fn chat_mode_may_only_be_specified_once() {
 }
 
 #[test]
+fn recommended_sampling_is_explicit_and_duplicate_rejected() {
+    let raw_model = TestModelFile::new();
+    let raw = parse_run(&["--model", raw_model.0.to_str().unwrap()]).unwrap();
+    assert!(!raw.recommended_sampling);
+
+    let sampled_model = TestModelFile::new();
+    let sampled = parse_run(&[
+        "--model",
+        sampled_model.0.to_str().unwrap(),
+        "--recommended-sampling",
+    ])
+    .unwrap();
+    assert!(sampled.recommended_sampling);
+
+    let duplicate_model = TestModelFile::new();
+    let error = parse_run(&[
+        "--model",
+        duplicate_model.0.to_str().unwrap(),
+        "--recommended-sampling",
+        "--recommended-sampling",
+    ])
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "--recommended-sampling may only be specified once"
+    );
+}
+
+#[test]
 fn chat_template_retry_size_is_positive_and_bounded() {
     assert_eq!(bounded_chat_template_retry_size(4_097).unwrap(), 4_097);
 

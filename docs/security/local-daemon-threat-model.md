@@ -448,4 +448,4 @@ mutable Git worktree. This generated threat-model artifact is excluded from its
 own snapshot digest to avoid a self-referential hash.
 
 Repository: target_sha256_cf07463cb2c12678153d6a7b23dc66d48faa84d15a657400db735728ec85adcd
-Version: codex-security-snapshot/v1:sha256:e1f7855801922c9b629b737694937f13b78d779c2f834b60ed64e732015319f4
+Version: codex-security-snapshot/v1:sha256:f01cc375f09a9070a744e370bdfd3d2944fb30aab5d0da0f8567952dca93f4ad

@@ -508,6 +508,8 @@ impl FlowSaveResult {
     }
 
     /// Whether directory synchronization confirmed the atomic publication.
+    /// This is conservatively false on targets without a portable directory
+    /// synchronization primitive.
     #[must_use]
     pub const fn durability_confirmed(&self) -> bool {
         self.durability_confirmed
@@ -1111,7 +1113,7 @@ fn open_or_create_directory(
     name: &'static str,
 ) -> Result<(Dir, bool), FlowEditorError> {
     match parent.open_dir_nofollow(name) {
-        Ok(directory) => return Ok((directory, sync_directory(parent).is_ok())),
+        Ok(directory) => return Ok((directory, sync_directory(parent).unwrap_or(false))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Err(FlowEditorError::UnsafeDirectory(name)),
     }
@@ -1123,7 +1125,7 @@ fn open_or_create_directory(
     let directory = parent
         .open_dir_nofollow(name)
         .map_err(|_| FlowEditorError::UnsafeDirectory(name))?;
-    Ok((directory, sync_directory(parent).is_ok()))
+    Ok((directory, sync_directory(parent).unwrap_or(false)))
 }
 
 fn atomic_save(
@@ -1272,10 +1274,10 @@ fn atomic_save_locked(
             recovery_file: backup_name,
         });
     }
-    let durability_confirmed = sync_directory(directory).is_ok();
+    let durability_confirmed = sync_directory(directory).unwrap_or(false);
     let cleanup_complete = if durability_confirmed {
         backup_name.as_deref().is_none_or(|name| {
-            directory.remove_file(name).is_ok() && sync_directory(directory).is_ok()
+            directory.remove_file(name).is_ok() && sync_directory(directory).unwrap_or(false)
         })
     } else {
         backup_name.is_none()
@@ -1369,8 +1371,31 @@ fn create_temporary_file(
     Err(FlowEditorError::SaveBusy)
 }
 
-fn sync_directory(directory: &Dir) -> io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> io::Result<bool> {
+    let handle = directory.open(".")?;
+    if !handle.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory sync handle is not a directory",
+        ));
+    }
+    handle.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Dir) -> io::Result<bool> {
+    // Rust's portable filesystem API cannot confirm directory-entry
+    // durability on these targets. File contents are still synchronized, and
+    // callers retain recovery backups while reporting durability unconfirmed.
+    Ok(false)
+}
+
+#[cfg(test)]
+pub(crate) fn sync_directory_path_for_test(path: &Path) -> io::Result<bool> {
+    let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+    sync_directory(&directory)
 }
 
 fn validate_selector(selector: &str) -> Result<(), FlowEditorError> {

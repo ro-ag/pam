@@ -691,7 +691,7 @@ fn prepared_save_creates_and_updates_only_normalized_identity_files() {
     let expected = interaction.normalized_toml().to_owned();
     let result = document.commit_save(interaction).unwrap();
     assert!(result.created());
-    assert!(result.durability_confirmed());
+    assert_eq!(result.durability_confirmed(), cfg!(unix));
     assert!(result.cleanup_complete());
     assert_eq!(document.source(), expected);
     assert_eq!(
@@ -721,13 +721,21 @@ fn prepared_save_creates_and_updates_only_normalized_identity_files() {
         fs::read_to_string(project.flows().join("saved.toml")).unwrap(),
         updated
     );
-    assert!(!fs::read_dir(project.flows()).unwrap().any(|entry| {
+    let retained_backup = fs::read_dir(project.flows()).unwrap().any(|entry| {
         entry
             .unwrap()
             .file_name()
             .to_string_lossy()
             .contains(".backup-")
-    }));
+    });
+    assert_eq!(retained_backup, !cfg!(unix));
+}
+
+#[test]
+fn directory_sync_reopens_an_fsync_capable_handle() {
+    let project = TestProject::new("directory-sync");
+    let durability_confirmed = flow_editor::sync_directory_path_for_test(project.path()).unwrap();
+    assert_eq!(durability_confirmed, cfg!(unix));
 }
 
 #[test]

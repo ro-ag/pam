@@ -522,7 +522,7 @@ jobs:
           private_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
           echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           printf '%s' "$APPLE_CERTIFICATE_BASE64_SECRET" | base64 --decode > "$certificate"
-          printf '%s' "$APPLE_API_KEY_MATERIAL" > "$private_key"
+          printf '%s' "$APPLE_API_KEY_MATERIAL" | base64 --decode > "$private_key"
           security create-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"

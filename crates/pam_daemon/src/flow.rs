@@ -2118,15 +2118,26 @@ fn append_output(
 }
 
 struct CommandGroup {
+    #[cfg(unix)]
     process_id: Option<u32>,
+    #[cfg(unix)]
     armed: bool,
 }
 
 impl CommandGroup {
     fn for_child(child: &Child) -> Self {
-        Self {
-            process_id: child.id(),
-            armed: true,
+        #[cfg(unix)]
+        {
+            Self {
+                process_id: child.id(),
+                armed: true,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Self {}
         }
     }
 
@@ -2142,7 +2153,10 @@ impl CommandGroup {
                 return;
             }
         }
-        self.armed = false;
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
         let _ = child.start_kill();
     }
 }

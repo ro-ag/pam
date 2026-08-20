@@ -5,14 +5,17 @@ use pam_core::{
 use pam_flow::{MAX_FLOW_DOCUMENT_BYTES, MAX_RUN_ID_BYTES};
 
 use super::{
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
-    MAX_FLOW_PROJECT_ROOT_BYTES, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES,
-    MAX_MODEL_OUTPUT_TOKENS, ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole,
-    ModelUsage, NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState,
-    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
-    ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
+    ApprovalDecision, ApprovalDecisionDisposition, ApprovalDecisionResult, BriefItem,
+    BriefProvenance, BriefResult, CancellationDisposition, CancellationResult, Capability,
+    ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, FailureCode,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_FLOW_PROJECT_ROOT_BYTES, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES,
+    MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS, MAX_PROJECT_CURRENT_QUEUED,
+    MAX_PROJECT_OPERATION_KIND_BYTES, ModelFinishReason, ModelGenerationResult, ModelMessage,
+    ModelRole, ModelUsage, NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState,
+    ProjectCurrentResult, ProjectRequestState, ProjectRequestSummary, ProtocolContractError,
+    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
+    SourceAvailability, StatusResult,
 };
 
 const PROJECT_ROOT: &str = "/canonical/project";
@@ -58,6 +61,150 @@ fn status_request_populates_the_versioned_identity_contract() {
     assert!(request.authentication.is_none());
     assert_eq!(request.project_id.as_str(), "project-1");
     assert_eq!(request.idempotency_key.as_str(), "status-1");
+}
+
+#[test]
+fn daemon_stop_is_an_authenticated_lifecycle_operation_without_process_identity() {
+    let request = RequestEnvelope::stop(
+        RequestId::from("stop-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("stop-key-1"),
+    )
+    .authenticated(CallerCredential::new("stop-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::DaemonStop);
+    assert_eq!(request.capability.policy_name(), "daemon.stop");
+    assert_eq!(request.payload, RequestPayload::Stop);
+
+    let result = ResultPayload::DaemonLifecycle(DaemonLifecycleResult { stopping: true });
+    let encoded = rmp_serde::to_vec_named(&result).unwrap();
+    assert!(matches!(
+        result,
+        ResultPayload::DaemonLifecycle(DaemonLifecycleResult { stopping: true })
+    ));
+    assert!(!String::from_utf8_lossy(&encoded).contains("pid"));
+}
+
+#[test]
+fn project_current_is_authenticated_policy_gated_and_bound_by_the_envelope() {
+    let request = RequestEnvelope::project_current(
+        RequestId::from("current-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("current-key-1"),
+    )
+    .authenticated(CallerCredential::new("current-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.caller_id.as_str(), "control-center-1");
+    assert_eq!(request.project_id.as_str(), "project-1");
+    assert_eq!(request.capability, Capability::ProjectCurrent);
+    assert_eq!(request.capability.policy_name(), "project.current");
+    assert_eq!(request.payload, RequestPayload::ProjectCurrent);
+}
+
+#[test]
+fn approval_decision_is_authenticated_and_contains_no_receipt_or_secret_field() {
+    let request = RequestEnvelope::approval_decide(
+        RequestId::from("approval-decision-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("approval-decision-key-1"),
+        ApprovalId::from("approval-1"),
+        ApprovalDecision::Approve,
+    )
+    .authenticated(CallerCredential::new("decision-credential"));
+
+    assert!(request.authentication.is_some());
+    assert!(request.approval_id.is_none());
+    assert_eq!(request.caller_id.as_str(), "control-center-1");
+    assert_eq!(request.project_id.as_str(), "project-1");
+    assert_eq!(request.capability, Capability::ApprovalDecide);
+    assert_eq!(request.capability.policy_name(), "approval.decide");
+    assert_eq!(
+        request.payload,
+        RequestPayload::ApprovalDecide {
+            approval_id: ApprovalId::from("approval-1"),
+            decision: ApprovalDecision::Approve,
+        }
+    );
+
+    let payload = rmp_serde::to_vec_named(&request.payload).unwrap();
+    let field_names = String::from_utf8_lossy(&payload);
+    assert!(!field_names.contains("credential"));
+    assert!(!field_names.contains("secret"));
+    assert!(!field_names.contains("token"));
+
+    let result = ResultPayload::ApprovalDecision(ApprovalDecisionResult {
+        approval_id: ApprovalId::from("approval-1"),
+        disposition: ApprovalDecisionDisposition::Approved,
+    });
+    assert!(matches!(result, ResultPayload::ApprovalDecision(_)));
+}
+
+fn project_request_summary(operation_kind: impl Into<String>) -> ProjectRequestSummary {
+    ProjectRequestSummary::new(
+        RequestId::from("work-1"),
+        operation_kind,
+        ProjectRequestState::Queued,
+        7,
+        100,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn project_current_result_bounds_queue_and_operation_kind_without_operation_payloads() {
+    let maximum_kind = "k".repeat(MAX_PROJECT_OPERATION_KIND_BYTES);
+    let maximum = project_request_summary(maximum_kind);
+    assert_eq!(
+        maximum.operation_kind().len(),
+        MAX_PROJECT_OPERATION_KIND_BYTES
+    );
+    assert_eq!(maximum.completed_at_ms, None);
+
+    assert_eq!(
+        ProjectRequestSummary::new(
+            RequestId::from("work-2"),
+            "k".repeat(MAX_PROJECT_OPERATION_KIND_BYTES + 1),
+            ProjectRequestState::Succeeded,
+            8,
+            101,
+            Some(102),
+        )
+        .unwrap_err(),
+        ProtocolContractError::InvalidProjectOperationKind
+    );
+
+    let queued = (0..MAX_PROJECT_CURRENT_QUEUED)
+        .map(|_| project_request_summary("flow_run"))
+        .collect::<Vec<_>>();
+    assert!(ProjectCurrentResult::new(queued.clone(), None, None, false).is_ok());
+    let error = ProjectCurrentResult::new(
+        queued
+            .into_iter()
+            .chain(std::iter::once(project_request_summary("model.infer")))
+            .collect(),
+        None,
+        None,
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        ProtocolContractError::ProjectCurrentQueueTooLarge {
+            actual: MAX_PROJECT_CURRENT_QUEUED + 1,
+            maximum: MAX_PROJECT_CURRENT_QUEUED,
+        }
+    );
+
+    let encoded = rmp_serde::to_vec_named(&maximum).unwrap();
+    let fields = String::from_utf8_lossy(&encoded);
+    assert!(!fields.contains("operation_blob"));
+    assert!(!fields.contains("operation_payload"));
 }
 
 #[test]

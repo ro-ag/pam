@@ -1,7 +1,8 @@
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt as _;
 use std::{
     collections::HashMap,
-    fmt,
-    fs::{self, OpenOptions},
+    fmt, fs,
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -13,6 +14,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use cap_fs_ext::OsMetadataExt as _;
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, ambient_authority};
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt as _;
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use nix::unistd::Uid;
 use pam_core::{
     APPLICATION_VERSION, ApprovalId, ContentDigest, EvidenceHandle, ProjectId, RequestId,
 };
@@ -30,20 +39,25 @@ use pam_platform::{
 };
 use pam_policy::{CapabilityName, InvalidResourceName, ResourceName, redact_audit_detail};
 use pam_protocol::{
-    ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
-    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure,
-    FailureCode, ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
-    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
-    SourceAvailability, StatusResult, decode_request_envelope, decode_server_message_envelope,
-    encode,
+    ApprovalChallenge, ApprovalDecision as ProtocolApprovalDecision, ApprovalDecisionDisposition,
+    ApprovalDecisionResult, BriefProvenance, BriefResult, CancellationDisposition,
+    CancellationResult, Capability, CodecError, ConfigurationPresence, DaemonLifecycleResult,
+    Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction, EvidenceRetention,
+    ExpectedTargetKind, Failure, FailureCode, ModelFinishReason, ModelGenerationResult,
+    ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult, OperationTruth,
+    PROTOCOL_VERSION, PacState, ProjectCurrentResult,
+    ProjectRequestState as ProtocolProjectRequestState,
+    ProjectRequestSummary as ProtocolProjectRequestSummary, ReplayResult, RequestEnvelope,
+    RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability,
+    StatusResult, decode_request_envelope, decode_server_message_envelope, encode,
 };
 use pam_store::{
-    AcceptOutcome, AcceptRequest, AppendAuditEvent, AuthorizationAudit, AuthorizationOutcome,
-    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CancelOutcome, EventRecord,
-    ExpectedOperationKind, FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome,
-    LeasedRequest, Replay, RequestSnapshot, RequestState, Store, StoreError, TerminalState,
+    AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision as StoreApprovalDecision,
+    ApprovalDecisionOutcome, AuthorizationAudit, AuthorizationOutcome, AuthorizationRequest,
+    AuthorizeFlowRun, CallerAuthentication, CancelOutcome, EventRecord, ExpectedOperationKind,
+    FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome, LeasedRequest,
+    ProjectCurrent as StoreProjectCurrent, ProjectRequestSummary as StoreProjectRequestSummary,
+    Replay, RequestSnapshot, RequestState, Store, StoreError, TerminalState,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -101,6 +115,10 @@ enum Outbound {
         messages: Vec<ServerMessage>,
         terminal: bool,
     },
+    Stop {
+        incoming: IncomingRequest,
+        result: Box<ResultEnvelope>,
+    },
 }
 
 struct SubscriptionRequest {
@@ -117,6 +135,13 @@ struct Subscription {
     observer_request_id: RequestId,
     project_id: ProjectId,
     last_sequence: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestStatusDispatch {
+    Immediate,
+    Durable,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +165,9 @@ pub struct DaemonConfig {
     /// Holds an admitted flow preflight for deterministic saturation tests.
     #[cfg(test)]
     pub(crate) flow_preflight_delay: Duration,
+    /// Preserves durable status fixtures used to exercise scheduler recovery.
+    #[cfg(test)]
+    pub(crate) status_dispatch: TestStatusDispatch,
 }
 
 impl Default for DaemonConfig {
@@ -158,6 +186,8 @@ impl Default for DaemonConfig {
             flow_preflight_capacity: FLOW_PREFLIGHT_CAPACITY,
             #[cfg(test)]
             flow_preflight_delay: Duration::ZERO,
+            #[cfg(test)]
+            status_dispatch: TestStatusDispatch::Immediate,
         }
     }
 }
@@ -273,6 +303,10 @@ where
     let flow_preflight_delay = config.flow_preflight_delay;
     #[cfg(not(test))]
     let flow_preflight_delay = Duration::ZERO;
+    #[cfg(test)]
+    let durable_status = config.status_dispatch == TestStatusDispatch::Durable;
+    #[cfg(not(test))]
+    let durable_status = false;
     let flow_preflight_admission = Arc::new(Semaphore::new(flow_preflight_capacity));
     let brief_provider = config
         .brief_provider
@@ -344,6 +378,7 @@ where
                         policy_required,
                         request_flow_preflight_admission,
                         flow_preflight_delay,
+                        durable_status,
                     )
                     .await
                 });
@@ -355,10 +390,10 @@ where
                 ) => {}
             ServeAction::Incoming(Err(error)) => break Err(error.into()),
             ServeAction::Outbound(Some(outbound)) => {
-                if let Err(error) =
-                    deliver_outbound(&mut server, &mut subscriptions, outbound).await
-                {
-                    break Err(error);
+                match deliver_outbound(&mut server, &mut subscriptions, outbound).await {
+                    Ok(false) => {}
+                    Ok(true) => break Ok(()),
+                    Err(error) => break Err(error),
                 }
             }
             ServeAction::HandlerCompleted(Some(Err(error)))
@@ -427,7 +462,7 @@ async fn deliver_outbound(
     server: &mut ServerTransport,
     subscriptions: &mut HashMap<RequestId, Vec<Subscription>>,
     outbound: Outbound,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     match outbound {
         Outbound::Routed {
             incoming,
@@ -474,8 +509,11 @@ async fn deliver_outbound(
                 subscriptions.remove(&request_id);
             }
         }
+        Outbound::Stop { incoming, result } => {
+            return send_messages(server, &incoming, &[ServerMessage::Result(*result)]).await;
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn send_messages(
@@ -598,6 +636,7 @@ async fn handle_incoming(
     policy_required: bool,
     flow_preflight_admission: Arc<Semaphore>,
     flow_preflight_delay: Duration,
+    durable_status: bool,
 ) -> Result<(), DaemonError> {
     let Ok(request) = decode_request_envelope(incoming.payload()) else {
         return Ok(());
@@ -622,6 +661,44 @@ async fn handle_incoming(
             incoming,
             vec![ServerMessage::Result(failure)],
             None,
+        )
+        .await;
+        return Ok(());
+    }
+    if let (
+        Capability::ApprovalDecide,
+        RequestPayload::ApprovalDecide {
+            approval_id,
+            decision,
+        },
+    ) = (&request.capability, &request.payload)
+    {
+        let approval_resource =
+            ResourceName::parse("approval").expect("static approval resource is valid");
+        if let Some(failure) = request_authentication_preflight(
+            &request,
+            &store,
+            authentication_required,
+            &approval_resource,
+        )
+        .await?
+        {
+            send_routed(
+                &outbound,
+                incoming,
+                vec![ServerMessage::Result(failure)],
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+        handle_approval_decision(
+            &request,
+            approval_id.clone(),
+            *decision,
+            incoming,
+            &store,
+            &outbound,
         )
         .await;
         return Ok(());
@@ -769,7 +846,18 @@ async fn handle_incoming(
 
     match (&request.capability, &request.payload) {
         (Capability::DaemonStatus, RequestPayload::Status) => {
-            handle_status(request, incoming, &store, &outbound, &scheduler).await
+            if durable_status {
+                handle_durable_status(request, incoming, &store, &outbound, &scheduler).await
+            } else {
+                handle_status(&request, incoming, &store, &outbound).await
+            }
+        }
+        (Capability::DaemonStop, RequestPayload::Stop) => {
+            handle_stop(&request, incoming, &outbound).await;
+            Ok(())
+        }
+        (Capability::ProjectCurrent, RequestPayload::ProjectCurrent) => {
+            handle_project_current(&request, incoming, &store, &outbound).await
         }
         (Capability::FlowRun, RequestPayload::FlowRun { .. }) => {
             handle_flow_run(
@@ -978,6 +1066,12 @@ fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
     let capability_matches = matches!(
         (&request.capability, &request.payload),
         (Capability::DaemonStatus, RequestPayload::Status)
+            | (Capability::DaemonStop, RequestPayload::Stop)
+            | (Capability::ProjectCurrent, RequestPayload::ProjectCurrent)
+            | (
+                Capability::ApprovalDecide,
+                RequestPayload::ApprovalDecide { .. }
+            )
             | (Capability::CancelRequest, RequestPayload::Cancel { .. })
             | (Capability::ReplayEvents, RequestPayload::Replay { .. })
             | (Capability::Brief, RequestPayload::Brief)
@@ -1002,6 +1096,8 @@ fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
             | (Capability::FlowRun, RequestPayload::FlowRun { .. })
     );
     capability_matches
+        && (!matches!(request.capability, Capability::ApprovalDecide)
+            || request.approval_id.is_none())
         && request.validate_model_request().is_ok()
         && request.validate_flow_request().is_ok()
 }
@@ -1134,7 +1230,9 @@ pub(super) fn policy_resource(
     request: &RequestEnvelope,
 ) -> Result<ResourceName, InvalidResourceName> {
     let resource = match &request.payload {
-        RequestPayload::Status => "daemon".to_owned(),
+        RequestPayload::Status | RequestPayload::Stop => "daemon".to_owned(),
+        RequestPayload::ProjectCurrent => "project".to_owned(),
+        RequestPayload::ApprovalDecide { .. } => "approval".to_owned(),
         RequestPayload::Brief => format!("project:{}", request.project_id),
         RequestPayload::NetworkDiagnostics => "network:configuration".to_owned(),
         RequestPayload::Cancel {
@@ -1327,6 +1425,7 @@ pub(super) fn approval_recovery(request: &RequestEnvelope, approval_id: &Approva
     }
     match &request.capability {
         Capability::DaemonStatus
+        | Capability::ProjectCurrent
         | Capability::Brief
         | Capability::NetworkDiagnostics
         | Capability::WaitForResult
@@ -1338,7 +1437,10 @@ pub(super) fn approval_recovery(request: &RequestEnvelope, approval_id: &Approva
         Capability::InspectEvidence | Capability::ReadEvidence => format!(
             "pam approval approve {approval_id}; pam evidence show spans inspection and range reads, so this one-request receipt must be retried by a protocol client against the exact challenged request"
         ),
-        Capability::CancelRequest | Capability::ReplayEvents => format!(
+        Capability::ApprovalDecide
+        | Capability::DaemonStop
+        | Capability::CancelRequest
+        | Capability::ReplayEvents => format!(
             "pam approval approve {approval_id}; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request"
         ),
     }
@@ -1895,7 +1997,186 @@ const fn no_proxy_presence(proxy: &pam_platform::ProxyDiagnostic) -> Configurati
     }
 }
 
+async fn handle_project_current(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let current = match store.project_current(request.project_id.clone()).await {
+        Ok(current) => current,
+        Err(error) => {
+            send_store_failure(outbound, incoming, request, &error).await;
+            return Ok(());
+        }
+    };
+    let Ok(result) = protocol_project_current(current) else {
+        send_routed(
+            outbound,
+            incoming,
+            vec![ServerMessage::Result(failure_result(
+                request,
+                FailureCode::FrameTooLarge,
+                "project current metadata exceeded bounded protocol limits",
+            ))],
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            OperationTruth::Observed,
+            ResultPayload::ProjectCurrent(result),
+        ))],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+pub(super) fn protocol_project_current(
+    current: StoreProjectCurrent,
+) -> Result<ProjectCurrentResult, ()> {
+    let queued = current
+        .queued
+        .into_iter()
+        .map(protocol_project_request)
+        .collect::<Result<Vec<_>, _>>()?;
+    let active = current.active.map(protocol_project_request).transpose()?;
+    let latest = current
+        .latest_terminal
+        .map(protocol_project_request)
+        .transpose()?;
+    ProjectCurrentResult::new(queued, active, latest, current.queued_truncated).map_err(|_| ())
+}
+
+fn protocol_project_request(
+    request: StoreProjectRequestSummary,
+) -> Result<ProtocolProjectRequestSummary, ()> {
+    ProtocolProjectRequestSummary::new(
+        request.request_id,
+        request.operation_kind,
+        protocol_project_request_state(request.state),
+        request.queue_sequence,
+        request.accepted_at_ms,
+        request.completed_at_ms,
+    )
+    .map_err(|_| ())
+}
+
+const fn protocol_project_request_state(state: RequestState) -> ProtocolProjectRequestState {
+    match state {
+        RequestState::Queued => ProtocolProjectRequestState::Queued,
+        RequestState::Leased => ProtocolProjectRequestState::Leased,
+        RequestState::CancellationRequested => ProtocolProjectRequestState::CancellationRequested,
+        RequestState::Succeeded => ProtocolProjectRequestState::Succeeded,
+        RequestState::Failed => ProtocolProjectRequestState::Failed,
+        RequestState::Cancelled => ProtocolProjectRequestState::Cancelled,
+    }
+}
+
+async fn handle_approval_decision(
+    request: &RequestEnvelope,
+    approval_id: ApprovalId,
+    decision: ProtocolApprovalDecision,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) {
+    let decision = match decision {
+        ProtocolApprovalDecision::Approve => StoreApprovalDecision::Approve,
+        ProtocolApprovalDecision::Deny => StoreApprovalDecision::Deny,
+    };
+    let outcome = store
+        .decide_project_approval(
+            approval_id.clone(),
+            request.project_id.clone(),
+            request.caller_id.clone(),
+            decision,
+            now_ms(),
+        )
+        .await;
+    let disposition = match outcome {
+        Ok(ApprovalDecisionOutcome::Approved) => ApprovalDecisionDisposition::Approved,
+        Ok(ApprovalDecisionOutcome::Denied) => ApprovalDecisionDisposition::Denied,
+        Ok(ApprovalDecisionOutcome::Expired) => ApprovalDecisionDisposition::Expired,
+        Err(StoreError::ApprovalNotFound(_) | StoreError::InvalidApprovalState) => {
+            send_routed(
+                outbound,
+                incoming,
+                vec![ServerMessage::Result(failure_result(
+                    request,
+                    FailureCode::Forbidden,
+                    "approval is unavailable for this project or caller",
+                ))],
+                None,
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            send_store_failure(outbound, incoming, request, &error).await;
+            return;
+        }
+    };
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            OperationTruth::Changed,
+            ResultPayload::ApprovalDecision(ApprovalDecisionResult {
+                approval_id,
+                disposition,
+            }),
+        ))],
+        None,
+    )
+    .await;
+}
+
 async fn handle_status(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let workload = match store.project_workload(request.project_id.clone()).await {
+        Ok(workload) => workload,
+        Err(error) => {
+            send_store_failure(outbound, incoming, request, &error).await;
+            return Ok(());
+        }
+    };
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            project_id: request.project_id.clone(),
+            body: ResultBody::Success {
+                truth: OperationTruth::Observed,
+                payload: ResultPayload::Status(StatusResult {
+                    ready: true,
+                    healthy: true,
+                    daemon_version: APPLICATION_VERSION.to_owned(),
+                    protocol_version: PROTOCOL_VERSION,
+                    queue_depth: workload.queued,
+                }),
+            },
+        })],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_durable_status(
     request: RequestEnvelope,
     incoming: IncomingRequest,
     store: &Store,
@@ -1909,7 +2190,7 @@ async fn handle_status(
                 caller_id: request.caller_id.clone(),
                 project_id: request.project_id.clone(),
                 idempotency_key: request.idempotency_key.clone(),
-                operation_kind: "daemon_status".to_owned(),
+                operation_kind: "status".to_owned(),
                 operation: Vec::new(),
             },
             now_ms(),
@@ -1968,6 +2249,29 @@ async fn handle_status(
         let _ = scheduler.send(()).await;
     }
     Ok(())
+}
+
+async fn handle_stop(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    outbound: &mpsc::Sender<Outbound>,
+) {
+    let _ = outbound
+        .send(Outbound::Stop {
+            incoming,
+            result: Box::new(ResultEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: request.request_id.clone(),
+                project_id: request.project_id.clone(),
+                body: ResultBody::Success {
+                    truth: OperationTruth::Changed,
+                    payload: ResultPayload::DaemonLifecycle(DaemonLifecycleResult {
+                        stopping: true,
+                    }),
+                },
+            }),
+        })
+        .await;
 }
 
 async fn handle_flow_run(
@@ -2740,7 +3044,17 @@ fn request_identifiers_are_bounded(request: &RequestEnvelope) -> bool {
     ]
     .into_iter()
     .all(identifier_is_bounded)
+        && request
+            .approval_id
+            .as_ref()
+            .is_none_or(|approval_id| identifier_is_bounded(approval_id.as_str()))
         && target_request_id(request).is_none_or(|target| identifier_is_bounded(target.as_str()))
+        && match &request.payload {
+            RequestPayload::ApprovalDecide { approval_id, .. } => {
+                identifier_is_bounded(approval_id.as_str())
+            }
+            _ => true,
+        }
 }
 
 fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
@@ -2758,6 +3072,9 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
             target_request_id, ..
         } => Some(target_request_id),
         RequestPayload::Status
+        | RequestPayload::Stop
+        | RequestPayload::ProjectCurrent
+        | RequestPayload::ApprovalDecide { .. }
         | RequestPayload::Brief
         | RequestPayload::NetworkDiagnostics
         | RequestPayload::InspectEvidence { .. }
@@ -3038,7 +3355,7 @@ async fn process_leased(
     }
     let queue_depth = store.queued_behind(leased.lease.request_id.clone()).await?;
     let (terminal_state, result, cached_flow_terminal, encoded_flow_result) =
-        if leased.operation_kind == "daemon_status" {
+        if matches!(leased.operation_kind.as_str(), "daemon_status" | "status") {
             (
                 TerminalState::Succeeded,
                 ResultEnvelope {
@@ -3290,13 +3607,26 @@ pub(super) struct Ownership {
 
 impl Ownership {
     pub(super) fn acquire(endpoint: &LocalEndpoint) -> Result<Self, DaemonError> {
-        fs::create_dir_all(endpoint.runtime_dir())?;
-        let mut file = OpenOptions::new()
+        let runtime = open_private_runtime_dir(endpoint.runtime_dir())?;
+        let ownership_name = endpoint
+            .ownership_path()
+            .strip_prefix(endpoint.runtime_dir())
+            .ok()
+            .filter(|path| path.components().count() == 1)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "daemon ownership path must be a direct runtime-directory child",
+                )
+            })?;
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(endpoint.ownership_path())?;
+            .follow(FollowSymlinks::No);
+        let mut file = runtime.open_with(ownership_name, &options)?.into_std();
         file.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => DaemonError::AlreadyRunning,
             fs::TryLockError::Error(error) => DaemonError::Io(error),
@@ -3305,4 +3635,66 @@ impl Ownership {
         writeln!(file, "{}", std::process::id())?;
         Ok(Self { _file: file })
     }
+}
+
+fn open_private_runtime_dir(path: &Path) -> Result<Dir, std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must have a parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must have a final component",
+        )
+    })?;
+
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
+    let runtime = parent.open_dir_nofollow(name)?;
+    #[cfg(unix)]
+    harden_unix_runtime_dir(&runtime)?;
+    Ok(runtime)
+}
+
+#[cfg(unix)]
+fn harden_unix_runtime_dir(runtime: &Dir) -> Result<(), std::io::Error> {
+    let metadata = runtime.dir_metadata()?;
+    if metadata.uid() != Uid::effective().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon runtime directory is owned by another user",
+        ));
+    }
+
+    runtime.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
+    if runtime.dir_metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon runtime directory is accessible by another user",
+        ));
+    }
+    Ok(())
 }

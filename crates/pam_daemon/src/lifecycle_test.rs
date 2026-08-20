@@ -20,20 +20,21 @@ use pam_policy::{
 use pam_protocol::{
     BriefProvenance, BriefResult, CancellationDisposition, Event, EvidenceRedaction,
     EvidenceRetention, ExpectedTargetKind, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE,
-    ModelMessage, ModelRole, OperationTruth, RequestEnvelope, RequestPayload, ResultBody,
-    ResultPayload, ServerMessage, SourceAvailability, decode_server_message, encode,
+    ModelMessage, ModelRole, OperationTruth, ProjectRequestState, RequestEnvelope, RequestPayload,
+    ResultBody, ResultPayload, ServerMessage, SourceAvailability, decode_server_message, encode,
 };
 use pam_store::{
     AcceptRequest, ApprovalDecision, CancelOutcome, EvidenceRedaction as StoreEvidenceRedaction,
-    EvidenceRetention as StoreEvidenceRetention, PutEvidence, PutGrant, RequestState, Store,
-    StoreError,
+    EvidenceRetention as StoreEvidenceRetention, ProjectCurrent as StoreProjectCurrent,
+    ProjectRequestSummary as StoreProjectRequestSummary, PutEvidence, PutGrant, RequestState,
+    Store, StoreError,
 };
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
     BriefProvider, DaemonConfig, Ownership, approval_recovery, cancellation_presentation,
     grant_recovery, model_runtime_result, policy_resource, prepare_endpoint,
-    request_audit_event_id, request_preflight, serve_until_with_delay,
+    protocol_project_current, request_audit_event_id, request_preflight, serve_until_with_delay,
 };
 use crate::{
     DaemonError, ExchangeError, request_exchange, request_exchange_streaming, request_status,
@@ -146,6 +147,49 @@ fn ownership_rejects_a_second_daemon() {
     ));
 
     drop(first);
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[cfg(unix)]
+#[test]
+fn ownership_hardens_runtime_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let runtime = test_runtime("ownership-permissions");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+
+    let ownership = Ownership::acquire(&endpoint).unwrap();
+
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    drop(ownership);
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[cfg(unix)]
+#[test]
+fn ownership_rejects_a_symlink_without_truncating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let runtime = test_runtime("ownership-symlink");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).unwrap();
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let target = runtime.join("must-not-be-truncated");
+    fs::write(&target, b"preserve these bytes").unwrap();
+    symlink(&target, endpoint.ownership_path()).unwrap();
+
+    assert!(matches!(
+        Ownership::acquire(&endpoint),
+        Err(DaemonError::Io(_))
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"preserve these bytes");
+
     let _ = fs::remove_dir_all(runtime);
 }
 
@@ -327,6 +371,7 @@ fn stale_socket_reports_recovery_command() {
         bypass_policy: true,
         flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
         flow_preflight_delay: Duration::ZERO,
+        status_dispatch: super::lifecycle::TestStatusDispatch::Immediate,
     })
     .unwrap_err();
     assert!(matches!(error, DaemonError::StaleState(_)));
@@ -362,6 +407,55 @@ fn audit_event_ids_are_unique_for_same_millisecond_retries() {
 }
 
 #[test]
+fn project_current_mapping_is_bounded_and_contains_only_scheduler_metadata() {
+    let summary =
+        |request_id: &str, operation_kind: &str, state: RequestState| StoreProjectRequestSummary {
+            request_id: RequestId::from(request_id),
+            operation_kind: operation_kind.to_owned(),
+            state,
+            queue_sequence: 7,
+            accepted_at_ms: 11,
+            completed_at_ms: (state == RequestState::Succeeded).then_some(19),
+        };
+    let mapped = protocol_project_current(StoreProjectCurrent {
+        queued: vec![summary("queued", "flow_run", RequestState::Queued)],
+        queued_truncated: true,
+        active: Some(summary(
+            "active",
+            "model.infer",
+            RequestState::CancellationRequested,
+        )),
+        latest_terminal: Some(summary("latest", "flow_run", RequestState::Succeeded)),
+    })
+    .unwrap();
+
+    assert_eq!(mapped.queued().len(), 1);
+    assert_eq!(mapped.queued()[0].request_id.as_str(), "queued");
+    assert_eq!(mapped.queued()[0].operation_kind(), "flow_run");
+    assert_eq!(mapped.queued()[0].state, ProjectRequestState::Queued);
+    assert_eq!(
+        mapped.active.as_ref().unwrap().state,
+        ProjectRequestState::CancellationRequested
+    );
+    assert_eq!(
+        mapped.latest.as_ref().unwrap().state,
+        ProjectRequestState::Succeeded
+    );
+    assert!(mapped.truncated);
+
+    let unbounded_kind = "x".repeat(pam_protocol::MAX_PROJECT_OPERATION_KIND_BYTES + 1);
+    assert!(
+        protocol_project_current(StoreProjectCurrent {
+            queued: vec![summary("oversized", &unbounded_kind, RequestState::Queued)],
+            queued_truncated: false,
+            active: None,
+            latest_terminal: None,
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn denial_recovery_is_executable_only_for_shell_safe_exact_resources() {
     let caller = CallerId::from("recovery-caller");
     let project = ProjectId::from("recovery-project");
@@ -375,6 +469,24 @@ fn denial_recovery_is_executable_only_for_shell_safe_exact_resources() {
                 IdempotencyKey::from("recovery-status"),
             ),
             "pam access grant daemon.status --resource daemon".to_owned(),
+        ),
+        (
+            RequestEnvelope::stop(
+                RequestId::from("recovery-stop"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-stop"),
+            ),
+            "pam access grant daemon.stop --resource daemon".to_owned(),
+        ),
+        (
+            RequestEnvelope::project_current(
+                RequestId::from("recovery-project-current"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("recovery-project-current"),
+            ),
+            "pam access grant project.current --resource project".to_owned(),
         ),
         (
             RequestEnvelope::inspect_evidence(
@@ -478,6 +590,13 @@ fn approval_recovery_matches_each_capability_retry_surface() {
     );
 
     let protocol_recovery = "pam approval approve approval-1; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request";
+    let stop = RequestEnvelope::stop(
+        RequestId::from("stop"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("stop"),
+    );
+    assert_eq!(approval_recovery(&stop, &approval_id), protocol_recovery);
     let generic_cancel = RequestEnvelope::cancel(
         RequestId::from("cancel"),
         caller.clone(),
@@ -662,6 +781,7 @@ fn start_daemon_with_provider(
             bypass_policy: true,
             flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
             flow_preflight_delay: Duration::ZERO,
+            status_dispatch: super::lifecycle::TestStatusDispatch::Durable,
         },
         async {
             let _ = shutdown_rx.await;
@@ -691,6 +811,7 @@ fn start_secure_daemon(
             bypass_policy: false,
             flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
             flow_preflight_delay: Duration::ZERO,
+            status_dispatch: super::lifecycle::TestStatusDispatch::Durable,
         },
         async {
             let _ = shutdown_rx.await;
@@ -2097,6 +2218,61 @@ async fn assert_evidence_failures(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_only_queued_project_work_without_waiting_for_active_work() {
+    let runtime = test_runtime("honest-status-workload");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let first = network_request("honest-project", "active");
+    let second = network_request("honest-project", "queued");
+    let seed = Store::open(&state_path).unwrap();
+    accept_pending_request(&seed, &first, 1).await;
+    accept_pending_request(&seed, &second, 2).await;
+    seed.shutdown().await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let daemon = tokio::spawn(serve_until_with_delay(
+        DaemonConfig {
+            endpoint: endpoint.clone(),
+            recover: false,
+            model: None,
+            state_path: Some(state_path.clone()),
+            brief_provider: None,
+            bypass_authentication: true,
+            bypass_policy: true,
+            flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
+            flow_preflight_delay: Duration::ZERO,
+            status_dispatch: super::lifecycle::TestStatusDispatch::Immediate,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+        Duration::from_secs(1),
+    ));
+    wait_until_ready(&endpoint).await;
+    let observer = Store::open(&state_path).unwrap();
+    wait_for_state(&observer, &first.request_id, RequestState::Leased).await;
+    wait_for_state(&observer, &second.request_id, RequestState::Queued).await;
+
+    let started = Instant::now();
+    let exchange = request_status(
+        &endpoint,
+        &request("honest-project", "status"),
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(exchange.events.is_empty());
+    assert_eq!(status_queue_depth(&exchange), 1);
+
+    observer.shutdown().await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_parallelizes_projects_but_serializes_each_project() {
     let runtime = test_runtime("concurrency");
     let _ = fs::remove_dir_all(&runtime);
@@ -2114,6 +2290,7 @@ async fn daemon_parallelizes_projects_but_serializes_each_project() {
             bypass_policy: true,
             flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
             flow_preflight_delay: Duration::ZERO,
+            status_dispatch: super::lifecycle::TestStatusDispatch::Durable,
         },
         async {
             let _ = shutdown_rx.await;

@@ -1,5 +1,7 @@
 use std::{env, path::PathBuf};
 
+use directories::ProjectDirs;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEndpoint {
     address: String,
@@ -9,14 +11,17 @@ pub struct LocalEndpoint {
 }
 
 impl LocalEndpoint {
+    /// Returns the default per-user local IPC endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operating system exposes neither a session runtime
+    /// directory nor the per-user local-data directory required by every
+    /// supported PAM platform. `PAM_RUNTIME_DIR` can provide an explicit
+    /// absolute override for constrained environments.
     #[must_use]
     pub fn default_for_user() -> Self {
-        let runtime_dir = runtime_dir();
-        if cfg!(windows) {
-            Self::loopback("tcp://127.0.0.1:39873", runtime_dir)
-        } else {
-            Self::ipc(runtime_dir)
-        }
+        Self::ipc(runtime_dir())
     }
 
     #[must_use]
@@ -65,14 +70,18 @@ fn runtime_dir() -> PathBuf {
     if let Some(configured) = env::var_os("PAM_RUNTIME_DIR") {
         return PathBuf::from(configured);
     }
+
     if !cfg!(windows)
         && let Some(xdg_runtime_dir) = env::var_os("XDG_RUNTIME_DIR")
     {
         return PathBuf::from(xdg_runtime_dir).join("pam");
     }
 
-    let user = env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_else(|_| "local".to_owned());
-    env::temp_dir().join(format!("pam-{user}"))
+    private_runtime_dir()
+        .expect("supported PAM platforms must provide a private per-user local-data directory")
+}
+
+pub(super) fn private_runtime_dir() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "PAM", "PAM")
+        .map(|project_dirs| project_dirs.data_local_dir().join("runtime"))
 }

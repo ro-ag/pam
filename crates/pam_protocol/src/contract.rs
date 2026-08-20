@@ -25,6 +25,8 @@ const MAX_FLOW_APPROVAL_ID_BYTES: usize = 256;
 const MAX_FLOW_REQUEST_ATTACHMENT_BYTES: usize =
     MAX_CALLER_CREDENTIAL_LENGTH + MAX_FLOW_APPROVAL_ID_BYTES + 64;
 pub const MAX_FLOW_PROJECT_ROOT_BYTES: usize = 4 * 1024;
+pub const MAX_PROJECT_CURRENT_QUEUED: usize = 64;
+pub const MAX_PROJECT_OPERATION_KIND_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
@@ -61,6 +63,93 @@ impl RequestEnvelope {
             idempotency_key,
             deadline_unix_ms: None,
             payload: RequestPayload::Status,
+        }
+    }
+
+    /// Creates an authenticated request to stop the daemon gracefully.
+    ///
+    /// Attach the caller credential with [`Self::authenticated`] before sending
+    /// the request.
+    #[must_use]
+    pub fn stop(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::DaemonStop,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::Stop,
+        }
+    }
+
+    /// Creates an authenticated, policy-gated snapshot request for the project
+    /// identified by this envelope.
+    ///
+    /// Attach the caller credential with [`Self::authenticated`] before sending
+    /// the request. The result contains bounded scheduling metadata only; it
+    /// never exposes stored operation payloads.
+    #[must_use]
+    pub fn project_current(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::ProjectCurrent,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::ProjectCurrent,
+        }
+    }
+
+    /// Creates an authenticated decision for one pending approval challenge.
+    ///
+    /// The daemon must authenticate this envelope and verify that the approval
+    /// is bound to its exact `project_id` and `caller_id` before applying the
+    /// decision. It must handle the decision before ordinary policy evaluation:
+    /// policy-gating this capability would recursively require another approval.
+    /// The approval ID is a challenge identifier, not a reusable receipt, and
+    /// this payload deliberately has no field capable of carrying a token or
+    /// secret.
+    #[must_use]
+    pub fn approval_decide(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::ApprovalDecide,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::ApprovalDecide {
+                approval_id,
+                decision,
+            },
         }
     }
 
@@ -557,6 +646,9 @@ impl RequestEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     DaemonStatus,
+    DaemonStop,
+    ProjectCurrent,
+    ApprovalDecide,
     CancelRequest,
     ReplayEvents,
     Brief,
@@ -574,6 +666,9 @@ impl Capability {
     pub const fn policy_name(&self) -> &'static str {
         match self {
             Self::DaemonStatus => "daemon.status",
+            Self::DaemonStop => "daemon.stop",
+            Self::ProjectCurrent => "project.current",
+            Self::ApprovalDecide => "approval.decide",
             Self::CancelRequest => "request.cancel",
             Self::ReplayEvents => "request.replay",
             Self::Brief => "brief.read",
@@ -722,6 +817,12 @@ impl FlowProjectRoot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestPayload {
     Status,
+    Stop,
+    ProjectCurrent,
+    ApprovalDecide {
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    },
     Cancel {
         target_request_id: RequestId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,6 +919,9 @@ pub enum OperationTruth {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResultPayload {
     Status(StatusResult),
+    DaemonLifecycle(DaemonLifecycleResult),
+    ProjectCurrent(ProjectCurrentResult),
+    ApprovalDecision(ApprovalDecisionResult),
     Cancellation(CancellationResult),
     Replay(ReplayResult),
     Brief(BriefResult),
@@ -1114,6 +1218,8 @@ pub enum ProtocolContractError {
     InvalidFlowDefinition,
     FlowRequestTooLarge { actual: usize, maximum: usize },
     FlowRequestEncoding,
+    InvalidProjectOperationKind,
+    ProjectCurrentQueueTooLarge { actual: usize, maximum: usize },
 }
 
 impl fmt::Display for ProtocolContractError {
@@ -1176,6 +1282,14 @@ impl fmt::Display for ProtocolContractError {
             Self::FlowRequestEncoding => {
                 formatter.write_str("flow request could not be encoded for size validation")
             }
+            Self::InvalidProjectOperationKind => write!(
+                formatter,
+                "project operation kind must contain 1 to {MAX_PROJECT_OPERATION_KIND_BYTES} bytes"
+            ),
+            Self::ProjectCurrentQueueTooLarge { actual, maximum } => write!(
+                formatter,
+                "project current queue contains {actual} summaries; maximum is {maximum}"
+            ),
         }
     }
 }
@@ -1306,6 +1420,50 @@ where
     Ok(bytes)
 }
 
+fn validate_project_operation_kind(operation_kind: &str) -> Result<(), ProtocolContractError> {
+    if operation_kind.is_empty()
+        || operation_kind.len() > MAX_PROJECT_OPERATION_KIND_BYTES
+        || operation_kind.contains('\0')
+    {
+        Err(ProtocolContractError::InvalidProjectOperationKind)
+    } else {
+        Ok(())
+    }
+}
+
+fn deserialize_project_operation_kind<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let operation_kind = String::deserialize(deserializer)?;
+    validate_project_operation_kind(&operation_kind).map_err(serde::de::Error::custom)?;
+    Ok(operation_kind)
+}
+
+fn validate_project_current_queued(
+    queued: &[ProjectRequestSummary],
+) -> Result<(), ProtocolContractError> {
+    if queued.len() > MAX_PROJECT_CURRENT_QUEUED {
+        Err(ProtocolContractError::ProjectCurrentQueueTooLarge {
+            actual: queued.len(),
+            maximum: MAX_PROJECT_CURRENT_QUEUED,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn deserialize_project_current_queued<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ProjectRequestSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let queued = Vec::<ProjectRequestSummary>::deserialize(deserializer)?;
+    validate_project_current_queued(&queued).map_err(serde::de::Error::custom)?;
+    Ok(queued)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CancellationResult {
     pub target_request_id: RequestId,
@@ -1340,6 +1498,139 @@ pub struct StatusResult {
     pub daemon_version: String,
     pub protocol_version: u16,
     pub queue_depth: u64,
+}
+
+/// Acknowledgement that an authenticated daemon lifecycle change has begun.
+///
+/// Process identifiers are intentionally absent from the caller-facing
+/// contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DaemonLifecycleResult {
+    pub stopping: bool,
+}
+
+/// One bounded, payload-free request summary for the native control center.
+///
+/// `operation_kind` is a classification label only. The stored operation body
+/// and any embedded command, prompt, path, credential, or model data never
+/// cross this contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectRequestSummary {
+    pub request_id: RequestId,
+    #[serde(deserialize_with = "deserialize_project_operation_kind")]
+    operation_kind: String,
+    pub state: ProjectRequestState,
+    pub queue_sequence: u64,
+    pub accepted_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+}
+
+impl ProjectRequestSummary {
+    /// Creates a request summary with a bounded, non-empty operation kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolContractError::InvalidProjectOperationKind`] when the
+    /// classification is empty, contains a NUL, or exceeds
+    /// [`MAX_PROJECT_OPERATION_KIND_BYTES`].
+    pub fn new(
+        request_id: RequestId,
+        operation_kind: impl Into<String>,
+        state: ProjectRequestState,
+        queue_sequence: u64,
+        accepted_at_ms: u64,
+        completed_at_ms: Option<u64>,
+    ) -> Result<Self, ProtocolContractError> {
+        let operation_kind = operation_kind.into();
+        validate_project_operation_kind(&operation_kind)?;
+        Ok(Self {
+            request_id,
+            operation_kind,
+            state,
+            queue_sequence,
+            accepted_at_ms,
+            completed_at_ms,
+        })
+    }
+
+    #[must_use]
+    pub fn operation_kind(&self) -> &str {
+        &self.operation_kind
+    }
+}
+
+/// Stable wire projection of durable scheduler states.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRequestState {
+    Queued,
+    Leased,
+    CancellationRequested,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Bounded current-work snapshot for the project bound by the result envelope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectCurrentResult {
+    #[serde(deserialize_with = "deserialize_project_current_queued")]
+    queued: Vec<ProjectRequestSummary>,
+    pub active: Option<ProjectRequestSummary>,
+    pub latest: Option<ProjectRequestSummary>,
+    pub truncated: bool,
+}
+
+impl ProjectCurrentResult {
+    /// Creates a bounded project-current result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolContractError::ProjectCurrentQueueTooLarge`] when
+    /// `queued` contains more than [`MAX_PROJECT_CURRENT_QUEUED`] summaries.
+    pub fn new(
+        queued: Vec<ProjectRequestSummary>,
+        active: Option<ProjectRequestSummary>,
+        latest: Option<ProjectRequestSummary>,
+        truncated: bool,
+    ) -> Result<Self, ProtocolContractError> {
+        validate_project_current_queued(&queued)?;
+        Ok(Self {
+            queued,
+            active,
+            latest,
+            truncated,
+        })
+    }
+
+    #[must_use]
+    pub fn queued(&self) -> &[ProjectRequestSummary] {
+        &self.queued
+    }
+}
+
+/// Human decision applied to one pending exact-effect approval challenge.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// Terminal disposition of an approval decision request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionDisposition {
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// Typed acknowledgement for an approval decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalDecisionResult {
+    pub approval_id: ApprovalId,
+    pub disposition: ApprovalDecisionDisposition,
 }
 
 /// Sanitized network configuration facts safe to return across the caller boundary.

@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Allow the local PAM main window to invoke only PAM-owned typed commands.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-bootstrap",
+    "allow-catalog",
+    "allow-activate-project",
+    "allow-refresh-project",
+    "allow-start-daemon",
+    "allow-stop-daemon",
+    "allow-register-gui-caller",
+    "allow-decide-approval",
+    "allow-load-evidence",
+    "allow-load-flow-workspace",
+    "allow-open-flow",
+    "allow-validate-flow",
+    "allow-save-flow"
+  ]
+}

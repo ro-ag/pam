@@ -6,6 +6,12 @@ on:
     paths-ignore:
       - "**/*.md"
       - "docs/**"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +19,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   foundation:
@@ -22,6 +28,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       has_cargo: ${{ steps.rust_workspace.outputs.has_cargo }}
+      has_frontend: ${{ steps.frontend.outputs.has_frontend }}
       has_prototype: ${{ steps.prototype.outputs.has_prototype }}
       rust_changed: ${{ steps.rust_changes.outputs.changed }}
     steps:
@@ -94,6 +101,16 @@ jobs:
             echo "has_prototype=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Detect desktop frontend
+        id: frontend
+        shell: bash
+        run: |
+          if [[ -f frontend/package-lock.json ]]; then
+            echo "has_frontend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_frontend=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: Rust
     needs: foundation
@@ -104,6 +121,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
@@ -111,6 +133,14 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Stage development PAM helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p pam_cli --bin pam --locked
+          mkdir -p src-tauri/binaries
+          cp target/debug/pam src-tauri/binaries/pam-x86_64-unknown-linux-gnu
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -124,24 +154,453 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
 
-  macos-developer-build:
-    name: macOS developer build
-    needs: [foundation, rust]
-    if: ${{ needs.foundation.outputs.rust_changed == 'true' }}
-    runs-on: macos-15
-    timeout-minutes: 15
+  frontend:
+    name: Desktop frontend
+    needs: foundation
+    if: ${{ needs.foundation.outputs.has_frontend == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Check types
+        run: npm run typecheck
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+  desktop-packages:
+    name: ${{ matrix.name }}
+    needs: [rust, frontend]
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 package
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            family: linux
+            artifact: PAM-linux-amd64
+          - name: Linux arm64 package
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: appimage,deb
+            family: linux
+            artifact: PAM-linux-arm64
+          - name: Windows amd64 package
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            family: windows
+            artifact: PAM-windows-amd64
+          - name: Windows arm64 package
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+            family: windows
+            artifact: PAM-windows-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Linux desktop dependencies
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: ${{ matrix.target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: desktop-${{ matrix.target }}
 
-      - name: Build developer workspace
-        run: cargo build --workspace --all-features --locked
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Stage PAM helper
+        run: node tools/stage-desktop-sidecar.mjs ${{ matrix.target }}
+
+      - name: Build desktop packages
+        run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Verify Linux package contract
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          helper="target/$TARGET/release/pam"
+          desktop="target/$TARGET/release/pam-gui"
+          mapfile -t appimages < <(find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
+          mapfile -t debs < <(find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
+          (( ${#appimages[@]} == 1 ))
+          (( ${#debs[@]} == 1 ))
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu)
+              expected_machine="Advanced Micro Devices X86-64"
+              expected_deb_arch="amd64"
+              ;;
+            aarch64-unknown-linux-gnu)
+              expected_machine="AArch64"
+              expected_deb_arch="arm64"
+              ;;
+            *)
+              echo "unsupported Linux verification target: $TARGET" >&2
+              exit 2
+              ;;
+          esac
+          for binary in "$helper" "$desktop" "${appimages[0]}"; do
+            machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+            [[ "$machine" == "$expected_machine" ]]
+          done
+          [[ "$(dpkg-deb --field "${debs[0]}" Architecture)" == "$expected_deb_arch" ]]
+
+          expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+              const metadata = JSON.parse(input);
+              process.stdout.write(metadata.packages.find(pkg => pkg.name === "pam_cli").version);
+            });
+          ')"
+          verify_helper_contract() {
+            local candidate="$1"
+            [[ "$("$candidate" --version)" == "pam $expected_version" ]]
+            "$candidate" --help > "$RUNNER_TEMP/pam-help.txt"
+            grep -Fxq "Local project continuity companion" "$RUNNER_TEMP/pam-help.txt"
+            grep -Eq '^Usage: pam( |$)' "$RUNNER_TEMP/pam-help.txt"
+          }
+          verify_helper_contract "$helper"
+
+          deb_root="$RUNNER_TEMP/pam-deb-payload"
+          appimage_root="$RUNNER_TEMP/pam-appimage-payload"
+          mkdir -p "$deb_root" "$appimage_root"
+          dpkg-deb --extract "${debs[0]}" "$deb_root"
+          (
+            cd "$appimage_root"
+            "$GITHUB_WORKSPACE/${appimages[0]}" --appimage-extract >/dev/null
+          )
+          verify_payload() {
+            local root="$1"
+            mapfile -t binaries < <(find "$root/usr/bin" -maxdepth 1 -type f -printf '%f\n' | sort)
+            [[ "${binaries[*]}" == "pam pam-gui" ]]
+            for binary in "$root/usr/bin/pam" "$root/usr/bin/pam-gui"; do
+              machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+              [[ "$machine" == "$expected_machine" ]]
+            done
+            verify_helper_contract "$root/usr/bin/pam"
+          }
+          verify_payload "$deb_root"
+          verify_payload "$appimage_root/squashfs-root"
+
+      - name: Verify Windows package contract
+        if: ${{ matrix.family == 'windows' }}
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "target/$env:TARGET/release/bundle"
+          $helper = (Resolve-Path "target/$env:TARGET/release/pam.exe").Path
+          $desktop = (Resolve-Path "target/$env:TARGET/release/pam-gui.exe").Path
+          $installers = @(Get-ChildItem "$bundle/nsis" -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
+
+          function Assert-PeMachine([string] $Path, [UInt16] $Expected) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "$Path is not a PE executable"
+            }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "$Path has an invalid PE header offset"
+            }
+            if ([Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") {
+              throw "$Path has no PE signature"
+            }
+            $actual = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($actual -ne $Expected) {
+              throw ("{0} PE machine 0x{1:x4} != 0x{2:x4}" -f $Path, $actual, $Expected)
+            }
+          }
+
+          function Assert-HelperContract([string] $Path, [string] $ExpectedVersion) {
+            $version = (& $Path --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $version -ne "pam $ExpectedVersion") {
+              throw "unexpected PAM helper version: $version"
+            }
+            $helpPath = Join-Path $env:RUNNER_TEMP ("pam-help-{0}.txt" -f [Guid]::NewGuid())
+            try {
+              & $Path --help *> $helpPath
+              $helpExit = $LASTEXITCODE
+              $help = Get-Content -LiteralPath $helpPath -Raw
+              $help = [Regex]::Replace($help, '\x1B\[[0-?]*[ -/]*[@-~]', '')
+              $hasAbout = $help.Contains('Local project continuity companion')
+              $hasUsage = $help.Contains('Usage: pam')
+              if ($helpExit -ne 0 -or -not $hasAbout -or -not $hasUsage) {
+                $helpBytes = (Get-Item -LiteralPath $helpPath).Length
+                throw "PAM helper help contract failed (exit=$helpExit, about=$hasAbout, usage=$hasUsage, bytes=$helpBytes)"
+              }
+            } finally {
+              Remove-Item -LiteralPath $helpPath -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          function Get-ByteHash([byte[]] $Bytes) {
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              [BitConverter]::ToString($sha256.ComputeHash($Bytes)).Replace('-', '')
+            } finally {
+              $sha256.Dispose()
+            }
+          }
+
+          function Assert-NsisDesktopContract([string] $OriginalPath, [string] $PackagedPath) {
+            $original = [IO.File]::ReadAllBytes($OriginalPath)
+            $packaged = [IO.File]::ReadAllBytes($PackagedPath)
+            # Tauri CLI 2.11.4 patches this one same-length marker for NSIS, then restores the build output.
+            $unknownMarker = '__TAURI_BUNDLE_TYPE_VAR_UNK'
+            $nsis = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+            $originalText = [Text.Encoding]::ASCII.GetString($original)
+            $offset = $originalText.IndexOf($unknownMarker, [StringComparison]::Ordinal)
+            if ($offset -lt 0 -or $offset -ne $originalText.LastIndexOf($unknownMarker, [StringComparison]::Ordinal)) {
+              throw "unpatched PAM desktop must contain exactly one Tauri bundle marker"
+            }
+            [Array]::Copy($nsis, 0, $original, $offset, $nsis.Length)
+            if ((Get-ByteHash $original) -ne (Get-ByteHash $packaged)) {
+              throw "packaged PAM desktop differs beyond the expected Tauri NSIS marker patch"
+            }
+          }
+
+          $expectedMachine = switch ($env:TARGET) {
+            'x86_64-pc-windows-msvc' { [UInt16] 0x8664 }
+            'aarch64-pc-windows-msvc' { [UInt16] 0xaa64 }
+            default { throw "unsupported Windows verification target: $env:TARGET" }
+          }
+          Assert-PeMachine $helper $expectedMachine
+          Assert-PeMachine $desktop $expectedMachine
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $expectedVersion = ($metadata.packages | Where-Object name -eq 'pam_cli').version
+          Assert-HelperContract $helper $expectedVersion
+
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles/7-Zip/7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "7-Zip is required to inspect the NSIS payload" }
+          $extract = Join-Path $env:RUNNER_TEMP 'pam-nsis'
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & $sevenZip x '-y' "-o$extract" $installers[0].FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to extract NSIS installer" }
+
+          $pamExecutables = @(Get-ChildItem $extract -Recurse -File -Filter 'pam*.exe')
+          $names = @($pamExecutables.Name | Sort-Object)
+          if (($names -join ' ') -ne 'pam-gui.exe pam.exe') {
+            throw "unexpected NSIS PAM executable inventory: $($names -join ' ')"
+          }
+          $packagedHelper = @($pamExecutables | Where-Object Name -eq 'pam.exe')
+          $packagedDesktop = @($pamExecutables | Where-Object Name -eq 'pam-gui.exe')
+          if ($packagedHelper.Count -ne 1 -or $packagedDesktop.Count -ne 1) {
+            throw "NSIS payload must contain one helper and one desktop executable"
+          }
+          Assert-PeMachine $packagedHelper[0].FullName $expectedMachine
+          Assert-PeMachine $packagedDesktop[0].FullName $expectedMachine
+          Assert-HelperContract $packagedHelper[0].FullName $expectedVersion
+          if ((Get-FileHash $helper).Hash -ne (Get-FileHash $packagedHelper[0].FullName).Hash) {
+            throw "packaged PAM helper differs from the verified target binary"
+          }
+          Assert-NsisDesktopContract $desktop $packagedDesktop[0].FullName
+
+      - name: Record package output
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            archive="target/$TARGET/release/PAM-$TARGET-bundle.tar.gz"
+            tar -C "$bundle" -czf "$PWD/$archive" .
+            echo "path=$archive" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$bundle" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload preview packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-package:
+    name: macOS arm64 signed package
+    needs: [rust, frontend]
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'run-macos')
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: desktop-aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Prepare Apple signing and notarization
+        shell: bash
+        env:
+          APPLE_API_KEY_ID_SECRET: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_MATERIAL: ${{ secrets.APPLE_API_KEY }}
+          APPLE_CERTIFICATE_BASE64_SECRET: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD_SECRET: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/pam-build.keychain-db"
+          certificate="$RUNNER_TEMP/pam-certificate.p12"
+          private_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+          echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64_SECRET" | base64 --decode > "$certificate"
+          printf '%s' "$APPLE_API_KEY_MATERIAL" | base64 --decode > "$private_key"
+          security create-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD_SECRET" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD_SECRET" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          [[ -n "$identity" ]]
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$private_key" >> "$GITHUB_ENV"
+
+      - name: Stage PAM helper
+        run: node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
+
+      - name: Build signed and notarized application
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: npm --prefix frontend run tauri -- build --target aarch64-apple-darwin --bundles app
+
+      - name: Build, sign, and notarize disk image
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          app="target/aarch64-apple-darwin/release/bundle/macos/PAM.app"
+          dmg_dir="target/aarch64-apple-darwin/release/bundle/dmg"
+          dmg="$(tools/package-macos-dmg.sh "$PWD/$app" "$PWD/$dmg_dir")"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 20m
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Verify macOS package contract
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="target/aarch64-apple-darwin/release/bundle"
+          app="$bundle/macos/PAM.app"
+          dmg="$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          codesign --verify --deep --strict "$app"
+          codesign --verify --strict "$dmg"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type execute "$app"
+          for binary in "$app/Contents/MacOS/pam" "$app/Contents/MacOS/pam-gui"; do
+            [[ "$(lipo -archs "$binary")" == arm64 ]]
+            [[ "$(otool -l "$binary" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
+          done
+          archive="target/aarch64-apple-darwin/release/PAM-macos-arm64-bundle.tar.gz"
+          tar -C "$bundle" -czf "$PWD/$archive" "macos/PAM.app" "dmg/$(basename "$dmg")"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed preview package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PAM-macos-arm64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -n "${PAM_BUILD_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$PAM_BUILD_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/pam-certificate.p12" "$RUNNER_TEMP"/AuthKey_*.p8
 
   prototype:
     name: Interactive prototype

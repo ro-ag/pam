@@ -29,6 +29,9 @@ const MAX_STDERR_BYTES: usize = 4 * 1024;
 const MAX_SECTION_ITEMS: usize = 16;
 const MAX_ITEM_BYTES: usize = 4 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
+const MAX_REGISTERED_PROJECTS: usize = 256;
+const MAX_PROJECT_NAME_BYTES: usize = 256;
+const MAX_PROJECT_PATH_BYTES: usize = 4 * 1024;
 const TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 pub(crate) struct PtrackBriefProvider {
@@ -42,7 +45,7 @@ impl PtrackBriefProvider {
         Self {
             directory,
             project_id,
-            executable: OsString::from("ptrack"),
+            executable: resolve_ptrack_executable(),
         }
     }
 
@@ -191,10 +194,31 @@ struct Note {
     body: String,
 }
 
-#[derive(Deserialize)]
-struct RegisteredProject {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RegisteredProject {
+    #[serde(rename = "Name")]
+    name: String,
     #[serde(rename = "Path")]
     path: PathBuf,
+    #[serde(rename = "LastSeen")]
+    last_seen: String,
+}
+
+impl RegisteredProject {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn last_seen(&self) -> &str {
+        &self.last_seen
+    }
 }
 
 impl ContextDigest {
@@ -393,11 +417,7 @@ pub(super) fn context_handle(bytes: &[u8]) -> EvidenceHandle {
 }
 
 pub(super) fn validate_registered_project(bytes: &[u8], directory: &Path) -> Result<(), String> {
-    let projects = serde_json::from_slice::<Vec<RegisteredProject>>(bytes).map_err(|error| {
-        bounded_detail(format!(
-            "ptrack returned incompatible projects JSON: {error}"
-        ))
-    })?;
+    let projects = parse_registered_projects(bytes)?;
     let registered = projects
         .into_iter()
         .any(|project| project.path == directory);
@@ -407,6 +427,97 @@ pub(super) fn validate_registered_project(bytes: &[u8], directory: &Path) -> Res
         Err("ptrack does not report this PAM project root through its supported projects interface."
             .to_owned())
     }
+}
+
+/// Returns the bounded ptrack project catalog used by the native control center.
+///
+/// # Errors
+///
+/// Returns a sanitized error when ptrack is unavailable, exceeds its deadline,
+/// or returns an incompatible or unbounded project catalog.
+pub async fn registered_projects(directory: &Path) -> Result<Vec<RegisteredProject>, String> {
+    let executable = resolve_ptrack_executable();
+    let bytes = run_command(
+        &executable,
+        directory,
+        &["projects", "--json"],
+        "ptrack projects --json",
+    )
+    .await?;
+    parse_registered_projects(&bytes)
+}
+
+fn resolve_ptrack_executable() -> OsString {
+    let executable_name = if cfg!(windows) {
+        "ptrack.exe"
+    } else {
+        "ptrack"
+    };
+    let mut candidates = Vec::new();
+
+    if let Some(configured) = std::env::var_os("PAM_PTRACK_EXECUTABLE") {
+        let configured = PathBuf::from(configured);
+        if configured.is_absolute() {
+            candidates.push(configured);
+        }
+    }
+    if let Ok(current_executable) = std::env::current_exe()
+        && let Some(directory) = current_executable.parent()
+    {
+        candidates.push(directory.join(executable_name));
+    }
+    if let Some(home) = user_home_directory() {
+        candidates.extend([
+            home.join(".local").join("bin").join(executable_name),
+            home.join(".cargo").join("bin").join(executable_name),
+            home.join("go").join("bin").join(executable_name),
+        ]);
+    }
+    if !cfg!(windows) {
+        candidates.extend([
+            PathBuf::from("/opt/homebrew/bin").join(executable_name),
+            PathBuf::from("/usr/local/bin").join(executable_name),
+        ]);
+    }
+
+    first_existing_executable(candidates).unwrap_or_else(|| OsString::from(executable_name))
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+pub(super) fn first_existing_executable(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<OsString> {
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(PathBuf::into_os_string)
+}
+
+fn parse_registered_projects(bytes: &[u8]) -> Result<Vec<RegisteredProject>, String> {
+    let projects = serde_json::from_slice::<Vec<RegisteredProject>>(bytes).map_err(|error| {
+        bounded_detail(format!(
+            "ptrack returned incompatible projects JSON: {error}"
+        ))
+    })?;
+    if projects.len() > MAX_REGISTERED_PROJECTS {
+        return Err("ptrack returned too many registered projects.".to_owned());
+    }
+    for project in &projects {
+        if project.name.trim().is_empty()
+            || project.name.len() > MAX_PROJECT_NAME_BYTES
+            || !project.path.is_absolute()
+            || project.path.as_os_str().as_encoded_bytes().len() > MAX_PROJECT_PATH_BYTES
+            || project.last_seen.len() > MAX_PROJECT_NAME_BYTES
+        {
+            return Err("ptrack returned an invalid registered project entry.".to_owned());
+        }
+    }
+    Ok(projects)
 }
 
 async fn run_command(

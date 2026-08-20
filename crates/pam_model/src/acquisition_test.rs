@@ -685,6 +685,24 @@ async fn a_preexisting_lock_file_does_not_block_a_new_acquisition() {
 }
 
 #[tokio::test]
+async fn a_hard_linked_lock_file_is_rejected_without_truncating_its_peer() {
+    let directory = TestDirectory::new("hard-linked-lock");
+    let fixture = Fixture::new();
+    let peer = directory.0.join("lock-peer");
+    let lock = directory.0.join(".model.gguf.pam-model.lock");
+    fs::write(&peer, b"unrelated owner").unwrap();
+    fs::hard_link(&peer, &lock).unwrap();
+    let transport = FakeTransport::new(vec![FakeResponse::full(fixture.bytes.clone())]);
+
+    assert!(matches!(
+        download_https(&transport, download_request(&directory.0, &fixture)).await,
+        Err(ModelError::UnsafePath)
+    ));
+    assert_eq!(fs::read(peer).unwrap(), b"unrelated owner");
+    assert!(!directory.0.join("model.gguf").exists());
+}
+
+#[tokio::test]
 async fn advisory_lock_rejects_a_concurrent_acquisition_and_can_be_reused() {
     let directory = TestDirectory::new("concurrent-lock");
     let fixture = Fixture::new();

@@ -7,7 +7,7 @@ all modes share the same versioned domain types and policy engine.
 
 ```mermaid
 flowchart LR
-  H["Human"] --> G["pam gui\nGPUI control center"]
+  H["Human"] --> G["pam gui\nTauri + React control center"]
   A["Coding agent"] --> C["pam client\ndefault mode"]
   G --> T["Local transport"]
   C --> T
@@ -109,9 +109,9 @@ the binary. The first transport adapter uses ZeroMQ Router/Dealer semantics:
 
 | Platform | First transport | Planned hardening |
 | --- | --- | --- |
-| macOS | Unix-domain IPC endpoint in the user runtime directory | launchd integration and signed peer registration |
-| Linux | Unix-domain IPC endpoint | systemd user service and peer credential checks |
-| Windows | authenticated loopback TCP | native named-pipe adapter after protocol stabilization |
+| macOS | ZeroMQ IPC endpoint in the per-user local-data runtime directory | launchd integration and signed peer registration |
+| Linux | ZeroMQ IPC endpoint in the session runtime directory, with a per-user local-data fallback | systemd user service and peer credential checks |
+| Windows | ZeroMQ IPC endpoint in the per-user local-data runtime directory | native service integration and signed peer registration |
 
 ZeroMQ availability is a build/runtime implementation detail, never exposed in
 the command contract. Message envelopes use Serde with a compact binary encoding

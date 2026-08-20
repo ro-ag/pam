@@ -8,8 +8,8 @@ use tokio::io::AsyncWriteExt as _;
 use super::{
     BriefProvider,
     ptrack::{
-        ContextDigest, PtrackBriefProvider, context_handle, read_bounded,
-        validate_registered_project,
+        ContextDigest, PtrackBriefProvider, context_handle, first_existing_executable,
+        read_bounded, validate_registered_project,
     },
 };
 
@@ -77,6 +77,21 @@ fn registered_project_validation_requires_the_exact_pam_root() {
     validate_registered_project(projects, &root).unwrap();
     assert!(validate_registered_project(projects, &PathBuf::from("/projects/pam/nested")).is_err());
     assert!(validate_registered_project(b"{}", &root).is_err());
+}
+
+#[test]
+fn executable_discovery_prefers_the_first_existing_candidate() {
+    let directory = test_directory("ptrack-executable-discovery");
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    let missing = directory.join("missing-ptrack");
+    let available = directory.join("ptrack");
+    fs::write(&available, b"test executable marker").unwrap();
+
+    let resolved = first_existing_executable([missing, available.clone()]);
+
+    assert_eq!(resolved, Some(available.into_os_string()));
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

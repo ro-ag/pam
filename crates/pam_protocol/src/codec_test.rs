@@ -12,15 +12,17 @@ use pam_flow::{
 use serde::Serialize;
 
 use super::{
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    ApprovalDecision, ApprovalDecisionDisposition, ApprovalDecisionResult, BriefItem,
+    BriefProvenance, BriefResult, CancellationDisposition, CancellationResult, Capability,
+    CodecError, ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure,
     FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES,
-    MAX_MODEL_OUTPUT_BYTES, ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole,
-    ModelUsage, NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
-    SourceAvailability, decode_request, decode_request_envelope, decode_server_message,
-    decode_server_message_envelope, encode,
+    MAX_MODEL_OUTPUT_BYTES, MAX_PROJECT_CURRENT_QUEUED, MAX_PROJECT_OPERATION_KIND_BYTES,
+    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ProjectCurrentResult,
+    ProjectRequestState, ProjectRequestSummary, ReplayResult, RequestEnvelope, RequestPayload,
+    ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, decode_request,
+    decode_request_envelope, decode_server_message, decode_server_message_envelope, encode,
 };
 
 const PROJECT_ROOT: &str = "/canonical/project";
@@ -57,6 +59,18 @@ fn status_request() -> RequestEnvelope {
         ProjectId::from("project-1"),
         IdempotencyKey::from("status-1"),
     )
+}
+
+fn project_request_summary(request_id: &str, state: ProjectRequestState) -> ProjectRequestSummary {
+    ProjectRequestSummary::new(
+        RequestId::from(request_id),
+        "flow_run",
+        state,
+        7,
+        100,
+        (state == ProjectRequestState::Succeeded).then_some(200),
+    )
+    .unwrap()
 }
 
 fn evidence_handle() -> EvidenceHandle {
@@ -219,6 +233,55 @@ fn authenticated_request_round_trips_without_debug_disclosure() {
 
     assert_eq!(actual, expected);
     assert!(!format!("{actual:?}").contains(secret));
+}
+
+#[test]
+fn authenticated_daemon_stop_round_trips_through_named_messagepack() {
+    let expected = RequestEnvelope::stop(
+        RequestId::from("stop-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("stop-key-1"),
+    )
+    .authenticated(CallerCredential::new("stop-credential"));
+
+    assert_eq!(
+        decode_request(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn authenticated_project_current_round_trips_through_named_messagepack() {
+    let expected = RequestEnvelope::project_current(
+        RequestId::from("current-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("current-key-1"),
+    )
+    .authenticated(CallerCredential::new("current-credential"));
+
+    assert_eq!(
+        decode_request(&encode(&expected).unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn authenticated_approval_decision_round_trips_without_a_receipt_field() {
+    let expected = RequestEnvelope::approval_decide(
+        RequestId::from("approval-decision-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("approval-decision-key-1"),
+        pam_core::ApprovalId::from("approval-1"),
+        ApprovalDecision::Deny,
+    )
+    .authenticated(CallerCredential::new("decision-credential"));
+
+    let decoded = decode_request(&encode(&expected).unwrap()).unwrap();
+    assert_eq!(decoded, expected);
+    assert!(decoded.approval_id.is_none());
 }
 
 #[test]
@@ -499,7 +562,7 @@ fn v3_cannot_treat_the_flow_only_target_field_as_ignorable_authority() {
         decode_request(&bytes),
         Err(CodecError::UnsupportedProtocolVersion {
             actual: 3,
-            supported: 5
+            supported: 7
         })
     ));
 }
@@ -595,6 +658,15 @@ fn durable_result_payloads_round_trip_through_named_messagepack() {
     let results = [
         ServerMessage::Result(ResultEnvelope {
             protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("stop-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Success {
+                truth: OperationTruth::Changed,
+                payload: ResultPayload::DaemonLifecycle(DaemonLifecycleResult { stopping: true }),
+            },
+        }),
+        ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
             request_id: RequestId::from("cancel-observer-1"),
             project_id: ProjectId::from("project-1"),
             body: ResultBody::Success {
@@ -602,6 +674,44 @@ fn durable_result_payloads_round_trip_through_named_messagepack() {
                 payload: ResultPayload::Cancellation(CancellationResult {
                     target_request_id: RequestId::from("target-1"),
                     disposition: CancellationDisposition::Requested,
+                }),
+            },
+        }),
+        ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("current-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Success {
+                truth: OperationTruth::Observed,
+                payload: ResultPayload::ProjectCurrent(
+                    ProjectCurrentResult::new(
+                        vec![project_request_summary(
+                            "queued-1",
+                            ProjectRequestState::Queued,
+                        )],
+                        Some(project_request_summary(
+                            "active-1",
+                            ProjectRequestState::Leased,
+                        )),
+                        Some(project_request_summary(
+                            "latest-1",
+                            ProjectRequestState::Succeeded,
+                        )),
+                        false,
+                    )
+                    .unwrap(),
+                ),
+            },
+        }),
+        ServerMessage::Result(ResultEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::from("approval-decision-1"),
+            project_id: ProjectId::from("project-1"),
+            body: ResultBody::Success {
+                truth: OperationTruth::Changed,
+                payload: ResultPayload::ApprovalDecision(ApprovalDecisionResult {
+                    approval_id: pam_core::ApprovalId::from("approval-1"),
+                    disposition: ApprovalDecisionDisposition::Denied,
                 }),
             },
         }),
@@ -626,6 +736,62 @@ fn durable_result_payloads_round_trip_through_named_messagepack() {
             expected
         );
     }
+}
+
+fn unbounded_project_request_summary(operation_kind: String) -> UnboundedProjectRequestSummary {
+    UnboundedProjectRequestSummary {
+        request_id: RequestId::from("work-1"),
+        operation_kind,
+        state: ProjectRequestState::Queued,
+        queue_sequence: 7,
+        accepted_at_ms: 100,
+        completed_at_ms: None,
+    }
+}
+
+fn unbounded_project_current_message(
+    result: UnboundedProjectCurrentResult,
+) -> UnboundedServerMessage {
+    UnboundedServerMessage::Result(UnboundedResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("current-1"),
+        project_id: ProjectId::from("project-1"),
+        body: UnboundedResultBody::Success {
+            truth: OperationTruth::Observed,
+            payload: UnboundedResultPayload::ProjectCurrent(result),
+        },
+    })
+}
+
+#[test]
+fn project_current_bounds_are_revalidated_during_decode() {
+    let oversized_queue = UnboundedProjectCurrentResult {
+        queued: (0..=MAX_PROJECT_CURRENT_QUEUED)
+            .map(|_| unbounded_project_request_summary("flow_run".to_owned()))
+            .collect(),
+        active: None,
+        latest: None,
+        truncated: true,
+    };
+    assert!(matches!(
+        decode_server_message(
+            &encode(&unbounded_project_current_message(oversized_queue)).unwrap()
+        ),
+        Err(CodecError::Decode(_))
+    ));
+
+    let invalid_active = UnboundedProjectCurrentResult {
+        queued: Vec::new(),
+        active: Some(unbounded_project_request_summary(
+            "k".repeat(MAX_PROJECT_OPERATION_KIND_BYTES + 1),
+        )),
+        latest: None,
+        truncated: false,
+    };
+    assert!(matches!(
+        decode_server_message(&encode(&unbounded_project_current_message(invalid_active)).unwrap()),
+        Err(CodecError::Decode(_))
+    ));
 }
 
 #[test]
@@ -695,7 +861,7 @@ fn durable_v4_server_results_are_decodable_before_current_reenveloping() {
         decode_server_message(&bytes),
         Err(CodecError::UnsupportedProtocolVersion {
             actual: 4,
-            supported: 5,
+            supported: 7,
         })
     ));
     assert_eq!(decode_server_message_envelope(&bytes).unwrap(), expected);
@@ -820,6 +986,7 @@ struct UnboundedEvidenceChunk {
 enum UnboundedResultPayload {
     EvidenceChunk(UnboundedEvidenceChunk),
     ModelGeneration(UnboundedModelGenerationResult),
+    ProjectCurrent(UnboundedProjectCurrentResult),
 }
 
 #[derive(Serialize)]
@@ -828,6 +995,24 @@ struct UnboundedModelGenerationResult {
     text: String,
     finish_reason: ModelFinishReason,
     usage: ModelUsage,
+}
+
+#[derive(Serialize)]
+struct UnboundedProjectRequestSummary {
+    request_id: RequestId,
+    operation_kind: String,
+    state: ProjectRequestState,
+    queue_sequence: u64,
+    accepted_at_ms: u64,
+    completed_at_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct UnboundedProjectCurrentResult {
+    queued: Vec<UnboundedProjectRequestSummary>,
+    active: Option<UnboundedProjectRequestSummary>,
+    latest: Option<UnboundedProjectRequestSummary>,
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -1163,9 +1348,8 @@ fn legacy_status_request_matches_the_exact_v4_golden_fixture() {
 }
 
 #[test]
-fn status_request_matches_the_current_v5_golden_fixture() {
-    assert_eq!(PROTOCOL_VERSION, 5);
-    let bytes = encode(&status_request()).unwrap();
+fn legacy_status_request_matches_the_exact_v5_golden_fixture() {
+    let bytes = encode(&status_request_for_version(5)).unwrap();
 
     assert_eq!(
         encode_hex(&bytes),
@@ -1174,11 +1358,34 @@ fn status_request_matches_the_current_v5_golden_fixture() {
 }
 
 #[test]
-fn v2_v3_and_v4_requests_are_correlatable_but_rejected_by_the_current_decoder() {
+fn legacy_status_request_matches_the_exact_v6_golden_fixture() {
+    let bytes = encode(&status_request_for_version(6)).unwrap();
+
+    assert_eq!(
+        encode_hex(&bytes),
+        include_str!("../fixtures/status_request_v6.msgpack.hex").trim()
+    );
+}
+
+#[test]
+fn status_request_matches_the_current_v7_golden_fixture() {
+    assert_eq!(PROTOCOL_VERSION, 7);
+    let bytes = encode(&status_request()).unwrap();
+
+    assert_eq!(
+        encode_hex(&bytes),
+        include_str!("../fixtures/status_request_v7.msgpack.hex").trim()
+    );
+}
+
+#[test]
+fn v2_through_v6_requests_are_correlatable_but_rejected_by_the_current_decoder() {
     for (actual, fixture) in [
         (2, include_str!("../fixtures/status_request_v2.msgpack.hex")),
         (3, include_str!("../fixtures/status_request_v3.msgpack.hex")),
         (4, include_str!("../fixtures/status_request_v4.msgpack.hex")),
+        (5, include_str!("../fixtures/status_request_v5.msgpack.hex")),
+        (6, include_str!("../fixtures/status_request_v6.msgpack.hex")),
     ] {
         let bytes = decode_hex(fixture);
         let envelope = decode_request_envelope(&bytes).unwrap();
@@ -1193,7 +1400,7 @@ fn v2_v3_and_v4_requests_are_correlatable_but_rejected_by_the_current_decoder() 
             decode_request(&bytes),
             Err(CodecError::UnsupportedProtocolVersion {
                 actual: rejected,
-                supported: 5
+                supported: 7
             }) if rejected == actual
         ));
     }

@@ -29,6 +29,8 @@ pub const MAX_VERSION_DIFF_LINES: usize = 1_024;
 const MAX_SELECTOR_BYTES: usize = 256;
 const MAX_VALIDATION_MESSAGE_BYTES: usize = 2_048;
 const SAVE_TEMP_ATTEMPTS: u64 = 8;
+const MAX_FLOW_OWNED_ARTIFACTS: usize = MAX_FLOW_CATALOG_ENTRIES;
+const MAX_FLOW_DIRECTORY_ENTRIES: usize = MAX_FLOW_CATALOG_ENTRIES + MAX_FLOW_OWNED_ARTIFACTS;
 static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Stable catalog identity for one validated flow version.
@@ -992,12 +994,14 @@ where
     };
     let mut entries = Vec::new();
     let mut catalog_bytes = 0_usize;
+    let mut catalog_entries = 0_usize;
+    let mut owned_artifacts = 0_usize;
     for (index, item) in flow_directory
         .entries()
         .map_err(FlowEditorError::ReadDirectory)?
         .enumerate()
     {
-        if index >= MAX_FLOW_CATALOG_ENTRIES {
+        if index >= MAX_FLOW_DIRECTORY_ENTRIES {
             return Err(FlowEditorError::TooManyEntries);
         }
         let item = item.map_err(FlowEditorError::ReadDirectory)?;
@@ -1008,6 +1012,20 @@ where
         let file_type = item.file_type().map_err(FlowEditorError::ReadEntry)?;
         if file_type.is_symlink() {
             return Err(FlowEditorError::UnsafeEntry(file_name));
+        }
+        if owned_artifact_target(&file_name).is_some() {
+            if !file_type.is_file() {
+                return Err(FlowEditorError::UnsafeEntry(file_name));
+            }
+            owned_artifacts += 1;
+            if owned_artifacts > MAX_FLOW_OWNED_ARTIFACTS {
+                return Err(FlowEditorError::TooManyRecoveryArtifacts);
+            }
+            continue;
+        }
+        catalog_entries += 1;
+        if catalog_entries > MAX_FLOW_CATALOG_ENTRIES {
+            return Err(FlowEditorError::TooManyEntries);
         }
         if file_type.is_dir() {
             continue;
@@ -1225,6 +1243,9 @@ fn atomic_save_locked(
     after_final_check: impl FnOnce(),
 ) -> Result<SavePublication, FlowEditorError> {
     verify_disk_baseline(directory, identity.file_name(), baseline)?;
+    if baseline.is_some() {
+        remove_prior_owned_artifacts(directory, identity.file_name())?;
+    }
     let backup_name = baseline
         .map(|_| create_backup_link(directory, identity.file_name()))
         .transpose()?;
@@ -1286,6 +1307,72 @@ fn atomic_save_locked(
         durability_confirmed,
         cleanup_complete,
     })
+}
+
+fn remove_prior_owned_artifacts(
+    directory: &Dir,
+    target_file_name: &str,
+) -> Result<(), FlowEditorError> {
+    let mut artifacts = Vec::new();
+    for (index, item) in directory
+        .entries()
+        .map_err(FlowEditorError::ReadDirectory)?
+        .enumerate()
+    {
+        if index >= MAX_FLOW_DIRECTORY_ENTRIES {
+            return Err(FlowEditorError::TooManyEntries);
+        }
+        let item = item.map_err(FlowEditorError::ReadDirectory)?;
+        let file_name = item
+            .file_name()
+            .into_string()
+            .map_err(|_| FlowEditorError::NonUtf8Entry)?;
+        if owned_artifact_target(&file_name) != Some(target_file_name) {
+            continue;
+        }
+        let file_type = item.file_type().map_err(FlowEditorError::ReadEntry)?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(FlowEditorError::UnsafeEntry(file_name));
+        }
+        artifacts.push(file_name);
+        if artifacts.len() > MAX_FLOW_OWNED_ARTIFACTS {
+            return Err(FlowEditorError::TooManyRecoveryArtifacts);
+        }
+    }
+    for artifact in artifacts {
+        directory
+            .remove_file(artifact)
+            .map_err(FlowEditorError::Write)?;
+    }
+    let _ = sync_directory(directory);
+    Ok(())
+}
+
+fn owned_artifact_target(file_name: &str) -> Option<&str> {
+    let reserved = file_name.strip_prefix('.')?;
+    for marker in [".backup-", ".tmp-"] {
+        let Some((target, suffix)) = reserved.rsplit_once(marker) else {
+            continue;
+        };
+        if target
+            .strip_suffix(".toml")
+            .is_some_and(|stem| !stem.is_empty())
+            && process_sequence_suffix(suffix)
+        {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn process_sequence_suffix(suffix: &str) -> bool {
+    let Some((process, sequence)) = suffix.split_once('-') else {
+        return false;
+    };
+    !process.is_empty()
+        && !sequence.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn create_backup_link(directory: &Dir, file_name: &str) -> Result<String, FlowEditorError> {
@@ -1498,6 +1585,7 @@ pub enum FlowEditorError {
     NonUtf8Entry,
     NonUtf8Definition(String),
     TooManyEntries,
+    TooManyRecoveryArtifacts,
     CatalogTooLarge,
     FileTooLarge(String),
     FileNameMismatch {
@@ -1561,7 +1649,11 @@ impl fmt::Display for FlowEditorError {
             }
             Self::TooManyEntries => write!(
                 formatter,
-                "Flow catalog exceeds the {MAX_FLOW_CATALOG_ENTRIES}-entry limit."
+                "Flow catalog exceeds its bounded directory-entry limits."
+            ),
+            Self::TooManyRecoveryArtifacts => write!(
+                formatter,
+                "Flow catalog exceeds the {MAX_FLOW_OWNED_ARTIFACTS}-recovery-artifact limit."
             ),
             Self::CatalogTooLarge => formatter.write_str("Flow catalog exceeds its byte limit."),
             Self::FileTooLarge(name) => write!(

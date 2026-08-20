@@ -11,6 +11,7 @@ members = [
     "crates/pam_compact",
     "crates/pam_model",
     "crates/pam_flow",
+    "src-tauri",
 ]
 resolver = "3"
 
@@ -32,6 +33,8 @@ llama-cpp-sys-4 = { version = "=0.6.0", default-features = false, features = ["m
 nix = { version = "=0.28.0", features = ["fs"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.145"
+tauri = { version = "=2.11.5", default-features = false, features = ["wry", "x11"] }
+tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
 rmp-serde = "=1.3.1"

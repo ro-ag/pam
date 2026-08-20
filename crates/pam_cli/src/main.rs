@@ -3,6 +3,7 @@ mod audit;
 mod command;
 mod evidence;
 mod flow;
+mod gui;
 mod render;
 mod request;
 
@@ -16,6 +17,8 @@ mod command_test;
 mod evidence_test;
 #[cfg(test)]
 mod flow_test;
+#[cfg(test)]
+mod gui_test;
 #[cfg(test)]
 mod render_test;
 #[cfg(test)]
@@ -158,10 +161,7 @@ async fn main() {
                 1
             }
         },
-        Mode::Gui => {
-            pam_gui::run();
-            0
-        }
+        Mode::Gui => gui::run(),
     };
 
     std::process::exit(exit_code);

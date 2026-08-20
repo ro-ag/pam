@@ -37,8 +37,9 @@ use crate::{
     LeasedRequest, MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
     MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
-    MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, ProjectPolicy, PutEvidence,
-    PutGrant, Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoreError, StoredResult,
+    MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
+    ProjectCurrent, ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant,
+    Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoreError, StoredResult,
     TerminalState,
 };
 
@@ -46,6 +47,8 @@ const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const FLOW_OPERATION_KIND: &str = "flow_run";
+const STATUS_OPERATION_KIND: &str = "status";
+const LEGACY_STATUS_OPERATION_KIND: &str = "daemon_status";
 const FLOW_CAPABILITY_NAME: &str = "flow.run";
 pub(super) const LATEST_SCHEMA_VERSION: u32 = 9;
 const MIGRATIONS: &[(u32, &str)] = &[
@@ -324,7 +327,41 @@ impl Store {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Policy(PolicyCommand::DecideApproval {
             approval_id,
+            project_id: None,
             approver_id,
+            decision,
+            now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Applies a caller's approval decision only when the approval belongs to that caller and
+    /// project.
+    ///
+    /// This is the remote-control-safe decision boundary: authenticate the caller first, then pass
+    /// that exact caller ID and the request-envelope project ID here. The approval-requester match,
+    /// project match, and active-caller check are performed atomically with the decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval is absent from the project, no longer pending, the
+    /// caller did not request the approval or is not active, the timestamp is invalid, or durable
+    /// state is unavailable.
+    pub async fn decide_project_approval(
+        &self,
+        approval_id: ApprovalId,
+        project_id: ProjectId,
+        caller_id: CallerId,
+        decision: ApprovalDecision,
+        now_ms: u64,
+    ) -> Result<ApprovalDecisionOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::DecideApproval {
+            approval_id,
+            project_id: Some(project_id),
+            approver_id: caller_id,
             decision,
             now_ms,
             response: response_tx,
@@ -946,6 +983,52 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Loads the current non-status scheduler workload for one project.
+    ///
+    /// Queued status requests are excluded from the count. A leased or
+    /// cancellation-requested non-status request remains active until its worker
+    /// acknowledges a terminal result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the transactionally consistent aggregate cannot
+    /// be read from durable state.
+    pub async fn project_workload(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<ProjectWorkload, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::ProjectWorkload {
+            project_id,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Loads a bounded, transactionally consistent current-work view for one project.
+    ///
+    /// Status requests are excluded. Queued work is FIFO and capped at
+    /// [`MAX_PROJECT_CURRENT_QUEUED`]; callers can inspect `queued_truncated` to decide whether to
+    /// offer a more targeted follow-up. The view never includes operation payloads, credentials,
+    /// approval receipts, results, or evidence content.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when durable state is invalid or unavailable.
+    pub async fn project_current(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<ProjectCurrent, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::ProjectCurrent {
+            project_id,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Stores exact evidence bytes behind an immutable semantic handle.
     ///
     /// Exact content is globally deduplicated by SHA-256 while handle lookup remains
@@ -1193,6 +1276,14 @@ enum Command {
         request_id: RequestId,
         response: Response<u64>,
     },
+    ProjectWorkload {
+        project_id: ProjectId,
+        response: Response<ProjectWorkload>,
+    },
+    ProjectCurrent {
+        project_id: ProjectId,
+        response: Response<ProjectCurrent>,
+    },
     Shutdown(Response<()>),
 }
 
@@ -1268,6 +1359,7 @@ enum PolicyCommand {
     },
     DecideApproval {
         approval_id: ApprovalId,
+        project_id: Option<ProjectId>,
         approver_id: CallerId,
         decision: ApprovalDecision,
         now_ms: u64,
@@ -1460,6 +1552,14 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
                 request_id,
                 response,
             } => respond(response, queued_behind(&mut connection, &request_id)),
+            Command::ProjectWorkload {
+                project_id,
+                response,
+            } => respond(response, project_workload(&connection, &project_id)),
+            Command::ProjectCurrent {
+                project_id,
+                response,
+            } => respond(response, project_current(&mut connection, &project_id)),
             Command::Shutdown(response) => {
                 drop(connection);
                 respond(response, Ok(()));
@@ -1553,13 +1653,21 @@ fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
         ),
         PolicyCommand::DecideApproval {
             approval_id,
+            project_id,
             approver_id,
             decision,
             now_ms,
             response,
         } => respond(
             response,
-            decide_approval(connection, &approval_id, &approver_id, decision, now_ms),
+            decide_approval(
+                connection,
+                &approval_id,
+                project_id.as_ref(),
+                &approver_id,
+                decision,
+                now_ms,
+            ),
         ),
     }
 }
@@ -3225,6 +3333,7 @@ fn resolve_approval(
 fn decide_approval(
     connection: &mut Connection,
     approval_id: &ApprovalId,
+    project_id: Option<&ProjectId>,
     approver_id: &CallerId,
     decision: ApprovalDecision,
     now_ms: u64,
@@ -3244,16 +3353,39 @@ fn decide_approval(
     }
     let approval = transaction
         .query_row(
-            "SELECT state, expires_at_ms FROM approvals WHERE approval_id = ?1",
-            [approval_id.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            "SELECT state, expires_at_ms, decided_by
+             FROM approvals
+             WHERE approval_id = ?1
+               AND (?2 IS NULL OR (project_id = ?2 AND caller_id = ?3))",
+            params![
+                approval_id.as_str(),
+                project_id.map(ProjectId::as_str),
+                approver_id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((state, expires_at)) = approval else {
+    let Some((state, expires_at, decided_by)) = approval else {
         return Err(StoreError::ApprovalNotFound(approval_id.clone()));
     };
-    if state != "requested" {
-        return Err(StoreError::InvalidApprovalState);
+    match (state.as_str(), decision, decided_by.as_deref()) {
+        ("approved", ApprovalDecision::Approve, Some(decider))
+            if decider == approver_id.as_str() =>
+        {
+            return Ok(ApprovalDecisionOutcome::Approved);
+        }
+        ("denied", ApprovalDecision::Deny, Some(decider)) if decider == approver_id.as_str() => {
+            return Ok(ApprovalDecisionOutcome::Denied);
+        }
+        ("expired", _, _) => return Ok(ApprovalDecisionOutcome::Expired),
+        ("requested", _, None) => {}
+        _ => return Err(StoreError::InvalidApprovalState),
     }
     if now_ms >= unsigned_integer(expires_at)? {
         transaction.execute(
@@ -5346,6 +5478,152 @@ fn queued_behind(connection: &mut Connection, request_id: &RequestId) -> Result<
     )?;
     transaction.commit()?;
     unsigned_integer(count)
+}
+
+fn project_workload(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<ProjectWorkload, StoreError> {
+    let (queued, active): (i64, bool) = connection.query_row(
+        "SELECT
+             COUNT(*) FILTER (WHERE state = 'queued'),
+             EXISTS(
+                 SELECT 1
+                 FROM requests AS active
+                 WHERE active.project_id = ?1
+                   AND active.operation_kind NOT IN (?2, ?3)
+                   AND active.state IN ('leased', 'cancellation_requested')
+             )
+         FROM requests
+         WHERE project_id = ?1 AND operation_kind NOT IN (?2, ?3)",
+        params![
+            project_id.as_str(),
+            STATUS_OPERATION_KIND,
+            LEGACY_STATUS_OPERATION_KIND
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(ProjectWorkload {
+        queued: unsigned_integer(queued)?,
+        active,
+    })
+}
+
+fn project_current(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+) -> Result<ProjectCurrent, StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let mut queued = {
+        let mut statement = transaction.prepare(
+            "SELECT request_id, operation_kind, state, queue_sequence,
+                    accepted_at_ms, completed_at_ms
+             FROM requests
+             WHERE project_id = ?1 AND operation_kind NOT IN (?2, ?3)
+               AND state = 'queued'
+             ORDER BY queue_sequence ASC, request_id ASC
+             LIMIT 65",
+        )?;
+        statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    STATUS_OPERATION_KIND,
+                    LEGACY_STATUS_OPERATION_KIND
+                ],
+                project_request_row,
+            )?
+            .map(|row| decode_project_request(row?))
+            .collect::<Result<Vec<_>, StoreError>>()?
+    };
+    let queued_truncated = queued.len() > MAX_PROJECT_CURRENT_QUEUED;
+    queued.truncate(MAX_PROJECT_CURRENT_QUEUED);
+
+    let active = transaction
+        .query_row(
+            "SELECT request_id, operation_kind, state, queue_sequence,
+                    accepted_at_ms, completed_at_ms
+             FROM requests
+             WHERE project_id = ?1 AND operation_kind NOT IN (?2, ?3)
+               AND state IN ('leased', 'cancellation_requested')
+             ORDER BY queue_sequence ASC, request_id ASC
+             LIMIT 1",
+            params![
+                project_id.as_str(),
+                STATUS_OPERATION_KIND,
+                LEGACY_STATUS_OPERATION_KIND
+            ],
+            project_request_row,
+        )
+        .optional()?
+        .map(decode_project_request)
+        .transpose()?;
+    let latest_terminal = transaction
+        .query_row(
+            "SELECT request_id, operation_kind, state, queue_sequence,
+                    accepted_at_ms, completed_at_ms
+             FROM requests
+             WHERE project_id = ?1 AND operation_kind NOT IN (?2, ?3)
+               AND state IN ('succeeded', 'failed', 'cancelled')
+             ORDER BY completed_at_ms DESC, queue_sequence DESC, request_id DESC
+             LIMIT 1",
+            params![
+                project_id.as_str(),
+                STATUS_OPERATION_KIND,
+                LEGACY_STATUS_OPERATION_KIND
+            ],
+            project_request_row,
+        )
+        .optional()?
+        .map(decode_project_request)
+        .transpose()?;
+    transaction.commit()?;
+
+    Ok(ProjectCurrent {
+        queued,
+        queued_truncated,
+        active,
+        latest_terminal,
+    })
+}
+
+type ProjectRequestRow = (String, String, String, i64, i64, Option<i64>);
+
+fn project_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRequestRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn decode_project_request(row: ProjectRequestRow) -> Result<ProjectRequestSummary, StoreError> {
+    let (request_id, operation_kind, state, queue_sequence, accepted_at_ms, completed_at_ms) = row;
+    let state = parse_state(&state)?;
+    let completed_at_ms = completed_at_ms.map(unsigned_integer).transpose()?;
+    match (state, completed_at_ms) {
+        (
+            RequestState::Queued | RequestState::Leased | RequestState::CancellationRequested,
+            None,
+        )
+        | (RequestState::Succeeded | RequestState::Failed | RequestState::Cancelled, Some(_)) => {}
+        _ => {
+            return Err(StoreError::InvalidState(
+                "request summary completion does not match state".to_owned(),
+            ));
+        }
+    }
+    Ok(ProjectRequestSummary {
+        request_id: RequestId::from(request_id),
+        operation_kind,
+        state,
+        queue_sequence: unsigned_integer(queue_sequence)?,
+        accepted_at_ms: unsigned_integer(accepted_at_ms)?,
+        completed_at_ms,
+    })
 }
 
 fn ensure_live_lease(

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

@@ -23,8 +23,8 @@ use super::{
     FlowCheckpointDisposition, FlowEffectAuthorization, FlowTerminalResult, GrantRevocation,
     MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
-    MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES, PutGrant, RequestState,
-    SaveFlowCheckpoint, Store, StoreError, TerminalState,
+    MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_PROJECT_CURRENT_QUEUED,
+    ProjectWorkload, PutGrant, RequestState, SaveFlowCheckpoint, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -43,6 +43,12 @@ fn request(
         operation_kind: "test.operation".to_owned(),
         operation: operation.to_vec(),
     }
+}
+
+fn request_with_kind(request_id: &str, operation_kind: &str, operation: &[u8]) -> AcceptRequest {
+    let mut accepted = request(request_id, "caller", "project-a", request_id, operation);
+    accepted.operation_kind = operation_kind.to_owned();
+    accepted
 }
 
 fn capability(value: &str) -> CapabilityName {
@@ -244,6 +250,140 @@ fn flow_authorization_request(
 async fn close(store: Store, directory: &Path) {
     store.shutdown().await.unwrap();
     fs::remove_dir_all(directory).unwrap();
+}
+
+async fn assert_project_workload(store: &Store, project_id: &str, queued: u64, active: bool) {
+    assert_eq!(
+        store
+            .project_workload(ProjectId::from(project_id))
+            .await
+            .unwrap(),
+        ProjectWorkload { queued, active }
+    );
+}
+
+async fn seed_project_current_history(store: &Store) {
+    let status = request_with_kind("status-a", "status", b"status-secret");
+    let legacy_status =
+        request_with_kind("legacy-status-a", "daemon_status", b"legacy-status-secret");
+    for (accepted, now_ms) in [
+        (status, 1),
+        (legacy_status, 2),
+        (
+            request(
+                "terminal-a-1",
+                "caller",
+                "project-a",
+                "terminal-a-1",
+                b"first-result-secret",
+            ),
+            3,
+        ),
+        (
+            request(
+                "terminal-a-2",
+                "caller",
+                "project-a",
+                "terminal-a-2",
+                b"second-result-secret",
+            ),
+            4,
+        ),
+        (
+            request(
+                "active-a",
+                "caller",
+                "project-a",
+                "active-a",
+                b"active-operation-secret",
+            ),
+            5,
+        ),
+    ] {
+        store.accept(accepted, now_ms).await.unwrap();
+    }
+
+    let status = store.claim("worker", 10, 1_000).await.unwrap().unwrap();
+    store
+        .finish(
+            status.lease,
+            20,
+            TerminalState::Succeeded,
+            b"status-result-secret".to_vec(),
+        )
+        .await
+        .unwrap();
+    let legacy_status = store.claim("worker", 21, 1_000).await.unwrap().unwrap();
+    store
+        .finish(
+            legacy_status.lease,
+            101,
+            TerminalState::Succeeded,
+            b"legacy-status-result-secret".to_vec(),
+        )
+        .await
+        .unwrap();
+    let first = store.claim("worker", 22, 1_000).await.unwrap().unwrap();
+    store
+        .finish(
+            first.lease,
+            100,
+            TerminalState::Failed,
+            b"failed-secret".to_vec(),
+        )
+        .await
+        .unwrap();
+    let second = store.claim("worker", 23, 1_000).await.unwrap().unwrap();
+    store
+        .finish(
+            second.lease,
+            100,
+            TerminalState::Succeeded,
+            b"solved-secret".to_vec(),
+        )
+        .await
+        .unwrap();
+    let active = store.claim("worker", 24, 1_000).await.unwrap().unwrap();
+    assert_eq!(active.lease.request_id, RequestId::from("active-a"));
+    assert_eq!(
+        store
+            .cancel(active.lease.request_id, 25, b"cancel-secret".to_vec())
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+}
+
+async fn seed_project_current_queue(store: &Store) {
+    for index in 0_u64..66 {
+        let request_id = format!("queued-a-{index:02}");
+        store
+            .accept(
+                request(
+                    &request_id,
+                    "caller",
+                    "project-a",
+                    &request_id,
+                    b"queued-operation-secret",
+                ),
+                200 + index,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .accept(
+            request(
+                "queued-b",
+                "caller",
+                "project-b",
+                "queued-b",
+                b"other-project-secret",
+            ),
+            300,
+        )
+        .await
+        .unwrap();
 }
 
 fn flow_definition(revision: u64) -> FlowDefinition {
@@ -2339,6 +2479,132 @@ async fn queued_behind_counts_only_later_nonterminal_project_work() {
 }
 
 #[tokio::test]
+async fn project_workload_reports_only_non_status_queued_and_active_work() {
+    let (directory, path) = database_path("project-workload");
+    let store = Store::open(&path).unwrap();
+
+    let status = request_with_kind("status-a", "status", b"status");
+    let legacy_status = request_with_kind("legacy-status-a", "daemon_status", b"legacy-status");
+    for (accepted, now_ms) in [
+        (status, 10),
+        (legacy_status, 11),
+        (
+            request("work-a-1", "caller", "project-a", "work-a-1", b"first"),
+            12,
+        ),
+        (
+            request("work-a-2", "caller", "project-a", "work-a-2", b"second"),
+            13,
+        ),
+        (
+            request("work-b-1", "caller", "project-b", "work-b-1", b"other"),
+            14,
+        ),
+    ] {
+        store.accept(accepted, now_ms).await.unwrap();
+    }
+
+    assert_project_workload(&store, "project-a", 2, false).await;
+    assert_project_workload(&store, "project-b", 1, false).await;
+    assert_project_workload(&store, "missing-project", 0, false).await;
+
+    let status = store.claim("worker", 20, 100).await.unwrap().unwrap();
+    assert_eq!(status.lease.request_id, RequestId::from("status-a"));
+    assert_project_workload(&store, "project-a", 2, false).await;
+    store
+        .finish(status.lease, 21, TerminalState::Succeeded, Vec::new())
+        .await
+        .unwrap();
+
+    let legacy_status = store.claim("worker", 22, 100).await.unwrap().unwrap();
+    assert_eq!(
+        legacy_status.lease.request_id,
+        RequestId::from("legacy-status-a")
+    );
+    assert_project_workload(&store, "project-a", 2, false).await;
+    store
+        .finish(
+            legacy_status.lease,
+            23,
+            TerminalState::Succeeded,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let work = store.claim("worker", 24, 100).await.unwrap().unwrap();
+    assert_eq!(work.lease.request_id, RequestId::from("work-a-1"));
+    assert_project_workload(&store, "project-a", 1, true).await;
+    assert_eq!(
+        store
+            .cancel(work.lease.request_id.clone(), 25, b"cancelled".to_vec())
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+    assert_project_workload(&store, "project-a", 1, true).await;
+    store
+        .finish(work.lease, 26, TerminalState::Succeeded, Vec::new())
+        .await
+        .unwrap();
+    assert_project_workload(&store, "project-a", 1, false).await;
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn project_current_is_bounded_fifo_project_scoped_and_excludes_status() {
+    let (directory, path) = database_path("project-current");
+    let store = Store::open(&path).unwrap();
+    seed_project_current_history(&store).await;
+    seed_project_current_queue(&store).await;
+
+    let current = store
+        .project_current(ProjectId::from("project-a"))
+        .await
+        .unwrap();
+    assert_eq!(current.queued.len(), MAX_PROJECT_CURRENT_QUEUED);
+    assert!(current.queued_truncated);
+    assert_eq!(current.queued[0].request_id, RequestId::from("queued-a-00"));
+    assert_eq!(current.queued[0].queue_sequence, 6);
+    assert_eq!(current.queued[0].accepted_at_ms, 200);
+    assert_eq!(current.queued[0].completed_at_ms, None);
+    assert_eq!(
+        current.queued[MAX_PROJECT_CURRENT_QUEUED - 1].request_id,
+        RequestId::from("queued-a-63")
+    );
+    let active = current.active.unwrap();
+    assert_eq!(active.request_id, RequestId::from("active-a"));
+    assert_eq!(active.state, RequestState::CancellationRequested);
+    assert_eq!(active.completed_at_ms, None);
+    let latest_terminal = current.latest_terminal.unwrap();
+    assert_eq!(latest_terminal.request_id, RequestId::from("terminal-a-2"));
+    assert_eq!(latest_terminal.state, RequestState::Succeeded);
+    assert_eq!(latest_terminal.completed_at_ms, Some(100));
+
+    let other = store
+        .project_current(ProjectId::from("project-b"))
+        .await
+        .unwrap();
+    assert_eq!(other.queued.len(), 1);
+    assert_eq!(other.queued[0].request_id, RequestId::from("queued-b"));
+    assert!(!other.queued_truncated);
+    assert_eq!(other.active, None);
+    assert_eq!(other.latest_terminal, None);
+
+    let missing = store
+        .project_current(ProjectId::from("missing-project"))
+        .await
+        .unwrap();
+    assert!(missing.queued.is_empty());
+    assert!(!missing.queued_truncated);
+    assert_eq!(missing.active, None);
+    assert_eq!(missing.latest_terminal, None);
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
 async fn terminal_result_and_gap_free_events_replay_atomically_after_reopen() {
     let (directory, path) = database_path("result-replay");
     let store = Store::open(&path).unwrap();
@@ -3970,6 +4236,82 @@ async fn approvals_are_exact_durable_and_consumed_atomically_once() {
 }
 
 #[tokio::test]
+async fn project_approval_decisions_require_active_requester_and_exact_project() {
+    let (directory, _path, store) = open_approval_store("project-bound-approval").await;
+    let AuthorizationOutcome::ApprovalRequired { approval_id, .. } = store
+        .authorize(
+            authorization(
+                "approval-subject",
+                "approval-project",
+                "deploy",
+                "release-a",
+                None,
+            ),
+            100,
+            20,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("approval-requiring grant should return an approval ID")
+    };
+
+    assert!(matches!(
+        store
+            .decide_project_approval(
+                approval_id.clone(),
+                ProjectId::from("approval-project"),
+                CallerId::from("unknown-reviewer"),
+                ApprovalDecision::Approve,
+                101,
+            )
+            .await,
+        Err(StoreError::InvalidApprovalState)
+    ));
+    for decision in [ApprovalDecision::Approve, ApprovalDecision::Deny] {
+        assert!(matches!(
+            store
+                .decide_project_approval(
+                    approval_id.clone(),
+                    ProjectId::from("approval-project"),
+                    CallerId::from("approval-reviewer"),
+                    decision,
+                    101,
+                )
+                .await,
+            Err(StoreError::ApprovalNotFound(id)) if id == approval_id
+        ));
+    }
+    assert!(matches!(
+        store
+            .decide_project_approval(
+                approval_id.clone(),
+                ProjectId::from("other-project"),
+                CallerId::from("approval-subject"),
+                ApprovalDecision::Approve,
+                101,
+            )
+            .await,
+        Err(StoreError::ApprovalNotFound(id)) if id == approval_id
+    ));
+    assert_eq!(
+        store
+            .decide_project_approval(
+                approval_id,
+                ProjectId::from("approval-project"),
+                CallerId::from("approval-subject"),
+                ApprovalDecision::Approve,
+                102,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Approved
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
 async fn audit_failure_rolls_back_approval_creation() {
     let (directory, path, store) = open_approval_store("audit-approval-create-rollback").await;
     store
@@ -4054,6 +4396,61 @@ async fn audit_failure_rolls_back_one_time_approval_consumption() {
     close(store, &directory).await;
 }
 
+async fn assert_denied_decision_retry_is_idempotent(store: &Store, denied_id: &ApprovalId) {
+    assert_eq!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                111,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Denied
+    );
+    assert_eq!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                112,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Denied,
+        "an identical retry after a lost response must be idempotent"
+    );
+    assert!(matches!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Approve,
+                112,
+            )
+            .await,
+        Err(StoreError::InvalidApprovalState)
+    ));
+}
+
+async fn assert_expired_decision_retry_is_idempotent(store: &Store, expiring_id: &ApprovalId) {
+    assert_eq!(
+        store
+            .decide_approval(
+                expiring_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                131,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Expired,
+        "an expired decision response must also be safely repeatable"
+    );
+}
+
 #[tokio::test]
 async fn approval_decisions_return_denied_and_expired_outcomes() {
     let (directory, _path, store) = open_approval_store("approval-outcomes").await;
@@ -4074,18 +4471,7 @@ async fn approval_decisions_return_denied_and_expired_outcomes() {
     else {
         panic!("a new exact effect should request a new approval")
     };
-    assert_eq!(
-        store
-            .decide_approval(
-                denied_id.clone(),
-                CallerId::from("approval-reviewer"),
-                ApprovalDecision::Deny,
-                111,
-            )
-            .await
-            .unwrap(),
-        ApprovalDecisionOutcome::Denied
-    );
+    assert_denied_decision_retry_is_idempotent(&store, &denied_id).await;
     let mut denied_request = exact_request.clone();
     denied_request.approval_id = Some(denied_id);
     assert_eq!(
@@ -4112,6 +4498,7 @@ async fn approval_decisions_return_denied_and_expired_outcomes() {
             .unwrap(),
         ApprovalDecisionOutcome::Expired
     );
+    assert_expired_decision_retry_is_idempotent(&store, &expiring_id).await;
     assert_eq!(
         store
             .authorize(

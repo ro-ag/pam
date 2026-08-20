@@ -26,9 +26,9 @@ pub use model::{
     MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
     MAX_AUDIT_PROJECT_ID_BYTES, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_MEDIA_TYPE_BYTES,
     MAX_EVIDENCE_PRUNE_BATCH_SIZE, MAX_EVIDENCE_RANGE_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
-    MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, ProjectPolicy, PutEvidence,
-    PutGrant, Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoredResult,
-    TerminalState,
+    MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
+    ProjectCurrent, ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant,
+    Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoredResult, TerminalState,
 };
 pub use pam_model::{ModelKey, RegisteredModel};
 pub use store::Store;

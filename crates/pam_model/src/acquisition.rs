@@ -1112,8 +1112,8 @@ impl AcquisitionLock {
         if !file.metadata()?.is_file() {
             return Err(ModelError::UnsafePath);
         }
-        let mut file = file.into_std();
         ensure_single_link(&file)?;
+        let mut file = file.into_std();
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(ModelError::ConcurrentAcquisition),
@@ -1243,29 +1243,17 @@ fn open_partial(paths: &AcquisitionPaths, offset: u64) -> Result<File, ModelErro
         .parent
         .open_with(&paths.partial, &options)
         .map_err(|error| classify_file_open_error(&paths.parent, &paths.partial, error))?;
-    let file = file.into_std();
     ensure_single_link(&file)?;
+    let file = file.into_std();
     if file.metadata()?.len() != offset {
         return Err(ModelError::CheckpointConflict);
     }
     Ok(file)
 }
 
-#[cfg(unix)]
-fn ensure_single_link(file: &File) -> Result<(), ModelError> {
-    let metadata = file.metadata()?;
-    if std::os::unix::fs::MetadataExt::nlink(&metadata) == 1 {
-        Ok(())
-    } else {
-        Err(ModelError::UnsafePath)
-    }
-}
-
-#[cfg(windows)]
-fn ensure_single_link(file: &File) -> Result<(), ModelError> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    if file.metadata()?.number_of_links() == Some(1) {
+#[cfg(any(unix, windows))]
+fn ensure_single_link(file: &CapFile) -> Result<(), ModelError> {
+    if file.metadata()?.nlink() == 1 {
         Ok(())
     } else {
         Err(ModelError::UnsafePath)
@@ -1273,7 +1261,7 @@ fn ensure_single_link(file: &File) -> Result<(), ModelError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_single_link(_file: &File) -> Result<(), ModelError> {
+fn ensure_single_link(_file: &CapFile) -> Result<(), ModelError> {
     Ok(())
 }
 

@@ -1,15 +1,30 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    path::{Component, Path, PathBuf},
+};
 
 use pam_core::{
     ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
-    ProjectId, RequestId,
+    MAX_CALLER_CREDENTIAL_LENGTH, ProjectId, RequestId,
 };
+use pam_flow::{FlowDefinition, MAX_FLOW_DOCUMENT_BYTES, RunId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MAX_EVIDENCE_CHUNK_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_MESSAGES, MAX_MODEL_OUTPUT_BYTES,
-    MAX_MODEL_OUTPUT_TOKENS, MAX_MODEL_PROMPT_BYTES, PROTOCOL_VERSION,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_MESSAGES,
+    MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS, MAX_MODEL_PROMPT_BYTES, PROTOCOL_VERSION,
 };
+
+// Flow requests are authenticated and may carry one exact approval receipt.
+// Reserve their maximum validated values plus named-MessagePack field overhead
+// so the infallible attachment builders cannot push a constructed request over
+// the frame boundary. Daemon request identifiers, including issued approval
+// IDs, are bounded to 256 bytes.
+const MAX_FLOW_APPROVAL_ID_BYTES: usize = 256;
+const MAX_FLOW_REQUEST_ATTACHMENT_BYTES: usize =
+    MAX_CALLER_CREDENTIAL_LENGTH + MAX_FLOW_APPROVAL_ID_BYTES + 64;
+pub const MAX_FLOW_PROJECT_ROOT_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
@@ -72,7 +87,37 @@ impl RequestEnvelope {
             capability: Capability::CancelRequest,
             idempotency_key,
             deadline_unix_ms: None,
-            payload: RequestPayload::Cancel { target_request_id },
+            payload: RequestPayload::Cancel {
+                target_request_id,
+                expected_target_kind: None,
+            },
+        }
+    }
+
+    /// Creates a cancellation request bound to an immutable target kind.
+    #[must_use]
+    pub fn cancel_with_expected_target(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        target_request_id: RequestId,
+        expected_target_kind: ExpectedTargetKind,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::CancelRequest,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::Cancel {
+                target_request_id,
+                expected_target_kind: Some(expected_target_kind),
+            },
         }
     }
 
@@ -104,6 +149,36 @@ impl RequestEnvelope {
             payload: RequestPayload::Replay {
                 target_request_id,
                 after_sequence,
+                expected_target_kind: None,
+            },
+        }
+    }
+
+    /// Creates an event replay request bound to an immutable target kind.
+    #[must_use]
+    pub fn replay_with_expected_target(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        target_request_id: RequestId,
+        after_sequence: u64,
+        expected_target_kind: ExpectedTargetKind,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::ReplayEvents,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::Replay {
+                target_request_id,
+                after_sequence,
+                expected_target_kind: Some(expected_target_kind),
             },
         }
     }
@@ -190,6 +265,45 @@ impl RequestEnvelope {
         })
     }
 
+    /// Creates an authenticated, policy-gated request to run a validated flow.
+    ///
+    /// Attach the caller credential with [`Self::authenticated`] before sending
+    /// the request. The raw TOML and canonical project root remain available to
+    /// the daemon but are redacted from debug output.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contract error when the definition is malformed, either field
+    /// exceeds its budget, the project root is not canonical absolute UTF-8, or
+    /// the encoded request would exceed the protocol frame limit.
+    pub fn flow_run(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        definition: impl Into<String>,
+        project_root: impl Into<String>,
+    ) -> Result<Self, ProtocolContractError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::FlowRun,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::FlowRun {
+                definition: FlowDefinitionDocument::new(definition)?,
+                project_root: FlowProjectRoot::new(project_root)?,
+            },
+        };
+        request.validate_flow_request()?;
+        validate_flow_request_frame(&request)?;
+        Ok(request)
+    }
+
     /// Revalidates the bounded direct-inference payload after deserialization.
     ///
     /// # Errors
@@ -205,6 +319,27 @@ impl RequestEnvelope {
             } => {
                 validate_model_generation(model, messages, *max_output_tokens)?;
                 validate_model_deadline(self.deadline_unix_ms)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Revalidates a flow definition after the request has been deserialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contract error for an invalid run identity or malformed,
+    /// unsafe, or over-budget TOML.
+    pub fn validate_flow_request(&self) -> Result<(), ProtocolContractError> {
+        match &self.payload {
+            RequestPayload::FlowRun {
+                definition,
+                project_root,
+            } => {
+                RunId::parse(self.request_id.as_str())
+                    .map_err(|_| ProtocolContractError::InvalidFlowRunId)?;
+                definition.validate()?;
+                project_root.validate()
             }
             _ => Ok(()),
         }
@@ -237,6 +372,36 @@ impl RequestEnvelope {
             payload: RequestPayload::WaitForResult {
                 target_request_id,
                 after_sequence,
+                expected_target_kind: None,
+            },
+        }
+    }
+
+    /// Creates a wait request bound to an immutable target kind.
+    #[must_use]
+    pub fn wait_for_result_with_expected_target(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        target_request_id: RequestId,
+        after_sequence: u64,
+        expected_target_kind: ExpectedTargetKind,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::WaitForResult,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::WaitForResult {
+                target_request_id,
+                after_sequence,
+                expected_target_kind: Some(expected_target_kind),
             },
         }
     }
@@ -264,7 +429,37 @@ impl RequestEnvelope {
             capability: Capability::GetResult,
             idempotency_key,
             deadline_unix_ms: None,
-            payload: RequestPayload::GetResult { target_request_id },
+            payload: RequestPayload::GetResult {
+                target_request_id,
+                expected_target_kind: None,
+            },
+        }
+    }
+
+    /// Creates a non-blocking result read bound to an immutable target kind.
+    #[must_use]
+    pub fn get_result_with_expected_target(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        target_request_id: RequestId,
+        expected_target_kind: ExpectedTargetKind,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::GetResult,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::GetResult {
+                target_request_id,
+                expected_target_kind: Some(expected_target_kind),
+            },
         }
     }
 
@@ -371,6 +566,7 @@ pub enum Capability {
     InspectEvidence,
     ReadEvidence,
     ModelInfer,
+    FlowRun,
 }
 
 impl Capability {
@@ -387,7 +583,138 @@ impl Capability {
             Self::InspectEvidence => "evidence.inspect",
             Self::ReadEvidence => "evidence.read",
             Self::ModelInfer => "model.infer",
+            Self::FlowRun => "flow.run",
         }
+    }
+}
+
+/// Bounded flow TOML transported without exposing its contents through debug logs.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct FlowDefinitionDocument(String);
+
+impl<'de> Deserialize<'de> for FlowDefinitionDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let definition = String::deserialize(deserializer)?;
+        Self::new(definition).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for FlowDefinitionDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FlowDefinitionDocument")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+impl FlowDefinitionDocument {
+    /// Creates a document within the flow schema's transport budget.
+    ///
+    /// Parsing is performed by [`RequestEnvelope::validate_flow_request`] so
+    /// constructors and canonical request decoding share one validation path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolContractError::FlowDefinitionTooLarge`] when the TOML
+    /// exceeds [`MAX_FLOW_DOCUMENT_BYTES`].
+    pub fn new(definition: impl Into<String>) -> Result<Self, ProtocolContractError> {
+        let definition = definition.into();
+        if definition.len() > MAX_FLOW_DOCUMENT_BYTES {
+            return Err(ProtocolContractError::FlowDefinitionTooLarge {
+                actual: definition.len(),
+                maximum: MAX_FLOW_DOCUMENT_BYTES,
+            });
+        }
+        Ok(Self(definition))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<(), ProtocolContractError> {
+        FlowDefinition::parse_toml(&self.0)
+            .map(|_| ())
+            .map_err(|_| ProtocolContractError::InvalidFlowDefinition)
+    }
+}
+
+/// Bounded canonical project root transported without exposing its path in debug logs.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct FlowProjectRoot(String);
+
+impl<'de> Deserialize<'de> for FlowProjectRoot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let project_root = String::deserialize(deserializer)?;
+        Self::new(project_root).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for FlowProjectRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FlowProjectRoot")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+impl FlowProjectRoot {
+    /// Creates a bounded, lexically canonical absolute project root.
+    ///
+    /// The daemon still resolves the supplied path and verifies that its
+    /// canonical filesystem identity matches the request's project ID before
+    /// reading any workspace content.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contract error when the root is over budget, relative, or
+    /// contains path syntax that a canonical path would have removed.
+    pub fn new(project_root: impl Into<String>) -> Result<Self, ProtocolContractError> {
+        let project_root = project_root.into();
+        if project_root.len() > MAX_FLOW_PROJECT_ROOT_BYTES {
+            return Err(ProtocolContractError::FlowProjectRootTooLarge {
+                actual: project_root.len(),
+                maximum: MAX_FLOW_PROJECT_ROOT_BYTES,
+            });
+        }
+        let root = Self(project_root);
+        root.validate()?;
+        Ok(root)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<(), ProtocolContractError> {
+        let path = Path::new(&self.0);
+        let components_are_canonical = path.components().all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        });
+        let normalized = path.components().collect::<PathBuf>();
+        if self.0.is_empty()
+            || !path.is_absolute()
+            || !components_are_canonical
+            || normalized.as_os_str() != path.as_os_str()
+        {
+            return Err(ProtocolContractError::InvalidFlowProjectRoot);
+        }
+        Ok(())
     }
 }
 
@@ -397,19 +724,27 @@ pub enum RequestPayload {
     Status,
     Cancel {
         target_request_id: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_target_kind: Option<ExpectedTargetKind>,
     },
     Replay {
         target_request_id: RequestId,
         after_sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_target_kind: Option<ExpectedTargetKind>,
     },
     Brief,
     NetworkDiagnostics,
     WaitForResult {
         target_request_id: RequestId,
         after_sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_target_kind: Option<ExpectedTargetKind>,
     },
     GetResult {
         target_request_id: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_target_kind: Option<ExpectedTargetKind>,
     },
     InspectEvidence {
         handle: EvidenceHandle,
@@ -425,6 +760,30 @@ pub enum RequestPayload {
         messages: Vec<ModelMessage>,
         max_output_tokens: u32,
     },
+    FlowRun {
+        definition: FlowDefinitionDocument,
+        project_root: FlowProjectRoot,
+    },
+}
+
+/// Optional immutable target classification bound by observer operations.
+///
+/// A flow-namespaced observer sets this to [`Self::FlowRun`] so a request ID
+/// belonging to unrelated durable work cannot be cancelled or observed by
+/// mistake. Generic observer commands omit the expectation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedTargetKind {
+    FlowRun,
+}
+
+impl ExpectedTargetKind {
+    #[must_use]
+    pub const fn policy_label(self) -> &'static str {
+        match self {
+            Self::FlowRun => "flow_run",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -466,6 +825,7 @@ pub enum ResultPayload {
     EvidenceMetadata(EvidenceMetadata),
     EvidenceChunk(EvidenceChunk),
     ModelGeneration(ModelGenerationResult),
+    FlowRun(pam_flow::FlowRunResult),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -747,6 +1107,13 @@ pub enum ProtocolContractError {
     ModelPromptTooLarge { actual: usize, maximum: usize },
     InvalidModelOutputTokens { actual: u32, maximum: u32 },
     ModelOutputTooLarge { actual: usize, maximum: usize },
+    FlowDefinitionTooLarge { actual: usize, maximum: usize },
+    FlowProjectRootTooLarge { actual: usize, maximum: usize },
+    InvalidFlowProjectRoot,
+    InvalidFlowRunId,
+    InvalidFlowDefinition,
+    FlowRequestTooLarge { actual: usize, maximum: usize },
+    FlowRequestEncoding,
 }
 
 impl fmt::Display for ProtocolContractError {
@@ -786,11 +1153,49 @@ impl fmt::Display for ProtocolContractError {
                 formatter,
                 "model output is {actual} bytes; maximum is {maximum} bytes"
             ),
+            Self::FlowDefinitionTooLarge { actual, maximum } => write!(
+                formatter,
+                "flow definition is {actual} bytes; maximum is {maximum} bytes"
+            ),
+            Self::FlowProjectRootTooLarge { actual, maximum } => write!(
+                formatter,
+                "flow project root is {actual} bytes; maximum is {maximum} bytes"
+            ),
+            Self::InvalidFlowProjectRoot => formatter
+                .write_str("flow project root must be a bounded canonical absolute UTF-8 path"),
+            Self::InvalidFlowRunId => formatter.write_str(
+                "flow run request identifier must use the bounded portable run-ID format",
+            ),
+            Self::InvalidFlowDefinition => {
+                formatter.write_str("flow definition is malformed or invalid")
+            }
+            Self::FlowRequestTooLarge { actual, maximum } => write!(
+                formatter,
+                "encoded flow request is {actual} bytes; maximum is {maximum} bytes"
+            ),
+            Self::FlowRequestEncoding => {
+                formatter.write_str("flow request could not be encoded for size validation")
+            }
         }
     }
 }
 
 impl Error for ProtocolContractError {}
+
+fn validate_flow_request_frame(request: &RequestEnvelope) -> Result<(), ProtocolContractError> {
+    let encoded = rmp_serde::to_vec_named(request)
+        .map_err(|_| ProtocolContractError::FlowRequestEncoding)?
+        .len();
+    let actual = encoded.saturating_add(MAX_FLOW_REQUEST_ATTACHMENT_BYTES);
+    if actual > MAX_FRAME_SIZE {
+        Err(ProtocolContractError::FlowRequestTooLarge {
+            actual,
+            maximum: MAX_FRAME_SIZE,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 fn validate_model_generation(
     model: &str,
@@ -911,6 +1316,7 @@ pub struct CancellationResult {
 #[serde(rename_all = "snake_case")]
 pub enum CancellationDisposition {
     Requested,
+    AlreadyRequested,
     AlreadyCancelled,
     AlreadyTerminal,
 }
@@ -1019,6 +1425,7 @@ pub enum Event {
     Cancelled,
     Completed,
     Failed,
+    FlowTransition(pam_flow::RunTransition),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

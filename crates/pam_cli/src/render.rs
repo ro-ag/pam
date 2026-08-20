@@ -32,15 +32,198 @@ pub(crate) fn present_result(body: &ResultBody) -> Presentation {
 pub(crate) fn render_events(events: &[EventEnvelope]) -> String {
     let mut rendered = String::new();
     for event in events {
-        writeln!(
-            rendered,
-            "sequence={} event={}",
-            event.sequence,
-            event_label(&event.event)
-        )
-        .expect("writing to a String cannot fail");
+        if let Event::FlowTransition(transition) = &event.event {
+            if transition.semantic_events().is_empty() {
+                write!(
+                    rendered,
+                    "sequence={} event=flow_transition flow_sequence={} ",
+                    event.sequence,
+                    transition.sequence()
+                )
+                .expect("writing to a String cannot fail");
+                render_flow_transition(&mut rendered, transition.kind());
+                rendered.push('\n');
+            } else {
+                for (semantic_index, semantic) in transition.semantic_events().iter().enumerate() {
+                    write!(
+                        rendered,
+                        "sequence={} event=flow_progress flow_sequence={} semantic_index={} ",
+                        event.sequence,
+                        transition.sequence(),
+                        semantic_index + 1
+                    )
+                    .expect("writing to a String cannot fail");
+                    render_flow_semantic_event(&mut rendered, semantic);
+                    rendered.push('\n');
+                }
+            }
+        } else {
+            writeln!(
+                rendered,
+                "sequence={} event={}",
+                event.sequence,
+                event_label(&event.event)
+            )
+            .expect("writing to a String cannot fail");
+        }
     }
     rendered
+}
+
+fn render_flow_semantic_event(rendered: &mut String, event: &pam_flow::FlowSemanticEvent) {
+    use pam_flow::FlowSemanticEvent;
+    match event {
+        FlowSemanticEvent::Waiting {
+            step_id,
+            reason,
+            not_before_ms,
+        } => {
+            write!(
+                rendered,
+                "progress=waiting step={} reason={}",
+                escape_text(step_id),
+                flow_wait_reason_label(*reason)
+            )
+            .expect("writing to a String cannot fail");
+            if let Some(not_before_ms) = not_before_ms {
+                write!(rendered, " not_before_ms={not_before_ms}")
+                    .expect("writing to a String cannot fail");
+            }
+        }
+        FlowSemanticEvent::ApprovalRequired { step_id } => write!(
+            rendered,
+            "progress=approval_required step={}",
+            escape_text(step_id)
+        )
+        .expect("writing to a String cannot fail"),
+        FlowSemanticEvent::EvidenceFound { step_id, evidence } => {
+            write!(
+                rendered,
+                "progress=evidence_found step={} evidence=",
+                escape_text(step_id)
+            )
+            .expect("writing to a String cannot fail");
+            render_flow_evidence(rendered, evidence);
+        }
+        FlowSemanticEvent::FixApplied { step_id, report } => {
+            render_semantic_report(rendered, "fix_applied", step_id, report);
+        }
+        FlowSemanticEvent::VerificationPassed { step_id, report } => {
+            render_semantic_report(rendered, "verification_passed", step_id, report);
+        }
+        FlowSemanticEvent::Unresolved { step_id, report } => {
+            render_semantic_report(rendered, "unresolved", step_id, report);
+        }
+        FlowSemanticEvent::Blocked { step_id, report } => {
+            render_semantic_report(rendered, "blocked", step_id, report);
+        }
+    }
+}
+
+fn render_semantic_report(
+    rendered: &mut String,
+    progress: &str,
+    step_id: &str,
+    report: &pam_flow::EffectReport,
+) {
+    write!(
+        rendered,
+        "progress={progress} step={} summary={} evidence=",
+        escape_text(step_id),
+        escape_text(report.summary())
+    )
+    .expect("writing to a String cannot fail");
+    render_flow_evidence(rendered, report.evidence());
+}
+
+fn render_flow_transition(rendered: &mut String, kind: &pam_flow::TransitionKind) {
+    use pam_flow::TransitionKind;
+    match kind {
+        TransitionKind::StepSkipped { step_id } => {
+            write!(rendered, "transition=step_skipped step={}", escape_text(step_id))
+        }
+        TransitionKind::ApprovalRequested { step_id } => write!(
+            rendered,
+            "transition=approval_requested step={}",
+            escape_text(step_id)
+        ),
+        TransitionKind::ApprovalGranted { step_id } => write!(
+            rendered,
+            "transition=approval_granted step={}",
+            escape_text(step_id)
+        ),
+        TransitionKind::ApprovalDenied { step_id } => write!(
+            rendered,
+            "transition=approval_denied step={}",
+            escape_text(step_id)
+        ),
+        TransitionKind::EffectEvaluationRequired { step_id, attempt } => write!(
+            rendered,
+            "transition=effect_evaluation_required step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::EffectAuthorizationDenied {
+            step_id,
+            attempt,
+            replay,
+        } => write!(
+            rendered,
+            "transition=effect_authorization_denied step={} attempt={attempt} replay={replay}",
+            escape_text(step_id)
+        ),
+        TransitionKind::EffectStarted {
+            step_id,
+            attempt,
+            replay,
+        } => write!(
+            rendered,
+            "transition=effect_started step={} attempt={attempt} replay={replay}",
+            escape_text(step_id)
+        ),
+        TransitionKind::EffectSucceeded { step_id, attempt } => write!(
+            rendered,
+            "transition=effect_succeeded step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::RetryScheduled {
+            step_id,
+            next_attempt,
+            not_before_ms,
+        } => write!(
+            rendered,
+            "transition=retry_scheduled step={} next_attempt={next_attempt} not_before_ms={not_before_ms}",
+            escape_text(step_id)
+        ),
+        TransitionKind::RetryExhausted { step_id, attempt } => write!(
+            rendered,
+            "transition=retry_exhausted step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::EffectFailed { step_id, attempt } => write!(
+            rendered,
+            "transition=effect_failed step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::ReconciledNotApplied { step_id, attempt } => write!(
+            rendered,
+            "transition=reconciled_not_applied step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::ReconciliationUnknown { step_id, attempt } => write!(
+            rendered,
+            "transition=reconciliation_unknown step={} attempt={attempt}",
+            escape_text(step_id)
+        ),
+        TransitionKind::CancellationRequested => {
+            rendered.write_str("transition=cancellation_requested")
+        }
+        TransitionKind::RunCompleted { outcome } => write!(
+            rendered,
+            "transition=run_completed outcome={}",
+            run_outcome_label(*outcome)
+        ),
+    }
+    .expect("writing to a String cannot fail");
 }
 
 pub(crate) fn render_brief(brief: &BriefResult) -> String {
@@ -314,6 +497,102 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             truth_label(truth),
             escape_text(result.text())
         ),
+        ResultPayload::FlowRun(result) => render_flow_result(result, truth),
+    }
+}
+
+fn render_flow_result(result: &pam_flow::FlowRunResult, truth: &OperationTruth) -> String {
+    let mut rendered = format!(
+        "run_id={} definition_digest={} outcome={} steps={} truth={}\n",
+        escape_text(result.run_id().as_str()),
+        result.definition_digest(),
+        run_outcome_label(result.outcome()),
+        result.steps().len(),
+        truth_label(truth)
+    );
+    for (name, section) in [
+        ("solved", result.report().solved()),
+        ("changed", result.report().changed()),
+        ("verified", result.report().verified()),
+        ("unresolved", result.report().unresolved()),
+        ("blocked", result.report().blocked()),
+    ] {
+        render_flow_outcome_section(&mut rendered, name, section);
+    }
+    for step in result.steps() {
+        write!(
+            rendered,
+            "step={} semantic={} status={}",
+            escape_text(step.step_id()),
+            step_semantic_label(step.semantic_role()),
+            step_result_label(step.kind())
+        )
+        .expect("writing to a String cannot fail");
+        if let Some(effect_result) = step.result() {
+            match effect_result.kind() {
+                pam_flow::EffectResultKind::Succeeded => rendered.push_str(" result=succeeded"),
+                pam_flow::EffectResultKind::Failed { retryable } => {
+                    write!(rendered, " result=failed retryable={retryable}")
+                        .expect("writing to a String cannot fail");
+                }
+            }
+        }
+        if let Some(report) = step.report() {
+            write!(
+                rendered,
+                " summary={} evidence=",
+                escape_text(report.summary())
+            )
+            .expect("writing to a String cannot fail");
+            render_flow_evidence(&mut rendered, report.evidence());
+        }
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn render_flow_outcome_section(
+    rendered: &mut String,
+    name: &str,
+    section: &pam_flow::FlowOutcomeSection,
+) {
+    write!(
+        rendered,
+        "outcome_section={name} satisfied={} summary={} steps=",
+        section.satisfied(),
+        escape_text(section.summary())
+    )
+    .expect("writing to a String cannot fail");
+    if section.step_ids().is_empty() {
+        rendered.push('-');
+    } else {
+        for (index, step_id) in section.step_ids().iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            rendered.push_str(&escape_text(step_id));
+        }
+    }
+    rendered.push_str(" evidence=");
+    render_flow_evidence(rendered, section.evidence());
+    writeln!(
+        rendered,
+        " evidence_truncated={}",
+        section.evidence_truncated()
+    )
+    .expect("writing to a String cannot fail");
+}
+
+fn render_flow_evidence(rendered: &mut String, evidence: &[pam_flow::EvidenceHandle]) {
+    if evidence.is_empty() {
+        rendered.push('-');
+        return;
+    }
+    for (index, handle) in evidence.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        rendered.push_str(handle.as_str());
     }
 }
 
@@ -368,6 +647,7 @@ fn availability_label(availability: &SourceAvailability) -> &'static str {
 fn cancellation_label(disposition: &CancellationDisposition) -> &'static str {
     match disposition {
         CancellationDisposition::Requested => "requested",
+        CancellationDisposition::AlreadyRequested => "already_requested",
         CancellationDisposition::AlreadyCancelled => "already_cancelled",
         CancellationDisposition::AlreadyTerminal => "already_terminal",
     }
@@ -397,6 +677,44 @@ fn event_label(event: &Event) -> &'static str {
         Event::Cancelled => "cancelled",
         Event::Completed => "completed",
         Event::Failed => "failed",
+        Event::FlowTransition(_) => "flow_transition",
+    }
+}
+
+const fn run_outcome_label(outcome: pam_flow::RunOutcome) -> &'static str {
+    match outcome {
+        pam_flow::RunOutcome::Solved => "solved",
+        pam_flow::RunOutcome::Unresolved => "unresolved",
+        pam_flow::RunOutcome::Blocked => "blocked",
+        pam_flow::RunOutcome::Cancelled => "cancelled",
+    }
+}
+
+const fn flow_wait_reason_label(reason: pam_flow::FlowWaitReason) -> &'static str {
+    match reason {
+        pam_flow::FlowWaitReason::Approval => "approval",
+        pam_flow::FlowWaitReason::EffectResult => "effect_result",
+        pam_flow::FlowWaitReason::Retry => "retry",
+        pam_flow::FlowWaitReason::Reconciliation => "reconciliation",
+    }
+}
+
+const fn step_semantic_label(semantic: pam_flow::StepSemanticRole) -> &'static str {
+    match semantic {
+        pam_flow::StepSemanticRole::Observe => "observe",
+        pam_flow::StepSemanticRole::Verify => "verify",
+        pam_flow::StepSemanticRole::Change => "change",
+    }
+}
+
+const fn step_result_label(kind: pam_flow::StepRunResultKind) -> &'static str {
+    match kind {
+        pam_flow::StepRunResultKind::Succeeded => "succeeded",
+        pam_flow::StepRunResultKind::Skipped => "skipped",
+        pam_flow::StepRunResultKind::Failed => "failed",
+        pam_flow::StepRunResultKind::Blocked => "blocked",
+        pam_flow::StepRunResultKind::Cancelled => "cancelled",
+        pam_flow::StepRunResultKind::NotRun => "not_run",
     }
 }
 

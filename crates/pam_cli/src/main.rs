@@ -2,6 +2,7 @@ mod app;
 mod audit;
 mod command;
 mod evidence;
+mod flow;
 mod render;
 mod request;
 
@@ -13,6 +14,8 @@ mod audit_test;
 mod command_test;
 #[cfg(test)]
 mod evidence_test;
+#[cfg(test)]
+mod flow_test;
 #[cfg(test)]
 mod render_test;
 #[cfg(test)]
@@ -41,6 +44,35 @@ async fn main() {
             request_id,
             approval_id,
         } => app::result(request_id, approval_id).await,
+        Mode::FlowRun {
+            selector,
+            run_id,
+            idempotency_key,
+            timeout,
+            approval_id,
+        } => app::flow_run(&selector, run_id, idempotency_key, timeout, approval_id).await,
+        Mode::FlowList => app::flow_list(),
+        Mode::FlowShow { selector } => app::flow_show(&selector),
+        Mode::FlowValidate { selector } => app::flow_validate(selector.as_deref()),
+        Mode::FlowCancel {
+            run_id,
+            approval_id,
+        } => app::flow_cancel(run_id, approval_id).await,
+        Mode::FlowLogs {
+            run_id,
+            after,
+            approval_id,
+        } => app::flow_logs(run_id, after, approval_id).await,
+        Mode::FlowWait {
+            run_id,
+            after,
+            timeout,
+            approval_id,
+        } => app::flow_wait(run_id, after, timeout, approval_id).await,
+        Mode::FlowResult {
+            run_id,
+            approval_id,
+        } => app::flow_result(run_id, approval_id).await,
         Mode::EvidenceShow {
             handle,
             raw,

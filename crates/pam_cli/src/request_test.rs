@@ -1,5 +1,7 @@
-use pam_core::{ApprovalId, CallerId, EvidenceHandle, ProjectId, RequestId};
-use pam_protocol::{Capability, ModelMessage, ModelRole, RequestPayload};
+use pam_core::{ApprovalId, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId};
+use std::path::Path;
+
+use pam_protocol::{Capability, ExpectedTargetKind, ModelMessage, ModelRole, RequestPayload};
 
 use super::request::RequestContext;
 
@@ -14,6 +16,8 @@ fn context_with_approval(approval_id: Option<ApprovalId>) -> RequestContext {
         approval_id,
     )
 }
+
+const PROJECT_ROOT: &str = "/canonical/project";
 
 #[test]
 fn observer_and_idempotency_ids_are_unique_per_request() {
@@ -46,6 +50,7 @@ fn wait_and_result_keep_the_target_separate_from_observer_identity() {
         RequestPayload::WaitForResult {
             target_request_id: target.clone(),
             after_sequence: 7,
+            expected_target_kind: None,
         }
     );
     assert_ne!(result.request_id, target);
@@ -54,8 +59,89 @@ fn wait_and_result_keep_the_target_separate_from_observer_identity() {
         result.payload,
         RequestPayload::GetResult {
             target_request_id: target,
+            expected_target_kind: None,
         }
     );
+}
+
+#[test]
+fn flow_requests_bind_exact_run_identity_and_target_kind() {
+    let definition = super::flow_test::flow_source("cli-flow", "CLI flow");
+    let run = context()
+        .flow_run(
+            definition.clone(),
+            Some(RequestId::from("run-1")),
+            Some(IdempotencyKey::from("stable-run-1")),
+            Path::new(PROJECT_ROOT),
+        )
+        .unwrap();
+    assert_eq!(run.request_id, RequestId::from("run-1"));
+    assert_eq!(run.idempotency_key, IdempotencyKey::from("stable-run-1"));
+    assert!(run.authentication.is_some());
+    assert!(matches!(
+        run.payload,
+        RequestPayload::FlowRun {
+            definition: ref document,
+            project_root: ref root,
+        } if document.as_str() == definition && root.as_str() == PROJECT_ROOT
+    ));
+
+    let target = RequestId::from("run-1");
+    for request in [
+        context().flow_cancel(target.clone()),
+        context().flow_logs(target.clone(), 2),
+        context().flow_wait(target.clone(), 3),
+        context().flow_result(target.clone()),
+    ] {
+        assert_ne!(request.request_id, target);
+        let (RequestPayload::Cancel {
+            target_request_id: observed_target,
+            expected_target_kind: expected,
+        }
+        | RequestPayload::Replay {
+            target_request_id: observed_target,
+            expected_target_kind: expected,
+            ..
+        }
+        | RequestPayload::WaitForResult {
+            target_request_id: observed_target,
+            expected_target_kind: expected,
+            ..
+        }
+        | RequestPayload::GetResult {
+            target_request_id: observed_target,
+            expected_target_kind: expected,
+        }) = request.payload
+        else {
+            panic!("expected target-scoped flow request")
+        };
+        assert_eq!(observed_target, target);
+        assert_eq!(expected, Some(ExpectedTargetKind::FlowRun));
+    }
+}
+
+#[test]
+fn flow_run_default_idempotency_is_deterministic_from_the_run_id() {
+    let definition = super::flow_test::flow_source("cli-flow", "CLI flow");
+    let first = context()
+        .flow_run(
+            definition.clone(),
+            Some(RequestId::from("stable-run")),
+            None,
+            Path::new(PROJECT_ROOT),
+        )
+        .unwrap();
+    let retry = context()
+        .flow_run(
+            definition,
+            Some(RequestId::from("stable-run")),
+            None,
+            Path::new(PROJECT_ROOT),
+        )
+        .unwrap();
+    assert_eq!(first.request_id, retry.request_id);
+    assert_eq!(first.idempotency_key, retry.idempotency_key);
+    assert_eq!(first.idempotency_key.as_str(), "flow-run:stable-run");
 }
 
 #[test]

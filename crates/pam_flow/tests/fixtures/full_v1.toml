@@ -1,0 +1,50 @@
+name = "After merge checks"
+schema_version = 1
+revision = 7
+description = "Collect CI evidence, diagnose failures, and rerun only with approval."
+id = "after-merge-checks"
+
+[outcome]
+blocked = "Report the policy, approval, or environment boundary."
+unresolved = "List every diagnosis that still needs investigation."
+verified = "List checks that produced direct passing evidence."
+changed = "List externally visible changes and their evidence."
+solved = "State whether the after-merge checks are healthy."
+
+[[steps]]
+description = "Inspect repository state without modifying it."
+timeout_seconds = 30
+effect = "read_only"
+id = "inspect-repository"
+action = { working_directory = ".", args = ["status", "--short"], type = "command", program = "git" }
+
+[[steps]]
+id = "run-tests"
+description = "Run the portable workspace test suite."
+depends_on = ["inspect-repository"]
+condition = { step = "inspect-repository", kind = "succeeded" }
+retry = { max_backoff_ms = 2000, max_attempts = 3, initial_backoff_ms = 250 }
+timeout_seconds = 1800
+effect = "read_only"
+action = { type = "command", program = "cargo", args = ["test", "--workspace"], working_directory = "." }
+
+[[steps]]
+id = "inspect-ci-run"
+description = "Collect structured evidence for a failed CI run."
+depends_on = ["run-tests"]
+condition = { kind = "failed", step = "run-tests" }
+timeout_seconds = 120
+effect = "read_only"
+action = { type = "connector", connector = "github.actions", capability = "runs.inspect", resource = { kind = "workflow_run", id = "github:ro-ag/pam/runs/12345" } }
+
+[[steps]]
+id = "rerun-ci"
+description = "Rerun the exact failed CI run after human approval."
+depends_on = ["inspect-ci-run"]
+condition = { kind = "succeeded", step = "inspect-ci-run" }
+retry = { max_attempts = 2, initial_backoff_ms = 1000, max_backoff_ms = 5000 }
+approval = "required"
+idempotency_key = "after-merge-checks:r7:rerun-ci"
+timeout_seconds = 300
+effect = "stateful"
+action = { type = "connector", connector = "github.actions", capability = "runs.rerun", resource = { kind = "workflow_run", id = "github:ro-ag/pam/runs/12345" } }

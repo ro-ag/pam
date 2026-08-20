@@ -1,18 +1,43 @@
 use pam_core::{
     ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, IdempotencyKey,
-    ProjectId, RequestId,
+    MAX_CALLER_CREDENTIAL_LENGTH, ProjectId, RequestId,
 };
+use pam_flow::{MAX_FLOW_DOCUMENT_BYTES, MAX_RUN_ID_BYTES};
 
 use super::{
     BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
-    EvidenceRedaction, EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
-    MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS, ModelFinishReason,
-    ModelGenerationResult, ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult,
-    OperationTruth, PROTOCOL_VERSION, PacState, ProtocolContractError, ReplayResult,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, SourceAvailability,
-    StatusResult,
+    EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, FailureCode, MAX_EVIDENCE_CHUNK_SIZE,
+    MAX_FLOW_PROJECT_ROOT_BYTES, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES,
+    MAX_MODEL_OUTPUT_TOKENS, ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole,
+    ModelUsage, NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState,
+    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
+    ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
 };
+
+const PROJECT_ROOT: &str = "/canonical/project";
+
+const FLOW_DEFINITION: &str = r#"
+schema_version = 1
+id = "protocol-flow"
+name = "Protocol flow"
+description = "Debug must not reveal this flow description."
+revision = 1
+
+[outcome]
+solved = "Report solved work."
+changed = "Report changed state."
+verified = "Report verified evidence."
+unresolved = "Report unresolved work."
+blocked = "Report blockers."
+
+[[steps]]
+id = "inspect"
+description = "Inspect repository state."
+timeout_seconds = 30
+effect = "read_only"
+action = { type = "command", program = "git", args = ["status"], working_directory = "." }
+"#;
 
 fn status_request() -> RequestEnvelope {
     RequestEnvelope::status(
@@ -49,6 +74,188 @@ fn request_authentication_is_explicit_and_redacted() {
         secret
     );
     assert!(!format!("{request:?}").contains(secret));
+}
+
+#[test]
+fn flow_run_constructor_is_bounded_authenticated_and_policy_named() {
+    let request = RequestEnvelope::flow_run(
+        RequestId::from("flow-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("flow-1"),
+        FLOW_DEFINITION,
+        PROJECT_ROOT,
+    )
+    .unwrap()
+    .authenticated(CallerCredential::new("flow-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::FlowRun);
+    assert_eq!(request.capability.policy_name(), "flow.run");
+    let RequestPayload::FlowRun {
+        definition,
+        project_root,
+    } = &request.payload
+    else {
+        panic!("expected flow-run payload")
+    };
+    assert_eq!(definition.as_str(), FLOW_DEFINITION);
+    assert_eq!(project_root.as_str(), PROJECT_ROOT);
+    assert!(request.validate_flow_request().is_ok());
+    assert!(!format!("{request:?}").contains("Debug must not reveal"));
+    assert!(!format!("{request:?}").contains(PROJECT_ROOT));
+}
+
+#[test]
+fn flow_run_constructor_rejects_malformed_and_oversized_definitions() {
+    let request = |definition| {
+        RequestEnvelope::flow_run(
+            RequestId::from("flow-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("flow-1"),
+            definition,
+            PROJECT_ROOT,
+        )
+    };
+
+    assert!(matches!(
+        request("not valid TOML =".to_owned()),
+        Err(ProtocolContractError::InvalidFlowDefinition)
+    ));
+    assert!(matches!(
+        request("x".repeat(MAX_FLOW_DOCUMENT_BYTES + 1)),
+        Err(ProtocolContractError::FlowDefinitionTooLarge { .. })
+    ));
+}
+
+#[test]
+fn flow_run_constructor_rejects_request_ids_outside_the_run_id_contract() {
+    for invalid in [
+        "run id".to_owned(),
+        "rún".to_owned(),
+        "r".repeat(MAX_RUN_ID_BYTES + 1),
+    ] {
+        let error = RequestEnvelope::flow_run(
+            RequestId::from(invalid.clone()),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("flow-1"),
+            FLOW_DEFINITION,
+            PROJECT_ROOT,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ProtocolContractError::InvalidFlowRunId);
+        assert!(!format!("{error:?}").contains(&invalid));
+        assert!(!error.to_string().contains(&invalid));
+    }
+}
+
+#[test]
+fn flow_run_constructor_rejects_a_valid_document_that_cannot_fit_one_frame() {
+    let comment_bytes = MAX_FRAME_SIZE - FLOW_DEFINITION.len() - 2;
+    let definition = format!("{FLOW_DEFINITION}#{}", "x".repeat(comment_bytes));
+    assert_eq!(definition.len(), MAX_FRAME_SIZE - 1);
+
+    assert!(matches!(
+        RequestEnvelope::flow_run(
+            RequestId::from("flow-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("flow-1"),
+            definition,
+            PROJECT_ROOT,
+        ),
+        Err(ProtocolContractError::FlowRequestTooLarge { .. })
+    ));
+}
+
+#[test]
+fn flow_run_constructor_reserves_authenticated_approval_frame_space() {
+    let target_bytes = MAX_FRAME_SIZE - 512;
+    let definition = format!(
+        "{FLOW_DEFINITION}#{}",
+        "x".repeat(target_bytes - FLOW_DEFINITION.len() - 1)
+    );
+    assert_eq!(definition.len(), target_bytes);
+    let bare = RequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::from("flow-observer-1"),
+        caller_id: CallerId::from("cli-1"),
+        authentication: None,
+        approval_id: None,
+        project_id: ProjectId::from("project-1"),
+        capability: Capability::FlowRun,
+        idempotency_key: IdempotencyKey::from("flow-1"),
+        deadline_unix_ms: None,
+        payload: RequestPayload::FlowRun {
+            definition: super::FlowDefinitionDocument::new(definition.clone()).unwrap(),
+            project_root: super::FlowProjectRoot::new(PROJECT_ROOT).unwrap(),
+        },
+    };
+    let bare_bytes = rmp_serde::to_vec_named(&bare).unwrap();
+    assert!(bare_bytes.len() <= MAX_FRAME_SIZE);
+    let attached = bare
+        .authenticated(CallerCredential::new(
+            "x".repeat(MAX_CALLER_CREDENTIAL_LENGTH),
+        ))
+        .with_approval(ApprovalId::from("a".repeat(256)));
+    assert!(rmp_serde::to_vec_named(&attached).unwrap().len() > MAX_FRAME_SIZE);
+
+    assert!(matches!(
+        RequestEnvelope::flow_run(
+            RequestId::from("flow-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("flow-1"),
+            definition,
+            PROJECT_ROOT,
+        ),
+        Err(ProtocolContractError::FlowRequestTooLarge { .. })
+    ));
+}
+
+#[test]
+fn flow_run_constructor_rejects_noncanonical_or_unbounded_project_roots_without_disclosure() {
+    let invalid_roots = [
+        "relative/project".to_owned(),
+        "/canonical/../project".to_owned(),
+        "/canonical//project".to_owned(),
+        "/canonical/project/".to_owned(),
+    ];
+    for invalid in invalid_roots {
+        let error = RequestEnvelope::flow_run(
+            RequestId::from("flow-observer-1"),
+            CallerId::from("cli-1"),
+            ProjectId::from("project-1"),
+            IdempotencyKey::from("flow-1"),
+            FLOW_DEFINITION,
+            invalid.clone(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, ProtocolContractError::InvalidFlowProjectRoot);
+        assert!(!format!("{error:?}").contains(&invalid));
+        assert!(!error.to_string().contains(&invalid));
+    }
+
+    let oversized = format!("/{}", "x".repeat(MAX_FLOW_PROJECT_ROOT_BYTES));
+    let error = RequestEnvelope::flow_run(
+        RequestId::from("flow-observer-1"),
+        CallerId::from("cli-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("flow-1"),
+        FLOW_DEFINITION,
+        oversized.clone(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ProtocolContractError::FlowProjectRootTooLarge { .. }
+    ));
+    assert!(!format!("{error:?}").contains(&oversized));
+    assert!(!error.to_string().contains(&oversized));
 }
 
 #[test]
@@ -246,6 +453,7 @@ fn cancel_request_keeps_observer_and_target_correlation_separate() {
         request.payload,
         RequestPayload::Cancel {
             target_request_id: RequestId::from("target-1"),
+            expected_target_kind: None,
         }
     );
 }
@@ -268,6 +476,7 @@ fn replay_request_resumes_exclusively_after_the_observed_sequence() {
         RequestPayload::Replay {
             target_request_id: RequestId::from("target-1"),
             after_sequence: 41,
+            expected_target_kind: None,
         }
     );
 }
@@ -297,6 +506,7 @@ fn read_only_request_constructors_preserve_observer_and_target_identity() {
         RequestPayload::WaitForResult {
             target_request_id: RequestId::from("target-1"),
             after_sequence: 7,
+            expected_target_kind: None,
         }
     );
     assert_eq!(result.capability, Capability::GetResult);
@@ -305,8 +515,70 @@ fn read_only_request_constructors_preserve_observer_and_target_identity() {
         result.payload,
         RequestPayload::GetResult {
             target_request_id: RequestId::from("target-1"),
+            expected_target_kind: None,
         }
     );
+}
+
+#[test]
+fn typed_target_constructors_always_bind_flow_run() {
+    let cancel = RequestEnvelope::cancel_with_expected_target(
+        RequestId::from("cancel-observer"),
+        CallerId::from("cli"),
+        ProjectId::from("project"),
+        IdempotencyKey::from("cancel-key"),
+        RequestId::from("target"),
+        ExpectedTargetKind::FlowRun,
+    );
+    let replay = RequestEnvelope::replay_with_expected_target(
+        RequestId::from("logs-observer"),
+        CallerId::from("cli"),
+        ProjectId::from("project"),
+        IdempotencyKey::from("logs-key"),
+        RequestId::from("target"),
+        3,
+        ExpectedTargetKind::FlowRun,
+    );
+    let wait = RequestEnvelope::wait_for_result_with_expected_target(
+        RequestId::from("wait-observer"),
+        CallerId::from("cli"),
+        ProjectId::from("project"),
+        IdempotencyKey::from("wait-key"),
+        RequestId::from("target"),
+        4,
+        ExpectedTargetKind::FlowRun,
+    );
+    let result = RequestEnvelope::get_result_with_expected_target(
+        RequestId::from("result-observer"),
+        CallerId::from("cli"),
+        ProjectId::from("project"),
+        IdempotencyKey::from("result-key"),
+        RequestId::from("target"),
+        ExpectedTargetKind::FlowRun,
+    );
+
+    for payload in [cancel.payload, replay.payload, wait.payload, result.payload] {
+        let (RequestPayload::Cancel {
+            expected_target_kind: expected,
+            ..
+        }
+        | RequestPayload::Replay {
+            expected_target_kind: expected,
+            ..
+        }
+        | RequestPayload::WaitForResult {
+            expected_target_kind: expected,
+            ..
+        }
+        | RequestPayload::GetResult {
+            expected_target_kind: expected,
+            ..
+        }) = payload
+        else {
+            panic!("expected a target-scoped payload")
+        };
+        assert_eq!(expected, Some(ExpectedTargetKind::FlowRun));
+    }
 }
 
 #[test]

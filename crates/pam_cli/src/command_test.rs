@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use pam_core::{ApprovalId, EvidenceHandle, RequestId};
+use pam_core::{ApprovalId, EvidenceHandle, IdempotencyKey, RequestId};
 use pam_policy::{CapabilityName, ResourceName};
 
 use super::command::{CallerKindArg, Cli, Mode, RetentionScopeArg};
@@ -137,6 +137,130 @@ fn explicit_subcommands_select_runtime_modes() {
             .mode(),
         Mode::NetworkDiagnostics { approval_id: None }
     );
+}
+
+#[test]
+fn flow_subcommands_select_all_runtime_modes_in_the_public_namespace() {
+    let approval = ApprovalId::from("approval-1");
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "flow",
+            "run",
+            "after-merge",
+            "--run-id",
+            "run-1",
+            "--idempotency-key",
+            "stable-1",
+            "--timeout",
+            "5m",
+            "--approval-id",
+            "approval-1",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::FlowRun {
+            selector: "after-merge".to_owned(),
+            run_id: Some(RequestId::from("run-1")),
+            idempotency_key: Some(IdempotencyKey::from("stable-1")),
+            timeout: Duration::from_mins(5),
+            approval_id: Some(approval.clone()),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "list"]).unwrap().mode(),
+        Mode::FlowList
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "show", "after-merge"])
+            .unwrap()
+            .mode(),
+        Mode::FlowShow {
+            selector: "after-merge".to_owned(),
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "validate"])
+            .unwrap()
+            .mode(),
+        Mode::FlowValidate { selector: None }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "cancel", "run-1"])
+            .unwrap()
+            .mode(),
+        Mode::FlowCancel {
+            run_id: RequestId::from("run-1"),
+            approval_id: None,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "logs", "run-1", "--after", "7"])
+            .unwrap()
+            .mode(),
+        Mode::FlowLogs {
+            run_id: RequestId::from("run-1"),
+            after: 7,
+            approval_id: None,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "flow", "wait", "run-1", "--after", "8"])
+            .unwrap()
+            .mode(),
+        Mode::FlowWait {
+            run_id: RequestId::from("run-1"),
+            after: 8,
+            timeout: Duration::from_secs(30),
+            approval_id: None,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "flow",
+            "result",
+            "run-1",
+            "--approval-id",
+            "approval-1",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::FlowResult {
+            run_id: RequestId::from("run-1"),
+            approval_id: Some(approval),
+        }
+    );
+}
+
+#[test]
+fn flow_commands_reject_missing_or_unsafe_bounded_arguments() {
+    for arguments in [
+        vec!["pam", "flow", "run"],
+        vec!["pam", "flow", "cancel"],
+        vec!["pam", "flow", "logs", "bad id"],
+        vec!["pam", "flow", "cancel", "generic@request"],
+        vec!["pam", "flow", "logs", "generic@request"],
+        vec!["pam", "flow", "wait", "generic@request"],
+        vec!["pam", "flow", "result", "generic@request"],
+        vec!["pam", "flow", "wait", "run-1", "--timeout", "0s"],
+        vec!["pam", "flow", "run", "x", "--idempotency-key", "bad key"],
+        vec!["pam", "flow", "run", "x", "--idempotency-key", "bad;key"],
+        vec!["pam", "flow", "run", "x", "--idempotency-key", "$(bad)"],
+        vec!["pam", "flow", "run", "x", "--idempotency-key", "-bad"],
+        vec![
+            "pam",
+            "flow",
+            "logs",
+            "run-1",
+            "--after",
+            "9223372036854775808",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
+    assert!(Cli::try_parse_from(["pam", "wait", "generic@request"]).is_ok());
+    assert!(Cli::try_parse_from(["pam", "result", "generic@request"]).is_ok());
 }
 
 #[test]

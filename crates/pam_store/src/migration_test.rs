@@ -561,6 +561,117 @@ fn model_registry_migration_upgrades_v6_without_replacing_existing_state() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Every preserved table/column is asserted in one upgrade test.
+fn flow_checkpoint_migration_upgrades_v7_without_replacing_existing_state() {
+    let (directory, path) = database_path("migration-v7-flows");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+        include_str!("../migrations/0007_models.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 7).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('preserved')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO requests(
+                 request_id, caller_id, project_id, idempotency_key,
+                 operation_kind, operation, queue_sequence, state, accepted_at_ms
+             ) VALUES (
+                 'preserved-request', 'caller', 'preserved', 'key',
+                 'flow_run', X'00', 1, 'queued', 10
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events(request_id, sequence, kind, payload, recorded_at_ms)
+             VALUES ('preserved-request', 1, 'accepted', X'', 10)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'preserved-request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_count: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE request_id = 'preserved-request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let flow_table: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'flow_runs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let terminal_columns: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('flow_runs')
+             WHERE name IN (
+                 'terminal_outcome', 'terminal_result', 'terminal_cancellation_override'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let flow_authorization_table: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'flow_authorizations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let approval_binding_column: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('approvals')
+             WHERE name = 'flow_request_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let fabricated_flow_authorizations: u32 = connection
+        .query_row("SELECT COUNT(*) FROM flow_authorizations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(preserved, 1);
+    assert_eq!(event_count, 1);
+    assert_eq!(flow_table, 1);
+    assert_eq!(terminal_columns, 3);
+    assert_eq!(flow_authorization_table, 1);
+    assert_eq!(approval_binding_column, 1);
+    assert_eq!(fabricated_flow_authorizations, 0);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

@@ -1,0 +1,17 @@
+[package]
+name = "pam_flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+rmp-serde.workspace = true
+
+[lints]
+workspace = true

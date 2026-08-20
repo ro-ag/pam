@@ -32,24 +32,31 @@ use pam_policy::{CapabilityName, InvalidResourceName, ResourceName, redact_audit
 use pam_protocol::{
     ApprovalChallenge, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
     Capability, CodecError, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
-    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure, FailureCode,
-    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
+    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure,
+    FailureCode, ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
     NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ReplayResult,
     RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
-    SourceAvailability, StatusResult, decode_request_envelope, decode_server_message, encode,
+    SourceAvailability, StatusResult, decode_request_envelope, decode_server_message_envelope,
+    encode,
 };
 use pam_store::{
     AcceptOutcome, AcceptRequest, AppendAuditEvent, AuthorizationAudit, AuthorizationOutcome,
-    AuthorizationRequest, CallerAuthentication, CancelOutcome, EventRecord, LeasedRequest, Replay,
-    RequestState, Store, StoreError, TerminalState,
+    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CancelOutcome, EventRecord,
+    ExpectedOperationKind, FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome,
+    LeasedRequest, Replay, RequestSnapshot, RequestState, Store, StoreError, TerminalState,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 
 use crate::DaemonError;
+use crate::flow::{
+    FLOW_OPERATION_KIND, FlowProcessing, FlowSubmissionError, PreparedFlowSubmission,
+    decode_flow_transition, flow_result_truth, prepare_flow_submission, process_flow,
+    verify_flow_project_root,
+};
 #[cfg(target_os = "macos")]
 use crate::macos_admission::MacosRuntimeHostAdmission;
 use crate::model_service::{ModelService, ModelServiceError, ModelWorker};
@@ -57,6 +64,7 @@ use crate::ptrack::PtrackBriefProvider;
 
 const RESPONSE_CAPACITY: usize = 64;
 const SCHEDULER_CAPACITY: usize = 64;
+pub(super) const FLOW_PREFLIGHT_CAPACITY: usize = 4;
 const LEASE_DURATION: Duration = Duration::from_secs(3);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(1);
 const RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
@@ -126,6 +134,12 @@ pub struct DaemonConfig {
     pub(crate) bypass_authentication: bool,
     #[cfg(test)]
     pub(crate) bypass_policy: bool,
+    /// Bounds expensive flow authority preparation in tests.
+    #[cfg(test)]
+    pub(crate) flow_preflight_capacity: usize,
+    /// Holds an admitted flow preflight for deterministic saturation tests.
+    #[cfg(test)]
+    pub(crate) flow_preflight_delay: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -140,6 +154,10 @@ impl Default for DaemonConfig {
             bypass_authentication: false,
             #[cfg(test)]
             bypass_policy: false,
+            #[cfg(test)]
+            flow_preflight_capacity: FLOW_PREFLIGHT_CAPACITY,
+            #[cfg(test)]
+            flow_preflight_delay: Duration::ZERO,
         }
     }
 }
@@ -247,6 +265,15 @@ where
     };
     let store = Store::open(state_path)?;
     store.recover_all_leases(now_ms()).await?;
+    #[cfg(test)]
+    let flow_preflight_capacity = config.flow_preflight_capacity;
+    #[cfg(not(test))]
+    let flow_preflight_capacity = FLOW_PREFLIGHT_CAPACITY;
+    #[cfg(test)]
+    let flow_preflight_delay = config.flow_preflight_delay;
+    #[cfg(not(test))]
+    let flow_preflight_delay = Duration::ZERO;
+    let flow_preflight_admission = Arc::new(Semaphore::new(flow_preflight_capacity));
     let brief_provider = config
         .brief_provider
         .clone()
@@ -304,6 +331,7 @@ where
                 let request_scheduler = scheduler_tx.clone();
                 let request_brief_provider = Arc::clone(&brief_provider);
                 let request_model = loaded_model.clone();
+                let request_flow_preflight_admission = Arc::clone(&flow_preflight_admission);
                 handlers.spawn(async move {
                     handle_incoming(
                         incoming,
@@ -314,6 +342,8 @@ where
                         request_model,
                         authentication_required,
                         policy_required,
+                        request_flow_preflight_admission,
+                        flow_preflight_delay,
                     )
                     .await
                 });
@@ -556,6 +586,7 @@ fn remap_messages(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn handle_incoming(
     incoming: IncomingRequest,
     store: Store,
@@ -565,6 +596,8 @@ async fn handle_incoming(
     loaded_model: Option<LoadedModelService>,
     authentication_required: bool,
     policy_required: bool,
+    flow_preflight_admission: Arc<Semaphore>,
+    flow_preflight_delay: Duration,
 ) -> Result<(), DaemonError> {
     let Ok(request) = decode_request_envelope(incoming.payload()) else {
         return Ok(());
@@ -593,9 +626,137 @@ async fn handle_incoming(
         .await;
         return Ok(());
     }
-    if let Some(failure) =
-        request_preflight(&request, &store, authentication_required, policy_required).await?
-    {
+    let is_flow_run = matches!(
+        (&request.capability, &request.payload),
+        (Capability::FlowRun, RequestPayload::FlowRun { .. })
+    );
+    if is_flow_run {
+        let unprepared_resource =
+            ResourceName::parse("flow:unprepared").expect("static flow resource is valid");
+        if let Some(failure) = request_authentication_preflight(
+            &request,
+            &store,
+            authentication_required,
+            &unprepared_resource,
+        )
+        .await?
+        {
+            send_routed(
+                &outbound,
+                incoming,
+                vec![ServerMessage::Result(failure)],
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+    let flow_preflight_permit = if is_flow_run {
+        if let Ok(permit) = Arc::clone(&flow_preflight_admission).try_acquire_owned() {
+            Some(permit)
+        } else {
+            let mut failure = failure_result(
+                &request,
+                FailureCode::Busy,
+                "flow preflight capacity is busy",
+            );
+            if let ResultBody::Failure(failure) = &mut failure.body {
+                failure.recovery =
+                    Some("retry the exact flow run after another preflight finishes".to_owned());
+            }
+            send_routed(
+                &outbound,
+                incoming,
+                vec![ServerMessage::Result(failure)],
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+    } else {
+        None
+    };
+    if flow_preflight_permit.is_some() && !flow_preflight_delay.is_zero() {
+        tokio::time::sleep(flow_preflight_delay).await;
+    }
+    let prepared_flow = match (&request.capability, &request.payload) {
+        (
+            Capability::FlowRun,
+            RequestPayload::FlowRun {
+                definition,
+                project_root,
+            },
+        ) => {
+            let verified_root =
+                verify_flow_project_root(Path::new(project_root.as_str()), &request.project_id);
+            match verified_root {
+                Ok(root) => match prepare_flow_submission(definition, &root).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        send_routed(
+                            &outbound,
+                            incoming,
+                            vec![ServerMessage::Result(failure_result(
+                                &request,
+                                FailureCode::InvalidRequest,
+                                flow_submission_error_message(error),
+                            ))],
+                            None,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                },
+                Err(error) => {
+                    send_routed(
+                        &outbound,
+                        incoming,
+                        vec![ServerMessage::Result(failure_result(
+                            &request,
+                            FailureCode::InvalidRequest,
+                            flow_submission_error_message(error),
+                        ))],
+                        None,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+        _ => None,
+    };
+    drop(flow_preflight_permit);
+    let flow_resource = prepared_flow
+        .as_ref()
+        .map(|prepared| ResourceName::parse(prepared.policy_resource.clone()))
+        .transpose();
+    let Ok(flow_resource) = flow_resource else {
+        send_routed(
+            &outbound,
+            incoming,
+            vec![ServerMessage::Result(failure_result(
+                &request,
+                FailureCode::InvalidRequest,
+                "flow policy authority is invalid",
+            ))],
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+    let preflight_failure = if flow_resource.is_some() {
+        None
+    } else {
+        request_preflight_with_resource(
+            &request,
+            &store,
+            authentication_required,
+            policy_required,
+            None,
+        )
+        .await?
+    };
+    if let Some(failure) = preflight_failure {
         send_routed(
             &outbound,
             incoming,
@@ -610,10 +771,29 @@ async fn handle_incoming(
         (Capability::DaemonStatus, RequestPayload::Status) => {
             handle_status(request, incoming, &store, &outbound, &scheduler).await
         }
-        (Capability::CancelRequest, RequestPayload::Cancel { target_request_id }) => {
+        (Capability::FlowRun, RequestPayload::FlowRun { .. }) => {
+            handle_flow_run(
+                request,
+                prepared_flow.expect("flow submission was prepared before preflight"),
+                flow_resource.expect("flow resource was prepared before dispatch"),
+                incoming,
+                &store,
+                &outbound,
+                &scheduler,
+            )
+            .await
+        }
+        (
+            Capability::CancelRequest,
+            RequestPayload::Cancel {
+                target_request_id,
+                expected_target_kind,
+            },
+        ) => {
             handle_cancel(
                 &request,
                 target_request_id.clone(),
+                *expected_target_kind,
                 incoming,
                 &store,
                 &outbound,
@@ -626,12 +806,14 @@ async fn handle_incoming(
             RequestPayload::Replay {
                 target_request_id,
                 after_sequence,
+                expected_target_kind,
             },
         ) => {
             handle_replay(
                 &request,
                 target_request_id.clone(),
                 *after_sequence,
+                *expected_target_kind,
                 incoming,
                 &store,
                 &outbound,
@@ -652,11 +834,41 @@ async fn handle_incoming(
     }
 }
 
+const fn flow_submission_error_message(error: FlowSubmissionError) -> &'static str {
+    match error {
+        FlowSubmissionError::InvalidDefinition => "flow definition is invalid",
+        FlowSubmissionError::UnsupportedDefinition => {
+            "flow contains an action, classification, or approval unsupported by this daemon"
+        }
+        FlowSubmissionError::WorkspaceUnavailable => {
+            "the exact workspace authority could not be established"
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn request_preflight(
     request: &RequestEnvelope,
     store: &Store,
     authentication_required: bool,
     policy_required: bool,
+) -> Result<Option<ResultEnvelope>, StoreError> {
+    request_preflight_with_resource(
+        request,
+        store,
+        authentication_required,
+        policy_required,
+        None,
+    )
+    .await
+}
+
+async fn request_preflight_with_resource(
+    request: &RequestEnvelope,
+    store: &Store,
+    authentication_required: bool,
+    policy_required: bool,
+    resource_override: Option<ResourceName>,
 ) -> Result<Option<ResultEnvelope>, StoreError> {
     if !request_shape_is_valid(request) {
         return Ok(Some(failure_result(
@@ -665,12 +877,17 @@ pub(super) async fn request_preflight(
             "capability and payload do not match",
         )));
     }
-    let Ok(resource) = policy_resource(request) else {
-        return Ok(Some(failure_result(
-            request,
-            FailureCode::InvalidRequest,
-            "request cannot be represented as a policy resource",
-        )));
+    let resource = if let Some(resource) = resource_override {
+        resource
+    } else {
+        let Ok(resource) = policy_resource(request) else {
+            return Ok(Some(failure_result(
+                request,
+                FailureCode::InvalidRequest,
+                "request cannot be represented as a policy resource",
+            )));
+        };
+        resource
     };
     if authentication_required
         && !matches!(
@@ -716,6 +933,47 @@ pub(super) async fn request_preflight(
     Ok(None)
 }
 
+async fn request_authentication_preflight(
+    request: &RequestEnvelope,
+    store: &Store,
+    authentication_required: bool,
+    resource: &ResourceName,
+) -> Result<Option<ResultEnvelope>, StoreError> {
+    if !request_shape_is_valid(request) {
+        return Ok(Some(failure_result(
+            request,
+            FailureCode::InvalidRequest,
+            "capability and payload do not match",
+        )));
+    }
+    if authentication_required
+        && !matches!(
+            authenticate_request(request, store).await?,
+            CallerAuthentication::Authenticated
+        )
+    {
+        append_request_audit(
+            store,
+            request,
+            resource,
+            "deny",
+            "unauthenticated",
+            "authentication failed",
+        )
+        .await?;
+        let mut failure = failure_result(
+            request,
+            FailureCode::Unauthenticated,
+            "caller authentication failed",
+        );
+        if let ResultBody::Failure(body) = &mut failure.body {
+            body.recovery = Some("pam caller register".to_owned());
+        }
+        return Ok(Some(failure));
+    }
+    Ok(None)
+}
+
 fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
     let capability_matches = matches!(
         (&request.capability, &request.payload),
@@ -741,8 +999,11 @@ fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
                 RequestPayload::ReadEvidence { .. }
             )
             | (Capability::ModelInfer, RequestPayload::ModelInfer { .. })
+            | (Capability::FlowRun, RequestPayload::FlowRun { .. })
     );
-    capability_matches && request.validate_model_request().is_ok()
+    capability_matches
+        && request.validate_model_request().is_ok()
+        && request.validate_flow_request().is_ok()
 }
 
 async fn append_request_audit(
@@ -876,18 +1137,28 @@ pub(super) fn policy_resource(
         RequestPayload::Status => "daemon".to_owned(),
         RequestPayload::Brief => format!("project:{}", request.project_id),
         RequestPayload::NetworkDiagnostics => "network:configuration".to_owned(),
-        RequestPayload::Cancel { target_request_id }
-        | RequestPayload::GetResult { target_request_id } => {
-            format!("request:{target_request_id}")
+        RequestPayload::Cancel {
+            target_request_id,
+            expected_target_kind,
         }
+        | RequestPayload::GetResult {
+            target_request_id,
+            expected_target_kind,
+        } => target_policy_resource(target_request_id, *expected_target_kind, None),
         RequestPayload::Replay {
             target_request_id,
             after_sequence,
+            expected_target_kind,
         }
         | RequestPayload::WaitForResult {
             target_request_id,
             after_sequence,
-        } => format!("request:{target_request_id}:after={after_sequence}"),
+            expected_target_kind,
+        } => target_policy_resource(
+            target_request_id,
+            *expected_target_kind,
+            Some(*after_sequence),
+        ),
         RequestPayload::InspectEvidence { handle } => format!("evidence:{handle}"),
         RequestPayload::ReadEvidence {
             handle,
@@ -902,8 +1173,34 @@ pub(super) fn policy_resource(
             let digest = model_infer_effect_digest(model, messages, *max_output_tokens);
             format!("model:{model}:effect={digest}")
         }
+        // Flow execution requires an exact worktree fingerprint and is prepared by
+        // `handle_incoming` before policy evaluation.
+        RequestPayload::FlowRun { .. } => return Err(InvalidResourceName),
     };
     ResourceName::parse(resource)
+}
+
+fn target_policy_resource(
+    target_request_id: &RequestId,
+    expected_target_kind: Option<ExpectedTargetKind>,
+    after_sequence: Option<u64>,
+) -> String {
+    let id = target_request_id.as_str();
+    if expected_target_kind.is_none() {
+        return after_sequence.map_or_else(
+            || format!("request:{id}"),
+            |after_sequence| format!("request:{id}:after={after_sequence}"),
+        );
+    }
+    let kind = expected_target_kind
+        .expect("typed target checked above")
+        .policy_label();
+    let mut resource = format!("flow-request-v4:id-bytes={}:id={id}:kind={kind}", id.len());
+    if let Some(after_sequence) = after_sequence {
+        use std::fmt::Write as _;
+        let _ = write!(resource, ":after={after_sequence}");
+    }
+    resource
 }
 
 fn model_infer_effect_digest(
@@ -940,22 +1237,50 @@ fn authorization_failure(
     request: &RequestEnvelope,
     outcome: AuthorizationOutcome,
 ) -> ResultEnvelope {
+    authorization_failure_with_resource(request, outcome, &policy_resource(request))
+}
+
+fn flow_authorization_failure(
+    request: &RequestEnvelope,
+    resource: &ResourceName,
+    outcome: FlowAuthorizationOutcome,
+) -> ResultEnvelope {
+    let outcome = match outcome {
+        FlowAuthorizationOutcome::Accepted(_) => {
+            unreachable!("accepted flow requests are dispatched")
+        }
+        FlowAuthorizationOutcome::Denied => AuthorizationOutcome::Denied,
+        FlowAuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        } => AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        },
+        FlowAuthorizationOutcome::ApprovalDenied => AuthorizationOutcome::ApprovalDenied,
+        FlowAuthorizationOutcome::ApprovalExpired => AuthorizationOutcome::ApprovalExpired,
+    };
+    authorization_failure_with_resource(request, outcome, &Ok(resource.clone()))
+}
+
+fn authorization_failure_with_resource(
+    request: &RequestEnvelope,
+    outcome: AuthorizationOutcome,
+    resource: &Result<ResourceName, InvalidResourceName>,
+) -> ResultEnvelope {
     let (code, message, recovery, approval) = match outcome {
         AuthorizationOutcome::Allowed => unreachable!("allowed requests are dispatched"),
         AuthorizationOutcome::Denied => (
             FailureCode::Forbidden,
             "project policy denied this capability".to_owned(),
-            Some(grant_recovery(
-                &request.capability,
-                &policy_resource(request),
-            )),
+            Some(grant_recovery(&request.capability, resource)),
             None,
         ),
         AuthorizationOutcome::ApprovalRequired {
             approval_id,
             expires_at_ms,
         } => {
-            let recovery = approval_recovery(&request.capability, &approval_id);
+            let recovery = approval_recovery(request, &approval_id);
             (
                 FailureCode::ApprovalRequired,
                 "this exact effect requires approval".to_owned(),
@@ -992,14 +1317,22 @@ fn authorization_failure(
     }
 }
 
-pub(super) fn approval_recovery(capability: &Capability, approval_id: &ApprovalId) -> String {
-    match capability {
+pub(super) fn approval_recovery(request: &RequestEnvelope, approval_id: &ApprovalId) -> String {
+    if !shell_safe_policy_argument(approval_id.as_str()) {
+        return "approve the exact request using a shell-quoted approval ID, then retry without changing its effect"
+            .to_owned();
+    }
+    if let Some(recovery) = typed_flow_approval_recovery(request, approval_id) {
+        return recovery;
+    }
+    match &request.capability {
         Capability::DaemonStatus
         | Capability::Brief
         | Capability::NetworkDiagnostics
         | Capability::WaitForResult
         | Capability::GetResult
-        | Capability::ModelInfer => format!(
+        | Capability::ModelInfer
+        | Capability::FlowRun => format!(
             "pam approval approve {approval_id}, then retry the original command with --approval-id {approval_id}"
         ),
         Capability::InspectEvidence | Capability::ReadEvidence => format!(
@@ -1009,6 +1342,48 @@ pub(super) fn approval_recovery(capability: &Capability, approval_id: &ApprovalI
             "pam approval approve {approval_id}; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request"
         ),
     }
+}
+
+fn typed_flow_approval_recovery(
+    request: &RequestEnvelope,
+    approval_id: &ApprovalId,
+) -> Option<String> {
+    if !shell_safe_policy_argument(approval_id.as_str()) {
+        return None;
+    }
+    let approval = approval_id.as_str();
+    let command = match &request.payload {
+        RequestPayload::Cancel {
+            target_request_id,
+            expected_target_kind: Some(ExpectedTargetKind::FlowRun),
+        } if shell_safe_policy_argument(target_request_id.as_str()) => {
+            format!("pam flow cancel {target_request_id} --approval-id {approval}")
+        }
+        RequestPayload::Replay {
+            target_request_id,
+            after_sequence,
+            expected_target_kind: Some(ExpectedTargetKind::FlowRun),
+        } if shell_safe_policy_argument(target_request_id.as_str()) => format!(
+            "pam flow logs {target_request_id} --after {after_sequence} --approval-id {approval}"
+        ),
+        RequestPayload::WaitForResult {
+            target_request_id,
+            after_sequence,
+            expected_target_kind: Some(ExpectedTargetKind::FlowRun),
+        } if shell_safe_policy_argument(target_request_id.as_str()) => format!(
+            "pam flow wait {target_request_id} --after {after_sequence} --approval-id {approval}"
+        ),
+        RequestPayload::GetResult {
+            target_request_id,
+            expected_target_kind: Some(ExpectedTargetKind::FlowRun),
+        } if shell_safe_policy_argument(target_request_id.as_str()) => {
+            format!("pam flow result {target_request_id} --approval-id {approval}")
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "pam approval approve {approval}, then run {command}"
+    ))
 }
 
 pub(super) fn grant_recovery(
@@ -1032,6 +1407,7 @@ pub(super) fn grant_recovery(
 
 fn shell_safe_policy_argument(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('-')
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'=' | b'+')
@@ -1061,22 +1437,31 @@ async fn handle_read_only(
             RequestPayload::WaitForResult {
                 target_request_id,
                 after_sequence,
+                expected_target_kind,
             },
         ) => {
             handle_wait_for_result(
                 request,
                 target_request_id.clone(),
                 *after_sequence,
+                *expected_target_kind,
                 incoming,
                 store,
                 outbound,
             )
             .await
         }
-        (Capability::GetResult, RequestPayload::GetResult { target_request_id }) => {
+        (
+            Capability::GetResult,
+            RequestPayload::GetResult {
+                target_request_id,
+                expected_target_kind,
+            },
+        ) => {
             handle_get_result(
                 request,
                 target_request_id.clone(),
+                *expected_target_kind,
                 incoming,
                 store,
                 outbound,
@@ -1585,76 +1970,184 @@ async fn handle_status(
     Ok(())
 }
 
-async fn handle_cancel(
-    request: &RequestEnvelope,
-    target_request_id: RequestId,
+async fn handle_flow_run(
+    request: RequestEnvelope,
+    prepared: PreparedFlowSubmission,
+    resource: ResourceName,
     incoming: IncomingRequest,
     store: &Store,
     outbound: &mpsc::Sender<Outbound>,
     scheduler: &mpsc::Sender<()>,
 ) -> Result<(), DaemonError> {
-    let snapshot = match store.snapshot(target_request_id.clone()).await {
-        Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
-        Ok(_) => {
-            send_routed(
-                outbound,
-                incoming,
-                vec![ServerMessage::Result(failure_result(
-                    request,
-                    FailureCode::NotFound,
-                    "target request was not found in this project",
-                ))],
-                None,
-            )
-            .await;
-            return Ok(());
-        }
-        Err(StoreError::RequestNotFound(_)) => {
-            send_routed(
-                outbound,
-                incoming,
-                vec![ServerMessage::Result(failure_result(
-                    request,
-                    FailureCode::NotFound,
-                    "target request was not found",
-                ))],
-                None,
-            )
-            .await;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
+    let RequestPayload::FlowRun { .. } = &request.payload else {
+        unreachable!("flow execution is dispatched only for its matching payload")
     };
+    let authorized = authorize_flow_submission(&request, prepared, &resource, store).await;
+    let canonical_request_id = match authorized {
+        Ok(FlowAuthorizationOutcome::Accepted(
+            AcceptOutcome::Created { request_id, .. } | AcceptOutcome::Existing { request_id, .. },
+        )) => request_id,
+        Ok(outcome) => {
+            send_routed(
+                outbound,
+                incoming,
+                vec![ServerMessage::Result(flow_authorization_failure(
+                    &request, &resource, outcome,
+                ))],
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+        Err(error) => {
+            send_store_failure(outbound, incoming, &request, &error).await;
+            return Ok(());
+        }
+    };
+    let replay = store.replay(canonical_request_id.clone(), 0).await?;
+    let snapshot = store.snapshot(canonical_request_id.clone()).await?;
+    let terminal = replay.result.is_some();
+    let last_sequence = replay.events.last().map_or(0, |event| event.sequence);
+    let messages = remap_messages(
+        replay_messages(&snapshot.project_id, &canonical_request_id, replay)?,
+        &request.request_id,
+        &request.request_id,
+        &request.project_id,
+    );
+    if terminal {
+        send_routed(outbound, incoming, messages, None).await;
+        return Ok(());
+    }
+
+    let (registered_tx, registered_rx) = oneshot::channel();
+    let _ = outbound
+        .send(Outbound::Routed {
+            incoming,
+            messages,
+            subscribe: Some(SubscriptionRequest {
+                canonical_request_id: canonical_request_id.clone(),
+                event_request_id: request.request_id.clone(),
+                observer_request_id: request.request_id.clone(),
+                project_id: request.project_id.clone(),
+                last_sequence,
+            }),
+            registered: Some(registered_tx),
+        })
+        .await;
+    if registered_rx.await.is_ok() {
+        let replay = store
+            .replay(canonical_request_id.clone(), last_sequence)
+            .await?;
+        let terminal = replay.result.is_some();
+        let messages = replay_messages(&snapshot.project_id, &canonical_request_id, replay)?;
+        let _ = outbound
+            .send(Outbound::Persisted {
+                request_id: canonical_request_id.clone(),
+                messages,
+                terminal,
+            })
+            .await;
+    }
+    let _ = scheduler.send(()).await;
+    Ok(())
+}
+
+async fn authorize_flow_submission(
+    request: &RequestEnvelope,
+    prepared: PreparedFlowSubmission,
+    resource: &ResourceName,
+    store: &Store,
+) -> Result<FlowAuthorizationOutcome, StoreError> {
+    let now = now_ms();
+    let audit_detail = redact_audit_detail(
+        format!(
+            "capability=flow.run resource={} detail=project policy evaluated",
+            resource.as_str()
+        )
+        .as_bytes(),
+    );
+    store
+        .authorize_flow_run(
+            AuthorizeFlowRun {
+                accept: AcceptRequest {
+                    request_id: request.request_id.clone(),
+                    caller_id: request.caller_id.clone(),
+                    project_id: request.project_id.clone(),
+                    idempotency_key: request.idempotency_key.clone(),
+                    operation_kind: FLOW_OPERATION_KIND.to_owned(),
+                    operation: prepared.operation,
+                },
+                resource: resource.clone(),
+                approval_id: request.approval_id.clone(),
+                audit: AuthorizationAudit {
+                    event_id: request_audit_event_id(request, "policy", now),
+                    action: "request.preflight".to_owned(),
+                    redacted_detail: audit_detail,
+                    retain_until_ms: now
+                        .saturating_add(duration_ms(AUDIT_RETENTION))
+                        .min(i64::MAX as u64),
+                },
+                schema_approval_required: prepared.schema_approval_required,
+            },
+            now,
+            duration_ms(APPROVAL_LIFETIME),
+        )
+        .await
+}
+
+async fn handle_cancel(
+    request: &RequestEnvelope,
+    target_request_id: RequestId,
+    expected_target_kind: Option<ExpectedTargetKind>,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+    scheduler: &mpsc::Sender<()>,
+) -> Result<(), DaemonError> {
+    let snapshot =
+        match target_snapshot(store, target_request_id.clone(), expected_target_kind).await {
+            Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
+            Ok(_) => {
+                send_routed(
+                    outbound,
+                    incoming,
+                    vec![ServerMessage::Result(failure_result(
+                        request,
+                        FailureCode::NotFound,
+                        "target request was not found in this project",
+                    ))],
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+            Err(StoreError::RequestNotFound(_)) => {
+                send_routed(
+                    outbound,
+                    incoming,
+                    vec![ServerMessage::Result(failure_result(
+                        request,
+                        FailureCode::NotFound,
+                        "target request was not found",
+                    ))],
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
     let target_project_id = snapshot.project_id;
-    let cancelled_result = ResultEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        request_id: target_request_id.clone(),
-        project_id: target_project_id.clone(),
-        body: ResultBody::Failure(Failure {
-            code: FailureCode::Cancelled,
-            message: "request was cancelled".to_owned(),
-            recovery: None,
-            approval: None,
-        }),
-    };
-    let stored = encode(&ServerMessage::Result(cancelled_result))?;
-    let outcome = store
-        .cancel(target_request_id.clone(), now_ms(), stored)
-        .await?;
-    let disposition = match outcome {
-        CancelOutcome::Cancelled | CancelOutcome::CancellationRequested => {
-            CancellationDisposition::Requested
-        }
-        CancelOutcome::AlreadyTerminal(RequestState::Cancelled) => {
-            CancellationDisposition::AlreadyCancelled
-        }
-        CancelOutcome::AlreadyTerminal(_) => CancellationDisposition::AlreadyTerminal,
-    };
-    let truth = if disposition == CancellationDisposition::Requested {
-        OperationTruth::Changed
-    } else {
-        OperationTruth::Observed
-    };
+    let stored = encoded_cancelled_result(&target_request_id, &target_project_id)?;
+    let outcome = target_cancel(
+        store,
+        target_request_id.clone(),
+        now_ms(),
+        stored,
+        expected_target_kind,
+    )
+    .await?;
+    let (disposition, truth) = cancellation_presentation(outcome);
     let result = ResultEnvelope {
         protocol_version: PROTOCOL_VERSION,
         request_id: request.request_id.clone(),
@@ -1674,7 +2167,7 @@ async fn handle_cancel(
         None,
     )
     .await;
-    let replay = store.replay(target_request_id.clone(), 0).await?;
+    let replay = target_replay(store, target_request_id.clone(), 0, expected_target_kind).await?;
     let terminal = replay.result.is_some();
     let messages = replay_messages(&target_project_id, &target_request_id, replay)?;
     let _ = outbound
@@ -1688,10 +2181,106 @@ async fn handle_cancel(
     Ok(())
 }
 
+pub(super) fn cancellation_presentation(
+    outcome: CancelOutcome,
+) -> (CancellationDisposition, OperationTruth) {
+    let disposition = match outcome {
+        CancelOutcome::Cancelled | CancelOutcome::CancellationRequested => {
+            CancellationDisposition::Requested
+        }
+        CancelOutcome::AlreadyRequested => CancellationDisposition::AlreadyRequested,
+        CancelOutcome::AlreadyTerminal(RequestState::Cancelled) => {
+            CancellationDisposition::AlreadyCancelled
+        }
+        CancelOutcome::AlreadyTerminal(_) => CancellationDisposition::AlreadyTerminal,
+    };
+    let truth = if disposition == CancellationDisposition::Requested {
+        OperationTruth::Changed
+    } else {
+        OperationTruth::Observed
+    };
+    (disposition, truth)
+}
+
+fn encoded_cancelled_result(
+    target_request_id: &RequestId,
+    target_project_id: &ProjectId,
+) -> Result<Vec<u8>, CodecError> {
+    encode(&ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: target_request_id.clone(),
+        project_id: target_project_id.clone(),
+        body: ResultBody::Failure(Failure {
+            code: FailureCode::Cancelled,
+            message: "request was cancelled".to_owned(),
+            recovery: None,
+            approval: None,
+        }),
+    }))
+}
+
+async fn target_snapshot(
+    store: &Store,
+    request_id: RequestId,
+    expected_target_kind: Option<ExpectedTargetKind>,
+) -> Result<RequestSnapshot, StoreError> {
+    match expected_target_kind {
+        None => store.snapshot(request_id).await,
+        Some(ExpectedTargetKind::FlowRun) => {
+            store
+                .snapshot_with_expected_target(request_id, ExpectedOperationKind::FlowRun)
+                .await
+        }
+    }
+}
+
+async fn target_replay(
+    store: &Store,
+    request_id: RequestId,
+    after_sequence: u64,
+    expected_target_kind: Option<ExpectedTargetKind>,
+) -> Result<Replay, StoreError> {
+    match expected_target_kind {
+        None => store.replay(request_id, after_sequence).await,
+        Some(ExpectedTargetKind::FlowRun) => {
+            store
+                .replay_with_expected_target(
+                    request_id,
+                    after_sequence,
+                    ExpectedOperationKind::FlowRun,
+                )
+                .await
+        }
+    }
+}
+
+async fn target_cancel(
+    store: &Store,
+    request_id: RequestId,
+    now_ms: u64,
+    result: Vec<u8>,
+    expected_target_kind: Option<ExpectedTargetKind>,
+) -> Result<CancelOutcome, StoreError> {
+    match expected_target_kind {
+        None => store.cancel(request_id, now_ms, result).await,
+        Some(ExpectedTargetKind::FlowRun) => {
+            store
+                .cancel_with_expected_target(
+                    request_id,
+                    now_ms,
+                    result,
+                    ExpectedOperationKind::FlowRun,
+                )
+                .await
+        }
+    }
+}
+
 async fn handle_replay(
     request: &RequestEnvelope,
     target_request_id: RequestId,
     after_sequence: u64,
+    expected_target_kind: Option<ExpectedTargetKind>,
     incoming: IncomingRequest,
     store: &Store,
     outbound: &mpsc::Sender<Outbound>,
@@ -1710,27 +2299,32 @@ async fn handle_replay(
         .await;
         return Ok(());
     }
-    let snapshot = match store.snapshot(target_request_id.clone()).await {
-        Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
-        Ok(_) | Err(StoreError::RequestNotFound(_)) => {
-            send_routed(
-                outbound,
-                incoming,
-                vec![ServerMessage::Result(failure_result(
-                    request,
-                    FailureCode::NotFound,
-                    "target request was not found in this project",
-                ))],
-                None,
-            )
-            .await;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let replay = store
-        .replay(target_request_id.clone(), after_sequence)
-        .await?;
+    let snapshot =
+        match target_snapshot(store, target_request_id.clone(), expected_target_kind).await {
+            Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
+            Ok(_) | Err(StoreError::RequestNotFound(_)) => {
+                send_routed(
+                    outbound,
+                    incoming,
+                    vec![ServerMessage::Result(failure_result(
+                        request,
+                        FailureCode::NotFound,
+                        "target request was not found in this project",
+                    ))],
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let replay = target_replay(
+        store,
+        target_request_id.clone(),
+        after_sequence,
+        expected_target_kind,
+    )
+    .await?;
     let terminal = replay.result.is_some();
     let through_sequence = replay
         .events
@@ -1802,6 +2396,7 @@ async fn handle_wait_for_result(
     request: &RequestEnvelope,
     target_request_id: RequestId,
     after_sequence: u64,
+    expected_target_kind: Option<ExpectedTargetKind>,
     incoming: IncomingRequest,
     store: &Store,
     outbound: &mpsc::Sender<Outbound>,
@@ -1820,17 +2415,22 @@ async fn handle_wait_for_result(
         .await;
         return Ok(());
     }
-    let snapshot = match store.snapshot(target_request_id.clone()).await {
-        Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
-        Ok(_) | Err(StoreError::RequestNotFound(_)) => {
-            send_target_not_found(outbound, incoming, request).await;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let replay = store
-        .replay(target_request_id.clone(), after_sequence)
-        .await?;
+    let snapshot =
+        match target_snapshot(store, target_request_id.clone(), expected_target_kind).await {
+            Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
+            Ok(_) | Err(StoreError::RequestNotFound(_)) => {
+                send_target_not_found(outbound, incoming, request).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let replay = target_replay(
+        store,
+        target_request_id.clone(),
+        after_sequence,
+        expected_target_kind,
+    )
+    .await?;
     let terminal = replay.result.is_some();
     let last_sequence = replay
         .events
@@ -1858,9 +2458,13 @@ async fn handle_wait_for_result(
         })
         .await;
     if registered_rx.await.is_ok() {
-        let replay = store
-            .replay(target_request_id.clone(), last_sequence)
-            .await?;
+        let replay = target_replay(
+            store,
+            target_request_id.clone(),
+            last_sequence,
+            expected_target_kind,
+        )
+        .await?;
         let terminal = replay.result.is_some();
         let messages = replay_messages(&snapshot.project_id, &target_request_id, replay)?;
         let _ = outbound
@@ -1877,21 +2481,27 @@ async fn handle_wait_for_result(
 async fn handle_get_result(
     request: &RequestEnvelope,
     target_request_id: RequestId,
+    expected_target_kind: Option<ExpectedTargetKind>,
     incoming: IncomingRequest,
     store: &Store,
     outbound: &mpsc::Sender<Outbound>,
 ) -> Result<(), DaemonError> {
-    let snapshot = match store.snapshot(target_request_id.clone()).await {
-        Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
-        Ok(_) | Err(StoreError::RequestNotFound(_)) => {
-            send_target_not_found(outbound, incoming, request).await;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let replay = store
-        .replay(target_request_id.clone(), i64::MAX as u64)
-        .await?;
+    let snapshot =
+        match target_snapshot(store, target_request_id.clone(), expected_target_kind).await {
+            Ok(snapshot) if snapshot.project_id == request.project_id => snapshot,
+            Ok(_) | Err(StoreError::RequestNotFound(_)) => {
+                send_target_not_found(outbound, incoming, request).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let replay = target_replay(
+        store,
+        target_request_id.clone(),
+        i64::MAX as u64,
+        expected_target_kind,
+    )
+    .await?;
     let result = match replay.result {
         Some(stored) => remap_stored_result(
             &stored.payload,
@@ -2135,20 +2745,25 @@ fn request_identifiers_are_bounded(request: &RequestEnvelope) -> bool {
 
 fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
     match &request.payload {
-        RequestPayload::Cancel { target_request_id }
+        RequestPayload::Cancel {
+            target_request_id, ..
+        }
         | RequestPayload::Replay {
             target_request_id, ..
         }
         | RequestPayload::WaitForResult {
             target_request_id, ..
         }
-        | RequestPayload::GetResult { target_request_id } => Some(target_request_id),
+        | RequestPayload::GetResult {
+            target_request_id, ..
+        } => Some(target_request_id),
         RequestPayload::Status
         | RequestPayload::Brief
         | RequestPayload::NetworkDiagnostics
         | RequestPayload::InspectEvidence { .. }
         | RequestPayload::ReadEvidence { .. }
-        | RequestPayload::ModelInfer { .. } => None,
+        | RequestPayload::ModelInfer { .. }
+        | RequestPayload::FlowRun { .. } => None,
     }
 }
 
@@ -2293,10 +2908,19 @@ async fn run_scheduler(
                 })
                 .await;
         }
-        while let Some(leased) = store
-            .claim(&owner, now_ms(), duration_ms(LEASE_DURATION))
-            .await?
-        {
+        loop {
+            let leased = match store
+                .claim(&owner, now_ms(), duration_ms(LEASE_DURATION))
+                .await
+            {
+                Ok(Some(leased)) => leased,
+                Ok(None) => break,
+                Err(StoreError::CorruptFlowAuthorization(request_id)) => {
+                    quarantine_corrupt_flow_authorization(&store, &outbound, request_id).await?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let worker_store = store.clone();
             let worker_outbound = outbound.clone();
             workers.spawn(async move {
@@ -2333,6 +2957,42 @@ async fn run_scheduler(
     }
 }
 
+async fn quarantine_corrupt_flow_authorization(
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+    request_id: RequestId,
+) -> Result<(), DaemonError> {
+    let snapshot = store.snapshot(request_id.clone()).await?;
+    let result = ServerMessage::Result(ResultEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: request_id.clone(),
+        project_id: snapshot.project_id.clone(),
+        body: ResultBody::Failure(Failure {
+            code: FailureCode::Internal,
+            message: "stored flow authorization is invalid".to_owned(),
+            recovery: None,
+            approval: None,
+        }),
+    });
+    let recovery = store
+        .fail_corrupt_flow_authorization(request_id.clone(), now_ms(), encode(&result)?)
+        .await?;
+    if matches!(recovery, FlowAuthorizationRecoveryOutcome::NoLongerEligible) {
+        return Ok(());
+    }
+    let replay = store.replay(request_id.clone(), 0).await?;
+    let messages = replay_messages(&snapshot.project_id, &request_id, replay)?;
+    let _ = outbound
+        .send(Outbound::Persisted {
+            request_id,
+            messages,
+            terminal: true,
+        })
+        .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 async fn process_leased(
     mut leased: LeasedRequest,
     store: Store,
@@ -2377,46 +3037,77 @@ async fn process_leased(
         }
     }
     let queue_depth = store.queued_behind(leased.lease.request_id.clone()).await?;
-    let (terminal_state, result) = if leased.operation_kind == "daemon_status" {
-        (
-            TerminalState::Succeeded,
-            ResultEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                request_id: leased.lease.request_id.clone(),
-                project_id: leased.lease.project_id.clone(),
-                body: ResultBody::Success {
-                    truth: OperationTruth::Observed,
-                    payload: ResultPayload::Status(StatusResult {
-                        ready: true,
-                        healthy: true,
-                        daemon_version: APPLICATION_VERSION.to_owned(),
-                        protocol_version: PROTOCOL_VERSION,
-                        queue_depth,
+    let (terminal_state, result, cached_flow_terminal, encoded_flow_result) =
+        if leased.operation_kind == "daemon_status" {
+            (
+                TerminalState::Succeeded,
+                ResultEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: leased.lease.request_id.clone(),
+                    project_id: leased.lease.project_id.clone(),
+                    body: ResultBody::Success {
+                        truth: OperationTruth::Observed,
+                        payload: ResultPayload::Status(StatusResult {
+                            ready: true,
+                            healthy: true,
+                            daemon_version: APPLICATION_VERSION.to_owned(),
+                            protocol_version: PROTOCOL_VERSION,
+                            queue_depth,
+                        }),
+                    },
+                },
+                false,
+                None,
+            )
+        } else if leased.operation_kind == FLOW_OPERATION_KIND {
+            match process_flow(&mut leased, &store, lease_duration, LEASE_HEARTBEAT).await {
+                Err(StoreError::StaleLease(_)) | Ok(FlowProcessing::StaleLease) => return Ok(()),
+                Err(error) => return Err(error.into()),
+                Ok(FlowProcessing::Terminal {
+                    terminal_state,
+                    result,
+                    encoded_result,
+                    ..
+                }) => (
+                    terminal_state,
+                    *result,
+                    !encoded_result.is_empty(),
+                    (!encoded_result.is_empty()).then_some(encoded_result),
+                ),
+            }
+        } else {
+            (
+                TerminalState::Failed,
+                ResultEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: leased.lease.request_id.clone(),
+                    project_id: leased.lease.project_id.clone(),
+                    body: ResultBody::Failure(Failure {
+                        code: FailureCode::InvalidRequest,
+                        message: format!("unknown durable operation {}", leased.operation_kind),
+                        recovery: None,
+                        approval: None,
                     }),
                 },
-            },
-        )
+                false,
+                None,
+            )
+        };
+    let stored = if let Some(encoded) = encoded_flow_result {
+        encoded
     } else {
-        (
-            TerminalState::Failed,
-            ResultEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                request_id: leased.lease.request_id.clone(),
-                project_id: leased.lease.project_id.clone(),
-                body: ResultBody::Failure(Failure {
-                    code: FailureCode::InvalidRequest,
-                    message: format!("unknown durable operation {}", leased.operation_kind),
-                    recovery: None,
-                    approval: None,
-                }),
-            },
-        )
+        encode(&ServerMessage::Result(result))?
     };
-    let stored = encode(&ServerMessage::Result(result))?;
-    match store
-        .finish(leased.lease.clone(), now_ms(), terminal_state, stored)
-        .await
-    {
+    let finished = if cached_flow_terminal {
+        store
+            .finish_terminal_flow(leased.lease.clone(), now_ms(), stored)
+            .await
+    } else {
+        store
+            .finish(leased.lease.clone(), now_ms(), terminal_state, stored)
+            .await
+    };
+    match finished {
         Ok(_) => {}
         Err(StoreError::StaleLease(_)) => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -2468,23 +3159,58 @@ fn replay_messages_without_result(
                 request_id: request_id.clone(),
                 project_id: project_id.clone(),
                 sequence: record.sequence,
-                event: stored_event(&record.kind)?,
+                event: stored_event(record)?,
             }))
         })
         .collect()
 }
 
-fn decode_stored_result(payload: &[u8]) -> Result<ServerMessage, DaemonError> {
-    let message = decode_server_message(payload)?;
-    if matches!(message, ServerMessage::Result(_)) {
-        Ok(message)
-    } else {
-        Err(StoreError::InvalidState("stored result is not a result envelope".to_owned()).into())
+pub(super) fn decode_stored_result(payload: &[u8]) -> Result<ServerMessage, DaemonError> {
+    let mut message = decode_server_message_envelope(payload)?;
+    if let ServerMessage::Result(result) = &mut message {
+        if result.protocol_version == 0 || result.protocol_version > PROTOCOL_VERSION {
+            return Err(StoreError::InvalidState(
+                "stored result uses an unsupported protocol version".to_owned(),
+            )
+            .into());
+        }
+        if matches!(
+            &result.body,
+            ResultBody::Success {
+                payload: ResultPayload::FlowRun(_),
+                ..
+            }
+        ) && result.protocol_version < 4
+        {
+            return Err(StoreError::InvalidState(
+                "stored flow result predates the flow protocol".to_owned(),
+            )
+            .into());
+        }
+        // Durable results outlive the transport version that first encoded
+        // them. Their typed payload is decoded compatibly, then the daemon
+        // re-envelopes the replay for the current observer protocol.
+        if result.protocol_version < PROTOCOL_VERSION
+            && let ResultBody::Success {
+                truth,
+                payload: ResultPayload::FlowRun(flow),
+            } = &mut result.body
+        {
+            *truth = flow_result_truth(flow);
+        }
+        result.protocol_version = PROTOCOL_VERSION;
+        return Ok(message);
     }
+    Err(StoreError::InvalidState("stored result is not a result envelope".to_owned()).into())
 }
 
-fn stored_event(kind: &str) -> Result<Event, DaemonError> {
-    match kind {
+fn stored_event(record: &EventRecord) -> Result<Event, DaemonError> {
+    if record.kind.starts_with("flow_") {
+        return Ok(Event::FlowTransition(decode_flow_transition(
+            &record.payload,
+        )?));
+    }
+    match record.kind.as_str() {
         "accepted" => Ok(Event::Accepted),
         "started" => Ok(Event::Started),
         "lease_expired" => Ok(Event::LeaseExpired),

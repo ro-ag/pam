@@ -42,6 +42,32 @@ pub enum StoreError {
         canonical_request_id: RequestId,
     },
     StaleLease(RequestId),
+    InvalidFlowCheckpoint(&'static str),
+    FlowCheckpointTooLarge {
+        size_bytes: usize,
+        maximum_bytes: usize,
+    },
+    FlowTransitionTooLarge {
+        size_bytes: usize,
+        maximum_bytes: usize,
+    },
+    FlowTerminalResultTooLarge {
+        size_bytes: usize,
+        maximum_bytes: usize,
+    },
+    FlowCheckpointRevisionConflict {
+        request_id: RequestId,
+        expected: u64,
+        actual: u64,
+    },
+    FlowCheckpointConflict(RequestId),
+    FlowDefinitionDigestMismatch(RequestId),
+    FlowCheckpointRequestMismatch(RequestId),
+    FlowTerminalOutcomeConflict(RequestId),
+    FlowEffectStartConflict(RequestId),
+    CorruptFlowAuthorization(RequestId),
+    CorruptFlowCheckpoint(RequestId),
+    FlowCheckpointRevisionOverflow,
     InvalidState(String),
     TimestampOutOfRange(u64),
     LeaseDurationZero,
@@ -96,11 +122,8 @@ impl fmt::Display for StoreError {
                 formatter.write_str("PAM durable state contains an orphaned reference.")
             }
             Self::WorkerStopped => formatter.write_str("PAM's durable state worker stopped."),
-            Self::InvalidCallerCredential => {
-                formatter.write_str("caller credential must contain 1 to 256 bytes")
-            }
-            Self::CallerAlreadyRegistered(caller_id) => {
-                write!(formatter, "caller {caller_id} is already registered")
+            Self::InvalidCallerCredential | Self::CallerAlreadyRegistered(_) => {
+                format_caller_error(self, formatter)
             }
             Self::AuditEventAlreadyExists => formatter.write_str("audit event ID already exists"),
             Self::InvalidAuditEvent(reason) => write!(formatter, "invalid audit event: {reason}"),
@@ -137,6 +160,19 @@ impl fmt::Display for StoreError {
             Self::StaleLease(request_id) => {
                 write!(formatter, "lease for request {request_id} is stale")
             }
+            Self::InvalidFlowCheckpoint(_)
+            | Self::FlowCheckpointTooLarge { .. }
+            | Self::FlowTransitionTooLarge { .. }
+            | Self::FlowTerminalResultTooLarge { .. }
+            | Self::FlowCheckpointRevisionConflict { .. }
+            | Self::FlowCheckpointConflict(_)
+            | Self::FlowDefinitionDigestMismatch(_)
+            | Self::FlowCheckpointRequestMismatch(_)
+            | Self::FlowTerminalOutcomeConflict(_)
+            | Self::FlowEffectStartConflict(_)
+            | Self::CorruptFlowAuthorization(_)
+            | Self::CorruptFlowCheckpoint(_)
+            | Self::FlowCheckpointRevisionOverflow => format_flow_error(self, formatter),
             Self::InvalidState(state) => write!(formatter, "invalid stored request state {state}"),
             Self::TimestampOutOfRange(timestamp) => {
                 write!(
@@ -170,6 +206,85 @@ impl fmt::Display for StoreError {
                 format_model_error(self, formatter)
             }
         }
+    }
+}
+
+fn format_caller_error(error: &StoreError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match error {
+        StoreError::InvalidCallerCredential => {
+            formatter.write_str("caller credential must contain 1 to 256 bytes")
+        }
+        StoreError::CallerAlreadyRegistered(caller_id) => {
+            write!(formatter, "caller {caller_id} is already registered")
+        }
+        _ => unreachable!("format_caller_error requires a caller error"),
+    }
+}
+
+fn format_flow_error(error: &StoreError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match error {
+        StoreError::InvalidFlowCheckpoint(reason) => {
+            write!(formatter, "invalid flow checkpoint: {reason}")
+        }
+        StoreError::FlowCheckpointTooLarge {
+            size_bytes,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "flow checkpoint is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::FlowTransitionTooLarge {
+            size_bytes,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "flow transition is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::FlowTerminalResultTooLarge {
+            size_bytes,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "flow terminal result is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::FlowCheckpointRevisionConflict {
+            request_id,
+            expected,
+            actual,
+        } => write!(
+            formatter,
+            "flow checkpoint revision conflict for {request_id}: expected {expected}, found {actual}"
+        ),
+        StoreError::FlowCheckpointConflict(request_id) => write!(
+            formatter,
+            "flow checkpoint replay for {request_id} conflicts with durable state"
+        ),
+        StoreError::FlowDefinitionDigestMismatch(request_id) => write!(
+            formatter,
+            "flow definition digest for {request_id} does not match durable state"
+        ),
+        StoreError::FlowCheckpointRequestMismatch(request_id) => write!(
+            formatter,
+            "flow checkpoint run ID does not match request {request_id}"
+        ),
+        StoreError::FlowTerminalOutcomeConflict(request_id) => write!(
+            formatter,
+            "flow terminal outcome for {request_id} conflicts with durable request state"
+        ),
+        StoreError::FlowEffectStartConflict(request_id) => write!(
+            formatter,
+            "flow effect start for {request_id} conflicts with durable request state"
+        ),
+        StoreError::CorruptFlowAuthorization(request_id) => {
+            write!(formatter, "flow authorization for {request_id} is corrupt")
+        }
+        StoreError::CorruptFlowCheckpoint(request_id) => {
+            write!(formatter, "flow checkpoint for {request_id} is corrupt")
+        }
+        StoreError::FlowCheckpointRevisionOverflow => {
+            formatter.write_str("flow checkpoint revision overflowed")
+        }
+        _ => unreachable!("format_flow_error requires a flow checkpoint error"),
     }
 }
 
@@ -268,6 +383,19 @@ impl Error for StoreError {
             | Self::RequestIdConflict(_)
             | Self::IdempotencyConflict { .. }
             | Self::StaleLease(_)
+            | Self::InvalidFlowCheckpoint(_)
+            | Self::FlowCheckpointTooLarge { .. }
+            | Self::FlowTransitionTooLarge { .. }
+            | Self::FlowTerminalResultTooLarge { .. }
+            | Self::FlowCheckpointRevisionConflict { .. }
+            | Self::FlowCheckpointConflict(_)
+            | Self::FlowDefinitionDigestMismatch(_)
+            | Self::FlowCheckpointRequestMismatch(_)
+            | Self::FlowTerminalOutcomeConflict(_)
+            | Self::FlowEffectStartConflict(_)
+            | Self::CorruptFlowAuthorization(_)
+            | Self::CorruptFlowCheckpoint(_)
+            | Self::FlowCheckpointRevisionOverflow
             | Self::InvalidState(_)
             | Self::TimestampOutOfRange(_)
             | Self::LeaseDurationZero

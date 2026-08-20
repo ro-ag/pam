@@ -1,0 +1,48 @@
+schema_version = 2
+id = "after-merge-checks"
+name = "After merge checks"
+description = "Observe the merged revision and verify that the tracked worktree still matches the index."
+revision = 1
+
+[outcome]
+solved = "Whether every declared after-merge observation and verification completed successfully."
+changed = "State changes completed by this flow; this read-only flow is not expected to satisfy this section."
+verified = "Whether the tracked worktree was directly verified against the index."
+unresolved = "Which observation or verification could not be completed."
+blocked = "Which policy, workspace, or execution boundary stopped the flow."
+
+[[steps]]
+id = "observe-revision"
+description = "Record the exact checked-out revision as evidence."
+depends_on = []
+condition = { kind = "always" }
+retry = { max_attempts = 1, initial_backoff_ms = 0, max_backoff_ms = 0 }
+approval = "none"
+timeout_seconds = 30
+effect = "read_only"
+semantic = "observe"
+action = { type = "command", program = "git", args = ["rev-parse", "--verify", "HEAD"], working_directory = "." }
+
+[[steps]]
+id = "observe-worktree"
+description = "Record the bounded porcelain worktree status as evidence."
+depends_on = ["observe-revision"]
+condition = { kind = "succeeded", step = "observe-revision" }
+retry = { max_attempts = 1, initial_backoff_ms = 0, max_backoff_ms = 0 }
+approval = "none"
+timeout_seconds = 30
+effect = "read_only"
+semantic = "observe"
+action = { type = "command", program = "git", args = ["status", "--porcelain=v1", "--untracked-files=all"], working_directory = "." }
+
+[[steps]]
+id = "verify-tracked-worktree"
+description = "Verify that tracked worktree files match the index without modifying either."
+depends_on = ["observe-worktree"]
+condition = { kind = "succeeded", step = "observe-worktree" }
+retry = { max_attempts = 1, initial_backoff_ms = 0, max_backoff_ms = 0 }
+approval = "none"
+timeout_seconds = 30
+effect = "read_only"
+semantic = "verify"
+action = { type = "command", program = "git", args = ["diff", "--quiet"], working_directory = "." }

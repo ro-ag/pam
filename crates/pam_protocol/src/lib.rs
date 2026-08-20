@@ -13,17 +13,19 @@ pub use codec::{
     decode_server_message_envelope, encode,
 };
 pub use contract::{
-    ApprovalChallenge, BriefItem, BriefProvenance, BriefResult, CancellationDisposition,
-    CancellationResult, Capability, ConfigurationPresence, Event, EventEnvelope, EvidenceChunk,
+    ApprovalChallenge, ApprovalDecision, ApprovalDecisionDisposition, ApprovalDecisionResult,
+    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
+    Capability, ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure,
     FailureCode, FlowDefinitionDocument, FlowProjectRoot, MAX_FLOW_PROJECT_ROOT_BYTES,
-    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
-    NetworkDiagnosticsResult, OperationTruth, PacState, ProtocolContractError, ReplayResult,
-    RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage,
-    SourceAvailability, StatusResult,
+    MAX_PROJECT_CURRENT_QUEUED, MAX_PROJECT_OPERATION_KIND_BYTES, ModelFinishReason,
+    ModelGenerationResult, ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult,
+    OperationTruth, PacState, ProjectCurrentResult, ProjectRequestState, ProjectRequestSummary,
+    ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload, ResultBody,
+    ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability, StatusResult,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_EVIDENCE_CHUNK_SIZE: usize = 256 * 1024;
 pub const MAX_MODEL_MESSAGES: usize = 32;

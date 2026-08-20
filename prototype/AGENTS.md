@@ -17,5 +17,12 @@ When implementing from a selected generated mock, treat that image as the source
   military/security-console styling, or generic disaster language.
 - The primary UX is durable continuity: a project timeline expands into a
   provenance-backed brief that is ready for the next coding agent.
+- The user strongly prefers p-track's compact spatial grammar. Reuse its 248px
+  resizable sidebar, 44px toolbar, inset scrollable canvas, bounded cards,
+  right-side drawers, responsive icon rail, and keyboard density without
+  importing p-track's mint brand or Kanban semantics.
+- Production UI uses Tauri + React. Keep PAM's approved Current/Flows/Access
+  content, sunset identity, and provenance truth inside that shell; do not
+  revive the GPUI appearance.
 
 Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts/prepare-sites-build.mjs`, and `tests/sites-worker.test.mjs` intact so the same local prototype can be handed to Sites. Before a Sites handoff, run `npm run build` and `npm run test:sites`; the build must leave `dist/client/index.html`, `dist/server/index.js`, and `dist/.openai/hosting.json`.

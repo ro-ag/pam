@@ -73,7 +73,7 @@ The first usable slice proves the complete local loop on an M1-class Mac with
 - one signed development binary with client, daemon, and GUI entry points;
 - project discovery and a durable SQLite-backed queue;
 - authenticated local IPC and caller registration;
-- a native GPUI control center that starts or stops the daemon;
+- a native Tauri control center that starts or stops the daemon;
 - `pam brief`, one diagnostic operation, and one file-defined flow;
 - deterministic build-log compaction with source evidence retained;
 - import or assisted download of one compatible GGUF model;

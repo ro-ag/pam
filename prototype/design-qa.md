@@ -137,8 +137,8 @@ across without introducing a second design system.
 ## Follow-up polish
 
 - [P3] At 720 px height, the handoff's secondary text is intentionally denser
-  than the approved 1058 px-tall source. A future native GPUI build should use
-  the roomier source scale whenever the window height permits it.
+  than the approved 1058 px-tall source. The Tauri desktop uses the roomier
+  source scale whenever the window height permits it.
 - [P3] The bottom daemon label wraps in the compact browser frame. The native
   control can use an icon-only status with an accessible tooltip at this size.
 - [P3] At 1024 px, long catalog names and Git commands intentionally ellipsize.
@@ -147,7 +147,7 @@ across without introducing a second design system.
 
 ## Implementation checklist
 
-- Keep the approved expanded Current state as the primary native GPUI target.
+- Keep the approved expanded Current state as the primary Tauri desktop target.
 - Preserve low-height visibility of the three core handoff actions.
 - Carry project switching, daemon control, evidence inspection, and handoff
   success states into the production interaction contract.

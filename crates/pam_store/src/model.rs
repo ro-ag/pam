@@ -451,3 +451,33 @@ pub struct RequestSnapshot {
     pub attempt: u64,
     pub lease_expires_at_ms: Option<u64>,
 }
+
+/// Current non-status scheduler workload for one project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectWorkload {
+    pub queued: u64,
+    pub active: bool,
+}
+
+/// Maximum number of queued requests returned by [`crate::Store::project_current`].
+pub const MAX_PROJECT_CURRENT_QUEUED: usize = 64;
+
+/// Bounded scheduler metadata safe to expose in a project-current read model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectRequestSummary {
+    pub request_id: RequestId,
+    pub operation_kind: String,
+    pub state: RequestState,
+    pub queue_sequence: u64,
+    pub accepted_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+}
+
+/// Transactionally consistent current scheduler state for one project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectCurrent {
+    pub queued: Vec<ProjectRequestSummary>,
+    pub queued_truncated: bool,
+    pub active: Option<ProjectRequestSummary>,
+    pub latest_terminal: Option<ProjectRequestSummary>,
+}

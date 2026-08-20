@@ -12,15 +12,17 @@ native certificate trust, sanitized proxy diagnostics, a durable audit ledger,
 explicit retention controls, verified user-owned model registration, and
 bounded direct llama.cpp inference are also implemented.
 
-Flows, connector effects, the full GPUI control center, service-manager
-integration, signed peer registration, Unix peer-credential checks, and Windows
-named pipes are planned, not current security controls. Model inference uses the
-existing authenticated PAM IPC protocol and an in-process Rust/llama.cpp
-adapter; there is no HTTP model listener or bearer-token export.
+Connector effects, service-manager integration, signed peer registration,
+Unix peer-credential checks, and Windows named pipes are planned, not current
+security controls. The Tauri control center is an implemented presentation
+boundary over typed Rust commands; it does not receive caller credentials,
+raw project identifiers, or unrestricted filesystem authority. Model inference
+uses the existing authenticated PAM IPC protocol and an in-process
+Rust/llama.cpp adapter; there is no HTTP model listener or bearer-token export.
 
 This model covers the whole repository, while concentrating on deployed runtime
-code under `crates/`. The React prototype is a design contract and is not a
-production security boundary.
+code under `crates/` and the Tauri shell under `src-tauri/`. The React frontend
+is a presentation layer and is not a production security boundary.
 
 ## Threat Model, Trust Boundaries, and Assumptions
 

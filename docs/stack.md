@@ -10,7 +10,7 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 | Language | Rust 2024 edition | One native binary, strong type boundaries, predictable resource use, and good macOS/Linux/Windows reach. | Keep unsafe code isolated to audited FFI adapters. |
 | Async runtime | Tokio | Matches the selected ZeroMQ implementation and connector ecosystem. | Blocking database, process, and model work use bounded workers. |
 | CLI | clap | Mature derive-based command contract and shell completion support. | Domain operations do not depend on CLI types. |
-| Native UI | GPUI 0.2.x | The requested Zed stack, GPU-native, and already exercised in a serious editor. | Pin exact revisions, isolate `pam_gui`, and keep a daemon-first fallback because the public API is young. |
+| Desktop UI | Tauri 2.11.5 + React 19 + TypeScript | Preserves a small Rust authority boundary while providing the cross-platform layout, accessibility tree, and interaction fidelity the GPUI spike could not deliver. | Keep Tauri commands typed and narrow; no shell/fs/http plugins or credentials in frontend DTOs. |
 | IPC | zeromq 0.6 Router/Dealer | Native Rust, Tokio, Unix IPC, multiplexed clients, and no required `libzmq`. | Own the versioned protocol; transport fallback and conformance tests are mandatory. |
 | Encoding | Serde + MessagePack | Compact typed envelopes without inventing a serializer. | Explicit limits, schema versions, unknown-field behavior, and golden fixtures. |
 | Durable state | SQLite via rusqlite with bundled SQLite | Transactional queues and audit state in a user-local deployment. | WAL mode, migrations, bounded DB worker, backups, and corruption tests. |
@@ -24,15 +24,15 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 | Observability | tracing | Structured daemon spans and correlation IDs. | Local by default, redaction at source, no telemetry without opt-in. |
 | Planning continuity | ptrack adapter | Existing purpose-built durable goal/plan/task companion. | Use supported CLI/protocol; never couple to the ptrack database. |
 
-## Why not Tauri or Electron first
+## Why Tauri replaced the GPUI spike
 
-Tauri would make cross-platform settings screens faster, and Electron would
-offer the largest UI ecosystem. Neither is the requested product character:
-PAM should feel like a native operations companion and share the rendering
-approach of Zed. GPUI earns the first spike because the user explicitly chose
-that family and macOS is the first delivery. The daemon/client boundary keeps a
-future secondary UI possible if GPUI portability or accessibility becomes a
-release blocker.
+The GPUI spike proved the Rust-side state boundaries but failed the approved
+visual contract, did not expose the control center through a platform
+accessibility tree, and made the requested five-target preview matrix costly.
+Tauri keeps `pam_gui` independent of the webview shell: Rust owns credentials,
+project authority, daemon protocol, evidence bounds, and stale-operation fences;
+React owns presentation and interaction. Electron remains unnecessary because
+Tauri reuses the operating system webview and bundles the existing Rust helper.
 
 ## Why application-level queues, not a ZeroMQ queue
 
@@ -62,7 +62,10 @@ remains calibration history; the production Qwen3-Coder-30B-A3B-Instruct
 Q4_K_S profile passed the 20 GB model-allocation ceiling at 8,192 context
 tokens. M1 Pro with 32 GB memory is the minimum supported Mac; host-specific
 admission is mandatory, and M1 Pro speed remains unmeasured.
-Universal packaging also remains unproven. PAM will use bounded chunk-boundary
+Universal model packaging remains intentionally out of scope. The desktop
+control center targets Linux and Windows on arm64/amd64 and macOS 12+ on arm64.
+The macOS CI package is Developer-ID-signed, notarized, stapled, and
+Gatekeeper-validated without exposing repository credentials. PAM will use bounded chunk-boundary
 cancellation and a serialized worker instead of the binding's unsafe abort
 callback. See `docs/benchmarks/llama-cpp-macos.md` for commands, measurements,
 limitations, and the fallback criteria. The preview uses the embedded adapter
@@ -102,7 +105,7 @@ contract.
 crates/
   pam_cli          command parsing and terminal presentation
   pam_daemon       composition root and lifecycle
-  pam_gui          GPUI application
+  pam_gui          Tauri-independent desktop authority and DTO boundary
   pam_core         IDs, requests, results, state machines
   pam_protocol     versioned envelopes and transport contracts
   pam_store        SQLite and evidence storage
@@ -112,6 +115,8 @@ crates/
   pam_model        runtime contract and llama.cpp adapter
   pam_connectors   connector capability interfaces
   pam_platform     paths, IPC, credentials, service lifecycle
+src-tauri/         thin typed Tauri 2 shell and platform packaging
+frontend/          React presentation, interactions, and visual states
 ```
 
 This is a dependency-boundary proposal, not permission to create every crate on
@@ -122,10 +127,10 @@ boundary is proven.
 ## Validation strategy
 
 - Portable format, lint, unit, and contract tests run cheaply on Linux.
-- macOS is added for GPUI, Keychain, Unix IPC, Metal, signing, and packaging only
-  after Linux checks pass.
-- Windows is added for protocol/path compile checks before its native transport
-  milestone and for full integration only when the implementation exists.
+- Linux frontend/Rust validation is the cheap gate for every desktop package.
+- Windows arm64/amd64 and Linux arm64/amd64 packages run on native GitHub
+  runners after that gate; macOS arm64 signing and notarization is gated to
+  approved PRs and `main`.
 - Protocol and flow schemas use golden fixtures. Queue recovery uses crash/fault
   tests. Redaction and capability policy use adversarial cases.
 - Rust tests live in sibling test files rather than inline test modules, matching
@@ -133,7 +138,8 @@ boundary is proven.
 
 ## Open decisions
 
-- Minimum supported macOS version and signing/notarization identity.
+- Release and long-term distribution policy beyond CI-retained preview
+  artifacts; no tag, release, or public upload is implied by the package jobs.
 - MessagePack library and evolution rules after protocol fixture spike.
 - Whether a later model-sharing slice needs another authenticated PAM protocol
   operation; an HTTP/OpenAI-compatible listener is intentionally out of scope.

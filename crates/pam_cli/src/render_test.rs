@@ -1,11 +1,11 @@
 use pam_core::{ContentDigest, EvidenceHandle, ProjectId, RequestId};
 use pam_flow::{EffectResult, FlowDefinition, FlowRun, RunDecision, RunId};
 use pam_protocol::{
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    ConfigurationPresence, Event, EventEnvelope, EvidenceMetadata, EvidenceRedaction,
-    EvidenceRetention, Failure, FailureCode, ModelFinishReason, ModelGenerationResult, ModelUsage,
-    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ResultBody,
-    ResultPayload, SourceAvailability,
+    ApprovalDecisionDisposition, ApprovalDecisionResult, BriefItem, BriefProvenance, BriefResult,
+    CancellationDisposition, CancellationResult, ConfigurationPresence, DaemonLifecycleResult,
+    Event, EventEnvelope, EvidenceMetadata, EvidenceRedaction, EvidenceRetention, Failure,
+    FailureCode, ModelFinishReason, ModelGenerationResult, ModelUsage, NetworkDiagnosticsResult,
+    OperationTruth, PROTOCOL_VERSION, PacState, ResultBody, ResultPayload, SourceAvailability,
 };
 
 use super::render::{
@@ -15,6 +15,34 @@ use super::render::{
 
 fn handle() -> EvidenceHandle {
     EvidenceHandle::parse("evidence://ci/1842/failure").unwrap()
+}
+
+#[test]
+fn daemon_stop_acknowledgement_is_rendered_without_process_identity() {
+    let presentation = present_result(&ResultBody::Success {
+        truth: OperationTruth::Changed,
+        payload: ResultPayload::DaemonLifecycle(DaemonLifecycleResult { stopping: true }),
+    });
+
+    assert_eq!(presentation.stdout, "stopping=true truth=changed\n");
+    assert!(presentation.stderr.is_empty());
+}
+
+#[test]
+fn approval_decision_renders_only_bounded_identity_and_disposition() {
+    let presentation = present_result(&ResultBody::Success {
+        truth: OperationTruth::Changed,
+        payload: ResultPayload::ApprovalDecision(ApprovalDecisionResult {
+            approval_id: pam_core::ApprovalId::new("approval-1"),
+            disposition: ApprovalDecisionDisposition::Approved,
+        }),
+    });
+
+    assert_eq!(
+        presentation.stdout,
+        "approval_id=approval-1 disposition=approved truth=changed\n"
+    );
+    assert!(presentation.stderr.is_empty());
 }
 
 #[test]

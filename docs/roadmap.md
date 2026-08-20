@@ -88,7 +88,7 @@ progress, and hand its compact verified result to an agent.
 Deliverables:
 
 - approved Project Current direction and Baywatch visual tokens translated to
-  GPUI;
+  the typed Tauri desktop boundary;
 - daemon start/stop and health;
 - project switcher, queue, active run, approval, and solved-result views;
 - models, access, certificates, configuration, and evidence surfaces;
@@ -133,7 +133,7 @@ preview, approval, idempotency, and verification.
 ## Immediate decision tasks
 
 - Set the minimum supported macOS release.
-- Validate GPUI accessibility and packaging constraints.
+- Validate Tauri accessibility, responsive behavior, and five-target packaging.
 - Complete the llama.cpp binding benchmark.
 - Define the first flow schema and protocol golden fixture.
 

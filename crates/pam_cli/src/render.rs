@@ -445,6 +445,25 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             status.queue_depth,
             truth_label(truth)
         ),
+        ResultPayload::DaemonLifecycle(result) => format!(
+            "stopping={} truth={}\n",
+            result.stopping,
+            truth_label(truth)
+        ),
+        ResultPayload::ProjectCurrent(current) => format!(
+            "queued={} active={} latest={} truncated={} truth={}\n",
+            current.queued().len(),
+            current.active.is_some(),
+            current.latest.is_some(),
+            current.truncated,
+            truth_label(truth)
+        ),
+        ResultPayload::ApprovalDecision(result) => format!(
+            "approval_id={} disposition={} truth={}\n",
+            escape_text(result.approval_id.as_str()),
+            approval_decision_label(result.disposition),
+            truth_label(truth)
+        ),
         ResultPayload::Cancellation(cancellation) => format!(
             "target_request_id={} disposition={} truth={}\n",
             escape_text(cancellation.target_request_id.as_str()),
@@ -498,6 +517,17 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             escape_text(result.text())
         ),
         ResultPayload::FlowRun(result) => render_flow_result(result, truth),
+    }
+}
+
+const fn approval_decision_label(
+    disposition: pam_protocol::ApprovalDecisionDisposition,
+) -> &'static str {
+    use pam_protocol::ApprovalDecisionDisposition;
+    match disposition {
+        ApprovalDecisionDisposition::Approved => "approved",
+        ApprovalDecisionDisposition::Denied => "denied",
+        ApprovalDecisionDisposition::Expired => "expired",
     }
 }
 

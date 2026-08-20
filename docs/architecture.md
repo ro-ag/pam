@@ -7,7 +7,7 @@ all modes share the same versioned domain types and policy engine.
 
 ```mermaid
 flowchart LR
-  H["Human"] --> G["pam gui\nGPUI control center"]
+  H["Human"] --> G["pam gui\nTauri + React control center"]
   A["Coding agent"] --> C["pam client\ndefault mode"]
   G --> T["Local transport"]
   C --> T

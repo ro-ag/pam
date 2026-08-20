@@ -29,6 +29,9 @@ const MAX_STDERR_BYTES: usize = 4 * 1024;
 const MAX_SECTION_ITEMS: usize = 16;
 const MAX_ITEM_BYTES: usize = 4 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
+const MAX_REGISTERED_PROJECTS: usize = 256;
+const MAX_PROJECT_NAME_BYTES: usize = 256;
+const MAX_PROJECT_PATH_BYTES: usize = 4 * 1024;
 const TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 pub(crate) struct PtrackBriefProvider {
@@ -191,10 +194,31 @@ struct Note {
     body: String,
 }
 
-#[derive(Deserialize)]
-struct RegisteredProject {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RegisteredProject {
+    #[serde(rename = "Name")]
+    name: String,
     #[serde(rename = "Path")]
     path: PathBuf,
+    #[serde(rename = "LastSeen")]
+    last_seen: String,
+}
+
+impl RegisteredProject {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn last_seen(&self) -> &str {
+        &self.last_seen
+    }
 }
 
 impl ContextDigest {
@@ -393,11 +417,7 @@ pub(super) fn context_handle(bytes: &[u8]) -> EvidenceHandle {
 }
 
 pub(super) fn validate_registered_project(bytes: &[u8], directory: &Path) -> Result<(), String> {
-    let projects = serde_json::from_slice::<Vec<RegisteredProject>>(bytes).map_err(|error| {
-        bounded_detail(format!(
-            "ptrack returned incompatible projects JSON: {error}"
-        ))
-    })?;
+    let projects = parse_registered_projects(bytes)?;
     let registered = projects
         .into_iter()
         .any(|project| project.path == directory);
@@ -407,6 +427,45 @@ pub(super) fn validate_registered_project(bytes: &[u8], directory: &Path) -> Res
         Err("ptrack does not report this PAM project root through its supported projects interface."
             .to_owned())
     }
+}
+
+/// Returns the bounded ptrack project catalog used by the native control center.
+///
+/// # Errors
+///
+/// Returns a sanitized error when ptrack is unavailable, exceeds its deadline,
+/// or returns an incompatible or unbounded project catalog.
+pub async fn registered_projects(directory: &Path) -> Result<Vec<RegisteredProject>, String> {
+    let bytes = run_command(
+        &OsString::from("ptrack"),
+        directory,
+        &["projects", "--json"],
+        "ptrack projects --json",
+    )
+    .await?;
+    parse_registered_projects(&bytes)
+}
+
+fn parse_registered_projects(bytes: &[u8]) -> Result<Vec<RegisteredProject>, String> {
+    let projects = serde_json::from_slice::<Vec<RegisteredProject>>(bytes).map_err(|error| {
+        bounded_detail(format!(
+            "ptrack returned incompatible projects JSON: {error}"
+        ))
+    })?;
+    if projects.len() > MAX_REGISTERED_PROJECTS {
+        return Err("ptrack returned too many registered projects.".to_owned());
+    }
+    for project in &projects {
+        if project.name.trim().is_empty()
+            || project.name.len() > MAX_PROJECT_NAME_BYTES
+            || !project.path.is_absolute()
+            || project.path.as_os_str().as_encoded_bytes().len() > MAX_PROJECT_PATH_BYTES
+            || project.last_seen.len() > MAX_PROJECT_NAME_BYTES
+        {
+            return Err("ptrack returned an invalid registered project entry.".to_owned());
+        }
+    }
+    Ok(projects)
 }
 
 async fn run_command(

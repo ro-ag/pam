@@ -6,6 +6,12 @@ on:
     paths-ignore:
       - "**/*.md"
       - "docs/**"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +19,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   foundation:
@@ -22,6 +28,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       has_cargo: ${{ steps.rust_workspace.outputs.has_cargo }}
+      has_frontend: ${{ steps.frontend.outputs.has_frontend }}
       has_prototype: ${{ steps.prototype.outputs.has_prototype }}
       rust_changed: ${{ steps.rust_changes.outputs.changed }}
     steps:
@@ -94,6 +101,16 @@ jobs:
             echo "has_prototype=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Detect desktop frontend
+        id: frontend
+        shell: bash
+        run: |
+          if [[ -f frontend/package-lock.json ]]; then
+            echo "has_frontend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_frontend=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: Rust
     needs: foundation
@@ -103,6 +120,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -124,24 +146,260 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
 
-  macos-developer-build:
-    name: macOS developer build
-    needs: [foundation, rust]
-    if: ${{ needs.foundation.outputs.rust_changed == 'true' }}
-    runs-on: macos-15
-    timeout-minutes: 15
+  frontend:
+    name: Desktop frontend
+    needs: foundation
+    if: ${{ needs.foundation.outputs.has_frontend == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Check types
+        run: npm run typecheck
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+  desktop-packages:
+    name: ${{ matrix.name }}
+    needs: [rust, frontend]
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 package
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            family: linux
+            artifact: PAM-linux-amd64
+          - name: Linux arm64 package
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: appimage,deb
+            family: linux
+            artifact: PAM-linux-arm64
+          - name: Windows amd64 package
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            family: windows
+            artifact: PAM-windows-amd64
+          - name: Windows arm64 package
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+            family: windows
+            artifact: PAM-windows-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Linux desktop dependencies
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: ${{ matrix.target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: desktop-${{ matrix.target }}
 
-      - name: Build developer workspace
-        run: cargo build --workspace --all-features --locked
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Stage PAM helper
+        run: node tools/stage-desktop-sidecar.mjs ${{ matrix.target }}
+
+      - name: Build desktop packages
+        run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Verify package output
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          FAMILY: ${{ matrix.family }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          if [[ "$FAMILY" == linux ]]; then
+            find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit | grep -q .
+            find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print -quit | grep -q .
+          else
+            find "$bundle/nsis" -maxdepth 1 -type f -name '*.exe' -print -quit | grep -q .
+          fi
+          echo "path=$bundle" >> "$GITHUB_OUTPUT"
+
+      - name: Upload preview packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-package:
+    name: macOS arm64 signed package
+    needs: [rust, frontend]
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-macos'))
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: desktop-aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Prepare Apple signing and notarization
+        shell: bash
+        env:
+          APPLE_API_KEY_ID_SECRET: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_MATERIAL: ${{ secrets.APPLE_API_KEY }}
+          APPLE_CERTIFICATE_BASE64_SECRET: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD_SECRET: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/pam-build.keychain-db"
+          certificate="$RUNNER_TEMP/pam-certificate.p12"
+          private_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64_SECRET" | base64 --decode > "$certificate"
+          printf '%s' "$APPLE_API_KEY_MATERIAL" > "$private_key"
+          security create-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD_SECRET" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD_SECRET" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          [[ -n "$identity" ]]
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$private_key" >> "$GITHUB_ENV"
+          echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Stage PAM helper
+        run: node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
+
+      - name: Build signed and notarized application
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: npm --prefix frontend run tauri -- build --target aarch64-apple-darwin --bundles app
+
+      - name: Build, sign, and notarize disk image
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          app="target/aarch64-apple-darwin/release/bundle/macos/PAM.app"
+          dmg_dir="target/aarch64-apple-darwin/release/bundle/dmg"
+          dmg="$(tools/package-macos-dmg.sh "$PWD/$app" "$PWD/$dmg_dir")"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 20m
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Verify macOS package contract
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="target/aarch64-apple-darwin/release/bundle"
+          app="$bundle/macos/PAM.app"
+          dmg="$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          codesign --verify --deep --strict "$app"
+          codesign --verify --strict "$dmg"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type execute "$app"
+          for binary in "$app/Contents/MacOS/pam" "$app/Contents/MacOS/pam-gui"; do
+            [[ "$(lipo -archs "$binary")" == arm64 ]]
+            [[ "$(otool -l "$binary" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
+          done
+          echo "path=$bundle" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed preview package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PAM-macos-arm64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -n "${PAM_BUILD_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$PAM_BUILD_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/pam-certificate.p12" "$RUNNER_TEMP"/AuthKey_*.p8
 
   prototype:
     name: Interactive prototype

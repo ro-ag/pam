@@ -8,18 +8,19 @@ story. It keeps durable context, turns noisy evidence into compact answers,
 safely brokers approved tools, and runs repeatable flows without sending the
 developer's workspace to a hosted control plane.
 
-PAM is designed as one Rust binary with three faces:
+PAM is designed as a Rust authority boundary with a dedicated desktop shell:
 
 ```text
 pam                         # client mode (default)
 pam daemon                  # local background service
-pam gui                     # native control center; can start/stop the daemon
+pam gui                     # launches the installed desktop control center
 pam flow run "release check"
 ```
 
-The first delivery targets Apple Silicon Macs. Linux and Windows remain
-architectural constraints from the first commit rather than ports deferred
-until the end.
+Desktop previews target Linux arm64/amd64, Windows arm64/amd64, and Apple
+Silicon macOS. The embedded llama.cpp/Metal runtime remains macOS-only; the
+portable desktop surfaces report that limitation instead of implying a model
+is available.
 
 ## Why PAM
 
@@ -56,11 +57,12 @@ PAM should help an agent answer:
 
 ## Current status
 
-The product foundation, walking skeleton, durable project-continuity, and local
-trust-and-policy slices are complete. The pinned Rust workspace builds one
-`pam` executable with client, daemon, status, brief, wait, result, evidence,
-caller, access, approval, network-diagnostics, audit-export, retention, and
-GUI-shell modes. The daemon durably schedules per-project work in SQLite,
+The product foundation, walking skeleton, durable project-continuity, local
+trust-and-policy, and desktop-control-center slices are implemented. The pinned
+Rust workspace builds the `pam` command and a dedicated Tauri `pam-gui` app
+entry point with client, daemon, status, brief, wait, result, evidence, caller,
+access, approval, network-diagnostics, audit-export, retention, and native GUI
+modes. The daemon durably schedules per-project work in SQLite,
 recovers leases after restart, replays ordered events, retains exact
 content-addressed evidence, and obtains project context from `ptrack` only
 through its supported JSON CLI. The workspace also contains a tested,
@@ -81,8 +83,8 @@ explicit, bounded, and crash-recoverable. Model registration verifies exact
 user-owned bytes and license consent; model loading is disabled unless the
 daemon receives `--model VENDOR/NAME`, then fails closed on the 20 GB profile,
 fresh memory pressure, swap trend, Metal working set, and OS/PAM reserves.
-Flows, connectors, service-manager integration, peer-credential transport
-hardening, and the full GPUI control center remain later roadmap slices. PAC
+Flow authoring, connectors, service-manager integration, peer-credential
+transport hardening, and screen-reader semantics remain later roadmap slices. PAC
 evaluation and live managed enterprise CA/proxy behavior are not claimed; no
 managed-environment interviews or workflow observations have been conducted.
 
@@ -147,8 +149,7 @@ cargo run -p pam_cli -- model generate \
 The daemon runs in the foreground and shuts down cleanly on Ctrl-C. If an
 interrupted daemon leaves stale local endpoint state, recover it explicitly
 with `cargo run -p pam_cli -- daemon --recover`. The native GUI boundary is
-available as `cargo run -p pam_cli -- gui`; the production GPUI surface lands
-in the native-control-center roadmap slice. `pam brief` requires `ptrack` to be
+available as `cargo run -p pam_cli -- gui`. `pam brief` requires `ptrack` to be
 installed and initialized for that exact project root; otherwise it reports the
 source as unavailable. Durable request observers use `pam wait <request-id>` and
 `pam result <request-id>`. A brief's exact source can be inspected with
@@ -197,6 +198,43 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
+## Desktop previews
+
+The Tauri 2 shell packages the same typed Rust desktop core and React interface
+for five native targets:
+
+| Platform | Architecture | Preview package |
+| --- | --- | --- |
+| Linux | amd64, arm64 | AppImage and DEB |
+| Windows | amd64, arm64 | NSIS installer |
+| macOS 12+ | arm64 only | application bundle and DMG |
+
+Every package includes the matching `pam` helper. GitHub Actions builds each
+target on a native runner after the Linux Rust and frontend gates pass. The
+macOS job imports the repository's configured certificate and App Store Connect
+key into an ephemeral runner keychain, signs with the hardened runtime,
+notarizes and staples the app and DMG, validates Gatekeeper, then destroys the
+temporary signing material. It does not create a release, tag, or public
+download.
+
+For an unsigned local Apple Silicon build:
+
+```sh
+npm --prefix frontend ci
+node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=12.0 \
+  npm --prefix frontend run tauri -- build \
+  --target aarch64-apple-darwin --bundles app
+tools/package-macos-dmg.sh \
+  "$PWD/target/aarch64-apple-darwin/release/bundle/macos/PAM.app" \
+  "$PWD/target/aarch64-apple-darwin/release/bundle/dmg"
+```
+
+The React interface uses native HTML controls, DOM focus order, labeled regions,
+keyboard shortcuts, reduced-motion behavior, and forced-color fallbacks. The
+preview does not claim complete VoiceOver or WCAG conformance until the full
+platform interaction matrix is independently verified.
+
 The prototype translates the approved "Project Current" direction into a
 responsive, interactive screen with project switching, daemon control, agent
 handoff, evidence inspection, and flow/access states:
@@ -207,9 +245,9 @@ npm install
 npm run dev
 ```
 
-See the [prototype visual QA](prototype/design-qa.md) for the source target and
-comparison evidence. The prototype is a design contract; production UI remains
-native GPUI.
+See the [prototype visual QA](prototype/design-qa.md) for the original source
+target. The approved PAM Current screen remains the content contract; the
+production React interface renders it inside p-track's compact shell grammar.
 
 Read next:
 

@@ -383,6 +383,32 @@ jobs:
             }
           }
 
+          function Get-ByteHash([byte[]] $Bytes) {
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              [BitConverter]::ToString($sha256.ComputeHash($Bytes)).Replace('-', '')
+            } finally {
+              $sha256.Dispose()
+            }
+          }
+
+          function Assert-NsisDesktopContract([string] $OriginalPath, [string] $PackagedPath) {
+            $original = [IO.File]::ReadAllBytes($OriginalPath)
+            $packaged = [IO.File]::ReadAllBytes($PackagedPath)
+            # Tauri CLI 2.11.4 patches this one same-length marker for NSIS, then restores the build output.
+            $unknownMarker = '__TAURI_BUNDLE_TYPE_VAR_UNK'
+            $nsis = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+            $originalText = [Text.Encoding]::ASCII.GetString($original)
+            $offset = $originalText.IndexOf($unknownMarker, [StringComparison]::Ordinal)
+            if ($offset -lt 0 -or $offset -ne $originalText.LastIndexOf($unknownMarker, [StringComparison]::Ordinal)) {
+              throw "unpatched PAM desktop must contain exactly one Tauri bundle marker"
+            }
+            [Array]::Copy($nsis, 0, $original, $offset, $nsis.Length)
+            if ((Get-ByteHash $original) -ne (Get-ByteHash $packaged)) {
+              throw "packaged PAM desktop differs beyond the expected Tauri NSIS marker patch"
+            }
+          }
+
           $expectedMachine = switch ($env:TARGET) {
             'x86_64-pc-windows-msvc' { [UInt16] 0x8664 }
             'aarch64-pc-windows-msvc' { [UInt16] 0xaa64 }
@@ -420,9 +446,7 @@ jobs:
           if ((Get-FileHash $helper).Hash -ne (Get-FileHash $packagedHelper[0].FullName).Hash) {
             throw "packaged PAM helper differs from the verified target binary"
           }
-          if ((Get-FileHash $desktop).Hash -ne (Get-FileHash $packagedDesktop[0].FullName).Hash) {
-            throw "packaged PAM desktop differs from the verified target binary"
-          }
+          Assert-NsisDesktopContract $desktop $packagedDesktop[0].FullName
 
       - name: Record package output
         id: package

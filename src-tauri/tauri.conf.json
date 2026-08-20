@@ -4,9 +4,15 @@
   "version": "0.1.0",
   "identifier": "com.github.ro-ag.pam",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../frontend"
+    },
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../frontend"
+    },
     "frontendDist": "../frontend/dist"
   },
   "app": {

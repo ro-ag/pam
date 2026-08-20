@@ -368,13 +368,15 @@ jobs:
             }
             $helpPath = Join-Path $env:RUNNER_TEMP ("pam-help-{0}.txt" -f [Guid]::NewGuid())
             try {
-              & $Path --help > $helpPath
+              & $Path --help *> $helpPath
               $helpExit = $LASTEXITCODE
-              $helpLines = @(Get-Content -LiteralPath $helpPath)
-              $hasAbout = $helpLines -contains 'Local project continuity companion'
-              $hasUsage = @($helpLines | Where-Object { $_ -match '^Usage: pam(?: |$)' }).Count -gt 0
+              $help = Get-Content -LiteralPath $helpPath -Raw
+              $help = [Regex]::Replace($help, '\x1B\[[0-?]*[ -/]*[@-~]', '')
+              $hasAbout = $help.Contains('Local project continuity companion')
+              $hasUsage = $help.Contains('Usage: pam')
               if ($helpExit -ne 0 -or -not $hasAbout -or -not $hasUsage) {
-                throw "PAM helper help contract failed"
+                $helpBytes = (Get-Item -LiteralPath $helpPath).Length
+                throw "PAM helper help contract failed (exit=$helpExit, about=$hasAbout, usage=$hasUsage, bytes=$helpBytes)"
               }
             } finally {
               Remove-Item -LiteralPath $helpPath -Force -ErrorAction SilentlyContinue

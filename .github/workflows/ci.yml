@@ -134,6 +134,14 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
+      - name: Stage development PAM helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p pam_cli --bin pam --locked
+          mkdir -p src-tauri/binaries
+          cp target/debug/pam src-tauri/binaries/pam-x86_64-unknown-linux-gnu
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

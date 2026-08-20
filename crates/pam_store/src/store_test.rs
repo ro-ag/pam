@@ -4,6 +4,11 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, ContentDigest, GrantId, IdempotencyKey, ProjectId,
     RequestId,
 };
+use pam_flow::{
+    ApprovalDecision as FlowApprovalDecision, EffectReport, EffectResult, EngineUpdate,
+    FlowDefinition, FlowRun, ReconciliationResult, RunDecision, RunId, RunOutcome, RunTransition,
+    TransitionKind,
+};
 use pam_model::{
     GgufMetadata, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource, RegisteredModel,
 };
@@ -13,10 +18,13 @@ use rusqlite::Connection;
 use super::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
     ApprovalDecisionOutcome, AuditPruneOutcome, AuthorizationAudit, AuthorizationOutcome,
-    AuthorizationRequest, CallerAuthentication, CallerRevocation, CancelOutcome, GrantRevocation,
+    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CallerRevocation, CancelOutcome,
+    ExpectedOperationKind, FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome,
+    FlowCheckpointDisposition, FlowEffectAuthorization, FlowTerminalResult, GrantRevocation,
     MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
-    MAX_AUDIT_PROJECT_ID_BYTES, PutGrant, RequestState, Store, StoreError, TerminalState,
+    MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES, PutGrant, RequestState,
+    SaveFlowCheckpoint, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -166,9 +174,626 @@ async fn open_approval_store(name: &str) -> (std::path::PathBuf, std::path::Path
     (directory, path, store)
 }
 
+async fn open_flow_authorization_store(
+    name: &str,
+    approval: ApprovalRequirement,
+) -> (std::path::PathBuf, std::path::PathBuf, Store, ResourceName) {
+    let (directory, path) = database_path(name);
+    let store = Store::open(&path).unwrap();
+    for (caller_id, credential) in [
+        ("flow-auth-subject", "flow auth subject credential"),
+        ("flow-auth-reviewer", "flow auth reviewer credential"),
+    ] {
+        store
+            .register_caller(
+                CallerId::from(caller_id),
+                CallerCredential::new(credential),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let flow_resource = resource("flow:test-authority");
+    let mut flow_grant = grant(
+        "flow-auth-grant",
+        "flow-auth-subject",
+        "flow-auth-project",
+        "flow.run",
+        ResourceScope::Exact(flow_resource.clone()),
+    );
+    flow_grant.approval = approval;
+    store
+        .put_grant(PutGrant {
+            grant: flow_grant,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    (directory, path, store, flow_resource)
+}
+
+fn flow_authorization_request(
+    request_id: &str,
+    flow_resource: ResourceName,
+    approval_id: Option<ApprovalId>,
+    schema_approval_required: bool,
+    audit_id: &str,
+) -> AuthorizeFlowRun {
+    let mut accept = request(
+        request_id,
+        "flow-auth-subject",
+        "flow-auth-project",
+        request_id,
+        format!("flow operation {request_id}").as_bytes(),
+    );
+    accept.operation_kind = "flow_run".to_owned();
+    AuthorizeFlowRun {
+        accept,
+        resource: flow_resource,
+        approval_id,
+        audit: AuthorizationAudit {
+            event_id: audit_id.to_owned(),
+            action: "flow.authorize".to_owned(),
+            redacted_detail: "exact flow authorization decision".to_owned(),
+            retain_until_ms: 10_000,
+        },
+        schema_approval_required,
+    }
+}
+
 async fn close(store: Store, directory: &Path) {
     store.shutdown().await.unwrap();
     fs::remove_dir_all(directory).unwrap();
+}
+
+fn flow_definition(revision: u64) -> FlowDefinition {
+    flow_definition_with_step(revision, "inspect")
+}
+
+fn flow_definition_with_step(revision: u64, step_id: &str) -> FlowDefinition {
+    FlowDefinition::parse_toml(&format!(
+        r#"
+schema_version = 1
+id = "store-flow"
+name = "Store flow"
+description = "Exercise durable flow checkpoints."
+revision = {revision}
+
+[outcome]
+solved = "Report solved work."
+changed = "Report changed state."
+verified = "Report verified evidence."
+unresolved = "Report unresolved work."
+blocked = "Report the exact blocker."
+
+[[steps]]
+id = "{step_id}"
+description = "Inspect durable state."
+timeout_seconds = 30
+effect = "read_only"
+action = {{ type = "command", program = "git", args = ["status"], working_directory = "." }}
+"#
+    ))
+    .unwrap()
+}
+
+fn approval_flow_definition() -> FlowDefinition {
+    let source = flow_definition(1)
+        .to_normalized_toml()
+        .unwrap()
+        .replace("approval = \"none\"", "approval = \"required\"");
+    FlowDefinition::parse_toml(&source).unwrap()
+}
+
+fn stateful_approval_flow_definition() -> FlowDefinition {
+    FlowDefinition::parse_toml(
+        r#"
+schema_version = 1
+id = "store-stateful-flow"
+name = "Store stateful flow"
+description = "Exercise uncertain stateful cancellation recovery."
+revision = 1
+
+[outcome]
+solved = "Report solved work."
+changed = "Report changed state."
+verified = "Report verified evidence."
+unresolved = "Report unresolved work."
+blocked = "Report the exact blocker."
+
+[[steps]]
+id = "apply"
+description = "Apply one exact approved effect."
+approval = "required"
+idempotency_key = "store-stateful:apply"
+timeout_seconds = 30
+effect = "stateful"
+action = { type = "connector", connector = "github.actions", capability = "runs.rerun", resource = { kind = "workflow_run", id = "github:ro-ag/pam/runs/42" } }
+"#,
+    )
+    .unwrap()
+}
+
+async fn leased_flow(store: &Store, request_id: &str) -> (super::Lease, FlowRun) {
+    leased_flow_with_definition(store, request_id, flow_definition(1)).await
+}
+
+async fn leased_flow_with_definition(
+    store: &Store,
+    request_id: &str,
+    definition: FlowDefinition,
+) -> (super::Lease, FlowRun) {
+    let mut accepted = request(
+        request_id,
+        "flow-caller",
+        "flow-project",
+        request_id,
+        b"flow",
+    );
+    accepted.operation_kind = "flow_run".to_owned();
+    match store
+        .register_caller(
+            CallerId::from("flow-caller"),
+            CallerCredential::new("flow-test-credential"),
+            1,
+        )
+        .await
+    {
+        Ok(_) | Err(StoreError::CallerAlreadyRegistered(_)) => {}
+        Err(error) => panic!("flow test caller registration failed: {error}"),
+    }
+    let flow_resource = resource(&format!("flow-test:{request_id}"));
+    store
+        .put_grant(PutGrant {
+            grant: grant(
+                &format!("flow-grant-{request_id}"),
+                "flow-caller",
+                "flow-project",
+                "flow.run",
+                ResourceScope::Exact(flow_resource.clone()),
+            ),
+            created_at_ms: 2,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                AuthorizeFlowRun {
+                    accept: accepted,
+                    resource: flow_resource,
+                    approval_id: None,
+                    audit: AuthorizationAudit {
+                        event_id: format!("flow-auth-{request_id}"),
+                        action: "flow.authorize".to_owned(),
+                        redacted_detail: "store flow fixture authorized".to_owned(),
+                        retain_until_ms: 1_000,
+                    },
+                    schema_approval_required: false,
+                },
+                10,
+                100,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    let lease = store
+        .claim("flow-worker", 20, 1_000)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    let run = FlowRun::start(RunId::parse(request_id).unwrap(), definition).unwrap();
+    (lease, run)
+}
+
+async fn checkpointed_flow(
+    store: &Store,
+    request_id: &str,
+) -> (super::Lease, FlowRun, EngineUpdate) {
+    let (lease, mut run) = leased_flow(store, request_id).await;
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    let update = run.next_decision(22).unwrap();
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 1,
+            snapshot: update.snapshot().clone(),
+            transition: update.transition().cloned(),
+            terminal_result: None,
+            updated_at_ms: 22,
+        })
+        .await
+        .unwrap();
+    (lease, run, update)
+}
+
+async fn cancelled_flow_with_terminal_checkpoint(
+    store: &Store,
+    request_id: &str,
+    terminal_result: Vec<u8>,
+) -> super::Lease {
+    let (lease, mut run) = leased_flow(store, request_id).await;
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cancel(
+                lease.request_id.clone(),
+                22,
+                b"generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+    let terminal = run.cancel().unwrap();
+    let RunDecision::Terminal { result } = terminal.decision() else {
+        panic!("cancelled flow must become terminal");
+    };
+    assert_eq!(result.outcome(), RunOutcome::Cancelled);
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 1,
+            snapshot: terminal.snapshot().clone(),
+            transition: terminal.transition().cloned(),
+            terminal_result: Some(FlowTerminalResult {
+                outcome: RunOutcome::Cancelled,
+                encoded_result: terminal_result,
+            }),
+            updated_at_ms: 23,
+        })
+        .await
+        .unwrap();
+    lease
+}
+
+#[allow(clippy::too_many_lines)] // Every persisted real-engine boundary is part of this fixture.
+async fn reconciliation_unknown_after_cancellation(
+    store: &Store,
+    request_id: &str,
+    terminal_result: &[u8],
+) -> super::Lease {
+    let (lease, mut run) =
+        leased_flow_with_definition(store, request_id, stateful_approval_flow_definition()).await;
+    let initial = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    let mut revision = initial.checkpoint.checkpoint_revision;
+
+    let approval = run.next_decision(22).unwrap();
+    let token = match approval.decision() {
+        RunDecision::AwaitApproval { token, .. } => *token,
+        other => panic!("expected approval request, got {other:?}"),
+    };
+    (_, revision) = save_test_flow_update(store, &lease, revision, approval, terminal_result).await;
+
+    let approved = run
+        .resolve_approval(token, FlowApprovalDecision::Approve)
+        .unwrap();
+    (_, revision) = save_test_flow_update(store, &lease, revision, approved, terminal_result).await;
+
+    let evaluated = run.next_decision(23).unwrap();
+    let effect = match evaluated.decision() {
+        RunDecision::EvaluateEffect { effect, .. } => effect.clone(),
+        other => panic!("expected effect evaluation, got {other:?}"),
+    };
+    (_, revision) =
+        save_test_flow_update(store, &lease, revision, evaluated, terminal_result).await;
+
+    let started = run.prepare_effect(&effect, 24).unwrap();
+    assert!(matches!(started.decision(), RunDecision::Execute { .. }));
+    (_, revision) = save_test_flow_update(store, &lease, revision, started, terminal_result).await;
+
+    assert_eq!(
+        store
+            .cancel(
+                lease.request_id.clone(),
+                25,
+                b"generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+    let cancelling = run.cancel().unwrap();
+    assert!(matches!(
+        cancelling.decision(),
+        RunDecision::Reconcile { .. }
+    ));
+    assert!(matches!(
+        cancelling.transition().map(RunTransition::kind),
+        Some(TransitionKind::CancellationRequested)
+    ));
+    (_, revision) =
+        save_test_flow_update(store, &lease, revision, cancelling, terminal_result).await;
+
+    let blocked = run
+        .record_reconciliation(
+            &effect,
+            ReconciliationResult::Unknown(
+                EffectReport::new("application cannot be determined", Vec::new()).unwrap(),
+            ),
+            26,
+        )
+        .unwrap();
+    assert!(matches!(
+        blocked.transition().map(RunTransition::kind),
+        Some(TransitionKind::ReconciliationUnknown { .. })
+    ));
+    let (decision, _) =
+        save_test_flow_update(store, &lease, revision, blocked, terminal_result).await;
+    assert!(matches!(
+        decision,
+        RunDecision::Terminal { result } if result.outcome() == RunOutcome::Blocked
+    ));
+    let checkpoint = store
+        .load_flow_checkpoint(lease.clone(), 27)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint.terminal_result,
+        Some(FlowTerminalResult {
+            outcome: RunOutcome::Blocked,
+            encoded_result: terminal_result.to_vec(),
+        })
+    );
+    lease
+}
+
+async fn save_test_flow_update(
+    store: &Store,
+    lease: &super::Lease,
+    revision: u64,
+    update: EngineUpdate,
+    encoded_terminal_result: &[u8],
+) -> (RunDecision, u64) {
+    let decision = update.decision().clone();
+    let terminal_result = match &decision {
+        RunDecision::Terminal { result } => Some(FlowTerminalResult {
+            outcome: result.outcome(),
+            encoded_result: encoded_terminal_result.to_vec(),
+        }),
+        _ => None,
+    };
+    let saved = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: revision,
+            snapshot: update.snapshot().clone(),
+            transition: update.transition().cloned(),
+            terminal_result,
+            updated_at_ms: 30 + revision,
+        })
+        .await
+        .unwrap();
+    (decision, saved.checkpoint.checkpoint_revision)
+}
+
+async fn assert_terminal_flow_update_rejected(
+    store: &Store,
+    lease: &super::Lease,
+    revision: u64,
+    update: EngineUpdate,
+    encoded_terminal_result: &[u8],
+) {
+    let RunDecision::Terminal { result } = update.decision() else {
+        panic!("expected terminal flow update");
+    };
+    let error = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: revision,
+            snapshot: update.snapshot().clone(),
+            transition: update.transition().cloned(),
+            terminal_result: Some(FlowTerminalResult {
+                outcome: result.outcome(),
+                encoded_result: encoded_terminal_result.to_vec(),
+            }),
+            updated_at_ms: 30 + revision,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        StoreError::FlowTerminalOutcomeConflict(request_id) if request_id == &lease.request_id
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "flow terminal outcome for {} conflicts with durable request state",
+            lease.request_id
+        )
+    );
+}
+
+#[allow(clippy::too_many_lines)] // Keep each real engine outcome explicit in the race fixture.
+async fn terminal_flow_with_checkpoint(
+    store: &Store,
+    request_id: &str,
+    outcome: RunOutcome,
+    encoded_terminal_result: &[u8],
+    cancel_before_terminal: bool,
+) -> super::Lease {
+    let definition = if outcome == RunOutcome::Blocked {
+        approval_flow_definition()
+    } else {
+        flow_definition(1)
+    };
+    let (lease, mut run) = leased_flow_with_definition(store, request_id, definition).await;
+    let initial = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    let mut revision = initial.checkpoint.checkpoint_revision;
+
+    match outcome {
+        RunOutcome::Cancelled => {
+            assert_eq!(
+                store
+                    .cancel(
+                        lease.request_id.clone(),
+                        22,
+                        b"generic cancellation".to_vec(),
+                    )
+                    .await
+                    .unwrap(),
+                CancelOutcome::CancellationRequested
+            );
+            let terminal = run.cancel().unwrap();
+            let (decision, _) =
+                save_test_flow_update(store, &lease, revision, terminal, encoded_terminal_result)
+                    .await;
+            assert!(matches!(
+                decision,
+                RunDecision::Terminal { result } if result.outcome() == outcome
+            ));
+        }
+        RunOutcome::Blocked => {
+            let requested = run.next_decision(22).unwrap();
+            let token = match requested.decision() {
+                RunDecision::AwaitApproval { token, .. } => *token,
+                other => panic!("expected approval request, got {other:?}"),
+            };
+            (_, revision) =
+                save_test_flow_update(store, &lease, revision, requested, encoded_terminal_result)
+                    .await;
+            if cancel_before_terminal {
+                assert_eq!(
+                    store
+                        .cancel(
+                            lease.request_id.clone(),
+                            24,
+                            b"earlier cancellation".to_vec(),
+                        )
+                        .await
+                        .unwrap(),
+                    CancelOutcome::CancellationRequested
+                );
+            }
+            let denied = run
+                .resolve_approval(token, FlowApprovalDecision::Deny)
+                .unwrap();
+            if cancel_before_terminal {
+                assert_terminal_flow_update_rejected(
+                    store,
+                    &lease,
+                    revision,
+                    denied,
+                    encoded_terminal_result,
+                )
+                .await;
+            } else {
+                let (decision, _) =
+                    save_test_flow_update(store, &lease, revision, denied, encoded_terminal_result)
+                        .await;
+                assert!(matches!(
+                    decision,
+                    RunDecision::Terminal { result } if result.outcome() == outcome
+                ));
+            }
+        }
+        RunOutcome::Solved | RunOutcome::Unresolved => {
+            let evaluation = run.next_decision(22).unwrap();
+            let effect = match evaluation.decision() {
+                RunDecision::EvaluateEffect { effect, .. } => effect.clone(),
+                other => panic!("expected effect evaluation, got {other:?}"),
+            };
+            (_, revision) =
+                save_test_flow_update(store, &lease, revision, evaluation, encoded_terminal_result)
+                    .await;
+            let started = run.prepare_effect(&effect, 23).unwrap();
+            (_, revision) =
+                save_test_flow_update(store, &lease, revision, started, encoded_terminal_result)
+                    .await;
+            let effect_result = if outcome == RunOutcome::Solved {
+                EffectResult::succeeded("completed", Vec::new()).unwrap()
+            } else {
+                EffectResult::failed("failed", false, Vec::new()).unwrap()
+            };
+            let recorded = run
+                .record_effect_result(&effect, effect_result, 24)
+                .unwrap();
+            (_, revision) =
+                save_test_flow_update(store, &lease, revision, recorded, encoded_terminal_result)
+                    .await;
+            if cancel_before_terminal {
+                assert_eq!(
+                    store
+                        .cancel(
+                            lease.request_id.clone(),
+                            25,
+                            b"earlier cancellation".to_vec(),
+                        )
+                        .await
+                        .unwrap(),
+                    CancelOutcome::CancellationRequested
+                );
+            }
+            let terminal = run.next_decision(25).unwrap();
+            if cancel_before_terminal {
+                assert_terminal_flow_update_rejected(
+                    store,
+                    &lease,
+                    revision,
+                    terminal,
+                    encoded_terminal_result,
+                )
+                .await;
+            } else {
+                let (decision, _) = save_test_flow_update(
+                    store,
+                    &lease,
+                    revision,
+                    terminal,
+                    encoded_terminal_result,
+                )
+                .await;
+                assert!(matches!(
+                    decision,
+                    RunDecision::Terminal { result } if result.outcome() == outcome
+                ));
+            }
+        }
+    }
+    lease
 }
 
 #[tokio::test]
@@ -721,7 +1346,7 @@ async fn running_cancellation_retains_lease_until_worker_acknowledges_it() {
             )
             .await
             .unwrap(),
-        CancelOutcome::CancellationRequested
+        CancelOutcome::AlreadyRequested
     );
     assert_eq!(
         store
@@ -764,6 +1389,739 @@ async fn running_cancellation_retains_lease_until_worker_acknowledges_it() {
     assert_eq!(next.lease.request_id, RequestId::from("a-2"));
 
     close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn cancelled_flow_finish_replaces_the_placeholder_and_replays_once() {
+    let (directory, path) = database_path("cancelled-flow-finish");
+    let store = Store::open(&path).unwrap();
+    let truthful_result = b"typed cancelled flow result".to_vec();
+    let lease =
+        cancelled_flow_with_terminal_checkpoint(&store, "flow-cancel-1", truthful_result.clone())
+            .await;
+    let request_id = lease.request_id.clone();
+
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease.clone(), 25, b"different result".to_vec())
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+    let completed = store
+        .finish_terminal_flow(lease.clone(), 25, truthful_result.clone())
+        .await
+        .unwrap();
+    assert_eq!(completed.state, RequestState::Cancelled);
+    assert_eq!(completed.payload, truthful_result);
+    assert_eq!(completed.completed_at_ms, 25);
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease, 26, b"duplicate".to_vec())
+            .await,
+        Err(StoreError::StaleLease(_))
+    ));
+
+    let replay = store.replay(request_id, 0).await.unwrap();
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| (event.sequence, event.kind.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "accepted"),
+            (2, "started"),
+            (3, "cancellation_requested"),
+            (4, "flow_completed"),
+            (5, "cancelled")
+        ]
+    );
+    assert_eq!(replay.result.unwrap().payload, truthful_result);
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn cancelled_flow_recovery_uses_the_cached_terminal_result_after_a_crash() {
+    let (directory, path) = database_path("cancelled-flow-recovery");
+    let store = Store::open(&path).unwrap();
+    let truthful_result = b"durable typed cancellation".to_vec();
+    let lease = cancelled_flow_with_terminal_checkpoint(
+        &store,
+        "flow-cancel-recovery",
+        truthful_result.clone(),
+    )
+    .await;
+    let request_id = lease.request_id.clone();
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.recover_all_leases(25).await.unwrap(), 1);
+    assert_eq!(reopened.recover_all_leases(26).await.unwrap(), 0);
+    let replay = reopened.replay(request_id, 0).await.unwrap();
+    assert_eq!(replay.events.len(), 5);
+    let result = replay.result.unwrap();
+    assert_eq!(result.state, RequestState::Cancelled);
+    assert_eq!(result.payload, truthful_result);
+    assert_eq!(result.completed_at_ms, 25);
+
+    close(reopened, &directory).await;
+}
+
+async fn assert_reconciliation_unknown_replay(
+    store: &Store,
+    request_id: &str,
+    terminal_result: &[u8],
+    completed_at_ms: u64,
+) {
+    let replay = store.replay(RequestId::from(request_id), 0).await.unwrap();
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "accepted",
+            "started",
+            "flow_approval_required",
+            "flow_approval_granted",
+            "flow_effect_evaluation_required",
+            "flow_effect_started",
+            "cancellation_requested",
+            "flow_cancellation_requested",
+            "flow_reconciliation_unknown",
+            "failed",
+        ]
+    );
+    let result = replay.result.unwrap();
+    assert_eq!(result.state, RequestState::Failed);
+    assert_eq!(result.payload, terminal_result);
+    assert_eq!(result.completed_at_ms, completed_at_ms);
+}
+
+#[tokio::test]
+async fn reconciliation_unknown_after_cancellation_finishes_with_exact_blocked_truth() {
+    let (directory, path) = database_path("cancelled-stateful-unknown-finish");
+    let store = Store::open(&path).unwrap();
+    let terminal_result = b"typed blocked reconciliation result".to_vec();
+    let lease = reconciliation_unknown_after_cancellation(
+        &store,
+        "cancel-stateful-unknown-finish",
+        &terminal_result,
+    )
+    .await;
+
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease.clone(), 40, b"wrong terminal bytes".to_vec())
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+    let finished = store
+        .finish_terminal_flow(lease.clone(), 40, terminal_result.clone())
+        .await
+        .unwrap();
+    assert_eq!(finished.state, RequestState::Failed);
+    assert_eq!(finished.payload, terminal_result);
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease, 41, b"duplicate".to_vec())
+            .await,
+        Err(StoreError::StaleLease(_))
+    ));
+    assert_reconciliation_unknown_replay(
+        &store,
+        "cancel-stateful-unknown-finish",
+        &terminal_result,
+        40,
+    )
+    .await;
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn duplicate_cancel_finalizes_cached_reconciliation_unknown_as_failed() {
+    let (directory, path) = database_path("cancelled-stateful-unknown-duplicate");
+    let store = Store::open(&path).unwrap();
+    let request_id = "cancel-stateful-unknown-duplicate";
+    let terminal_result = b"durable blocked reconciliation result".to_vec();
+    reconciliation_unknown_after_cancellation(&store, request_id, &terminal_result).await;
+
+    assert_eq!(
+        store
+            .cancel(
+                RequestId::from(request_id),
+                40,
+                b"second generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::AlreadyTerminal(RequestState::Failed)
+    );
+    assert_eq!(
+        store
+            .cancel(
+                RequestId::from(request_id),
+                41,
+                b"third generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::AlreadyTerminal(RequestState::Failed)
+    );
+    assert_reconciliation_unknown_replay(&store, request_id, &terminal_result, 40).await;
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn recovery_finalizes_cached_reconciliation_unknown_as_failed_before_requeue() {
+    let (directory, path) = database_path("cancelled-stateful-unknown-recovery");
+    let store = Store::open(&path).unwrap();
+    let request_id = "cancel-stateful-unknown-recovery";
+    let terminal_result = b"recovered blocked reconciliation result".to_vec();
+    reconciliation_unknown_after_cancellation(&store, request_id, &terminal_result).await;
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.recover_all_leases(40).await.unwrap(), 1);
+    assert_eq!(reopened.recover_all_leases(41).await.unwrap(), 0);
+    assert!(
+        reopened
+            .claim("other-worker", 41, 100)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .cancel(
+                RequestId::from(request_id),
+                42,
+                b"late generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::AlreadyTerminal(RequestState::Failed)
+    );
+    assert_reconciliation_unknown_replay(&reopened, request_id, &terminal_result, 40).await;
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn expired_recovery_finalizes_cached_reconciliation_unknown_as_failed() {
+    let (directory, path) = database_path("cancelled-stateful-unknown-expired");
+    let store = Store::open(&path).unwrap();
+    let request_id = "cancel-stateful-unknown-expired";
+    let terminal_result = b"expired blocked reconciliation result".to_vec();
+    reconciliation_unknown_after_cancellation(&store, request_id, &terminal_result).await;
+
+    assert_eq!(
+        store.recover_expired_requests(1_020).await.unwrap(),
+        vec![RequestId::from(request_id)]
+    );
+    assert!(
+        store
+            .recover_expired_requests(1_020)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_reconciliation_unknown_replay(&store, request_id, &terminal_result, 1_020).await;
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn terminal_flow_checkpoint_requires_a_bounded_encoded_result() {
+    let (directory, path) = database_path("terminal-flow-result-bound");
+    let store = Store::open(&path).unwrap();
+    let lease = cancelled_flow_with_terminal_checkpoint(
+        &store,
+        "flow-terminal-bound",
+        b"cached result".to_vec(),
+    )
+    .await;
+    let checkpoint = store
+        .load_flow_checkpoint(lease.clone(), 25)
+        .await
+        .unwrap()
+        .unwrap();
+    let cached = FlowTerminalResult {
+        outcome: RunOutcome::Cancelled,
+        encoded_result: b"cached result".to_vec(),
+    };
+    assert_eq!(checkpoint.terminal_result.as_ref(), Some(&cached));
+    let unchanged = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: checkpoint.checkpoint_revision,
+            snapshot: checkpoint.snapshot.clone(),
+            transition: None,
+            terminal_result: Some(cached.clone()),
+            updated_at_ms: 25,
+        })
+        .await
+        .unwrap();
+    assert_eq!(unchanged.disposition, FlowCheckpointDisposition::Unchanged);
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: checkpoint.checkpoint_revision,
+                snapshot: checkpoint.snapshot.clone(),
+                transition: None,
+                terminal_result: Some(FlowTerminalResult {
+                    outcome: RunOutcome::Cancelled,
+                    encoded_result: b"different result".to_vec(),
+                }),
+                updated_at_ms: 25,
+            })
+            .await,
+        Err(StoreError::FlowCheckpointConflict(_))
+    ));
+
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: checkpoint.checkpoint_revision,
+                snapshot: checkpoint.snapshot.clone(),
+                transition: None,
+                terminal_result: None,
+                updated_at_ms: 25,
+            })
+            .await,
+        Err(StoreError::InvalidFlowCheckpoint(_))
+    ));
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease,
+                expected_revision: checkpoint.checkpoint_revision,
+                snapshot: checkpoint.snapshot,
+                transition: None,
+                terminal_result: Some(FlowTerminalResult {
+                    outcome: RunOutcome::Cancelled,
+                    encoded_result: vec![0; MAX_FLOW_TERMINAL_RESULT_BYTES + 1],
+                }),
+                updated_at_ms: 25,
+            })
+            .await,
+        Err(StoreError::FlowTerminalResultTooLarge {
+            size_bytes,
+            maximum_bytes: MAX_FLOW_TERMINAL_RESULT_BYTES,
+        }) if size_bytes == MAX_FLOW_TERMINAL_RESULT_BYTES + 1
+    ));
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn cancelled_flow_finish_rejects_a_live_non_cancellation_state_and_stale_lease() {
+    let (directory, path) = database_path("cancelled-flow-state");
+    let store = Store::open(&path).unwrap();
+    let (lease, _) = leased_flow(&store, "flow-cancel-state").await;
+    let request_id = lease.request_id.clone();
+    let mut stale = lease.clone();
+    stale.token = "stale-token".to_owned();
+
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease.clone(), 21, b"premature".to_vec())
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        store
+            .finish_terminal_flow(stale, 21, b"stale".to_vec())
+            .await,
+        Err(StoreError::StaleLease(_))
+    ));
+    let replay = store.replay(request_id.clone(), 0).await.unwrap();
+    assert_eq!(replay.events.len(), 2);
+    assert!(replay.result.is_none());
+
+    store
+        .cancel(request_id, 22, b"placeholder".to_vec())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .finish_terminal_flow(lease, 23, b"cancelled flow".to_vec())
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn cancelled_flow_finish_rejects_non_flow_work_and_generic_finish_retains_its_result() {
+    let (directory, path) = database_path("cancelled-non-flow");
+    let store = Store::open(&path).unwrap();
+    store
+        .accept(
+            request("ordinary-1", "caller", "project", "ordinary-1", b"work"),
+            10,
+        )
+        .await
+        .unwrap();
+    let leased = store.claim("worker", 20, 100).await.unwrap().unwrap();
+    store
+        .cancel(
+            leased.lease.request_id.clone(),
+            21,
+            b"ordinary cancellation".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .finish_terminal_flow(leased.lease.clone(), 22, b"replacement".to_vec())
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+    let completed = store
+        .finish(
+            leased.lease,
+            23,
+            TerminalState::Succeeded,
+            b"success cannot win".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.state, RequestState::Cancelled);
+    assert_eq!(completed.payload, b"ordinary cancellation");
+    let replay = store
+        .replay(RequestId::from("ordinary-1"), 0)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 4);
+    assert_eq!(replay.result.unwrap().payload, b"ordinary cancellation");
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exact per-outcome event streams are the regression contract.
+async fn cancellation_after_each_terminal_flow_checkpoint_preserves_cached_truth() {
+    for (label, flow_outcome) in [
+        ("solved", RunOutcome::Solved),
+        ("unresolved", RunOutcome::Unresolved),
+        ("blocked", RunOutcome::Blocked),
+        ("cancelled", RunOutcome::Cancelled),
+    ] {
+        let (directory, path) = database_path(&format!("terminal-cancel-race-{label}"));
+        let store = Store::open(&path).unwrap();
+        let request_id = format!("terminal-cancel-race-{label}");
+        let encoded_result = format!("encoded terminal {label}").into_bytes();
+        let lease = terminal_flow_with_checkpoint(
+            &store,
+            &request_id,
+            flow_outcome,
+            &encoded_result,
+            false,
+        )
+        .await;
+
+        let (expected_state, expected_cancel, expected_events) = match flow_outcome {
+            RunOutcome::Solved => (
+                RequestState::Succeeded,
+                CancelOutcome::AlreadyTerminal(RequestState::Succeeded),
+                vec![
+                    "accepted",
+                    "started",
+                    "flow_effect_evaluation_required",
+                    "flow_effect_started",
+                    "flow_effect_succeeded",
+                    "flow_completed",
+                    "completed",
+                ],
+            ),
+            RunOutcome::Unresolved => (
+                RequestState::Failed,
+                CancelOutcome::AlreadyTerminal(RequestState::Failed),
+                vec![
+                    "accepted",
+                    "started",
+                    "flow_effect_evaluation_required",
+                    "flow_effect_started",
+                    "flow_effect_failed",
+                    "flow_completed",
+                    "failed",
+                ],
+            ),
+            RunOutcome::Blocked => (
+                RequestState::Failed,
+                CancelOutcome::AlreadyTerminal(RequestState::Failed),
+                vec![
+                    "accepted",
+                    "started",
+                    "flow_approval_required",
+                    "flow_approval_denied",
+                    "failed",
+                ],
+            ),
+            RunOutcome::Cancelled => (
+                RequestState::Cancelled,
+                CancelOutcome::Cancelled,
+                vec![
+                    "accepted",
+                    "started",
+                    "cancellation_requested",
+                    "flow_completed",
+                    "cancelled",
+                ],
+            ),
+        };
+        let cancellation = store
+            .cancel(
+                lease.request_id.clone(),
+                90,
+                b"late generic cancellation".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancellation, expected_cancel, "{label}");
+        assert_eq!(
+            store
+                .cancel(
+                    lease.request_id.clone(),
+                    91,
+                    b"duplicate cancellation".to_vec(),
+                )
+                .await
+                .unwrap(),
+            CancelOutcome::AlreadyTerminal(expected_state),
+            "{label}"
+        );
+
+        let replay = store.replay(lease.request_id.clone(), 0).await.unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            expected_events,
+            "{label}"
+        );
+        let result = replay.result.unwrap();
+        assert_eq!(result.state, expected_state, "{label}");
+        assert_eq!(result.payload, encoded_result, "{label}");
+        assert_eq!(result.completed_at_ms, 90, "{label}");
+        assert!(matches!(
+            store
+                .finish(
+                    lease,
+                    92,
+                    TerminalState::Succeeded,
+                    b"worker result".to_vec(),
+                )
+                .await,
+            Err(StoreError::StaleLease(_))
+        ));
+
+        close(store, &directory).await;
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_a_non_cancelled_terminal_checkpoint_remains_authoritative() {
+    for (label, flow_outcome, expected_events) in [
+        (
+            "solved",
+            RunOutcome::Solved,
+            vec![
+                "accepted",
+                "started",
+                "flow_effect_evaluation_required",
+                "flow_effect_started",
+                "flow_effect_succeeded",
+                "cancellation_requested",
+                "cancelled",
+            ],
+        ),
+        (
+            "unresolved",
+            RunOutcome::Unresolved,
+            vec![
+                "accepted",
+                "started",
+                "flow_effect_evaluation_required",
+                "flow_effect_started",
+                "flow_effect_failed",
+                "cancellation_requested",
+                "cancelled",
+            ],
+        ),
+        (
+            "blocked",
+            RunOutcome::Blocked,
+            vec![
+                "accepted",
+                "started",
+                "flow_approval_required",
+                "cancellation_requested",
+                "cancelled",
+            ],
+        ),
+    ] {
+        let (directory, path) = database_path(&format!("cancel-first-race-{label}"));
+        let store = Store::open(&path).unwrap();
+        let request_id = format!("cancel-first-race-{label}");
+        let lease = terminal_flow_with_checkpoint(
+            &store,
+            &request_id,
+            flow_outcome,
+            format!("later terminal {label}").as_bytes(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .cancel(
+                    lease.request_id.clone(),
+                    90,
+                    b"duplicate cancellation".to_vec(),
+                )
+                .await
+                .unwrap(),
+            CancelOutcome::AlreadyRequested,
+            "{label}"
+        );
+        let before_finish = store.replay(lease.request_id.clone(), 0).await.unwrap();
+        assert!(before_finish.result.is_none(), "{label}");
+        let completed = store
+            .finish(
+                lease.clone(),
+                91,
+                TerminalState::Succeeded,
+                b"worker terminal result".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.state, RequestState::Cancelled, "{label}");
+        assert_eq!(completed.payload, b"earlier cancellation", "{label}");
+        let replay = store.replay(lease.request_id, 0).await.unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            expected_events,
+            "{label}"
+        );
+        assert_eq!(replay.result.unwrap().payload, b"earlier cancellation");
+
+        close(store, &directory).await;
+    }
+}
+
+#[tokio::test]
+async fn lease_recovery_finalizes_each_cached_terminal_flow_without_requeueing() {
+    for (label, flow_outcome, expected_state, expected_events) in [
+        (
+            "solved",
+            RunOutcome::Solved,
+            RequestState::Succeeded,
+            vec![
+                "accepted",
+                "started",
+                "flow_effect_evaluation_required",
+                "flow_effect_started",
+                "flow_effect_succeeded",
+                "flow_completed",
+                "completed",
+            ],
+        ),
+        (
+            "unresolved",
+            RunOutcome::Unresolved,
+            RequestState::Failed,
+            vec![
+                "accepted",
+                "started",
+                "flow_effect_evaluation_required",
+                "flow_effect_started",
+                "flow_effect_failed",
+                "flow_completed",
+                "failed",
+            ],
+        ),
+        (
+            "blocked",
+            RunOutcome::Blocked,
+            RequestState::Failed,
+            vec![
+                "accepted",
+                "started",
+                "flow_approval_required",
+                "flow_approval_denied",
+                "failed",
+            ],
+        ),
+        (
+            "cancelled",
+            RunOutcome::Cancelled,
+            RequestState::Cancelled,
+            vec![
+                "accepted",
+                "started",
+                "cancellation_requested",
+                "flow_completed",
+                "cancelled",
+            ],
+        ),
+    ] {
+        let (directory, path) = database_path(&format!("terminal-recovery-{label}"));
+        let store = Store::open(&path).unwrap();
+        let request_id = format!("terminal-recovery-{label}");
+        let encoded_result = format!("recovered terminal {label}").into_bytes();
+        let lease = terminal_flow_with_checkpoint(
+            &store,
+            &request_id,
+            flow_outcome,
+            &encoded_result,
+            false,
+        )
+        .await;
+
+        assert_eq!(store.recover_all_leases(90).await.unwrap(), 1, "{label}");
+        assert_eq!(store.recover_all_leases(91).await.unwrap(), 0, "{label}");
+        assert!(store.claim("other", 92, 100).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .cancel(lease.request_id.clone(), 93, b"late cancellation".to_vec(),)
+                .await
+                .unwrap(),
+            CancelOutcome::AlreadyTerminal(expected_state),
+            "{label}"
+        );
+        let replay = store.replay(lease.request_id, 0).await.unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            expected_events,
+            "{label}"
+        );
+        let result = replay.result.unwrap();
+        assert_eq!(result.state, expected_state, "{label}");
+        assert_eq!(result.payload, encoded_result, "{label}");
+        assert_eq!(result.completed_at_ms, 90, "{label}");
+
+        close(store, &directory).await;
+    }
 }
 
 #[tokio::test]
@@ -1042,6 +2400,151 @@ async fn terminal_result_and_gap_free_events_replay_atomically_after_reopen() {
     assert_eq!(replay.result.unwrap().payload, b"terminal result");
 
     close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_only_target_operations_hide_and_never_mutate_generic_work() {
+    let (directory, path) = database_path("flow-only-target-mismatch");
+    let store = Store::open(&path).unwrap();
+    let request_id = RequestId::from("generic-request");
+    store
+        .accept(
+            request(
+                request_id.as_str(),
+                "caller",
+                "project",
+                "key",
+                b"generic operation",
+            ),
+            10,
+        )
+        .await
+        .unwrap();
+    let before_snapshot = store.snapshot(request_id.clone()).await.unwrap();
+    let before_replay = store.replay(request_id.clone(), 0).await.unwrap();
+
+    assert!(matches!(
+        store
+            .snapshot_with_expected_target(
+                request_id.clone(),
+                ExpectedOperationKind::FlowRun,
+            )
+            .await,
+        Err(StoreError::RequestNotFound(found)) if found == request_id
+    ));
+    assert!(matches!(
+        store
+            .replay_with_expected_target(
+                request_id.clone(),
+                0,
+                ExpectedOperationKind::FlowRun,
+            )
+            .await,
+        Err(StoreError::RequestNotFound(found)) if found == request_id
+    ));
+    assert!(matches!(
+        store
+            .cancel_with_expected_target(
+                request_id.clone(),
+                11,
+                b"must not persist".to_vec(),
+                ExpectedOperationKind::FlowRun,
+            )
+            .await,
+        Err(StoreError::RequestNotFound(found)) if found == request_id
+    ));
+
+    assert_eq!(
+        store.snapshot(request_id.clone()).await.unwrap(),
+        before_snapshot
+    );
+    assert_eq!(store.replay(request_id, 0).await.unwrap(), before_replay);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn explicit_cancelled_finish_requires_durable_cancellation_and_then_fences_the_lease() {
+    let (directory, path) = database_path("explicit-cancelled-finish");
+    let store = Store::open(&path).unwrap();
+    store
+        .accept(
+            request("request-1", "caller", "project", "key", b"operation"),
+            10,
+        )
+        .await
+        .unwrap();
+    let leased = store.claim("worker", 20, 100).await.unwrap().unwrap();
+    let consumed = leased.lease.clone();
+    assert!(matches!(
+        store
+            .finish(
+                leased.lease.clone(),
+                21,
+                TerminalState::Cancelled,
+                b"truthful cancelled result".to_vec(),
+            )
+            .await,
+        Err(StoreError::InvalidState(_))
+    ));
+    let unchanged = store.snapshot(RequestId::from("request-1")).await.unwrap();
+    assert_eq!(unchanged.state, RequestState::Leased);
+    let unchanged_replay = store.replay(RequestId::from("request-1"), 0).await.unwrap();
+    assert!(unchanged_replay.result.is_none());
+    assert_eq!(
+        unchanged_replay
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["accepted", "started"]
+    );
+
+    assert_eq!(
+        store
+            .cancel(
+                RequestId::from("request-1"),
+                22,
+                b"truthful cancelled result".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+    let finished = store
+        .finish(
+            leased.lease,
+            23,
+            TerminalState::Cancelled,
+            b"ignored worker result".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(finished.state, RequestState::Cancelled);
+    assert_eq!(finished.payload, b"truthful cancelled result");
+
+    let replay = store.replay(RequestId::from("request-1"), 0).await.unwrap();
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["accepted", "started", "cancellation_requested", "cancelled"]
+    );
+    assert_eq!(replay.result.unwrap().state, RequestState::Cancelled);
+    assert!(matches!(
+        store
+            .finish(
+                consumed,
+                24,
+                TerminalState::Cancelled,
+                b"replacement".to_vec(),
+            )
+            .await,
+        Err(StoreError::StaleLease(_))
+    ));
+
+    close(store, &directory).await;
 }
 
 #[tokio::test]
@@ -1471,6 +2974,900 @@ async fn authorization_rechecks_caller_revocation_after_grant_creation() {
         store.authorize(request, 22, 100).await.unwrap(),
         AuthorizationOutcome::Denied
     );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // The exact receipt lifecycle is one atomic end-to-end invariant.
+async fn stateful_flow_approval_is_request_bound_and_reusable_after_restart() {
+    let (directory, path, store, flow_resource) =
+        open_flow_authorization_store("stateful-flow-approval", ApprovalRequirement::None).await;
+    let initial = flow_authorization_request(
+        "stateful-flow-a",
+        flow_resource.clone(),
+        None,
+        true,
+        "stateful-challenge-a",
+    );
+    let FlowAuthorizationOutcome::ApprovalRequired {
+        approval_id,
+        expires_at_ms,
+    } = store.authorize_flow_run(initial, 100, 20).await.unwrap()
+    else {
+        panic!("stateful schema must require approval despite an unconditional grant")
+    };
+    assert_eq!(expires_at_ms, 120);
+
+    let repeated = store
+        .authorize_flow_run(
+            flow_authorization_request(
+                "stateful-flow-a",
+                flow_resource.clone(),
+                None,
+                true,
+                "stateful-challenge-retry",
+            ),
+            101,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated,
+        FlowAuthorizationOutcome::ApprovalRequired {
+            approval_id: approval_id.clone(),
+            expires_at_ms: 120,
+        }
+    );
+
+    assert_eq!(
+        store
+            .revoke_grant(GrantId::from("flow-auth-grant"), 102)
+            .await
+            .unwrap(),
+        GrantRevocation::Revoked
+    );
+    let mut approval_grant = grant(
+        "flow-auth-approval-grant",
+        "flow-auth-subject",
+        "flow-auth-project",
+        "flow.run",
+        ResourceScope::Exact(flow_resource.clone()),
+    );
+    approval_grant.approval = ApprovalRequirement::Once;
+    store
+        .put_grant(PutGrant {
+            grant: approval_grant,
+            created_at_ms: 102,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .decide_approval(
+                approval_id.clone(),
+                CallerId::from("flow-auth-reviewer"),
+                ApprovalDecision::Approve,
+                103,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Approved
+    );
+
+    assert_eq!(
+        store
+            .authorize(
+                authorization(
+                    "flow-auth-subject",
+                    "flow-auth-project",
+                    "flow.run",
+                    flow_resource.as_str(),
+                    Some(approval_id.clone()),
+                ),
+                104,
+                20,
+            )
+            .await
+            .unwrap(),
+        AuthorizationOutcome::Denied,
+        "a flow-bound receipt must not be consumable through generic authorization"
+    );
+    assert_eq!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "stateful-flow-wrong",
+                    flow_resource.clone(),
+                    Some(approval_id.clone()),
+                    true,
+                    "stateful-wrong-request",
+                ),
+                105,
+                20,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Denied
+    );
+
+    let accepted = flow_authorization_request(
+        "stateful-flow-a",
+        flow_resource.clone(),
+        Some(approval_id.clone()),
+        true,
+        "stateful-accept",
+    );
+    assert!(matches!(
+        store
+            .authorize_flow_run(accepted.clone(), 106, 20)
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    let mut pending_alias = accepted.clone();
+    pending_alias.accept.request_id = RequestId::from("stateful-flow-alias");
+    pending_alias.audit.event_id = "stateful-flow-alias".to_owned();
+    assert!(matches!(
+        store.authorize_flow_run(pending_alias, 106, 20).await,
+        Err(StoreError::RequestIdConflict(request_id))
+            if request_id == RequestId::from("stateful-flow-alias")
+    ));
+    let lease = store
+        .claim("flow-auth-worker", 107, 1_000)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    assert_eq!(lease.request_id, RequestId::from("stateful-flow-a"));
+    store
+        .validate_flow_operation_resource(lease.clone(), flow_resource.clone(), 120)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .validate_flow_operation_resource(
+                lease.clone(),
+                ResourceName::parse("flow:other:revision=1:digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:workspace=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                120,
+            )
+            .await,
+        Err(StoreError::CorruptFlowAuthorization(request_id))
+            if request_id == RequestId::from("stateful-flow-a")
+    ));
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(lease.clone(), 121)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed,
+        "a receipt consumed before expiry remains reusable at later boundaries"
+    );
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                AuthorizeFlowRun {
+                    audit: AuthorizationAudit {
+                        event_id: "stateful-existing".to_owned(),
+                        ..accepted.audit
+                    },
+                    ..accepted
+                },
+                122,
+                20,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Existing { .. })
+    ));
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state, flow_request_id, decided_at_ms, consumed_at_ms
+                 FROM approvals WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                )),
+            )
+            .unwrap(),
+        (
+            "consumed".to_owned(),
+            "stateful-flow-a".to_owned(),
+            103,
+            106
+        )
+    );
+    drop(connection);
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .validate_flow_effect_authorization(lease.clone(), 123)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed
+    );
+    assert_eq!(
+        reopened
+            .revoke_caller(CallerId::from("flow-auth-subject"), 124)
+            .await
+            .unwrap(),
+        CallerRevocation::Revoked
+    );
+    assert_eq!(
+        reopened
+            .validate_flow_effect_authorization(lease.clone(), 125)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Denied
+    );
+    reopened.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET flow_request_id = 'wrong-request'
+             WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = Store::open(&path).unwrap();
+    assert!(matches!(
+        reopened
+            .validate_flow_effect_authorization(lease, 126)
+            .await,
+        Err(StoreError::CorruptFlowAuthorization(request_id))
+            if request_id == RequestId::from("stateful-flow-a")
+    ));
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One test covers both durable authorization proof kinds.
+async fn flow_effect_boundaries_recheck_unconditional_and_approved_policy() {
+    let (directory, _path, store, flow_resource) =
+        open_flow_authorization_store("flow-effect-policy", ApprovalRequirement::None).await;
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "read-only-unconditional",
+                    flow_resource.clone(),
+                    None,
+                    false,
+                    "read-only-unconditional-accept",
+                ),
+                100,
+                20,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    let unconditional = store
+        .claim("flow-auth-worker-a", 101, 1_000)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(unconditional.clone(), 102)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed
+    );
+    store
+        .revoke_grant(GrantId::from("flow-auth-grant"), 103)
+        .await
+        .unwrap();
+    let mut approval_grant = grant(
+        "read-only-approval-grant",
+        "flow-auth-subject",
+        "flow-auth-project",
+        "flow.run",
+        ResourceScope::Exact(flow_resource.clone()),
+    );
+    approval_grant.approval = ApprovalRequirement::Once;
+    store
+        .put_grant(PutGrant {
+            grant: approval_grant,
+            created_at_ms: 104,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(unconditional.clone(), 105)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Denied,
+        "a receiptless flow cannot cross a boundary after policy requires approval"
+    );
+    store
+        .finish(
+            unconditional,
+            106,
+            TerminalState::Failed,
+            b"authorization revoked before the effect".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let FlowAuthorizationOutcome::ApprovalRequired { approval_id, .. } = store
+        .authorize_flow_run(
+            flow_authorization_request(
+                "read-only-approved",
+                flow_resource.clone(),
+                None,
+                false,
+                "read-only-approved-challenge",
+            ),
+            200,
+            10,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("policy-approved read-only flow must create an exact challenge")
+    };
+    store
+        .decide_approval(
+            approval_id.clone(),
+            CallerId::from("flow-auth-reviewer"),
+            ApprovalDecision::Approve,
+            201,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "read-only-approved",
+                    flow_resource.clone(),
+                    Some(approval_id),
+                    false,
+                    "read-only-approved-accept",
+                ),
+                202,
+                10,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    let approved = store
+        .claim("flow-auth-worker-b", 203, 1_000)
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(approved.clone(), 211)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed
+    );
+    let mut deny = grant(
+        "read-only-deny",
+        "flow-auth-subject",
+        "flow-auth-project",
+        "flow.run",
+        ResourceScope::Exact(flow_resource),
+    );
+    deny.effect = Effect::Deny;
+    store
+        .put_grant(PutGrant {
+            grant: deny,
+            created_at_ms: 212,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(approved, 213)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Denied
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Expiry and rollback exercise one receipt state machine.
+async fn flow_approval_expiry_and_failed_accept_do_not_consume_receipts() {
+    let (directory, path, store, flow_resource) =
+        open_flow_authorization_store("flow-approval-rollback", ApprovalRequirement::Once).await;
+    let FlowAuthorizationOutcome::ApprovalRequired {
+        approval_id: expiring,
+        expires_at_ms: 105,
+    } = store
+        .authorize_flow_run(
+            flow_authorization_request(
+                "flow-expiring",
+                flow_resource.clone(),
+                None,
+                false,
+                "flow-expiring-challenge",
+            ),
+            100,
+            5,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("flow should require an expiring approval")
+    };
+    assert_eq!(
+        store
+            .decide_approval(
+                expiring.clone(),
+                CallerId::from("flow-auth-reviewer"),
+                ApprovalDecision::Approve,
+                105,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Expired
+    );
+    assert_eq!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "flow-expiring",
+                    flow_resource.clone(),
+                    Some(expiring),
+                    false,
+                    "flow-expiring-retry",
+                ),
+                106,
+                5,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::ApprovalExpired
+    );
+
+    let FlowAuthorizationOutcome::ApprovalRequired {
+        approval_id: approved,
+        ..
+    } = store
+        .authorize_flow_run(
+            flow_authorization_request(
+                "flow-audit-rollback",
+                flow_resource.clone(),
+                None,
+                false,
+                "flow-rollback-challenge",
+            ),
+            110,
+            20,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("flow should require approval")
+    };
+    store
+        .decide_approval(
+            approved.clone(),
+            CallerId::from("flow-auth-reviewer"),
+            ApprovalDecision::Approve,
+            111,
+        )
+        .await
+        .unwrap();
+    store
+        .append_audit_event(audit_event(
+            "flow-authorization-collision",
+            "flow-auth-project",
+            "flow-auth-subject",
+            10,
+            10_000,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "flow-audit-rollback",
+                    flow_resource.clone(),
+                    Some(approved.clone()),
+                    false,
+                    "flow-authorization-collision",
+                ),
+                112,
+                20,
+            )
+            .await,
+        Err(StoreError::AuditEventAlreadyExists)
+    ));
+    assert!(matches!(
+        store
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "flow-audit-rollback",
+                    flow_resource,
+                    Some(approved.clone()),
+                    false,
+                    "flow-rollback-accepted",
+                ),
+                113,
+                20,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state, flow_request_id FROM approvals WHERE approval_id = ?1",
+                [approved.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("consumed".to_owned(), "flow-audit-rollback".to_owned())
+    );
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Corrupt, missing, and valid FIFO heads form one recovery contract.
+async fn flow_rows_without_exact_authorization_proof_never_execute() {
+    let (directory, path, store, flow_resource) =
+        open_flow_authorization_store("flow-proof-corruption", ApprovalRequirement::None).await;
+    let mut bypass = request(
+        "flow-public-bypass",
+        "flow-auth-subject",
+        "flow-auth-project",
+        "flow-public-bypass",
+        b"flow",
+    );
+    bypass.operation_kind = "flow_run".to_owned();
+    assert!(matches!(
+        store.accept(bypass, 20).await,
+        Err(StoreError::InvalidState(_))
+    ));
+    for (request_id, audit_id) in [
+        ("flow-corrupt-proof", "flow-corrupt-proof-accept"),
+        ("flow-missing-proof", "flow-missing-proof-accept"),
+        ("flow-valid-followup", "flow-valid-followup-accept"),
+    ] {
+        assert!(matches!(
+            store
+                .authorize_flow_run(
+                    flow_authorization_request(
+                        request_id,
+                        flow_resource.clone(),
+                        None,
+                        false,
+                        audit_id,
+                    ),
+                    30,
+                    20,
+                )
+                .await
+                .unwrap(),
+            FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+        ));
+    }
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE flow_authorizations SET effect_fingerprint = zeroblob(32)
+             WHERE request_id = 'flow-corrupt-proof'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM flow_authorizations WHERE request_id = 'flow-missing-proof'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(&path).unwrap();
+    assert!(matches!(
+        reopened.claim("flow-proof-worker", 32, 100).await,
+        Err(StoreError::CorruptFlowAuthorization(corrupt))
+            if corrupt == RequestId::from("flow-corrupt-proof")
+    ));
+    let before = reopened
+        .replay(RequestId::from("flow-corrupt-proof"), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        before
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["accepted"]
+    );
+    assert!(before.result.is_none());
+    assert_eq!(
+        reopened
+            .fail_corrupt_flow_authorization(
+                RequestId::from("flow-corrupt-proof"),
+                32,
+                b"corrupt proof".to_vec(),
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationRecoveryOutcome::Failed(super::StoredResult {
+            state: RequestState::Failed,
+            payload: b"corrupt proof".to_vec(),
+            completed_at_ms: 32,
+        })
+    );
+    let after = reopened
+        .replay(RequestId::from("flow-corrupt-proof"), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        after
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["accepted", "failed"]
+    );
+    assert_eq!(after.result.unwrap().payload, b"corrupt proof");
+
+    assert!(matches!(
+        reopened.claim("flow-proof-worker", 33, 100).await,
+        Err(StoreError::CorruptFlowAuthorization(corrupt))
+            if corrupt == RequestId::from("flow-missing-proof")
+    ));
+    assert_eq!(
+        reopened
+            .cancel(
+                RequestId::from("flow-missing-proof"),
+                34,
+                b"cancelled during quarantine".to_vec(),
+            )
+            .await
+            .unwrap(),
+        CancelOutcome::Cancelled
+    );
+    assert_eq!(
+        reopened
+            .fail_corrupt_flow_authorization(
+                RequestId::from("flow-missing-proof"),
+                35,
+                b"must not replace cancellation".to_vec(),
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationRecoveryOutcome::AlreadyTerminal(super::StoredResult {
+            state: RequestState::Cancelled,
+            payload: b"cancelled during quarantine".to_vec(),
+            completed_at_ms: 34,
+        })
+    );
+    assert!(matches!(
+        reopened
+            .authorize_flow_run(
+                flow_authorization_request(
+                    "flow-missing-proof",
+                    flow_resource,
+                    None,
+                    false,
+                    "flow-missing-terminal-retry",
+                ),
+                36,
+                20,
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Existing {
+            state: RequestState::Cancelled,
+            ..
+        })
+    ));
+    assert_eq!(
+        reopened
+            .fail_corrupt_flow_authorization(
+                RequestId::from("flow-valid-followup"),
+                37,
+                b"must not fail valid flow".to_vec(),
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationRecoveryOutcome::NoLongerEligible
+    );
+    let valid = reopened
+        .claim("flow-proof-worker", 38, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        valid.lease.request_id,
+        RequestId::from("flow-valid-followup")
+    );
+    assert_eq!(
+        reopened
+            .validate_flow_effect_authorization(valid.lease, 39)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed
+    );
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Receipt corruption and both replay identities are one contract.
+async fn quarantined_receipt_corruption_replays_for_exact_and_idempotent_retries() {
+    let (directory, path, store, flow_resource) =
+        open_flow_authorization_store("flow-receipt-quarantine", ApprovalRequirement::None).await;
+    let FlowAuthorizationOutcome::ApprovalRequired { approval_id, .. } = store
+        .authorize_flow_run(
+            flow_authorization_request(
+                "flow-corrupt-receipt",
+                flow_resource.clone(),
+                None,
+                true,
+                "flow-corrupt-receipt-challenge",
+            ),
+            100,
+            20,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("stateful flow must require an exact receipt")
+    };
+    store
+        .decide_approval(
+            approval_id.clone(),
+            CallerId::from("flow-auth-reviewer"),
+            ApprovalDecision::Approve,
+            101,
+        )
+        .await
+        .unwrap();
+    let accepted = flow_authorization_request(
+        "flow-corrupt-receipt",
+        flow_resource,
+        Some(approval_id.clone()),
+        true,
+        "flow-corrupt-receipt-accept",
+    );
+    assert!(matches!(
+        store
+            .authorize_flow_run(accepted.clone(), 102, 20)
+            .await
+            .unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Created { .. })
+    ));
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET flow_request_id = 'wrong-request'
+             WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(&path).unwrap();
+    assert!(matches!(
+        reopened.claim("flow-receipt-worker", 103, 100).await,
+        Err(StoreError::CorruptFlowAuthorization(request_id))
+            if request_id == RequestId::from("flow-corrupt-receipt")
+    ));
+    assert!(matches!(
+        reopened
+            .fail_corrupt_flow_authorization(
+                RequestId::from("flow-corrupt-receipt"),
+                104,
+                b"receipt corruption failure".to_vec(),
+            )
+            .await
+            .unwrap(),
+        FlowAuthorizationRecoveryOutcome::Failed(_)
+    ));
+
+    let mut exact = accepted.clone();
+    exact.audit.event_id = "flow-corrupt-receipt-exact-retry".to_owned();
+    assert!(matches!(
+        reopened.authorize_flow_run(exact, 105, 20).await.unwrap(),
+        FlowAuthorizationOutcome::Accepted(AcceptOutcome::Existing {
+            state: RequestState::Failed,
+            ..
+        })
+    ));
+    let mut idempotent = accepted;
+    idempotent.accept.request_id = RequestId::from("flow-corrupt-receipt-observer");
+    idempotent.audit.event_id = "flow-corrupt-receipt-idempotent-retry".to_owned();
+    assert!(matches!(
+        reopened.authorize_flow_run(idempotent, 106, 20).await,
+        Err(StoreError::RequestIdConflict(request_id))
+            if request_id == RequestId::from("flow-corrupt-receipt-observer")
+    ));
+    assert_eq!(
+        reopened
+            .replay(RequestId::from("flow-corrupt-receipt"), 0)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .payload,
+        b"receipt corruption failure"
+    );
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn cancellation_fences_effect_authorization_and_effect_started_checkpoint() {
+    let (directory, path) = database_path("flow-effect-cancel-fence");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run, evaluated) = checkpointed_flow(&store, "flow-effect-cancel").await;
+    let effect = match evaluated.decision() {
+        RunDecision::EvaluateEffect { effect, .. } => effect.clone(),
+        other => panic!("expected effect evaluation, got {other:?}"),
+    };
+    assert_eq!(
+        store
+            .validate_flow_effect_authorization(lease.clone(), 23)
+            .await
+            .unwrap(),
+        FlowEffectAuthorization::Allowed
+    );
+    assert_eq!(
+        store
+            .cancel(lease.request_id.clone(), 24, b"cancelled".to_vec())
+            .await
+            .unwrap(),
+        CancelOutcome::CancellationRequested
+    );
+    assert!(matches!(
+        store
+            .validate_flow_effect_authorization(lease.clone(), 25)
+            .await,
+        Err(StoreError::StaleLease(request_id)) if request_id == lease.request_id
+    ));
+    let started = run.prepare_effect(&effect, 25).unwrap();
+    assert!(matches!(started.decision(), RunDecision::Execute { .. }));
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 2,
+                snapshot: started.snapshot().clone(),
+                transition: started.transition().cloned(),
+                terminal_result: None,
+                updated_at_ms: 25,
+            })
+            .await,
+        Err(StoreError::FlowEffectStartConflict(request_id)) if request_id == lease.request_id
+    ));
 
     close(store, &directory).await;
 }
@@ -2286,4 +4683,713 @@ async fn model_registry_reports_corrupt_stored_gguf_counts() {
         Err(StoreError::IntegrityCheckFailed(_))
     ));
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers create, idempotent save, semantic replay, and restart.
+async fn flow_checkpoint_create_update_and_exact_replay_are_atomic() {
+    let (directory, path) = database_path("flow-checkpoint-atomic");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run) = leased_flow(&store, "flow-request").await;
+
+    assert!(
+        store
+            .load_flow_checkpoint(lease.clone(), 21)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let created = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.disposition, FlowCheckpointDisposition::Created);
+    assert_eq!(created.checkpoint.checkpoint_revision, 1);
+    assert!(created.event.is_none());
+
+    let update = run.next_decision(22).unwrap();
+    let RunDecision::EvaluateEffect { effect, .. } = update.decision() else {
+        panic!("flow should require effect evaluation")
+    };
+    let effect = effect.clone();
+    let transition = update.transition().unwrap().clone();
+    let save = SaveFlowCheckpoint {
+        lease: lease.clone(),
+        expected_revision: 1,
+        snapshot: update.snapshot().clone(),
+        transition: Some(transition.clone()),
+        terminal_result: None,
+        updated_at_ms: 22,
+    };
+    let updated = store.save_flow_checkpoint(save.clone()).await.unwrap();
+    assert_eq!(updated.disposition, FlowCheckpointDisposition::Updated);
+    assert_eq!(updated.checkpoint.checkpoint_revision, 2);
+    let event = updated.event.unwrap();
+    assert_eq!(event.sequence, 3);
+    assert_eq!(event.kind, "flow_effect_evaluation_required");
+    assert_eq!(
+        rmp_serde::from_slice::<RunTransition>(&event.payload).unwrap(),
+        transition
+    );
+
+    let mut replay_save = save.clone();
+    replay_save.updated_at_ms = 23;
+    let unchanged = store.save_flow_checkpoint(replay_save).await.unwrap();
+    assert_eq!(unchanged.disposition, FlowCheckpointDisposition::Unchanged);
+    assert_eq!(unchanged.checkpoint.updated_at_ms, 22);
+    assert!(unchanged.event.is_none());
+    let unchanged_without_transition = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            expected_revision: 2,
+            transition: None,
+            updated_at_ms: 24,
+            ..save
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged_without_transition.disposition,
+        FlowCheckpointDisposition::Unchanged
+    );
+    assert_eq!(unchanged_without_transition.checkpoint.updated_at_ms, 22);
+    assert!(unchanged_without_transition.event.is_none());
+    let replay = store
+        .replay(RequestId::from("flow-request"), 0)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 3);
+    assert_eq!(replay.events[2], event);
+
+    let started = run.prepare_effect(&effect, 25).unwrap();
+    let semantic_transition = started.transition().unwrap().clone();
+    assert!(matches!(
+        semantic_transition.semantic_events(),
+        [pam_flow::FlowSemanticEvent::Waiting {
+            step_id,
+            reason: pam_flow::FlowWaitReason::EffectResult,
+            not_before_ms: None,
+        }] if step_id == "inspect"
+    ));
+    let semantic_event = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 2,
+            snapshot: started.snapshot().clone(),
+            transition: Some(semantic_transition.clone()),
+            terminal_result: None,
+            updated_at_ms: 25,
+        })
+        .await
+        .unwrap()
+        .event
+        .unwrap();
+    assert_eq!(semantic_event.sequence, 4);
+    assert_eq!(semantic_event.kind, "flow_effect_started");
+    assert_eq!(
+        rmp_serde::from_slice::<RunTransition>(&semantic_event.payload).unwrap(),
+        semantic_transition
+    );
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    let replay = reopened
+        .replay(RequestId::from("flow-request"), 0)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 4);
+    assert_eq!(replay.events[3], semantic_event);
+
+    close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_rejects_cross_run_transition_without_mutation() {
+    let (directory, path) = database_path("flow-checkpoint-successor-validation");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run) = leased_flow(&store, "successor-flow").await;
+    let initial = run.snapshot().clone();
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: initial.clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+
+    let candidate = run.next_decision(22).unwrap();
+    let mut other = FlowRun::start(
+        RunId::parse("other-successor-flow").unwrap(),
+        flow_definition_with_step(1, "collect"),
+    )
+    .unwrap();
+    let wrong_transition = other
+        .next_decision(22)
+        .unwrap()
+        .transition()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        wrong_transition.sequence(),
+        candidate.transition().unwrap().sequence()
+    );
+    assert_ne!(&wrong_transition, candidate.transition().unwrap());
+
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 1,
+                snapshot: candidate.snapshot().clone(),
+                transition: Some(wrong_transition.clone()),
+                terminal_result: None,
+                updated_at_ms: 22,
+            })
+            .await,
+        Err(StoreError::InvalidFlowCheckpoint(_))
+    ));
+    let unchanged = store
+        .load_flow_checkpoint(lease.clone(), 23)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.snapshot, initial);
+    assert_eq!(unchanged.checkpoint_revision, 1);
+
+    let correct = SaveFlowCheckpoint {
+        lease: lease.clone(),
+        expected_revision: 1,
+        snapshot: candidate.snapshot().clone(),
+        transition: candidate.transition().cloned(),
+        terminal_result: None,
+        updated_at_ms: 24,
+    };
+    store.save_flow_checkpoint(correct).await.unwrap();
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 1,
+                snapshot: candidate.snapshot().clone(),
+                transition: Some(wrong_transition),
+                terminal_result: None,
+                updated_at_ms: 25,
+            })
+            .await,
+        Err(StoreError::FlowCheckpointConflict(request_id))
+            if request_id == RequestId::from("successor-flow")
+    ));
+    let replay = store
+        .replay(RequestId::from("successor-flow"), 0)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 3);
+    assert_eq!(
+        store
+            .load_flow_checkpoint(lease, 27)
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint_revision,
+        2
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_rejects_changed_snapshot_without_transition() {
+    let (directory, path) = database_path("flow-checkpoint-missing-transition");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run, evaluation) = checkpointed_flow(&store, "missing-transition-flow").await;
+    let effect = match evaluation.decision() {
+        RunDecision::EvaluateEffect { effect, .. } => effect.clone(),
+        other => panic!("expected effect evaluation, got {other:?}"),
+    };
+    let changed_without_transition = run.prepare_effect(&effect, 24).unwrap();
+
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 2,
+                snapshot: changed_without_transition.snapshot().clone(),
+                transition: None,
+                terminal_result: None,
+                updated_at_ms: 24,
+            })
+            .await,
+        Err(StoreError::InvalidFlowCheckpoint(_))
+    ));
+    assert_eq!(
+        store
+            .load_flow_checkpoint(lease.clone(), 25)
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint_revision,
+        2
+    );
+    assert_eq!(
+        store
+            .replay(RequestId::from("missing-transition-flow"), 0)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_requires_the_exact_initial_snapshot_shape() {
+    let (directory, path) = database_path("flow-checkpoint-initial-shape");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run) = leased_flow(&store, "initial-shape-flow").await;
+    let advanced = run.next_decision(21).unwrap();
+
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 0,
+                snapshot: advanced.snapshot().clone(),
+                transition: advanced.transition().cloned(),
+                terminal_result: None,
+                updated_at_ms: 21,
+            })
+            .await,
+        Err(StoreError::InvalidFlowCheckpoint(_))
+    ));
+    assert!(
+        store
+            .load_flow_checkpoint(lease.clone(), 22)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .replay(RequestId::from("initial-shape-flow"), 0)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_rejects_optimistic_revision_conflicts_atomically() {
+    let (directory, path) = database_path("flow-checkpoint-revision-conflict");
+    let store = Store::open(&path).unwrap();
+    let (lease, mut run, update) = checkpointed_flow(&store, "revision-flow").await;
+
+    let effect = match update.decision() {
+        RunDecision::EvaluateEffect { effect, .. } => effect.clone(),
+        other => panic!("expected effect evaluation, got {other:?}"),
+    };
+    let next = run.prepare_effect(&effect, 24).unwrap();
+    let conflict = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 1,
+            snapshot: next.snapshot().clone(),
+            transition: next.transition().cloned(),
+            terminal_result: None,
+            updated_at_ms: 24,
+        })
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(StoreError::FlowCheckpointRevisionConflict {
+            expected: 1,
+            actual: 2,
+            ..
+        })
+    ));
+    assert_eq!(
+        store
+            .load_flow_checkpoint(lease.clone(), 25)
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint_revision,
+        2
+    );
+    assert_eq!(
+        store
+            .replay(RequestId::from("revision-flow"), 0)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_rejects_definition_and_request_identity_mismatches() {
+    let (directory, path) = database_path("flow-checkpoint-identity-conflict");
+    let store = Store::open(&path).unwrap();
+    let (lease, _, _) = checkpointed_flow(&store, "identity-flow").await;
+
+    let mismatched =
+        FlowRun::start(RunId::parse("identity-flow").unwrap(), flow_definition(2)).unwrap();
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 2,
+                snapshot: mismatched.snapshot().clone(),
+                transition: None,
+                terminal_result: None,
+                updated_at_ms: 26,
+            })
+            .await,
+        Err(StoreError::FlowDefinitionDigestMismatch(request_id))
+            if request_id == RequestId::from("identity-flow")
+    ));
+
+    let wrong_request =
+        FlowRun::start(RunId::parse("another-request").unwrap(), flow_definition(1)).unwrap();
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease: lease.clone(),
+                expected_revision: 2,
+                snapshot: wrong_request.snapshot().clone(),
+                transition: None,
+                terminal_result: None,
+                updated_at_ms: 27,
+            })
+            .await,
+        Err(StoreError::FlowCheckpointRequestMismatch(request_id))
+            if request_id == RequestId::from("identity-flow")
+    ));
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn flow_checkpoint_survives_restart_and_requires_a_live_lease() {
+    let (directory, path) = database_path("flow-checkpoint-restart");
+    let store = Store::open(&path).unwrap();
+    let (lease, run) = leased_flow(&store, "restart-flow").await;
+    let snapshot = run.snapshot().clone();
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: snapshot.clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let store = Store::open(&path).unwrap();
+    let restored = store
+        .load_flow_checkpoint(lease.clone(), 22)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.snapshot, snapshot);
+    assert_eq!(restored.checkpoint_revision, 1);
+    assert!(matches!(
+        store.load_flow_checkpoint(lease.clone(), 1_020).await,
+        Err(StoreError::StaleLease(request_id))
+            if request_id == RequestId::from("restart-flow")
+    ));
+    assert!(matches!(
+        store
+            .save_flow_checkpoint(SaveFlowCheckpoint {
+                lease,
+                expected_revision: 1,
+                snapshot: restored.snapshot,
+                transition: None,
+                terminal_result: None,
+                updated_at_ms: 1_020,
+            })
+            .await,
+        Err(StoreError::StaleLease(_))
+    ));
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers the persisted legacy row and its first exact CAS.
+async fn legacy_flow_checkpoint_upgrades_atomically_before_its_next_transition() {
+    #[derive(serde::Serialize)]
+    struct LegacyStep<'a> {
+        id: &'a str,
+        idempotency_identity: pam_flow::IdempotencyIdentity,
+        approval: &'a pam_flow::StepApprovalState,
+        state: &'a pam_flow::StepState,
+        results: Vec<()>,
+        blocked_report: Option<&'a EffectReport>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacySnapshot<'a> {
+        snapshot_version: u16,
+        run_id: &'a RunId,
+        definition_digest: pam_flow::FlowDigest,
+        status: pam_flow::RunStatus,
+        cancel_requested: bool,
+        transition_sequence: u64,
+        steps: Vec<LegacyStep<'a>>,
+    }
+
+    let (directory, path) = database_path("flow-checkpoint-legacy-upgrade");
+    let store = Store::open(&path).unwrap();
+    let definition = flow_definition(1);
+    let (lease, run) =
+        leased_flow_with_definition(&store, "legacy-upgrade", definition.clone()).await;
+    let snapshot = run.snapshot().clone();
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: snapshot.clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let legacy = LegacySnapshot {
+        snapshot_version: 1,
+        run_id: snapshot.run_id(),
+        definition_digest: snapshot.definition_digest(),
+        status: snapshot.status(),
+        cancel_requested: snapshot.cancel_requested(),
+        transition_sequence: snapshot.transition_sequence(),
+        steps: snapshot
+            .steps()
+            .iter()
+            .map(|step| {
+                assert_eq!(step.results().len(), 0);
+                LegacyStep {
+                    id: step.id(),
+                    idempotency_identity: step.idempotency_identity(),
+                    approval: step.approval(),
+                    state: step.state(),
+                    results: Vec::new(),
+                    blocked_report: step.blocked_report(),
+                }
+            })
+            .collect(),
+    };
+    let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE flow_runs SET snapshot = ?1 WHERE request_id = ?2",
+            rusqlite::params![legacy_bytes, "legacy-upgrade"],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    let checkpoint = store
+        .load_flow_checkpoint(lease.clone(), 31)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.snapshot.snapshot_version(), 1);
+    let mut resumed = FlowRun::resume(
+        &RunId::parse("legacy-upgrade").unwrap(),
+        definition,
+        checkpoint.snapshot,
+    )
+    .unwrap();
+    let upgraded = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: checkpoint.checkpoint_revision,
+            snapshot: resumed.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 32,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        upgraded.checkpoint.snapshot.snapshot_version(),
+        pam_flow::FLOW_SNAPSHOT_VERSION
+    );
+    assert!(upgraded.event.is_none());
+    let repeated = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: checkpoint.checkpoint_revision,
+            snapshot: resumed.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 32,
+        })
+        .await
+        .unwrap();
+    assert_eq!(repeated.disposition, FlowCheckpointDisposition::Unchanged);
+    assert_eq!(
+        repeated.checkpoint.checkpoint_revision,
+        upgraded.checkpoint.checkpoint_revision
+    );
+    assert!(repeated.event.is_none());
+
+    let update = resumed.next_decision(33).unwrap();
+    let advanced = store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease,
+            expected_revision: upgraded.checkpoint.checkpoint_revision,
+            snapshot: update.snapshot().clone(),
+            transition: update.transition().cloned(),
+            terminal_result: None,
+            updated_at_ms: 33,
+        })
+        .await
+        .unwrap();
+    assert!(advanced.event.is_some());
+
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn corrupt_flow_checkpoint_bytes_are_rejected_on_load() {
+    let (directory, path) = database_path("flow-checkpoint-corrupt");
+    let store = Store::open(&path).unwrap();
+    let (lease, run) = leased_flow(&store, "corrupt-flow").await;
+    store
+        .save_flow_checkpoint(SaveFlowCheckpoint {
+            lease: lease.clone(),
+            expected_revision: 0,
+            snapshot: run.snapshot().clone(),
+            transition: None,
+            terminal_result: None,
+            updated_at_ms: 21,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE flow_runs SET snapshot = X'01' WHERE request_id = 'corrupt-flow'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store.load_flow_checkpoint(lease, 22).await,
+        Err(StoreError::CorruptFlowCheckpoint(request_id))
+            if request_id == RequestId::from("corrupt-flow")
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn forged_terminal_cancellation_override_is_rejected_as_corrupt() {
+    let (directory, path) = database_path("flow-checkpoint-forged-override");
+    let store = Store::open(&path).unwrap();
+    let lease = terminal_flow_with_checkpoint(
+        &store,
+        "forged-terminal-override",
+        RunOutcome::Blocked,
+        b"ordinary blocked result",
+        false,
+    )
+    .await;
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE flow_runs
+             SET terminal_cancellation_override = 1
+             WHERE request_id = 'forged-terminal-override'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store.load_flow_checkpoint(lease, 40).await,
+        Err(StoreError::CorruptFlowCheckpoint(request_id))
+            if request_id == RequestId::from("forged-terminal-override")
+    ));
+    assert!(matches!(
+        store.recover_all_leases(40).await,
+        Err(StoreError::CorruptFlowCheckpoint(request_id))
+            if request_id == RequestId::from("forged-terminal-override")
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn terminal_cancellation_override_requires_its_exact_durable_transition() {
+    let (directory, path) = database_path("flow-checkpoint-override-transition");
+    let store = Store::open(&path).unwrap();
+    let request_id = "override-transition-corrupt";
+    let lease = reconciliation_unknown_after_cancellation(
+        &store,
+        request_id,
+        b"blocked reconciliation result",
+    )
+    .await;
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE events SET payload = X'00'
+             WHERE request_id = ?1 AND kind = 'flow_reconciliation_unknown'",
+            [request_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store.load_flow_checkpoint(lease, 40).await,
+        Err(StoreError::CorruptFlowCheckpoint(corrupt_id))
+            if corrupt_id == RequestId::from(request_id)
+    ));
+    assert!(matches!(
+        store
+            .cancel(
+                RequestId::from(request_id),
+                40,
+                b"generic cancellation".to_vec(),
+            )
+            .await,
+        Err(StoreError::CorruptFlowCheckpoint(corrupt_id))
+            if corrupt_id == RequestId::from(request_id)
+    ));
+    close(store, &directory).await;
 }

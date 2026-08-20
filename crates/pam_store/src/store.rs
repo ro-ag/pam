@@ -9,12 +9,16 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, ContentDigest, EvidenceHandle, GrantId, ProjectId,
     RequestId,
 };
+use pam_flow::{
+    FlowSnapshot, RunOutcome, RunStatus, RunTransition, TransitionKind,
+    validate_snapshot_successor, validate_snapshot_upgrade,
+};
 use pam_model::{
     GgufMetadata, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource, RegisteredModel,
 };
 use pam_policy::{
-    ApprovalRequirement, Decision, Effect, EffectFingerprint, Grant, ResourceName, ResourceScope,
-    evaluate, redact_audit_detail,
+    ApprovalRequirement, CapabilityName, Decision, Effect, EffectFingerprint, Grant, ResourceName,
+    ResourceScope, evaluate, redact_audit_detail,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -25,19 +29,25 @@ use crate::evidence::{self, EvidenceFiles};
 use crate::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
     ApprovalDecisionOutcome, AuditEventRecord, AuditExport, AuditPruneOutcome, AuthorizationAudit,
-    AuthorizationOutcome, AuthorizationRequest, CallerAuthentication, CallerRegistration,
-    CallerRevocation, CancelOutcome, EventRecord, EvidenceMetadata, EvidencePruneOutcome,
-    EvidenceRetention, GrantRevocation, Lease, LeasedRequest, MAX_AUDIT_ACTION_BYTES,
-    MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES, MAX_AUDIT_DECISION_BYTES,
-    MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
-    MAX_AUDIT_PROJECT_ID_BYTES, ProjectPolicy, PutEvidence, PutGrant, Replay, RequestSnapshot,
-    RequestState, StoreError, StoredResult, TerminalState,
+    AuthorizationOutcome, AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication,
+    CallerRegistration, CallerRevocation, CancelOutcome, EventRecord, EvidenceMetadata,
+    EvidencePruneOutcome, EvidenceRetention, ExpectedOperationKind, FlowAuthorizationOutcome,
+    FlowAuthorizationRecoveryOutcome, FlowCheckpoint, FlowCheckpointDisposition,
+    FlowCheckpointSaveOutcome, FlowEffectAuthorization, FlowTerminalResult, GrantRevocation, Lease,
+    LeasedRequest, MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
+    MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
+    MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
+    MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, ProjectPolicy, PutEvidence,
+    PutGrant, Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoreError, StoredResult,
+    TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
 const EVIDENCE_COMMAND_CAPACITY: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 7;
+const FLOW_OPERATION_KIND: &str = "flow_run";
+const FLOW_CAPABILITY_NAME: &str = "flow.run";
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 9;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
@@ -49,6 +59,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0006_policy_resource_bound.sql"),
     ),
     (7, include_str!("../migrations/0007_models.sql")),
+    (8, include_str!("../migrations/0008_flows.sql")),
+    (
+        9,
+        include_str!("../migrations/0009_flow_authorizations.sql"),
+    ),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -208,6 +223,87 @@ impl Store {
             approval_ttl_ms,
             response: response_tx,
         }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Authorizes one exact flow and accepts it in the same durable transaction.
+    ///
+    /// Stateful schema approval is enforced even when policy otherwise grants an
+    /// unconditional allow. A consumed approval is bound to the accepted request;
+    /// ordinary policy approvals remain one-use and are not reusable here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for inconsistent flow identity, idempotency conflicts,
+    /// invalid timing or audit metadata, corrupt policy state, or unavailable storage.
+    pub async fn authorize_flow_run(
+        &self,
+        request: AuthorizeFlowRun,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+    ) -> Result<FlowAuthorizationOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(PolicyCommand::AuthorizeFlowRun {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Rechecks authorization immediately before a flow effect is prepared.
+    ///
+    /// The caller must still be active and current policy must permit the exact
+    /// accepted flow resource. Approval-backed flows additionally require the same
+    /// consumed receipt bound to this request. The receipt is validated,
+    /// never consumed again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale leases, corrupt durable proof or policy state,
+    /// invalid timing, or unavailable storage.
+    pub async fn validate_flow_effect_authorization(
+        &self,
+        lease: Lease,
+        now_ms: u64,
+    ) -> Result<FlowEffectAuthorization, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(
+            PolicyCommand::ValidateFlowEffectAuthorization {
+                lease,
+                now_ms,
+                response: response_tx,
+            },
+        ))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Confirms that a live flow lease remains bound to the exact resource
+    /// derived from its immutable operation bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale lease, corrupt durable authorization proof,
+    /// or a resource that differs from the one atomically accepted.
+    pub async fn validate_flow_operation_resource(
+        &self,
+        lease: Lease,
+        resource: ResourceName,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Policy(
+            PolicyCommand::ValidateFlowOperationResource {
+                lease,
+                resource,
+                now_ms,
+                response: response_tx,
+            },
+        ))
         .await?;
         receive(response_rx).await
     }
@@ -425,7 +521,11 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns a store error for invalid lease time or database failure.
+    /// Returns [`StoreError::CorruptFlowAuthorization`] without leasing or
+    /// appending `started` when the FIFO head is a flow with invalid durable
+    /// authorization. Call [`Self::fail_corrupt_flow_authorization`] with an
+    /// encoded failure result to quarantine that exact head and continue.
+    /// Returns another store error for invalid lease time or database failure.
     pub async fn claim(
         &self,
         owner: impl Into<String>,
@@ -467,8 +567,10 @@ impl Store {
 
     /// Recovers expired leases without releasing cancellation-requested work early.
     ///
-    /// Ordinary leases return to their original FIFO positions. Cancellation-requested
-    /// leases become terminally cancelled with their persisted result.
+    /// Ordinary leases return to their original FIFO positions. A validated terminal
+    /// flow cache is finalized instead of requeued. Cancellation-requested leases become
+    /// terminally cancelled unless their validated cache records reconciliation-unknown;
+    /// that narrow stateful-effect case becomes failed with its exact blocked result.
     ///
     /// # Errors
     ///
@@ -485,9 +587,10 @@ impl Store {
 
     /// Recovers expired leases and returns every transitioned request in order.
     ///
-    /// Ordinary leases are returned after being requeued; cancellation-requested
-    /// leases are returned after becoming terminally cancelled. Repeating the call
-    /// returns an empty vector and creates no duplicate events.
+    /// Ordinary leases are returned after being requeued, terminal flow caches after
+    /// being finalized, and cancellation-requested leases after becoming terminally
+    /// cancelled or, for reconciliation-unknown, failed with the cached blocked result.
+    /// Repeating the call returns an empty vector and creates no duplicate events.
     ///
     /// # Errors
     ///
@@ -509,8 +612,10 @@ impl Store {
     ///
     /// This operation is intended to run only after the daemon has acquired
     /// exclusive process ownership. Ordinary leases return to their original FIFO
-    /// positions, while cancellation-requested leases become terminally cancelled.
-    /// Repeating it is safe and adds no duplicate recovery events.
+    /// positions and validated terminal flow caches are finalized. Cancellation-requested
+    /// leases become terminally cancelled except for cached reconciliation-unknown, which
+    /// becomes failed with its exact blocked result. Repeating it is safe and adds no
+    /// duplicate recovery events.
     ///
     /// # Errors
     ///
@@ -549,6 +654,51 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Loads a flow checkpoint only while the supplied scheduler lease is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleLease`] for an expired or fenced lease and
+    /// [`StoreError::CorruptFlowCheckpoint`] for invalid durable bytes.
+    pub async fn load_flow_checkpoint(
+        &self,
+        lease: Lease,
+        now_ms: u64,
+    ) -> Result<Option<FlowCheckpoint>, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::LoadFlowCheckpoint {
+            lease,
+            now_ms,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Saves a typed flow checkpoint with optimistic revision control.
+    ///
+    /// A new semantic transition, its snapshot, and any exact encoded terminal
+    /// result are committed atomically.
+    /// Replaying the exact same write is idempotent and does not append another event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale leases, revision or identity conflicts, terminal
+    /// outcomes that disagree with request cancellation order, invalid transition
+    /// sequencing, oversized payloads, or corrupt durable state.
+    pub async fn save_flow_checkpoint(
+        &self,
+        checkpoint: SaveFlowCheckpoint,
+    ) -> Result<FlowCheckpointSaveOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::SaveFlowCheckpoint {
+            checkpoint,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Commits a worker acknowledgement and its terminal event together.
     ///
     /// A cancellation request always becomes cancelled with its previously persisted
@@ -577,10 +727,73 @@ impl Store {
         receive(response_rx).await
     }
 
+    /// Finishes a flow with the truthful result cached by its terminal checkpoint.
+    ///
+    /// Unlike [`Self::finish`], this flow-only acknowledgement derives the
+    /// request state from the validated terminal checkpoint and requires the
+    /// supplied bytes to exactly match its cached result. A cancellation request
+    /// may normally finish only as cancelled. The sole exception is a blocked
+    /// checkpoint reached through reconciliation-unknown, which preserves the
+    /// truthful possibility that a stateful effect was applied. The request
+    /// result and its single terminal event commit atomically under the live lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleLease`] for an expired, fenced, or already
+    /// terminal lease. Returns [`StoreError::InvalidState`] unless the live
+    /// request is a flow with a matching terminal checkpoint whose outcome is
+    /// permitted by the durable request state.
+    pub async fn finish_terminal_flow(
+        &self,
+        lease: Lease,
+        now_ms: u64,
+        terminal_result: Vec<u8>,
+    ) -> Result<StoredResult, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::FinishTerminalFlow {
+            lease,
+            now_ms,
+            terminal_result,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Fails one queued flow whose durable authorization proof is corrupt or absent.
+    ///
+    /// This is the recovery half of [`Self::claim`] returning
+    /// [`StoreError::CorruptFlowAuthorization`]. The corruption is revalidated in
+    /// the same transaction as the failed result and event, so this method cannot
+    /// be used to fail a valid queued flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is absent, is not a queued flow, its
+    /// authorization is now valid, timing is invalid, or storage is unavailable.
+    pub async fn fail_corrupt_flow_authorization(
+        &self,
+        request_id: RequestId,
+        now_ms: u64,
+        result: Vec<u8>,
+    ) -> Result<FlowAuthorizationRecoveryOutcome, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::FailCorruptFlowAuthorization {
+            request_id,
+            now_ms,
+            result,
+            response: response_tx,
+        })
+        .await?;
+        receive(response_rx).await
+    }
+
     /// Cancels queued work or durably requests cancellation of leased work.
     ///
     /// A leased request retains its fencing token and project gate until `finish` or
-    /// lease recovery acknowledges the cancellation.
+    /// lease recovery acknowledges the cancellation. If a flow already has a
+    /// validated terminal checkpoint, that cached terminal truth wins the race
+    /// and is finalized atomically instead of recording a cancellation request.
     ///
     /// # Errors
     ///
@@ -591,11 +804,42 @@ impl Store {
         now_ms: u64,
         result: Vec<u8>,
     ) -> Result<CancelOutcome, StoreError> {
+        self.cancel_internal(request_id, now_ms, result, None).await
+    }
+
+    /// Cancels work only when its immutable operation kind matches `expected_target_kind`.
+    ///
+    /// A mismatch is deliberately reported as [`StoreError::RequestNotFound`] and does not
+    /// mutate the target, preventing callers from using this API to probe unrelated work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the request is absent, has a different operation kind, or the
+    /// transition fails.
+    pub async fn cancel_with_expected_target(
+        &self,
+        request_id: RequestId,
+        now_ms: u64,
+        result: Vec<u8>,
+        expected_target_kind: ExpectedOperationKind,
+    ) -> Result<CancelOutcome, StoreError> {
+        self.cancel_internal(request_id, now_ms, result, Some(expected_target_kind))
+            .await
+    }
+
+    async fn cancel_internal(
+        &self,
+        request_id: RequestId,
+        now_ms: u64,
+        result: Vec<u8>,
+        expected_target_kind: Option<ExpectedOperationKind>,
+    ) -> Result<CancelOutcome, StoreError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Cancel {
             request_id,
             now_ms,
             result,
+            expected_target_kind,
             response: response_tx,
         })
         .await?;
@@ -612,10 +856,36 @@ impl Store {
         request_id: RequestId,
         after_sequence: u64,
     ) -> Result<Replay, StoreError> {
+        self.replay_internal(request_id, after_sequence, None).await
+    }
+
+    /// Replays a request only when its immutable operation kind matches the expectation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the request is absent, has a different operation kind, or
+    /// stored data is invalid.
+    pub async fn replay_with_expected_target(
+        &self,
+        request_id: RequestId,
+        after_sequence: u64,
+        expected_target_kind: ExpectedOperationKind,
+    ) -> Result<Replay, StoreError> {
+        self.replay_internal(request_id, after_sequence, Some(expected_target_kind))
+            .await
+    }
+
+    async fn replay_internal(
+        &self,
+        request_id: RequestId,
+        after_sequence: u64,
+        expected_target_kind: Option<ExpectedOperationKind>,
+    ) -> Result<Replay, StoreError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Replay {
             request_id,
             after_sequence,
+            expected_target_kind,
             response: response_tx,
         })
         .await?;
@@ -628,9 +898,33 @@ impl Store {
     ///
     /// Returns a store error when the request is absent or stored data is invalid.
     pub async fn snapshot(&self, request_id: RequestId) -> Result<RequestSnapshot, StoreError> {
+        self.snapshot_internal(request_id, None).await
+    }
+
+    /// Loads scheduler metadata only when the immutable operation kind matches the expectation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the request is absent, has a different operation kind, or
+    /// stored data is invalid.
+    pub async fn snapshot_with_expected_target(
+        &self,
+        request_id: RequestId,
+        expected_target_kind: ExpectedOperationKind,
+    ) -> Result<RequestSnapshot, StoreError> {
+        self.snapshot_internal(request_id, Some(expected_target_kind))
+            .await
+    }
+
+    async fn snapshot_internal(
+        &self,
+        request_id: RequestId,
+        expected_target_kind: Option<ExpectedOperationKind>,
+    ) -> Result<RequestSnapshot, StoreError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Snapshot {
             request_id,
+            expected_target_kind,
             response: response_tx,
         })
         .await?;
@@ -849,6 +1143,15 @@ enum Command {
         payload: Vec<u8>,
         response: Response<EventRecord>,
     },
+    LoadFlowCheckpoint {
+        lease: Lease,
+        now_ms: u64,
+        response: Response<Option<FlowCheckpoint>>,
+    },
+    SaveFlowCheckpoint {
+        checkpoint: SaveFlowCheckpoint,
+        response: Response<FlowCheckpointSaveOutcome>,
+    },
     Finish {
         lease: Lease,
         now_ms: u64,
@@ -856,19 +1159,34 @@ enum Command {
         result: Vec<u8>,
         response: Response<StoredResult>,
     },
+    FinishTerminalFlow {
+        lease: Lease,
+        now_ms: u64,
+        terminal_result: Vec<u8>,
+        response: Response<StoredResult>,
+    },
+    FailCorruptFlowAuthorization {
+        request_id: RequestId,
+        now_ms: u64,
+        result: Vec<u8>,
+        response: Response<FlowAuthorizationRecoveryOutcome>,
+    },
     Cancel {
         request_id: RequestId,
         now_ms: u64,
         result: Vec<u8>,
+        expected_target_kind: Option<ExpectedOperationKind>,
         response: Response<CancelOutcome>,
     },
     Replay {
         request_id: RequestId,
         after_sequence: u64,
+        expected_target_kind: Option<ExpectedOperationKind>,
         response: Response<Replay>,
     },
     Snapshot {
         request_id: RequestId,
+        expected_target_kind: Option<ExpectedOperationKind>,
         response: Response<RequestSnapshot>,
     },
     QueuedBehind {
@@ -930,6 +1248,23 @@ enum PolicyCommand {
         now_ms: u64,
         approval_ttl_ms: u64,
         response: Response<AuthorizationOutcome>,
+    },
+    AuthorizeFlowRun {
+        request: AuthorizeFlowRun,
+        now_ms: u64,
+        approval_ttl_ms: u64,
+        response: Response<FlowAuthorizationOutcome>,
+    },
+    ValidateFlowEffectAuthorization {
+        lease: Lease,
+        now_ms: u64,
+        response: Response<FlowEffectAuthorization>,
+    },
+    ValidateFlowOperationResource {
+        lease: Lease,
+        resource: ResourceName,
+        now_ms: u64,
+        response: Response<()>,
     },
     DecideApproval {
         approval_id: ApprovalId,
@@ -993,6 +1328,7 @@ enum EvidenceCommand {
     Shutdown(Response<()>),
 }
 
+#[allow(clippy::too_many_lines)] // Keep the exhaustive command dispatcher in one auditable match.
 fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Command>) {
     while let Some(command) = commands.blocking_recv() {
         match command {
@@ -1042,6 +1378,18 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
                 response,
                 append_leased_event(&mut connection, &lease, now_ms, &kind, &payload),
             ),
+            Command::LoadFlowCheckpoint {
+                lease,
+                now_ms,
+                response,
+            } => respond(
+                response,
+                load_flow_checkpoint(&mut connection, &lease, now_ms),
+            ),
+            Command::SaveFlowCheckpoint {
+                checkpoint,
+                response,
+            } => respond(response, save_flow_checkpoint(&mut connection, checkpoint)),
             Command::Finish {
                 lease,
                 now_ms,
@@ -1052,24 +1400,62 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
                 response,
                 finish(&mut connection, &lease, now_ms, terminal_state, &result),
             ),
-            Command::Cancel {
+            Command::FinishTerminalFlow {
+                lease,
+                now_ms,
+                terminal_result,
+                response,
+            } => respond(
+                response,
+                finish_terminal_flow(&mut connection, &lease, now_ms, &terminal_result),
+            ),
+            Command::FailCorruptFlowAuthorization {
                 request_id,
                 now_ms,
                 result,
                 response,
             } => respond(
                 response,
-                cancel(&mut connection, &request_id, now_ms, &result),
+                fail_corrupt_flow_authorization(&mut connection, &request_id, now_ms, &result),
+            ),
+            Command::Cancel {
+                request_id,
+                now_ms,
+                result,
+                expected_target_kind,
+                response,
+            } => respond(
+                response,
+                cancel(
+                    &mut connection,
+                    &request_id,
+                    now_ms,
+                    &result,
+                    expected_target_kind,
+                ),
             ),
             Command::Replay {
                 request_id,
                 after_sequence,
+                expected_target_kind,
                 response,
-            } => respond(response, replay(&connection, &request_id, after_sequence)),
+            } => respond(
+                response,
+                replay(
+                    &connection,
+                    &request_id,
+                    after_sequence,
+                    expected_target_kind,
+                ),
+            ),
             Command::Snapshot {
                 request_id,
+                expected_target_kind,
                 response,
-            } => respond(response, snapshot(&connection, &request_id)),
+            } => respond(
+                response,
+                snapshot(&connection, &request_id, expected_target_kind),
+            ),
             Command::QueuedBehind {
                 request_id,
                 response,
@@ -1138,6 +1524,32 @@ fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
         } => respond(
             response,
             authorize_audited(connection, &request, audit, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::AuthorizeFlowRun {
+            request,
+            now_ms,
+            approval_ttl_ms,
+            response,
+        } => respond(
+            response,
+            authorize_flow_run(connection, request, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::ValidateFlowEffectAuthorization {
+            lease,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            validate_flow_effect_authorization(connection, &lease, now_ms),
+        ),
+        PolicyCommand::ValidateFlowOperationResource {
+            lease,
+            resource,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            validate_flow_operation_resource(connection, &lease, &resource, now_ms),
         ),
         PolicyCommand::DecideApproval {
             approval_id,
@@ -1892,6 +2304,479 @@ fn authorize_audited(
     Ok(outcome)
 }
 
+fn authorize_flow_run(
+    connection: &mut Connection,
+    request: AuthorizeFlowRun,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<FlowAuthorizationOutcome, StoreError> {
+    if request.accept.operation_kind != FLOW_OPERATION_KIND {
+        return Err(StoreError::InvalidState(
+            "flow authorization requires an exact flow operation".to_owned(),
+        ));
+    }
+    let now = sql_integer(now_ms)?;
+    let capability = flow_capability();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = if let Some(existing) = existing_acceptance_tx(&transaction, &request.accept)? {
+        let request_id = accept_outcome_request_id(&existing);
+        if request_id != &request.accept.request_id {
+            return Err(StoreError::RequestIdConflict(
+                request.accept.request_id.clone(),
+            ));
+        }
+        let terminal_existing = matches!(
+            existing,
+            AcceptOutcome::Existing {
+                state: RequestState::Succeeded | RequestState::Failed | RequestState::Cancelled,
+                ..
+            }
+        );
+        match validate_flow_authorization_integrity(&transaction, request_id) {
+            Err(StoreError::CorruptFlowAuthorization(_)) if terminal_existing => {
+                FlowAuthorizationOutcome::Accepted(existing)
+            }
+            Err(error) => return Err(error),
+            Ok(proof)
+                if proof.capability == capability
+                    && proof.resource == request.resource
+                    && proof.schema_approval_required == request.schema_approval_required
+                    && validate_loaded_flow_authorization(
+                        &transaction,
+                        request_id,
+                        &proof,
+                        now_ms,
+                    )? == FlowEffectAuthorization::Allowed =>
+            {
+                FlowAuthorizationOutcome::Accepted(existing)
+            }
+            Ok(_) => FlowAuthorizationOutcome::Denied,
+        }
+    } else {
+        authorize_new_flow_run(&transaction, &request, now, now_ms, approval_ttl_ms)?
+    };
+    let (decision, audit_outcome) = flow_authorization_audit_outcome(&outcome);
+    append_audit_event_tx(
+        &transaction,
+        AppendAuditEvent {
+            event_id: request.audit.event_id,
+            project_id: request.accept.project_id,
+            caller_id: request.accept.caller_id,
+            action: request.audit.action,
+            decision: decision.to_owned(),
+            outcome: audit_outcome.to_owned(),
+            redacted_detail: request.audit.redacted_detail,
+            occurred_at_ms: now_ms,
+            retain_until_ms: request.audit.retain_until_ms,
+        },
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn authorize_new_flow_run(
+    transaction: &Transaction<'_>,
+    request: &AuthorizeFlowRun,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<FlowAuthorizationOutcome, StoreError> {
+    if !caller_is_active(transaction, &request.accept.caller_id)? {
+        return Ok(FlowAuthorizationOutcome::Denied);
+    }
+    let capability = flow_capability();
+    let policy_request = AuthorizationRequest {
+        caller_id: request.accept.caller_id.clone(),
+        project_id: request.accept.project_id.clone(),
+        capability: capability.clone(),
+        resource: request.resource.clone(),
+        approval_id: request.approval_id.clone(),
+    };
+    let grants = load_grants(transaction, &policy_request)?;
+    let decision = evaluate(
+        &grants,
+        &policy_request.caller_id,
+        &policy_request.project_id,
+        &policy_request.capability,
+        &policy_request.resource,
+        now_ms,
+    );
+    if decision == Decision::Denied {
+        return Ok(FlowAuthorizationOutcome::Denied);
+    }
+    let approval_required =
+        request.schema_approval_required || decision == Decision::ApprovalRequired;
+    if approval_required {
+        let approval = authorize_flow_with_approval(
+            transaction,
+            &policy_request,
+            &request.accept.request_id,
+            now,
+            now_ms,
+            approval_ttl_ms,
+        )?;
+        if approval != AuthorizationOutcome::Allowed {
+            return Ok(flow_authorization_outcome(approval));
+        }
+    }
+
+    let accepted = accept_tx(transaction, request.accept.clone(), now)?;
+    let approval_id = if approval_required {
+        Some(request.approval_id.clone().ok_or_else(|| {
+            StoreError::InvalidState("approved flow omitted its consumed receipt".to_owned())
+        })?)
+    } else {
+        None
+    };
+    insert_flow_authorization(
+        transaction,
+        accept_outcome_request_id(&accepted),
+        request,
+        &capability,
+        approval_id.as_ref(),
+        now,
+    )?;
+    Ok(FlowAuthorizationOutcome::Accepted(accepted))
+}
+
+fn flow_capability() -> CapabilityName {
+    CapabilityName::parse(FLOW_CAPABILITY_NAME)
+        .expect("flow capability name is a static valid policy identifier")
+}
+
+fn insert_flow_authorization(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    request: &AuthorizeFlowRun,
+    capability: &CapabilityName,
+    approval_id: Option<&ApprovalId>,
+    now: i64,
+) -> Result<(), StoreError> {
+    let fingerprint = EffectFingerprint::compute(
+        &request.accept.caller_id,
+        &request.accept.project_id,
+        capability,
+        &request.resource,
+    );
+    transaction.execute(
+        "INSERT INTO flow_authorizations(
+             request_id, capability, resource, effect_fingerprint,
+             authorization_kind, approval_id, schema_approval_required, authorized_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            request_id.as_str(),
+            capability.as_str(),
+            request.resource.as_str(),
+            fingerprint.as_bytes().as_slice(),
+            if approval_id.is_some() {
+                "approved"
+            } else {
+                "unconditional"
+            },
+            approval_id.map(ApprovalId::as_str),
+            request.schema_approval_required,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn accept_outcome_request_id(outcome: &AcceptOutcome) -> &RequestId {
+    match outcome {
+        AcceptOutcome::Created { request_id, .. } | AcceptOutcome::Existing { request_id, .. } => {
+            request_id
+        }
+    }
+}
+
+const fn flow_authorization_audit_outcome(
+    outcome: &FlowAuthorizationOutcome,
+) -> (&'static str, &'static str) {
+    match outcome {
+        FlowAuthorizationOutcome::Accepted(_) => ("allow", "authorized"),
+        FlowAuthorizationOutcome::Denied => ("deny", "forbidden"),
+        FlowAuthorizationOutcome::ApprovalRequired { .. } => ("challenge", "approval_required"),
+        FlowAuthorizationOutcome::ApprovalDenied => ("deny", "approval_denied"),
+        FlowAuthorizationOutcome::ApprovalExpired => ("deny", "approval_expired"),
+    }
+}
+
+fn flow_authorization_outcome(outcome: AuthorizationOutcome) -> FlowAuthorizationOutcome {
+    match outcome {
+        AuthorizationOutcome::Allowed => {
+            unreachable!("allowed flow authorization is accepted atomically")
+        }
+        AuthorizationOutcome::Denied => FlowAuthorizationOutcome::Denied,
+        AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        } => FlowAuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        },
+        AuthorizationOutcome::ApprovalDenied => FlowAuthorizationOutcome::ApprovalDenied,
+        AuthorizationOutcome::ApprovalExpired => FlowAuthorizationOutcome::ApprovalExpired,
+    }
+}
+
+struct StoredFlowAuthorization {
+    caller_id: CallerId,
+    project_id: ProjectId,
+    capability: CapabilityName,
+    resource: ResourceName,
+    fingerprint: Vec<u8>,
+    approval_id: Option<ApprovalId>,
+    schema_approval_required: bool,
+}
+
+fn validate_flow_effect_authorization(
+    connection: &mut Connection,
+    lease: &Lease,
+    now_ms: u64,
+) -> Result<FlowEffectAuthorization, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if ensure_live_flow_lease(&transaction, lease, now)? != RequestState::Leased {
+        return Err(StoreError::StaleLease(lease.request_id.clone()));
+    }
+    let proof = validate_flow_authorization_integrity(&transaction, &lease.request_id)?;
+    if proof.project_id != lease.project_id {
+        return Err(StoreError::StaleLease(lease.request_id.clone()));
+    }
+    let outcome =
+        validate_loaded_flow_authorization(&transaction, &lease.request_id, &proof, now_ms)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn validate_flow_operation_resource(
+    connection: &mut Connection,
+    lease: &Lease,
+    resource: &ResourceName,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !matches!(
+        ensure_live_flow_lease(&transaction, lease, now)?,
+        RequestState::Leased | RequestState::CancellationRequested
+    ) {
+        return Err(StoreError::StaleLease(lease.request_id.clone()));
+    }
+    let proof = validate_flow_authorization_integrity(&transaction, &lease.request_id)?;
+    if proof.project_id != lease.project_id || proof.resource != *resource {
+        return Err(StoreError::CorruptFlowAuthorization(
+            lease.request_id.clone(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_loaded_flow_authorization(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    proof: &StoredFlowAuthorization,
+    now_ms: u64,
+) -> Result<FlowEffectAuthorization, StoreError> {
+    if let Some(approval_id) = &proof.approval_id {
+        validate_consumed_flow_receipt(transaction, request_id, proof, approval_id)?;
+    }
+    if !caller_is_active(transaction, &proof.caller_id)? {
+        return Ok(FlowEffectAuthorization::Denied);
+    }
+    let policy_request = AuthorizationRequest {
+        caller_id: proof.caller_id.clone(),
+        project_id: proof.project_id.clone(),
+        capability: proof.capability.clone(),
+        resource: proof.resource.clone(),
+        approval_id: proof.approval_id.clone(),
+    };
+    let grants = load_grants(transaction, &policy_request)?;
+    let decision = evaluate(
+        &grants,
+        &proof.caller_id,
+        &proof.project_id,
+        &proof.capability,
+        &proof.resource,
+        now_ms,
+    );
+    let allowed = match (&proof.approval_id, decision) {
+        (_, Decision::Denied) | (None, Decision::ApprovalRequired) => false,
+        (None, Decision::Allowed) => !proof.schema_approval_required,
+        (Some(_), Decision::Allowed | Decision::ApprovalRequired) => true,
+    };
+    Ok(if allowed {
+        FlowEffectAuthorization::Allowed
+    } else {
+        FlowEffectAuthorization::Denied
+    })
+}
+
+fn validate_flow_authorization_integrity(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+) -> Result<StoredFlowAuthorization, StoreError> {
+    let proof = load_flow_authorization(transaction, request_id)?;
+    if let Some(approval_id) = &proof.approval_id {
+        validate_consumed_flow_receipt(transaction, request_id, &proof, approval_id)?;
+    }
+    Ok(proof)
+}
+
+fn load_flow_authorization(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+) -> Result<StoredFlowAuthorization, StoreError> {
+    let stored = transaction
+        .query_row(
+            "SELECT requests.caller_id, requests.project_id,
+                    flow_authorizations.capability, flow_authorizations.resource,
+                    flow_authorizations.effect_fingerprint,
+                    flow_authorizations.authorization_kind,
+                    flow_authorizations.approval_id,
+                    flow_authorizations.schema_approval_required,
+                    requests.accepted_at_ms, flow_authorizations.authorized_at_ms
+             FROM requests
+             LEFT JOIN flow_authorizations
+               ON flow_authorizations.request_id = requests.request_id
+             WHERE requests.request_id = ?1 AND requests.operation_kind = 'flow_run'",
+            [request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<bool>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        project,
+        capability,
+        resource,
+        fingerprint,
+        kind,
+        approval,
+        schema_required,
+        accepted_at,
+        authorized_at,
+    )) = stored
+    else {
+        return Err(StoreError::CorruptFlowAuthorization(request_id.clone()));
+    };
+    let (
+        Some(capability),
+        Some(resource),
+        Some(fingerprint),
+        Some(kind),
+        Some(schema_required),
+        Some(authorized_at),
+    ) = (
+        capability,
+        resource,
+        fingerprint,
+        kind,
+        schema_required,
+        authorized_at,
+    )
+    else {
+        return Err(StoreError::CorruptFlowAuthorization(request_id.clone()));
+    };
+    let capability = CapabilityName::parse(capability)
+        .map_err(|_| StoreError::CorruptFlowAuthorization(request_id.clone()))?;
+    let resource = ResourceName::parse(resource)
+        .map_err(|_| StoreError::CorruptFlowAuthorization(request_id.clone()))?;
+    let caller_id = CallerId::from(caller);
+    let project_id = ProjectId::from(project);
+    let expected = EffectFingerprint::compute(&caller_id, &project_id, &capability, &resource);
+    let kind_matches = matches!((kind.as_str(), approval.as_ref()), ("unconditional", None))
+        || matches!((kind.as_str(), approval.as_ref()), ("approved", Some(_)));
+    if capability.as_str() != FLOW_CAPABILITY_NAME
+        || !kind_matches
+        || (schema_required && approval.is_none())
+        || authorized_at != accepted_at
+        || !constant_time_equal(&fingerprint, expected.as_bytes())
+    {
+        return Err(StoreError::CorruptFlowAuthorization(request_id.clone()));
+    }
+    Ok(StoredFlowAuthorization {
+        caller_id,
+        project_id,
+        capability,
+        resource,
+        fingerprint,
+        approval_id: approval.map(ApprovalId::from),
+        schema_approval_required: schema_required,
+    })
+}
+
+fn validate_consumed_flow_receipt(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    proof: &StoredFlowAuthorization,
+    approval_id: &ApprovalId,
+) -> Result<(), StoreError> {
+    let receipt = transaction
+        .query_row(
+            "SELECT caller_id, project_id, capability, resource,
+                    effect_fingerprint, state, flow_request_id,
+                    decided_at_ms, consumed_at_ms, expires_at_ms
+             FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        project,
+        capability,
+        resource,
+        fingerprint,
+        state,
+        bound_request,
+        decided_at,
+        consumed_at,
+        expires_at,
+    )) = receipt
+    else {
+        return Err(StoreError::CorruptFlowAuthorization(request_id.clone()));
+    };
+    if caller != proof.caller_id.as_str()
+        || project != proof.project_id.as_str()
+        || capability != proof.capability.as_str()
+        || resource != proof.resource.as_str()
+        || state != "consumed"
+        || bound_request.as_deref() != Some(request_id.as_str())
+        || !matches!((decided_at, consumed_at), (Some(decided), Some(consumed)) if decided <= consumed && consumed < expires_at)
+        || !constant_time_equal(&fingerprint, &proof.fingerprint)
+    {
+        return Err(StoreError::CorruptFlowAuthorization(request_id.clone()));
+    }
+    Ok(())
+}
+
 fn authorize_tx(
     transaction: &Transaction<'_>,
     request: &AuthorizationRequest,
@@ -1899,15 +2784,7 @@ fn authorize_tx(
     now_ms: u64,
     approval_ttl_ms: u64,
 ) -> Result<AuthorizationOutcome, StoreError> {
-    let active_caller = transaction
-        .query_row(
-            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
-            [request.caller_id.as_str()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !active_caller {
+    if !caller_is_active(transaction, &request.caller_id)? {
         return Ok(AuthorizationOutcome::Denied);
     }
     let grants = load_grants(transaction, request)?;
@@ -1927,6 +2804,21 @@ fn authorize_tx(
         }
     };
     Ok(outcome)
+}
+
+fn caller_is_active(
+    transaction: &Transaction<'_>,
+    caller_id: &CallerId,
+) -> Result<bool, StoreError> {
+    let active = transaction
+        .query_row(
+            "SELECT 1 FROM callers WHERE caller_id = ?1 AND revoked_at_ms IS NULL",
+            [caller_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(active)
 }
 
 const fn authorization_audit_outcome(
@@ -2067,10 +2959,113 @@ fn authorize_with_approval(
     resolve_approval(transaction, approval_id, request, &fingerprint, now, now_ms)
 }
 
-fn resolve_approval(
+fn authorize_flow_with_approval(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    request_id: &RequestId,
+    now: i64,
+    now_ms: u64,
+    approval_ttl_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let fingerprint = EffectFingerprint::compute(
+        &request.caller_id,
+        &request.project_id,
+        &request.capability,
+        &request.resource,
+    );
+    let Some(approval_id) = &request.approval_id else {
+        if let Some((approval_id, expires_at_ms)) =
+            reusable_flow_approval(transaction, request, request_id, &fingerprint, now_ms)?
+        {
+            return Ok(AuthorizationOutcome::ApprovalRequired {
+                approval_id,
+                expires_at_ms,
+            });
+        }
+        if approval_ttl_ms == 0 {
+            return Err(StoreError::InvalidState(
+                "approval lifetime must be non-zero".to_owned(),
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(approval_ttl_ms)
+            .ok_or(StoreError::ApprovalExpiryOverflow)?;
+        let expires_at = sql_integer(expires_at_ms)?;
+        let approval_id = ApprovalId::new(Uuid::new_v4().to_string());
+        transaction.execute(
+            "INSERT INTO approvals(
+                approval_id, caller_id, project_id, capability, resource,
+                effect_fingerprint, state, requested_at_ms, expires_at_ms,
+                flow_request_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'requested', ?7, ?8, ?9)",
+            params![
+                approval_id.as_str(),
+                request.caller_id.as_str(),
+                request.project_id.as_str(),
+                request.capability.as_str(),
+                request.resource.as_str(),
+                fingerprint.as_bytes().as_slice(),
+                now,
+                expires_at,
+                request_id.as_str(),
+            ],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+        });
+    };
+    resolve_flow_approval(
+        transaction,
+        approval_id,
+        request,
+        request_id,
+        &fingerprint,
+        now,
+        now_ms,
+    )
+}
+
+fn reusable_flow_approval(
+    transaction: &Transaction<'_>,
+    request: &AuthorizationRequest,
+    request_id: &RequestId,
+    fingerprint: &EffectFingerprint,
+    now_ms: u64,
+) -> Result<Option<(ApprovalId, u64)>, StoreError> {
+    let approval = transaction
+        .query_row(
+            "SELECT approval_id, expires_at_ms
+             FROM approvals
+             WHERE caller_id = ?1 AND project_id = ?2 AND capability = ?3
+               AND resource = ?4 AND effect_fingerprint = ?5
+               AND flow_request_id = ?6 AND state IN ('requested', 'approved')
+               AND expires_at_ms > ?7
+             ORDER BY requested_at_ms DESC, approval_id DESC LIMIT 1",
+            params![
+                request.caller_id.as_str(),
+                request.project_id.as_str(),
+                request.capability.as_str(),
+                request.resource.as_str(),
+                fingerprint.as_bytes().as_slice(),
+                request_id.as_str(),
+                sql_integer(now_ms)?,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    approval
+        .map(|(approval_id, expires_at)| {
+            Ok((ApprovalId::from(approval_id), unsigned_integer(expires_at)?))
+        })
+        .transpose()
+}
+
+fn resolve_flow_approval(
     transaction: &Transaction<'_>,
     approval_id: &ApprovalId,
     request: &AuthorizationRequest,
+    request_id: &RequestId,
     fingerprint: &EffectFingerprint,
     now: i64,
     now_ms: u64,
@@ -2078,7 +3073,7 @@ fn resolve_approval(
     let approval = transaction
         .query_row(
             "SELECT caller_id, project_id, capability, resource,
-                    effect_fingerprint, state, expires_at_ms
+                    effect_fingerprint, state, expires_at_ms, flow_request_id
              FROM approvals WHERE approval_id = ?1",
             [approval_id.as_str()],
             |row| {
@@ -2090,11 +3085,12 @@ fn resolve_approval(
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((caller, project, capability, resource, stored_fingerprint, state, expires_at)) =
+    let Some((caller, project, capability, resource, stored_fingerprint, state, expires_at, bound)) =
         approval
     else {
         return Ok(AuthorizationOutcome::Denied);
@@ -2103,6 +3099,91 @@ fn resolve_approval(
         || project != request.project_id.as_str()
         || capability != request.capability.as_str()
         || resource != request.resource.as_str()
+        || bound.as_deref() != Some(request_id.as_str())
+        || !constant_time_equal(&stored_fingerprint, fingerprint.as_bytes())
+    {
+        return Ok(AuthorizationOutcome::Denied);
+    }
+    let expires_at_ms = unsigned_integer(expires_at)?;
+    if now_ms >= expires_at_ms && matches!(state.as_str(), "requested" | "approved") {
+        transaction.execute(
+            "UPDATE approvals SET state = 'expired' WHERE approval_id = ?1",
+            [approval_id.as_str()],
+        )?;
+        return Ok(AuthorizationOutcome::ApprovalExpired);
+    }
+    match state.as_str() {
+        "requested" => Ok(AuthorizationOutcome::ApprovalRequired {
+            approval_id: approval_id.clone(),
+            expires_at_ms,
+        }),
+        "approved" => {
+            let updated = transaction.execute(
+                "UPDATE approvals SET state = 'consumed', consumed_at_ms = ?3
+                 WHERE approval_id = ?1 AND state = 'approved' AND flow_request_id = ?2",
+                params![approval_id.as_str(), request_id.as_str(), now],
+            )?;
+            if updated == 1 {
+                Ok(AuthorizationOutcome::Allowed)
+            } else {
+                Ok(AuthorizationOutcome::Denied)
+            }
+        }
+        "denied" => Ok(AuthorizationOutcome::ApprovalDenied),
+        "expired" => Ok(AuthorizationOutcome::ApprovalExpired),
+        "consumed" => Ok(AuthorizationOutcome::Denied),
+        _ => Err(StoreError::InvalidState(
+            "invalid stored approval state".to_owned(),
+        )),
+    }
+}
+
+fn resolve_approval(
+    transaction: &Transaction<'_>,
+    approval_id: &ApprovalId,
+    request: &AuthorizationRequest,
+    fingerprint: &EffectFingerprint,
+    now: i64,
+    now_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let approval = transaction
+        .query_row(
+            "SELECT caller_id, project_id, capability, resource,
+                    effect_fingerprint, state, expires_at_ms, flow_request_id
+             FROM approvals WHERE approval_id = ?1",
+            [approval_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        caller,
+        project,
+        capability,
+        resource,
+        stored_fingerprint,
+        state,
+        expires_at,
+        flow_request_id,
+    )) = approval
+    else {
+        return Ok(AuthorizationOutcome::Denied);
+    };
+    if caller != request.caller_id.as_str()
+        || project != request.project_id.as_str()
+        || capability != request.capability.as_str()
+        || resource != request.resource.as_str()
+        || flow_request_id.is_some()
         || !constant_time_equal(&stored_fingerprint, fingerprint.as_bytes())
     {
         return Ok(AuthorizationOutcome::Denied);
@@ -2478,40 +3559,25 @@ fn accept(
     request: AcceptRequest,
     now_ms: u64,
 ) -> Result<AcceptOutcome, StoreError> {
+    if request.operation_kind == FLOW_OPERATION_KIND {
+        return Err(StoreError::InvalidState(
+            "flow requests require atomic authorization and acceptance".to_owned(),
+        ));
+    }
     let now = sql_integer(now_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing = transaction
-        .query_row(
-            "SELECT request_id, operation_kind, operation, state
-             FROM requests
-             WHERE caller_id = ?1 AND project_id = ?2 AND idempotency_key = ?3",
-            params![
-                request.caller_id.as_str(),
-                request.project_id.as_str(),
-                request.idempotency_key.as_str()
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
+    let outcome = accept_tx(&transaction, request, now)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
 
-    if let Some((request_id, operation_kind, operation, state)) = existing {
-        let canonical_request_id = RequestId::from(request_id);
-        if operation_kind == request.operation_kind && operation == request.operation {
-            return Ok(AcceptOutcome::Existing {
-                request_id: canonical_request_id,
-                state: parse_state(&state)?,
-            });
-        }
-        return Err(StoreError::IdempotencyConflict {
-            canonical_request_id,
-        });
+fn accept_tx(
+    transaction: &Transaction<'_>,
+    request: AcceptRequest,
+    now: i64,
+) -> Result<AcceptOutcome, StoreError> {
+    if let Some(existing) = existing_acceptance_tx(transaction, &request)? {
+        return Ok(existing);
     }
 
     let request_id_exists = transaction
@@ -2558,13 +3624,52 @@ fn accept(
             now
         ],
     )?;
-    append_event_tx(&transaction, &request.request_id, now, "accepted", &[])?;
-    transaction.commit()?;
-
+    append_event_tx(transaction, &request.request_id, now, "accepted", &[])?;
     Ok(AcceptOutcome::Created {
         request_id: request.request_id,
         queue_sequence: unsigned_integer(queue_sequence)?,
     })
+}
+
+fn existing_acceptance_tx(
+    transaction: &Transaction<'_>,
+    request: &AcceptRequest,
+) -> Result<Option<AcceptOutcome>, StoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT request_id, operation_kind, operation, state
+             FROM requests
+             WHERE caller_id = ?1 AND project_id = ?2 AND idempotency_key = ?3",
+            params![
+                request.caller_id.as_str(),
+                request.project_id.as_str(),
+                request.idempotency_key.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if let Some((request_id, operation_kind, operation, state)) = existing {
+        let canonical_request_id = RequestId::from(request_id);
+        if operation_kind == request.operation_kind && operation == request.operation {
+            return Ok(Some(AcceptOutcome::Existing {
+                request_id: canonical_request_id,
+                state: parse_state(&state)?,
+            }));
+        }
+        return Err(StoreError::IdempotencyConflict {
+            canonical_request_id,
+        });
+    }
+
+    Ok(None)
 }
 
 struct ClaimCandidate {
@@ -2630,6 +3735,11 @@ fn claim(
         return Ok(None);
     };
 
+    let request_id = RequestId::from(candidate.request_id.clone());
+    if candidate.operation_kind == FLOW_OPERATION_KIND {
+        validate_flow_authorization_integrity(&transaction, &request_id)?;
+    }
+
     let attempt = candidate
         .attempt
         .checked_add(1)
@@ -2647,7 +3757,6 @@ fn claim(
             "claim candidate changed state".to_owned(),
         ));
     }
-    let request_id = RequestId::from(candidate.request_id);
     append_event_tx(&transaction, &request_id, now, "started", &[])?;
     transaction.commit()?;
 
@@ -2734,31 +3843,51 @@ fn recover_leases(
     for active in active_leases {
         let changed = match active.state {
             RequestState::Leased => {
-                let changed = release_lease(&transaction, &active.request_id, now, recovery)?;
+                let terminal = validated_terminal_flow_result(
+                    &transaction,
+                    &RequestId::from(active.request_id.clone()),
+                    &active.operation_kind,
+                )?;
+                let (changed, event_kind) = if let Some(terminal) = terminal.as_ref() {
+                    finalize_recovered_terminal_flow(
+                        &transaction,
+                        &active.request_id,
+                        now,
+                        recovery,
+                        terminal,
+                    )?
+                } else {
+                    (
+                        release_lease(&transaction, &active.request_id, now, recovery)?,
+                        "lease_expired",
+                    )
+                };
                 if changed == 1 {
                     append_event_tx(
                         &transaction,
                         &RequestId::from(active.request_id.clone()),
                         now,
-                        "lease_expired",
+                        event_kind,
                         &[],
                     )?;
                 }
                 changed
             }
             RequestState::CancellationRequested => {
-                let changed = finalize_recovered_cancellation(
+                let terminal = recovered_cancellation_flow_result(&transaction, &active)?;
+                let (changed, event_kind) = finalize_recovered_cancellation(
                     &transaction,
                     &active.request_id,
                     now,
                     recovery,
+                    terminal.as_ref(),
                 )?;
                 if changed == 1 {
                     append_event_tx(
                         &transaction,
                         &RequestId::from(active.request_id.clone()),
                         now,
-                        "cancelled",
+                        event_kind,
                         &[],
                     )?;
                 }
@@ -2782,6 +3911,7 @@ fn recover_leases(
 struct ActiveLease {
     request_id: String,
     state: RequestState,
+    operation_kind: String,
 }
 
 fn active_leases(
@@ -2792,7 +3922,7 @@ fn active_leases(
     let stored = match recovery {
         LeaseRecovery::Expired => {
             let mut statement = transaction.prepare(
-                "SELECT request_id, state
+                "SELECT request_id, state, operation_kind
                  FROM requests
                  WHERE state IN ('leased', 'cancellation_requested')
                    AND lease_expires_at_ms <= ?1
@@ -2800,33 +3930,84 @@ fn active_leases(
             )?;
             statement
                 .query_map([now], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         }
         LeaseRecovery::All => {
             let mut statement = transaction.prepare(
-                "SELECT request_id, state
+                "SELECT request_id, state, operation_kind
                  FROM requests
                  WHERE state IN ('leased', 'cancellation_requested')
                  ORDER BY accepted_at_ms, rowid",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
     stored
         .into_iter()
-        .map(|(request_id, state)| {
+        .map(|(request_id, state, operation_kind)| {
             Ok(ActiveLease {
                 request_id,
                 state: parse_state(&state)?,
+                operation_kind,
             })
         })
         .collect()
+}
+
+#[derive(Clone)]
+struct ValidatedTerminalFlowResult {
+    terminal: FlowTerminalResult,
+    cancellation_override: bool,
+}
+
+fn recovered_cancellation_flow_result(
+    transaction: &Transaction<'_>,
+    active: &ActiveLease,
+) -> Result<Option<ValidatedTerminalFlowResult>, StoreError> {
+    let request_id = RequestId::from(active.request_id.clone());
+    Ok(
+        validated_terminal_flow_result(transaction, &request_id, &active.operation_kind)?
+            .filter(terminal_may_override_cancellation),
+    )
+}
+
+fn validated_terminal_flow_result(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    operation_kind: &str,
+) -> Result<Option<ValidatedTerminalFlowResult>, StoreError> {
+    if operation_kind != FLOW_OPERATION_KIND {
+        return Ok(None);
+    }
+    let Some(stored) = read_flow_checkpoint(transaction, request_id)? else {
+        return Ok(None);
+    };
+    decode_and_validate_flow_checkpoint(transaction, request_id, &stored)?;
+    Ok(stored
+        .terminal_result
+        .map(|terminal| ValidatedTerminalFlowResult {
+            terminal,
+            cancellation_override: stored.terminal_cancellation_override,
+        }))
+}
+
+fn terminal_may_override_cancellation(terminal: &ValidatedTerminalFlowResult) -> bool {
+    terminal.terminal.outcome == RunOutcome::Cancelled
+        || (terminal.terminal.outcome == RunOutcome::Blocked && terminal.cancellation_override)
 }
 
 fn finalize_recovered_cancellation(
@@ -2834,25 +4015,75 @@ fn finalize_recovered_cancellation(
     request_id: &str,
     now: i64,
     recovery: LeaseRecovery,
-) -> Result<usize, StoreError> {
+    terminal: Option<&ValidatedTerminalFlowResult>,
+) -> Result<(usize, &'static str), StoreError> {
+    let (state, event_kind, terminal_result) =
+        terminal.map_or((RequestState::Cancelled, "cancelled", None), |terminal| {
+            let (state, event_kind, _) = terminal_request_resolution(terminal.terminal.outcome);
+            (
+                state,
+                event_kind,
+                Some(terminal.terminal.encoded_result.as_slice()),
+            )
+        });
     let changed = match recovery {
         LeaseRecovery::Expired => transaction.execute(
             "UPDATE requests
-             SET state = 'cancelled', lease_owner = NULL, lease_token = NULL,
-                 lease_expires_at_ms = NULL, completed_at_ms = ?2
+             SET state = ?3, lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at_ms = NULL, completed_at_ms = ?2,
+                 result = COALESCE(?4, result)
              WHERE request_id = ?1 AND state = 'cancellation_requested'
                AND lease_expires_at_ms <= ?2",
-            params![request_id, now],
+            params![request_id, now, state.as_str(), terminal_result],
         )?,
         LeaseRecovery::All => transaction.execute(
             "UPDATE requests
-             SET state = 'cancelled', lease_owner = NULL, lease_token = NULL,
-                 lease_expires_at_ms = NULL, completed_at_ms = ?2
+             SET state = ?3, lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at_ms = NULL, completed_at_ms = ?2,
+                 result = COALESCE(?4, result)
              WHERE request_id = ?1 AND state = 'cancellation_requested'",
-            params![request_id, now],
+            params![request_id, now, state.as_str(), terminal_result],
         )?,
     };
-    Ok(changed)
+    Ok((changed, event_kind))
+}
+
+fn finalize_recovered_terminal_flow(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    now: i64,
+    recovery: LeaseRecovery,
+    terminal: &ValidatedTerminalFlowResult,
+) -> Result<(usize, &'static str), StoreError> {
+    let (state, event_kind, _) = terminal_request_resolution(terminal.terminal.outcome);
+    let changed = match recovery {
+        LeaseRecovery::Expired => transaction.execute(
+            "UPDATE requests
+             SET state = ?3, lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at_ms = NULL, completed_at_ms = ?2, result = ?4
+             WHERE request_id = ?1 AND state = 'leased'
+               AND lease_expires_at_ms <= ?2",
+            params![
+                request_id,
+                now,
+                state.as_str(),
+                terminal.terminal.encoded_result.as_slice()
+            ],
+        )?,
+        LeaseRecovery::All => transaction.execute(
+            "UPDATE requests
+             SET state = ?3, lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at_ms = NULL, completed_at_ms = ?2, result = ?4
+             WHERE request_id = ?1 AND state = 'leased'",
+            params![
+                request_id,
+                now,
+                state.as_str(),
+                terminal.terminal.encoded_result.as_slice()
+            ],
+        )?,
+    };
+    Ok((changed, event_kind))
 }
 
 fn release_lease(
@@ -2901,6 +4132,720 @@ fn append_leased_event(
     })
 }
 
+struct StoredFlowCheckpoint {
+    definition_digest: Vec<u8>,
+    snapshot_bytes: Vec<u8>,
+    checkpoint_revision: u64,
+    updated_at_ms: u64,
+    terminal_result: Option<FlowTerminalResult>,
+    terminal_cancellation_override: bool,
+}
+
+type FlowPersistenceOutcome = (u64, u64, FlowCheckpointDisposition, Option<EventRecord>);
+
+fn load_flow_checkpoint(
+    connection: &mut Connection,
+    lease: &Lease,
+    now_ms: u64,
+) -> Result<Option<FlowCheckpoint>, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_live_flow_lease(&transaction, lease, now)?;
+    let stored = read_flow_checkpoint(&transaction, &lease.request_id)?;
+    let checkpoint = stored
+        .map(|stored| decode_and_validate_flow_checkpoint(&transaction, &lease.request_id, &stored))
+        .transpose()?;
+    transaction.commit()?;
+    Ok(checkpoint)
+}
+
+fn save_flow_checkpoint(
+    connection: &mut Connection,
+    save: SaveFlowCheckpoint,
+) -> Result<FlowCheckpointSaveOutcome, StoreError> {
+    validate_flow_request_identity(&save.lease.request_id, &save.snapshot)?;
+    validate_flow_terminal_result(
+        &save.snapshot,
+        save.transition.as_ref(),
+        save.terminal_result.as_ref(),
+    )?;
+    let snapshot_bytes = encode_snapshot(&save.snapshot)?;
+    let encoded_transition = save
+        .transition
+        .as_ref()
+        .map(encode_transition)
+        .transpose()?;
+    let now = sql_integer(save.updated_at_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let request_state = ensure_live_flow_lease(&transaction, &save.lease, now)?;
+    if request_state == RequestState::CancellationRequested
+        && matches!(
+            save.transition.as_ref().map(RunTransition::kind),
+            Some(TransitionKind::EffectStarted { .. })
+        )
+    {
+        return Err(StoreError::FlowEffectStartConflict(
+            save.lease.request_id.clone(),
+        ));
+    }
+    let terminal_cancellation_override = terminal_cancellation_override(&save, request_state)?;
+
+    let existing = read_flow_checkpoint(&transaction, &save.lease.request_id)?;
+    let (checkpoint_revision, checkpoint_updated_at_ms, disposition, event) =
+        persist_flow_checkpoint(
+            &transaction,
+            &save,
+            &snapshot_bytes,
+            encoded_transition.as_deref(),
+            now,
+            existing,
+            terminal_cancellation_override,
+        )?;
+
+    transaction.commit()?;
+    Ok(FlowCheckpointSaveOutcome {
+        checkpoint: FlowCheckpoint {
+            request_id: save.lease.request_id,
+            snapshot: save.snapshot,
+            checkpoint_revision,
+            updated_at_ms: checkpoint_updated_at_ms,
+            terminal_result: save.terminal_result,
+        },
+        disposition,
+        event,
+    })
+}
+
+fn terminal_cancellation_override(
+    save: &SaveFlowCheckpoint,
+    request_state: RequestState,
+) -> Result<bool, StoreError> {
+    let Some(terminal) = save.terminal_result.as_ref() else {
+        return Ok(false);
+    };
+    match (request_state, terminal.outcome) {
+        (
+            RequestState::Leased,
+            RunOutcome::Solved | RunOutcome::Unresolved | RunOutcome::Blocked,
+        )
+        | (RequestState::CancellationRequested, RunOutcome::Cancelled) => Ok(false),
+        (RequestState::CancellationRequested, RunOutcome::Blocked)
+            if save.snapshot.cancel_requested()
+                && matches!(
+                    save.transition.as_ref().map(RunTransition::kind),
+                    Some(TransitionKind::ReconciliationUnknown { .. })
+                ) =>
+        {
+            Ok(true)
+        }
+        _ => Err(StoreError::FlowTerminalOutcomeConflict(
+            save.lease.request_id.clone(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep the create/update CAS and exact replay checks together.
+fn persist_flow_checkpoint(
+    transaction: &Transaction<'_>,
+    save: &SaveFlowCheckpoint,
+    snapshot_bytes: &[u8],
+    transition_bytes: Option<&[u8]>,
+    now: i64,
+    existing: Option<StoredFlowCheckpoint>,
+    terminal_cancellation_override: bool,
+) -> Result<FlowPersistenceOutcome, StoreError> {
+    match existing {
+        None => {
+            if save.expected_revision != 0 {
+                return Err(StoreError::FlowCheckpointRevisionConflict {
+                    request_id: save.lease.request_id.clone(),
+                    expected: save.expected_revision,
+                    actual: 0,
+                });
+            }
+            validate_flow_successor(None, &save.snapshot, save.transition.as_ref())?;
+            insert_flow_checkpoint(
+                transaction,
+                save,
+                snapshot_bytes,
+                terminal_cancellation_override,
+            )?;
+            let event = append_flow_transition(
+                transaction,
+                &save.lease.request_id,
+                now,
+                save.transition.as_ref(),
+                transition_bytes,
+            )?;
+            Ok((
+                1,
+                save.updated_at_ms,
+                FlowCheckpointDisposition::Created,
+                event,
+            ))
+        }
+        Some(stored) => {
+            validate_stored_digest(&save.lease.request_id, &stored, &save.snapshot)?;
+            let previous =
+                decode_and_validate_flow_checkpoint(transaction, &save.lease.request_id, &stored)?;
+            if stored.snapshot_bytes == snapshot_bytes {
+                if stored.terminal_result != save.terminal_result
+                    || stored.terminal_cancellation_override != terminal_cancellation_override
+                {
+                    return Err(StoreError::FlowCheckpointConflict(
+                        save.lease.request_id.clone(),
+                    ));
+                }
+                let repeats_last_write =
+                    save.expected_revision.checked_add(1) == Some(stored.checkpoint_revision);
+                if save.expected_revision != stored.checkpoint_revision && !repeats_last_write {
+                    return Err(StoreError::FlowCheckpointRevisionConflict {
+                        request_id: save.lease.request_id.clone(),
+                        expected: save.expected_revision,
+                        actual: stored.checkpoint_revision,
+                    });
+                }
+                validate_flow_successor(Some(&previous.snapshot), &save.snapshot, None)?;
+                if save.transition.is_some() {
+                    validate_transition_alignment(&save.snapshot, save.transition.as_ref())?;
+                }
+                validate_exact_flow_replay(
+                    transaction,
+                    &save.lease.request_id,
+                    save.transition.as_ref(),
+                    transition_bytes,
+                )?;
+                Ok((
+                    stored.checkpoint_revision,
+                    stored.updated_at_ms,
+                    FlowCheckpointDisposition::Unchanged,
+                    None,
+                ))
+            } else {
+                if save.expected_revision != stored.checkpoint_revision {
+                    return Err(StoreError::FlowCheckpointRevisionConflict {
+                        request_id: save.lease.request_id.clone(),
+                        expected: save.expected_revision,
+                        actual: stored.checkpoint_revision,
+                    });
+                }
+                if save.transition.is_none()
+                    && previous.snapshot.snapshot_version() == 1
+                    && save.snapshot.snapshot_version() == pam_flow::FLOW_SNAPSHOT_VERSION
+                {
+                    if stored.terminal_result != save.terminal_result
+                        || stored.terminal_cancellation_override != terminal_cancellation_override
+                    {
+                        return Err(StoreError::FlowCheckpointConflict(
+                            save.lease.request_id.clone(),
+                        ));
+                    }
+                    validate_snapshot_upgrade(&previous.snapshot, &save.snapshot).map_err(
+                        |_| {
+                            StoreError::InvalidFlowCheckpoint(
+                                "legacy snapshot upgrade changed durable flow state",
+                            )
+                        },
+                    )?;
+                } else {
+                    validate_flow_successor(
+                        Some(&previous.snapshot),
+                        &save.snapshot,
+                        save.transition.as_ref(),
+                    )?;
+                }
+                let revision = save
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::FlowCheckpointRevisionOverflow)?;
+                update_flow_checkpoint(
+                    transaction,
+                    save,
+                    snapshot_bytes,
+                    revision,
+                    terminal_cancellation_override,
+                )?;
+                let event = append_flow_transition(
+                    transaction,
+                    &save.lease.request_id,
+                    now,
+                    save.transition.as_ref(),
+                    transition_bytes,
+                )?;
+                Ok((
+                    revision,
+                    save.updated_at_ms,
+                    FlowCheckpointDisposition::Updated,
+                    event,
+                ))
+            }
+        }
+    }
+}
+
+fn validate_flow_successor(
+    previous: Option<&FlowSnapshot>,
+    snapshot: &FlowSnapshot,
+    transition: Option<&RunTransition>,
+) -> Result<(), StoreError> {
+    validate_snapshot_successor(previous, snapshot, transition).map_err(|_| {
+        StoreError::InvalidFlowCheckpoint(
+            "snapshot and transition do not form a valid semantic successor",
+        )
+    })
+}
+
+fn read_flow_checkpoint(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+) -> Result<Option<StoredFlowCheckpoint>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT definition_digest, snapshot, checkpoint_revision, updated_at_ms,
+                    terminal_outcome, terminal_result, terminal_cancellation_override
+             FROM flow_runs WHERE request_id = ?1",
+            [request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                definition_digest,
+                snapshot_bytes,
+                checkpoint_revision,
+                updated_at_ms,
+                terminal_outcome,
+                terminal_result,
+                terminal_cancellation_override,
+            )| {
+                Ok(StoredFlowCheckpoint {
+                    definition_digest,
+                    snapshot_bytes,
+                    checkpoint_revision: unsigned_integer(checkpoint_revision)?,
+                    updated_at_ms: unsigned_integer(updated_at_ms)?,
+                    terminal_result: decode_stored_terminal_result(
+                        request_id,
+                        terminal_outcome,
+                        terminal_result,
+                    )?,
+                    terminal_cancellation_override,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn decode_flow_checkpoint(
+    request_id: &RequestId,
+    stored: &StoredFlowCheckpoint,
+) -> Result<FlowCheckpoint, StoreError> {
+    if stored.snapshot_bytes.is_empty() || stored.snapshot_bytes.len() > MAX_FLOW_CHECKPOINT_BYTES {
+        return Err(StoreError::CorruptFlowCheckpoint(request_id.clone()));
+    }
+    let snapshot: FlowSnapshot = rmp_serde::from_slice(&stored.snapshot_bytes)
+        .map_err(|_| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+    validate_flow_request_identity(request_id, &snapshot)
+        .map_err(|_| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+    if stored.definition_digest.as_slice() != snapshot.definition_digest().as_bytes() {
+        return Err(StoreError::CorruptFlowCheckpoint(request_id.clone()));
+    }
+    validate_flow_terminal_result(&snapshot, None, stored.terminal_result.as_ref())
+        .map_err(|_| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+    if stored.terminal_cancellation_override
+        && (!snapshot.cancel_requested()
+            || !matches!(
+                stored
+                    .terminal_result
+                    .as_ref()
+                    .map(|terminal| terminal.outcome),
+                Some(RunOutcome::Blocked)
+            ))
+    {
+        return Err(StoreError::CorruptFlowCheckpoint(request_id.clone()));
+    }
+    Ok(FlowCheckpoint {
+        request_id: request_id.clone(),
+        snapshot,
+        checkpoint_revision: stored.checkpoint_revision,
+        updated_at_ms: stored.updated_at_ms,
+        terminal_result: stored.terminal_result.clone(),
+    })
+}
+
+fn decode_and_validate_flow_checkpoint(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    stored: &StoredFlowCheckpoint,
+) -> Result<FlowCheckpoint, StoreError> {
+    let checkpoint = decode_flow_checkpoint(request_id, stored)?;
+    if !stored.terminal_cancellation_override {
+        return Ok(checkpoint);
+    }
+    let transition_bytes = transaction
+        .query_row(
+            "SELECT payload FROM events
+             WHERE request_id = ?1 AND kind = 'flow_reconciliation_unknown'
+             ORDER BY sequence DESC LIMIT 1",
+            [request_id.as_str()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+    let transition: RunTransition = rmp_serde::from_slice(&transition_bytes)
+        .map_err(|_| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+    if transition.sequence() != checkpoint.snapshot.transition_sequence()
+        || !matches!(
+            transition.kind(),
+            TransitionKind::ReconciliationUnknown { .. }
+        )
+    {
+        return Err(StoreError::CorruptFlowCheckpoint(request_id.clone()));
+    }
+    Ok(checkpoint)
+}
+
+fn encode_snapshot(snapshot: &FlowSnapshot) -> Result<Vec<u8>, StoreError> {
+    let bytes = rmp_serde::to_vec_named(snapshot)
+        .map_err(|_| StoreError::InvalidFlowCheckpoint("snapshot cannot be encoded"))?;
+    if bytes.is_empty() || bytes.len() > MAX_FLOW_CHECKPOINT_BYTES {
+        return Err(StoreError::FlowCheckpointTooLarge {
+            size_bytes: bytes.len(),
+            maximum_bytes: MAX_FLOW_CHECKPOINT_BYTES,
+        });
+    }
+    let decoded: FlowSnapshot = rmp_serde::from_slice(&bytes)
+        .map_err(|_| StoreError::InvalidFlowCheckpoint("snapshot cannot be decoded"))?;
+    if decoded != *snapshot {
+        return Err(StoreError::InvalidFlowCheckpoint(
+            "snapshot encoding is not lossless",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn encode_transition(transition: &RunTransition) -> Result<Vec<u8>, StoreError> {
+    let bytes = rmp_serde::to_vec_named(transition)
+        .map_err(|_| StoreError::InvalidFlowCheckpoint("transition cannot be encoded"))?;
+    if bytes.is_empty() || bytes.len() > MAX_FLOW_TRANSITION_BYTES {
+        return Err(StoreError::FlowTransitionTooLarge {
+            size_bytes: bytes.len(),
+            maximum_bytes: MAX_FLOW_TRANSITION_BYTES,
+        });
+    }
+    let decoded: RunTransition = rmp_serde::from_slice(&bytes)
+        .map_err(|_| StoreError::InvalidFlowCheckpoint("transition cannot be decoded"))?;
+    if decoded != *transition {
+        return Err(StoreError::InvalidFlowCheckpoint(
+            "transition encoding is not lossless",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_flow_terminal_result(
+    snapshot: &FlowSnapshot,
+    transition: Option<&RunTransition>,
+    terminal_result: Option<&FlowTerminalResult>,
+) -> Result<(), StoreError> {
+    let snapshot_outcome = terminal_outcome_for_status(snapshot.status());
+    match (snapshot_outcome, terminal_result) {
+        (Some(expected), Some(terminal)) if expected == terminal.outcome => {
+            if terminal.encoded_result.is_empty() {
+                return Err(StoreError::InvalidFlowCheckpoint(
+                    "terminal result cannot be empty",
+                ));
+            }
+            if terminal.encoded_result.len() > MAX_FLOW_TERMINAL_RESULT_BYTES {
+                return Err(StoreError::FlowTerminalResultTooLarge {
+                    size_bytes: terminal.encoded_result.len(),
+                    maximum_bytes: MAX_FLOW_TERMINAL_RESULT_BYTES,
+                });
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(StoreError::InvalidFlowCheckpoint(
+                "terminal result outcome does not match snapshot status",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(StoreError::InvalidFlowCheckpoint(
+                "terminal snapshot requires its encoded result",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(StoreError::InvalidFlowCheckpoint(
+                "non-terminal snapshot cannot cache a terminal result",
+            ));
+        }
+        (None, None) => {}
+    }
+
+    if let Some(transition) = transition {
+        match (transition.kind(), terminal_result) {
+            (TransitionKind::RunCompleted { outcome }, Some(terminal))
+                if *outcome == terminal.outcome => {}
+            (TransitionKind::RunCompleted { .. }, _) => {
+                return Err(StoreError::InvalidFlowCheckpoint(
+                    "run completion and terminal result outcomes do not match",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+const fn terminal_outcome_for_status(status: RunStatus) -> Option<RunOutcome> {
+    match status {
+        RunStatus::Succeeded => Some(RunOutcome::Solved),
+        RunStatus::Unresolved => Some(RunOutcome::Unresolved),
+        RunStatus::Blocked => Some(RunOutcome::Blocked),
+        RunStatus::Cancelled => Some(RunOutcome::Cancelled),
+        RunStatus::Running
+        | RunStatus::WaitingApproval
+        | RunStatus::WaitingRetry
+        | RunStatus::AwaitingEffectEvaluation
+        | RunStatus::EffectInFlight
+        | RunStatus::Cancelling => None,
+    }
+}
+
+const fn flow_outcome_name(outcome: RunOutcome) -> &'static str {
+    match outcome {
+        RunOutcome::Solved => "solved",
+        RunOutcome::Unresolved => "unresolved",
+        RunOutcome::Blocked => "blocked",
+        RunOutcome::Cancelled => "cancelled",
+    }
+}
+
+fn parse_flow_outcome(value: &str) -> Option<RunOutcome> {
+    match value {
+        "solved" => Some(RunOutcome::Solved),
+        "unresolved" => Some(RunOutcome::Unresolved),
+        "blocked" => Some(RunOutcome::Blocked),
+        "cancelled" => Some(RunOutcome::Cancelled),
+        _ => None,
+    }
+}
+
+fn decode_stored_terminal_result(
+    request_id: &RequestId,
+    outcome: Option<String>,
+    result: Option<Vec<u8>>,
+) -> Result<Option<FlowTerminalResult>, StoreError> {
+    match (outcome, result) {
+        (None, None) => Ok(None),
+        (Some(outcome), Some(encoded_result)) => {
+            let outcome = parse_flow_outcome(&outcome)
+                .ok_or_else(|| StoreError::CorruptFlowCheckpoint(request_id.clone()))?;
+            Ok(Some(FlowTerminalResult {
+                outcome,
+                encoded_result,
+            }))
+        }
+        _ => Err(StoreError::CorruptFlowCheckpoint(request_id.clone())),
+    }
+}
+
+fn validate_flow_request_identity(
+    request_id: &RequestId,
+    snapshot: &FlowSnapshot,
+) -> Result<(), StoreError> {
+    if snapshot.run_id().as_str() == request_id.as_str() {
+        Ok(())
+    } else {
+        Err(StoreError::FlowCheckpointRequestMismatch(
+            request_id.clone(),
+        ))
+    }
+}
+
+fn validate_transition_alignment(
+    snapshot: &FlowSnapshot,
+    transition: Option<&RunTransition>,
+) -> Result<(), StoreError> {
+    match transition {
+        Some(transition) if transition.sequence() == snapshot.transition_sequence() => Ok(()),
+        Some(_) => Err(StoreError::InvalidFlowCheckpoint(
+            "transition sequence does not match snapshot",
+        )),
+        None if snapshot.transition_sequence() == 0 => Ok(()),
+        None => Err(StoreError::InvalidFlowCheckpoint(
+            "non-initial snapshot requires its transition",
+        )),
+    }
+}
+
+fn validate_stored_digest(
+    request_id: &RequestId,
+    stored: &StoredFlowCheckpoint,
+    snapshot: &FlowSnapshot,
+) -> Result<(), StoreError> {
+    if stored.definition_digest.as_slice() == snapshot.definition_digest().as_bytes() {
+        Ok(())
+    } else {
+        Err(StoreError::FlowDefinitionDigestMismatch(request_id.clone()))
+    }
+}
+
+fn insert_flow_checkpoint(
+    transaction: &Transaction<'_>,
+    save: &SaveFlowCheckpoint,
+    snapshot_bytes: &[u8],
+    terminal_cancellation_override: bool,
+) -> Result<(), StoreError> {
+    let terminal_outcome = save
+        .terminal_result
+        .as_ref()
+        .map(|terminal| flow_outcome_name(terminal.outcome));
+    let terminal_result = save
+        .terminal_result
+        .as_ref()
+        .map(|terminal| terminal.encoded_result.as_slice());
+    transaction.execute(
+        "INSERT INTO flow_runs(
+             request_id, definition_digest, snapshot, checkpoint_revision, updated_at_ms,
+             terminal_outcome, terminal_result, terminal_cancellation_override
+         ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+        params![
+            save.lease.request_id.as_str(),
+            save.snapshot.definition_digest().as_bytes().as_slice(),
+            snapshot_bytes,
+            sql_integer(save.updated_at_ms)?,
+            terminal_outcome,
+            terminal_result,
+            terminal_cancellation_override,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_flow_checkpoint(
+    transaction: &Transaction<'_>,
+    save: &SaveFlowCheckpoint,
+    snapshot_bytes: &[u8],
+    revision: u64,
+    terminal_cancellation_override: bool,
+) -> Result<(), StoreError> {
+    let terminal_outcome = save
+        .terminal_result
+        .as_ref()
+        .map(|terminal| flow_outcome_name(terminal.outcome));
+    let terminal_result = save
+        .terminal_result
+        .as_ref()
+        .map(|terminal| terminal.encoded_result.as_slice());
+    let changed = transaction.execute(
+        "UPDATE flow_runs
+         SET snapshot = ?3, checkpoint_revision = ?4, updated_at_ms = ?5,
+             terminal_outcome = ?7, terminal_result = ?8,
+             terminal_cancellation_override = ?9
+         WHERE request_id = ?1 AND definition_digest = ?2 AND checkpoint_revision = ?6",
+        params![
+            save.lease.request_id.as_str(),
+            save.snapshot.definition_digest().as_bytes().as_slice(),
+            snapshot_bytes,
+            sql_integer(revision)?,
+            sql_integer(save.updated_at_ms)?,
+            sql_integer(save.expected_revision)?,
+            terminal_outcome,
+            terminal_result,
+            terminal_cancellation_override,
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::FlowCheckpointConflict(
+            save.lease.request_id.clone(),
+        ))
+    }
+}
+
+fn append_flow_transition(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    now: i64,
+    transition: Option<&RunTransition>,
+    transition_bytes: Option<&[u8]>,
+) -> Result<Option<EventRecord>, StoreError> {
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    let payload = transition_bytes.ok_or(StoreError::InvalidFlowCheckpoint(
+        "transition bytes are missing",
+    ))?;
+    let kind = flow_event_kind(transition.kind());
+    let sequence = append_event_tx(transaction, request_id, now, kind, payload)?;
+    Ok(Some(EventRecord {
+        sequence,
+        kind: kind.to_owned(),
+        payload: payload.to_vec(),
+        recorded_at_ms: unsigned_integer(now)?,
+    }))
+}
+
+fn validate_exact_flow_replay(
+    transaction: &Transaction<'_>,
+    request_id: &RequestId,
+    transition: Option<&RunTransition>,
+    transition_bytes: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    let Some(transition) = transition else {
+        return Ok(());
+    };
+    let payload = transition_bytes.ok_or(StoreError::InvalidFlowCheckpoint(
+        "transition bytes are missing",
+    ))?;
+    let exists = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM events WHERE request_id = ?1 AND kind = ?2 AND payload = ?3
+         )",
+        params![
+            request_id.as_str(),
+            flow_event_kind(transition.kind()),
+            payload
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::FlowCheckpointConflict(request_id.clone()))
+    }
+}
+
+const fn flow_event_kind(kind: &TransitionKind) -> &'static str {
+    match kind {
+        TransitionKind::StepSkipped { .. } => "flow_step_skipped",
+        TransitionKind::ApprovalRequested { .. } => "flow_approval_required",
+        TransitionKind::ApprovalGranted { .. } => "flow_approval_granted",
+        TransitionKind::ApprovalDenied { .. } => "flow_approval_denied",
+        TransitionKind::EffectEvaluationRequired { .. } => "flow_effect_evaluation_required",
+        TransitionKind::EffectStarted { .. } => "flow_effect_started",
+        TransitionKind::EffectAuthorizationDenied { .. } => "flow_effect_authorization_denied",
+        TransitionKind::EffectSucceeded { .. } => "flow_effect_succeeded",
+        TransitionKind::RetryScheduled { .. } => "flow_retry_scheduled",
+        TransitionKind::RetryExhausted { .. } => "flow_retry_exhausted",
+        TransitionKind::EffectFailed { .. } => "flow_effect_failed",
+        TransitionKind::ReconciledNotApplied { .. } => "flow_reconciled_not_applied",
+        TransitionKind::ReconciliationUnknown { .. } => "flow_reconciliation_unknown",
+        TransitionKind::CancellationRequested => "flow_cancellation_requested",
+        TransitionKind::RunCompleted { .. } => "flow_completed",
+    }
+}
+
 fn finish(
     connection: &mut Connection,
     lease: &Lease,
@@ -2925,6 +4870,12 @@ fn finish(
         .ok_or_else(|| StoreError::StaleLease(lease.request_id.clone()))?;
     let active_state = parse_state(&live.0)?;
     let (state, payload, event_kind, changed) = match (active_state, live.1) {
+        (RequestState::Leased, None) if terminal_state == TerminalState::Cancelled => {
+            return Err(StoreError::InvalidState(
+                "a leased request cannot finish cancelled without a durable cancellation request"
+                    .to_owned(),
+            ));
+        }
         (RequestState::Leased, None) => {
             let state = terminal_state.request_state();
             let changed = transaction.execute(
@@ -2982,23 +4933,214 @@ fn finish(
     })
 }
 
+fn fail_corrupt_flow_authorization(
+    connection: &mut Connection,
+    request_id: &RequestId,
+    now_ms: u64,
+    result: &[u8],
+) -> Result<FlowAuthorizationRecoveryOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored = transaction
+        .query_row(
+            "SELECT state, operation_kind, result, completed_at_ms
+             FROM requests WHERE request_id = ?1",
+            [request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::RequestNotFound(request_id.clone()))?;
+    if stored.1 != FLOW_OPERATION_KIND {
+        return Err(StoreError::InvalidState(
+            "corrupt flow authorization recovery requires a flow request".to_owned(),
+        ));
+    }
+    let state = parse_state(&stored.0)?;
+    if matches!(
+        state,
+        RequestState::Succeeded | RequestState::Failed | RequestState::Cancelled
+    ) {
+        let (Some(payload), Some(completed_at)) = (stored.2, stored.3) else {
+            return Err(StoreError::InvalidState(
+                "terminal corrupt flow recovery omitted its result".to_owned(),
+            ));
+        };
+        transaction.commit()?;
+        return Ok(FlowAuthorizationRecoveryOutcome::AlreadyTerminal(
+            StoredResult {
+                state,
+                payload,
+                completed_at_ms: unsigned_integer(completed_at)?,
+            },
+        ));
+    }
+    if state != RequestState::Queued {
+        transaction.commit()?;
+        return Ok(FlowAuthorizationRecoveryOutcome::NoLongerEligible);
+    }
+    match validate_flow_authorization_integrity(&transaction, request_id) {
+        Err(StoreError::CorruptFlowAuthorization(corrupt)) if corrupt == *request_id => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            transaction.commit()?;
+            return Ok(FlowAuthorizationRecoveryOutcome::NoLongerEligible);
+        }
+    }
+    let changed = transaction.execute(
+        "UPDATE requests
+         SET state = 'failed', completed_at_ms = ?2, result = ?3,
+             lease_owner = NULL, lease_token = NULL, lease_expires_at_ms = NULL
+         WHERE request_id = ?1 AND state = 'queued' AND operation_kind = 'flow_run'",
+        params![request_id.as_str(), now, result],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(
+            "corrupt flow authorization recovery lost its queued state".to_owned(),
+        ));
+    }
+    append_event_tx(&transaction, request_id, now, "failed", &[])?;
+    transaction.commit()?;
+    Ok(FlowAuthorizationRecoveryOutcome::Failed(StoredResult {
+        state: RequestState::Failed,
+        payload: result.to_vec(),
+        completed_at_ms: now_ms,
+    }))
+}
+
+fn finish_terminal_flow(
+    connection: &mut Connection,
+    lease: &Lease,
+    now_ms: u64,
+    terminal_result: &[u8],
+) -> Result<StoredResult, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let live = transaction
+        .query_row(
+            "SELECT state, result, operation_kind
+             FROM requests
+             WHERE request_id = ?1
+               AND state IN ('leased', 'cancellation_requested')
+               AND lease_owner = ?2 AND lease_token = ?3
+               AND lease_expires_at_ms > ?4",
+            params![lease.request_id.as_str(), lease.owner, lease.token, now],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::StaleLease(lease.request_id.clone()))?;
+    let request_state = parse_state(&live.0)?;
+    if live.2 != FLOW_OPERATION_KIND {
+        return Err(StoreError::InvalidState(
+            "terminal flow completion requires a flow request".to_owned(),
+        ));
+    }
+    let cached = validated_terminal_flow_result(&transaction, &lease.request_id, &live.2)?
+        .ok_or_else(|| StoreError::InvalidState("flow has no terminal checkpoint".to_owned()))?;
+    let state_allows_outcome = request_state == RequestState::Leased
+        || (request_state == RequestState::CancellationRequested
+            && terminal_may_override_cancellation(&cached));
+    if !state_allows_outcome
+        || (request_state == RequestState::CancellationRequested && live.1.is_none())
+        || cached.terminal.encoded_result.as_slice() != terminal_result
+    {
+        return Err(StoreError::InvalidState(
+            "flow completion does not match its terminal checkpoint or request state".to_owned(),
+        ));
+    }
+    let (state, event_kind, _) = terminal_request_resolution(cached.terminal.outcome);
+
+    let changed = transaction.execute(
+        "UPDATE requests
+         SET state = ?5, lease_owner = NULL, lease_token = NULL,
+             lease_expires_at_ms = NULL, completed_at_ms = ?4, result = ?7
+         WHERE request_id = ?1 AND state = ?6
+           AND lease_owner = ?2 AND lease_token = ?3
+           AND lease_expires_at_ms > ?4",
+        params![
+            lease.request_id.as_str(),
+            lease.owner,
+            lease.token,
+            now,
+            state.as_str(),
+            request_state.as_str(),
+            terminal_result,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleLease(lease.request_id.clone()));
+    }
+    append_event_tx(&transaction, &lease.request_id, now, event_kind, &[])?;
+    transaction.commit()?;
+
+    Ok(StoredResult {
+        state,
+        payload: terminal_result.to_vec(),
+        completed_at_ms: now_ms,
+    })
+}
+
 fn cancel(
     connection: &mut Connection,
     request_id: &RequestId,
     now_ms: u64,
     result: &[u8],
+    expected_target_kind: Option<ExpectedOperationKind>,
 ) -> Result<CancelOutcome, StoreError> {
     let now = sql_integer(now_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let stored_state = transaction
+    let stored = transaction
         .query_row(
-            "SELECT state FROM requests WHERE request_id = ?1",
+            "SELECT state, operation_kind FROM requests WHERE request_id = ?1",
             [request_id.as_str()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
         .ok_or_else(|| StoreError::RequestNotFound(request_id.clone()))?;
-    let state = parse_state(&stored_state)?;
+    ensure_expected_target_kind(request_id, &stored.1, expected_target_kind)?;
+    let state = parse_state(&stored.0)?;
+    if matches!(
+        state,
+        RequestState::Leased | RequestState::CancellationRequested
+    ) && let Some(terminal) =
+        validated_terminal_flow_result(&transaction, request_id, &stored.1)?
+        && (state == RequestState::Leased || terminal_may_override_cancellation(&terminal))
+    {
+        let (terminal_state, event_kind, outcome) =
+            terminal_request_resolution(terminal.terminal.outcome);
+        let changed = transaction.execute(
+            "UPDATE requests
+             SET state = ?2, lease_owner = NULL, lease_token = NULL,
+                 lease_expires_at_ms = NULL, completed_at_ms = ?3, result = ?4
+             WHERE request_id = ?1 AND state IN ('leased', 'cancellation_requested')",
+            params![
+                request_id.as_str(),
+                terminal_state.as_str(),
+                now,
+                terminal.terminal.encoded_result
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "terminal flow cancellation race changed no request".to_owned(),
+            ));
+        }
+        append_event_tx(&transaction, request_id, now, event_kind, &[])?;
+        transaction.commit()?;
+        return Ok(outcome);
+    }
     let (changed, event_kind, outcome) = match state {
         RequestState::Queued => (
             transaction.execute(
@@ -3021,7 +5163,7 @@ fn cancel(
             CancelOutcome::CancellationRequested,
         ),
         RequestState::CancellationRequested => {
-            return Ok(CancelOutcome::CancellationRequested);
+            return Ok(CancelOutcome::AlreadyRequested);
         }
         RequestState::Succeeded | RequestState::Failed | RequestState::Cancelled => {
             return Ok(CancelOutcome::AlreadyTerminal(state));
@@ -3037,14 +5179,37 @@ fn cancel(
     Ok(outcome)
 }
 
+const fn terminal_request_resolution(
+    outcome: RunOutcome,
+) -> (RequestState, &'static str, CancelOutcome) {
+    match outcome {
+        RunOutcome::Solved => (
+            RequestState::Succeeded,
+            "completed",
+            CancelOutcome::AlreadyTerminal(RequestState::Succeeded),
+        ),
+        RunOutcome::Unresolved | RunOutcome::Blocked => (
+            RequestState::Failed,
+            "failed",
+            CancelOutcome::AlreadyTerminal(RequestState::Failed),
+        ),
+        RunOutcome::Cancelled => (
+            RequestState::Cancelled,
+            "cancelled",
+            CancelOutcome::Cancelled,
+        ),
+    }
+}
+
 fn replay(
     connection: &Connection,
     request_id: &RequestId,
     after_sequence: u64,
+    expected_target_kind: Option<ExpectedOperationKind>,
 ) -> Result<Replay, StoreError> {
     let stored = connection
         .query_row(
-            "SELECT state, result, completed_at_ms
+            "SELECT state, result, completed_at_ms, operation_kind
              FROM requests WHERE request_id = ?1",
             [request_id.as_str()],
             |row| {
@@ -3052,11 +5217,13 @@ fn replay(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<Vec<u8>>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?
         .ok_or_else(|| StoreError::RequestNotFound(request_id.clone()))?;
+    ensure_expected_target_kind(request_id, &stored.3, expected_target_kind)?;
     let state = parse_state(&stored.0)?;
     let result = match (state, stored.1, stored.2) {
         (
@@ -3110,10 +5277,12 @@ fn replay(
 fn snapshot(
     connection: &Connection,
     request_id: &RequestId,
+    expected_target_kind: Option<ExpectedOperationKind>,
 ) -> Result<RequestSnapshot, StoreError> {
     let stored = connection
         .query_row(
-            "SELECT project_id, queue_sequence, state, attempt, lease_expires_at_ms
+            "SELECT project_id, queue_sequence, state, attempt, lease_expires_at_ms,
+                    operation_kind
              FROM requests WHERE request_id = ?1",
             [request_id.as_str()],
             |row| {
@@ -3123,11 +5292,13 @@ fn snapshot(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?
         .ok_or_else(|| StoreError::RequestNotFound(request_id.clone()))?;
+    ensure_expected_target_kind(request_id, &stored.5, expected_target_kind)?;
 
     Ok(RequestSnapshot {
         request_id: request_id.clone(),
@@ -3137,6 +5308,22 @@ fn snapshot(
         attempt: unsigned_integer(stored.3)?,
         lease_expires_at_ms: stored.4.map(unsigned_integer).transpose()?,
     })
+}
+
+fn ensure_expected_target_kind(
+    request_id: &RequestId,
+    operation_kind: &str,
+    expected_target_kind: Option<ExpectedOperationKind>,
+) -> Result<(), StoreError> {
+    let matches = match expected_target_kind {
+        None => true,
+        Some(ExpectedOperationKind::FlowRun) => operation_kind == FLOW_OPERATION_KIND,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::RequestNotFound(request_id.clone()))
+    }
 }
 
 fn queued_behind(connection: &mut Connection, request_id: &RequestId) -> Result<u64, StoreError> {
@@ -3181,6 +5368,31 @@ fn ensure_live_lease(
     } else {
         Err(StoreError::StaleLease(lease.request_id.clone()))
     }
+}
+
+fn ensure_live_flow_lease(
+    transaction: &Transaction<'_>,
+    lease: &Lease,
+    now: i64,
+) -> Result<RequestState, StoreError> {
+    let live = transaction
+        .query_row(
+            "SELECT state, operation_kind
+             FROM requests
+             WHERE request_id = ?1 AND state IN ('leased', 'cancellation_requested')
+               AND lease_owner = ?2 AND lease_token = ?3
+               AND lease_expires_at_ms > ?4",
+            params![lease.request_id.as_str(), lease.owner, lease.token, now],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::StaleLease(lease.request_id.clone()))?;
+    if live.1 != FLOW_OPERATION_KIND {
+        return Err(StoreError::InvalidState(
+            "flow checkpoint requires a flow request".to_owned(),
+        ));
+    }
+    parse_state(&live.0)
 }
 
 fn append_event_tx(

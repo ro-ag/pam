@@ -1731,9 +1731,12 @@ dependencies = [
 name = "pam_cli"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "clap",
  "pam_core",
  "pam_daemon",
+ "pam_flow",
  "pam_gui",
  "pam_model",
  "pam_platform",
@@ -1767,12 +1770,18 @@ dependencies = [
 name = "pam_daemon"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "nix",
  "pam_core",
+ "pam_flow",
  "pam_model",
  "pam_platform",
  "pam_policy",
  "pam_protocol",
  "pam_store",
+ "rmp-serde",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -1781,9 +1790,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_flow"
+version = "0.1.0"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "pam_gui"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "pam_flow",
  "pam_platform",
  "pam_protocol",
 ]
@@ -1841,6 +1863,7 @@ name = "pam_protocol"
 version = "0.1.0"
 dependencies = [
  "pam_core",
+ "pam_flow",
  "rmp-serde",
  "serde",
 ]
@@ -1853,9 +1876,12 @@ dependencies = [
  "cap-std",
  "nix",
  "pam_core",
+ "pam_flow",
  "pam_model",
  "pam_policy",
+ "rmp-serde",
  "rusqlite",
+ "serde",
  "sha2",
  "tokio",
  "uuid",

@@ -5,14 +5,16 @@ use std::{
 };
 
 use pam_core::{
-    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, ProjectId, RequestId,
+    ApprovalId, CallerCredential, CallerId, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
+    RequestId,
 };
 use pam_daemon::{ClientExchange, StatusError};
 use pam_model::{
     ImportRequest, LicenseConsent, LicenseSnapshot, ModelDescriptor, ModelKey, import_existing,
 };
 use pam_platform::{
-    CallerKind, IdentityError, LocalEndpoint, caller_id, discover_project_id, user_data_dir,
+    CallerKind, IdentityError, LocalEndpoint, ProjectIdentity, caller_id, discover_project,
+    discover_project_id, user_data_dir,
 };
 use pam_policy::{
     ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope,
@@ -31,7 +33,11 @@ use crate::{
     audit::encode_audit_export,
     command::{CallerKindArg, RetentionScopeArg},
     evidence::{EvidenceError, download_evidence, write_new_output},
-    render::{EXIT_OPERATION_FAILED, Presentation, escape_text, present_result, render_events},
+    flow::{FlowCatalog, FlowCatalogError},
+    render::{
+        EXIT_OPERATION_FAILED, EXIT_PENDING, Presentation, escape_text, present_result,
+        render_events,
+    },
     request::{
         NativeCredentialError, RequestContext, RequestContextError, delete_native_credential,
         load_native_credential, store_native_credential,
@@ -982,6 +988,389 @@ pub(crate) async fn result(request_id: RequestId, approval_id: Option<ApprovalId
     }
 }
 
+pub(crate) async fn flow_run(
+    selector: &str,
+    run_id: Option<RequestId>,
+    idempotency_key: Option<IdempotencyKey>,
+    timeout: Duration,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let Some((project, catalog)) = discover_flow_catalog(Path::new(".")) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let Some(entry) = select_flow(&catalog, selector) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let Some(context) = discover_context_for_project(&project, approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let request = match context.flow_run(entry.source, run_id, idempotency_key, project.root()) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("PAM could not construct the bounded flow request.");
+            eprintln!("Details: {}", escape_text(&error.to_string()));
+            return EXIT_OPERATION_FAILED;
+        }
+    };
+    let durable_run_id = request.request_id.clone();
+    let retry = flow_run_retry(
+        entry.definition.id(),
+        &durable_run_id,
+        &request.idempotency_key,
+    );
+    println!("run_id={durable_run_id}");
+    let _ = io::stdout().flush();
+    stream_flow_exchange(
+        &request,
+        timeout,
+        &durable_run_id,
+        FlowResponseKind::Run,
+        Some(&retry),
+        Some(&retry),
+    )
+    .await
+}
+
+pub(crate) fn flow_run_retry(
+    definition_id: &str,
+    run_id: &RequestId,
+    idempotency_key: &IdempotencyKey,
+) -> String {
+    format!("pam flow run {definition_id} --run-id {run_id} --idempotency-key {idempotency_key}")
+}
+
+pub(crate) fn flow_list() -> i32 {
+    let Some((_, catalog)) = discover_flow_catalog(Path::new(".")) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    for entry in catalog.entries() {
+        println!(
+            "id={} revision={} name={} file={}",
+            escape_text(entry.definition.id()),
+            entry.definition.revision(),
+            escape_text(entry.definition.name()),
+            escape_text(&entry.file_name)
+        );
+    }
+    0
+}
+
+pub(crate) fn flow_show(selector: &str) -> i32 {
+    let Some((_, catalog)) = discover_flow_catalog(Path::new(".")) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let Some(entry) = select_flow(&catalog, selector) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    print!("{}", entry.normalized);
+    0
+}
+
+pub(crate) fn flow_validate(selector: Option<&str>) -> i32 {
+    let Some((_, catalog)) = discover_flow_catalog(Path::new(".")) else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let entries = if let Some(selector) = selector {
+        match catalog.select(selector) {
+            Ok(entry) => std::slice::from_ref(entry),
+            Err(error) => return report_flow_catalog_error(&error),
+        }
+    } else {
+        catalog.entries()
+    };
+    for entry in entries {
+        println!(
+            "Validated {} (id={}, revision={}).",
+            escape_text(&entry.file_name),
+            escape_text(entry.definition.id()),
+            entry.definition.revision()
+        );
+    }
+    0
+}
+
+pub(crate) async fn flow_cancel(run_id: RequestId, approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let request = context.flow_cancel(run_id.clone());
+    let retry = format!("pam flow cancel {run_id}");
+    stream_flow_exchange(
+        &request,
+        READ_TIMEOUT,
+        &run_id,
+        FlowResponseKind::Cancellation,
+        Some(&retry),
+        Some(&retry),
+    )
+    .await
+}
+
+pub(crate) async fn flow_logs(
+    run_id: RequestId,
+    after: u64,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let request = context.flow_logs(run_id.clone(), after);
+    let retry = format!("pam flow logs {run_id} --after {after}");
+    stream_flow_exchange(
+        &request,
+        READ_TIMEOUT,
+        &run_id,
+        FlowResponseKind::Replay,
+        Some(&retry),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn flow_wait(
+    run_id: RequestId,
+    after: u64,
+    timeout: Duration,
+    approval_id: Option<ApprovalId>,
+) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let request = context.flow_wait(run_id.clone(), after);
+    let retry = format!("pam flow wait {run_id} --after {after}");
+    stream_flow_exchange(
+        &request,
+        timeout,
+        &run_id,
+        FlowResponseKind::Wait,
+        Some(&retry),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn flow_result(run_id: RequestId, approval_id: Option<ApprovalId>) -> i32 {
+    let Some(context) = discover_context(approval_id).await else {
+        return EXIT_OPERATION_FAILED;
+    };
+    let request = context.flow_result(run_id.clone());
+    let retry = format!("pam flow result {run_id}");
+    stream_flow_exchange(
+        &request,
+        READ_TIMEOUT,
+        &run_id,
+        FlowResponseKind::Result,
+        Some(&retry),
+        None,
+    )
+    .await
+}
+
+pub(crate) fn discover_flow_catalog(start: &Path) -> Option<(ProjectIdentity, FlowCatalog)> {
+    let project = match discover_project(start) {
+        Ok(project) => project,
+        Err(error) => {
+            report_identity_error(&error);
+            return None;
+        }
+    };
+    let catalog = match FlowCatalog::load(project.root()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            report_flow_catalog_error(&error);
+            return None;
+        }
+    };
+    Some((project, catalog))
+}
+
+pub(crate) fn select_flow(
+    catalog: &FlowCatalog,
+    selector: &str,
+) -> Option<crate::flow::CatalogFlow> {
+    match catalog.select(selector) {
+        Ok(entry) => Some(entry.clone()),
+        Err(error) => {
+            report_flow_catalog_error(&error);
+            None
+        }
+    }
+}
+
+async fn stream_flow_exchange(
+    request: &pam_protocol::RequestEnvelope,
+    timeout: Duration,
+    run_id: &RequestId,
+    response_kind: FlowResponseKind,
+    approval_retry: Option<&str>,
+    ambiguous_retry: Option<&str>,
+) -> i32 {
+    let mut unexpected_event = false;
+    let result = pam_daemon::request_exchange_streaming(
+        &LocalEndpoint::default_for_user(),
+        request,
+        timeout,
+        |event| {
+            if response_kind.allows_events() {
+                print!("{}", render_events(std::slice::from_ref(event)));
+                let _ = io::stdout().flush();
+            } else {
+                unexpected_event = true;
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(exchange) if unexpected_event => report_flow_observation_unknown(
+            run_id,
+            exchange.last_sequence,
+            "daemon returned unexpected events for this flow command",
+            response_kind,
+            ambiguous_retry,
+        ),
+        Ok(exchange) if !flow_response_matches(&exchange.result.body, response_kind) => {
+            report_flow_observation_unknown(
+                run_id,
+                exchange.last_sequence,
+                "daemon returned a correlated but unexpected result payload",
+                response_kind,
+                ambiguous_retry,
+            )
+        }
+        Ok(exchange) => present_expected_flow_result(
+            &exchange.result.body,
+            response_kind,
+            response_kind.operation_name(),
+            approval_retry,
+        ),
+        Err(error) if error.request_may_have_been_sent() => report_flow_observation_unknown(
+            run_id,
+            error.last_sequence(),
+            &error.error().to_string(),
+            response_kind,
+            ambiguous_retry,
+        ),
+        Err(error) => report_exchange_error(error.error()),
+    }
+}
+
+fn report_flow_observation_unknown(
+    run_id: &RequestId,
+    last_sequence: u64,
+    detail: &str,
+    response_kind: FlowResponseKind,
+    ambiguous_retry: Option<&str>,
+) -> i32 {
+    let last_sequence = flow_recovery_cursor(response_kind, last_sequence);
+    let run_id = escape_text(run_id.as_str());
+    eprintln!(
+        "Flow observation is pending or unknown after local submission; run_id={run_id}; last_sequence={last_sequence}."
+    );
+    eprintln!("Details: {}", escape_text(detail));
+    if let Some(retry) = ambiguous_retry {
+        let label = if matches!(response_kind, FlowResponseKind::Cancellation) {
+            "Idempotent cancel retry"
+        } else {
+            "Exact submission retry"
+        };
+        eprintln!("{label}: {retry}");
+    }
+    eprintln!("Result: pam flow result {run_id}");
+    eprintln!("Recovery: pam flow wait {run_id} --after {last_sequence}");
+    eprintln!("Logs: pam flow logs {run_id} --after {last_sequence}");
+    EXIT_PENDING
+}
+
+pub(crate) const fn flow_recovery_cursor(
+    response_kind: FlowResponseKind,
+    received_sequence: u64,
+) -> u64 {
+    if response_kind.allows_events() {
+        received_sequence
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FlowResponseKind {
+    Run,
+    Wait,
+    Result,
+    Replay,
+    Cancellation,
+}
+
+impl FlowResponseKind {
+    const fn allows_events(self) -> bool {
+        matches!(self, Self::Run | Self::Wait | Self::Replay)
+    }
+
+    const fn operation_name(self) -> &'static str {
+        match self {
+            Self::Run => "flow run",
+            Self::Wait => "flow wait",
+            Self::Result => "flow result",
+            Self::Replay => "flow logs",
+            Self::Cancellation => "flow cancel",
+        }
+    }
+}
+
+fn present_expected_flow_result(
+    body: &ResultBody,
+    expected: FlowResponseKind,
+    operation: &str,
+    approval_retry: Option<&str>,
+) -> i32 {
+    if !flow_response_matches(body, expected) {
+        return unexpected_result(operation);
+    }
+    let retry_approval = match body {
+        ResultBody::Failure(failure) => failure.approval.as_ref(),
+        ResultBody::Success { .. } => None,
+    };
+    let exit_code = emit(present_result(body));
+    if let (Some(retry), Some(approval)) = (approval_retry, retry_approval) {
+        eprintln!(
+            "Flow retry: {retry} --approval-id {}",
+            escape_text(approval.approval_id.as_str())
+        );
+    }
+    exit_code
+}
+
+pub(crate) fn flow_response_matches(body: &ResultBody, expected: FlowResponseKind) -> bool {
+    matches!(body, ResultBody::Failure(_))
+        || matches!(
+            (expected, body),
+            (
+                FlowResponseKind::Run | FlowResponseKind::Wait | FlowResponseKind::Result,
+                ResultBody::Success {
+                    payload: ResultPayload::FlowRun(_),
+                    ..
+                }
+            ) | (
+                FlowResponseKind::Replay,
+                ResultBody::Success {
+                    payload: ResultPayload::Replay(_),
+                    ..
+                }
+            ) | (
+                FlowResponseKind::Cancellation,
+                ResultBody::Success {
+                    payload: ResultPayload::Cancellation(_),
+                    ..
+                }
+            )
+        )
+}
+
+fn report_flow_catalog_error(error: &FlowCatalogError) -> i32 {
+    eprintln!("{}", escape_text(&error.to_string()));
+    EXIT_OPERATION_FAILED
+}
+
 pub(crate) async fn evidence_show(handle: EvidenceHandle, raw: bool, output: Option<&Path>) -> i32 {
     let Some(context) = discover_context(None).await else {
         return EXIT_OPERATION_FAILED;
@@ -1048,6 +1437,23 @@ async fn exchange(
 
 async fn discover_context(approval_id: Option<ApprovalId>) -> Option<RequestContext> {
     match RequestContext::discover(approval_id).await {
+        Ok(context) => Some(context),
+        Err(RequestContextError::Identity(error)) => {
+            report_identity_error(&error);
+            None
+        }
+        Err(RequestContextError::Credential(error)) => {
+            report_native_credential_error(&error);
+            None
+        }
+    }
+}
+
+async fn discover_context_for_project(
+    project: &ProjectIdentity,
+    approval_id: Option<ApprovalId>,
+) -> Option<RequestContext> {
+    match RequestContext::discover_for_project(project, approval_id).await {
         Ok(context) => Some(context),
         Err(RequestContextError::Identity(error)) => {
             report_identity_error(&error);

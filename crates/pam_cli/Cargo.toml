@@ -10,9 +10,12 @@ name = "pam"
 path = "src/main.rs"
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 pam_core.workspace = true
 pam_daemon.workspace = true
+pam_flow.workspace = true
 pam_gui.workspace = true
 pam_model.workspace = true
 pam_platform.workspace = true

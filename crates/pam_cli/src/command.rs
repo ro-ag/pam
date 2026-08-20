@@ -1,7 +1,7 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, GrantId, RequestId};
+use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, RequestId};
 use pam_model::ModelKey;
 use pam_policy::{CapabilityName, ResourceName};
 
@@ -55,6 +55,11 @@ enum Command {
         /// One-time exact-effect approval receipt, when policy requires it.
         #[arg(long, value_parser = parse_approval_id)]
         approval_id: Option<ApprovalId>,
+    },
+    /// Validate, run, and observe durable project flows.
+    Flow {
+        #[command(subcommand)]
+        command: FlowCommand,
     },
     /// Inspect retained project evidence.
     Evidence {
@@ -126,6 +131,67 @@ enum EvidenceCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum FlowCommand {
+    /// Validate and submit a project-local flow definition.
+    Run {
+        /// Exact flow ID or `<id>.toml` file name from `.pam/flows`.
+        selector: String,
+        /// Durable run ID; generated when omitted.
+        #[arg(long, value_parser = parse_flow_run_id)]
+        run_id: Option<RequestId>,
+        /// Idempotency key; generated when omitted.
+        #[arg(long, value_parser = parse_idempotency_key)]
+        idempotency_key: Option<IdempotencyKey>,
+        /// Stop observing after this bounded duration.
+        #[arg(long, default_value = DEFAULT_WAIT_TIMEOUT, value_parser = parse_wait_timeout)]
+        timeout: Duration,
+        /// One-time exact-effect approval receipt, when policy requires it.
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+    /// List validated project-local flow definitions.
+    List,
+    /// Show one normalized project-local flow definition.
+    Show { selector: String },
+    /// Validate one flow, or every flow when no selector is supplied.
+    Validate { selector: Option<String> },
+    /// Cancel one durable flow run.
+    Cancel {
+        #[arg(value_parser = parse_flow_run_id)]
+        run_id: RequestId,
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+    /// Replay durable flow events without waiting.
+    Logs {
+        #[arg(value_parser = parse_flow_run_id)]
+        run_id: RequestId,
+        #[arg(long, default_value_t = 0, value_parser = parse_flow_after)]
+        after: u64,
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+    /// Replay and wait for a durable flow result.
+    Wait {
+        #[arg(value_parser = parse_flow_run_id)]
+        run_id: RequestId,
+        #[arg(long, default_value_t = 0, value_parser = parse_flow_after)]
+        after: u64,
+        #[arg(long, default_value = DEFAULT_WAIT_TIMEOUT, value_parser = parse_wait_timeout)]
+        timeout: Duration,
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+    /// Read one durable flow result without waiting.
+    Result {
+        #[arg(value_parser = parse_flow_run_id)]
+        run_id: RequestId,
+        #[arg(long, value_parser = parse_approval_id)]
+        approval_id: Option<ApprovalId>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CallerCommand {
     /// Register a caller and save its credential in the native secure store.
     Register {
@@ -151,7 +217,7 @@ enum ModelCommand {
         /// Absolute path to the existing GGUF.
         #[arg(long, value_name = "PATH")]
         path: PathBuf,
-        /// Expected model digest in canonical sha256:<lowercase-hex> form.
+        /// Expected model digest in canonical `sha256:<lowercase-hex>` form.
         #[arg(long, value_parser = parse_content_digest)]
         digest: ContentDigest,
         /// Expected model file size in bytes.
@@ -324,6 +390,39 @@ pub(crate) enum Mode {
         request_id: RequestId,
         approval_id: Option<ApprovalId>,
     },
+    FlowRun {
+        selector: String,
+        run_id: Option<RequestId>,
+        idempotency_key: Option<IdempotencyKey>,
+        timeout: Duration,
+        approval_id: Option<ApprovalId>,
+    },
+    FlowList,
+    FlowShow {
+        selector: String,
+    },
+    FlowValidate {
+        selector: Option<String>,
+    },
+    FlowCancel {
+        run_id: RequestId,
+        approval_id: Option<ApprovalId>,
+    },
+    FlowLogs {
+        run_id: RequestId,
+        after: u64,
+        approval_id: Option<ApprovalId>,
+    },
+    FlowWait {
+        run_id: RequestId,
+        after: u64,
+        timeout: Duration,
+        approval_id: Option<ApprovalId>,
+    },
+    FlowResult {
+        run_id: RequestId,
+        approval_id: Option<ApprovalId>,
+    },
     EvidenceShow {
         handle: EvidenceHandle,
         raw: bool,
@@ -411,6 +510,7 @@ impl fmt::Debug for Command {
             Self::Brief { .. } => formatter.write_str("Brief"),
             Self::Wait { .. } => formatter.write_str("Wait"),
             Self::Result { .. } => formatter.write_str("Result"),
+            Self::Flow { .. } => formatter.write_str("Flow"),
             Self::Evidence { .. } => formatter.write_str("Evidence"),
             Self::Caller { .. } => formatter.write_str("Caller"),
             Self::Access { .. } => formatter.write_str("Access"),
@@ -472,6 +572,14 @@ impl fmt::Debug for Mode {
             Self::Brief { .. } => formatter.write_str("Brief"),
             Self::Wait { .. } => formatter.write_str("Wait"),
             Self::Result { .. } => formatter.write_str("Result"),
+            Self::FlowRun { .. } => formatter.write_str("FlowRun"),
+            Self::FlowList => formatter.write_str("FlowList"),
+            Self::FlowShow { .. } => formatter.write_str("FlowShow"),
+            Self::FlowValidate { .. } => formatter.write_str("FlowValidate"),
+            Self::FlowCancel { .. } => formatter.write_str("FlowCancel"),
+            Self::FlowLogs { .. } => formatter.write_str("FlowLogs"),
+            Self::FlowWait { .. } => formatter.write_str("FlowWait"),
+            Self::FlowResult { .. } => formatter.write_str("FlowResult"),
             Self::EvidenceShow { .. } => formatter.write_str("EvidenceShow"),
             Self::CallerRegister { .. } => formatter.write_str("CallerRegister"),
             Self::CallerRevoke { .. } => formatter.write_str("CallerRevoke"),
@@ -514,6 +622,7 @@ impl Cli {
                 request_id,
                 approval_id,
             },
+            Some(Command::Flow { command }) => flow_mode(command),
             Some(Command::Evidence { command }) => evidence_mode(command),
             Some(Command::Caller {
                 command: CallerCommand::Register { kind },
@@ -643,6 +752,61 @@ fn evidence_mode(command: EvidenceCommand) -> Mode {
     }
 }
 
+fn flow_mode(command: FlowCommand) -> Mode {
+    match command {
+        FlowCommand::Run {
+            selector,
+            run_id,
+            idempotency_key,
+            timeout,
+            approval_id,
+        } => Mode::FlowRun {
+            selector,
+            run_id,
+            idempotency_key,
+            timeout,
+            approval_id,
+        },
+        FlowCommand::List => Mode::FlowList,
+        FlowCommand::Show { selector } => Mode::FlowShow { selector },
+        FlowCommand::Validate { selector } => Mode::FlowValidate { selector },
+        FlowCommand::Cancel {
+            run_id,
+            approval_id,
+        } => Mode::FlowCancel {
+            run_id,
+            approval_id,
+        },
+        FlowCommand::Logs {
+            run_id,
+            after,
+            approval_id,
+        } => Mode::FlowLogs {
+            run_id,
+            after,
+            approval_id,
+        },
+        FlowCommand::Wait {
+            run_id,
+            after,
+            timeout,
+            approval_id,
+        } => Mode::FlowWait {
+            run_id,
+            after,
+            timeout,
+            approval_id,
+        },
+        FlowCommand::Result {
+            run_id,
+            approval_id,
+        } => Mode::FlowResult {
+            run_id,
+            approval_id,
+        },
+    }
+}
+
 fn parse_request_id(value: &str) -> Result<RequestId, String> {
     if value.is_empty()
         || value
@@ -654,6 +818,38 @@ fn parse_request_id(value: &str) -> Result<RequestId, String> {
         );
     }
     Ok(RequestId::from(value.to_owned()))
+}
+
+fn parse_idempotency_key(value: &str) -> Result<IdempotencyKey, String> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(
+            "idempotency key must contain 1 to 256 shell-safe ASCII bytes and not start with '-'"
+                .to_owned(),
+        );
+    }
+    Ok(IdempotencyKey::from(value.to_owned()))
+}
+
+fn parse_flow_run_id(value: &str) -> Result<RequestId, String> {
+    pam_flow::RunId::parse(value)
+        .map(|run_id| RequestId::from(run_id.as_str().to_owned()))
+        .map_err(|error| error.to_string())
+}
+
+fn parse_flow_after(value: &str) -> Result<u64, String> {
+    let sequence = value
+        .parse::<u64>()
+        .map_err(|_| "flow sequence must be an unsigned integer".to_owned())?;
+    if sequence > i64::MAX as u64 {
+        return Err("flow sequence exceeds the supported range".to_owned());
+    }
+    Ok(sequence)
 }
 
 fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {

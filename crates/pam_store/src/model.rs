@@ -2,6 +2,7 @@ use pam_core::{
     ApprovalId, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
     RequestId,
 };
+use pam_flow::{FlowSnapshot, RunOutcome, RunTransition};
 use pam_policy::{CapabilityName, Grant, ResourceName};
 
 pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -17,6 +18,9 @@ pub const MAX_AUDIT_DETAIL_BYTES: usize = 16 * 1024;
 pub const MAX_AUDIT_EVENT_ID_BYTES: usize = 256;
 pub const MAX_AUDIT_OUTCOME_BYTES: usize = 64;
 pub const MAX_AUDIT_PROJECT_ID_BYTES: usize = 256;
+pub const MAX_FLOW_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_FLOW_TRANSITION_BYTES: usize = 64 * 1024;
+pub const MAX_FLOW_TERMINAL_RESULT_BYTES: usize = 1024 * 1024;
 
 /// One audit event to append to the durable ledger.
 ///
@@ -125,6 +129,46 @@ pub enum AuthorizationOutcome {
     },
     ApprovalDenied,
     ApprovalExpired,
+}
+
+/// One exact flow authorization request coupled to its durable acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizeFlowRun {
+    pub accept: AcceptRequest,
+    pub resource: ResourceName,
+    pub approval_id: Option<ApprovalId>,
+    pub audit: AuthorizationAudit,
+    /// True when the flow schema contains a stateful step that mandates human approval.
+    pub schema_approval_required: bool,
+}
+
+/// Result of atomically authorizing and, on success, accepting one flow run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowAuthorizationOutcome {
+    Accepted(AcceptOutcome),
+    Denied,
+    ApprovalRequired {
+        approval_id: ApprovalId,
+        expires_at_ms: u64,
+    },
+    ApprovalDenied,
+    ApprovalExpired,
+}
+
+/// Fresh authorization result at one flow effect boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowEffectAuthorization {
+    Allowed,
+    Denied,
+}
+
+/// Outcome of atomically recovering one corrupt queued flow authorization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlowAuthorizationRecoveryOutcome {
+    Failed(StoredResult),
+    AlreadyTerminal(StoredResult),
+    /// Another transaction changed the request or repaired its proof.
+    NoLongerEligible,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,10 +314,20 @@ impl RequestState {
     }
 }
 
+/// Optional immutable operation classification for target-scoped store operations.
+///
+/// This store-owned type keeps durable storage independent of the wire protocol while allowing
+/// callers to request an atomic kind check before observing or mutating a target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedOperationKind {
+    FlowRun,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalState {
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 impl TerminalState {
@@ -281,6 +335,7 @@ impl TerminalState {
         match self {
             Self::Succeeded => RequestState::Succeeded,
             Self::Failed => RequestState::Failed,
+            Self::Cancelled => RequestState::Cancelled,
         }
     }
 
@@ -288,6 +343,7 @@ impl TerminalState {
         match self {
             Self::Succeeded => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -314,6 +370,7 @@ pub struct LeasedRequest {
 pub enum CancelOutcome {
     Cancelled,
     CancellationRequested,
+    AlreadyRequested,
     AlreadyTerminal(RequestState),
 }
 
@@ -323,6 +380,53 @@ pub struct EventRecord {
     pub kind: String,
     pub payload: Vec<u8>,
     pub recorded_at_ms: u64,
+}
+
+/// One durable flow checkpoint owned by a scheduler request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowCheckpoint {
+    pub request_id: RequestId,
+    pub snapshot: FlowSnapshot,
+    pub checkpoint_revision: u64,
+    pub updated_at_ms: u64,
+    /// Exact encoded terminal result, present only when the snapshot is terminal.
+    pub terminal_result: Option<FlowTerminalResult>,
+}
+
+/// Encoded protocol result durably bound to a terminal flow checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowTerminalResult {
+    pub outcome: RunOutcome,
+    pub encoded_result: Vec<u8>,
+}
+
+/// A compare-and-swap checkpoint write performed under a live scheduler lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SaveFlowCheckpoint {
+    pub lease: Lease,
+    /// Zero creates the first checkpoint; otherwise this must match the stored revision.
+    pub expected_revision: u64,
+    pub snapshot: FlowSnapshot,
+    /// The single semantic transition represented by this snapshot update.
+    pub transition: Option<RunTransition>,
+    /// Required for terminal snapshots and forbidden for non-terminal snapshots.
+    pub terminal_result: Option<FlowTerminalResult>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowCheckpointDisposition {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlowCheckpointSaveOutcome {
+    pub checkpoint: FlowCheckpoint,
+    pub disposition: FlowCheckpointDisposition,
+    /// The event appended atomically for a newly persisted transition.
+    pub event: Option<EventRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

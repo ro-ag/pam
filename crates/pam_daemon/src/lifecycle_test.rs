@@ -18,24 +18,44 @@ use pam_policy::{
     ResourceScope,
 };
 use pam_protocol::{
-    BriefProvenance, BriefResult, CancellationDisposition, Capability, Event, EvidenceRedaction,
-    EvidenceRetention, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE, ModelMessage,
-    ModelRole, OperationTruth, RequestEnvelope, RequestPayload, ResultBody, ResultPayload,
-    ServerMessage, SourceAvailability, decode_server_message, encode,
+    BriefProvenance, BriefResult, CancellationDisposition, Event, EvidenceRedaction,
+    EvidenceRetention, ExpectedTargetKind, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FRAME_SIZE,
+    ModelMessage, ModelRole, OperationTruth, RequestEnvelope, RequestPayload, ResultBody,
+    ResultPayload, ServerMessage, SourceAvailability, decode_server_message, encode,
 };
 use pam_store::{
-    AcceptRequest, ApprovalDecision, EvidenceRedaction as StoreEvidenceRedaction,
+    AcceptRequest, ApprovalDecision, CancelOutcome, EvidenceRedaction as StoreEvidenceRedaction,
     EvidenceRetention as StoreEvidenceRetention, PutEvidence, PutGrant, RequestState, Store,
     StoreError,
 };
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
-    BriefProvider, DaemonConfig, Ownership, approval_recovery, grant_recovery,
-    model_runtime_result, policy_resource, prepare_endpoint, request_audit_event_id,
-    request_preflight, serve_until_with_delay,
+    BriefProvider, DaemonConfig, Ownership, approval_recovery, cancellation_presentation,
+    grant_recovery, model_runtime_result, policy_resource, prepare_endpoint,
+    request_audit_event_id, request_preflight, serve_until_with_delay,
 };
-use crate::{DaemonError, request_exchange, request_status};
+use crate::{
+    DaemonError, ExchangeError, request_exchange, request_exchange_streaming, request_status,
+};
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[test]
+fn repeated_running_cancellation_is_observed_not_changed() {
+    assert_eq!(
+        cancellation_presentation(CancelOutcome::CancellationRequested),
+        (CancellationDisposition::Requested, OperationTruth::Changed)
+    );
+    assert_eq!(
+        cancellation_presentation(CancelOutcome::AlreadyRequested),
+        (
+            CancellationDisposition::AlreadyRequested,
+            OperationTruth::Observed,
+        )
+    );
+}
 
 fn test_runtime(name: &str) -> PathBuf {
     let base = if cfg!(unix) {
@@ -305,6 +325,8 @@ fn stale_socket_reports_recovery_command() {
         brief_provider: None,
         bypass_authentication: true,
         bypass_policy: true,
+        flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
+        flow_preflight_delay: Duration::ZERO,
     })
     .unwrap_err();
     assert!(matches!(error, DaemonError::StaleState(_)));
@@ -388,7 +410,8 @@ fn denial_recovery_is_executable_only_for_shell_safe_exact_resources() {
                 RequestId::from("target"),
                 7,
             ),
-            "pam access grant request.replay --resource request:target:after=7".to_owned(),
+            "pam access grant request.replay --resource request:target:after=7"
+                .to_owned(),
         ),
     ];
     for (request, expected) in requests {
@@ -411,34 +434,118 @@ fn denial_recovery_is_executable_only_for_shell_safe_exact_resources() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Covers every public retry surface in one contract table.
 fn approval_recovery_matches_each_capability_retry_surface() {
     let approval_id = ApprovalId::from("approval-1");
+    let caller = CallerId::from("approval-recovery-caller");
+    let project = ProjectId::from("approval-recovery-project");
     let cli_recovery = "pam approval approve approval-1, then retry the original command with --approval-id approval-1";
-    for capability in [
-        Capability::DaemonStatus,
-        Capability::Brief,
-        Capability::NetworkDiagnostics,
-        Capability::WaitForResult,
-        Capability::GetResult,
+    for request in [
+        RequestEnvelope::status(
+            RequestId::from("status"),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::from("status"),
+        ),
+        RequestEnvelope::brief(
+            RequestId::from("brief"),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::from("brief"),
+        ),
+        RequestEnvelope::get_result(
+            RequestId::from("result"),
+            caller.clone(),
+            project.clone(),
+            IdempotencyKey::from("result"),
+            RequestId::from("target"),
+        ),
     ] {
-        assert_eq!(approval_recovery(&capability, &approval_id), cli_recovery);
+        assert_eq!(approval_recovery(&request, &approval_id), cli_recovery);
     }
 
     let evidence_recovery = "pam approval approve approval-1; pam evidence show spans inspection and range reads, so this one-request receipt must be retried by a protocol client against the exact challenged request";
-    for capability in [Capability::InspectEvidence, Capability::ReadEvidence] {
-        assert_eq!(
-            approval_recovery(&capability, &approval_id),
-            evidence_recovery
-        );
-    }
+    let evidence = RequestEnvelope::inspect_evidence(
+        RequestId::from("evidence"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("evidence"),
+        EvidenceHandle::parse("evidence://flow/test").unwrap(),
+    );
+    assert_eq!(
+        approval_recovery(&evidence, &approval_id),
+        evidence_recovery
+    );
 
     let protocol_recovery = "pam approval approve approval-1; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request";
-    for capability in [Capability::CancelRequest, Capability::ReplayEvents] {
-        assert_eq!(
-            approval_recovery(&capability, &approval_id),
-            protocol_recovery
-        );
+    let generic_cancel = RequestEnvelope::cancel(
+        RequestId::from("cancel"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("cancel"),
+        RequestId::from("run-1"),
+    );
+    assert_eq!(
+        approval_recovery(&generic_cancel, &approval_id),
+        protocol_recovery
+    );
+
+    let target = RequestId::from("run-1");
+    let typed = [
+        (
+            RequestEnvelope::cancel_with_expected_target(
+                RequestId::from("typed-cancel"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("typed-cancel"),
+                target.clone(),
+                ExpectedTargetKind::FlowRun,
+            ),
+            "pam approval approve approval-1, then run pam flow cancel run-1 --approval-id approval-1",
+        ),
+        (
+            RequestEnvelope::replay_with_expected_target(
+                RequestId::from("typed-logs"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("typed-logs"),
+                target.clone(),
+                7,
+                ExpectedTargetKind::FlowRun,
+            ),
+            "pam approval approve approval-1, then run pam flow logs run-1 --after 7 --approval-id approval-1",
+        ),
+        (
+            RequestEnvelope::wait_for_result_with_expected_target(
+                RequestId::from("typed-wait"),
+                caller.clone(),
+                project.clone(),
+                IdempotencyKey::from("typed-wait"),
+                target.clone(),
+                8,
+                ExpectedTargetKind::FlowRun,
+            ),
+            "pam approval approve approval-1, then run pam flow wait run-1 --after 8 --approval-id approval-1",
+        ),
+        (
+            RequestEnvelope::get_result_with_expected_target(
+                RequestId::from("typed-result"),
+                caller,
+                project,
+                IdempotencyKey::from("typed-result"),
+                target,
+                ExpectedTargetKind::FlowRun,
+            ),
+            "pam approval approve approval-1, then run pam flow result run-1 --approval-id approval-1",
+        ),
+    ];
+    for (request, expected) in typed {
+        assert_eq!(approval_recovery(&request, &approval_id), expected);
     }
+    assert_eq!(
+        approval_recovery(&generic_cancel, &ApprovalId::from("-unsafe-option")),
+        "approve the exact request using a shell-quoted approval ID, then retry without changing its effect"
+    );
 }
 
 #[tokio::test]
@@ -505,13 +612,22 @@ async fn authenticated_policy_preflight_appends_a_redacted_project_audit_event()
 }
 
 async fn wait_until_ready(endpoint: &LocalEndpoint) {
-    for _ in 0..50 {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
         if endpoint.socket_path().is_some_and(std::path::Path::exists) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "daemon did not create endpoint {} within {TEST_TIMEOUT:?}; runtime_dir={} ownership_exists={}",
+            endpoint.address(),
+            endpoint.runtime_dir().display(),
+            endpoint.ownership_path().exists(),
+        );
+        tokio::time::sleep(TEST_POLL_INTERVAL.min(deadline - now)).await;
     }
-    panic!("daemon did not create its endpoint")
 }
 
 fn start_daemon(
@@ -544,6 +660,8 @@ fn start_daemon_with_provider(
             brief_provider,
             bypass_authentication: true,
             bypass_policy: true,
+            flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
+            flow_preflight_delay: Duration::ZERO,
         },
         async {
             let _ = shutdown_rx.await;
@@ -571,6 +689,8 @@ fn start_secure_daemon(
             brief_provider: None,
             bypass_authentication: false,
             bypass_policy: false,
+            flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
+            flow_preflight_delay: Duration::ZERO,
         },
         async {
             let _ = shutdown_rx.await;
@@ -672,7 +792,7 @@ async fn approve_required_request(
     approver: &CallerId,
     request: &RequestEnvelope,
 ) -> ApprovalId {
-    let exchange = request_exchange(endpoint, request, Duration::from_secs(1))
+    let exchange = request_exchange(endpoint, request, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(failure) = exchange.result.body else {
@@ -680,7 +800,7 @@ async fn approve_required_request(
     };
     assert_eq!(failure.code, FailureCode::ApprovalRequired);
     let approval_id = failure.approval.unwrap().approval_id;
-    let expected_recovery = approval_recovery(&request.capability, &approval_id);
+    let expected_recovery = approval_recovery(request, &approval_id);
     assert_eq!(
         failure.recovery.as_deref(),
         Some(expected_recovery.as_str())
@@ -699,7 +819,7 @@ async fn approve_required_request(
 
 async fn assert_forbidden(endpoint: &LocalEndpoint, request: &RequestEnvelope) {
     assert!(matches!(
-        request_exchange(endpoint, request, Duration::from_secs(1))
+        request_exchange(endpoint, request, TEST_TIMEOUT)
             .await
             .unwrap()
             .result
@@ -757,21 +877,27 @@ async fn seed_max_evidence_policy_state(
 }
 
 async fn wait_for_state(store: &Store, request_id: &RequestId, expected: RequestState) {
-    for _ in 0..100 {
-        if store
-            .snapshot(request_id.clone())
-            .await
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let snapshot = store.snapshot(request_id.clone()).await;
+        if snapshot
+            .as_ref()
             .is_ok_and(|snapshot| snapshot.state == expected)
         {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "request {request_id} did not reach {expected:?} within {TEST_TIMEOUT:?}; last_snapshot={snapshot:?}",
+        );
+        tokio::time::sleep(TEST_POLL_INTERVAL.min(deadline - now)).await;
     }
-    panic!("request {request_id} did not reach {expected:?}")
 }
 
 async fn request_once(endpoint: &LocalEndpoint, request: &RequestEnvelope) -> Vec<ServerMessage> {
-    let mut client = ClientTransport::connect(endpoint, Duration::from_secs(1))
+    let mut client = ClientTransport::connect(endpoint, TEST_TIMEOUT)
         .await
         .unwrap();
     client.send(encode(request).unwrap()).await.unwrap();
@@ -788,13 +914,9 @@ async fn request_once(endpoint: &LocalEndpoint, request: &RequestEnvelope) -> Ve
 }
 
 async fn assert_status_healthy(endpoint: &LocalEndpoint, suffix: &str) {
-    let exchange = request_status(
-        endpoint,
-        &request("health-project", suffix),
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
+    let exchange = request_status(endpoint, &request("health-project", suffix), TEST_TIMEOUT)
+        .await
+        .unwrap();
     assert!(matches!(exchange.result.body, ResultBody::Success { .. }));
 }
 
@@ -813,7 +935,7 @@ async fn brief_baseline_is_honest_read_only_and_provider_neutral() {
         IdempotencyKey::from("brief-read"),
     );
 
-    let exchange = request_exchange(&endpoint, &request, Duration::from_secs(1))
+    let exchange = request_exchange(&endpoint, &request, TEST_TIMEOUT)
         .await
         .unwrap();
     assert!(exchange.events.is_empty());
@@ -929,7 +1051,7 @@ async fn brief_provider_can_report_partial_source_failure_explicitly() {
         IdempotencyKey::from("partial-brief"),
     );
 
-    let exchange = request_exchange(&endpoint, &request, Duration::from_secs(1))
+    let exchange = request_exchange(&endpoint, &request, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Success {
@@ -975,7 +1097,7 @@ async fn client_deadline_is_not_reported_as_daemon_unavailable() {
     let error = request_exchange(&endpoint, &request, Duration::from_millis(100))
         .await
         .unwrap_err();
-    assert!(matches!(error, crate::ExchangeError::DeadlineExceeded));
+    assert!(matches!(error, ExchangeError::DeadlineExceeded));
     assert!(!error.is_unavailable());
     assert_eq!(error.recovery_action(), None);
 
@@ -1003,7 +1125,7 @@ async fn oversized_brief_provider_result_isolated_and_daemon_stays_healthy() {
         IdempotencyKey::from("oversized-brief"),
     );
 
-    let exchange = request_exchange(&endpoint, &request, Duration::from_secs(1))
+    let exchange = request_exchange(&endpoint, &request, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(failure) = exchange.result.body else {
@@ -1046,7 +1168,7 @@ async fn wait_resumes_live_and_terminal_work_with_split_correlation() {
         IdempotencyKey::from("pending-result"),
         target.request_id.clone(),
     );
-    let pending = request_exchange(&endpoint, &pending_request, Duration::from_secs(1))
+    let pending = request_exchange(&endpoint, &pending_request, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(pending_failure) = pending.result.body else {
@@ -1106,7 +1228,7 @@ async fn assert_terminal_reads(
         target.request_id.clone(),
         2,
     );
-    let resumed = request_exchange(endpoint, &resumed_request, Duration::from_secs(1))
+    let resumed = request_exchange(endpoint, &resumed_request, TEST_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(resumed.events.len(), 1);
@@ -1122,7 +1244,7 @@ async fn assert_terminal_reads(
         IdempotencyKey::from("terminal-result"),
         target.request_id.clone(),
     );
-    let terminal = request_exchange(endpoint, &result_request, Duration::from_secs(1))
+    let terminal = request_exchange(endpoint, &result_request, TEST_TIMEOUT)
         .await
         .unwrap();
     assert!(terminal.events.is_empty());
@@ -1136,7 +1258,7 @@ async fn assert_terminal_reads(
         IdempotencyKey::from("wrong-project-result"),
         target.request_id.clone(),
     );
-    let hidden = request_exchange(endpoint, &wrong_project, Duration::from_secs(1))
+    let hidden = request_exchange(endpoint, &wrong_project, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(hidden_failure) = hidden.result.body else {
@@ -1152,7 +1274,7 @@ async fn assert_terminal_reads(
         target.request_id.clone(),
         0,
     );
-    let hidden_wait = request_exchange(endpoint, &wrong_wait, Duration::from_secs(1))
+    let hidden_wait = request_exchange(endpoint, &wrong_wait, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(hidden_wait_failure) = hidden_wait.result.body else {
@@ -1167,7 +1289,7 @@ async fn assert_terminal_reads(
         IdempotencyKey::from("missing-result"),
         RequestId::from("missing-target"),
     );
-    let missing_exchange = request_exchange(endpoint, &missing, Duration::from_secs(1))
+    let missing_exchange = request_exchange(endpoint, &missing, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(missing_failure) = missing_exchange.result.body else {
@@ -1204,11 +1326,85 @@ async fn dropping_wait_observer_does_not_cancel_target_work() {
         target.request_id.clone(),
         0,
     );
-    let mut client = ClientTransport::connect(&endpoint, Duration::from_secs(1))
+    let mut client = ClientTransport::connect(&endpoint, TEST_TIMEOUT)
         .await
         .unwrap();
     client.send(encode(&wait_request).unwrap()).await.unwrap();
     drop(client);
+
+    let completed = target_observer.await.unwrap().unwrap();
+    assert!(matches!(completed.result.body, ResultBody::Success { .. }));
+    wait_for_state(&observer, &target.request_id, RequestState::Succeeded).await;
+
+    observer.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_wait_timeout_retains_progress_and_does_not_cancel_target_work() {
+    let runtime = test_runtime("streaming-wait-timeout");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let target = request("streaming-project", "streaming-target");
+    let (shutdown, daemon) = start_daemon(
+        endpoint.clone(),
+        state_path.clone(),
+        Duration::from_millis(500),
+    );
+    wait_until_ready(&endpoint).await;
+    let target_observer = tokio::spawn({
+        let endpoint = endpoint.clone();
+        let target = target.clone();
+        async move { request_status(&endpoint, &target, Duration::from_secs(2)).await }
+    });
+    let observer = Store::open(&state_path).unwrap();
+    wait_for_state(&observer, &target.request_id, RequestState::Leased).await;
+    let wait = RequestEnvelope::wait_for_result(
+        RequestId::from("streaming-wait-observer"),
+        target.caller_id.clone(),
+        target.project_id.clone(),
+        IdempotencyKey::from("streaming-wait-observer"),
+        target.request_id.clone(),
+        0,
+    );
+    let mut delivered = Vec::new();
+    let error = request_exchange_streaming(&endpoint, &wait, Duration::from_millis(100), |event| {
+        delivered.push((event.sequence, event.event.clone()));
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(error.error(), ExchangeError::DeadlineExceeded));
+    assert_eq!(error.last_sequence(), 2);
+    assert!(error.request_sent());
+    assert_eq!(delivered, vec![(1, Event::Accepted), (2, Event::Started)]);
+
+    let resumed_wait = RequestEnvelope::wait_for_result(
+        RequestId::from("streaming-zero-event-observer"),
+        target.caller_id.clone(),
+        target.project_id.clone(),
+        IdempotencyKey::from("streaming-zero-event-observer"),
+        target.request_id.clone(),
+        2,
+    );
+    let mut resumed_delivered = Vec::new();
+    let resumed_error = request_exchange_streaming(
+        &endpoint,
+        &resumed_wait,
+        Duration::from_millis(100),
+        |event| resumed_delivered.push(event.sequence),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        resumed_error.error(),
+        ExchangeError::DeadlineExceeded
+    ));
+    assert!(resumed_error.request_sent());
+    assert_eq!(resumed_error.last_sequence(), 2);
+    assert!(resumed_delivered.is_empty());
 
     let completed = target_observer.await.unwrap().unwrap();
     assert!(matches!(completed.result.body, ResultBody::Success { .. }));
@@ -1268,7 +1464,7 @@ async fn max_length_evidence_handles_are_safe_and_exactly_policy_bound() {
         IdempotencyKey::from("max-evidence-unauthenticated"),
         handle.clone(),
     );
-    let denied = request_exchange(&endpoint, &unauthenticated, Duration::from_secs(1))
+    let denied = request_exchange(&endpoint, &unauthenticated, TEST_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(denied.result.request_id, unauthenticated.request_id);
@@ -1277,7 +1473,7 @@ async fn max_length_evidence_handles_are_safe_and_exactly_policy_bound() {
         ResultBody::Failure(ref failure) if failure.code == FailureCode::Unauthenticated
     ));
 
-    let allowed = request_exchange(&endpoint, &allowed_read, Duration::from_secs(1))
+    let allowed = request_exchange(&endpoint, &allowed_read, TEST_TIMEOUT)
         .await
         .unwrap();
     assert!(matches!(
@@ -1311,7 +1507,7 @@ async fn max_length_evidence_handles_are_safe_and_exactly_policy_bound() {
     )
     .authenticated(credential);
     assert!(matches!(
-        request_status(&endpoint, &health, Duration::from_secs(1))
+        request_status(&endpoint, &health, TEST_TIMEOUT)
             .await
             .unwrap()
             .result
@@ -1380,8 +1576,9 @@ async fn malformed_request_shape_cannot_consume_a_cancel_approval() {
     let mut malformed = cancel("shape-malformed").with_approval(approval_id.clone());
     malformed.payload = RequestPayload::GetResult {
         target_request_id: target.request_id.clone(),
+        expected_target_kind: None,
     };
-    let malformed_exchange = request_exchange(&endpoint, &malformed, Duration::from_secs(1))
+    let malformed_exchange = request_exchange(&endpoint, &malformed, TEST_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(malformed_exchange.result.request_id, malformed.request_id);
@@ -1391,7 +1588,7 @@ async fn malformed_request_shape_cannot_consume_a_cancel_approval() {
     ));
 
     let valid = cancel("shape-valid").with_approval(approval_id.clone());
-    let valid_exchange = request_exchange(&endpoint, &valid, Duration::from_secs(1))
+    let valid_exchange = request_exchange(&endpoint, &valid, TEST_TIMEOUT)
         .await
         .unwrap();
     assert!(matches!(
@@ -1479,7 +1676,7 @@ async fn replay_approval_is_bound_to_the_exact_after_sequence() {
 
     let exact_cursor = replay("cursor-exact", 100).with_approval(approval_id.clone());
     assert!(matches!(
-        request_exchange(&endpoint, &exact_cursor, Duration::from_secs(1))
+        request_exchange(&endpoint, &exact_cursor, TEST_TIMEOUT)
             .await
             .unwrap()
             .result
@@ -1498,6 +1695,80 @@ async fn replay_approval_is_bound_to_the_exact_after_sequence() {
     shutdown.send(()).unwrap();
     daemon.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(runtime);
+}
+
+#[test]
+fn target_policy_resource_is_unambiguous_and_binds_the_expected_kind() {
+    let caller = CallerId::from("resource-caller");
+    let project = ProjectId::from("resource-project");
+    let typed = RequestEnvelope::cancel_with_expected_target(
+        RequestId::from("typed-observer"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("typed-key"),
+        RequestId::from("target"),
+        ExpectedTargetKind::FlowRun,
+    );
+    let generic_same_id = RequestEnvelope::cancel(
+        RequestId::from("generic-observer"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("generic-key"),
+        RequestId::from("target"),
+    );
+    let hostile_generic = RequestEnvelope::cancel(
+        RequestId::from("hostile-observer"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("hostile-key"),
+        RequestId::from("target:kind=flow_run"),
+    );
+    assert_ne!(
+        policy_resource(&typed).unwrap(),
+        policy_resource(&generic_same_id).unwrap()
+    );
+    assert_ne!(
+        policy_resource(&typed).unwrap(),
+        policy_resource(&hostile_generic).unwrap()
+    );
+    assert_eq!(
+        policy_resource(&generic_same_id).unwrap().as_str(),
+        "request:target"
+    );
+
+    let typed_replay = RequestEnvelope::replay_with_expected_target(
+        RequestId::from("typed-replay"),
+        caller.clone(),
+        project.clone(),
+        IdempotencyKey::from("typed-replay"),
+        RequestId::from("target"),
+        7,
+        ExpectedTargetKind::FlowRun,
+    );
+    let hostile_replay = RequestEnvelope::replay(
+        RequestId::from("hostile-replay"),
+        caller,
+        project,
+        IdempotencyKey::from("hostile-replay"),
+        RequestId::from("target:kind=flow_run:after=7"),
+        0,
+    );
+    assert_ne!(
+        policy_resource(&typed_replay).unwrap(),
+        policy_resource(&hostile_replay).unwrap()
+    );
+    let generic_replay = RequestEnvelope::replay(
+        RequestId::from("generic-replay"),
+        CallerId::from("resource-caller"),
+        ProjectId::from("resource-project"),
+        IdempotencyKey::from("generic-replay"),
+        RequestId::from("target"),
+        7,
+    );
+    assert_eq!(
+        policy_resource(&generic_replay).unwrap().as_str(),
+        "request:target:after=7"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1561,7 +1832,7 @@ async fn model_approval_retry_refreshes_deadline_but_not_the_semantic_effect() {
     let exact_retry = model_request("model-approval-exact", "exact prompt", refreshed_deadline)
         .with_approval(approval_id.clone());
     assert!(matches!(
-        request_exchange(&endpoint, &exact_retry, Duration::from_secs(1))
+        request_exchange(&endpoint, &exact_retry, TEST_TIMEOUT)
             .await
             .unwrap()
             .result
@@ -1695,7 +1966,7 @@ async fn assert_evidence_metadata(
         IdempotencyKey::from("inspect-evidence"),
         handle.clone(),
     );
-    let inspected = request_exchange(endpoint, &request, Duration::from_secs(1))
+    let inspected = request_exchange(endpoint, &request, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Success {
@@ -1729,7 +2000,7 @@ async fn assert_evidence_chunks(
         MAX_EVIDENCE_CHUNK_SIZE as u64,
     )
     .unwrap();
-    let first = request_exchange(endpoint, &first_read, Duration::from_secs(1))
+    let first = request_exchange(endpoint, &first_read, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Success {
@@ -1753,7 +2024,7 @@ async fn assert_evidence_chunks(
         17,
     )
     .unwrap();
-    let final_exchange = request_exchange(endpoint, &final_read, Duration::from_secs(1))
+    let final_exchange = request_exchange(endpoint, &final_read, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Success {
@@ -1780,7 +2051,7 @@ async fn assert_evidence_failures(
         IdempotencyKey::from("inspect-wrong-project"),
         handle.clone(),
     );
-    let hidden = request_exchange(endpoint, &wrong_project, Duration::from_secs(1))
+    let hidden = request_exchange(endpoint, &wrong_project, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(hidden_failure) = hidden.result.body else {
@@ -1798,7 +2069,7 @@ async fn assert_evidence_failures(
         1,
     )
     .unwrap();
-    let hidden_read = request_exchange(endpoint, &wrong_read, Duration::from_secs(1))
+    let hidden_read = request_exchange(endpoint, &wrong_read, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(hidden_read_failure) = hidden_read.result.body else {
@@ -1816,7 +2087,7 @@ async fn assert_evidence_failures(
         1,
     )
     .unwrap();
-    let invalid = request_exchange(endpoint, &invalid_range, Duration::from_secs(1))
+    let invalid = request_exchange(endpoint, &invalid_range, TEST_TIMEOUT)
         .await
         .unwrap();
     let ResultBody::Failure(range_failure) = invalid.result.body else {
@@ -1841,6 +2112,8 @@ async fn daemon_parallelizes_projects_but_serializes_each_project() {
             brief_provider: None,
             bypass_authentication: true,
             bypass_policy: true,
+            flow_preflight_capacity: super::lifecycle::FLOW_PREFLIGHT_CAPACITY,
+            flow_preflight_delay: Duration::ZERO,
         },
         async {
             let _ = shutdown_rx.await;
@@ -1883,7 +2156,7 @@ async fn daemon_parallelizes_projects_but_serializes_each_project() {
     );
 
     let abandoned = request("project-abandoned", "abandoned");
-    let mut abandoned_client = ClientTransport::connect(&endpoint, Duration::from_secs(1))
+    let mut abandoned_client = ClientTransport::connect(&endpoint, TEST_TIMEOUT)
         .await
         .unwrap();
     abandoned_client
@@ -2021,6 +2294,113 @@ async fn cancelling_running_work_is_terminal_and_notifies_the_original_observer(
     let _ = fs::remove_dir_all(runtime);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flow_only_observers_hide_generic_work_and_cancel_does_not_mutate_it() {
+    let runtime = test_runtime("flow-only-target-kind");
+    let _ = fs::remove_dir_all(&runtime);
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let state_path = runtime.join("state.sqlite3");
+    let target = request("flow-only-project", "generic-target");
+    let seed = Store::open(&state_path).unwrap();
+    accept_pending_request(&seed, &target, 1).await;
+    seed.shutdown().await.unwrap();
+
+    let (shutdown, daemon) =
+        start_daemon(endpoint.clone(), state_path.clone(), Duration::from_secs(5));
+    wait_until_ready(&endpoint).await;
+    let observer = Store::open(&state_path).unwrap();
+    wait_for_state(&observer, &target.request_id, RequestState::Leased).await;
+    let before_snapshot = observer.snapshot(target.request_id.clone()).await.unwrap();
+    let before_replay = observer.replay(target.request_id.clone(), 0).await.unwrap();
+
+    let mut legacy_cancel = RequestEnvelope::cancel_with_expected_target(
+        RequestId::from("legacy-flow-cancel"),
+        target.caller_id.clone(),
+        target.project_id.clone(),
+        IdempotencyKey::from("legacy-flow-cancel"),
+        target.request_id.clone(),
+        ExpectedTargetKind::FlowRun,
+    );
+    legacy_cancel.protocol_version = 3;
+    let legacy = request_exchange(&endpoint, &legacy_cancel, TEST_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        legacy.result.body,
+        ResultBody::Failure(ref failure)
+            if failure.code == FailureCode::UnsupportedProtocolVersion
+    ));
+    assert_eq!(
+        observer.snapshot(target.request_id.clone()).await.unwrap(),
+        before_snapshot
+    );
+    assert_eq!(
+        observer.replay(target.request_id.clone(), 0).await.unwrap(),
+        before_replay
+    );
+
+    let requests = [
+        RequestEnvelope::cancel_with_expected_target(
+            RequestId::from("flow-cancel-generic"),
+            target.caller_id.clone(),
+            target.project_id.clone(),
+            IdempotencyKey::from("flow-cancel-generic"),
+            target.request_id.clone(),
+            ExpectedTargetKind::FlowRun,
+        ),
+        RequestEnvelope::replay_with_expected_target(
+            RequestId::from("flow-logs-generic"),
+            target.caller_id.clone(),
+            target.project_id.clone(),
+            IdempotencyKey::from("flow-logs-generic"),
+            target.request_id.clone(),
+            0,
+            ExpectedTargetKind::FlowRun,
+        ),
+        RequestEnvelope::wait_for_result_with_expected_target(
+            RequestId::from("flow-wait-generic"),
+            target.caller_id.clone(),
+            target.project_id.clone(),
+            IdempotencyKey::from("flow-wait-generic"),
+            target.request_id.clone(),
+            0,
+            ExpectedTargetKind::FlowRun,
+        ),
+        RequestEnvelope::get_result_with_expected_target(
+            RequestId::from("flow-result-generic"),
+            target.caller_id.clone(),
+            target.project_id.clone(),
+            IdempotencyKey::from("flow-result-generic"),
+            target.request_id.clone(),
+            ExpectedTargetKind::FlowRun,
+        ),
+    ];
+    for typed in requests {
+        let exchange = request_exchange(&endpoint, &typed, TEST_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(exchange.events.is_empty());
+        assert!(matches!(
+            exchange.result.body,
+            ResultBody::Failure(ref failure) if failure.code == FailureCode::NotFound
+        ));
+    }
+
+    assert_eq!(
+        observer.snapshot(target.request_id.clone()).await.unwrap(),
+        before_snapshot
+    );
+    assert_eq!(
+        observer.replay(target.request_id.clone(), 0).await.unwrap(),
+        before_replay
+    );
+
+    observer.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+}
+
 fn status_queue_depth(exchange: &crate::StatusExchange) -> u64 {
     let ResultBody::Success {
         payload: ResultPayload::Status(status),
@@ -2128,7 +2508,7 @@ async fn invalid_replay_cursor_is_correlated_and_does_not_stop_the_daemon() {
     };
     assert_eq!(wait_failure.code, FailureCode::InvalidRequest);
     assert!(
-        request_status(&endpoint, &status, Duration::from_secs(1))
+        request_status(&endpoint, &status, TEST_TIMEOUT)
             .await
             .is_ok()
     );

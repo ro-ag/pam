@@ -68,6 +68,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<RequestEnvelope, CodecError> {
     request
         .validate_model_request()
         .map_err(CodecError::Contract)?;
+    request
+        .validate_flow_request()
+        .map_err(CodecError::Contract)?;
     Ok(request)
 }
 
@@ -90,11 +93,23 @@ pub fn decode_request_envelope(bytes: &[u8]) -> Result<RequestEnvelope, CodecErr
 /// Returns a codec error when the frame is oversized, malformed, or uses an
 /// unsupported protocol version.
 pub fn decode_server_message(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
-    let message: ServerMessage = decode(bytes)?;
+    let message = decode_server_message_envelope(bytes)?;
     if !is_version_negotiation_failure(&message) {
         enforce_version(message.protocol_version())?;
     }
     Ok(message)
+}
+
+/// Decodes a daemon message without enforcing its application protocol version.
+///
+/// Durable stores use this only to recover an already-validated historical
+/// result before re-enveloping it at the current protocol version.
+///
+/// # Errors
+///
+/// Returns a codec error when the frame is oversized or malformed.
+pub fn decode_server_message_envelope(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
+    decode(bytes)
 }
 
 fn is_version_negotiation_failure(message: &ServerMessage) -> bool {

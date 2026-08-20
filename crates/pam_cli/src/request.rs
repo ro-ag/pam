@@ -2,11 +2,11 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
 };
 use pam_platform::{
-    CallerKind, IdentityError, NativeSecretBackend, SecretLocator, SecretStore, SecretStoreError,
-    SecretStoreErrorKind, caller_id, discover_project_id,
+    CallerKind, IdentityError, NativeSecretBackend, ProjectIdentity, SecretLocator, SecretStore,
+    SecretStoreError, SecretStoreErrorKind, caller_id, discover_project,
 };
-use pam_protocol::{ModelMessage, ProtocolContractError, RequestEnvelope};
-use std::{error::Error, fmt};
+use pam_protocol::{ExpectedTargetKind, ModelMessage, ProtocolContractError, RequestEnvelope};
+use std::{error::Error, fmt, path::Path};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -21,12 +21,19 @@ impl RequestContext {
     pub(crate) async fn discover(
         approval_id: Option<ApprovalId>,
     ) -> Result<Self, RequestContextError> {
+        let project = discover_project(".").map_err(RequestContextError::Identity)?;
+        Self::discover_for_project(&project, approval_id).await
+    }
+
+    pub(crate) async fn discover_for_project(
+        project: &ProjectIdentity,
+        approval_id: Option<ApprovalId>,
+    ) -> Result<Self, RequestContextError> {
         let caller_id = caller_id(CallerKind::Cli).map_err(RequestContextError::Identity)?;
-        let project_id = discover_project_id(".").map_err(RequestContextError::Identity)?;
         let credential = load_native_credential(caller_id.clone()).await?;
         Ok(Self {
             caller_id,
-            project_id,
+            project_id: project.id().clone(),
             credential,
             approval_id,
         })
@@ -44,6 +51,15 @@ impl RequestContext {
             credential: CallerCredential::new("test-caller-credential"),
             approval_id,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_project(
+        caller_id: CallerId,
+        project: &ProjectIdentity,
+        approval_id: Option<ApprovalId>,
+    ) -> Self {
+        Self::new(caller_id, project.id().clone(), approval_id)
     }
 
     pub(crate) fn status(&self) -> RequestEnvelope {
@@ -117,6 +133,78 @@ impl RequestContext {
             self.project_id.clone(),
             idempotency_key,
             target_request_id,
+        ))
+    }
+
+    pub(crate) fn flow_run(
+        &self,
+        definition: String,
+        run_id: Option<RequestId>,
+        idempotency_key: Option<IdempotencyKey>,
+        project_root: &Path,
+    ) -> Result<RequestEnvelope, ProtocolContractError> {
+        let run_id =
+            run_id.unwrap_or_else(|| RequestId::new(format!("flow-run-{}", Uuid::new_v4())));
+        let idempotency_key =
+            idempotency_key.unwrap_or_else(|| IdempotencyKey::new(format!("flow-run:{run_id}")));
+        RequestEnvelope::flow_run(
+            run_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            definition,
+            project_root.to_str().unwrap_or_default(),
+        )
+        .map(|request| self.authenticate(request))
+    }
+
+    pub(crate) fn flow_cancel(&self, run_id: RequestId) -> RequestEnvelope {
+        let (request_id, idempotency_key) = operation_ids("flow-cancel");
+        self.authenticate(RequestEnvelope::cancel_with_expected_target(
+            request_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            run_id,
+            ExpectedTargetKind::FlowRun,
+        ))
+    }
+
+    pub(crate) fn flow_logs(&self, run_id: RequestId, after: u64) -> RequestEnvelope {
+        let (request_id, idempotency_key) = operation_ids("flow-logs");
+        self.authenticate(RequestEnvelope::replay_with_expected_target(
+            request_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            run_id,
+            after,
+            ExpectedTargetKind::FlowRun,
+        ))
+    }
+
+    pub(crate) fn flow_wait(&self, run_id: RequestId, after: u64) -> RequestEnvelope {
+        let (request_id, idempotency_key) = operation_ids("flow-wait");
+        self.authenticate(RequestEnvelope::wait_for_result_with_expected_target(
+            request_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            run_id,
+            after,
+            ExpectedTargetKind::FlowRun,
+        ))
+    }
+
+    pub(crate) fn flow_result(&self, run_id: RequestId) -> RequestEnvelope {
+        let (request_id, idempotency_key) = operation_ids("flow-result");
+        self.authenticate(RequestEnvelope::get_result_with_expected_target(
+            request_id,
+            self.caller_id.clone(),
+            self.project_id.clone(),
+            idempotency_key,
+            run_id,
+            ExpectedTargetKind::FlowRun,
         ))
     }
 

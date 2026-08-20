@@ -1,0 +1,57 @@
+schema_version = 1
+id = "after-merge-checks"
+name = "After merge checks"
+description = "Collect CI evidence, diagnose failures, and rerun only with approval."
+revision = 7
+
+[outcome]
+solved = "State whether the after-merge checks are healthy."
+changed = "List externally visible changes and their evidence."
+verified = "List checks that produced direct passing evidence."
+unresolved = "List every diagnosis that still needs investigation."
+blocked = "Report the policy, approval, or environment boundary."
+
+[[steps]]
+id = "inspect-repository"
+description = "Inspect repository state without modifying it."
+depends_on = []
+condition = { kind = "always" }
+retry = { max_attempts = 1, initial_backoff_ms = 0, max_backoff_ms = 0 }
+approval = "none"
+timeout_seconds = 30
+effect = "read_only"
+action = { type = "command", program = "git", args = ["status", "--short"], working_directory = "." }
+
+[[steps]]
+id = "run-tests"
+description = "Run the portable workspace test suite."
+depends_on = ["inspect-repository"]
+condition = { kind = "succeeded", step = "inspect-repository" }
+retry = { max_attempts = 3, initial_backoff_ms = 250, max_backoff_ms = 2000 }
+approval = "none"
+timeout_seconds = 1800
+effect = "read_only"
+action = { type = "command", program = "cargo", args = ["test", "--workspace"], working_directory = "." }
+
+[[steps]]
+id = "inspect-ci-run"
+description = "Collect structured evidence for a failed CI run."
+depends_on = ["run-tests"]
+condition = { kind = "failed", step = "run-tests" }
+retry = { max_attempts = 1, initial_backoff_ms = 0, max_backoff_ms = 0 }
+approval = "none"
+timeout_seconds = 120
+effect = "read_only"
+action = { type = "connector", connector = "github.actions", capability = "runs.inspect", resource = { kind = "workflow_run", id = "github:ro-ag/pam/runs/12345" } }
+
+[[steps]]
+id = "rerun-ci"
+description = "Rerun the exact failed CI run after human approval."
+depends_on = ["inspect-ci-run"]
+condition = { kind = "succeeded", step = "inspect-ci-run" }
+retry = { max_attempts = 2, initial_backoff_ms = 1000, max_backoff_ms = 5000 }
+approval = "required"
+idempotency_key = "after-merge-checks:r7:rerun-ci"
+timeout_seconds = 300
+effect = "stateful"
+action = { type = "connector", connector = "github.actions", capability = "runs.rerun", resource = { kind = "workflow_run", id = "github:ro-ag/pam/runs/12345" } }

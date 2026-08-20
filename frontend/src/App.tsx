@@ -30,6 +30,7 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   useCallback,
   useEffect,
   useReducer,
@@ -56,6 +57,7 @@ import { appReducer, initialState, presentError } from "./state";
 
 interface AppProps {
   bridge: PamBridge;
+  initialView?: ViewId;
 }
 
 const navItems: ReadonlyArray<{ id: ViewId; label: string; icon: typeof Pulse }> = [
@@ -86,10 +88,8 @@ function formatDateTime(iso: string): string {
 
 function briefText(brief: AgentBriefView): string {
   return [
-    `Goal: ${brief.goal}`,
-    `Decisions: ${brief.decisions}`,
-    `Verified: ${brief.verified}`,
-    `Next: ${brief.next}`,
+    brief.title,
+    ...brief.sections.map((section) => `${section.label}: ${section.summary}`),
   ].join("\n");
 }
 
@@ -99,6 +99,10 @@ function acceptsResponseFence(requestFence: CommandFence, responseFence: Command
     requestFence.projectHandle === responseFence.projectHandle &&
     requestFence.operationId === responseFence.operationId
   );
+}
+
+function sameAuthority(left: CommandFence, right: CommandFence): boolean {
+  return left.projectHandle === right.projectHandle && left.generation === right.generation;
 }
 
 function StatusDot({ state = "coral" }: { state?: "coral" | "aqua" | "muted" }) {
@@ -115,7 +119,21 @@ function ProjectMenu({
   onSelect: (project: ProjectView) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState(0);
   const wrap = useRef<HTMLDivElement>(null);
+  const switcher = useRef<HTMLButtonElement>(null);
+  const menuItems = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const focusMenuItem = (index: number) => {
+    const bounded = Math.max(0, Math.min(projects.length - 1, index));
+    setFocusedIndex(bounded);
+    window.requestAnimationFrame(() => menuItems.current[bounded]?.focus());
+  };
+
+  const openMenu = (index = projects.findIndex((project) => project.handle === active.handle)) => {
+    setOpen(true);
+    focusMenuItem(index < 0 ? 0 : index);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -130,14 +148,18 @@ function ProjectMenu({
     <div className="project-menu-wrap" ref={wrap}>
       <button
         type="button"
+        ref={switcher}
         className="project-switcher"
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => { if (open) setOpen(false); else openMenu(); }}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
             setOpen(false);
+          } else if (event.key === "ArrowDown") {
+            event.preventDefault();
+            openMenu();
           }
         }}
       >
@@ -147,15 +169,25 @@ function ProjectMenu({
       </button>
       {open && (
         <div className="project-menu" role="menu" aria-label="Registered projects">
-          {projects.map((project) => (
+          {projects.map((project, index) => (
             <button
               type="button"
+              ref={(element) => { menuItems.current[index] = element; }}
               role="menuitemradio"
               aria-checked={project.handle === active.handle}
+              tabIndex={index === focusedIndex ? 0 : -1}
               key={project.handle}
               onClick={() => {
                 onSelect(project);
                 setOpen(false);
+                switcher.current?.focus();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown") { event.preventDefault(); focusMenuItem((index + 1) % projects.length); }
+                else if (event.key === "ArrowUp") { event.preventDefault(); focusMenuItem((index - 1 + projects.length) % projects.length); }
+                else if (event.key === "Home") { event.preventDefault(); focusMenuItem(0); }
+                else if (event.key === "End") { event.preventDefault(); focusMenuItem(projects.length - 1); }
+                else if (event.key === "Escape") { event.preventDefault(); setOpen(false); switcher.current?.focus(); }
               }}
             >
               <span className={`health-dot health-dot--${project.health}`} aria-hidden="true" />
@@ -180,6 +212,7 @@ function Sidebar({
   onNavigate,
   onSelectProject,
   onToggleDaemon,
+  containerRef,
 }: {
   data: ControlCenterView;
   activeView: ViewId;
@@ -188,9 +221,10 @@ function Sidebar({
   onNavigate: (view: ViewId) => void;
   onSelectProject: (project: ProjectView) => void;
   onToggleDaemon: () => void;
+  containerRef: RefObject<HTMLElement | null>;
 }) {
   return (
-    <aside className={`sidebar ${collapsed ? "is-collapsed" : ""}`} aria-label="Project navigation">
+    <aside ref={containerRef} className={`sidebar ${collapsed ? "is-collapsed" : ""}`} aria-label="Project navigation">
       <div className="brand" aria-label="PAM">
         <img src="/assets/pam-mark.png" alt="" />
         {!collapsed && <span>PAM</span>}
@@ -237,8 +271,8 @@ function Sidebar({
           {!collapsed && <span>{data.daemon.detail}</span>}
         </button>
         <div className="utility-nav">
-          <button type="button" aria-label="Settings" title="Settings"><Gear size={19} /></button>
-          <button type="button" aria-label="Documentation" title="Documentation"><BookOpen size={19} /></button>
+          <button type="button" aria-label="Settings unavailable in this preview" title="Settings unavailable in this preview" disabled><Gear size={19} /></button>
+          <button type="button" aria-label="Documentation unavailable in this preview" title="Documentation unavailable in this preview" disabled><BookOpen size={19} /></button>
         </div>
       </div>
     </aside>
@@ -312,6 +346,7 @@ function Toolbar({
   onToggleSidebar,
   onRefresh,
   onOpenQueue,
+  toggleButtonRef,
 }: {
   data: ControlCenterView;
   collapsed: boolean;
@@ -319,10 +354,11 @@ function Toolbar({
   onToggleSidebar: () => void;
   onRefresh: () => void;
   onOpenQueue: () => void;
+  toggleButtonRef: RefObject<HTMLButtonElement | null>;
 }) {
   return (
     <header className="toolbar">
-      <button type="button" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={onToggleSidebar}>
+      <button ref={toggleButtonRef} type="button" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={onToggleSidebar}>
         <SidebarSimple size={19} weight="bold" />
       </button>
       <div className="breadcrumb">
@@ -330,7 +366,7 @@ function Toolbar({
         <CaretRight size={12} aria-hidden="true" />
         <strong>Control center</strong>
       </div>
-      {data.fixture && <span className="fixture-badge">Design fixture</span>}
+      {import.meta.env.DEV && data.fixture && <span className="fixture-badge">Design fixture</span>}
       <div className="toolbar-actions">
         <button type="button" aria-label="Open queue" title="Open queue" onClick={onOpenQueue}>
           <Queue size={19} />
@@ -387,34 +423,46 @@ function HandoffPanel({
 }) {
   return (
     <section className="handoff-panel" aria-labelledby="handoff-title">
-      <h2 id="handoff-title">Ready for the next agent</h2>
+      <h2 id="handoff-title">{brief.title}</h2>
       <dl className="brief-grid">
-        <div><dt>Goal</dt><dd>{brief.goal}</dd></div>
-        <div><dt>Decisions</dt><dd>{brief.decisions}</dd></div>
-        <div><dt>Verified</dt><dd>{brief.verified}</dd></div>
-        <div><dt>Next</dt><dd>{brief.next}</dd></div>
+        {brief.sections.map((section) => (
+          <div key={section.label}>
+            <dt>{section.label}</dt>
+            <dd className="outcome-section-summary">
+              <span className={`state-pill state-pill--${section.satisfied ? "observed" : "not-reported"}`}>
+                {section.satisfied ? "yes" : "no"}
+              </span>
+              <span>{section.summary}</span>
+            </dd>
+          </div>
+        ))}
       </dl>
       <div className="provenance">
         <div className="provenance-intro">
           <GitBranch size={19} weight="bold" aria-hidden="true" />
           <strong>Provenance</strong>
-          <span>Every statement in this brief is grounded in retained evidence.</span>
+          <span>
+            {brief.evidenceHandles.length > 0
+              ? `${brief.evidenceHandles.length} evidence handle${brief.evidenceHandles.length === 1 ? "" : "s"} reported by the terminal result${brief.evidenceTruncated ? "; additional handles were truncated" : ""}.`
+              : "The terminal result reported no evidence handles."}
+          </span>
         </div>
         <div className="evidence-handles">
-          {brief.evidenceHandles.map((handle) => (
-            <button type="button" key={handle} onClick={() => onEvidence(handle)}>
+          {brief.evidenceHandles.map((handle, index) => (
+            <button type="button" aria-label={`Open Evidence ${index + 1}`} key={handle} onClick={() => onEvidence(handle)}>
               <FileText size={17} aria-hidden="true" />
-              <code>{handle}</code>
+              <span>Evidence {index + 1}</span>
+              <code>{handle.slice(0, 8)}…{handle.slice(-4)}</code>
             </button>
           ))}
         </div>
       </div>
       <div className="handoff-actions">
         <button type="button" className="button button--primary" onClick={onCopy}>
-          <Copy size={19} weight="bold" /> Copy agent brief
+          <Copy size={19} weight="bold" /> Copy outcome brief
         </button>
         <div>
-          <button type="button" className="button button--secondary" onClick={() => brief.evidenceHandles[0] && onEvidence(brief.evidenceHandles[0])}>
+          <button type="button" className="button button--secondary" disabled={brief.evidenceHandles.length === 0} onClick={() => brief.evidenceHandles[0] && onEvidence(brief.evidenceHandles[0])}>
             <FolderOpen size={19} /> Open evidence
           </button>
           <button type="button" className="button button--secondary" onClick={onContinue}>
@@ -431,15 +479,29 @@ function CurrentView({
   onCopy,
   onEvidence,
   onContinue,
+  onOpenQueue,
+  onOpenApproval,
+  onRecoverDaemon,
+  onRefresh,
+  onRegisterCaller,
+  registrationBusy,
 }: {
   data: ControlCenterView;
   onCopy: (brief: AgentBriefView) => void;
   onEvidence: (handle: string) => void;
   onContinue: () => void;
+  onOpenQueue: () => void;
+  onOpenApproval: () => void;
+  onRecoverDaemon: () => void;
+  onRefresh: () => void;
+  onRegisterCaller: () => void;
+  registrationBusy: boolean;
 }) {
   const [expanded, setExpanded] = useState(true);
   const outcome = data.current.latestOutcome;
   const timeline = data.current.activeRun?.timeline ?? outcome?.timeline ?? [];
+  const missingCredential = data.current.recoveryAction === "register-caller";
+  const canStartDaemon = data.current.recoveryAction === "start-daemon";
   return (
     <main className="canvas" id="main-content">
       <header className="project-header">
@@ -456,7 +518,39 @@ function CurrentView({
       </header>
       {data.catalogWarning && <div className="surface-notice" role="status"><WarningCircle size={18} /><span>{data.catalogWarning}</span></div>}
       {data.current.failure && <div className="surface-notice is-error" role="alert"><WarningCircle size={18} /><span>{data.current.failure}</span></div>}
-      {timeline.length === 0 ? (
+      {data.current.approval ? (
+        <section className="empty-state state-card is-attention">
+          <WarningCircle size={38} aria-hidden="true" />
+          <h2>Approval required</h2>
+          <p>The selected project's bounded current queue and latest run are waiting for your decision.</p>
+          <button type="button" className="button button--primary" onClick={onOpenApproval}>Review exact effect</button>
+        </section>
+      ) : timeline.length === 0 && data.current.failure ? (
+        <section className="empty-state state-card is-attention">
+          <WarningCircle size={38} aria-hidden="true" />
+          <h2>Authenticated project state is unavailable</h2>
+          <p>{missingCredential
+            ? "Register the GUI caller credential, then retry authenticated project loading."
+            : canStartDaemon
+              ? "Start PAM, then retry authenticated project loading."
+              : "Use the recovery guidance above, then retry authenticated project loading."}</p>
+          <div className="state-actions">
+            {missingCredential
+              ? <button type="button" className="button button--primary" disabled={registrationBusy} onClick={onRegisterCaller}><LockSimple size={18} /> {registrationBusy ? "Registering…" : "Register GUI caller"}</button>
+              : canStartDaemon
+                ? <button type="button" className="button button--primary" disabled={registrationBusy} onClick={onRecoverDaemon}><Power size={18} /> Start PAM</button>
+                : null}
+            <button type="button" className="button button--secondary" disabled={registrationBusy} onClick={onRefresh}><ArrowClockwise size={18} /> Retry</button>
+          </div>
+        </section>
+      ) : timeline.length === 0 && !data.current.activeRun && data.current.queue.length > 0 ? (
+        <section className="empty-state state-card">
+          <Queue size={38} aria-hidden="true" />
+          <h2>{data.current.queue.length} project request{data.current.queue.length === 1 ? " is" : "s are"} queued</h2>
+          <p>Next: {data.current.queue[0]?.operationKind}. PAM remains on watch while durable work waits.</p>
+          <button type="button" className="button button--secondary" onClick={onOpenQueue}>Open project queue</button>
+        </section>
+      ) : timeline.length === 0 && !data.current.activeRun ? (
         <section className="empty-state">
           <Pulse size={38} aria-hidden="true" />
           <h2>No current activity</h2>
@@ -464,14 +558,17 @@ function CurrentView({
         </section>
       ) : (
         <section className="timeline-surface" aria-label={`${data.project.name} activity timeline`}>
+          {data.current.activeRun && <div className="active-run-strip" role="status"><Pulse size={18} aria-hidden="true" /><strong>{data.current.activeRun.state === "cancelling" ? "Cancelling durable request" : "Active durable request"}</strong><span>{data.current.activeRun.operationKind}</span><span className={`state-pill state-pill--${data.current.activeRun.state}`}>{data.current.activeRun.state}</span></div>}
           <ol className="timeline-list">
             {timeline.map((item, index) => <TimelineEventRow item={item} last={index === timeline.length - 1} key={item.id} />)}
           </ol>
           {outcome?.brief && (
-            <article className="outcome-card">
+            <article className={`outcome-card ${outcome.state === "succeeded" ? "is-solved" : "is-attention"}`}>
               <button type="button" className="outcome-summary" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-                <span><CheckCircle size={24} weight="regular" aria-hidden="true" /></span>
-                <span><strong>{outcome.title}</strong><small>Provenance-backed outcome</small></span>
+                <span>{outcome.state === "succeeded"
+                  ? <CheckCircle size={24} weight="regular" aria-hidden="true" />
+                  : <WarningCircle size={24} weight="regular" aria-hidden="true" />}</span>
+                <span><strong>{outcome.title}</strong><small>{outcome.state === "succeeded" ? "Terminal result · solved" : "Terminal result · follow-up required"}</small></span>
                 {expanded ? <CaretUp size={18} weight="bold" /> : <CaretDown size={18} weight="bold" />}
               </button>
               {expanded && <HandoffPanel brief={outcome.brief} onCopy={() => onCopy(outcome.brief!)} onEvidence={onEvidence} onContinue={onContinue} />}
@@ -484,19 +581,29 @@ function CurrentView({
 }
 
 function AccessView({ data }: { data: ControlCenterView }) {
+  const accessIcon = (id: string) => id === "model"
+    ? Pulse
+    : id === "policy"
+      ? LockSimple
+      : id === "certificates"
+        ? FileText
+        : id === "network"
+          ? GitBranch
+          : WarningCircle;
   return (
     <main className="canvas" id="main-content">
       <header className="project-header compact"><div><h1>Access</h1><p>Narrow capabilities, visible to the developer.</p></div></header>
       <section className="panel access-panel" aria-labelledby="access-heading">
         <div className="panel-title"><div><span className="eyebrow">Project boundary</span><h2 id="access-heading">Authorized capabilities</h2></div><LockSimple size={22} /></div>
         <div className="access-list">
-          {data.access.length === 0 ? <p className="panel-empty">No access grants are configured for this project.</p> : data.access.map((grant) => (
-            <article key={grant.id}>
-              <span className="access-icon"><GitBranch size={21} /></span>
+          {data.access.length === 0 ? <p className="panel-empty">No access grants are configured for this project.</p> : data.access.map((grant) => {
+              const Icon = accessIcon(grant.id);
+              return <article key={grant.id}>
+              <span className="access-icon"><Icon size={21} /></span>
               <div><strong>{grant.name}</strong><p>{grant.summary}</p></div>
               <span className={`state-pill state-pill--${grant.state}`}>{grant.state}</span>
-            </article>
-          ))}
+            </article>;
+          })}
         </div>
       </section>
     </main>
@@ -508,82 +615,158 @@ function FlowsView({ bridge, fence, onError, onToast }: { bridge: PamBridge; fen
   const [selected, setSelected] = useState<FlowDocumentDataDto | null>(null);
   const [draft, setDraft] = useState("");
   const [review, setReview] = useState<FlowReviewDataDto | null>(null);
+  const [reviewedSource, setReviewedSource] = useState<string | null>(null);
+  const [reviewPanel, setReviewPanel] = useState<"dry-run" | "diff">("dry-run");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const validationErrorId = useId();
   const fenceRef = useRef(fence);
+  const requestSequence = useRef(0);
   fenceRef.current = fence;
 
+  const isCurrentRequest = useCallback((sequence: number, requestFence: CommandFence) => (
+    sequence === requestSequence.current && sameAuthority(requestFence, fenceRef.current)
+  ), []);
+
   const load = useCallback(async () => {
+    const sequence = ++requestSequence.current;
     const requestFence = withOperation(fenceRef.current);
     setBusy(true);
+    setLoadError(null);
+    setWorkspace(null);
+    setSelected(null);
+    setDraft("");
+    setReview(null);
+    setReviewedSource(null);
+    setReviewPanel("dry-run");
+    setValidationError(null);
     try {
       const response = await bridge.loadFlowWorkspace(requestFence);
-      if (!sameFence(requestFence, response.fence)) return;
+      if (!isCurrentRequest(sequence, requestFence)) return;
+      if (!sameFence(requestFence, response.fence)) {
+        setLoadError("The flow workspace response did not match the active project request. Retry flows.");
+        return;
+      }
       setWorkspace(response.data);
-      setSelected(null);
-      setDraft("");
-      setReview(null);
     } catch (error) {
-      onError(presentError(error));
+      if (isCurrentRequest(sequence, requestFence)) setLoadError(presentError(error));
     } finally {
-      setBusy(false);
+      if (isCurrentRequest(sequence, requestFence)) setBusy(false);
     }
-  }, [bridge, onError]);
+  }, [bridge, isCurrentRequest]);
 
-  useEffect(() => { void load(); }, [load, fence.projectHandle, fence.generation]);
+  useEffect(() => {
+    void load();
+    return () => { requestSequence.current += 1; };
+  }, [load, fence.projectHandle, fence.generation]);
 
   const open = async (flowHandle: string) => {
+    const sequence = ++requestSequence.current;
     const requestFence = withOperation(fenceRef.current);
     setBusy(true);
+    setSelected(null);
+    setDraft("");
+    setReview(null);
+    setReviewedSource(null);
+    setReviewPanel("dry-run");
+    setValidationError(null);
     try {
       const response = await bridge.openFlow(requestFence, flowHandle);
-      if (!sameFence(requestFence, response.fence)) return;
+      if (!isCurrentRequest(sequence, requestFence)) return;
+      if (!sameFence(requestFence, response.fence)) {
+        onError("The flow document response did not match the active project request.");
+        return;
+      }
       setSelected(response.data);
       setDraft(response.data.source);
-      setReview(null);
-    } catch (error) { onError(presentError(error)); }
-    finally { setBusy(false); }
+    } catch (error) {
+      if (isCurrentRequest(sequence, requestFence)) onError(presentError(error));
+    } finally {
+      if (isCurrentRequest(sequence, requestFence)) setBusy(false);
+    }
   };
 
   const validate = async () => {
     if (!selected) return;
+    const source = draft.slice(0, MAX_FLOW_SOURCE);
+    const documentHandle = selected.handle;
+    const sequence = ++requestSequence.current;
     const requestFence = withOperation(fenceRef.current);
     setBusy(true);
+    setReview(null);
+    setReviewedSource(null);
+    setValidationError(null);
     try {
-      const response = await bridge.validateFlow(requestFence, selected.handle, draft.slice(0, MAX_FLOW_SOURCE));
-      if (!sameFence(requestFence, response.fence)) return;
+      const response = await bridge.validateFlow(requestFence, documentHandle, source);
+      if (!isCurrentRequest(sequence, requestFence)) return;
+      if (!sameFence(requestFence, response.fence)) {
+        setValidationError("The flow validation response did not match the active project request. Retry validation.");
+        return;
+      }
       setReview(response.data);
+      setReviewedSource(source);
+      setReviewPanel("dry-run");
       onToast(response.data.dryRun.daemonDefinitionEligible ? "Flow document is valid and daemon-eligible" : "Flow document is valid with authority limits");
-    } catch (error) { onError(presentError(error)); }
-    finally { setBusy(false); }
+    } catch (error) {
+      if (isCurrentRequest(sequence, requestFence)) setValidationError(presentError(error));
+    } finally {
+      if (isCurrentRequest(sequence, requestFence)) setBusy(false);
+    }
   };
 
   const save = async () => {
-    if (!selected || !review) return;
+    const source = draft.slice(0, MAX_FLOW_SOURCE);
+    if (!selected || !review || reviewedSource !== source || !review.diff.changed) return;
+    const normalizedSource = review.normalizedToml.slice(0, MAX_FLOW_SOURCE);
+    const documentHandle = selected.handle;
+    const sequence = ++requestSequence.current;
     const requestFence = withOperation(fenceRef.current);
     setBusy(true);
     try {
-      const response = await bridge.saveFlow(requestFence, selected.handle, draft.slice(0, MAX_FLOW_SOURCE));
-      if (!sameFence(requestFence, response.fence)) return;
-      setSelected((current) => current && ({ ...current, identity: response.data.identity, source: draft }));
+      const response = await bridge.saveFlow(requestFence, documentHandle, normalizedSource);
+      if (!isCurrentRequest(sequence, requestFence)) return;
+      if (!sameFence(requestFence, response.fence)) {
+        onError("The flow save response did not match the active project request.");
+        return;
+      }
+      if (response.data.document !== documentHandle) {
+        onError("The flow save response did not match the reviewed document. Reload flows before saving again.");
+        return;
+      }
+      setSelected((current) => current?.handle === documentHandle ? { ...current, identity: response.data.identity, source: normalizedSource } : current);
+      setDraft(normalizedSource);
       setWorkspace((current) => current && ({ definitions: current.definitions.map((definition) => definition.identity.id === response.data.identity.id ? { ...definition, identity: response.data.identity } : definition) }));
       setReview(null);
+      setReviewedSource(null);
       onToast(response.data.durabilityConfirmed && response.data.cleanupComplete ? "Flow saved durably inside the project boundary" : "Flow saved; durability confirmation is incomplete");
-    } catch (error) { onError(presentError(error)); }
-    finally { setBusy(false); }
+    } catch (error) {
+      if (isCurrentRequest(sequence, requestFence)) onError(presentError(error));
+    } finally {
+      if (isCurrentRequest(sequence, requestFence)) setBusy(false);
+    }
   };
+
+  const acceptedReview = reviewedSource === draft ? review : null;
 
   return (
     <main className="canvas" id="main-content">
       <header className="project-header compact"><div><h1>Flows</h1><p>Repeatable work, with meaningful feedback.</p></div></header>
-      {!workspace ? (
-        <section className="panel loading-panel" aria-live="polite"><ArrowClockwise className={busy ? "is-spinning" : ""} size={25} /><p>Loading bounded flow workspace…</p></section>
+      {loadError && !workspace ? (
+        <section className="panel loading-panel is-error" role="alert">
+          <WarningCircle size={25} />
+          <div><strong>Flow workspace unavailable</strong><p>{loadError}</p></div>
+          <button type="button" className="button button--secondary" onClick={() => void load()}><ArrowClockwise size={18} /> Retry flows</button>
+        </section>
+      ) : !workspace ? (
+        <section className="panel loading-panel" aria-busy="true" aria-live="polite"><ArrowClockwise className={busy ? "is-spinning" : ""} size={25} /><p>Loading bounded flow workspace…</p></section>
       ) : (
         <section className="flow-workspace" aria-label="Flow workspace">
           <aside className="flow-catalog">
             <div className="panel-title"><div><span className="eyebrow">Project catalog</span><h2>Definitions</h2></div><FileText size={20} /></div>
             <div className="flow-list">
               {workspace.definitions.map((flow) => (
-                <button type="button" className={selected?.identity?.id === flow.identity.id ? "is-active" : ""} key={flow.handle} onClick={() => void open(flow.handle)}>
+                <button type="button" className={selected?.identity?.id === flow.identity.id ? "is-active" : ""} aria-pressed={selected?.identity?.id === flow.identity.id} key={flow.handle} onClick={() => void open(flow.handle)}>
                   <GitBranch size={18} />
                   <span><strong>{flow.identity.id}</strong><small>{flow.identity.fileName}</small></span>
                   <span className="state-pill state-pill--ready">r{flow.identity.revision}</span>
@@ -596,15 +779,51 @@ function FlowsView({ bridge, fence, onError, onToast }: { bridge: PamBridge; fen
               <div><span className="eyebrow">Editing</span><h2>{selected?.identity?.fileName ?? "Select a definition"}</h2></div>
               <div>
                 <button type="button" className="button button--secondary button--small" disabled={busy || !selected} onClick={() => void validate()}><ListChecks size={17} /> Validate</button>
-                <button type="button" className="button button--primary button--small" disabled={busy || !review} onClick={() => void save()}><FloppyDisk size={17} /> Save</button>
+                <button type="button" className="button button--primary button--small" disabled={busy || !acceptedReview?.diff.changed} onClick={() => void save()}><FloppyDisk size={17} /> Save</button>
               </div>
             </div>
-            <textarea aria-label="Flow TOML source" spellCheck={false} value={draft} maxLength={MAX_FLOW_SOURCE} disabled={!selected} onChange={(event) => { setDraft(event.target.value); setReview(null); }} />
+            <textarea
+              aria-label="Flow TOML source"
+              aria-invalid={validationError ? true : undefined}
+              aria-describedby={validationError ? validationErrorId : undefined}
+              spellCheck={false}
+              value={draft}
+              maxLength={MAX_FLOW_SOURCE}
+              disabled={!selected}
+              onChange={(event) => {
+                requestSequence.current += 1;
+                setBusy(false);
+                setDraft(event.target.value);
+                setReview(null);
+                setReviewedSource(null);
+                setValidationError(null);
+              }}
+            />
+            {validationError && <div className="validation-errors" id={validationErrorId} role="alert"><p><WarningCircle size={16} aria-hidden="true" />{validationError}</p></div>}
             <div className="editor-status" role="status">
               <span>{draft.length.toLocaleString()} / {MAX_FLOW_SOURCE.toLocaleString()} characters</span>
-              {review && <span className={review.dryRun.daemonDefinitionEligible ? "is-valid" : "is-invalid"}>{review.dryRun.daemonDefinitionEligible ? `Valid · ${review.dryRun.steps.length} dry-run steps` : "Valid · outside daemon authority"}</span>}
+              {acceptedReview && <span className={acceptedReview.dryRun.daemonDefinitionEligible ? "is-valid" : "is-invalid"}>{acceptedReview.dryRun.daemonDefinitionEligible ? `Valid · ${acceptedReview.dryRun.steps.length} dry-run steps` : "Valid · outside daemon authority"}</span>}
             </div>
-            {review && <div className="flow-review" aria-label="Dry-run review">{review.dryRun.steps.slice(0, 5).map((step) => <p key={`${step.index}:${step.id}`}><span>{step.index + 1}</span><strong>{step.id}</strong><small>{step.semanticRole} · {step.daemonAuthority}</small></p>)}</div>}
+            {acceptedReview && (
+              <div className="flow-inspector">
+                <div className="flow-inspector-tabs" role="tablist" aria-label="Flow review">
+                  <button type="button" role="tab" aria-selected={reviewPanel === "dry-run"} onClick={() => setReviewPanel("dry-run")}>Dry run</button>
+                  <button type="button" role="tab" aria-selected={reviewPanel === "diff"} onClick={() => setReviewPanel("diff")}>Version diff{acceptedReview.diff.changed ? " · changed" : " · clean"}</button>
+                </div>
+                {reviewPanel === "dry-run" ? (
+                  <div className="flow-review" role="tabpanel" aria-label="Dry-run review">
+                    {acceptedReview.dryRun.steps.slice(0, 5).map((step) => <p key={`${step.index}:${step.id}`}><span>{step.index + 1}</span><strong>{step.id}</strong><small>{step.semanticRole} · {step.daemonAuthority}</small></p>)}
+                  </div>
+                ) : (
+                  <div className="flow-diff" role="tabpanel" aria-label="Version diff">
+                    {acceptedReview.diff.lines.length === 0
+                      ? <p>No versioned source changes were reported.</p>
+                      : acceptedReview.diff.lines.map((line, index) => <pre className={`is-${line.kind}`} key={`${index}:${line.kind}`}>{line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " "} {line.text}</pre>)}
+                    {acceptedReview.diff.truncated && <p className="bounded-note">The bounded version diff was truncated.</p>}
+                  </div>
+                )}
+              </div>
+            )}
           </section>
         </section>
       )}
@@ -615,10 +834,9 @@ function FlowsView({ bridge, fence, onError, onToast }: { bridge: PamBridge; fen
 function Drawer({ title, eyebrow, onClose, children }: { title: string; eyebrow: string; onClose: () => void; children: React.ReactNode }) {
   const titleId = useId();
   const drawerRef = useRef<HTMLElement>(null);
-  const previousFocus = useRef<HTMLElement | null>(null);
+  const previousFocus = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
   useEffect(() => {
-    previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    return () => previousFocus.current?.focus();
+    return () => { if (previousFocus.current?.isConnected) previousFocus.current.focus(); };
   }, []);
   const trapFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab") return;
@@ -639,11 +857,11 @@ function Drawer({ title, eyebrow, onClose, children }: { title: string; eyebrow:
   );
 }
 
-function EvidenceDrawer({ document, loading, error, onClose }: { document: EvidenceDataDto | null; loading: boolean; error: string | null; onClose: () => void }) {
+function EvidenceDrawer({ document, loading, error, onRetry, onClose }: { document: EvidenceDataDto | null; loading: boolean; error: string | null; onRetry?: () => void; onClose: () => void }) {
   return (
     <Drawer title="Evidence" eyebrow="Exact bounded source" onClose={onClose}>
-      {loading && <div className="drawer-message"><ArrowClockwise className="is-spinning" size={23} /><p>Loading retained evidence…</p></div>}
-      {error && <div className="drawer-message is-error"><WarningCircle size={23} /><p>{error}</p></div>}
+      {loading && <div className="drawer-message" role="status" aria-live="polite"><ArrowClockwise className="is-spinning" size={23} /><p>Loading retained evidence…</p></div>}
+      {error && <div className="drawer-message is-error" role="alert"><WarningCircle size={23} /><p>{error}</p>{onRetry && <button type="button" className="button button--secondary" onClick={onRetry}><ArrowClockwise size={18} /> Retry evidence</button>}</div>}
       {document && <article className="evidence-document"><code>{document.handle}</code><h3>{document.truth}</h3><p>{document.mediaType} · {document.sizeBytes.toLocaleString()} bytes · {document.digest}{document.truncated ? " · bounded preview" : ""}</p><pre>{(document.body ?? "This evidence has no text preview.").slice(0, MAX_EVIDENCE_TEXT)}</pre></article>}
     </Drawer>
   );
@@ -667,7 +885,7 @@ function ApprovalDrawer({ data, busy, onDecision, onClose }: { data: ControlCent
   if (!approval) return null;
   return (
     <Drawer title="Approval required" eyebrow="Bounded project effect" onClose={onClose}>
-      <article className="approval-card"><WarningCircle size={28} /><h3>{approval.title}</h3><p>{approval.reason}</p><dl><div><dt>Effect</dt><dd>{approval.effect}</dd></div><div><dt>Request</dt><dd><code>{approval.requestId}</code></dd></div></dl><div><button type="button" className="button button--secondary" disabled={busy} onClick={() => onDecision("deny")}>Deny</button><button type="button" className="button button--primary" disabled={busy} onClick={() => onDecision("approve")}>Approve exact request</button></div></article>
+      <article className="approval-card" aria-busy={busy}><WarningCircle size={28} /><h3>{approval.title}</h3><p>{approval.reason}</p><dl><div><dt>Effect</dt><dd>{approval.effect}</dd></div><div><dt>Project</dt><dd>{approval.projectName}</dd></div><div><dt>Policy / capability</dt><dd>{approval.policyCapability}</dd></div><div><dt>Expires</dt><dd>{approval.expiresAt}</dd></div><div><dt>Request handle</dt><dd><code>{approval.approvalHandle}</code></dd></div></dl>{busy && <p role="status">Applying the exact decision…</p>}<div><button type="button" className="button button--secondary" disabled={busy} onClick={() => onDecision("deny")}>Deny</button><button type="button" className="button button--primary" disabled={busy} onClick={() => onDecision("approve")}>Approve exact request</button></div></article>
     </Drawer>
   );
 }
@@ -680,15 +898,42 @@ function RecoveryScreen({ message, onRetry }: { message: string; onRetry: () => 
   return <main className="startup-screen recovery-screen" role="alert"><WarningCircle size={38} /><h1>PAM needs a moment</h1><p>{message}</p><button type="button" className="button button--primary" onClick={onRetry}><ArrowClockwise size={18} /> Retry safely</button></main>;
 }
 
-export function App({ bridge }: AppProps) {
-  const [state, dispatch] = useReducer(appReducer, initialState);
+export function App({ bridge, initialView = "current" }: AppProps) {
+  const [compactViewport, setCompactViewport] = useState(() => window.matchMedia("(max-width: 780px)").matches);
+  const [state, dispatch] = useReducer(appReducer, {
+    ...initialState,
+    activeView: initialView,
+    sidebarCollapsed: compactViewport,
+  });
   const [toast, setToast] = useState("");
   const [queueOpen, setQueueOpen] = useState(false);
   const [approvalOpen, setApprovalOpen] = useState(false);
-  const [evidence, setEvidence] = useState<{ open: boolean; loading: boolean; document: EvidenceDataDto | null; error: string | null }>({ open: false, loading: false, document: null, error: null });
+  const [evidence, setEvidence] = useState<{ open: boolean; loading: boolean; handle: string | null; document: EvidenceDataDto | null; error: string | null }>({ open: false, loading: false, handle: null, document: null, error: null });
   const toastTimer = useRef<number | null>(null);
+  const evidenceRequestSequence = useRef(0);
+  const dataCommandSequence = useRef(0);
+  const bootstrapRequestSequence = useRef(0);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
   const fenceRef = useRef(state.activeFence);
   fenceRef.current = state.activeFence;
+
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 780px)");
+    const update = () => setCompactViewport(query.matches);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  const closeEvidence = useCallback(() => {
+    evidenceRequestSequence.current += 1;
+    setEvidence({ open: false, loading: false, handle: null, document: null, error: null });
+  }, []);
+
+  useEffect(() => {
+    evidenceRequestSequence.current += 1;
+    setEvidence({ open: false, loading: false, handle: null, document: null, error: null });
+  }, [state.activeFence?.projectHandle, state.activeFence?.generation]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -697,11 +942,15 @@ export function App({ bridge }: AppProps) {
   }, []);
 
   const bootstrap = useCallback(async () => {
+    const sequence = ++bootstrapRequestSequence.current;
+    dataCommandSequence.current += 1;
     dispatch({ type: "retry" });
     try {
       const [response, catalog] = await Promise.all([bridge.bootstrap(), bridge.catalog()]);
+      if (sequence !== bootstrapRequestSequence.current) return;
       dispatch({ type: "bootstrapSucceeded", response, catalog });
     } catch (error) {
+      if (sequence !== bootstrapRequestSequence.current) return;
       const syntheticFence = { projectHandle: "bootstrap", generation: "", operationId: "bootstrap" };
       dispatch({ type: "commandStarted", fence: syntheticFence });
       dispatch({ type: "commandFailed", fence: syntheticFence, message: presentError(error) });
@@ -716,14 +965,22 @@ export function App({ bridge }: AppProps) {
     command: () => Promise<SnapshotDto>,
     successMessage?: string,
   ) => {
+    const sequence = ++dataCommandSequence.current;
     dispatch({ type: "commandStarted", fence });
     try {
       const response = await command();
-      if (!acceptsResponseFence(fence, response.fence)) return;
+      if (sequence !== dataCommandSequence.current) return false;
+      if (!acceptsResponseFence(fence, response.fence)) {
+        dispatch({ type: "commandFailed", fence, message: "The command response did not match the latest project operation. Retry safely." });
+        return false;
+      }
       dispatch({ type: "commandSucceeded", response });
       if (successMessage) showToast(successMessage);
+      return true;
     } catch (error) {
+      if (sequence !== dataCommandSequence.current) return false;
       dispatch({ type: "commandFailed", fence, message: presentError(error) });
+      return false;
     }
   }, [showToast]);
 
@@ -733,12 +990,24 @@ export function App({ bridge }: AppProps) {
     void executeDataCommand(fence, () => bridge.refreshProject(fence), "Project state refreshed");
   }, [bridge, executeDataCommand]);
 
+  const mobileSidebarOpen = compactViewport && !state.sidebarCollapsed;
+  const toggleSidebar = useCallback(() => {
+    const opening = state.sidebarCollapsed;
+    dispatch({ type: "toggleSidebar" });
+    if (!compactViewport) return;
+    window.requestAnimationFrame(() => {
+      if (opening) sidebarRef.current?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
+      else sidebarToggleRef.current?.focus();
+    });
+  }, [compactViewport, state.sidebarCollapsed]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setEvidence((current) => ({ ...current, open: false }));
+        closeEvidence();
         setQueueOpen(false);
         setApprovalOpen(false);
+        if (mobileSidebarOpen) toggleSidebar();
       }
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey) {
         const view = event.key === "1" ? "current" : event.key === "2" ? "flows" : event.key === "3" ? "access" : null;
@@ -748,7 +1017,7 @@ export function App({ bridge }: AppProps) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [refresh]);
+  }, [closeEvidence, mobileSidebarOpen, refresh, toggleSidebar]);
 
   if (state.loadState === "loading" && !state.data) return <LoadingScreen />;
   if (!state.data || !state.catalog || !state.activeFence) return <RecoveryScreen message={state.error ?? "The project control center is unavailable."} onRetry={() => void bootstrap()} />;
@@ -760,24 +1029,39 @@ export function App({ bridge }: AppProps) {
     const operationId = nextOperationId();
     const pendingFence = { projectHandle: project.handle, generation: "", operationId };
     void executeDataCommand(pendingFence, () => bridge.activateProject(project.handle, operationId), `Now watching ${project.name}`);
+    if (mobileSidebarOpen) toggleSidebar();
   };
   const toggleDaemon = () => {
     const fence = withOperation(state.activeFence!);
     const stopping = data.daemon.state === "running";
     void executeDataCommand(fence, () => stopping ? bridge.stopDaemon(fence) : bridge.startDaemon(fence), stopping ? "PAM is paused" : "PAM is back on watch");
   };
-  const loadEvidence = async (handle: string) => {
+  const registerGuiCaller = () => {
     const fence = withOperation(state.activeFence!);
-    setEvidence({ open: true, loading: true, document: null, error: null });
+    void executeDataCommand(
+      fence,
+      () => bridge.registerGuiCaller(fence).catch(() => {
+        throw new Error("GUI caller registration could not be completed. Retry from this screen.");
+      }),
+      "GUI caller registered",
+    );
+  };
+  const loadEvidence = async (handle: string) => {
+    if (!fenceRef.current) return;
+    const sequence = ++evidenceRequestSequence.current;
+    const fence = withOperation(fenceRef.current);
+    setEvidence({ open: true, loading: true, handle, document: null, error: null });
     try {
       const response = await bridge.loadEvidence(fence, handle);
+      if (sequence !== evidenceRequestSequence.current || !fenceRef.current || !sameAuthority(fence, fenceRef.current)) return;
       if (!sameFence(fence, response.fence)) {
-        setEvidence({ open: true, loading: false, document: null, error: "The active project changed. Reopen this evidence from the refreshed outcome." });
+        setEvidence({ open: true, loading: false, handle: null, document: null, error: "The active project changed. Reopen this evidence from the refreshed outcome." });
         return;
       }
-      setEvidence({ open: true, loading: false, document: { ...response.data, body: response.data.body?.slice(0, MAX_EVIDENCE_TEXT) ?? null }, error: null });
+      setEvidence({ open: true, loading: false, handle, document: { ...response.data, body: response.data.body?.slice(0, MAX_EVIDENCE_TEXT) ?? null }, error: null });
     } catch (error) {
-      setEvidence({ open: true, loading: false, document: null, error: presentError(error) });
+      if (sequence !== evidenceRequestSequence.current || !fenceRef.current || !sameAuthority(fence, fenceRef.current)) return;
+      setEvidence({ open: true, loading: false, handle, document: null, error: presentError(error) });
     }
   };
   const copyBrief = async (brief: AgentBriefView) => {
@@ -788,12 +1072,30 @@ export function App({ bridge }: AppProps) {
       showToast("Clipboard access is unavailable");
     }
   };
-  const decide = (decision: ApprovalDecision) => {
+  const decide = async (decision: ApprovalDecision) => {
     const approval = data.current.approval;
     if (!approval) return;
     const fence = withOperation(state.activeFence!);
-    void executeDataCommand(fence, () => bridge.decideApproval(fence, approval.approvalHandle, decision), decision === "approve" ? "Exact request approved" : "Request denied");
-    setApprovalOpen(false);
+    const sequence = ++dataCommandSequence.current;
+    dispatch({ type: "commandStarted", fence });
+    try {
+      const response = await bridge.decideApproval(fence, approval.approvalHandle, decision);
+      if (sequence !== dataCommandSequence.current) return;
+      if (!acceptsResponseFence(fence, response.snapshot.fence)) {
+        dispatch({ type: "commandFailed", fence, message: "The approval response did not match the latest project operation. Retry safely." });
+        return;
+      }
+      dispatch({ type: "commandSucceeded", response: response.snapshot });
+      showToast(response.disposition === "approved"
+        ? "Exact request approved"
+        : response.disposition === "denied"
+          ? "Request denied"
+          : "Approval expired; request a new challenge");
+      setApprovalOpen(false);
+    } catch (error) {
+      if (sequence !== dataCommandSequence.current) return;
+      dispatch({ type: "commandFailed", fence, message: presentError(error) });
+    }
   };
 
   const shellWidth = state.sidebarCollapsed ? 68 : state.sidebarWidth;
@@ -801,20 +1103,21 @@ export function App({ bridge }: AppProps) {
     <div className={`app-shell sidebar-width-${shellWidth}`}>
       <div className="atmosphere" aria-hidden="true" />
       <a className="skip-link" href="#main-content">Skip to content</a>
-      <Sidebar data={data} activeView={state.activeView} collapsed={state.sidebarCollapsed} pending={pending} onNavigate={(view) => dispatch({ type: "navigate", view })} onSelectProject={selectProject} onToggleDaemon={toggleDaemon} />
-      <ResizeSeparator collapsed={state.sidebarCollapsed} width={state.sidebarWidth} onResize={(width) => dispatch({ type: "resizeSidebar", width })} onToggle={() => dispatch({ type: "toggleSidebar" })} />
-      <section className="workspace">
-        <Toolbar data={data} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={() => dispatch({ type: "toggleSidebar" })} onRefresh={refresh} onOpenQueue={() => setQueueOpen(true)} />
+      <Sidebar containerRef={sidebarRef} data={data} activeView={state.activeView} collapsed={state.sidebarCollapsed} pending={pending} onNavigate={(view) => { dispatch({ type: "navigate", view }); if (mobileSidebarOpen) toggleSidebar(); }} onSelectProject={selectProject} onToggleDaemon={toggleDaemon} />
+      {mobileSidebarOpen && <button type="button" className="sidebar-scrim" aria-label="Close project sidebar" onClick={toggleSidebar} />}
+      <ResizeSeparator collapsed={state.sidebarCollapsed} width={state.sidebarWidth} onResize={(width) => dispatch({ type: "resizeSidebar", width })} onToggle={toggleSidebar} />
+      <section className="workspace" inert={mobileSidebarOpen} aria-hidden={mobileSidebarOpen || undefined}>
+        <Toolbar toggleButtonRef={sidebarToggleRef} data={data} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onRefresh={refresh} onOpenQueue={() => setQueueOpen(true)} />
         <div className="canvas-inset">
           {state.loadState === "recovering" && state.error && <div className="inline-recovery" role="alert"><WarningCircle size={18} /><span>{state.error}</span><button type="button" onClick={refresh}>Retry</button></div>}
-          {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} />}
+          {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} onOpenQueue={() => setQueueOpen(true)} onOpenApproval={() => setApprovalOpen(true)} onRecoverDaemon={toggleDaemon} onRefresh={refresh} onRegisterCaller={registerGuiCaller} registrationBusy={pending} />}
           {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
           {state.activeView === "access" && <AccessView data={data} />}
         </div>
       </section>
       {queueOpen && <QueueDrawer data={data} onClose={() => setQueueOpen(false)} />}
-      {approvalOpen && data.current.approval && <ApprovalDrawer data={data} busy={pending} onDecision={decide} onClose={() => setApprovalOpen(false)} />}
-      {evidence.open && <EvidenceDrawer document={evidence.document} loading={evidence.loading} error={evidence.error} onClose={() => setEvidence((current) => ({ ...current, open: false }))} />}
+      {approvalOpen && data.current.approval && <ApprovalDrawer data={data} busy={pending} onDecision={(decision) => { void decide(decision); }} onClose={() => setApprovalOpen(false)} />}
+      {evidence.open && <EvidenceDrawer document={evidence.document} loading={evidence.loading} error={evidence.error} onRetry={evidence.handle ? () => { void loadEvidence(evidence.handle!); } : undefined} onClose={closeEvidence} />}
       {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );

@@ -125,8 +125,8 @@ preview, approval, idempotency, and verification.
 ## Milestone 3 — portable companion
 
 - Linux user service, Secret Service/keyring behavior, Unix IPC, and packaging.
-- Windows service lifecycle, Credential Manager, path semantics, and named-pipe
-  transport.
+- Windows service lifecycle, Credential Manager, local IPC path semantics, and
+  packaging.
 - Cross-platform migration/recovery, protocol compatibility, and upgrade tests.
 - Hardware/runtime profiles beyond Apple Metal.
 

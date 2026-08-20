@@ -12,11 +12,11 @@ native certificate trust, sanitized proxy diagnostics, a durable audit ledger,
 explicit retention controls, verified user-owned model registration, and
 bounded direct llama.cpp inference are also implemented.
 
-Connector effects, service-manager integration, signed peer registration,
-Unix peer-credential checks, and Windows named pipes are planned, not current
-security controls. The Tauri control center is an implemented presentation
-boundary over typed Rust commands; it does not receive caller credentials,
-raw project identifiers, or unrestricted filesystem authority. Model inference
+Connector effects, service-manager integration, signed peer registration, and
+Unix peer-credential checks are planned, not current security controls. The
+Tauri control center is an implemented presentation boundary over typed Rust
+commands; it does not receive caller credentials, raw project identifiers, or
+unrestricted filesystem authority. Model inference
 uses the existing authenticated PAM IPC protocol and an in-process
 Rust/llama.cpp adapter; there is no HTTP model listener or bearer-token export.
 
@@ -57,7 +57,7 @@ is a presentation layer and is not a production security boundary.
 | Unregistered local process or another OS user | Can attempt endpoint connections, malformed/oversized frames, endpoint occupation, replay, or denial of service | Untrusted; must gain no capability from reachability alone |
 | Unrestricted process running as the PAM OS user | Can invoke administrative CLI paths and may be able to read or alter per-user files subject to OS controls | Inside the current administrative boundary; not isolated by PAM |
 | Project/workspace content | `.pam/project.toml`, Git metadata, paths, filenames, logs, evidence, and tool output | Untrusted data even when the checkout is operator-selected |
-| `ptrack` executable and JSON output | Program resolved from `PATH`; project registration data and context JSON | Operator/developer-controlled dependency; returned content is untrusted |
+| `ptrack` executable and JSON output | Program resolved from an explicit absolute override, the application directory, common per-user install directories, then `PATH`; project registration data and context JSON | Operator/developer-controlled dependency; returned content is untrusted |
 | OS keyring, filesystem, SQLite, certificate verifier, and proxy configuration | Security services, errors, environment variables, proxy URLs, PAC state, and trusted roots | Trusted platform boundary, but values and failure text may be sensitive or malformed |
 | Repository developer and CI | Dependencies, migrations, feature flags, tests, release artifacts | Trusted supply-chain actor; compromise can replace all controls |
 
@@ -68,12 +68,13 @@ is a presentation layer and is not a production security boundary.
    enforce their advertised isolation. Native keyring calls may block or prompt,
    so they are opened lazily on a blocking worker. Unavailable or headless
    stores fail closed without a plaintext fallback.
-2. **Local transport boundary.** A Unix-domain endpoint is current on macOS and
-   Linux; Windows uses loopback TCP with application-layer caller
-   authentication. Endpoint access is not identity. Every production request
-   must carry a registered caller credential, and policy is enforced after
-   authentication. Peer credentials and a Windows named-pipe adapter are planned
-   hardening.
+2. **Local transport boundary.** Every supported OS uses a ZeroMQ local IPC
+   endpoint rooted in the OS account's session runtime or per-user local-data
+   directory. The directory boundary prevents another OS account from claiming
+   the default endpoint, but endpoint access is not caller identity. Every
+   production request must carry a registered caller credential, and policy is
+   enforced after authentication. Peer credentials and signed peer registration
+   are planned hardening.
 3. **Local-administrator boundary.** Caller registration/revocation,
    grant/revocation, and approval decisions currently open protected per-user
    state directly. They treat unrestricted execution as the PAM OS user as
@@ -213,23 +214,24 @@ target request identity. Durable idempotency and replay cursors prevent a client
 reconnect from silently restarting work. Daemon authentication and policy
 bypass switches exist only under `cfg(test)`.
 
-The Unix endpoint and ownership file reject ordinary duplicate ownership and
-require explicit stale-state recovery. The fallback runtime path under the
-system temporary directory and the Windows loopback endpoint do not yet provide
-peer-credential identity, and runtime-directory ownership/mode is not explicitly
-verified before use. On the predictable temporary-directory fallback,
-`Ownership::acquire` opens `daemon.lock` with symlink-following path APIs before
-truncating and writing it. Another OS user who can precreate that runtime
-directory and lock symlink may redirect truncation or writes to a file accessible
-by the PAM user. Planned hardening must use a private owner/mode-validated
-runtime directory and descriptor-relative, no-follow lock creation.
+The default endpoint never falls back to a shared system-temporary path. It uses
+the OS session runtime directory when available and otherwise a `ProjectDirs`
+per-user local-data runtime directory; absence of both fails closed. On Unix the
+daemon opens the final runtime directory without following a symlink, verifies
+that its owner is the effective user, reduces its mode to `0700`, and opens
+`daemon.lock` relative to that directory without following a symlink before it
+locks or truncates the file. Windows relies on the documented OS-account
+isolation of the per-user local-data directory. An explicit `PAM_RUNTIME_DIR`
+override remains an operator-controlled trust decision and should designate a
+private absolute directory.
 
 Caller authentication prevents endpoint possession from granting capability,
 but a local attacker may still cause availability loss, connection churn, or
 stale-path interference. There is no documented per-caller transport rate
 limiter, and the protocol deadline field is not yet enforced by the daemon.
-Planned Unix peer-credential checks, service-manager-owned directories, Windows
-named pipes, and admission limits further reduce this residual attack surface.
+Planned Unix peer-credential checks, service-manager-owned directories, signed
+peer registration, and admission limits further reduce this residual attack
+surface.
 
 ### Project identity, policy, and approvals
 
@@ -356,14 +358,15 @@ Deterministic log compaction strips terminal noise, enforces source/record/polic
 bounds, remains byte-stable, and preserves evidence spans. Compaction is not
 secret redaction.
 
-Residual risk: `ptrack` is resolved through `PATH`; replacement is arbitrary
-code execution with the daemon user's authority, already inside the same-user
-administrator assumption. The child inherits the process environment, and the
-timeout does not establish process-group termination for grandchildren. Valid
-JSON may contain sensitive content not recognized as a secret and is currently
-stored as unredacted evidence. Policy must therefore protect evidence reads, and
-future integrations should prefer an authenticated protocol or explicitly
-pinned executable.
+Residual risk: `ptrack` is selected from operator-controlled installation
+locations (or finally `PATH`); replacement is arbitrary code execution with the
+daemon user's authority, already inside the same-user administrator assumption.
+`PAM_PTRACK_EXECUTABLE` is honored only when it names an absolute existing file.
+The child inherits the process environment, and the timeout does not establish
+process-group termination for grandchildren. Valid JSON may contain sensitive
+content not recognized as a secret and is currently stored as unredacted
+evidence. Policy must therefore protect evidence reads, and future integrations
+should prefer an authenticated protocol or explicitly pinned executable.
 
 `pam evidence show --raw` intentionally writes exact bytes to the terminal and
 therefore bypasses preview escaping; it is an operator-selected exfiltration and
@@ -398,7 +401,7 @@ repository-relative test-file path in that cell.
 | Exact approvals are one-time, explicitly retried for single requests, and audit-atomic | `crates/pam_policy/src/lib.rs::EffectFingerprint`; `crates/pam_store/src/store.rs::authorize_audited`; `crates/pam_cli/src/request.rs::RequestContext` | `crates/pam_policy/src/lib_test.rs::approval_is_bound_to_the_exact_effect_and_consumed_once`; `crates/pam_store/src/store_test.rs::approvals_are_exact_durable_and_consumed_atomically_once`; `::audit_failure_rolls_back_approval_creation`; `::audit_failure_rolls_back_one_time_approval_consumption`; `crates/pam_daemon/tests/status_round_trip.rs::exact_approval_is_required_bound_to_effect_and_consumed_once`; `crates/pam_daemon/src/lifecycle_test.rs::malformed_request_shape_cannot_consume_a_cancel_approval`; `::replay_approval_is_bound_to_the_exact_after_sequence`; `crates/pam_cli/src/request_test.rs::explicit_approval_receipt_is_attached_to_each_supported_single_request` | Approval decisions assume same-user admin authority; multi-request evidence downloads do not accept one reusable receipt |
 | Protocol input and evidence chunks are bounded and versioned | `crates/pam_protocol/src/codec.rs`; `crates/pam_protocol/src/contract.rs` | `crates/pam_protocol/src/codec_test.rs::oversized_frames_are_rejected_before_decode`; `::unsupported_protocol_versions_are_rejected`; `::invalid_evidence_read_lengths_are_rejected_during_decode`; `::maximum_evidence_chunk_fits_the_protocol_frame_and_round_trips` | No per-caller request-rate limiter is documented |
 | Direct model inference is authenticated, bounded, redacted, and capacity-limited | `crates/pam_protocol/src/contract.rs`; `crates/pam_daemon/src/model_service.rs`; `crates/pam_model/src/runtime.rs`; `crates/pam_model/src/llama_cpp_macos.rs` | `crates/pam_protocol/src/codec_test.rs::aggregate_model_prompt_budget_is_enforced_by_the_canonical_decoder`; `::oversized_model_generation_is_rejected_by_the_canonical_decoder`; `crates/pam_daemon/src/model_service_test.rs`; `crates/pam_model/src/runtime_test.rs`; `crates/pam_model/src/llama_cpp_macos_test.rs` | Native live-model qualification is artifact- and macOS-host-specific; model output remains untrusted |
-| Local endpoint ownership/recovery does not replace authentication | `crates/pam_platform/src/endpoint.rs`; `crates/pam_platform/src/transport.rs`; `crates/pam_daemon/src/lifecycle.rs::Ownership` | `crates/pam_daemon/src/lifecycle_test.rs::ownership_rejects_a_second_daemon`; `::stale_socket_reports_recovery_command`; `crates/pam_daemon/tests/status_round_trip.rs::status_crosses_transport_queue_events_and_result` | Predictable fallback lock is symlink-following; peer credentials and hardened service directories are planned |
+| Local endpoint ownership/recovery does not replace authentication | `crates/pam_platform/src/endpoint.rs`; `crates/pam_platform/src/transport.rs`; `crates/pam_daemon/src/lifecycle.rs::Ownership` | `crates/pam_platform/src/endpoint_test.rs::fallback_runtime_is_rooted_in_private_per_user_data`; `crates/pam_daemon/src/lifecycle_test.rs::ownership_rejects_a_second_daemon`; `::ownership_hardens_runtime_directory_permissions`; `::ownership_rejects_a_symlink_without_truncating_its_target`; `::stale_socket_reports_recovery_command`; `crates/pam_daemon/tests/status_round_trip.rs::status_crosses_transport_queue_events_and_result` | Peer credentials, signed peer registration, and hardened service ownership are planned |
 | Evidence is immutable, project-scoped, digest-verified, and path-safe | `crates/pam_store/src/evidence.rs` | `crates/pam_store/src/evidence_test.rs::blobs_deduplicate_globally_while_handles_remain_project_scoped`; `::semantic_handle_puts_are_idempotent_but_immutable`; `::missing_and_corrupt_blobs_are_never_returned`; `::symlinked_evidence_directory_is_rejected_before_put`; `::fifo_blob_is_rejected_without_blocking_evidence_requests_or_shutdown`; `::held_directory_handles_prevent_namespace_swap_from_redirecting_publication`; `crates/pam_daemon/src/lifecycle_test.rs::evidence_inspection_and_chunk_reads_are_bounded_and_project_scoped` | Plaintext evidence relies on per-user filesystem isolation |
 | Put/GC races and crash orphans recover without false deletion claims | install intents and prune logic in `crates/pam_store/src/evidence.rs` | `crates/pam_store/src/evidence_test.rs::put_recovers_when_prune_removes_optimistic_install_before_handle_publish`; `::stale_intent_removes_its_exact_crash_temp_before_hardlink_idempotently`; `::stale_same_digest_attempt_cannot_clear_or_delete_a_non_stale_attempt`; `::cleanup_reports_committed_removals_when_a_later_database_step_fails` | Filesystem and SQLite cannot be one atomic unit |
 | Audit detail is secret-redacted, terminal-safe, and bounded at persistence | `crates/pam_policy/src/redaction.rs`; `crates/pam_store/src/store.rs::append_audit_event_tx` | `crates/pam_policy/src/redaction_test.rs::incomplete_sensitive_headers_consume_unindented_crlf_tail`; `::json_secret_value_after_multiline_whitespace_is_redacted_idempotently`; `::overlapping_header_bearer_and_jwt_matches_collapse_without_leaking_fragments`; `::arbitrary_bytes_controls_ansi_and_bidi_are_rendered_as_safe_utf8`; `::output_bound_is_exact_and_always_uses_an_explicit_truncation_marker`; `crates/pam_store/src/store_test.rs::audit_rejects_control_and_format_characters_in_every_text_field`; `crates/pam_daemon/src/lifecycle_test.rs::authenticated_policy_preflight_appends_a_redacted_project_audit_event` | Pattern redaction cannot recognize every future semantic secret format |

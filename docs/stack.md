@@ -11,7 +11,7 @@ Status: proposed foundation; versions are pinned only when implementation lands.
 | Async runtime | Tokio | Matches the selected ZeroMQ implementation and connector ecosystem. | Blocking database, process, and model work use bounded workers. |
 | CLI | clap | Mature derive-based command contract and shell completion support. | Domain operations do not depend on CLI types. |
 | Desktop UI | Tauri 2.11.5 + React 19 + TypeScript | Preserves a small Rust authority boundary while providing the cross-platform layout, accessibility tree, and interaction fidelity the GPUI spike could not deliver. | Keep Tauri commands typed and narrow; no shell/fs/http plugins or credentials in frontend DTOs. |
-| IPC | zeromq 0.6 Router/Dealer | Native Rust, Tokio, Unix IPC, multiplexed clients, and no required `libzmq`. | Own the versioned protocol; transport fallback and conformance tests are mandatory. |
+| IPC | zeromq 0.6 Router/Dealer | Native Rust, Tokio, local IPC on every supported OS, multiplexed clients, and no required `libzmq`. | Own the versioned protocol and transport conformance tests. |
 | Encoding | Serde + MessagePack | Compact typed envelopes without inventing a serializer. | Explicit limits, schema versions, unknown-field behavior, and golden fixtures. |
 | Durable state | SQLite via rusqlite with bundled SQLite | Transactional queues and audit state in a user-local deployment. | WAL mode, migrations, bounded DB worker, backups, and corruption tests. |
 | Evidence | Content-addressed files + SQLite metadata | Avoids bloating IPC/database while retaining exact proof. | Checksums, ownership, retention, redaction, size limits, atomic writes. |

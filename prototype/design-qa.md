@@ -10,6 +10,12 @@
 - Flow editor implementation: `qa/flow-editor-implementation.png`
 - Flow editor responsive implementation: `qa/flow-editor-responsive.png`
 - Flow editor visual-system comparison: `qa/flow-editor-comparison.png`
+- Tauri/React solved-state comparisons:
+  `qa/task68/compare-reference-1487x1058.png` and
+  `qa/task68/compare-reference-1280x720.png`
+- Tauri/React state and responsive contact sheets:
+  `qa/task68/state-matrix-1280.png` and
+  `qa/task68/responsive-matrix-600.png`
 - Browser viewport: 1280 x 720 CSS px
 - Browser density: device pixel ratio 2; the Browser capture is normalized to
   1280 x 720 output pixels.
@@ -114,7 +120,11 @@ across without introducing a second design system.
   the prior handoff comparison remains the focused evidence for the unchanged
   Current state.
 
-## Interaction and runtime checks
+## Prototype/reference interaction and runtime checks
+
+The checks in this section apply to the approved React reference prototype.
+The production Tauri/React evidence and its narrower native authority contract
+are recorded separately below.
 
 - Project switcher changed to `ledger-web` and restored `payments-api`.
 - Current, Flows, and Access navigation states rendered and returned correctly.
@@ -154,5 +164,52 @@ across without introducing a second design system.
 - Preserve the Flow editor's validation-first save rule, explicit version
   advance, non-executing dry run, deterministic diff, and visible authority
   boundary in the native control center.
+
+## Tauri/React production-shell validation
+
+The production React surface was compared directly with both approved Current
+references after the GPUI spike was replaced. It intentionally adopts p-track's
+compact desktop shell—248 px resizable sidebar, 44 px toolbar, inset canvas,
+bounded cards, 430 px drawers, and a responsive icon rail—while retaining PAM's
+Pacific/sunset palette, editorial project title, narrative timeline, exact
+handoff structure, and Phosphor icon language.
+
+Fifty task-68 captures cover loading, offline, missing GUI credential,
+approval, queued, queued-drawer, active, solved, unresolved, blocked,
+cancelled, Access available/blocked, evidence
+loading/available/failed/binary/truncated, and production Flows
+validated/invalid states. Responsive evidence
+covers 1487 x 1058, 1280 x 720, 1024 x 768, 800 x 600, 600 x 800, and the 320
+CSS-pixel reflow equivalent used for 400% zoom. Every measured capture reported
+`body.scrollWidth == body.clientWidth`. The 320 px solved state scrolls only its
+main canvas, and its bottom capture proves all three handoff actions remain
+reachable without horizontal scrolling.
+
+The 1280 x 720 solved state shows all four timeline stages, all five native
+terminal report rows, both evidence controls, and Copy outcome brief / Open
+evidence / Continue flow without clipping. Unresolved, blocked, and cancelled
+captures retain terminal-specific headings and failure treatment instead of a
+solved claim. Approval displays the concrete bounded effect, selected
+project, `project.current` policy boundary, expiry, and opaque handle. Missing
+credential recovery uses the fenced bundled helper action rather than a shell
+`PATH` assumption. Access cards distinguish observed, policy-gated, disabled,
+and unavailable facts without inferring grants or model identity. Evidence
+drawers distinguish text, binary metadata, truncation, loading, and retryable
+failure.
+
+The production Flows captures show the bounded project catalog, source editor,
+validation-first save state, dry-run inspector, version-diff tab, and a
+persistent source-associated invalid-TOML alert. The graphical node-and-edge
+builder is intentionally tracked as later plan 12 rather than implied here.
+
+Keyboard-only tests cover menu opening/navigation/selection/dismissal, compact
+sidebar focus/inert behavior, and focus return; drawer tests send Tab and
+Shift-Tab across the focus trap and verify opener restoration. Focus QA measured
+a 2 px aqua `:focus-visible` outline. Reduced-motion and forced-color contracts
+are explicit stylesheet fallbacks. Deferred-response tests prove command success
+announcements, evidence, and flow results cannot cross project generations,
+reopen after dismissal, or enable Save for a newer draft. Production fixtures
+use the native SOLVED / CHANGED / VERIFIED / UNRESOLVED / BLOCKED report shape
+and the exact typed `gui_registration_required` recovery code.
 
 final result: passed

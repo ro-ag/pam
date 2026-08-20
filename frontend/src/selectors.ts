@@ -13,8 +13,8 @@ import type {
 
 export type DaemonState = "running" | "stopped" | "unavailable";
 export type ProjectHealth = "ready" | "busy" | "attention" | "offline" | "unknown";
-export type RunState = "queued" | "running" | "approval" | "succeeded" | "failed" | "blocked";
-export type TimelineKind = "request" | "evidence" | "change" | "verification" | "failure";
+export type RunState = "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "unknown";
+export type TimelineKind = TimelineFactDto["kind"];
 
 export interface ProjectView {
   handle: string;
@@ -49,11 +49,15 @@ export interface TimelineItemView {
 }
 
 export interface AgentBriefView {
-  goal: string;
-  decisions: string;
-  verified: string;
-  next: string;
+  title: string;
+  solved: boolean;
+  sections: Array<{
+    label: string;
+    summary: string;
+    satisfied: boolean;
+  }>;
   evidenceHandles: string[];
+  evidenceTruncated: boolean;
 }
 
 export interface OutcomeView {
@@ -75,17 +79,19 @@ export interface ActiveRunView {
 
 export interface ApprovalView {
   approvalHandle: string;
-  requestId: string;
   title: string;
   reason: string;
   effect: string;
+  projectName: string;
+  policyCapability: string;
+  expiresAt: string;
 }
 
 export interface AccessGrantView {
   id: string;
   name: string;
   summary: string;
-  state: "allowed" | "scoped" | "unavailable";
+  state: "observed" | "policy-gated" | "unavailable";
 }
 
 export interface ControlCenterView {
@@ -101,19 +107,29 @@ export interface ControlCenterView {
     approval: ApprovalView | null;
     queueTruncated: boolean;
     failure: string | null;
+    recoveryAction: "register-caller" | "start-daemon" | null;
   };
   access: AccessGrantView[];
   fixture: boolean;
 }
 
-function runState(raw: string): RunState {
-  const value = raw.toLowerCase();
-  if (value.includes("succeed") || value.includes("complete")) return "succeeded";
-  if (value.includes("fail")) return "failed";
-  if (value.includes("block")) return "blocked";
-  if (value.includes("approval")) return "approval";
-  if (value.includes("run") || value.includes("active")) return "running";
-  return "queued";
+export function runState(raw: string): RunState {
+  switch (raw) {
+    case "queued":
+      return "queued";
+    case "leased":
+      return "running";
+    case "cancellation_requested":
+      return "cancelling";
+    case "succeeded":
+      return "succeeded";
+    case "failed":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    default:
+      return "unknown";
+  }
 }
 
 function queueItem(request: RequestSummaryDto): QueueItemView {
@@ -125,19 +141,10 @@ function queueItem(request: RequestSummaryDto): QueueItemView {
   };
 }
 
-function timelineKind(fact: TimelineFactDto): TimelineKind {
-  const label = fact.label.toLowerCase();
-  if (fact.verified) return "verification";
-  if (label.includes("fail") || label.includes("block")) return "failure";
-  if (label.includes("evidence") || fact.evidence.length > 0) return "evidence";
-  if (label.includes("fix") || label.includes("change") || label.includes("applied")) return "change";
-  return "request";
-}
-
 function timeline(run: RunDto): TimelineItemView[] {
   return run.timeline.map((fact, index) => ({
     id: `${run.request.requestId}:${index}`,
-    kind: timelineKind(fact),
+    kind: fact.kind,
     title: fact.label,
     description: fact.summary,
     occurredAt: null,
@@ -145,12 +152,7 @@ function timeline(run: RunDto): TimelineItemView[] {
   }));
 }
 
-function section(outcome: OutcomeDto, label: string): string {
-  return outcome.sections.find((item) => item.label.toLowerCase() === label.toLowerCase())?.summary
-    ?? `No ${label.toLowerCase()} section was reported.`;
-}
-
-function currentView(current: CurrentDto) {
+function currentView(current: CurrentDto, projectName: string, health: HealthDto): ControlCenterView["current"] {
   if (current.status === "approval_required") {
     return {
       queue: [],
@@ -158,30 +160,40 @@ function currentView(current: CurrentDto) {
       latestOutcome: null,
       approval: {
         approvalHandle: current.approval,
-        requestId: "Current project request",
         title: "The daemon requires an exact approval",
-        reason: `This approval expires at ${new Date(current.expiresAtMs).toLocaleString()}.`,
-        effect: "The exact pending project request only",
+        reason: "PAM needs approval before reading retained state for the selected project.",
+        effect: "Read the selected project's bounded current queue and latest run",
+        projectName,
+        policyCapability: "project.current · exact project policy",
+        expiresAt: new Date(current.expiresAtMs).toLocaleString(),
       },
       queueTruncated: false,
       failure: null,
+      recoveryAction: null,
     };
   }
   if (current.status === "blocked" || current.status === "unavailable") {
+    const registrationRequired = current.failure.code === "gui_registration_required";
     return {
       queue: [], activeRun: null, latestOutcome: null, approval: null, queueTruncated: false,
       failure: [current.failure.detail, current.failure.recovery].filter(Boolean).join(" "),
+      recoveryAction: registrationRequired ? "register-caller" : health.status === "offline" ? "start-daemon" : null,
     };
   }
   const run = current.run;
   const events = run ? timeline(run) : [];
   const outcome = run?.outcome;
+  const state = run ? runState(run.request.state) : null;
+  const active = state === "queued" || state === "running" || state === "cancelling";
+  const missingTerminalOutcome = run && !outcome && !active
+    ? `The ${state ?? "terminal"} request has no terminal outcome available. Refresh the project state before acting on it.`
+    : null;
   return {
     queue: current.queued.map(queueItem),
-    activeRun: run && !outcome ? {
+    activeRun: run && !outcome && active ? {
       runId: run.request.requestId,
       operationKind: run.request.operationKind,
-      state: runState(run.request.state),
+      state: state ?? "unknown",
       summary: run.detailError ?? run.request.operationKind,
       startedAt: new Date(run.request.acceptedAtMs).toISOString(),
       timeline: events,
@@ -192,16 +204,17 @@ function currentView(current: CurrentDto) {
       state: outcome.solved ? "succeeded" as const : "failed" as const,
       timeline: events,
       brief: {
-        goal: section(outcome, "Goal"),
-        decisions: section(outcome, "Decisions"),
-        verified: section(outcome, "Verified"),
-        next: section(outcome, "Next"),
+        title: outcome.heading,
+        solved: outcome.solved,
+        sections: outcome.sections.map(({ label, summary, satisfied }) => ({ label, summary, satisfied })),
         evidenceHandles: outcome.evidence,
+        evidenceTruncated: outcome.evidenceTruncated,
       },
     } : null,
     approval: null,
     queueTruncated: current.truncated,
-    failure: run?.detailError ?? null,
+    failure: run?.detailError ?? missingTerminalOutcome,
+    recoveryAction: null,
   };
 }
 
@@ -219,13 +232,44 @@ function healthView(health: HealthDto) {
 }
 
 function accessView(access: AccessConfigDto): AccessGrantView[] {
-  if (access.status !== "available") {
+  if (access.status === "blocked") {
+    return [{
+      id: "access-recovery",
+      name: "Access policy",
+      summary: `Policy gated. ${[access.failure.detail, access.failure.recovery].filter(Boolean).join(" ")}`,
+      state: "policy-gated",
+    }];
+  }
+  if (access.status === "unavailable") {
     return [{ id: "access-recovery", name: "Access configuration", summary: [access.failure.detail, access.failure.recovery].filter(Boolean).join(" "), state: "unavailable" }];
   }
   return [
-    { id: "truth", name: "Effective configuration", summary: access.truth, state: "allowed" },
-    { id: "roots", name: "Platform trust roots", summary: access.platformRootsEnabled ? "Enabled for authenticated project requests" : "Not enabled", state: access.platformRootsEnabled ? "allowed" : "scoped" },
-    { id: "proxy", name: "Network discovery", summary: [access.proxyEnvironment, access.noProxy, access.pac].filter(Boolean).join(" · "), state: access.systemProxyDiscoveryEnabled ? "allowed" : "scoped" },
+    {
+      id: "model",
+      name: "Model access",
+      summary: "Current model identity is not reported by protocol. Model requests remain authenticated and project-policy gated.",
+      state: "policy-gated",
+    },
+    {
+      id: "policy",
+      name: "Access policy",
+      summary: `${access.truth}. The network.diagnostics capability was observed; no other capability is inferred.`,
+      state: "observed",
+    },
+    {
+      id: "certificates",
+      name: "Certificates",
+      summary: access.platformRootsEnabled
+        ? "Operating-system certificate verifier enabled. No certificate-bypass mode."
+        : "Operating-system certificate verifier reported disabled. No certificate-bypass mode.",
+      state: "observed",
+    },
+    {
+      id: "network",
+      name: "Network configuration",
+      summary: `Proxy environment ${access.proxyEnvironment} · NO_PROXY ${access.noProxy} · PAC ${access.pac} · system discovery ${access.systemProxyDiscoveryEnabled ? "enabled" : "not enabled"}.`,
+      state: "observed",
+    },
   ];
 }
 
@@ -250,7 +294,7 @@ export function selectControlCenter(data: SnapshotDataDto, catalog: CatalogDto, 
     catalog: projects.map((project) => projectView(project, data, health.health)),
     catalogWarning: catalog.warning ?? data.catalogWarning,
     daemon: health.daemon,
-    current: currentView(data.current),
+    current: currentView(data.current, data.project.name, data.health),
     access: accessView(data.access),
     fixture,
   };

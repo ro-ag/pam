@@ -4396,6 +4396,61 @@ async fn audit_failure_rolls_back_one_time_approval_consumption() {
     close(store, &directory).await;
 }
 
+async fn assert_denied_decision_retry_is_idempotent(store: &Store, denied_id: &ApprovalId) {
+    assert_eq!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                111,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Denied
+    );
+    assert_eq!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                112,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Denied,
+        "an identical retry after a lost response must be idempotent"
+    );
+    assert!(matches!(
+        store
+            .decide_approval(
+                denied_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Approve,
+                112,
+            )
+            .await,
+        Err(StoreError::InvalidApprovalState)
+    ));
+}
+
+async fn assert_expired_decision_retry_is_idempotent(store: &Store, expiring_id: &ApprovalId) {
+    assert_eq!(
+        store
+            .decide_approval(
+                expiring_id.clone(),
+                CallerId::from("approval-reviewer"),
+                ApprovalDecision::Deny,
+                131,
+            )
+            .await
+            .unwrap(),
+        ApprovalDecisionOutcome::Expired,
+        "an expired decision response must also be safely repeatable"
+    );
+}
+
 #[tokio::test]
 async fn approval_decisions_return_denied_and_expired_outcomes() {
     let (directory, _path, store) = open_approval_store("approval-outcomes").await;
@@ -4416,18 +4471,7 @@ async fn approval_decisions_return_denied_and_expired_outcomes() {
     else {
         panic!("a new exact effect should request a new approval")
     };
-    assert_eq!(
-        store
-            .decide_approval(
-                denied_id.clone(),
-                CallerId::from("approval-reviewer"),
-                ApprovalDecision::Deny,
-                111,
-            )
-            .await
-            .unwrap(),
-        ApprovalDecisionOutcome::Denied
-    );
+    assert_denied_decision_retry_is_idempotent(&store, &denied_id).await;
     let mut denied_request = exact_request.clone();
     denied_request.approval_id = Some(denied_id);
     assert_eq!(
@@ -4454,6 +4498,7 @@ async fn approval_decisions_return_denied_and_expired_outcomes() {
             .unwrap(),
         ApprovalDecisionOutcome::Expired
     );
+    assert_expired_decision_retry_is_idempotent(&store, &expiring_id).await;
     assert_eq!(
         store
             .authorize(

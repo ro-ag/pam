@@ -77,6 +77,20 @@ action = {{ type = "command", program = "git", args = ["status", "--short"], wor
     )
 }
 
+fn write_recovery_links(project: &TestProject, id: &str, count: usize) {
+    let target = project.flows().join(format!("{id}.toml"));
+    for sequence in 0..count {
+        fs::hard_link(
+            &target,
+            project.flows().join(format!(
+                ".{id}.toml.backup-{}-{sequence}",
+                std::process::id()
+            )),
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn checked_after_merge_flow_is_a_schema_v2_editor_golden() {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -222,6 +236,14 @@ fn catalog_rejects_filename_mismatch_invalid_utf8_and_unsafe_entry_types() {
         FlowEditorError::InvalidCatalogDefinition { .. }
     ));
     assert!(!error.to_string().contains(private_value));
+
+    let reserved_directory = TestProject::new("reserved-artifact-directory");
+    reserved_directory.create_catalog();
+    fs::create_dir(reserved_directory.flows().join(".target.toml.backup-100-1")).unwrap();
+    assert!(matches!(
+        FlowEditorModel::open(reserved_directory.path()),
+        Err(FlowEditorError::UnsafeEntry(_))
+    ));
 
     #[cfg(unix)]
     {
@@ -729,6 +751,42 @@ fn prepared_save_creates_and_updates_only_normalized_identity_files() {
             .contains(".backup-")
     });
     assert_eq!(retained_backup, !cfg!(unix));
+}
+
+#[test]
+fn bounded_owned_recovery_artifacts_do_not_exhaust_the_flow_catalog() {
+    let project = TestProject::new("bounded-recovery-artifacts");
+    project.write_flow("recoverable", 1, "Recoverable");
+    write_recovery_links(&project, "recoverable", MAX_FLOW_CATALOG_ENTRIES);
+
+    let mut model = FlowEditorModel::open(project.path()).unwrap();
+    assert_eq!(model.entries().len(), 1);
+    let mut document = model.open_document("recoverable").unwrap();
+    document
+        .replace_source(flow_source("recoverable", 2, "Recovered"))
+        .unwrap();
+    let interaction = document.prepare_save().unwrap();
+    document.commit_save(interaction).unwrap();
+    model.reload().unwrap();
+
+    let retained = fs::read_dir(project.flows())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
+        .count();
+    assert!(retained <= 1, "only the latest recovery link may remain");
+}
+
+#[test]
+fn owned_recovery_artifacts_have_an_independent_hard_limit() {
+    let project = TestProject::new("excess-recovery-artifacts");
+    project.write_flow("recoverable", 1, "Recoverable");
+    write_recovery_links(&project, "recoverable", MAX_FLOW_CATALOG_ENTRIES + 1);
+
+    assert!(matches!(
+        FlowEditorModel::open(project.path()),
+        Err(FlowEditorError::TooManyRecoveryArtifacts)
+    ));
 }
 
 #[test]

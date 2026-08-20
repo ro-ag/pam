@@ -63,8 +63,41 @@ const definitionHandle = "66666666-6666-4666-8666-666666666666";
 const secondDefinitionHandle = "77777777-7777-4777-8777-777777777777";
 const documentHandle = "88888888-8888-4888-8888-888888888888";
 
-function snapshot(project: ProjectSummaryDto, daemonRunning: boolean): SnapshotDataDto {
-  return {
+export const fixtureScenarios = [
+  "loading",
+  "offline",
+  "missing-credential",
+  "approval",
+  "queued",
+  "active",
+  "solved",
+  "unresolved",
+  "blocked",
+  "cancelled",
+  "access-available",
+  "access-blocked",
+  "evidence-loading",
+  "evidence-available",
+  "evidence-failed",
+  "evidence-binary",
+  "evidence-truncated",
+] as const;
+
+export type FixtureScenario = typeof fixtureScenarios[number];
+
+export function fixtureScenario(value: string | null | undefined): FixtureScenario {
+  return fixtureScenarios.find((scenario) => scenario === value) ?? "solved";
+}
+
+const unavailableFailure = {
+  kind: "unavailable" as const,
+  code: null,
+  detail: "The authenticated daemon is unavailable for this project.",
+  recovery: "Start PAM, then retry the authenticated project refresh.",
+};
+
+function solvedSnapshot(project: ProjectSummaryDto, daemonRunning: boolean): SnapshotDataDto {
+  const data: SnapshotDataDto = {
     project,
     health: daemonRunning
       ? { status: "healthy", daemonVersion: "fixture-0.1.0", queueDepth: 2 }
@@ -80,19 +113,20 @@ function snapshot(project: ProjectSummaryDto, daemonRunning: boolean): SnapshotD
         request: { requestId: "fixture-request-1", operationKind: "merge-repair", state: "succeeded", queueSequence: 1, acceptedAtMs: 1_777_000_000_000, completedAtMs: 1_777_001_440_000 },
         detailError: null,
         timeline: [
-          { label: "Request received", summary: "Investigate failing merge in PR #1842", verified: false, evidence: [] },
-          { label: "Evidence found", summary: "CI failure and merge base identified", verified: false, evidence: [evidenceHandles[0]] },
-          { label: "Fix applied", summary: "Resolved conflicting idempotency logic", verified: false, evidence: [evidenceHandles[1]] },
-          { label: "Verification passed", summary: "All checks green on PR #1842", verified: true, evidence: evidenceHandles },
+          { kind: "request", label: "Request received", summary: "Investigate failing merge in PR #1842", verified: false, evidence: [] },
+          { kind: "evidence", label: "Evidence found", summary: "CI failure and merge base identified", verified: false, evidence: [evidenceHandles[0]] },
+          { kind: "change", label: "Fix applied", summary: "Resolved conflicting idempotency logic", verified: false, evidence: [evidenceHandles[1]] },
+          { kind: "verification", label: "Verification passed", summary: "All checks green on PR #1842", verified: true, evidence: evidenceHandles },
         ],
         outcome: {
           heading: "Ready for the next agent",
           solved: true,
           sections: [
-            { label: "Goal", summary: "Unblock PR #1842 by repairing the failing merge and restoring green CI.", satisfied: true },
-            { label: "Decisions", summary: "Kept the idempotency check in the service layer; removed the duplicate guard in the controller.", satisfied: true },
-            { label: "Verified", summary: "CI pipeline passed; unit and integration tests are green; no regressions were detected.", satisfied: true },
-            { label: "Next", summary: "Request review from Payments; monitor the staging smoke for 30 minutes.", satisfied: true },
+            { label: "SOLVED", summary: "The merge conflict was repaired and the original request completed.", satisfied: true },
+            { label: "CHANGED", summary: "Conflicting idempotency logic was consolidated in the service layer.", satisfied: true },
+            { label: "VERIFIED", summary: "Unit and integration checks completed successfully.", satisfied: true },
+            { label: "UNRESOLVED", summary: "No unresolved work was reported.", satisfied: false },
+            { label: "BLOCKED", summary: "No blocker was reported.", satisfied: false },
           ],
           evidence: evidenceHandles,
           evidenceTruncated: false,
@@ -104,19 +138,109 @@ function snapshot(project: ProjectSummaryDto, daemonRunning: boolean): SnapshotD
       truth: "System trust and proxy discovery are available to the active project.",
       platformRootsEnabled: true,
       systemProxyDiscoveryEnabled: true,
-      proxyEnvironment: "No explicit proxy environment variables",
-      noProxy: "localhost,127.0.0.1",
-      pac: "No PAC URL configured",
+      proxyEnvironment: "not configured",
+      noProxy: "configured",
+      pac: "not detected",
     },
     catalogWarning: null,
   };
+
+  if (!daemonRunning) {
+    data.current = { status: "unavailable", failure: unavailableFailure };
+    data.access = { status: "unavailable", failure: unavailableFailure };
+  }
+
+  return data;
+}
+
+function snapshot(project: ProjectSummaryDto, daemonRunning: boolean, scenario: FixtureScenario): SnapshotDataDto {
+  const data = solvedSnapshot(project, daemonRunning);
+  if (!daemonRunning || scenario === "solved" || scenario.startsWith("evidence-")) return data;
+
+  if (["unresolved", "blocked", "cancelled"].includes(scenario) && data.current.status === "available" && data.current.run?.outcome) {
+    const outcome = data.current.run.outcome;
+    outcome.solved = false;
+    outcome.heading = scenario === "unresolved"
+      ? "Run needs follow-up"
+      : scenario === "blocked"
+        ? "Run is blocked"
+        : "Run was cancelled";
+    outcome.sections = outcome.sections.map((section) => ({
+      ...section,
+      satisfied: section.label === "CHANGED"
+        || (scenario === "unresolved" && section.label === "UNRESOLVED")
+        || (scenario === "blocked" && section.label === "BLOCKED"),
+      summary: section.label === "UNRESOLVED" && scenario === "unresolved"
+        ? "The staging verification still needs investigation."
+        : section.label === "BLOCKED" && scenario === "blocked"
+          ? "Project policy blocked the declared write effect."
+          : section.summary,
+    }));
+    data.current.run.timeline[data.current.run.timeline.length - 1] = {
+      kind: "failure",
+      label: scenario === "unresolved" ? "Unresolved" : scenario === "blocked" ? "Blocked" : "Run cancelled",
+      summary: outcome.heading,
+      verified: false,
+      evidence: [],
+    };
+    return data;
+  }
+
+  if (scenario === "missing-credential") {
+    const detail = "PAM has no native caller credential for this caller.";
+    const recovery = "Use Register GUI caller in PAM.";
+    const failure = { kind: "unavailable" as const, code: "gui_registration_required", detail, recovery };
+    data.health = { status: "degraded", detail, recovery };
+    data.current = { status: "unavailable", failure };
+    data.access = { status: "unavailable", failure };
+  }
+  if (scenario === "offline") {
+    return solvedSnapshot(project, false);
+  }
+  if (scenario === "approval") {
+    data.health = { status: "healthy", daemonVersion: "fixture-0.1.0", queueDepth: 0 };
+    data.current = {
+      status: "approval_required",
+      approval: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      expiresAtMs: 2_000_000_000_000,
+    };
+  }
+  if (scenario === "queued") {
+    data.current = { status: "available", queued: data.current.status === "available" ? data.current.queued : [], truncated: false, run: null };
+  }
+  if (scenario === "active" && data.current.status === "available" && data.current.run) {
+    data.current = {
+      ...data.current,
+      queued: data.current.queued.slice(0, 1),
+      run: {
+        ...data.current.run,
+        request: { ...data.current.run.request, state: "leased", completedAtMs: null },
+        timeline: data.current.run.timeline.slice(0, 2),
+        outcome: null,
+      },
+    };
+  }
+  if (scenario === "access-blocked") {
+    data.access = {
+      status: "blocked",
+      failure: {
+        kind: "blocked",
+        code: "Forbidden",
+        detail: "Network diagnostics are blocked by the selected project's policy.",
+        recovery: "Grant network.diagnostics for this GUI caller and project, then retry.",
+      },
+      approvalId: null,
+      expiresAtMs: null,
+    };
+  }
+  return data;
 }
 
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-export function fixtureBridge(): PamBridge {
+export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
   let active = projects[0];
   let generation = "99999999-9999-4999-8999-999999999999";
   let daemonRunning = true;
@@ -135,7 +259,8 @@ export function fixtureBridge(): PamBridge {
   return {
     mode: "fixture",
     async bootstrap() {
-      return fenceResponse(currentFence("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), snapshot(active, daemonRunning));
+      if (scenario === "loading") return new Promise(() => {});
+      return fenceResponse(currentFence("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), snapshot(active, daemonRunning, scenario));
     },
     async catalog(): Promise<CatalogDto> {
       return { projects: clone(projects), warning: null };
@@ -149,23 +274,46 @@ export function fixtureBridge(): PamBridge {
         : projectHandle === projects[2].handle
           ? "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
           : "99999999-9999-4999-8999-999999999999";
-      return fenceResponse(currentFence(operationId), snapshot(active, daemonRunning));
+      return fenceResponse(currentFence(operationId), snapshot(active, daemonRunning, scenario));
     },
-    async refreshProject(fence) { return fenceResponse(fence, snapshot(active, daemonRunning)); },
-    async startDaemon(fence) { daemonRunning = true; return fenceResponse(fence, snapshot(active, daemonRunning)); },
-    async stopDaemon(fence) { daemonRunning = false; return fenceResponse(fence, snapshot(active, daemonRunning)); },
-    async decideApproval(fence, _approvalHandle: string, _decision: ApprovalDecision) { return fenceResponse(fence, snapshot(active, daemonRunning)); },
+    async refreshProject(fence) { return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
+    async startDaemon(fence) { daemonRunning = true; return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
+    async stopDaemon(fence) { daemonRunning = false; return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
+    async registerGuiCaller(fence) { return fenceResponse(fence, solvedSnapshot(active, daemonRunning)); },
+    async decideApproval(fence, _approvalHandle: string, decision: ApprovalDecision) {
+      const data = solvedSnapshot(active, daemonRunning);
+      if (decision === "deny") {
+        data.current = {
+          status: "unavailable",
+          failure: {
+            kind: "unavailable",
+            code: "approval_denied",
+            detail: "This exact project-current request was denied.",
+            recovery: null,
+          },
+        };
+      }
+      return { disposition: decision === "approve" ? "approved" : "denied", snapshot: fenceResponse(fence, data) };
+    },
     async loadEvidence(fence, evidenceHandle) {
+      if (scenario === "evidence-loading") return new Promise(() => {});
+      if (scenario === "evidence-failed") throw new Error("The bounded evidence preview could not be loaded. Retry from the retained handle.");
+      const binary = scenario === "evidence-binary";
+      const truncated = scenario === "evidence-truncated";
       const data: EvidenceDataDto = {
         handle: evidenceHandle,
         digest: evidenceHandle === evidenceHandles[0] ? "sha256:fixture-ci" : "sha256:fixture-git",
-        sizeBytes: 108,
-        mediaType: "text/plain",
-        body: evidenceHandle === evidenceHandles[0]
-          ? "GitHub Actions · integration-test · exit 1\nNull currency in fixture triggers 500 at CurrencyService.java:142"
-          : "2 files changed\nAll checks green\nguard currency before invoking conversion pipeline",
-        truncated: false,
-        truth: evidenceHandle === evidenceHandles[0] ? "CI failure output" : "Verified Git patch",
+        sizeBytes: binary ? 32_768 : truncated ? 19_212 : 108,
+        mediaType: binary ? "application/octet-stream" : "text/plain",
+        body: binary
+          ? null
+          : truncated
+            ? `${"retained evidence line\n".repeat(220)}preview stops at the bounded read limit`
+            : evidenceHandle === evidenceHandles[0]
+              ? "GitHub Actions · integration-test · exit 1\nNull currency in fixture triggers 500 at CurrencyService.java:142"
+              : "2 files changed\nAll checks green\nguard currency before invoking conversion pipeline",
+        truncated,
+        truth: binary ? "Binary evidence metadata" : evidenceHandle === evidenceHandles[0] ? "CI failure output" : "Verified Git patch",
       };
       return fenceResponse(fence, data);
     },
@@ -181,19 +329,28 @@ export function fixtureBridge(): PamBridge {
       const data: FlowReviewDataDto = {
         document: documentHandle,
         identity,
-        normalizedToml: source,
+        normalizedToml: `${source.trimEnd()}\n`,
         dryRun: {
           daemonDefinitionEligible: true,
           steps: [
             { index: 0, id: "observe-revision", semanticRole: "observe", condition: "always", approval: "none", effect: "read_only", maxAttempts: 1, initialBackoffMs: 0, maxBackoffMs: 0, action: "git rev-parse --verify HEAD", daemonAuthority: "supported" },
           ],
         },
-        diff: { changed: source !== savedSource, truncated: false, lines: [] },
+        diff: {
+          changed: source !== savedSource,
+          truncated: false,
+          lines: source === savedSource
+            ? []
+            : [
+                { kind: "removed", text: `revision = ${identity.revision}` },
+                { kind: "added", text: `revision = ${identity.revision + 1}` },
+              ],
+        },
       };
       return fenceResponse(fence, data);
     },
     async saveFlow(fence, _documentHandle, source) {
-      savedSource = source;
+      savedSource = `${source.trimEnd()}\n`;
       const data: FlowSaveDataDto = { document: documentHandle, identity, created: false, durabilityConfirmed: true, cleanupComplete: true };
       return fenceResponse(fence, data);
     },

@@ -1,4 +1,9 @@
-use super::{TransportError, TransportErrorKind};
+use super::{PlatformTransport, TransportError, TransportErrorKind, selected_transport};
+
+#[test]
+fn every_supported_platform_selects_local_ipc() {
+    assert_eq!(selected_transport(), PlatformTransport::UnixIpc);
+}
 
 #[test]
 fn unavailable_transport_has_exact_recovery_action() {

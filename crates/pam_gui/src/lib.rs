@@ -18,15 +18,16 @@ mod desktop_test;
 mod flow_editor_test;
 
 pub use desktop::{
-    AccessConfigDto, ApprovalDecisionDto, ApprovalHandle, CatalogDto, CommandFence, CurrentDto,
-    DesktopCore, DesktopErrorDto, DesktopErrorKind, DesktopResult, EvidenceDataDto, EvidenceDto,
+    AccessConfigDto, ApprovalDecisionDispositionDto, ApprovalDecisionDto,
+    ApprovalDecisionResponseDto, ApprovalHandle, CatalogDto, CommandFence, CurrentDto, DesktopCore,
+    DesktopErrorDto, DesktopErrorKind, DesktopResult, EvidenceDataDto, EvidenceDto,
     EvidenceHandleDto, FailureDto, FailureKindDto, FlowDefinitionDto, FlowDefinitionHandle,
     FlowDocumentDataDto, FlowDocumentDto, FlowDocumentHandle, FlowDryRunDto, FlowDryRunStepDto,
     FlowIdentityDto, FlowReviewDataDto, FlowReviewDto, FlowSaveDataDto, FlowSaveDto,
     FlowVersionDiffDto, FlowVersionDiffLineDto, FlowWorkspaceDataDto, FlowWorkspaceDto,
     GenerationId, HealthDto, OperationId, OutcomeDto, OutcomeSectionDto, ProjectHandle,
     ProjectSummaryDto, RequestSummaryDto, RunDto, SnapshotDataDto, SnapshotDto, SnapshotFence,
-    TimelineFactDto,
+    TimelineFactDto, TimelineKindDto,
 };
 
 pub use flow_editor::{

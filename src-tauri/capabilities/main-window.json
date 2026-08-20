@@ -11,6 +11,7 @@
     "allow-refresh-project",
     "allow-start-daemon",
     "allow-stop-daemon",
+    "allow-register-gui-caller",
     "allow-decide-approval",
     "allow-load-evidence",
     "allow-load-flow-workspace",

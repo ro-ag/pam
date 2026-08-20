@@ -150,6 +150,49 @@ fn ownership_rejects_a_second_daemon() {
     let _ = fs::remove_dir_all(runtime);
 }
 
+#[cfg(unix)]
+#[test]
+fn ownership_hardens_runtime_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let runtime = test_runtime("ownership-permissions");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+
+    let ownership = Ownership::acquire(&endpoint).unwrap();
+
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    drop(ownership);
+    let _ = fs::remove_dir_all(runtime);
+}
+
+#[cfg(unix)]
+#[test]
+fn ownership_rejects_a_symlink_without_truncating_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let runtime = test_runtime("ownership-symlink");
+    let _ = fs::remove_dir_all(&runtime);
+    fs::create_dir_all(&runtime).unwrap();
+    let endpoint = LocalEndpoint::ipc(runtime.clone());
+    let target = runtime.join("must-not-be-truncated");
+    fs::write(&target, b"preserve these bytes").unwrap();
+    symlink(&target, endpoint.ownership_path()).unwrap();
+
+    assert!(matches!(
+        Ownership::acquire(&endpoint),
+        Err(DaemonError::Io(_))
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"preserve these bytes");
+
+    let _ = fs::remove_dir_all(runtime);
+}
+
 #[test]
 fn model_policy_resource_binds_the_exact_redacted_runtime_effect() {
     let make = |request_id: &str,

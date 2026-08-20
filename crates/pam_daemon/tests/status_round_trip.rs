@@ -848,6 +848,47 @@ async fn project_current_and_remote_approval_decisions_are_scoped_and_fail_close
         } if result.approval_id == approval_id
             && result.disposition == ApprovalDecisionDisposition::Approved
     ));
+    let approved_retry = request_exchange(
+        &endpoint,
+        &approval_decision_request(
+            "decision-approve-retry",
+            "project-round-trip",
+            "approval-caller",
+            Some("approval-caller-credential"),
+            approval_id.clone(),
+            ProtocolApprovalDecision::Approve,
+        ),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        approved_retry.result.body,
+        ResultBody::Success {
+            payload: ResultPayload::ApprovalDecision(ref result),
+            ..
+        } if result.approval_id == approval_id
+            && result.disposition == ApprovalDecisionDisposition::Approved
+    ));
+    assert!(matches!(
+        request_exchange(
+            &endpoint,
+            &approval_decision_request(
+                "decision-approve-conflict",
+                "project-round-trip",
+                "approval-caller",
+                Some("approval-caller-credential"),
+                approval_id.clone(),
+                ProtocolApprovalDecision::Deny,
+            ),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .result
+        .body,
+        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+    ));
 
     let exact_retry = approval_project_current("current-approved", Some(approval_id.clone()));
     let current_result = request_exchange(&endpoint, &exact_retry, Duration::from_secs(1))
@@ -926,6 +967,29 @@ async fn project_current_and_remote_approval_decisions_are_scoped_and_fail_close
         } if result.approval_id == denied_id
             && result.disposition == ApprovalDecisionDisposition::Denied
     ));
+    assert!(matches!(
+        request_exchange(
+            &endpoint,
+            &approval_decision_request(
+                "decision-deny-retry",
+                "project-round-trip",
+                "approval-caller",
+                Some("approval-caller-credential"),
+                denied_id.clone(),
+                ProtocolApprovalDecision::Deny,
+            ),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .result
+        .body,
+        ResultBody::Success {
+            payload: ResultPayload::ApprovalDecision(ref result),
+            ..
+        } if result.approval_id == denied_id
+            && result.disposition == ApprovalDecisionDisposition::Denied
+    ));
 
     let store = Store::open(&state_path).unwrap();
     let now = SystemTime::now()
@@ -972,6 +1036,29 @@ async fn project_current_and_remote_approval_decisions_are_scoped_and_fail_close
     .unwrap();
     assert!(matches!(
         expired.result.body,
+        ResultBody::Success {
+            payload: ResultPayload::ApprovalDecision(ref result),
+            ..
+        } if result.approval_id == expired_id
+            && result.disposition == ApprovalDecisionDisposition::Expired
+    ));
+    assert!(matches!(
+        request_exchange(
+            &endpoint,
+            &approval_decision_request(
+                "decision-expired-retry",
+                "project-round-trip",
+                "approval-caller",
+                Some("approval-caller-credential"),
+                expired_id.clone(),
+                ProtocolApprovalDecision::Deny,
+            ),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .result
+        .body,
         ResultBody::Success {
             payload: ResultPayload::ApprovalDecision(ref result),
             ..

@@ -258,22 +258,176 @@ jobs:
       - name: Build desktop packages
         run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-      - name: Verify package output
+      - name: Verify Linux package contract
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          helper="target/$TARGET/release/pam"
+          desktop="target/$TARGET/release/pam-gui"
+          mapfile -t appimages < <(find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
+          mapfile -t debs < <(find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
+          (( ${#appimages[@]} == 1 ))
+          (( ${#debs[@]} == 1 ))
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu)
+              expected_machine="Advanced Micro Devices X86-64"
+              expected_deb_arch="amd64"
+              ;;
+            aarch64-unknown-linux-gnu)
+              expected_machine="AArch64"
+              expected_deb_arch="arm64"
+              ;;
+            *)
+              echo "unsupported Linux verification target: $TARGET" >&2
+              exit 2
+              ;;
+          esac
+          for binary in "$helper" "$desktop" "${appimages[0]}"; do
+            machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+            [[ "$machine" == "$expected_machine" ]]
+          done
+          [[ "$(dpkg-deb --field "${debs[0]}" Architecture)" == "$expected_deb_arch" ]]
+
+          expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+              const metadata = JSON.parse(input);
+              process.stdout.write(metadata.packages.find(pkg => pkg.name === "pam_cli").version);
+            });
+          ')"
+          verify_helper_contract() {
+            local candidate="$1"
+            [[ "$("$candidate" --version)" == "pam $expected_version" ]]
+            "$candidate" --help > "$RUNNER_TEMP/pam-help.txt"
+            grep -Fxq "Local project continuity companion" "$RUNNER_TEMP/pam-help.txt"
+            grep -Eq '^Usage: pam( |$)' "$RUNNER_TEMP/pam-help.txt"
+          }
+          verify_helper_contract "$helper"
+
+          deb_root="$RUNNER_TEMP/pam-deb-payload"
+          appimage_root="$RUNNER_TEMP/pam-appimage-payload"
+          mkdir -p "$deb_root" "$appimage_root"
+          dpkg-deb --extract "${debs[0]}" "$deb_root"
+          (
+            cd "$appimage_root"
+            "$GITHUB_WORKSPACE/${appimages[0]}" --appimage-extract >/dev/null
+          )
+          verify_payload() {
+            local root="$1"
+            mapfile -t binaries < <(find "$root/usr/bin" -maxdepth 1 -type f -printf '%f\n' | sort)
+            [[ "${binaries[*]}" == "pam pam-gui" ]]
+            for binary in "$root/usr/bin/pam" "$root/usr/bin/pam-gui"; do
+              machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+              [[ "$machine" == "$expected_machine" ]]
+            done
+            verify_helper_contract "$root/usr/bin/pam"
+          }
+          verify_payload "$deb_root"
+          verify_payload "$appimage_root/squashfs-root"
+
+      - name: Verify Windows package contract
+        if: ${{ matrix.family == 'windows' }}
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "target/$env:TARGET/release/bundle"
+          $helper = (Resolve-Path "target/$env:TARGET/release/pam.exe").Path
+          $desktop = (Resolve-Path "target/$env:TARGET/release/pam-gui.exe").Path
+          $installers = @(Get-ChildItem "$bundle/nsis" -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
+
+          function Assert-PeMachine([string] $Path, [UInt16] $Expected) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "$Path is not a PE executable"
+            }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "$Path has an invalid PE header offset"
+            }
+            if ([Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") {
+              throw "$Path has no PE signature"
+            }
+            $actual = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($actual -ne $Expected) {
+              throw ("{0} PE machine 0x{1:x4} != 0x{2:x4}" -f $Path, $actual, $Expected)
+            }
+          }
+
+          function Assert-HelperContract([string] $Path, [string] $ExpectedVersion) {
+            $version = (& $Path --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $version -ne "pam $ExpectedVersion") {
+              throw "unexpected PAM helper version: $version"
+            }
+            $help = (& $Path --help | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $help -notmatch '(?m)^Local project continuity companion\r?$' -or $help -notmatch '(?m)^Usage: pam(?: |\r?$)') {
+              throw "PAM helper help contract failed"
+            }
+          }
+
+          $expectedMachine = switch ($env:TARGET) {
+            'x86_64-pc-windows-msvc' { [UInt16] 0x8664 }
+            'aarch64-pc-windows-msvc' { [UInt16] 0xaa64 }
+            default { throw "unsupported Windows verification target: $env:TARGET" }
+          }
+          Assert-PeMachine $helper $expectedMachine
+          Assert-PeMachine $desktop $expectedMachine
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $expectedVersion = ($metadata.packages | Where-Object name -eq 'pam_cli').version
+          Assert-HelperContract $helper $expectedVersion
+
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles/7-Zip/7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "7-Zip is required to inspect the NSIS payload" }
+          $extract = Join-Path $env:RUNNER_TEMP 'pam-nsis'
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & $sevenZip x '-y' "-o$extract" $installers[0].FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to extract NSIS installer" }
+
+          $pamExecutables = @(Get-ChildItem $extract -Recurse -File -Filter 'pam*.exe')
+          $names = @($pamExecutables.Name | Sort-Object)
+          if (($names -join ' ') -ne 'pam-gui.exe pam.exe') {
+            throw "unexpected NSIS PAM executable inventory: $($names -join ' ')"
+          }
+          $packagedHelper = @($pamExecutables | Where-Object Name -eq 'pam.exe')
+          $packagedDesktop = @($pamExecutables | Where-Object Name -eq 'pam-gui.exe')
+          if ($packagedHelper.Count -ne 1 -or $packagedDesktop.Count -ne 1) {
+            throw "NSIS payload must contain one helper and one desktop executable"
+          }
+          Assert-PeMachine $packagedHelper[0].FullName $expectedMachine
+          Assert-PeMachine $packagedDesktop[0].FullName $expectedMachine
+          Assert-HelperContract $packagedHelper[0].FullName $expectedVersion
+          if ((Get-FileHash $helper).Hash -ne (Get-FileHash $packagedHelper[0].FullName).Hash) {
+            throw "packaged PAM helper differs from the verified target binary"
+          }
+          if ((Get-FileHash $desktop).Hash -ne (Get-FileHash $packagedDesktop[0].FullName).Hash) {
+            throw "packaged PAM desktop differs from the verified target binary"
+          }
+
+      - name: Record package output
         id: package
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          FAMILY: ${{ matrix.family }}
         run: |
           set -euo pipefail
           bundle="target/$TARGET/release/bundle"
-          if [[ "$FAMILY" == linux ]]; then
-            find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit | grep -q .
-            find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print -quit | grep -q .
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            archive="target/$TARGET/release/PAM-$TARGET-bundle.tar.gz"
+            tar -C "$bundle" -czf "$PWD/$archive" .
+            echo "path=$archive" >> "$GITHUB_OUTPUT"
           else
-            find "$bundle/nsis" -maxdepth 1 -type f -name '*.exe' -print -quit | grep -q .
+            echo "path=$bundle" >> "$GITHUB_OUTPUT"
           fi
-          echo "path=$bundle" >> "$GITHUB_OUTPUT"
 
       - name: Upload preview packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -288,7 +442,9 @@ jobs:
     needs: [rust, frontend]
     if: >-
       github.ref == 'refs/heads/main' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-macos'))
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'run-macos')
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -329,6 +485,7 @@ jobs:
           keychain="$RUNNER_TEMP/pam-build.keychain-db"
           certificate="$RUNNER_TEMP/pam-certificate.p12"
           private_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+          echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           printf '%s' "$APPLE_CERTIFICATE_BASE64_SECRET" | base64 --decode > "$certificate"
           printf '%s' "$APPLE_API_KEY_MATERIAL" > "$private_key"
           security create-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
@@ -341,7 +498,6 @@ jobs:
           [[ -n "$identity" ]]
           echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
           echo "APPLE_API_KEY_PATH=$private_key" >> "$GITHUB_ENV"
-          echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
 
       - name: Stage PAM helper
         run: node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
@@ -390,7 +546,9 @@ jobs:
             [[ "$(lipo -archs "$binary")" == arm64 ]]
             [[ "$(otool -l "$binary" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
           done
-          echo "path=$bundle" >> "$GITHUB_OUTPUT"
+          archive="target/aarch64-apple-darwin/release/PAM-macos-arm64-bundle.tar.gz"
+          tar -C "$bundle" -czf "$PWD/$archive" "macos/PAM.app" "dmg/$(basename "$dmg")"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
 
       - name: Upload signed preview package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

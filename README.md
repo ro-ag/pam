@@ -214,8 +214,16 @@ target on a native runner after the Linux Rust and frontend gates pass. The
 macOS job imports the repository's configured certificate and App Store Connect
 key into an ephemeral runner keychain, signs with the hardened runtime,
 notarizes and staples the app and DMG, validates Gatekeeper, then destroys the
-temporary signing material. It does not create a release, tag, or public
-download.
+temporary signing material. Successful runs retain short-lived CI artifacts
+for seven days; because this repository is public, those artifacts are public
+to repository readers. They are previews, not a tagged GitHub Release, and no
+package registry is published.
+
+Project continuity still requires a local `ptrack` installation. Desktop
+launches resolve it from an explicit absolute `PAM_PTRACK_EXECUTABLE`, beside
+the application, common per-user install directories such as `~/.local/bin`,
+and finally `PATH`, so Finder and desktop-menu launches do not depend on an
+interactive shell profile.
 
 For an unsigned local Apple Silicon build:
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -18,12 +19,13 @@ use uuid::Uuid;
 use crate::{
     access_config::{AccessConfigState, AccessConfigView},
     control_center::{
-        HealthState, MAX_PROJECTS, bounded_name, load_credential, load_project_surfaces,
-        project_name, request_daemon_stop_authenticated,
+        HealthState, MAX_PROJECTS, bounded_name, load_credential, load_project_health_access,
+        load_project_surfaces, project_name, request_daemon_stop_authenticated,
     },
     current::{
-        CurrentState, CurrentView, EvidencePreview, EvidenceState, OutcomeView, PendingApproval,
-        RunView, TimelineFact, decide_current_approval, load_evidence,
+        ApprovalDecisionFailure, ApprovalDecisionView, CurrentState, CurrentUnavailableCode,
+        CurrentView, EvidencePreview, EvidenceState, OutcomeView, PendingApproval, RunView,
+        TimelineFact, TimelineKind, decide_current_approval, load_evidence,
     },
     flow_editor::{
         ActionAuthority, DaemonAuthority, DryRunCondition, FlowDryRunPlan, FlowEditorDocument,
@@ -37,6 +39,9 @@ const MAX_PROJECT_PATH_BYTES: usize = 4 * 1024;
 const MAX_TIMELINE_FACTS: usize = 256;
 const MAX_EVIDENCE_HANDLES: usize = 256;
 const STARTUP_DELAY: Duration = Duration::from_millis(500);
+const GUI_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(15);
+const GUI_REGISTRATION_ARGS: [&str; 4] = ["caller", "register", "--kind", "gui"];
+const GUI_REGISTRATION_RECOVERY: &str = "Use Register GUI caller in PAM.";
 
 macro_rules! uuid_handle {
     ($name:ident) => {
@@ -218,7 +223,11 @@ pub struct SnapshotDataDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum HealthDto {
     Healthy {
         daemon_version: String,
@@ -248,7 +257,11 @@ pub struct FailureDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum AccessConfigDto {
     Available {
         truth: String,
@@ -269,7 +282,11 @@ pub enum AccessConfigDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum CurrentDto {
     Available {
         queued: Vec<RequestSummaryDto>,
@@ -311,10 +328,21 @@ pub struct RunDto {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimelineFactDto {
+    pub kind: TimelineKindDto,
     pub label: String,
     pub summary: String,
     pub verified: bool,
     pub evidence: Vec<EvidenceHandleDto>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineKindDto {
+    Request,
+    Evidence,
+    Change,
+    Verification,
+    Failure,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -340,6 +368,31 @@ pub struct OutcomeSectionDto {
 pub enum ApprovalDecisionDto {
     Approve,
     Deny,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionDispositionDto {
+    Approved,
+    Denied,
+    Expired,
+}
+
+impl From<pam_protocol::ApprovalDecisionDisposition> for ApprovalDecisionDispositionDto {
+    fn from(value: pam_protocol::ApprovalDecisionDisposition) -> Self {
+        match value {
+            pam_protocol::ApprovalDecisionDisposition::Approved => Self::Approved,
+            pam_protocol::ApprovalDecisionDisposition::Denied => Self::Denied,
+            pam_protocol::ApprovalDecisionDisposition::Expired => Self::Expired,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalDecisionResponseDto {
+    pub disposition: ApprovalDecisionDispositionDto,
+    pub snapshot: SnapshotDto,
 }
 
 impl From<ApprovalDecisionDto> for ApprovalDecision {
@@ -838,10 +891,7 @@ impl DesktopCore {
         let caller = caller_id(CallerKind::Gui)
             .map_err(|error| DesktopErrorDto::unavailable(error.to_string(), None))?;
         let credential = load_credential(caller.clone()).await.map_err(|detail| {
-            DesktopErrorDto::unavailable(
-                detail,
-                Some("Run `pam caller register --kind gui`.".to_owned()),
-            )
+            DesktopErrorDto::unavailable(detail, Some(GUI_REGISTRATION_RECOVERY.to_owned()))
         })?;
         request_daemon_stop_authenticated(
             caller.clone(),
@@ -858,6 +908,27 @@ impl DesktopCore {
         finish_snapshot_locked(&mut state, fence, active, surfaces)
     }
 
+    /// Registers the GUI caller through the bundled PAM helper and refreshes
+    /// the authenticated project snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the fence is stale, the fixed helper
+    /// cannot be started, registration fails, or the helper exceeds its
+    /// deadline.
+    pub async fn register_gui_caller(&self, fence: CommandFence) -> DesktopResult<SnapshotDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let (executable, root) = {
+            let state = self.inner.lock().await;
+            ensure_active_matches(&state, &active, &fence)?;
+            (state.daemon_executable.clone(), active.catalog.root.clone())
+        };
+        run_gui_registration(&executable, &root).await?;
+        let surfaces = load_surfaces(active.project_id.clone()).await;
+        self.finish_snapshot(fence, active, surfaces).await
+    }
+
     /// Applies a decision to the exact retained approval request.
     ///
     /// # Errors
@@ -869,14 +940,29 @@ impl DesktopCore {
         fence: CommandFence,
         approval: ApprovalHandle,
         decision: ApprovalDecisionDto,
-    ) -> DesktopResult<SnapshotDto> {
+    ) -> DesktopResult<ApprovalDecisionResponseDto> {
+        self.decide_approval_with(fence, approval, decision, decide_current_approval)
+            .await
+    }
+
+    async fn decide_approval_with<F, Fut>(
+        &self,
+        fence: CommandFence,
+        approval: ApprovalHandle,
+        decision: ApprovalDecisionDto,
+        decide: F,
+    ) -> DesktopResult<ApprovalDecisionResponseDto>
+    where
+        F: FnOnce(PendingApproval, ApprovalDecision) -> Fut,
+        Fut: Future<Output = Result<ApprovalDecisionView, ApprovalDecisionFailure>>,
+    {
         let _command = self.command_gate.lock().await;
         approval.validate()?;
         let active = self.begin(&fence).await?;
         let pending = {
-            let mut state = self.inner.lock().await;
+            let state = self.inner.lock().await;
             ensure_active_matches(&state, &active, &fence)?;
-            state.approvals.remove(&approval).ok_or_else(|| {
+            state.approvals.get(&approval).cloned().ok_or_else(|| {
                 DesktopErrorDto::stale("The approval handle is no longer current.")
             })?
         };
@@ -885,9 +971,20 @@ impl DesktopCore {
                 "The approval belongs to another project.",
             ));
         }
-        let _decision_state = decide_current_approval(pending, decision.into()).await;
-        let surfaces = load_surfaces(active.project_id.clone()).await;
-        self.finish_snapshot(fence, active, surfaces).await
+        let decision = decide(pending, decision.into())
+            .await
+            .map_err(|failure| DesktopErrorDto::unavailable(failure.detail, failure.recovery))?;
+        let disposition = decision.disposition.into();
+        let project_id = active.project_id.clone();
+        let surfaces = approval_surfaces_with(decision.current, || async move {
+            load_health_access(project_id).await
+        })
+        .await;
+        let snapshot = self.finish_snapshot(fence, active, surfaces).await?;
+        Ok(ApprovalDecisionResponseDto {
+            disposition,
+            snapshot,
+        })
     }
 
     /// Loads a bounded 4 KiB preview through an opaque evidence handle.
@@ -914,10 +1011,7 @@ impl DesktopCore {
         let caller = caller_id(CallerKind::Gui)
             .map_err(|error| DesktopErrorDto::unavailable(error.to_string(), None))?;
         let credential = load_credential(caller.clone()).await.map_err(|detail| {
-            DesktopErrorDto::unavailable(
-                detail,
-                Some("Run `pam caller register --kind gui`.".to_owned()),
-            )
+            DesktopErrorDto::unavailable(detail, Some(GUI_REGISTRATION_RECOVERY.to_owned()))
         })?;
         let evidence = load_evidence(
             caller,
@@ -1077,7 +1171,7 @@ impl DesktopCore {
         workspace
             .model
             .reload()
-            .map_err(|error| flow_error(&error))?;
+            .map_err(|error| post_save_reload_error(&error))?;
         let data = FlowSaveDataDto {
             document,
             identity: identity_dto(saved.identity()),
@@ -1138,6 +1232,43 @@ fn default_daemon_executable() -> PathBuf {
     )
 }
 
+fn gui_registration_command(executable: &Path, root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(GUI_REGISTRATION_ARGS)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+async fn run_gui_registration(executable: &Path, root: &Path) -> DesktopResult<()> {
+    let mut command = gui_registration_command(executable, root);
+    let status = tokio::time::timeout(GUI_REGISTRATION_TIMEOUT, command.status())
+        .await
+        .map_err(|_| {
+            DesktopErrorDto::unavailable(
+                "PAM GUI caller registration exceeded its 15 second deadline.",
+                Some("Retry GUI caller registration.".to_owned()),
+            )
+        })?
+        .map_err(|error| {
+            DesktopErrorDto::unavailable(
+                "PAM could not start its bundled caller-registration helper.",
+                Some(error.to_string()),
+            )
+        })?;
+    if !status.success() {
+        return Err(DesktopErrorDto::unavailable(
+            format!("PAM GUI caller registration failed with {status}."),
+            Some("Retry registration or inspect the local PAM data store.".to_owned()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn executable_name(stem: &str) -> String {
     format!("{stem}.exe")
@@ -1157,16 +1288,11 @@ struct SurfaceBundle {
 async fn load_surfaces(project_id: ProjectId) -> SurfaceBundle {
     let caller = match caller_id(CallerKind::Gui) {
         Ok(caller) => caller,
-        Err(error) => return unavailable_bundle(error.to_string(), None),
+        Err(error) => return unavailable_bundle(error.to_string(), None, None),
     };
     let credential = match load_credential(caller.clone()).await {
         Ok(credential) => credential,
-        Err(detail) => {
-            return unavailable_bundle(
-                detail,
-                Some("Run `pam caller register --kind gui`.".to_owned()),
-            );
-        }
+        Err(detail) => return gui_registration_required_bundle(detail),
     };
     load_surfaces_with_credential(caller, credential, project_id).await
 }
@@ -1184,13 +1310,72 @@ async fn load_surfaces_with_credential(
     }
 }
 
-fn unavailable_bundle(detail: String, recovery: Option<String>) -> SurfaceBundle {
+async fn load_health_access(project_id: ProjectId) -> (HealthState, AccessConfigState) {
+    let caller = match caller_id(CallerKind::Gui) {
+        Ok(caller) => caller,
+        Err(error) => {
+            return unavailable_health_access(error.to_string(), None);
+        }
+    };
+    let credential = match load_credential(caller.clone()).await {
+        Ok(credential) => credential,
+        Err(detail) => {
+            return unavailable_health_access(detail, Some(GUI_REGISTRATION_RECOVERY.to_owned()));
+        }
+    };
+    load_project_health_access(caller, credential, project_id).await
+}
+
+async fn approval_surfaces_with<F, Fut>(current: CurrentState, load: F) -> SurfaceBundle
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = (HealthState, AccessConfigState)>,
+{
+    let (health, access) = load().await;
+    SurfaceBundle {
+        health,
+        current,
+        access,
+    }
+}
+
+fn unavailable_health_access(
+    detail: String,
+    recovery: Option<String>,
+) -> (HealthState, AccessConfigState) {
+    (
+        HealthState::Degraded {
+            detail: detail.clone(),
+            recovery: recovery.clone(),
+        },
+        AccessConfigState::Unavailable {
+            code: None,
+            detail,
+            recovery,
+        },
+    )
+}
+
+fn gui_registration_required_bundle(detail: String) -> SurfaceBundle {
+    unavailable_bundle(
+        detail,
+        Some(GUI_REGISTRATION_RECOVERY.to_owned()),
+        Some(CurrentUnavailableCode::GuiRegistrationRequired),
+    )
+}
+
+fn unavailable_bundle(
+    detail: String,
+    recovery: Option<String>,
+    current_code: Option<CurrentUnavailableCode>,
+) -> SurfaceBundle {
     SurfaceBundle {
         health: HealthState::Degraded {
             detail: detail.clone(),
             recovery: recovery.clone(),
         },
         current: CurrentState::Degraded {
+            code: current_code,
             detail: detail.clone(),
             recovery: recovery.clone(),
         },
@@ -1313,8 +1498,16 @@ fn current_dto(state: &mut DesktopState, current: CurrentState) -> CurrentDto {
         } => CurrentDto::Blocked {
             failure: failure_dto(&code, detail, recovery),
         },
-        CurrentState::Degraded { detail, recovery } => CurrentDto::Unavailable {
-            failure: unavailable_failure(None, detail, recovery),
+        CurrentState::Degraded {
+            code,
+            detail,
+            recovery,
+        } => CurrentDto::Unavailable {
+            failure: unavailable_failure(
+                code.map(|code| code.as_str().to_owned()),
+                detail,
+                recovery,
+            ),
         },
     }
 }
@@ -1365,6 +1558,7 @@ const fn request_state_label(state: ProjectRequestState) -> &'static str {
 
 fn timeline_dto(state: &mut DesktopState, fact: TimelineFact) -> TimelineFactDto {
     TimelineFactDto {
+        kind: timeline_kind_dto(fact.kind),
         label: bounded_detail(fact.label),
         summary: bounded_detail(fact.summary),
         verified: fact.verified,
@@ -1374,6 +1568,16 @@ fn timeline_dto(state: &mut DesktopState, fact: TimelineFact) -> TimelineFactDto
             .take(MAX_EVIDENCE_HANDLES)
             .map(|handle| register_evidence(state, handle))
             .collect(),
+    }
+}
+
+const fn timeline_kind_dto(kind: TimelineKind) -> TimelineKindDto {
+    match kind {
+        TimelineKind::Request => TimelineKindDto::Request,
+        TimelineKind::Evidence => TimelineKindDto::Evidence,
+        TimelineKind::Change => TimelineKindDto::Change,
+        TimelineKind::Verification => TimelineKindDto::Verification,
+        TimelineKind::Failure => TimelineKindDto::Failure,
     }
 }
 
@@ -1686,6 +1890,14 @@ fn flow_error(error: &FlowEditorError) -> DesktopErrorDto {
     DesktopErrorDto::new(kind, error.to_string(), None)
 }
 
+fn post_save_reload_error(error: &FlowEditorError) -> DesktopErrorDto {
+    DesktopErrorDto::new(
+        DesktopErrorKind::Unavailable,
+        format!("The flow was saved, but PAM could not refresh the flow workspace: {error}"),
+        Some("Reload the flow workspace before opening or saving another definition.".to_owned()),
+    )
+}
+
 fn bounded_detail(value: String) -> String {
     bounded_utf8(value, MAX_DETAILS_BYTES)
 }
@@ -1728,6 +1940,11 @@ pub(crate) fn bounded_detail_for_test(value: String) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn post_save_reload_error_for_test(error: &FlowEditorError) -> DesktopErrorDto {
+    post_save_reload_error(error)
+}
+
+#[cfg(test)]
 pub(crate) fn current_dto_for_test(current: CurrentState) -> CurrentDto {
     let mut state = test_state();
     current_dto(&mut state, current)
@@ -1744,6 +1961,90 @@ pub(crate) fn evidence_dto_for_test(
     preview: EvidencePreview,
 ) -> EvidenceDataDto {
     evidence_preview_dto(handle, preview)
+}
+
+#[cfg(test)]
+pub(crate) async fn approval_current_for_test(
+    current: CurrentState,
+    calls: &std::sync::atomic::AtomicUsize,
+) -> CurrentState {
+    approval_surfaces_with(current, || async {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (
+            HealthState::Offline,
+            AccessConfigState::Unavailable {
+                code: None,
+                detail: "test access".to_owned(),
+                recovery: None,
+            },
+        )
+    })
+    .await
+    .current
+}
+
+#[cfg(test)]
+pub(crate) fn gui_registration_current_for_test(detail: String) -> CurrentDto {
+    let mut state = test_state();
+    current_dto(&mut state, gui_registration_required_bundle(detail).current)
+}
+
+#[cfg(test)]
+pub(crate) async fn approval_failure_retains_handle_for_test(
+    core: &DesktopCore,
+    fence: CommandFence,
+    approval: ApprovalHandle,
+    pending: PendingApproval,
+) -> (DesktopErrorDto, bool, bool) {
+    let retry_fence = CommandFence::new(
+        fence.project_handle.clone(),
+        fence.generation.clone(),
+        OperationId::new(),
+    );
+    core.inner
+        .lock()
+        .await
+        .approvals
+        .insert(approval.clone(), pending);
+    let error = core
+        .decide_approval_with(
+            fence,
+            approval.clone(),
+            ApprovalDecisionDto::Approve,
+            |_, _| async {
+                Err::<ApprovalDecisionView, _>(ApprovalDecisionFailure {
+                    detail: "The approval response was not observed.".to_owned(),
+                    recovery: Some("Retry the exact decision.".to_owned()),
+                })
+            },
+        )
+        .await
+        .expect_err("the injected transport failure must be returned");
+    let retained = core.inner.lock().await.approvals.contains_key(&approval);
+    let retry_authorized = core.begin(&retry_fence).await.is_ok()
+        && core.inner.lock().await.approvals.contains_key(&approval);
+    (error, retained, retry_authorized)
+}
+
+#[cfg(test)]
+pub(crate) fn registration_contract_for_test(
+    executable: &Path,
+    root: &Path,
+) -> (
+    PathBuf,
+    Vec<std::ffi::OsString>,
+    Option<PathBuf>,
+    bool,
+    Duration,
+) {
+    let command = gui_registration_command(executable, root);
+    (
+        command.as_std().get_program().into(),
+        command.as_std().get_args().map(Into::into).collect(),
+        command.as_std().get_current_dir().map(PathBuf::from),
+        command.get_kill_on_drop(),
+        GUI_REGISTRATION_TIMEOUT,
+    )
 }
 
 #[cfg(test)]

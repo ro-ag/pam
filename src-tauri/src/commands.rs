@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use pam_gui::{
-    ApprovalDecisionDto, ApprovalHandle, CatalogDto, CommandFence, DesktopCore, DesktopErrorDto,
-    EvidenceDto, EvidenceHandleDto, FlowDefinitionHandle, FlowDocumentDto, FlowDocumentHandle,
-    FlowReviewDto, FlowSaveDto, FlowWorkspaceDto, GenerationId, OperationId, ProjectHandle,
-    SnapshotDto,
+    ApprovalDecisionDto, ApprovalDecisionResponseDto, ApprovalHandle, CatalogDto, CommandFence,
+    DesktopCore, DesktopErrorDto, EvidenceDto, EvidenceHandleDto, FlowDefinitionHandle,
+    FlowDocumentDto, FlowDocumentHandle, FlowReviewDto, FlowSaveDto, FlowWorkspaceDto,
+    GenerationId, OperationId, ProjectHandle, SnapshotDto,
 };
 use serde::{Deserialize, Deserializer, de::Error as _};
 use tauri::State;
@@ -199,10 +199,18 @@ pub(crate) async fn stop_daemon(
 }
 
 #[tauri::command]
+pub(crate) async fn register_gui_caller(
+    state: State<'_, DesktopState>,
+    request: FencedRequest,
+) -> Result<SnapshotDto, DesktopErrorDto> {
+    state.core.register_gui_caller(request.into_fence()).await
+}
+
+#[tauri::command]
 pub(crate) async fn decide_approval(
     state: State<'_, DesktopState>,
     request: ApprovalRequest,
-) -> Result<SnapshotDto, DesktopErrorDto> {
+) -> Result<ApprovalDecisionResponseDto, DesktopErrorDto> {
     state
         .core
         .decide_approval(

@@ -3353,7 +3353,7 @@ fn decide_approval(
     }
     let approval = transaction
         .query_row(
-            "SELECT state, expires_at_ms
+            "SELECT state, expires_at_ms, decided_by
              FROM approvals
              WHERE approval_id = ?1
                AND (?2 IS NULL OR (project_id = ?2 AND caller_id = ?3))",
@@ -3362,14 +3362,30 @@ fn decide_approval(
                 project_id.map(ProjectId::as_str),
                 approver_id.as_str()
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((state, expires_at)) = approval else {
+    let Some((state, expires_at, decided_by)) = approval else {
         return Err(StoreError::ApprovalNotFound(approval_id.clone()));
     };
-    if state != "requested" {
-        return Err(StoreError::InvalidApprovalState);
+    match (state.as_str(), decision, decided_by.as_deref()) {
+        ("approved", ApprovalDecision::Approve, Some(decider))
+            if decider == approver_id.as_str() =>
+        {
+            return Ok(ApprovalDecisionOutcome::Approved);
+        }
+        ("denied", ApprovalDecision::Deny, Some(decider)) if decider == approver_id.as_str() => {
+            return Ok(ApprovalDecisionOutcome::Denied);
+        }
+        ("expired", _, _) => return Ok(ApprovalDecisionOutcome::Expired),
+        ("requested", _, None) => {}
+        _ => return Err(StoreError::InvalidApprovalState),
     }
     if now_ms >= unsigned_integer(expires_at)? {
         transaction.execute(

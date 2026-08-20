@@ -59,6 +59,7 @@ export interface RequestSummaryDto {
 }
 
 export interface TimelineFactDto {
+  kind: "request" | "evidence" | "change" | "verification" | "failure";
   label: string;
   summary: string;
   verified: boolean;
@@ -102,6 +103,11 @@ export interface SnapshotDataDto {
 
 export type SnapshotDto = FencedResponse<SnapshotDataDto>;
 export type BootstrapResponse = SnapshotDto;
+
+export interface ApprovalDecisionResponseDto {
+  disposition: "approved" | "denied" | "expired";
+  snapshot: SnapshotDto;
+}
 
 export interface EvidenceDataDto {
   handle: string;
@@ -199,7 +205,8 @@ export interface PamBridge {
   refreshProject(fence: CommandFence): Promise<SnapshotDto>;
   startDaemon(fence: CommandFence): Promise<SnapshotDto>;
   stopDaemon(fence: CommandFence): Promise<SnapshotDto>;
-  decideApproval(fence: CommandFence, approvalHandle: string, decision: ApprovalDecision): Promise<SnapshotDto>;
+  registerGuiCaller(fence: CommandFence): Promise<SnapshotDto>;
+  decideApproval(fence: CommandFence, approvalHandle: string, decision: ApprovalDecision): Promise<ApprovalDecisionResponseDto>;
   loadEvidence(fence: CommandFence, evidenceHandle: string): Promise<EvidenceDto>;
   loadFlowWorkspace(fence: CommandFence): Promise<FlowWorkspaceDto>;
   openFlow(fence: CommandFence, flowHandle: string): Promise<FlowDocumentDto>;

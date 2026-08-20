@@ -63,6 +63,17 @@ pub(crate) async fn load_project_surfaces(
     )
 }
 
+pub(crate) async fn load_project_health_access(
+    caller_id: CallerId,
+    credential: CallerCredential,
+    project_id: ProjectId,
+) -> (HealthState, AccessConfigState) {
+    tokio::join!(
+        probe_health_authenticated(caller_id.clone(), credential.clone(), project_id.clone()),
+        load_access_config(caller_id, credential, project_id),
+    )
+}
+
 pub(crate) async fn load_credential(caller_id: CallerId) -> Result<CallerCredential, String> {
     tokio::task::spawn_blocking(move || {
         let locator = SecretLocator::for_caller(&caller_id).map_err(|error| error.to_string())?;

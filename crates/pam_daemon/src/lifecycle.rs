@@ -1,7 +1,8 @@
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt as _;
 use std::{
     collections::HashMap,
-    fmt,
-    fs::{self, OpenOptions},
+    fmt, fs,
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -13,6 +14,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use cap_fs_ext::OsMetadataExt as _;
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, ambient_authority};
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt as _;
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use nix::unistd::Uid;
 use pam_core::{
     APPLICATION_VERSION, ApprovalId, ContentDigest, EvidenceHandle, ProjectId, RequestId,
 };
@@ -3598,13 +3607,26 @@ pub(super) struct Ownership {
 
 impl Ownership {
     pub(super) fn acquire(endpoint: &LocalEndpoint) -> Result<Self, DaemonError> {
-        fs::create_dir_all(endpoint.runtime_dir())?;
-        let mut file = OpenOptions::new()
+        let runtime = open_private_runtime_dir(endpoint.runtime_dir())?;
+        let ownership_name = endpoint
+            .ownership_path()
+            .strip_prefix(endpoint.runtime_dir())
+            .ok()
+            .filter(|path| path.components().count() == 1)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "daemon ownership path must be a direct runtime-directory child",
+                )
+            })?;
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(endpoint.ownership_path())?;
+            .follow(FollowSymlinks::No);
+        let mut file = runtime.open_with(ownership_name, &options)?.into_std();
         file.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => DaemonError::AlreadyRunning,
             fs::TryLockError::Error(error) => DaemonError::Io(error),
@@ -3613,4 +3635,66 @@ impl Ownership {
         writeln!(file, "{}", std::process::id())?;
         Ok(Self { _file: file })
     }
+}
+
+fn open_private_runtime_dir(path: &Path) -> Result<Dir, std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must have a parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon runtime directory must have a final component",
+        )
+    })?;
+
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
+    let runtime = parent.open_dir_nofollow(name)?;
+    #[cfg(unix)]
+    harden_unix_runtime_dir(&runtime)?;
+    Ok(runtime)
+}
+
+#[cfg(unix)]
+fn harden_unix_runtime_dir(runtime: &Dir) -> Result<(), std::io::Error> {
+    let metadata = runtime.dir_metadata()?;
+    if metadata.uid() != Uid::effective().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon runtime directory is owned by another user",
+        ));
+    }
+
+    runtime.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
+    if runtime.dir_metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon runtime directory is accessible by another user",
+        ));
+    }
+    Ok(())
 }

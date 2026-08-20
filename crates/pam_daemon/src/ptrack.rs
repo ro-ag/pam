@@ -45,7 +45,7 @@ impl PtrackBriefProvider {
         Self {
             directory,
             project_id,
-            executable: OsString::from("ptrack"),
+            executable: resolve_ptrack_executable(),
         }
     }
 
@@ -436,14 +436,66 @@ pub(super) fn validate_registered_project(bytes: &[u8], directory: &Path) -> Res
 /// Returns a sanitized error when ptrack is unavailable, exceeds its deadline,
 /// or returns an incompatible or unbounded project catalog.
 pub async fn registered_projects(directory: &Path) -> Result<Vec<RegisteredProject>, String> {
+    let executable = resolve_ptrack_executable();
     let bytes = run_command(
-        &OsString::from("ptrack"),
+        &executable,
         directory,
         &["projects", "--json"],
         "ptrack projects --json",
     )
     .await?;
     parse_registered_projects(&bytes)
+}
+
+fn resolve_ptrack_executable() -> OsString {
+    let executable_name = if cfg!(windows) {
+        "ptrack.exe"
+    } else {
+        "ptrack"
+    };
+    let mut candidates = Vec::new();
+
+    if let Some(configured) = std::env::var_os("PAM_PTRACK_EXECUTABLE") {
+        let configured = PathBuf::from(configured);
+        if configured.is_absolute() {
+            candidates.push(configured);
+        }
+    }
+    if let Ok(current_executable) = std::env::current_exe()
+        && let Some(directory) = current_executable.parent()
+    {
+        candidates.push(directory.join(executable_name));
+    }
+    if let Some(home) = user_home_directory() {
+        candidates.extend([
+            home.join(".local").join("bin").join(executable_name),
+            home.join(".cargo").join("bin").join(executable_name),
+            home.join("go").join("bin").join(executable_name),
+        ]);
+    }
+    if !cfg!(windows) {
+        candidates.extend([
+            PathBuf::from("/opt/homebrew/bin").join(executable_name),
+            PathBuf::from("/usr/local/bin").join(executable_name),
+        ]);
+    }
+
+    first_existing_executable(candidates).unwrap_or_else(|| OsString::from(executable_name))
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+pub(super) fn first_existing_executable(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<OsString> {
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(PathBuf::into_os_string)
 }
 
 fn parse_registered_projects(bytes: &[u8]) -> Result<Vec<RegisteredProject>, String> {

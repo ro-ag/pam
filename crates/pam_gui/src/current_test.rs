@@ -1,10 +1,14 @@
 use pam_core::{ApprovalId, CallerId, IdempotencyKey, ProjectId, RequestId};
-use pam_flow::{EffectReport, FlowSemanticEvent, FlowWaitReason, RunOutcome};
-use pam_protocol::{ApprovalChallenge, Failure, FailureCode, RequestEnvelope};
+use pam_flow::{EffectReport, FlowSemanticEvent, FlowWaitReason, RunOutcome, TransitionKind};
+use pam_protocol::{
+    ApprovalChallenge, Event, EventEnvelope, Failure, FailureCode, PROTOCOL_VERSION,
+    RequestEnvelope,
+};
 
 use super::current::{
-    CurrentState, failure_state_for_test, outcome_heading_for_test, pending_approval_for_test,
-    timeline_semantic_for_test,
+    CurrentState, TimelineKind, failure_state_for_test, outcome_heading_for_test,
+    pending_approval_for_test, timeline_from_events, timeline_semantic_for_test,
+    timeline_transition_for_test,
 };
 
 #[test]
@@ -18,6 +22,7 @@ fn semantic_timeline_preserves_truthful_verification_and_evidence() {
 
     assert_eq!(fact.label, "Verification passed");
     assert_eq!(fact.summary, "All checks passed.");
+    assert_eq!(fact.kind, TimelineKind::Verification);
     assert!(fact.verified);
     assert_eq!(fact.evidence, vec![evidence]);
 }
@@ -53,8 +58,94 @@ fn waiting_semantics_do_not_claim_completion() {
     });
 
     assert_eq!(fact.label, "Waiting");
+    assert_eq!(fact.kind, TimelineKind::Request);
     assert!(!fact.verified);
     assert!(fact.summary.contains("approval"));
+}
+
+#[test]
+fn semantic_timeline_assigns_evidence_at_the_event_boundary() {
+    let fact = timeline_semantic_for_test(&FlowSemanticEvent::EvidenceFound {
+        step_id: "inspect".to_owned(),
+        evidence: vec![pam_flow::EvidenceHandle::parse("evidence://ci/run/inspect").unwrap()],
+    });
+
+    assert_eq!(fact.kind, TimelineKind::Evidence);
+}
+
+#[test]
+fn generic_terminal_completion_is_neutral_and_never_claims_verification() {
+    let facts = timeline_from_events(&[EventEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: RequestId::new("completed"),
+        project_id: ProjectId::new("project"),
+        sequence: 1,
+        event: Event::Completed,
+    }]);
+
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].kind, TimelineKind::Request);
+    assert!(!facts[0].verified);
+}
+
+#[test]
+fn transition_timeline_kind_is_semantic_not_label_derived() {
+    let cases = [
+        (
+            TransitionKind::ApprovalRequested {
+                step_id: "deploy".to_owned(),
+            },
+            TimelineKind::Request,
+        ),
+        (
+            TransitionKind::EffectSucceeded {
+                step_id: "deploy".to_owned(),
+                attempt: 1,
+            },
+            TimelineKind::Change,
+        ),
+        (
+            TransitionKind::RunCompleted {
+                outcome: RunOutcome::Solved,
+            },
+            TimelineKind::Request,
+        ),
+        (
+            TransitionKind::EffectFailed {
+                step_id: "deploy".to_owned(),
+                attempt: 1,
+            },
+            TimelineKind::Failure,
+        ),
+    ];
+
+    for (transition, expected) in cases {
+        assert_eq!(timeline_transition_for_test(&transition).kind, expected);
+    }
+}
+
+#[test]
+fn solved_terminal_transition_is_neutral_without_a_typed_verification_event() {
+    let fact = timeline_transition_for_test(&TransitionKind::RunCompleted {
+        outcome: RunOutcome::Solved,
+    });
+
+    assert_eq!(fact.kind, TimelineKind::Request);
+    assert!(!fact.verified);
+}
+
+#[test]
+fn non_solved_terminal_transitions_never_claim_verification() {
+    for outcome in [
+        RunOutcome::Unresolved,
+        RunOutcome::Blocked,
+        RunOutcome::Cancelled,
+    ] {
+        let fact = timeline_transition_for_test(&TransitionKind::RunCompleted { outcome });
+
+        assert_eq!(fact.kind, TimelineKind::Failure);
+        assert!(!fact.verified);
+    }
 }
 
 #[test]

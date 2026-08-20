@@ -24,9 +24,24 @@ pub(crate) enum CurrentState {
         recovery: Option<String>,
     },
     Degraded {
+        code: Option<CurrentUnavailableCode>,
         detail: String,
         recovery: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CurrentUnavailableCode {
+    GuiRegistrationRequired,
+}
+
+impl CurrentUnavailableCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::GuiRegistrationRequired => "gui_registration_required",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,10 +61,20 @@ pub(crate) struct RunView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TimelineFact {
+    pub(crate) kind: TimelineKind,
     pub(crate) label: String,
     pub(crate) summary: String,
     pub(crate) verified: bool,
     pub(crate) evidence: Vec<EvidenceHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TimelineKind {
+    Request,
+    Evidence,
+    Change,
+    Verification,
+    Failure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +97,18 @@ pub(crate) struct OutcomeView {
 pub(crate) struct PendingApproval {
     pub(crate) challenge: ApprovalChallenge,
     request: Box<RequestEnvelope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApprovalDecisionView {
+    pub(crate) disposition: ApprovalDecisionDisposition,
+    pub(crate) current: CurrentState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApprovalDecisionFailure {
+    pub(crate) detail: String,
+    pub(crate) recovery: Option<String>,
 }
 
 impl PendingApproval {
@@ -125,12 +162,12 @@ pub(crate) async fn load_current(
 pub(crate) async fn decide_current_approval(
     pending: PendingApproval,
     decision: ApprovalDecision,
-) -> CurrentState {
+) -> Result<ApprovalDecisionView, ApprovalDecisionFailure> {
     let Some(credential) = pending.request.authentication.clone() else {
-        return degraded(
+        return Err(approval_decision_failure(
             "The retained approval request is no longer authenticated.",
             None,
-        );
+        ));
     };
     let request = RequestEnvelope::approval_decide(
         unique_request_id("gui-approval"),
@@ -150,36 +187,60 @@ pub(crate) async fn decide_current_approval(
     {
         Ok(exchange) => exchange,
         Err(error) => {
-            return degraded(
+            return Err(approval_decision_failure(
                 error.to_string(),
                 error.recovery_action().map(str::to_owned),
-            );
+            ));
         }
     };
     if !exchange.events.is_empty() {
-        return degraded("PAM returned events for an approval decision.", None);
+        return Err(approval_decision_failure(
+            "PAM returned events for an approval decision.",
+            None,
+        ));
     }
     match exchange.result.body {
         ResultBody::Success {
             payload: ResultPayload::ApprovalDecision(result),
             ..
-        } if result.approval_id == pending.challenge.approval_id => match result.disposition {
-            ApprovalDecisionDisposition::Approved => {
-                let retry = (*pending.request).with_approval(result.approval_id);
-                load_current_request(retry).await
-            }
-            ApprovalDecisionDisposition::Denied => {
-                degraded("This exact project-current request was denied.", None)
-            }
-            ApprovalDecisionDisposition::Expired => degraded(
-                "This approval expired before the decision was applied.",
-                Some("Retry the project-current request to receive a new challenge.".to_owned()),
-            ),
-        },
-        ResultBody::Failure(failure) => failure_state(failure),
-        ResultBody::Success { .. } => {
-            degraded("PAM returned an unexpected approval response.", None)
+        } if result.approval_id == pending.challenge.approval_id => {
+            let current = match result.disposition {
+                ApprovalDecisionDisposition::Approved => {
+                    let retry = (*pending.request).with_approval(result.approval_id);
+                    load_current_request(retry).await
+                }
+                ApprovalDecisionDisposition::Denied => {
+                    degraded("This exact project-current request was denied.", None)
+                }
+                ApprovalDecisionDisposition::Expired => degraded(
+                    "This approval expired before the decision was applied.",
+                    Some(
+                        "Retry the project-current request to receive a new challenge.".to_owned(),
+                    ),
+                ),
+            };
+            Ok(ApprovalDecisionView {
+                disposition: result.disposition,
+                current,
+            })
         }
+        ResultBody::Failure(failure) => {
+            Err(approval_decision_failure(failure.message, failure.recovery))
+        }
+        ResultBody::Success { .. } => Err(approval_decision_failure(
+            "PAM returned an unexpected approval response.",
+            None,
+        )),
+    }
+}
+
+fn approval_decision_failure(
+    detail: impl Into<String>,
+    recovery: Option<String>,
+) -> ApprovalDecisionFailure {
+    ApprovalDecisionFailure {
+        detail: detail.into(),
+        recovery,
     }
 }
 
@@ -448,25 +509,48 @@ pub(crate) fn timeline_from_events(events: &[EventEnvelope]) -> Vec<TimelineFact
     let mut facts = Vec::new();
     for envelope in events {
         match &envelope.event {
-            Event::Accepted => facts.push(fact("Request received", "PAM accepted the run.", false)),
-            Event::Started => facts.push(fact("Run started", "PAM began the run.", false)),
+            Event::Accepted => facts.push(fact(
+                TimelineKind::Request,
+                "Request received",
+                "PAM accepted the run.",
+                false,
+            )),
+            Event::Started => facts.push(fact(
+                TimelineKind::Request,
+                "Run started",
+                "PAM began the run.",
+                false,
+            )),
             Event::LeaseExpired => facts.push(fact(
+                TimelineKind::Failure,
                 "Lease expired",
                 "PAM will recover this run from durable state.",
                 false,
             )),
             Event::CancellationRequested => facts.push(fact(
+                TimelineKind::Request,
                 "Cancellation requested",
                 "PAM is stopping at a safe boundary.",
                 false,
             )),
-            Event::Cancelled => facts.push(fact("Run cancelled", "The run was cancelled.", false)),
+            Event::Cancelled => facts.push(fact(
+                TimelineKind::Failure,
+                "Run cancelled",
+                "The run was cancelled.",
+                false,
+            )),
             Event::Completed => facts.push(fact(
+                TimelineKind::Request,
                 "Run completed",
                 "A terminal result is available.",
-                true,
+                false,
             )),
-            Event::Failed => facts.push(fact("Run failed", "The run ended with a failure.", false)),
+            Event::Failed => facts.push(fact(
+                TimelineKind::Failure,
+                "Run failed",
+                "The run ended with a failure.",
+                false,
+            )),
             Event::FlowTransition(transition) if transition.semantic_events().is_empty() => {
                 facts.push(transition_fact(transition.kind()));
             }
@@ -537,16 +621,19 @@ fn semantic_fact(event: &FlowSemanticEvent) -> TimelineFact {
         FlowSemanticEvent::Waiting {
             step_id, reason, ..
         } => fact(
+            TimelineKind::Request,
             "Waiting",
             &format!("Step {step_id} is waiting for {}.", wait_reason(*reason)),
             false,
         ),
         FlowSemanticEvent::ApprovalRequired { step_id } => fact(
+            TimelineKind::Request,
             "Approval required",
             &format!("Step {step_id} requires a human decision."),
             false,
         ),
         FlowSemanticEvent::EvidenceFound { step_id, evidence } => TimelineFact {
+            kind: TimelineKind::Evidence,
             label: "Evidence found".to_owned(),
             summary: format!(
                 "Step {step_id} recorded {} evidence item(s).",
@@ -556,24 +643,28 @@ fn semantic_fact(event: &FlowSemanticEvent) -> TimelineFact {
             evidence: core_evidence(evidence),
         },
         FlowSemanticEvent::FixApplied { report, .. } => TimelineFact {
+            kind: TimelineKind::Change,
             label: "Fix applied".to_owned(),
             summary: report.summary().to_owned(),
             verified: false,
             evidence: core_evidence(report.evidence()),
         },
         FlowSemanticEvent::VerificationPassed { report, .. } => TimelineFact {
+            kind: TimelineKind::Verification,
             label: "Verification passed".to_owned(),
             summary: report.summary().to_owned(),
             verified: true,
             evidence: core_evidence(report.evidence()),
         },
         FlowSemanticEvent::Unresolved { report, .. } => TimelineFact {
+            kind: TimelineKind::Failure,
             label: "Unresolved".to_owned(),
             summary: report.summary().to_owned(),
             verified: false,
             evidence: core_evidence(report.evidence()),
         },
         FlowSemanticEvent::Blocked { report, .. } => TimelineFact {
+            kind: TimelineKind::Failure,
             label: "Blocked".to_owned(),
             summary: report.summary().to_owned(),
             verified: false,
@@ -583,30 +674,84 @@ fn semantic_fact(event: &FlowSemanticEvent) -> TimelineFact {
 }
 
 fn transition_fact(kind: &TransitionKind) -> TimelineFact {
-    let (label, summary) = match kind {
-        TransitionKind::ApprovalRequested { .. } => {
-            ("Approval required", "A step requires a human decision.")
-        }
-        TransitionKind::ApprovalGranted { .. } => {
-            ("Approval granted", "The exact step effect was approved.")
-        }
+    let (timeline_kind, label, summary) = match kind {
+        TransitionKind::StepSkipped { .. } => (
+            TimelineKind::Change,
+            "Step skipped",
+            "A flow step was skipped by its declared condition.",
+        ),
+        TransitionKind::ApprovalRequested { .. } => (
+            TimelineKind::Request,
+            "Approval required",
+            "A step requires a human decision.",
+        ),
+        TransitionKind::ApprovalGranted { .. } => (
+            TimelineKind::Change,
+            "Approval granted",
+            "The exact step effect was approved.",
+        ),
         TransitionKind::ApprovalDenied { .. }
-        | TransitionKind::EffectAuthorizationDenied { .. } => {
-            ("Approval denied", "The exact step effect was denied.")
-        }
-        TransitionKind::EffectStarted { .. } => ("Work started", "A flow effect started."),
-        TransitionKind::EffectSucceeded { .. } => ("Work completed", "A flow effect completed."),
-        TransitionKind::EffectFailed { .. } => ("Work failed", "A flow effect failed."),
-        TransitionKind::RunCompleted { .. } => {
-            ("Run completed", "The flow reached a terminal result.")
-        }
-        _ => ("Run advanced", "PAM recorded durable flow progress."),
+        | TransitionKind::EffectAuthorizationDenied { .. } => (
+            TimelineKind::Failure,
+            "Approval denied",
+            "The exact step effect was denied.",
+        ),
+        TransitionKind::EffectEvaluationRequired { .. } => (
+            TimelineKind::Request,
+            "Evaluation required",
+            "A flow effect requires evaluation.",
+        ),
+        TransitionKind::EffectStarted { .. } => (
+            TimelineKind::Change,
+            "Work started",
+            "A flow effect started.",
+        ),
+        TransitionKind::EffectSucceeded { .. } => (
+            TimelineKind::Change,
+            "Work completed",
+            "A flow effect completed.",
+        ),
+        TransitionKind::RetryScheduled { .. } => (
+            TimelineKind::Request,
+            "Retry scheduled",
+            "PAM scheduled another bounded attempt.",
+        ),
+        TransitionKind::RetryExhausted { .. } => (
+            TimelineKind::Failure,
+            "Retries exhausted",
+            "The flow exhausted its bounded attempts.",
+        ),
+        TransitionKind::EffectFailed { .. } => (
+            TimelineKind::Failure,
+            "Work failed",
+            "A flow effect failed.",
+        ),
+        TransitionKind::ReconciledNotApplied { .. } => (
+            TimelineKind::Change,
+            "Effect reconciled",
+            "PAM verified that the effect was not applied.",
+        ),
+        TransitionKind::ReconciliationUnknown { .. } => (
+            TimelineKind::Failure,
+            "Reconciliation unknown",
+            "PAM could not verify the prior effect state.",
+        ),
+        TransitionKind::CancellationRequested => (
+            TimelineKind::Request,
+            "Cancellation requested",
+            "PAM is stopping at a safe boundary.",
+        ),
+        TransitionKind::RunCompleted { outcome } => (
+            if *outcome == RunOutcome::Solved {
+                TimelineKind::Request
+            } else {
+                TimelineKind::Failure
+            },
+            "Run completed",
+            "The flow reached a terminal result.",
+        ),
     };
-    fact(
-        label,
-        summary,
-        matches!(kind, TransitionKind::RunCompleted { .. }),
-    )
+    fact(timeline_kind, label, summary, false)
 }
 
 fn core_evidence(handles: &[pam_flow::EvidenceHandle]) -> Vec<EvidenceHandle> {
@@ -625,8 +770,9 @@ const fn wait_reason(reason: FlowWaitReason) -> &'static str {
     }
 }
 
-fn fact(label: &str, summary: &str, verified: bool) -> TimelineFact {
+fn fact(kind: TimelineKind, label: &str, summary: &str, verified: bool) -> TimelineFact {
     TimelineFact {
+        kind,
         label: label.to_owned(),
         summary: summary.to_owned(),
         verified,
@@ -636,6 +782,7 @@ fn fact(label: &str, summary: &str, verified: bool) -> TimelineFact {
 
 fn degraded(detail: impl Into<String>, recovery: Option<String>) -> CurrentState {
     CurrentState::Degraded {
+        code: None,
         detail: detail.into(),
         recovery,
     }
@@ -683,6 +830,11 @@ pub(crate) fn pending_approval_for_test(
 #[cfg(test)]
 pub(crate) fn timeline_semantic_for_test(event: &FlowSemanticEvent) -> TimelineFact {
     semantic_fact(event)
+}
+
+#[cfg(test)]
+pub(crate) fn timeline_transition_for_test(kind: &TransitionKind) -> TimelineFact {
+    transition_fact(kind)
 }
 
 #[cfg(test)]

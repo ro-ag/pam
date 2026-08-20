@@ -22,7 +22,7 @@ sha2.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["process", "signal"] }
+nix = { workspace = true, features = ["process", "signal", "user"] }
 
 [dev-dependencies]
 rusqlite.workspace = true

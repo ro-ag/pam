@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   BootstrapResponse,
+  ApprovalDecisionResponseDto,
   CatalogDto,
   CommandFence,
   EvidenceDto,
@@ -11,7 +12,7 @@ import type {
   PamBridge,
   SnapshotDto,
 } from "./domain";
-import { fixtureBridge } from "./fixtures";
+import { fixtureBridge, type FixtureScenario } from "./fixtures";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -66,8 +67,10 @@ export function createTauriBridge(invokeCommand: Invoke = invoke): PamBridge {
       invokeCommand<SnapshotDto>("start_daemon", request(flatFence(fence))),
     stopDaemon: (fence) =>
       invokeCommand<SnapshotDto>("stop_daemon", request(flatFence(fence))),
+    registerGuiCaller: (fence) =>
+      invokeCommand<SnapshotDto>("register_gui_caller", request(flatFence(fence))),
     decideApproval: (fence, approvalHandle, decision) =>
-      invokeCommand<SnapshotDto>("decide_approval", request({
+      invokeCommand<ApprovalDecisionResponseDto>("decide_approval", request({
         ...flatFence(fence),
         approvalHandle,
         decision,
@@ -99,6 +102,6 @@ export function createTauriBridge(invokeCommand: Invoke = invoke): PamBridge {
   };
 }
 
-export function createFixtureBridge(): PamBridge {
-  return fixtureBridge();
+export function createFixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
+  return fixtureBridge(scenario);
 }

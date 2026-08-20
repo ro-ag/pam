@@ -30,6 +30,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             commands::refresh_project,
             commands::start_daemon,
             commands::stop_daemon,
+            commands::register_gui_caller,
             commands::decide_approval,
             commands::load_evidence,
             commands::load_flow_workspace,

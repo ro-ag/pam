@@ -3174,9 +3174,12 @@ dependencies = [
 name = "pam_skills"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "pam_core",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

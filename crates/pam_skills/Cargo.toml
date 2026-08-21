@@ -6,11 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 pam_core.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

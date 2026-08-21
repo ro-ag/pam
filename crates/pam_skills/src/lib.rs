@@ -2,6 +2,7 @@
 
 mod claude;
 mod codex;
+mod cursor;
 mod model;
 mod scan;
 
@@ -10,12 +11,17 @@ mod claude_test;
 #[cfg(test)]
 mod codex_test;
 #[cfg(test)]
+mod cursor_test;
+#[cfg(test)]
 mod model_test;
 #[cfg(test)]
 mod scan_test;
 
 pub use claude::{ClaudePluginRoot, ClaudeScanRoots, scan_claude_code};
 pub use codex::{CodexScanRoots, scan_codex};
+pub use cursor::{
+    CursorGlobalRuleSource, CursorGlobalRulesStatus, CursorScanReport, CursorScanRoots, scan_cursor,
+};
 pub use model::{
     AgentArtifact, AgentArtifactIdentity, ArtifactKind, ArtifactScope, InvalidAgentArtifact,
     LoadSemantics, MAX_ARTIFACT_LOGICAL_PATH_BYTES, MAX_ARTIFACT_NAME_BYTES, OriginAgent,

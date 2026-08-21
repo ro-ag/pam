@@ -47,6 +47,7 @@ pub enum ScanDiagnosticKind {
     DuplicateArtifactIdentity,
     FileTooLarge,
     InvalidArtifact,
+    InvalidFrontmatter,
     InvalidJson,
     InvalidPluginId,
     InvalidProjectRootRelation,

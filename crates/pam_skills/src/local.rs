@@ -8,9 +8,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentArtifact, ArtifactScope, ClaudePluginRoot, ClaudeScanRoots, CursorGlobalRuleSource,
-    CursorGlobalRulesStatus, CursorScanRoots, ScanDiagnostic, ScanLimits, ScanReport,
+    AgentArtifact, ArtifactScope, ClaudePluginRoot, ClaudeScanRoots, CodexProjectTrust,
+    CodexProjectTrustError, CursorGlobalRuleSource, CursorGlobalRulesStatus, CursorScanRoots,
+    ScanDiagnostic, ScanLimits, ScanReport,
     claude::valid_plugin_id,
+    resolve_codex_project_trust,
     scan::{ScanSession, merge_scan_reports},
     scan_claude_code, scan_codex, scan_cursor,
 };
@@ -29,7 +31,6 @@ pub struct LocalInventoryRoots<'a> {
     pub codex_home: Option<&'a Path>,
     pub project_root: &'a Path,
     pub current_working_directory: &'a Path,
-    pub codex_project_trusted: bool,
     pub cursor_global_rule: Option<CursorGlobalRuleSource<'a>>,
 }
 
@@ -82,6 +83,8 @@ pub fn scan_local_inventory(
     limits: ScanLimits,
 ) -> Result<LocalInventoryReport, LocalInventoryError> {
     let plugins = plugin_roots(roots, limits)?;
+    let codex_project_trust =
+        resolve_codex_project_trust(roots.codex_home, roots.project_root, limits)?;
     let plugin_views = plugins
         .iter()
         .map(|plugin| ClaudePluginRoot::new(&plugin.id, &plugin.path))
@@ -96,7 +99,7 @@ pub fn scan_local_inventory(
             roots.codex_home,
             Some(roots.project_root),
             Some(roots.current_working_directory),
-            roots.codex_project_trusted,
+            codex_project_trust == CodexProjectTrust::Trusted,
         ),
         limits,
     );
@@ -351,6 +354,7 @@ fn valid_plugin_id_part(part: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalInventoryError {
+    CodexProjectTrust(CodexProjectTrustError),
     PluginRegistryScan(Vec<ScanDiagnostic>),
     MalformedPluginRegistry,
     MalformedClaudeSettings(ArtifactScope),
@@ -365,6 +369,7 @@ pub enum LocalInventoryError {
 impl fmt::Display for LocalInventoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CodexProjectTrust(error) => error.fmt(formatter),
             Self::PluginRegistryScan(diagnostics) => write!(
                 formatter,
                 "Claude plugin registry scan failed with {} diagnostics",
@@ -410,3 +415,9 @@ impl fmt::Display for LocalInventoryError {
 }
 
 impl Error for LocalInventoryError {}
+
+impl From<CodexProjectTrustError> for LocalInventoryError {
+    fn from(error: CodexProjectTrustError) -> Self {
+        Self::CodexProjectTrust(error)
+    }
+}

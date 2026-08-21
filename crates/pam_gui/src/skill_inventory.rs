@@ -137,7 +137,6 @@ impl SkillInventoryEnvironment {
             codex_home: self.codex_home.as_deref(),
             project_root: &self.project_root,
             current_working_directory: &self.current_working_directory,
-            codex_project_trusted: false,
             cursor_global_rule: None,
         }
     }
@@ -149,11 +148,13 @@ impl SkillInventoryEnvironment {
         state_path: PathBuf,
         observed_at_ms: u64,
     ) -> Self {
+        let default_codex_home = user_home.join(".codex");
+        let codex_home = default_codex_home.is_dir().then_some(default_codex_home);
         Self {
             user_home: Some(user_home),
             claude_plugin_registry_root: None,
             codex_system_config_root: None,
-            codex_home: None,
+            codex_home,
             current_working_directory: project_root.clone(),
             project_root,
             state_path,

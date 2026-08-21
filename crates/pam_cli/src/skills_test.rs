@@ -52,6 +52,12 @@ impl Drop for TestDirectory {
     }
 }
 
+fn toml_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn stored(path: &str, byte: u8) -> StoredAgentArtifact {
     let artifact = AgentArtifact::new(
         "review",
@@ -225,6 +231,52 @@ async fn nested_discovery_scans_the_canonical_root_and_avoids_false_drift() {
     );
 }
 
+#[tokio::test]
+async fn cli_environment_uses_exact_user_codex_trust() {
+    let project = TestDirectory::new("trusted-inventory-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"22222222-2222-4222-8222-222222222222\"\n",
+    );
+    project.write(".codex/config.toml", b"model = \"project\"\n");
+    let home = TestDirectory::new("trusted-inventory-home");
+    home.write(
+        ".codex/config.toml",
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            toml_key(project.path())
+        ),
+    );
+    let state = TestDirectory::new("trusted-inventory-state");
+    let state_path = state.path().join("state.sqlite3");
+    let environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state_path.clone(),
+    )
+    .unwrap();
+    let identity = discover_project(project.path()).unwrap();
+
+    let output = run_inventory(
+        InventoryRequest {
+            roots: environment.roots(),
+            project_id: identity.id(),
+            state_path: &state_path,
+            observed_at_ms: 10,
+        },
+        InventorySelection::List,
+    )
+    .await
+    .unwrap();
+    let InventoryRecords::List(records) = output.records else {
+        panic!("expected list records");
+    };
+    assert!(records.iter().any(|record| {
+        record.artifact.origin() == OriginAgent::Codex
+            && record.artifact.logical_path() == ".codex/config.toml"
+    }));
+}
+
 fn request<'a>(
     project: &'a TestDirectory,
     state_path: &'a Path,
@@ -239,7 +291,6 @@ fn request<'a>(
             codex_home: None,
             project_root: project.path(),
             current_working_directory: project.path(),
-            codex_project_trusted: false,
             cursor_global_rule: None,
         },
         project_id,

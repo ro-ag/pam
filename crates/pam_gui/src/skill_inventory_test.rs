@@ -32,6 +32,12 @@ impl Drop for TestDirectory {
     }
 }
 
+fn toml_key(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn stored_artifact(index: usize) -> StoredAgentArtifact {
     let artifact = AgentArtifact::new(
         format!("skill-{index}"),
@@ -120,4 +126,34 @@ async fn local_scan_persists_inventory_and_reports_drift_once() {
             .iter()
             .all(|artifact| !artifact.id.is_empty())
     );
+}
+
+#[tokio::test]
+async fn desktop_environment_uses_exact_user_codex_trust() {
+    let directory = TestDirectory::new("trusted-skill-inventory");
+    let home = directory.path().join("home");
+    let project = directory.path().join("project");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(
+        home.join(".codex/config.toml"),
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            toml_key(&project)
+        ),
+    )
+    .unwrap();
+    fs::write(project.join(".codex/config.toml"), b"model = \"project\"\n").unwrap();
+    let state = directory.path().join("state.sqlite3");
+
+    let inventory = load_skill_inventory(
+        ProjectId::new("trusted-inventory-project"),
+        SkillInventoryEnvironment::for_test(home, project, state, 10),
+    )
+    .await
+    .unwrap();
+
+    assert!(inventory.artifacts.iter().any(|artifact| {
+        artifact.origin == "codex" && artifact.logical_path == ".codex/config.toml"
+    }));
 }

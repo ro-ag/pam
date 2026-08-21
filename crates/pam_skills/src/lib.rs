@@ -2,6 +2,7 @@
 
 mod claude;
 mod codex;
+mod codex_trust;
 mod cursor;
 mod local;
 mod model;
@@ -11,6 +12,8 @@ mod scan;
 mod claude_test;
 #[cfg(test)]
 mod codex_test;
+#[cfg(test)]
+mod codex_trust_test;
 #[cfg(test)]
 mod cursor_test;
 #[cfg(test)]
@@ -24,6 +27,7 @@ mod scan_test;
 
 pub use claude::{ClaudePluginRoot, ClaudeScanRoots, scan_claude_code};
 pub use codex::{CodexScanRoots, scan_codex};
+pub use codex_trust::{CodexProjectTrust, CodexProjectTrustError, resolve_codex_project_trust};
 pub use cursor::{
     CursorGlobalRuleSource, CursorGlobalRulesStatus, CursorScanReport, CursorScanRoots, scan_cursor,
 };

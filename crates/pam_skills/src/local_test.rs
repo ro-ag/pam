@@ -17,7 +17,6 @@ fn roots<'a>(
         codex_home: None,
         project_root: project.path(),
         current_working_directory: project.path(),
-        codex_project_trusted: false,
         cursor_global_rule: None,
     }
 }
@@ -41,6 +40,12 @@ fn write_enabled(directory: &TestDirectory, relative: &str, id: &str, enabled: b
         relative,
         serde_json::to_vec(&json!({"enabledPlugins": {id: enabled}})).unwrap(),
     );
+}
+
+fn toml_key(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 #[test]
@@ -73,7 +78,14 @@ fn merges_all_adapters_into_one_deterministic_report() {
 #[test]
 fn codex_project_trust_is_explicit_in_integrated_scans() {
     let project = TestDirectory::new("local-codex-trust");
-    project.write(".codex/config.toml", b"model = \"trusted\"\n");
+    let codex_home = TestDirectory::new("local-codex-home");
+    project.write(
+        ".codex/config.toml",
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            toml_key(project.path())
+        ),
+    );
 
     let untrusted =
         scan_local_inventory(roots(&project, None, None), ScanLimits::default()).unwrap();
@@ -85,8 +97,31 @@ fn codex_project_trust_is_explicit_in_integrated_scans() {
         artifact.origin() == OriginAgent::Codex && artifact.logical_path() == ".codex/config.toml"
     }));
 
+    codex_home.write(
+        "config.toml",
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+            toml_key(project.path())
+        ),
+    );
+    let mut explicitly_untrusted_roots = roots(&project, None, None);
+    explicitly_untrusted_roots.codex_home = Some(codex_home.path());
+    let explicitly_untrusted =
+        scan_local_inventory(explicitly_untrusted_roots, ScanLimits::default()).unwrap();
+    assert!(explicitly_untrusted.diagnostics().iter().any(|diagnostic| {
+        diagnostic.kind() == ScanDiagnosticKind::UntrustedProjectConfig
+            && diagnostic.logical_path() == ".codex/config.toml"
+    }));
+
+    codex_home.write(
+        "config.toml",
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            toml_key(project.path())
+        ),
+    );
     let mut trusted_roots = roots(&project, None, None);
-    trusted_roots.codex_project_trusted = true;
+    trusted_roots.codex_home = Some(codex_home.path());
     let trusted = scan_local_inventory(trusted_roots, ScanLimits::default()).unwrap();
     assert!(trusted.complete(), "{:?}", trusted.diagnostics());
     assert!(trusted.artifacts().iter().any(|artifact| {

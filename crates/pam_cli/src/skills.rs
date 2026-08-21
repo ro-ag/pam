@@ -105,7 +105,6 @@ impl SkillsEnvironment {
             codex_home: self.codex_home.as_deref(),
             project_root: self.project.root(),
             current_working_directory: self.project.root(),
-            codex_project_trusted: false,
             cursor_global_rule: None,
         }
     }
@@ -116,12 +115,14 @@ impl SkillsEnvironment {
         user_home: PathBuf,
         state_path: PathBuf,
     ) -> Result<Self, SkillsError> {
+        let default_codex_home = user_home.join(".codex");
+        let codex_home = default_codex_home.is_dir().then_some(default_codex_home);
         Ok(Self {
             project: discover_project(current_working_directory).map_err(SkillsError::Identity)?,
             user_home,
             claude_plugin_registry_root: None,
             codex_system_config_root: None,
-            codex_home: None,
+            codex_home,
             state_path,
         })
     }

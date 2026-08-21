@@ -1,9 +1,12 @@
 use std::{
-    env,
+    env, fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use pam_core::{ContentDigest, EvidenceHandle};
+use pam_core::{ContentDigest, EvidenceHandle, ProjectId};
+use pam_store::{EvidenceRedaction, EvidenceRetention, Store};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use url::Url;
@@ -13,8 +16,9 @@ use super::github::{
     MAX_LOG_BYTES_PER_JOB, Repository, ReqwestGitHubTransport, RunId,
 };
 use super::github_diagnosis::{
-    DiagnosisError, DiagnosisStatus, ExactJobLog, FindingCategory, MAX_DIAGNOSIS_FINDINGS,
-    MAX_DIAGNOSIS_LOGS, diagnose_run,
+    DiagnosisError, DiagnosisPersistence, DiagnosisStatus, ExactJobLog, FindingCategory,
+    MAX_DIAGNOSIS_FINDINGS, MAX_DIAGNOSIS_LOGS, MAX_DIAGNOSIS_PROJECT_ID_BYTES, RunDiagnosis,
+    diagnose_run,
 };
 use super::{
     BoundedSummary, CancellationToken, Connector, ConnectorOutput, ExactArtifact,
@@ -22,6 +26,8 @@ use super::{
 };
 
 const RUN_ID: u64 = 42;
+const TEST_PROJECT: &str = "github-diagnosis-test";
+static NEXT_DIAGNOSIS_STORE: AtomicU64 = AtomicU64::new(1);
 
 fn digest(bytes: &[u8]) -> ContentDigest {
     ContentDigest::from_sha256(Sha256::digest(bytes).into())
@@ -36,6 +42,42 @@ fn canonical_handle(bytes: &[u8]) -> String {
         "evidence://github-actions/log/{}",
         digest(bytes).sha256_hex()
     )
+}
+
+fn diagnosis_store(name: &str) -> (PathBuf, PathBuf, Store) {
+    let fixture_id = NEXT_DIAGNOSIS_STORE.fetch_add(1, Ordering::Relaxed);
+    let root = env::temp_dir().join(format!(
+        "pam-connectors-{name}-{}-{fixture_id}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("pam.sqlite3");
+    let store = Store::open(&path).unwrap();
+    (root, path, store)
+}
+
+fn persistence(store: &Store) -> DiagnosisPersistence {
+    DiagnosisPersistence::new(
+        store.clone(),
+        ProjectId::from(TEST_PROJECT),
+        EvidenceRetention::Project,
+        EvidenceRedaction::Unredacted,
+        42,
+    )
+    .unwrap()
+}
+
+async fn diagnose(
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
+    exact_logs: Vec<ExactJobLog>,
+) -> Result<RunDiagnosis, DiagnosisError> {
+    let (root, _, store) = diagnosis_store("diagnosis");
+    let persistence = persistence(&store);
+    let result = diagnose_run(collection, exact_logs, &persistence).await;
+    drop(persistence);
+    store.shutdown().await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+    result
 }
 
 fn response(entries: &[(u64, usize)], total_jobs: u64) -> CollectRunLogsResponse {
@@ -110,15 +152,17 @@ fn collection(
     .unwrap()
 }
 
-#[test]
-fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
+#[tokio::test]
+async fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
     let bytes = b"setup ok\nerror[E0308]: mismatched types\ntest result: FAILED. 1 failed\ncodesign validation failed\ndeadline exceeded\npermission denied\nerror: upstream response\n";
     let collection = collection(
         response(&[(7, bytes.len())], 1),
         true,
         vec![(7, bytes.to_vec())],
     );
-    let diagnosis = diagnose_run(&collection, vec![exact_log(7, bytes)]).unwrap();
+    let diagnosis = diagnose(&collection, vec![exact_log(7, bytes)])
+        .await
+        .unwrap();
 
     assert_eq!(diagnosis.status(), DiagnosisStatus::Diagnosed);
     assert_eq!(diagnosis.logs().len(), 1);
@@ -162,16 +206,132 @@ fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
     assert_eq!(compacted.fragments[0].source.offset, 0);
 }
 
-#[test]
-fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
+#[tokio::test]
+async fn referenced_evidence_survives_store_restart_and_exact_range_read() {
+    let bytes = b"setup ok\nerror[E0308]: mismatched types\ncleanup\n";
+    let collection = collection(
+        response(&[(7, bytes.len())], 1),
+        true,
+        vec![(7, bytes.to_vec())],
+    );
+    let (root, path, store) = diagnosis_store("durable-evidence");
+    let persistence = persistence(&store);
+    let diagnosis = diagnose_run(&collection, vec![exact_log(7, bytes)], &persistence)
+        .await
+        .unwrap();
+    let reference = diagnosis.findings()[0].evidence().clone();
+    drop(persistence);
+    store.shutdown().await.unwrap();
+
+    let reopened = Store::open(&path).unwrap();
+    let project_id = ProjectId::from(TEST_PROJECT);
+    let metadata = reopened
+        .inspect_evidence(project_id.clone(), reference.handle.clone())
+        .await
+        .unwrap();
+    assert_eq!(metadata.handle, reference.handle);
+    assert_eq!(metadata.digest, digest(bytes));
+    assert_eq!(metadata.project_id, project_id);
+    assert_eq!(metadata.retention, EvidenceRetention::Project);
+    assert_eq!(metadata.redaction, EvidenceRedaction::Unredacted);
+    assert_eq!(metadata.created_at_ms, 42);
+    assert!(
+        reopened
+            .inspect_evidence(ProjectId::from("other-project"), reference.handle.clone(),)
+            .await
+            .is_err()
+    );
+    let cited = reopened
+        .read_evidence_range(
+            ProjectId::from(TEST_PROJECT),
+            reference.handle,
+            reference.offset,
+            reference.length,
+        )
+        .await
+        .unwrap();
+    let start = usize::try_from(reference.offset).unwrap();
+    let end = start + usize::try_from(reference.length).unwrap();
+    assert_eq!(cited, bytes[start..end]);
+    reopened.shutdown().await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_batch_is_rejected_before_any_evidence_is_persisted() {
+    let first = b"error: first\n";
+    let second = b"error: second\n";
+    let replacement = b"fatal: alterd\n";
+    assert_eq!(replacement.len(), second.len());
+    let collection = collection(
+        response(&[(1, first.len()), (2, second.len())], 2),
+        true,
+        vec![(1, first.to_vec()), (2, second.to_vec())],
+    );
+    let (root, _, store) = diagnosis_store("invalid-batch");
+    let persistence = persistence(&store);
+    assert!(matches!(
+        diagnose_run(
+            &collection,
+            vec![exact_log(1, first), exact_log(2, replacement)],
+            &persistence,
+        )
+        .await,
+        Err(DiagnosisError::ArtifactPayloadMismatch { job_id: 2 })
+    ));
+    let first_handle = EvidenceHandle::parse(canonical_handle(first)).unwrap();
+    assert!(
+        store
+            .inspect_evidence(ProjectId::from(TEST_PROJECT), first_handle)
+            .await
+            .is_err()
+    );
+    drop(persistence);
+    store.shutdown().await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn persistence_context_rejects_unbounded_identity_and_timestamp() {
+    let (root, _, store) = diagnosis_store("invalid-persistence-context");
+    assert!(matches!(
+        DiagnosisPersistence::new(
+            store.clone(),
+            ProjectId::from("x".repeat(MAX_DIAGNOSIS_PROJECT_ID_BYTES + 1)),
+            EvidenceRetention::Project,
+            EvidenceRedaction::Unredacted,
+            42,
+        ),
+        Err(DiagnosisError::InvalidPersistenceProject)
+    ));
+    assert!(matches!(
+        DiagnosisPersistence::new(
+            store.clone(),
+            ProjectId::from(TEST_PROJECT),
+            EvidenceRetention::Project,
+            EvidenceRedaction::Unredacted,
+            u64::MAX,
+        ),
+        Err(DiagnosisError::InvalidPersistenceTimestamp)
+    ));
+    store.shutdown().await.unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
     let bytes = b"compile\nerror[E0425]: missing value\n";
     let collection = collection(
         response(&[(9, bytes.len())], 1),
         true,
         vec![(9, bytes.to_vec())],
     );
-    let first = diagnose_run(&collection, vec![exact_log(9, bytes)]).unwrap();
-    let second = diagnose_run(&collection, vec![exact_log(9, bytes)]).unwrap();
+    let first = diagnose(&collection, vec![exact_log(9, bytes)])
+        .await
+        .unwrap();
+    let second = diagnose(&collection, vec![exact_log(9, bytes)])
+        .await
+        .unwrap();
     assert_eq!(first.manifest().bytes(), second.manifest().bytes());
     assert_eq!(first.manifest().name(), "github-run-42-diagnosis.json");
 
@@ -192,15 +352,17 @@ fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
     assert_eq!(manifest["findings"][0]["evidence"]["offset"], 8);
 }
 
-#[test]
-fn partial_input_never_becomes_diagnosed_and_benign_complete_input_is_unresolved() {
+#[tokio::test]
+async fn partial_input_never_becomes_diagnosed_and_benign_complete_input_is_unresolved() {
     let failing = b"error[E0308]: mismatch\n";
     let partial_collection = collection(
         response(&[(1, failing.len())], 1),
         false,
         vec![(1, failing.to_vec())],
     );
-    let partial = diagnose_run(&partial_collection, vec![exact_log(1, failing)]).unwrap();
+    let partial = diagnose(&partial_collection, vec![exact_log(1, failing)])
+        .await
+        .unwrap();
     assert_eq!(partial.status(), DiagnosisStatus::Partial);
     assert_eq!(partial.findings().len(), 1);
     assert!(partial.summary().as_str().starts_with("partial"));
@@ -211,13 +373,15 @@ fn partial_input_never_becomes_diagnosed_and_benign_complete_input_is_unresolved
         true,
         vec![(2, benign.to_vec())],
     );
-    let unresolved = diagnose_run(&complete_collection, vec![exact_log(2, benign)]).unwrap();
+    let unresolved = diagnose(&complete_collection, vec![exact_log(2, benign)])
+        .await
+        .unwrap();
     assert_eq!(unresolved.status(), DiagnosisStatus::Unresolved);
     assert!(unresolved.findings().is_empty());
 }
 
-#[test]
-fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
+#[tokio::test]
+async fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
     let bytes = b"error[E0308]: first\nerror[E0308]: duplicate class\ntest result: FAILED\ncodesign failed\ntimeout reached\npermission denied\nerror: remote unknown\n";
     let entries = (1..=MAX_DIAGNOSIS_LOGS as u64)
         .map(|job_id| (job_id, bytes.len()))
@@ -230,7 +394,7 @@ fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
         .map(|(job_id, _)| (*job_id, bytes.to_vec()))
         .collect();
     let collection = collection(response(&entries, entries.len() as u64), true, payloads);
-    let diagnosis = diagnose_run(&collection, logs).unwrap();
+    let diagnosis = diagnose(&collection, logs).await.unwrap();
 
     assert_eq!(diagnosis.findings().len(), MAX_DIAGNOSIS_FINDINGS);
     assert_eq!(diagnosis.status(), DiagnosisStatus::Partial);
@@ -248,12 +412,14 @@ fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
     assert_eq!(manifest["findings_truncated"], true);
 }
 
-#[test]
-fn artifact_correspondence_is_rejected_and_caller_chosen_handles_cannot_be_cited() {
+#[tokio::test]
+async fn artifact_correspondence_is_rejected_and_caller_chosen_handles_cannot_be_cited() {
     let bytes = b"error: exact bytes\n";
     let collected_response = response(&[(4, bytes.len())], 1);
     let collected = collection(collected_response.clone(), true, vec![(4, bytes.to_vec())]);
-    let diagnosis = diagnose_run(&collected, vec![exact_log(4, bytes)]).unwrap();
+    let diagnosis = diagnose(&collected, vec![exact_log(4, bytes)])
+        .await
+        .unwrap();
     let arbitrary = EvidenceHandle::parse("evidence://attacker/chosen-handle").unwrap();
     assert_ne!(diagnosis.findings()[0].evidence().handle, arbitrary);
     assert_eq!(
@@ -270,7 +436,7 @@ fn artifact_correspondence_is_rejected_and_caller_chosen_handles_cannot_be_cited
     longer_artifact.push(b'x');
     let wrong_length = collection(wrong_length, true, vec![(4, longer_artifact)]);
     assert!(matches!(
-        diagnose_run(&wrong_length, vec![exact_log(4, bytes)]),
+        diagnose(&wrong_length, vec![exact_log(4, bytes)]).await,
         Err(DiagnosisError::ByteLengthMismatch { job_id: 4 })
     ));
 
@@ -279,20 +445,20 @@ fn artifact_correspondence_is_rejected_and_caller_chosen_handles_cannot_be_cited
     let wrong_name: CollectRunLogsResponse = serde_json::from_value(value).unwrap();
     let wrong_name = collection(wrong_name, true, vec![(4, bytes.to_vec())]);
     assert!(matches!(
-        diagnose_run(&wrong_name, vec![exact_log(4, bytes)]),
+        diagnose(&wrong_name, vec![exact_log(4, bytes)]).await,
         Err(DiagnosisError::ArtifactNameMismatch { job_id: 4 })
     ));
 
     let replacement = b"fatal: altered dat\n";
     assert_eq!(replacement.len(), bytes.len());
     assert!(matches!(
-        diagnose_run(&collected, vec![exact_log(4, replacement)]),
+        diagnose(&collected, vec![exact_log(4, replacement)]).await,
         Err(DiagnosisError::ArtifactPayloadMismatch { job_id: 4 })
     ));
 }
 
-#[test]
-fn complete_truth_requires_artifact_and_evidence_for_every_failed_job() {
+#[tokio::test]
+async fn complete_truth_requires_artifact_and_evidence_for_every_failed_job() {
     let first = b"error: first\n";
     let second = b"error: other\n";
     let complete_response = response(&[(1, first.len()), (2, second.len())], 2);
@@ -302,20 +468,20 @@ fn complete_truth_requires_artifact_and_evidence_for_every_failed_job() {
     let collection = collection(missing_log, true, vec![(1, first.to_vec())]);
 
     assert!(matches!(
-        diagnose_run(&collection, vec![exact_log(1, first)]),
+        diagnose(&collection, vec![exact_log(1, first)]).await,
         Err(DiagnosisError::ContradictoryCompleteness)
     ));
 }
 
-#[test]
-fn log_count_and_payload_bounds_reject_overflow() {
+#[tokio::test]
+async fn log_count_and_payload_bounds_reject_overflow() {
     let bytes = b"error: bounded\n";
     let entries = (1..=(MAX_DIAGNOSIS_LOGS + 1) as u64)
         .map(|job_id| (job_id, bytes.len()))
         .collect::<Vec<_>>();
     let collection = collection(response(&entries, entries.len() as u64), true, Vec::new());
     assert!(matches!(
-        diagnose_run(&collection, Vec::new()),
+        diagnose(&collection, Vec::new()).await,
         Err(DiagnosisError::TooManyLogs)
     ));
 
@@ -380,7 +546,7 @@ async fn live_failed_run_is_diagnosed_with_compact_exact_evidence() {
             ExactJobLog::new(log.job_id(), artifact.bytes().to_vec()).unwrap()
         })
         .collect();
-    let diagnosis = diagnose_run(&collection, exact_logs).unwrap();
+    let diagnosis = diagnose(&collection, exact_logs).await.unwrap();
     assert_eq!(diagnosis.status(), DiagnosisStatus::Diagnosed);
     assert!(diagnosis.findings().iter().any(|finding| {
         finding.category() == FindingCategory::SigningOrPackaging

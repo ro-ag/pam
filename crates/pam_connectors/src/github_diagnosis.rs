@@ -1,11 +1,16 @@
 //! Deterministic, evidence-backed diagnosis of collected GitHub Actions logs.
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use pam_compact::{
     CompactError, CompactedLog, CompactionPolicy, LogMetadata, SourceEvidence, compact_log,
 };
-use pam_core::{ContentDigest, EvidenceHandle, EvidenceReference};
+use pam_core::{ContentDigest, EvidenceHandle, EvidenceReference, ProjectId};
+use pam_store::{EvidenceRedaction, EvidenceRetention, PutEvidence, Store};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -19,6 +24,7 @@ use crate::{
 pub const MAX_DIAGNOSIS_LOGS: usize = MAX_COLLECTED_JOBS;
 pub const MAX_DIAGNOSIS_FINDINGS: usize = 64;
 pub const MAX_DIAGNOSIS_MANIFEST_BYTES: usize = 256 * 1024;
+pub const MAX_DIAGNOSIS_PROJECT_ID_BYTES: usize = 256;
 pub const DIAGNOSIS_SCHEMA_VERSION: &str = "pam-github-diagnosis-v1";
 
 const COMPILATION_PATTERNS: &[&[u8]] = &[
@@ -58,6 +64,100 @@ const REMOTE_OR_UNKNOWN_PATTERNS: &[&[u8]] = &[
     b"connection reset",
 ];
 const GITHUB_LOG_EVIDENCE_PREFIX: &str = "evidence://github-actions/log";
+const GITHUB_LOG_MEDIA_TYPE: &str = "application/octet-stream";
+
+/// Explicit durable destination for exact log evidence used by diagnosis.
+#[derive(Clone)]
+pub struct DiagnosisPersistence {
+    store: Store,
+    project_id: ProjectId,
+    retention: EvidenceRetention,
+    redaction: EvidenceRedaction,
+    captured_at_ms: u64,
+}
+
+impl DiagnosisPersistence {
+    /// Binds diagnosis to one project-scoped durable evidence store and retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or oversized project identifier or a timestamp that cannot
+    /// be represented by the durable store.
+    pub fn new(
+        store: Store,
+        project_id: ProjectId,
+        retention: EvidenceRetention,
+        redaction: EvidenceRedaction,
+        captured_at_ms: u64,
+    ) -> Result<Self, DiagnosisError> {
+        if project_id.as_str().is_empty()
+            || project_id.as_str().len() > MAX_DIAGNOSIS_PROJECT_ID_BYTES
+        {
+            return Err(DiagnosisError::InvalidPersistenceProject);
+        }
+        if i64::try_from(captured_at_ms).is_err() {
+            return Err(DiagnosisError::InvalidPersistenceTimestamp);
+        }
+        Ok(Self {
+            store,
+            project_id,
+            retention,
+            redaction,
+            captured_at_ms,
+        })
+    }
+
+    #[must_use]
+    pub const fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+
+    async fn persist(&self, bytes: &[u8]) -> Result<SourceEvidence, DiagnosisError> {
+        let expected = canonical_source(bytes);
+        let metadata = self
+            .store
+            .put_evidence(
+                PutEvidence {
+                    handle: expected.handle.clone(),
+                    project_id: self.project_id.clone(),
+                    media_type: GITHUB_LOG_MEDIA_TYPE.to_owned(),
+                    retention: self.retention,
+                    redaction: self.redaction,
+                    bytes: bytes.to_vec(),
+                },
+                self.captured_at_ms,
+            )
+            .await
+            .map_err(|_| DiagnosisError::EvidencePersistence)?;
+        let size_bytes = u64::try_from(bytes.len()).expect("bounded evidence length fits u64");
+        if metadata.handle != expected.handle
+            || metadata.digest != expected.digest
+            || metadata.project_id != self.project_id
+            || metadata.size_bytes != size_bytes
+            || metadata.media_type != GITHUB_LOG_MEDIA_TYPE
+            || metadata.retention != self.retention
+            || metadata.redaction != self.redaction
+        {
+            return Err(DiagnosisError::PersistedIdentityMismatch);
+        }
+        Ok(SourceEvidence {
+            handle: metadata.handle,
+            digest: metadata.digest,
+        })
+    }
+}
+
+impl fmt::Debug for DiagnosisPersistence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiagnosisPersistence")
+            .field("project_id", &self.project_id)
+            .field("retention", &self.retention)
+            .field("redaction", &self.redaction)
+            .field("captured_at_ms", &self.captured_at_ms)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Exact bytes for one collected job log.
 #[derive(Clone, Eq, PartialEq)]
@@ -246,19 +346,23 @@ impl RunDiagnosis {
     }
 }
 
-/// Validates, compacts, and lexically classifies exact collected logs without model calls.
+/// Persists, compacts, and lexically classifies exact collected logs without model calls.
 ///
 /// # Errors
 ///
-/// Returns an error for inconsistent jobs/artifacts/evidence, exceeded bounds, compaction failure,
-/// or a manifest that cannot fit its fixed byte budget.
-pub fn diagnose_run(
+/// Returns an error for inconsistent jobs/artifacts/evidence, exceeded bounds, durable evidence
+/// failure, compaction failure, or a manifest that cannot fit its fixed byte budget. Every input is
+/// validated before the first durable write, and no diagnosis output is returned unless all
+/// canonical log artifacts have been persisted.
+pub async fn diagnose_run(
     collection: &ConnectorOutput<CollectRunLogsResponse>,
     exact_logs: Vec<ExactJobLog>,
+    persistence: &DiagnosisPersistence,
 ) -> Result<RunDiagnosis, DiagnosisError> {
     let response = collection.value();
     let input_complete = collection.truth().is_complete();
     validate_response_bounds(collection, &exact_logs)?;
+    let persisted_sources = persist_artifacts(collection, persistence).await?;
 
     let mut exact_logs = exact_logs;
     exact_logs.sort_by_key(ExactJobLog::job_id);
@@ -276,14 +380,11 @@ pub fn diagnose_run(
                 job_id: exact.job_id,
             });
         };
-        let artifact = collection
-            .artifacts()
-            .iter()
-            .find(|artifact| artifact.name() == collected.artifact_name())
+        let source = persisted_sources
+            .get(&exact.job_id)
             .ok_or(DiagnosisError::ArtifactPayloadCountMismatch)?;
-        let source = canonical_source(artifact.bytes());
         let compacted = compact_log(
-            &source,
+            source,
             &exact.bytes,
             &LogMetadata::default(),
             &CompactionPolicy::default(),
@@ -294,7 +395,7 @@ pub fn diagnose_run(
         })?;
         classify_log(
             exact.job_id,
-            &source,
+            source,
             &exact.bytes,
             &mut seen_findings,
             &mut findings,
@@ -338,6 +439,23 @@ pub fn diagnose_run(
         findings,
         manifest,
     })
+}
+
+async fn persist_artifacts(
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
+    persistence: &DiagnosisPersistence,
+) -> Result<BTreeMap<u64, SourceEvidence>, DiagnosisError> {
+    let mut sources = BTreeMap::new();
+    for log in collection.value().logs() {
+        let artifact = collection
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.name() == log.artifact_name())
+            .ok_or(DiagnosisError::ArtifactPayloadCountMismatch)?;
+        let source = persistence.persist(artifact.bytes()).await?;
+        sources.insert(log.job_id(), source);
+    }
+    Ok(sources)
 }
 
 fn validate_response_bounds(
@@ -637,6 +755,8 @@ fn manifest_bytes(
 #[derive(Debug)]
 pub enum DiagnosisError {
     InvalidJobId,
+    InvalidPersistenceProject,
+    InvalidPersistenceTimestamp,
     TooManyLogs,
     LogTooLarge { job_id: u64 },
     TotalLogBytesTooLarge,
@@ -653,6 +773,8 @@ pub enum DiagnosisError {
     EvidenceWithoutArtifact { job_id: u64 },
     MissingEvidence { job_id: u64 },
     ByteLengthMismatch { job_id: u64 },
+    EvidencePersistence,
+    PersistedIdentityMismatch,
     Compaction { job_id: u64, source: CompactError },
     SummaryTooLarge,
     ManifestEncoding,
@@ -663,6 +785,12 @@ impl fmt::Display for DiagnosisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidJobId => formatter.write_str("diagnosis job identifier must be nonzero"),
+            Self::InvalidPersistenceProject => {
+                formatter.write_str("diagnosis evidence project identifier is invalid")
+            }
+            Self::InvalidPersistenceTimestamp => {
+                formatter.write_str("diagnosis evidence timestamp is invalid")
+            }
             Self::TooManyLogs => formatter.write_str("diagnosis log count exceeds its bound"),
             Self::LogTooLarge { job_id } => {
                 write!(formatter, "job {job_id} log exceeds its byte bound")
@@ -715,6 +843,12 @@ impl fmt::Display for DiagnosisError {
                     formatter,
                     "job {job_id} evidence length differs from its artifact"
                 )
+            }
+            Self::EvidencePersistence => {
+                formatter.write_str("exact diagnosis evidence could not be persisted")
+            }
+            Self::PersistedIdentityMismatch => {
+                formatter.write_str("persisted diagnosis evidence identity is inconsistent")
             }
             Self::Compaction { job_id, source } => {
                 write!(formatter, "job {job_id} log compaction failed: {source}")

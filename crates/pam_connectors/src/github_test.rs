@@ -5,19 +5,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use pam_core::{ApprovalId, CallerId, IdempotencyKey, ProjectId};
+use pam_policy::{Approval, ApprovalState};
 use url::Url;
 
 use super::{
-    CancellationToken, Connector, FailureKind, InvocationContext, Operation, RetryGuidance,
+    CancellationToken, Connector, EffectApproval, FailureKind, InvocationContext, Operation,
+    RetryGuidance,
 };
 use crate::github::{
     CollectRunLogs, CollectRunLogsRequest, DiscoverFailedRuns, DiscoverRunsRequest, GitHubActions,
     GitHubTransport, MAX_DISCOVERED_RUNS, MAX_JOB_STEPS, MAX_LOG_BYTES_PER_JOB, Repository,
-    ReqwestGitHubTransport, RunId, TransportRequest, TransportResponse,
+    ReqwestGitHubTransport, RerunDisposition, RerunFailedJobs, RerunFailedJobsRequest, RunId,
+    TransportRequest, TransportResponse,
 };
 
 #[derive(Debug)]
 struct SeenRequest {
+    method: &'static str,
     url: String,
     authenticated: bool,
     response_limit: usize,
@@ -55,19 +60,18 @@ impl FakeTransport {
             .expect("reply lock must not be poisoned")
             .is_empty()
     }
-}
 
-impl GitHubTransport for FakeTransport {
-    fn get<'a>(
+    fn perform<'a>(
         &'a self,
+        method: &'static str,
         request: TransportRequest,
-        _context: &'a InvocationContext,
     ) -> super::ConnectorFuture<'a, Result<TransportResponse, super::ConnectorFailure>> {
         Box::pin(async move {
             self.seen
                 .lock()
                 .expect("seen request lock must not be poisoned")
                 .push(SeenRequest {
+                    method,
                     url: request.url().as_str().to_owned(),
                     authenticated: request.authenticated(),
                     response_limit: request.response_limit(),
@@ -83,6 +87,24 @@ impl GitHubTransport for FakeTransport {
                 Reply::Failure(failure) => Err(failure),
             }
         })
+    }
+}
+
+impl GitHubTransport for FakeTransport {
+    fn get<'a>(
+        &'a self,
+        request: TransportRequest,
+        _context: &'a InvocationContext,
+    ) -> super::ConnectorFuture<'a, Result<TransportResponse, super::ConnectorFailure>> {
+        self.perform("GET", request)
+    }
+
+    fn post<'a>(
+        &'a self,
+        request: TransportRequest,
+        _context: &'a InvocationContext,
+    ) -> super::ConnectorFuture<'a, Result<TransportResponse, super::ConnectorFailure>> {
+        self.perform("POST", request)
     }
 }
 
@@ -106,6 +128,38 @@ fn context() -> InvocationContext {
         None,
     )
     .unwrap()
+}
+
+fn stateful_context(attempt: u32, approval: Option<EffectApproval>) -> InvocationContext {
+    let context = InvocationContext::new(
+        Instant::now() + Duration::from_mins(1),
+        CancellationToken::new(),
+        attempt,
+        Some(IdempotencyKey::from("rerun-run-42")),
+    )
+    .unwrap();
+    match approval {
+        Some(approval) => context.with_effect_approval(approval),
+        None => context,
+    }
+}
+
+fn rerun_approval(request: &RerunFailedJobsRequest, expires_at_ms: u64) -> Approval {
+    let coordinates = RerunFailedJobs::coordinates(request);
+    Approval::requested(
+        ApprovalId::from("approval-rerun-42"),
+        CallerId::from("developer"),
+        ProjectId::from("pam"),
+        coordinates.capability().clone(),
+        coordinates.resource().clone(),
+        expires_at_ms,
+    )
+}
+
+fn approved_rerun(request: &RerunFailedJobsRequest) -> EffectApproval {
+    let mut approval = rerun_approval(request, u64::MAX);
+    assert_eq!(approval.approve(0), Ok(ApprovalState::Approved));
+    EffectApproval::new(approval)
 }
 
 fn connector(transport: FakeTransport) -> GitHubActions<FakeTransport> {
@@ -330,6 +384,266 @@ async fn rate_limits_and_unsafe_log_redirects_are_typed_without_leaking_targets(
         .unwrap();
     assert!(!output.truth().is_complete());
     assert!(!format!("{:?}", output.truth()).contains("signature=secret"));
+}
+
+#[tokio::test]
+async fn exact_approval_gates_rerun_and_incremented_attempt_verifies_it() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        RerunFailedJobs::coordinates(&request).resource().as_str(),
+        "github:ro-ag/pam/runs/42/attempts/1"
+    );
+    let approval = approved_rerun(&request);
+    let connector = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        response(201, Vec::new()),
+        response(200, run_json(42, 2, "CI")),
+    ]));
+
+    let output = Connector::<RerunFailedJobs>::execute(
+        &connector,
+        request,
+        stateful_context(1, Some(approval.clone())),
+    )
+    .await
+    .unwrap();
+
+    assert!(output.truth().is_complete());
+    assert_eq!(output.value().disposition(), RerunDisposition::Started);
+    assert_eq!(output.value().run().attempt(), 2);
+    assert_eq!(
+        output.value().approval_id().map(ApprovalId::as_str),
+        Some("approval-rerun-42")
+    );
+    assert_eq!(approval.state(), ApprovalState::Consumed);
+    let seen = connector.transport().seen();
+    assert_eq!(
+        seen.iter()
+            .map(|request| request.method)
+            .collect::<Vec<_>>(),
+        vec!["GET", "POST", "GET"]
+    );
+    assert!(seen[1].authenticated);
+    assert_eq!(seen[1].response_limit, 0);
+    assert!(seen[1].url.ends_with("/runs/42/rerun-failed-jobs"));
+    assert!(connector.transport().is_empty());
+}
+
+#[tokio::test]
+async fn unapproved_or_mismatched_reruns_never_post() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+
+    let requested = EffectApproval::new(rerun_approval(&request, u64::MAX));
+    let mut denied = rerun_approval(&request, u64::MAX);
+    assert_eq!(denied.deny(0), Ok(ApprovalState::Denied));
+    let denied = EffectApproval::new(denied);
+    let mut expired = rerun_approval(&request, 1);
+    assert_eq!(expired.approve(0), Ok(ApprovalState::Approved));
+    let expired = EffectApproval::new(expired);
+    let mismatched_request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        2,
+    )
+    .unwrap();
+    let mismatched = approved_rerun(&mismatched_request);
+
+    for approval in [requested, denied, expired, mismatched] {
+        let connector = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
+        let result = Connector::<RerunFailedJobs>::execute(
+            &connector,
+            request.clone(),
+            stateful_context(1, Some(approval)),
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("unapproved rerun must fail")
+        };
+        assert_eq!(failure.kind(), FailureKind::Forbidden);
+        assert_eq!(
+            connector
+                .transport()
+                .seen()
+                .iter()
+                .map(|request| request.method)
+                .collect::<Vec<_>>(),
+            vec!["GET"]
+        );
+        assert!(connector.transport().is_empty());
+    }
+
+    let connector = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
+    let result =
+        Connector::<RerunFailedJobs>::execute(&connector, request, stateful_context(1, None)).await;
+    let Err(failure) = result else {
+        panic!("missing approval must fail")
+    };
+    assert_eq!(failure.kind(), FailureKind::Forbidden);
+    assert_eq!(connector.transport().seen()[0].method, "GET");
+    assert!(connector.transport().is_empty());
+}
+
+#[tokio::test]
+async fn uncertain_rerun_is_reconciled_without_a_blind_second_post() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+    let approval = approved_rerun(&request);
+    let first = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        Reply::Failure(super::ConnectorFailure::timeout()),
+        response(200, run_json(42, 1, "CI")),
+    ]));
+    let result = Connector::<RerunFailedJobs>::execute(
+        &first,
+        request.clone(),
+        stateful_context(1, Some(approval.clone())),
+    )
+    .await;
+    let Err(failure) = result else {
+        panic!("unverified rerun must remain uncertain")
+    };
+    assert_eq!(failure.kind(), FailureKind::UncertainEffect);
+    assert_eq!(
+        failure.retry_guidance(),
+        RetryGuidance::ReconcileBeforeRetry
+    );
+    assert_eq!(approval.state(), ApprovalState::Consumed);
+    assert_eq!(
+        first
+            .transport()
+            .seen()
+            .iter()
+            .map(|request| request.method)
+            .collect::<Vec<_>>(),
+        vec!["GET", "POST", "GET"]
+    );
+
+    let retry = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
+    let result =
+        Connector::<RerunFailedJobs>::execute(&retry, request.clone(), stateful_context(2, None))
+            .await;
+    let Err(failure) = result else {
+        panic!("unchanged reconciliation must remain uncertain")
+    };
+    assert_eq!(failure.kind(), FailureKind::UncertainEffect);
+    assert_eq!(retry.transport().seen()[0].method, "GET");
+
+    let reconciled = connector(FakeTransport::new([response(200, run_json(42, 2, "CI"))]));
+    let output = Connector::<RerunFailedJobs>::execute(
+        &reconciled,
+        request.clone(),
+        stateful_context(2, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        output.value().disposition(),
+        RerunDisposition::AlreadyStarted
+    );
+    assert!(output.value().approval_id().is_none());
+    assert_eq!(reconciled.transport().seen()[0].method, "GET");
+
+    let over_advanced = connector(FakeTransport::new([response(200, run_json(42, 3, "CI"))]));
+    let result =
+        Connector::<RerunFailedJobs>::execute(&over_advanced, request, stateful_context(2, None))
+            .await;
+    let Err(failure) = result else {
+        panic!("over-advanced reconciliation must remain uncertain")
+    };
+    assert_eq!(failure.kind(), FailureKind::UncertainEffect);
+    assert_eq!(over_advanced.transport().seen()[0].method, "GET");
+}
+
+#[tokio::test]
+async fn post_success_with_failed_verification_remains_uncertain() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+    let approval = approved_rerun(&request);
+    let connector = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        response(201, Vec::new()),
+        Reply::Failure(super::ConnectorFailure::timeout()),
+    ]));
+
+    let result = Connector::<RerunFailedJobs>::execute(
+        &connector,
+        request,
+        stateful_context(1, Some(approval)),
+    )
+    .await;
+    let Err(failure) = result else {
+        panic!("failed post-effect verification must remain uncertain")
+    };
+    assert_eq!(failure.kind(), FailureKind::UncertainEffect);
+    assert_eq!(
+        failure.retry_guidance(),
+        RetryGuidance::ReconcileBeforeRetry
+    );
+    assert_eq!(
+        connector
+            .transport()
+            .seen()
+            .iter()
+            .map(|request| request.method)
+            .collect::<Vec<_>>(),
+        vec!["GET", "POST", "GET"]
+    );
+    assert!(connector.transport().is_empty());
+}
+
+#[tokio::test]
+async fn one_approval_cannot_authorize_two_posts() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+    let approval = approved_rerun(&request);
+    let first = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        response(201, Vec::new()),
+        response(200, run_json(42, 2, "CI")),
+    ]));
+    Connector::<RerunFailedJobs>::execute(
+        &first,
+        request.clone(),
+        stateful_context(1, Some(approval.clone())),
+    )
+    .await
+    .unwrap();
+
+    let second = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
+    let result = Connector::<RerunFailedJobs>::execute(
+        &second,
+        request,
+        stateful_context(1, Some(approval)),
+    )
+    .await;
+    let Err(failure) = result else {
+        panic!("consumed approval must not authorize a second rerun")
+    };
+    assert_eq!(failure.kind(), FailureKind::Forbidden);
+    assert_eq!(second.transport().seen()[0].method, "GET");
+    assert!(second.transport().is_empty());
 }
 
 #[test]

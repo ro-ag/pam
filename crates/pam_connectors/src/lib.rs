@@ -7,14 +7,15 @@ use std::{
     num::NonZeroU32,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub use pam_core::{EvidenceHandle, IdempotencyKey};
-pub use pam_policy::{CapabilityName, ResourceName};
+pub use pam_core::{ApprovalId, EvidenceHandle, IdempotencyKey};
+use pam_policy::{Approval, ApprovalTransitionError, EffectFingerprint};
+pub use pam_policy::{ApprovalState, CapabilityName, ResourceName};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(test)]
@@ -199,6 +200,7 @@ pub struct InvocationContext {
     cancellation: CancellationToken,
     attempt: NonZeroU32,
     idempotency_key: Option<IdempotencyKey>,
+    effect_approval: Option<EffectApproval>,
 }
 
 impl InvocationContext {
@@ -224,7 +226,15 @@ impl InvocationContext {
             cancellation,
             attempt,
             idempotency_key,
+            effect_approval: None,
         })
+    }
+
+    /// Attaches one policy approval for exact, one-time consumption at a stateful effect boundary.
+    #[must_use]
+    pub fn with_effect_approval(mut self, approval: EffectApproval) -> Self {
+        self.effect_approval = Some(approval);
+        self
     }
 
     #[must_use]
@@ -245,6 +255,11 @@ impl InvocationContext {
     #[must_use]
     pub fn idempotency_key(&self) -> Option<&IdempotencyKey> {
         self.idempotency_key.as_ref()
+    }
+
+    #[must_use]
+    pub fn effect_approval(&self) -> Option<&EffectApproval> {
+        self.effect_approval.as_ref()
     }
 
     #[must_use]
@@ -271,6 +286,33 @@ impl InvocationContext {
         }
         Ok(())
     }
+
+    /// Atomically consumes the attached approval for one operation's exact policy coordinates.
+    ///
+    /// Connectors must call this immediately before their first state-changing transport action.
+    /// Read-only reconciliation before this boundary does not consume the approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized forbidden failure unless an unexpired approved receipt matches the
+    /// operation's exact capability and resource and has not previously been consumed.
+    pub fn authorize_effect<O: Operation>(
+        &self,
+        request: &O::Request,
+    ) -> Result<ApprovalId, ConnectorFailure> {
+        self.preflight(O::EFFECT)?;
+        if !matches!(O::EFFECT, OperationEffect::Stateful(_)) {
+            return Err(ConnectorFailure::invalid_request(FailureMessage::trusted(
+                "read-only operation has no effect approval boundary",
+            )));
+        }
+        let approval = self.effect_approval.as_ref().ok_or_else(|| {
+            ConnectorFailure::forbidden(FailureMessage::trusted(
+                "stateful operation requires an exact approval",
+            ))
+        })?;
+        approval.consume(&O::coordinates(request))
+    }
 }
 
 impl fmt::Debug for InvocationContext {
@@ -281,7 +323,83 @@ impl fmt::Debug for InvocationContext {
             .field("cancellation", &self.cancellation)
             .field("attempt", &self.attempt)
             .field("has_idempotency_key", &self.idempotency_key.is_some())
+            .field("has_effect_approval", &self.effect_approval.is_some())
             .finish()
+    }
+}
+
+/// A shareable handle to one policy approval consumed at an exact connector effect boundary.
+#[derive(Clone)]
+pub struct EffectApproval {
+    approval: Arc<Mutex<Approval>>,
+}
+
+impl EffectApproval {
+    #[must_use]
+    pub fn new(approval: Approval) -> Self {
+        Self {
+            approval: Arc::new(Mutex::new(approval)),
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> ApprovalId {
+        self.with_approval(|approval| approval.id().clone())
+    }
+
+    #[must_use]
+    pub fn state(&self) -> ApprovalState {
+        self.with_approval(|approval| approval.state())
+    }
+
+    fn consume(&self, coordinates: &OperationCoordinates) -> Result<ApprovalId, ConnectorFailure> {
+        self.with_approval(|approval| {
+            let fingerprint = EffectFingerprint::compute(
+                approval.caller(),
+                approval.project(),
+                coordinates.capability(),
+                coordinates.resource(),
+            );
+            match approval.consume(&fingerprint, unix_time_ms()) {
+                Ok(ApprovalState::Consumed) => Ok(approval.id().clone()),
+                Ok(_) | Err(ApprovalTransitionError::InvalidTransition) => {
+                    Err(ConnectorFailure::forbidden(FailureMessage::trusted(
+                        "effect approval is not approved and unexpired",
+                    )))
+                }
+                Err(ApprovalTransitionError::FingerprintMismatch) => {
+                    Err(ConnectorFailure::forbidden(FailureMessage::trusted(
+                        "effect approval does not match the exact operation",
+                    )))
+                }
+            }
+        })
+    }
+
+    fn with_approval<T>(&self, operation: impl FnOnce(&mut Approval) -> T) -> T {
+        let mut approval = self
+            .approval
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operation(&mut approval)
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+impl fmt::Debug for EffectApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectApproval")
+            .field("id", &self.id())
+            .field("state", &self.state())
+            .finish_non_exhaustive()
     }
 }
 

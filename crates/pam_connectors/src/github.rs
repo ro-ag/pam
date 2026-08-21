@@ -1,4 +1,4 @@
-//! Typed GitHub Actions read operations.
+//! Typed GitHub Actions operations.
 
 use std::{collections::BTreeMap, error::Error, fmt, num::NonZeroU64, time::Duration};
 
@@ -7,9 +7,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
 use crate::{
-    BoundedSummary, CapabilityName, Connector, ConnectorDescriptor, ConnectorFailure,
-    ConnectorFuture, ConnectorOutput, ExactArtifact, FailureMessage, InvocationContext, Operation,
-    OperationCoordinates, OperationEffect, ResourceName, Truth,
+    ApprovalId, BoundedSummary, CapabilityName, Connector, ConnectorDescriptor, ConnectorFailure,
+    ConnectorFuture, ConnectorOutput, ExactArtifact, FailureMessage, IdempotencyDeclaration,
+    InvocationContext, Operation, OperationCoordinates, OperationEffect, ReconciliationDeclaration,
+    ResourceName, StatefulContract, Truth,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -85,6 +86,16 @@ impl Repository {
             run_id.get()
         ))
         .expect("validated GitHub run coordinates fit the policy resource bound")
+    }
+
+    fn rerun_resource(&self, run_id: RunId, baseline_attempt: u32) -> ResourceName {
+        ResourceName::parse(format!(
+            "github:{}/{}/runs/{}/attempts/{baseline_attempt}",
+            self.owner,
+            self.name,
+            run_id.get()
+        ))
+        .expect("validated GitHub rerun coordinates fit the policy resource bound")
     }
 }
 
@@ -197,6 +208,59 @@ pub struct CollectRunLogsRequest {
     max_jobs: usize,
     max_log_bytes: usize,
     max_total_log_bytes: usize,
+}
+
+/// An exact failed-run rerun request anchored to the observed run attempt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RerunFailedJobsRequest {
+    repository: Repository,
+    run_id: RunId,
+    baseline_attempt: u32,
+}
+
+impl RerunFailedJobsRequest {
+    /// # Errors
+    ///
+    /// Returns an error when the observed baseline attempt is zero.
+    pub fn new(
+        repository: Repository,
+        run_id: RunId,
+        baseline_attempt: u32,
+    ) -> Result<Self, InvalidReadBound> {
+        if baseline_attempt == 0 {
+            return Err(InvalidReadBound);
+        }
+        Ok(Self {
+            repository,
+            run_id,
+            baseline_attempt,
+        })
+    }
+
+    #[must_use]
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    #[must_use]
+    pub const fn baseline_attempt(&self) -> u32 {
+        self.baseline_attempt
+    }
+
+    fn validate(&self) -> Result<(), ConnectorFailure> {
+        if self.baseline_attempt == 0 {
+            Err(invalid_request(
+                "workflow rerun baseline attempt is invalid",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl CollectRunLogsRequest {
@@ -417,6 +481,37 @@ pub struct CollectRunLogsResponse {
     logs: Vec<JobLog>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RerunDisposition {
+    Started,
+    AlreadyStarted,
+    ReconciledAfterUncertainResponse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RerunFailedJobsResponse {
+    run: WorkflowRun,
+    disposition: RerunDisposition,
+    approval_id: Option<ApprovalId>,
+}
+
+impl RerunFailedJobsResponse {
+    #[must_use]
+    pub const fn run(&self) -> &WorkflowRun {
+        &self.run
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> RerunDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn approval_id(&self) -> Option<&ApprovalId> {
+        self.approval_id.as_ref()
+    }
+}
+
 impl CollectRunLogsResponse {
     #[must_use]
     pub const fn run(&self) -> &WorkflowRun {
@@ -464,6 +559,27 @@ impl Operation for CollectRunLogs {
         OperationCoordinates::new(
             capability(),
             request.repository.run_resource(request.run_id),
+        )
+    }
+}
+
+pub struct RerunFailedJobs;
+
+impl Operation for RerunFailedJobs {
+    type Request = RerunFailedJobsRequest;
+    type Response = RerunFailedJobsResponse;
+
+    const EFFECT: OperationEffect = OperationEffect::Stateful(StatefulContract::new(
+        IdempotencyDeclaration::NotSupported,
+        ReconciliationDeclaration::Required,
+    ));
+
+    fn coordinates(request: &Self::Request) -> OperationCoordinates {
+        OperationCoordinates::new(
+            rerun_capability(),
+            request
+                .repository
+                .rerun_resource(request.run_id, request.baseline_attempt),
         )
     }
 }
@@ -672,7 +788,95 @@ impl<T: GitHubTransport> Connector<CollectRunLogs> for GitHubActions<T> {
     }
 }
 
+impl<T: GitHubTransport> Connector<RerunFailedJobs> for GitHubActions<T> {
+    fn descriptor(&self) -> ConnectorDescriptor {
+        descriptor()
+    }
+
+    fn execute(
+        &self,
+        request: RerunFailedJobsRequest,
+        context: InvocationContext,
+    ) -> ConnectorFuture<'_, crate::ConnectorResult<RerunFailedJobsResponse>> {
+        Box::pin(async move {
+            context.preflight(RerunFailedJobs::EFFECT)?;
+            request.validate()?;
+
+            let current = self.fetch_run(&request, &context).await?;
+            if rerun_is_verified(&current, request.baseline_attempt) {
+                return rerun_output(current, RerunDisposition::AlreadyStarted, None);
+            }
+            if current.attempt < request.baseline_attempt {
+                return Err(remote_failure(
+                    "GitHub workflow run attempt regressed below the rerun baseline",
+                ));
+            }
+            if current.attempt != request.baseline_attempt {
+                return Err(uncertain_rerun());
+            }
+            if context.attempt().get() > 1 {
+                return Err(uncertain_rerun());
+            }
+            if current.status != "completed" || current.conclusion.as_deref() != Some("failure") {
+                return Err(invalid_request(
+                    "only a completed failed GitHub workflow run can be rerun",
+                ));
+            }
+
+            let approval_id = context.authorize_effect::<RerunFailedJobs>(&request)?;
+            let root = request.repository.api_path();
+            let path = format!("{root}/runs/{}/rerun-failed-jobs", request.run_id.get());
+            let response = self
+                .transport
+                .post(self.api_request(&path, 0)?, &context)
+                .await;
+            let disposition = match response {
+                Ok(response) if response.status == StatusCode::CREATED.as_u16() => {
+                    RerunDisposition::Started
+                }
+                Ok(response) if response.status < 500 => {
+                    require_status(&response, StatusCode::CREATED)?;
+                    unreachable!("matching status returned above")
+                }
+                Ok(_) | Err(_) => RerunDisposition::ReconciledAfterUncertainResponse,
+            };
+
+            let verified = self
+                .fetch_run(&request, &context)
+                .await
+                .map_err(|_| uncertain_rerun())?;
+            if !rerun_is_verified(&verified, request.baseline_attempt) {
+                return Err(uncertain_rerun());
+            }
+            rerun_output(verified, disposition, Some(approval_id))
+        })
+    }
+}
+
 impl<T: GitHubTransport> GitHubActions<T> {
+    async fn fetch_run(
+        &self,
+        request: &RerunFailedJobsRequest,
+        context: &InvocationContext,
+    ) -> Result<WorkflowRun, ConnectorFailure> {
+        let path = format!(
+            "{}/runs/{}",
+            request.repository.api_path(),
+            request.run_id.get()
+        );
+        let response = self
+            .transport
+            .get(self.api_request(&path, MAX_JSON_BYTES)?, context)
+            .await?;
+        require_status(&response, StatusCode::OK)?;
+        let run: WorkflowRun = parse_json(&response.body)?;
+        validate_run(&run)?;
+        if run.id != request.run_id {
+            return Err(remote_failure("GitHub returned a different workflow run"));
+        }
+        Ok(run)
+    }
+
     async fn collect_log(
         &self,
         api_path: &str,
@@ -792,6 +996,12 @@ pub trait GitHubTransport: Send + Sync {
         request: TransportRequest,
         context: &'a InvocationContext,
     ) -> ConnectorFuture<'a, Result<TransportResponse, ConnectorFailure>>;
+
+    fn post<'a>(
+        &'a self,
+        request: TransportRequest,
+        context: &'a InvocationContext,
+    ) -> ConnectorFuture<'a, Result<TransportResponse, ConnectorFailure>>;
 }
 
 /// Production transport with native rustls verification, system proxy support, and no redirects.
@@ -836,12 +1046,42 @@ impl GitHubTransport for ReqwestGitHubTransport {
         request: TransportRequest,
         context: &'a InvocationContext,
     ) -> ConnectorFuture<'a, Result<TransportResponse, ConnectorFailure>> {
+        self.send(
+            reqwest::Method::GET,
+            request,
+            context,
+            OperationEffect::ReadOnly,
+        )
+    }
+
+    fn post<'a>(
+        &'a self,
+        request: TransportRequest,
+        context: &'a InvocationContext,
+    ) -> ConnectorFuture<'a, Result<TransportResponse, ConnectorFailure>> {
+        self.send(
+            reqwest::Method::POST,
+            request,
+            context,
+            RerunFailedJobs::EFFECT,
+        )
+    }
+}
+
+impl ReqwestGitHubTransport {
+    fn send<'a>(
+        &'a self,
+        method: reqwest::Method,
+        request: TransportRequest,
+        context: &'a InvocationContext,
+        effect: OperationEffect,
+    ) -> ConnectorFuture<'a, Result<TransportResponse, ConnectorFailure>> {
         Box::pin(async move {
-            context.preflight(OperationEffect::ReadOnly)?;
+            context.preflight(effect)?;
             let remaining = context.remaining().ok_or_else(ConnectorFailure::timeout)?;
             let mut builder = self
                 .client
-                .get(request.url)
+                .request(method, request.url)
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header(header::USER_AGENT, "pam/0.1.0")
                 .header("x-github-api-version", GITHUB_API_VERSION)
@@ -851,10 +1091,13 @@ impl GitHubTransport for ReqwestGitHubTransport {
             {
                 builder = builder.bearer_auth(token);
             }
-            let mut response = builder
-                .send()
-                .await
-                .map_err(|error| map_reqwest_failure(&error))?;
+            let mut response = builder.send().await.map_err(|error| {
+                if matches!(effect, OperationEffect::Stateful(_)) {
+                    uncertain_rerun()
+                } else {
+                    map_reqwest_failure(&error)
+                }
+            })?;
             let status = response.status().as_u16();
             let mut headers = BTreeMap::new();
             for name in [
@@ -890,7 +1133,7 @@ impl GitHubTransport for ReqwestGitHubTransport {
                 .await
                 .map_err(|error| map_reqwest_failure(&error))?
             {
-                context.preflight(OperationEffect::ReadOnly)?;
+                context.preflight(effect)?;
                 if body.len().saturating_add(chunk.len()) > request.response_limit {
                     return Err(ConnectorFailure::response_too_large(request.response_limit));
                 }
@@ -923,6 +1166,43 @@ fn descriptor() -> ConnectorDescriptor {
 
 fn capability() -> CapabilityName {
     CapabilityName::parse("runs.inspect").expect("static GitHub capability is valid")
+}
+
+fn rerun_capability() -> CapabilityName {
+    CapabilityName::parse("runs.rerun").expect("static GitHub capability is valid")
+}
+
+fn rerun_output(
+    run: WorkflowRun,
+    disposition: RerunDisposition,
+    approval_id: Option<ApprovalId>,
+) -> crate::ConnectorResult<RerunFailedJobsResponse> {
+    let attempt = run.attempt;
+    ConnectorOutput::new(
+        RerunFailedJobsResponse {
+            run,
+            disposition,
+            approval_id,
+        },
+        summary(format!(
+            "verified GitHub Actions rerun at attempt {attempt}"
+        ))?,
+        Truth::Complete,
+        Vec::new(),
+        Vec::new(),
+    )
+    .map_err(|_| remote_failure("GitHub rerun output exceeded SDK bounds"))
+}
+
+fn uncertain_rerun() -> ConnectorFailure {
+    ConnectorFailure::uncertain_effect(safe_message(
+        "GitHub rerun result is not yet verified; reconcile before retrying",
+    ))
+}
+
+fn rerun_is_verified(run: &WorkflowRun, baseline_attempt: u32) -> bool {
+    baseline_attempt.checked_add(1) == Some(run.attempt)
+        && matches!(run.status.as_str(), "queued" | "in_progress" | "completed")
 }
 
 fn summary(value: String) -> Result<BoundedSummary, ConnectorFailure> {

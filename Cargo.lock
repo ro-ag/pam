@@ -3044,6 +3044,7 @@ dependencies = [
  "pam_compact",
  "pam_core",
  "pam_policy",
+ "pam_store",
  "reqwest",
  "serde",
  "serde_json",

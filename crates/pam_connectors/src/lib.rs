@@ -15,6 +15,7 @@ use std::{
 
 pub use pam_core::{ApprovalId, CallerId, EvidenceHandle, IdempotencyKey, ProjectId};
 pub use pam_policy::{CapabilityName, ResourceName};
+use pam_store::{AuthorizationOutcome, EffectApprovalCapability};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(test)]
@@ -199,7 +200,6 @@ pub struct InvocationContext {
     cancellation: CancellationToken,
     attempt: NonZeroU32,
     idempotency_key: Option<IdempotencyKey>,
-    identity: Option<InvocationIdentity>,
     effect_approval: Option<EffectApproval>,
 }
 
@@ -226,16 +226,8 @@ impl InvocationContext {
             cancellation,
             attempt,
             idempotency_key,
-            identity: None,
             effect_approval: None,
         })
-    }
-
-    /// Binds the authenticated caller and project selected by the trusted runtime.
-    #[must_use]
-    pub fn with_identity(mut self, caller: CallerId, project: ProjectId) -> Self {
-        self.identity = Some(InvocationIdentity { caller, project });
-        self
     }
 
     /// Attaches one policy approval for exact, one-time consumption at a stateful effect boundary.
@@ -268,11 +260,6 @@ impl InvocationContext {
     #[must_use]
     pub fn effect_approval(&self) -> Option<&EffectApproval> {
         self.effect_approval.as_ref()
-    }
-
-    #[must_use]
-    pub const fn identity(&self) -> Option<&InvocationIdentity> {
-        self.identity.as_ref()
     }
 
     #[must_use]
@@ -324,21 +311,28 @@ impl InvocationContext {
                 "stateful operation requires an exact approval",
             ))
         })?;
-        let identity = self.identity.as_ref().ok_or_else(|| {
-            ConnectorFailure::forbidden(FailureMessage::trusted(
-                "stateful operation requires an authenticated invocation identity",
-            ))
-        })?;
-        approval
-            .authority
+        let coordinates = O::coordinates(request);
+        match approval
+            .capability
             .consume(
-                &approval.approval_id,
-                &identity.caller,
-                &identity.project,
-                &O::coordinates(request),
+                coordinates.capability().clone(),
+                coordinates.resource().clone(),
             )
-            .await?;
-        Ok(approval.approval_id.clone())
+            .await
+            .map_err(|_| {
+                ConnectorFailure::remote(
+                    FailureMessage::trusted("approval authority is unavailable"),
+                    true,
+                )
+            })? {
+            AuthorizationOutcome::Allowed => Ok(approval.id()),
+            AuthorizationOutcome::Denied
+            | AuthorizationOutcome::ApprovalRequired { .. }
+            | AuthorizationOutcome::ApprovalDenied
+            | AuthorizationOutcome::ApprovalExpired => Err(ConnectorFailure::forbidden(
+                FailureMessage::trusted("approval is not valid for the exact effect"),
+            )),
+        }
     }
 }
 
@@ -350,65 +344,27 @@ impl fmt::Debug for InvocationContext {
             .field("cancellation", &self.cancellation)
             .field("attempt", &self.attempt)
             .field("has_idempotency_key", &self.idempotency_key.is_some())
-            .field("has_identity", &self.identity.is_some())
             .field("has_effect_approval", &self.effect_approval.is_some())
             .finish()
     }
 }
 
-/// Authenticated caller and project identity supplied by PAM's trusted runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvocationIdentity {
-    caller: CallerId,
-    project: ProjectId,
-}
-
-impl InvocationIdentity {
-    #[must_use]
-    pub const fn caller(&self) -> &CallerId {
-        &self.caller
-    }
-
-    #[must_use]
-    pub const fn project(&self) -> &ProjectId {
-        &self.project
-    }
-}
-
-/// Durable authority that atomically validates and consumes one exact approval receipt.
-pub trait EffectApprovalAuthority: Send + Sync {
-    /// # Errors
-    ///
-    /// Returns a sanitized failure unless the approval is approved, unexpired, unused, and bound
-    /// to the authenticated caller, project, capability, and resource.
-    fn consume<'a>(
-        &'a self,
-        approval_id: &'a ApprovalId,
-        caller: &'a CallerId,
-        project: &'a ProjectId,
-        coordinates: &'a OperationCoordinates,
-    ) -> ConnectorFuture<'a, Result<(), ConnectorFailure>>;
-}
-
 /// Opaque handle to a durable approval receipt consumed at an exact connector effect boundary.
 #[derive(Clone)]
 pub struct EffectApproval {
-    approval_id: ApprovalId,
-    authority: Arc<dyn EffectApprovalAuthority>,
+    capability: EffectApprovalCapability,
 }
 
 impl EffectApproval {
+    /// Wraps a capability issued by an authenticated [`pam_store::Store`] path.
     #[must_use]
-    pub fn new(approval_id: ApprovalId, authority: Arc<dyn EffectApprovalAuthority>) -> Self {
-        Self {
-            approval_id,
-            authority,
-        }
+    pub const fn from_store(capability: EffectApprovalCapability) -> Self {
+        Self { capability }
     }
 
     #[must_use]
     pub fn id(&self) -> ApprovalId {
-        self.approval_id.clone()
+        self.capability.approval_id().clone()
     }
 }
 

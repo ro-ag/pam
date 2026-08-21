@@ -2,7 +2,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use pam_core::{
@@ -50,6 +50,7 @@ const FLOW_OPERATION_KIND: &str = "flow_run";
 const STATUS_OPERATION_KIND: &str = "status";
 const LEGACY_STATUS_OPERATION_KIND: &str = "daemon_status";
 const FLOW_CAPABILITY_NAME: &str = "flow.run";
+const EFFECT_APPROVAL_AUDIT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub(super) const LATEST_SCHEMA_VERSION: u32 = 9;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
@@ -75,6 +76,76 @@ type Response<T> = oneshot::Sender<Result<T, StoreError>>;
 pub struct Store {
     commands: tokio_mpsc::Sender<Command>,
     evidence_commands: tokio_mpsc::Sender<EvidenceCommand>,
+}
+
+/// Store-issued capability for consuming one exact approval at an effect boundary.
+///
+/// Only [`Store::bind_effect_approval`] can construct this value. It keeps the authenticated
+/// caller, project, approval receipt, and originating store together so connector callers cannot
+/// substitute a different identity or an unconditional approval implementation.
+#[derive(Clone)]
+pub struct EffectApprovalCapability {
+    store: Store,
+    caller_id: CallerId,
+    project_id: ProjectId,
+    approval_id: ApprovalId,
+}
+
+impl EffectApprovalCapability {
+    #[must_use]
+    pub fn approval_id(&self) -> &ApprovalId {
+        &self.approval_id
+    }
+
+    /// Rechecks current policy and atomically consumes the bound exact approval receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timing, corrupt policy state, or unavailable durable state.
+    pub async fn consume(
+        &self,
+        capability: CapabilityName,
+        resource: ResourceName,
+    ) -> Result<AuthorizationOutcome, StoreError> {
+        let now_ms = system_now_ms();
+        let retain_until_ms = now_ms
+            .checked_add(EFFECT_APPROVAL_AUDIT_RETENTION_MS)
+            .ok_or(StoreError::InvalidAuditEvent("retention overflow"))?;
+        let audit = AuthorizationAudit {
+            event_id: format!("connector-effect-{}", Uuid::new_v4()),
+            action: "connector.effect.authorize".to_owned(),
+            redacted_detail: format!(
+                "approval={} capability={} resource={}",
+                self.approval_id, capability, resource
+            ),
+            retain_until_ms,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        self.store
+            .send(Command::Policy(PolicyCommand::ConsumeEffectApproval {
+                request: AuthorizationRequest {
+                    caller_id: self.caller_id.clone(),
+                    project_id: self.project_id.clone(),
+                    capability,
+                    resource,
+                    approval_id: Some(self.approval_id.clone()),
+                },
+                audit,
+                now_ms,
+                response: response_tx,
+            }))
+            .await?;
+        receive(response_rx).await
+    }
+}
+
+impl std::fmt::Debug for EffectApprovalCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectApprovalCapability")
+            .field("approval_id", &self.approval_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -228,6 +299,39 @@ impl Store {
         }))
         .await?;
         receive(response_rx).await
+    }
+
+    /// Authenticates a caller and binds one approval receipt to that caller, project, and store.
+    ///
+    /// The returned capability contains the authenticated identity privately. Consuming it
+    /// rechecks caller activity, current policy, exact effect coordinates, expiry, and one-use in
+    /// one immediate transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed credential or when durable state is unavailable. A
+    /// well-formed credential that does not authenticate returns `None` without disclosing whether
+    /// the caller exists or has been revoked.
+    pub async fn bind_effect_approval(
+        &self,
+        caller_id: CallerId,
+        credential: CallerCredential,
+        project_id: ProjectId,
+        approval_id: ApprovalId,
+    ) -> Result<Option<EffectApprovalCapability>, StoreError> {
+        if self
+            .authenticate_caller(caller_id.clone(), credential)
+            .await?
+            != CallerAuthentication::Authenticated
+        {
+            return Ok(None);
+        }
+        Ok(Some(EffectApprovalCapability {
+            store: self.clone(),
+            caller_id,
+            project_id,
+            approval_id,
+        }))
     }
 
     /// Authorizes one exact flow and accepts it in the same durable transaction.
@@ -1340,6 +1444,12 @@ enum PolicyCommand {
         approval_ttl_ms: u64,
         response: Response<AuthorizationOutcome>,
     },
+    ConsumeEffectApproval {
+        request: AuthorizationRequest,
+        audit: AuthorizationAudit,
+        now_ms: u64,
+        response: Response<AuthorizationOutcome>,
+    },
     AuthorizeFlowRun {
         request: AuthorizeFlowRun,
         now_ms: u64,
@@ -1624,6 +1734,15 @@ fn run_policy_command(connection: &mut Connection, command: PolicyCommand) {
         } => respond(
             response,
             authorize_audited(connection, &request, audit, now_ms, approval_ttl_ms),
+        ),
+        PolicyCommand::ConsumeEffectApproval {
+            request,
+            audit,
+            now_ms,
+            response,
+        } => respond(
+            response,
+            consume_effect_approval_audited(connection, &request, audit, now_ms),
         ),
         PolicyCommand::AuthorizeFlowRun {
             request,
@@ -2393,6 +2512,69 @@ fn authorize_audited(
     let now = sql_integer(now_ms)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let outcome = authorize_tx(&transaction, request, now, now_ms, approval_ttl_ms)?;
+    let (decision, audit_outcome) = authorization_audit_outcome(&outcome);
+    append_audit_event_tx(
+        &transaction,
+        AppendAuditEvent {
+            event_id: audit.event_id,
+            project_id: request.project_id.clone(),
+            caller_id: request.caller_id.clone(),
+            action: audit.action,
+            decision: decision.to_owned(),
+            outcome: audit_outcome.to_owned(),
+            redacted_detail: audit.redacted_detail,
+            occurred_at_ms: now_ms,
+            retain_until_ms: audit.retain_until_ms,
+        },
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn consume_effect_approval_audited(
+    connection: &mut Connection,
+    request: &AuthorizationRequest,
+    audit: AuthorizationAudit,
+    now_ms: u64,
+) -> Result<AuthorizationOutcome, StoreError> {
+    let now = sql_integer(now_ms)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = if caller_is_active(&transaction, &request.caller_id)? {
+        let grants = load_grants(&transaction, request)?;
+        if evaluate(
+            &grants,
+            &request.caller_id,
+            &request.project_id,
+            &request.capability,
+            &request.resource,
+            now_ms,
+        ) == Decision::Denied
+        {
+            AuthorizationOutcome::Denied
+        } else {
+            let approval_id = request.approval_id.as_ref().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "connector effect capability is missing its approval receipt".to_owned(),
+                )
+            })?;
+            let fingerprint = EffectFingerprint::compute(
+                &request.caller_id,
+                &request.project_id,
+                &request.capability,
+                &request.resource,
+            );
+            resolve_approval(
+                &transaction,
+                approval_id,
+                request,
+                &fingerprint,
+                now,
+                now_ms,
+            )?
+        }
+    } else {
+        AuthorizationOutcome::Denied
+    };
     let (decision, audit_outcome) = authorization_audit_outcome(&outcome);
     append_audit_event_tx(
         &transaction,
@@ -5712,6 +5894,15 @@ pub(super) fn sql_integer(value: u64) -> Result<i64, StoreError> {
 
 pub(super) fn unsigned_integer(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::InvalidState(format!("negative integer {value}")))
+}
+
+fn system_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn lease_expiry(now_ms: u64, duration_ms: u64) -> Result<u64, StoreError> {

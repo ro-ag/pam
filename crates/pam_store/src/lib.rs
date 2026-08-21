@@ -31,4 +31,4 @@ pub use model::{
     Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoredResult, TerminalState,
 };
 pub use pam_model::{ModelKey, RegisteredModel};
-pub use store::Store;
+pub use store::{EffectApprovalCapability, Store};

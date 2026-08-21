@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, error::Error, fmt};
 use pam_compact::{
     CompactError, CompactedLog, CompactionPolicy, LogMetadata, SourceEvidence, compact_log,
 };
-use pam_core::{ContentDigest, EvidenceReference};
+use pam_core::{ContentDigest, EvidenceHandle, EvidenceReference};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -57,37 +57,29 @@ const REMOTE_OR_UNKNOWN_PATTERNS: &[&[u8]] = &[
     b"service unavailable",
     b"connection reset",
 ];
+const GITHUB_LOG_EVIDENCE_PREFIX: &str = "evidence://github-actions/log";
 
-/// Exact bytes and their immutable evidence identity for one collected job log.
+/// Exact bytes for one collected job log.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ExactJobLog {
     job_id: u64,
-    source: SourceEvidence,
     bytes: Vec<u8>,
 }
 
 impl ExactJobLog {
-    /// Creates a bounded exact job log. Digest verification occurs in [`diagnose_run`].
+    /// Creates a bounded exact job log.
     ///
     /// # Errors
     ///
     /// Returns an error for a zero job identifier or a payload over the per-job collection bound.
-    pub fn new(
-        job_id: u64,
-        source: SourceEvidence,
-        bytes: Vec<u8>,
-    ) -> Result<Self, DiagnosisError> {
+    pub fn new(job_id: u64, bytes: Vec<u8>) -> Result<Self, DiagnosisError> {
         if job_id == 0 {
             return Err(DiagnosisError::InvalidJobId);
         }
         if bytes.len() > MAX_LOG_BYTES_PER_JOB {
             return Err(DiagnosisError::LogTooLarge { job_id });
         }
-        Ok(Self {
-            job_id,
-            source,
-            bytes,
-        })
+        Ok(Self { job_id, bytes })
     }
 
     #[must_use]
@@ -96,14 +88,19 @@ impl ExactJobLog {
     }
 
     #[must_use]
-    pub const fn source(&self) -> &SourceEvidence {
-        &self.source
-    }
-
-    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+fn canonical_source(bytes: &[u8]) -> SourceEvidence {
+    let digest = ContentDigest::from_sha256(Sha256::digest(bytes).into());
+    let handle = EvidenceHandle::parse(format!(
+        "{GITHUB_LOG_EVIDENCE_PREFIX}/{}",
+        digest.sha256_hex()
+    ))
+    .expect("a lowercase SHA-256 digest is a canonical evidence segment");
+    SourceEvidence { handle, digest }
 }
 
 impl fmt::Debug for ExactJobLog {
@@ -111,7 +108,6 @@ impl fmt::Debug for ExactJobLog {
         formatter
             .debug_struct("ExactJobLog")
             .field("job_id", &self.job_id)
-            .field("source", &self.source)
             .field("byte_len", &self.bytes.len())
             .finish()
     }
@@ -254,8 +250,8 @@ impl RunDiagnosis {
 ///
 /// # Errors
 ///
-/// Returns an error for inconsistent jobs/artifacts/evidence, exceeded bounds, digest mismatch,
-/// compaction failure, or a manifest that cannot fit its fixed byte budget.
+/// Returns an error for inconsistent jobs/artifacts/evidence, exceeded bounds, compaction failure,
+/// or a manifest that cannot fit its fixed byte budget.
 pub fn diagnose_run(
     collection: &ConnectorOutput<CollectRunLogsResponse>,
     exact_logs: Vec<ExactJobLog>,
@@ -280,9 +276,14 @@ pub fn diagnose_run(
                 job_id: exact.job_id,
             });
         };
-        verify_digest(&exact)?;
+        let artifact = collection
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.name() == collected.artifact_name())
+            .ok_or(DiagnosisError::ArtifactPayloadCountMismatch)?;
+        let source = canonical_source(artifact.bytes());
         let compacted = compact_log(
-            &exact.source,
+            &source,
             &exact.bytes,
             &LogMetadata::default(),
             &CompactionPolicy::default(),
@@ -291,7 +292,13 @@ pub fn diagnose_run(
             job_id: exact.job_id,
             source,
         })?;
-        classify_log(&exact, &mut seen_findings, &mut findings);
+        classify_log(
+            exact.job_id,
+            &source,
+            &exact.bytes,
+            &mut seen_findings,
+            &mut findings,
+        );
         diagnosed_logs.push(DiagnosedLog {
             job_id: exact.job_id,
             artifact_name: collected.artifact_name().to_owned(),
@@ -485,34 +492,26 @@ fn validate_exact_evidence(
     Ok(())
 }
 
-fn verify_digest(exact: &ExactJobLog) -> Result<(), DiagnosisError> {
-    let actual = ContentDigest::from_sha256(Sha256::digest(&exact.bytes).into());
-    if actual != exact.source.digest {
-        return Err(DiagnosisError::DigestMismatch {
-            job_id: exact.job_id,
-        });
-    }
-    Ok(())
-}
-
 fn classify_log(
-    exact: &ExactJobLog,
+    job_id: u64,
+    source: &SourceEvidence,
+    bytes: &[u8],
     seen: &mut BTreeSet<(u64, FindingCategory)>,
     findings: &mut Vec<DiagnosisFinding>,
 ) {
     let mut offset = 0_usize;
-    while offset < exact.bytes.len() {
-        let relative_end = exact.bytes[offset..].iter().position(|byte| *byte == b'\n');
-        let end = relative_end.map_or(exact.bytes.len(), |index| offset + index + 1);
-        let line = &exact.bytes[offset..end];
+    while offset < bytes.len() {
+        let relative_end = bytes[offset..].iter().position(|byte| *byte == b'\n');
+        let end = relative_end.map_or(bytes.len(), |index| offset + index + 1);
+        let line = &bytes[offset..end];
         if let Some(category) = classify_line(line)
-            && seen.insert((exact.job_id, category))
+            && seen.insert((job_id, category))
         {
             findings.push(DiagnosisFinding {
-                job_id: exact.job_id,
+                job_id,
                 category,
                 evidence: EvidenceReference {
-                    handle: exact.source.handle.clone(),
+                    handle: source.handle.clone(),
                     offset: u64::try_from(offset).expect("usize fits in u64"),
                     length: u64::try_from(end - offset).expect("usize fits in u64"),
                 },
@@ -654,7 +653,6 @@ pub enum DiagnosisError {
     EvidenceWithoutArtifact { job_id: u64 },
     MissingEvidence { job_id: u64 },
     ByteLengthMismatch { job_id: u64 },
-    DigestMismatch { job_id: u64 },
     Compaction { job_id: u64, source: CompactError },
     SummaryTooLarge,
     ManifestEncoding,
@@ -716,12 +714,6 @@ impl fmt::Display for DiagnosisError {
                 write!(
                     formatter,
                     "job {job_id} evidence length differs from its artifact"
-                )
-            }
-            Self::DigestMismatch { job_id } => {
-                write!(
-                    formatter,
-                    "job {job_id} evidence digest does not match its bytes"
                 )
             }
             Self::Compaction { job_id, source } => {

@@ -3,7 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pam_compact::SourceEvidence;
 use pam_core::{ContentDigest, EvidenceHandle};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -29,15 +28,14 @@ fn digest(bytes: &[u8]) -> ContentDigest {
 }
 
 fn exact_log(job_id: u64, bytes: &[u8]) -> ExactJobLog {
-    ExactJobLog::new(
-        job_id,
-        SourceEvidence {
-            handle: EvidenceHandle::parse(format!("evidence://github/job-{job_id}")).unwrap(),
-            digest: digest(bytes),
-        },
-        bytes.to_vec(),
+    ExactJobLog::new(job_id, bytes.to_vec()).unwrap()
+}
+
+fn canonical_handle(bytes: &[u8]) -> String {
+    format!(
+        "evidence://github-actions/log/{}",
+        digest(bytes).sha256_hex()
     )
-    .unwrap()
 }
 
 fn response(entries: &[(u64, usize)], total_jobs: u64) -> CollectRunLogsResponse {
@@ -143,10 +141,7 @@ fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
     for finding in diagnosis.findings() {
         assert!(finding.is_inference());
         assert_eq!(finding.job_id(), 7);
-        assert_eq!(
-            finding.evidence().handle.as_str(),
-            "evidence://github/job-7"
-        );
+        assert_eq!(finding.evidence().handle.as_str(), canonical_handle(bytes));
         let start = usize::try_from(finding.evidence().offset).unwrap();
         let end = start + usize::try_from(finding.evidence().length).unwrap();
         assert!(end <= bytes.len());
@@ -155,7 +150,7 @@ fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
 
     let compacted = diagnosis.logs()[0].compacted();
     assert_eq!(compacted.source.digest, digest(bytes));
-    assert_eq!(compacted.source.handle.as_str(), "evidence://github/job-7");
+    assert_eq!(compacted.source.handle.as_str(), canonical_handle(bytes));
     assert_eq!(
         compacted
             .fragments
@@ -187,7 +182,7 @@ fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
     assert_eq!(manifest["status"], "diagnosed");
     assert_eq!(
         manifest["logs"][0]["source"]["handle"],
-        "evidence://github/job-9"
+        canonical_handle(bytes)
     );
     assert_eq!(
         manifest["logs"][0]["source"]["digest"],
@@ -254,23 +249,21 @@ fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
 }
 
 #[test]
-fn malformed_digest_and_artifact_correspondence_are_rejected() {
+fn artifact_correspondence_is_rejected_and_caller_chosen_handles_cannot_be_cited() {
     let bytes = b"error: exact bytes\n";
     let collected_response = response(&[(4, bytes.len())], 1);
-    let bad_digest = ExactJobLog::new(
-        4,
-        SourceEvidence {
-            handle: EvidenceHandle::parse("evidence://github/job-4").unwrap(),
-            digest: digest(b"different"),
-        },
-        bytes.to_vec(),
-    )
-    .unwrap();
     let collected = collection(collected_response.clone(), true, vec![(4, bytes.to_vec())]);
-    assert!(matches!(
-        diagnose_run(&collected, vec![bad_digest]),
-        Err(DiagnosisError::DigestMismatch { job_id: 4 })
-    ));
+    let diagnosis = diagnose_run(&collected, vec![exact_log(4, bytes)]).unwrap();
+    let arbitrary = EvidenceHandle::parse("evidence://attacker/chosen-handle").unwrap();
+    assert_ne!(diagnosis.findings()[0].evidence().handle, arbitrary);
+    assert_eq!(
+        diagnosis.findings()[0].evidence().handle.as_str(),
+        canonical_handle(bytes)
+    );
+    assert_eq!(
+        diagnosis.logs()[0].compacted().source.handle.as_str(),
+        canonical_handle(bytes)
+    );
 
     let wrong_length = response(&[(4, bytes.len() + 1)], 1);
     let mut longer_artifact = bytes.to_vec();
@@ -328,14 +321,7 @@ fn log_count_and_payload_bounds_reject_overflow() {
 
     let oversized = vec![0_u8; MAX_LOG_BYTES_PER_JOB + 1];
     assert!(matches!(
-        ExactJobLog::new(
-            1,
-            SourceEvidence {
-                handle: EvidenceHandle::parse("evidence://github/job-1").unwrap(),
-                digest: digest(&oversized),
-            },
-            oversized,
-        ),
+        ExactJobLog::new(1, oversized),
         Err(DiagnosisError::LogTooLarge { job_id: 1 })
     ));
 }
@@ -391,20 +377,7 @@ async fn live_failed_run_is_diagnosed_with_compact_exact_evidence() {
                 .iter()
                 .find(|artifact| artifact.name() == log.artifact_name())
                 .expect("every collected log must have its exact artifact");
-            ExactJobLog::new(
-                log.job_id(),
-                SourceEvidence {
-                    handle: EvidenceHandle::parse(format!(
-                        "evidence://github/run-{}-job-{}",
-                        run_id.get(),
-                        log.job_id()
-                    ))
-                    .unwrap(),
-                    digest: digest(artifact.bytes()),
-                },
-                artifact.bytes().to_vec(),
-            )
-            .unwrap()
+            ExactJobLog::new(log.job_id(), artifact.bytes().to_vec()).unwrap()
         })
         .collect();
     let diagnosis = diagnose_run(&collection, exact_logs).unwrap();
@@ -415,7 +388,7 @@ async fn live_failed_run_is_diagnosed_with_compact_exact_evidence() {
                 .evidence()
                 .handle
                 .as_str()
-                .starts_with("evidence://github/run-")
+                .starts_with("evidence://github-actions/log/")
     }));
     assert!(!diagnosis.manifest().bytes().is_empty());
 }

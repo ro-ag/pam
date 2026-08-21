@@ -1,17 +1,25 @@
 use std::{
+    fs,
     future::Future,
-    sync::atomic::{AtomicUsize, Ordering},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use pam_core::{ApprovalId, CallerCredential, CallerId, GrantId, ProjectId};
+use pam_policy::{ApprovalRequirement, Effect, Grant, ResourceScope};
+use pam_store::{
+    ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome, AuthorizationRequest,
+    PutGrant, Store,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
     BoundedSummary, CancellationToken, CapabilityName, ConformanceViolation, Connector,
-    ConnectorDescriptor, ConnectorFailure, ConnectorFuture, ConnectorOutput, ExactArtifact,
-    ExactEvidence, FailureKind, FailureMessage, IdempotencyDeclaration, IdempotencyKey,
-    InvalidInvocationContext, InvocationContext, MAX_ARTIFACT_NAME_BYTES,
+    ConnectorDescriptor, ConnectorFailure, ConnectorFuture, ConnectorOutput, EffectApproval,
+    ExactArtifact, ExactEvidence, FailureKind, FailureMessage, IdempotencyDeclaration,
+    IdempotencyKey, InvalidInvocationContext, InvocationContext, MAX_ARTIFACT_NAME_BYTES,
     MAX_ARTIFACT_PAYLOAD_BYTES, MAX_ARTIFACT_PAYLOADS, MAX_EVIDENCE_PAYLOAD_BYTES,
     MAX_EVIDENCE_PAYLOADS, MAX_FAILURE_MESSAGE_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_SUMMARY_BYTES,
     Operation, OperationCoordinates, OperationEffect, ReconciliationDeclaration, ResourceName,
@@ -352,6 +360,302 @@ impl FakeConnector {
             .map_err(|_| ConnectorFailure::response_too_large(0))
         })
     }
+
+    async fn execute_stateful_effect(
+        &self,
+        request: &TestRequest,
+        context: &InvocationContext,
+    ) -> Result<ApprovalId, ConnectorFailure> {
+        let approval_id = context
+            .authorize_effect::<StatefulOperation>(request)
+            .await?;
+        self.transport_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(approval_id)
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .expect("current Unix time must fit u64")
+}
+
+fn connector_store_path(name: &str) -> (PathBuf, PathBuf) {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "pam-connectors-{name}-{}-{}-{}",
+        std::process::id(),
+        unix_now_ms(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    (directory.clone(), directory.join("pam.sqlite3"))
+}
+
+fn approval_grant(id: &str, caller: &str) -> PutGrant {
+    PutGrant {
+        grant: Grant {
+            id: GrantId::from(id),
+            caller: CallerId::from(caller),
+            project: ProjectId::from("pam"),
+            capability: capability("runs.rerun"),
+            resource: ResourceScope::Any,
+            effect: Effect::Allow,
+            approval: ApprovalRequirement::Once,
+            expires_at_ms: None,
+            revoked_at_ms: None,
+        },
+        created_at_ms: unix_now_ms(),
+    }
+}
+
+fn authorization_request(
+    caller: &str,
+    target: &str,
+    approval_id: Option<ApprovalId>,
+) -> AuthorizationRequest {
+    AuthorizationRequest {
+        caller_id: CallerId::from(caller),
+        project_id: ProjectId::from("pam"),
+        capability: capability("runs.rerun"),
+        resource: resource(target),
+        approval_id,
+    }
+}
+
+fn stateful_context_with(approval: EffectApproval) -> InvocationContext {
+    future_context(Some("rerun-42")).with_effect_approval(approval)
+}
+
+struct ApprovalFixture {
+    directory: PathBuf,
+    store: Store,
+    developer_credential: CallerCredential,
+    attacker_credential: CallerCredential,
+}
+
+impl ApprovalFixture {
+    async fn open(name: &str) -> Self {
+        let (directory, path) = connector_store_path(name);
+        let store = Store::open(path).unwrap();
+        let developer_credential = CallerCredential::new("developer credential");
+        let attacker_credential = CallerCredential::new("attacker credential");
+        for (caller, credential) in [
+            ("developer", developer_credential.clone()),
+            ("attacker", attacker_credential.clone()),
+        ] {
+            store
+                .register_caller(CallerId::from(caller), credential, unix_now_ms())
+                .await
+                .unwrap();
+        }
+        store
+            .put_grant(approval_grant("developer-rerun", "developer"))
+            .await
+            .unwrap();
+        store
+            .put_grant(approval_grant("attacker-rerun", "attacker"))
+            .await
+            .unwrap();
+        Self {
+            directory,
+            store,
+            developer_credential,
+            attacker_credential,
+        }
+    }
+
+    async fn approved(&self, target: &str, now_ms: u64, ttl_ms: u64) -> ApprovalId {
+        let AuthorizationOutcome::ApprovalRequired { approval_id, .. } = self
+            .store
+            .authorize(
+                authorization_request("developer", target, None),
+                now_ms,
+                ttl_ms,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("approval-requiring grant must issue a receipt")
+        };
+        assert_eq!(
+            self.store
+                .decide_project_approval(
+                    approval_id.clone(),
+                    ProjectId::from("pam"),
+                    CallerId::from("developer"),
+                    ApprovalDecision::Approve,
+                    now_ms,
+                )
+                .await
+                .unwrap(),
+            ApprovalDecisionOutcome::Approved
+        );
+        approval_id
+    }
+
+    async fn audit_count(&self) -> usize {
+        let audit = self
+            .store
+            .export_audit_events(ProjectId::from("pam"), 0, None, 10)
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .events
+                .iter()
+                .all(|event| event.action == "connector.effect.authorize")
+        );
+        audit.events.len()
+    }
+
+    async fn close(self) {
+        self.store.shutdown().await.unwrap();
+        fs::remove_dir_all(self.directory).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn store_issued_effect_approval_requires_authenticated_bound_identity() {
+    let fixture = ApprovalFixture::open("approval-identity").await;
+    let request = TestRequest {
+        target: "github:ro-ag/pam/runs/42/attempts/1".to_owned(),
+    };
+    let approval_id = fixture
+        .approved(&request.target, unix_now_ms(), 300_000)
+        .await;
+    assert!(
+        fixture
+            .store
+            .bind_effect_approval(
+                CallerId::from("developer"),
+                CallerCredential::new("wrong credential"),
+                ProjectId::from("pam"),
+                approval_id.clone(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let attacker_capability = fixture
+        .store
+        .bind_effect_approval(
+            CallerId::from("attacker"),
+            fixture.attacker_credential.clone(),
+            ProjectId::from("pam"),
+            approval_id,
+        )
+        .await
+        .unwrap()
+        .expect("registered attacker must authenticate");
+
+    let connector = FakeConnector::new();
+    let context = stateful_context_with(EffectApproval::from_store(attacker_capability));
+    assert_eq!(
+        connector
+            .execute_stateful_effect(&request, &context)
+            .await
+            .unwrap_err()
+            .kind(),
+        FailureKind::Forbidden
+    );
+    assert_eq!(connector.transport_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.audit_count().await, 1);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn store_issued_effect_approval_is_coordinate_bound_and_one_use() {
+    let fixture = ApprovalFixture::open("approval-coordinates").await;
+    let request = TestRequest {
+        target: "github:ro-ag/pam/runs/42/attempts/1".to_owned(),
+    };
+    let approval_id = fixture
+        .approved(&request.target, unix_now_ms(), 300_000)
+        .await;
+    let capability = fixture
+        .store
+        .bind_effect_approval(
+            CallerId::from("developer"),
+            fixture.developer_credential.clone(),
+            ProjectId::from("pam"),
+            approval_id.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("registered developer must authenticate");
+    let approval = EffectApproval::from_store(capability);
+    let connector = FakeConnector::new();
+    let wrong_request = TestRequest {
+        target: "github:ro-ag/pam/runs/43/attempts/1".to_owned(),
+    };
+    let wrong_context = stateful_context_with(approval.clone());
+    assert_eq!(
+        connector
+            .execute_stateful_effect(&wrong_request, &wrong_context)
+            .await
+            .unwrap_err()
+            .kind(),
+        FailureKind::Forbidden
+    );
+    assert_eq!(connector.transport_calls.load(Ordering::Relaxed), 0);
+
+    let exact_context = stateful_context_with(approval.clone());
+    assert_eq!(
+        connector
+            .execute_stateful_effect(&request, &exact_context)
+            .await
+            .unwrap(),
+        approval_id
+    );
+    assert_eq!(connector.transport_calls.load(Ordering::Relaxed), 1);
+    let replay_context = stateful_context_with(approval);
+    assert_eq!(
+        connector
+            .execute_stateful_effect(&request, &replay_context)
+            .await
+            .unwrap_err()
+            .kind(),
+        FailureKind::Forbidden
+    );
+    assert_eq!(connector.transport_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.audit_count().await, 3);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn store_issued_effect_approval_uses_trusted_time_for_expiry() {
+    let fixture = ApprovalFixture::open("approval-expiry").await;
+    let request = TestRequest {
+        target: "github:ro-ag/pam/runs/42/attempts/1".to_owned(),
+    };
+    let approval_id = fixture.approved(&request.target, 1, 1).await;
+    let capability = fixture
+        .store
+        .bind_effect_approval(
+            CallerId::from("developer"),
+            fixture.developer_credential.clone(),
+            ProjectId::from("pam"),
+            approval_id,
+        )
+        .await
+        .unwrap()
+        .expect("registered developer must authenticate");
+    let connector = FakeConnector::new();
+    let context = stateful_context_with(EffectApproval::from_store(capability));
+    assert_eq!(
+        connector
+            .execute_stateful_effect(&request, &context)
+            .await
+            .unwrap_err()
+            .kind(),
+        FailureKind::Forbidden
+    );
+    assert_eq!(connector.transport_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.audit_count().await, 1);
+    fixture.close().await;
 }
 
 macro_rules! fake_connector {

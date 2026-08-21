@@ -2,24 +2,33 @@ use std::{
     collections::VecDeque,
     env,
     error::Error,
-    fmt,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    fmt, fs,
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use pam_core::{ApprovalId, CallerId, IdempotencyKey, ProjectId};
-use pam_policy::{Approval, ApprovalState, EffectFingerprint};
+use pam_core::{ApprovalId, CallerCredential, CallerId, GrantId, IdempotencyKey, ProjectId};
+use pam_policy::{ApprovalRequirement, Effect, Grant, ResourceScope};
+use pam_store::{
+    ApprovalDecision, ApprovalDecisionOutcome, AuthorizationOutcome, AuthorizationRequest,
+    PutGrant, Store,
+};
 use url::Url;
 
 use super::{
-    CancellationToken, Connector, EffectApproval, EffectApprovalAuthority, FailureKind,
-    InvocationContext, Operation, OperationCoordinates, RetryGuidance,
+    CancellationToken, Connector, EffectApproval, FailureKind, InvocationContext, Operation,
+    RetryGuidance,
 };
 use crate::github::{
     CollectRunLogs, CollectRunLogsRequest, DiscoverFailedRuns, DiscoverRunsRequest, GitHubActions,
-    GitHubTransport, MAX_DISCOVERED_RUNS, MAX_JOB_STEPS, MAX_LOG_BYTES_PER_JOB, Repository,
-    ReqwestGitHubTransport, RerunDisposition, RerunFailedJobs, RerunFailedJobsRequest, RunId,
-    TransportRequest, TransportResponse, classify_transport_failure, rate_limit_delay_at,
+    GitHubTransport, MAX_DISCOVERED_RUNS, MAX_JOB_STEPS, MAX_LOG_BYTES_PER_JOB,
+    MAX_MUTATION_RESPONSE_BYTES, Repository, ReqwestGitHubTransport, RerunDisposition,
+    RerunFailedJobs, RerunFailedJobsRequest, RunId, TransportRequest, TransportResponse,
+    classify_transport_failure, rate_limit_delay_at,
 };
 
 #[derive(Debug)]
@@ -33,56 +42,32 @@ impl fmt::Display for SyntheticTransportError {
 
 impl Error for SyntheticTransportError {}
 
-struct TestApprovalAuthority {
-    approval: Mutex<Approval>,
-    now_ms: u64,
+static NEXT_APPROVAL_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+enum TestApprovalState {
+    Requested,
+    Approved,
+    Denied,
+    Expired,
 }
 
-impl TestApprovalAuthority {
-    fn state(&self) -> ApprovalState {
-        self.approval
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .state()
-    }
+struct ApprovalFixture {
+    approval: EffectApproval,
+    store: Store,
+    root: PathBuf,
 }
 
-impl EffectApprovalAuthority for TestApprovalAuthority {
-    fn consume<'a>(
-        &'a self,
-        approval_id: &'a ApprovalId,
-        caller: &'a CallerId,
-        project: &'a ProjectId,
-        coordinates: &'a OperationCoordinates,
-    ) -> super::ConnectorFuture<'a, Result<(), super::ConnectorFailure>> {
-        Box::pin(async move {
-            let mut approval = self
-                .approval
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if approval.id() != approval_id
-                || approval.caller() != caller
-                || approval.project() != project
-            {
-                return Err(super::ConnectorFailure::forbidden(
-                    super::FailureMessage::new("approval identity does not match invocation")
-                        .unwrap(),
-                ));
-            }
-            let fingerprint = EffectFingerprint::compute(
-                caller,
-                project,
-                coordinates.capability(),
-                coordinates.resource(),
-            );
-            match approval.consume(&fingerprint, self.now_ms) {
-                Ok(ApprovalState::Consumed) => Ok(()),
-                Ok(_) | Err(_) => Err(super::ConnectorFailure::forbidden(
-                    super::FailureMessage::new("approval is not valid for the exact effect")
-                        .unwrap(),
-                )),
-            }
-        })
+impl ApprovalFixture {
+    async fn close(self) {
+        let Self {
+            approval,
+            store,
+            root,
+        } = self;
+        drop(approval);
+        store.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -203,47 +188,143 @@ fn stateful_context(attempt: u32, approval: Option<EffectApproval>) -> Invocatio
         attempt,
         Some(IdempotencyKey::from("rerun-run-42")),
     )
-    .unwrap()
-    .with_identity(CallerId::from("developer"), ProjectId::from("pam"));
+    .unwrap();
     match approval {
         Some(approval) => context.with_effect_approval(approval),
         None => context,
     }
 }
 
-fn rerun_approval(request: &RerunFailedJobsRequest, expires_at_ms: u64) -> Approval {
-    let coordinates = RerunFailedJobs::coordinates(request);
-    Approval::requested(
-        ApprovalId::from("approval-rerun-42"),
-        CallerId::from("developer"),
-        ProjectId::from("pam"),
-        coordinates.capability().clone(),
-        coordinates.resource().clone(),
-        expires_at_ms,
-    )
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
-fn effect_approval(
-    approval: Approval,
-    now_ms: u64,
-) -> (EffectApproval, Arc<TestApprovalAuthority>) {
-    let approval_id = approval.id().clone();
-    let authority = Arc::new(TestApprovalAuthority {
-        approval: Mutex::new(approval),
-        now_ms,
-    });
-    (
-        EffectApproval::new(approval_id, authority.clone()),
-        authority,
-    )
-}
-
-fn approved_rerun(
+async fn approval_fixture(
     request: &RerunFailedJobsRequest,
-) -> (EffectApproval, Arc<TestApprovalAuthority>) {
-    let mut approval = rerun_approval(request, u64::MAX);
-    assert_eq!(approval.approve(0), Ok(ApprovalState::Approved));
-    effect_approval(approval, 1)
+    state: TestApprovalState,
+) -> ApprovalFixture {
+    let fixture_id = NEXT_APPROVAL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let root = env::temp_dir().join(format!(
+        "pam-connectors-github-approval-{}-{fixture_id}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let store = Store::open(root.join("pam.sqlite3")).unwrap();
+    let caller = CallerId::from(format!("developer-{fixture_id}"));
+    let reviewer = CallerId::from(format!("reviewer-{fixture_id}"));
+    let project = ProjectId::from(format!("pam-{fixture_id}"));
+    let credential = CallerCredential::new(format!("credential-{fixture_id}"));
+    let now_ms = if matches!(state, TestApprovalState::Expired) {
+        0
+    } else {
+        unix_time_ms()
+    };
+    for (identity, secret) in [
+        (caller.clone(), credential.clone()),
+        (
+            reviewer.clone(),
+            CallerCredential::new(format!("reviewer-credential-{fixture_id}")),
+        ),
+    ] {
+        store
+            .register_caller(identity, secret, now_ms)
+            .await
+            .unwrap();
+    }
+    let coordinates = RerunFailedJobs::coordinates(request);
+    store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::from(format!("rerun-grant-{fixture_id}")),
+                caller: caller.clone(),
+                project: project.clone(),
+                capability: coordinates.capability().clone(),
+                resource: ResourceScope::Exact(coordinates.resource().clone()),
+                effect: Effect::Allow,
+                approval: ApprovalRequirement::Once,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: now_ms,
+        })
+        .await
+        .unwrap();
+    let outcome = store
+        .authorize(
+            AuthorizationRequest {
+                caller_id: caller.clone(),
+                project_id: project.clone(),
+                capability: coordinates.capability().clone(),
+                resource: coordinates.resource().clone(),
+                approval_id: None,
+            },
+            now_ms,
+            if matches!(state, TestApprovalState::Expired) {
+                1
+            } else {
+                60_000
+            },
+        )
+        .await
+        .unwrap();
+    let AuthorizationOutcome::ApprovalRequired { approval_id, .. } = outcome else {
+        panic!("approval-required grant must issue a receipt")
+    };
+    decide_fixture_approval(&store, state, &approval_id, reviewer, now_ms).await;
+    let capability = store
+        .bind_effect_approval(caller, credential, project, approval_id)
+        .await
+        .unwrap()
+        .expect("registered credential must issue a store-bound capability");
+    ApprovalFixture {
+        approval: EffectApproval::from_store(capability),
+        store,
+        root,
+    }
+}
+
+async fn decide_fixture_approval(
+    store: &Store,
+    state: TestApprovalState,
+    approval_id: &ApprovalId,
+    reviewer: CallerId,
+    now_ms: u64,
+) {
+    match state {
+        TestApprovalState::Requested => {}
+        TestApprovalState::Approved | TestApprovalState::Expired => {
+            assert_eq!(
+                store
+                    .decide_approval(
+                        approval_id.clone(),
+                        reviewer,
+                        ApprovalDecision::Approve,
+                        now_ms,
+                    )
+                    .await
+                    .unwrap(),
+                ApprovalDecisionOutcome::Approved
+            );
+        }
+        TestApprovalState::Denied => {
+            assert_eq!(
+                store
+                    .decide_approval(
+                        approval_id.clone(),
+                        reviewer,
+                        ApprovalDecision::Deny,
+                        now_ms,
+                    )
+                    .await
+                    .unwrap(),
+                ApprovalDecisionOutcome::Denied
+            );
+        }
+    }
 }
 
 fn connector(transport: FakeTransport) -> GitHubActions<FakeTransport> {
@@ -534,6 +615,50 @@ async fn secondary_rate_limits_and_reset_deadlines_produce_bounded_backoff() {
     );
 }
 
+#[tokio::test]
+async fn rerun_retains_a_bounded_error_body_for_headerless_secondary_rate_limits() {
+    let request = RerunFailedJobsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        1,
+    )
+    .unwrap();
+    let fixture = approval_fixture(&request, TestApprovalState::Approved).await;
+    let connector = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        response(
+            403,
+            br#"{"message":"You have exceeded a secondary rate limit."}"#.to_vec(),
+        ),
+    ]));
+
+    let result = Connector::<RerunFailedJobs>::execute(
+        &connector,
+        request,
+        stateful_context(1, Some(fixture.approval.clone())),
+    )
+    .await;
+    let Err(failure) = result else {
+        panic!("headerless rerun secondary limit must fail with backoff")
+    };
+    assert_eq!(failure.kind(), FailureKind::RateLimit);
+    assert_eq!(
+        failure.retry_guidance(),
+        RetryGuidance::AfterBackoff {
+            delay: Some(Duration::from_mins(1))
+        }
+    );
+    let seen = connector.transport().seen();
+    assert_eq!(
+        seen.iter()
+            .map(|request| request.method)
+            .collect::<Vec<_>>(),
+        vec!["GET", "POST"]
+    );
+    assert_eq!(seen[1].response_limit, MAX_MUTATION_RESPONSE_BYTES);
+    fixture.close().await;
+}
+
 #[test]
 fn timeout_certificate_network_and_remote_failures_are_distinct() {
     let certificate = SyntheticTransportError("invalid peer certificate: unknown issuer");
@@ -641,7 +766,8 @@ async fn exact_approval_gates_rerun_and_incremented_attempt_verifies_it() {
         RerunFailedJobs::coordinates(&request).resource().as_str(),
         "github:ro-ag/pam/runs/42/attempts/1"
     );
-    let (approval, authority) = approved_rerun(&request);
+    let fixture = approval_fixture(&request, TestApprovalState::Approved).await;
+    let approval_id = fixture.approval.id();
     let connector = connector(FakeTransport::new([
         response(200, run_json(42, 1, "CI")),
         response(201, Vec::new()),
@@ -651,7 +777,7 @@ async fn exact_approval_gates_rerun_and_incremented_attempt_verifies_it() {
     let output = Connector::<RerunFailedJobs>::execute(
         &connector,
         request,
-        stateful_context(1, Some(approval.clone())),
+        stateful_context(1, Some(fixture.approval.clone())),
     )
     .await
     .unwrap();
@@ -661,9 +787,8 @@ async fn exact_approval_gates_rerun_and_incremented_attempt_verifies_it() {
     assert_eq!(output.value().run().attempt(), 2);
     assert_eq!(
         output.value().approval_id().map(ApprovalId::as_str),
-        Some("approval-rerun-42")
+        Some(approval_id.as_str())
     );
-    assert_eq!(authority.state(), ApprovalState::Consumed);
     let seen = connector.transport().seen();
     assert_eq!(
         seen.iter()
@@ -672,9 +797,10 @@ async fn exact_approval_gates_rerun_and_incremented_attempt_verifies_it() {
         vec!["GET", "POST", "GET"]
     );
     assert!(seen[1].authenticated);
-    assert_eq!(seen[1].response_limit, 0);
+    assert_eq!(seen[1].response_limit, MAX_MUTATION_RESPONSE_BYTES);
     assert!(seen[1].url.ends_with("/runs/42/rerun-failed-jobs"));
     assert!(connector.transport().is_empty());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -686,27 +812,25 @@ async fn unapproved_or_mismatched_reruns_never_post() {
     )
     .unwrap();
 
-    let requested = effect_approval(rerun_approval(&request, u64::MAX), 1).0;
-    let mut denied = rerun_approval(&request, u64::MAX);
-    assert_eq!(denied.deny(0), Ok(ApprovalState::Denied));
-    let denied = effect_approval(denied, 1).0;
-    let mut expired = rerun_approval(&request, 1);
-    assert_eq!(expired.approve(0), Ok(ApprovalState::Approved));
-    let expired = effect_approval(expired, 1).0;
     let mismatched_request = RerunFailedJobsRequest::new(
         Repository::parse("ro-ag/pam").unwrap(),
         RunId::new(42).unwrap(),
         2,
     )
     .unwrap();
-    let mismatched = approved_rerun(&mismatched_request).0;
+    let fixtures = [
+        approval_fixture(&request, TestApprovalState::Requested).await,
+        approval_fixture(&request, TestApprovalState::Denied).await,
+        approval_fixture(&request, TestApprovalState::Expired).await,
+        approval_fixture(&mismatched_request, TestApprovalState::Approved).await,
+    ];
 
-    for approval in [requested, denied, expired, mismatched] {
+    for fixture in fixtures {
         let connector = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
         let result = Connector::<RerunFailedJobs>::execute(
             &connector,
             request.clone(),
-            stateful_context(1, Some(approval)),
+            stateful_context(1, Some(fixture.approval.clone())),
         )
         .await;
         let Err(failure) = result else {
@@ -723,28 +847,8 @@ async fn unapproved_or_mismatched_reruns_never_post() {
             vec!["GET"]
         );
         assert!(connector.transport().is_empty());
+        fixture.close().await;
     }
-
-    let (approval, authority) = approved_rerun(&request);
-    let wrong_identity = InvocationContext::new(
-        Instant::now() + Duration::from_mins(1),
-        CancellationToken::new(),
-        1,
-        Some(IdempotencyKey::from("rerun-run-42-wrong-actor")),
-    )
-    .unwrap()
-    .with_identity(CallerId::from("intruder"), ProjectId::from("pam"))
-    .with_effect_approval(approval);
-    let actor_connector = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
-    let result =
-        Connector::<RerunFailedJobs>::execute(&actor_connector, request.clone(), wrong_identity)
-            .await;
-    let Err(failure) = result else {
-        panic!("approval for another caller must fail")
-    };
-    assert_eq!(failure.kind(), FailureKind::Forbidden);
-    assert_eq!(authority.state(), ApprovalState::Approved);
-    assert_eq!(actor_connector.transport().seen()[0].method, "GET");
 
     let connector = connector(FakeTransport::new([response(200, run_json(42, 1, "CI"))]));
     let result =
@@ -765,7 +869,7 @@ async fn uncertain_rerun_is_reconciled_without_a_blind_second_post() {
         1,
     )
     .unwrap();
-    let (approval, authority) = approved_rerun(&request);
+    let fixture = approval_fixture(&request, TestApprovalState::Approved).await;
     let first = connector(FakeTransport::new([
         response(200, run_json(42, 1, "CI")),
         Reply::Failure(super::ConnectorFailure::timeout()),
@@ -774,7 +878,7 @@ async fn uncertain_rerun_is_reconciled_without_a_blind_second_post() {
     let result = Connector::<RerunFailedJobs>::execute(
         &first,
         request.clone(),
-        stateful_context(1, Some(approval.clone())),
+        stateful_context(1, Some(fixture.approval.clone())),
     )
     .await;
     let Err(failure) = result else {
@@ -785,7 +889,6 @@ async fn uncertain_rerun_is_reconciled_without_a_blind_second_post() {
         failure.retry_guidance(),
         RetryGuidance::ReconcileBeforeRetry
     );
-    assert_eq!(authority.state(), ApprovalState::Consumed);
     assert_eq!(
         first
             .transport()
@@ -830,6 +933,7 @@ async fn uncertain_rerun_is_reconciled_without_a_blind_second_post() {
     };
     assert_eq!(failure.kind(), FailureKind::UncertainEffect);
     assert_eq!(over_advanced.transport().seen()[0].method, "GET");
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -840,7 +944,7 @@ async fn post_success_with_failed_verification_remains_uncertain() {
         1,
     )
     .unwrap();
-    let (approval, _) = approved_rerun(&request);
+    let fixture = approval_fixture(&request, TestApprovalState::Approved).await;
     let connector = connector(FakeTransport::new([
         response(200, run_json(42, 1, "CI")),
         response(201, Vec::new()),
@@ -850,7 +954,7 @@ async fn post_success_with_failed_verification_remains_uncertain() {
     let result = Connector::<RerunFailedJobs>::execute(
         &connector,
         request,
-        stateful_context(1, Some(approval)),
+        stateful_context(1, Some(fixture.approval.clone())),
     )
     .await;
     let Err(failure) = result else {
@@ -871,6 +975,7 @@ async fn post_success_with_failed_verification_remains_uncertain() {
         vec!["GET", "POST", "GET"]
     );
     assert!(connector.transport().is_empty());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -881,7 +986,7 @@ async fn one_approval_cannot_authorize_two_posts() {
         1,
     )
     .unwrap();
-    let (approval, _) = approved_rerun(&request);
+    let fixture = approval_fixture(&request, TestApprovalState::Approved).await;
     let first = connector(FakeTransport::new([
         response(200, run_json(42, 1, "CI")),
         response(201, Vec::new()),
@@ -890,7 +995,7 @@ async fn one_approval_cannot_authorize_two_posts() {
     Connector::<RerunFailedJobs>::execute(
         &first,
         request.clone(),
-        stateful_context(1, Some(approval.clone())),
+        stateful_context(1, Some(fixture.approval.clone())),
     )
     .await
     .unwrap();
@@ -899,7 +1004,7 @@ async fn one_approval_cannot_authorize_two_posts() {
     let result = Connector::<RerunFailedJobs>::execute(
         &second,
         request,
-        stateful_context(1, Some(approval)),
+        stateful_context(1, Some(fixture.approval.clone())),
     )
     .await;
     let Err(failure) = result else {
@@ -908,6 +1013,7 @@ async fn one_approval_cannot_authorize_two_posts() {
     assert_eq!(failure.kind(), FailureKind::Forbidden);
     assert_eq!(second.transport().seen()[0].method, "GET");
     assert!(second.transport().is_empty());
+    fixture.close().await;
 }
 
 #[test]

@@ -9,6 +9,7 @@ rust-version.workspace = true
 pam_compact.workspace = true
 pam_core.workspace = true
 pam_policy.workspace = true
+pam_store.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

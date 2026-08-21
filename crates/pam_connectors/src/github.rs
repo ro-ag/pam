@@ -30,6 +30,7 @@ pub const MAX_LOG_REDIRECTS: usize = 3;
 
 const MAX_REPOSITORY_PART_BYTES: usize = 100;
 const MAX_REMOTE_TEXT_BYTES: usize = 2048;
+pub(crate) const MAX_MUTATION_RESPONSE_BYTES: usize = 2048;
 const MAX_TOKEN_BYTES: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -839,7 +840,10 @@ impl<T: GitHubTransport> Connector<RerunFailedJobs> for GitHubActions<T> {
             let path = format!("{root}/runs/{}/rerun-failed-jobs", request.run_id.get());
             let response = self
                 .transport
-                .post(self.api_request(&path, 0)?, &context)
+                .post(
+                    self.api_request(&path, MAX_MUTATION_RESPONSE_BYTES)?,
+                    &context,
+                )
                 .await;
             let disposition = match response {
                 Ok(response) if response.status == StatusCode::CREATED.as_u16() => {

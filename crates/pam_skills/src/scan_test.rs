@@ -124,6 +124,89 @@ fn recursive_walk_enforces_traversal_depth() {
     assert!(!report.complete());
 }
 
+#[test]
+fn directory_entry_limit_accepts_exact_top_level_and_recursive_boundaries() {
+    let directory = TestDirectory::new("entry-limit-boundary");
+    directory.write("top/c.md", b"c");
+    directory.write("top/a.md", b"a");
+    directory.write("top/b.md", b"b");
+    directory.write("rules/a.md", b"a");
+    directory.write("rules/nested/b.md", b"b");
+
+    let limits = ScanLimits {
+        max_directory_entries: 3,
+        ..ScanLimits::default()
+    };
+    let mut top_level = ScanSession::new(limits);
+    let root = top_level.open_root(directory.path(), "", "test").unwrap();
+    assert_eq!(
+        top_level.list_files(&root, Path::new("top"), |_| true),
+        [
+            PathBuf::from("top/a.md"),
+            PathBuf::from("top/b.md"),
+            PathBuf::from("top/c.md"),
+        ]
+    );
+    assert!(top_level.finish().complete());
+
+    let mut recursive = ScanSession::new(limits);
+    let root = recursive.open_root(directory.path(), "", "test").unwrap();
+    assert_eq!(
+        recursive.walk_files(&root, Path::new("rules"), |_| true),
+        [
+            PathBuf::from("rules/a.md"),
+            PathBuf::from("rules/nested/b.md"),
+        ]
+    );
+    assert!(recursive.finish().complete());
+}
+
+#[test]
+fn directory_entry_limit_rejects_one_over_without_unbounded_collection() {
+    let directory = TestDirectory::new("entry-limit-one-over");
+    for name in ["d.md", "a.md", "c.md", "b.md"] {
+        directory.write(&format!("top/{name}"), name.as_bytes());
+    }
+    directory.write("rules/a.md", b"a");
+    directory.write("rules/nested/b.md", b"b");
+    directory.write("rules/nested/c.md", b"c");
+
+    let limits = ScanLimits {
+        max_directory_entries: 3,
+        ..ScanLimits::default()
+    };
+    let mut top_level = ScanSession::new(limits);
+    let root = top_level.open_root(directory.path(), "", "test").unwrap();
+    assert!(
+        top_level
+            .list_files(&root, Path::new("top"), |_| true)
+            .is_empty()
+    );
+    let report = top_level.finish();
+    assert_eq!(report.diagnostics().len(), 1);
+    assert_eq!(
+        report.diagnostics()[0].kind(),
+        ScanDiagnosticKind::DirectoryEntryLimitExceeded
+    );
+    assert_eq!(report.diagnostics()[0].logical_path(), "top");
+    assert!(!report.complete());
+
+    let mut recursive = ScanSession::new(limits);
+    let root = recursive.open_root(directory.path(), "", "test").unwrap();
+    assert_eq!(
+        recursive.walk_files(&root, Path::new("rules"), |_| true),
+        [PathBuf::from("rules/a.md")]
+    );
+    let report = recursive.finish();
+    assert_eq!(report.diagnostics().len(), 1);
+    assert_eq!(
+        report.diagnostics()[0].kind(),
+        ScanDiagnosticKind::DirectoryEntryLimitExceeded
+    );
+    assert_eq!(report.diagnostics()[0].logical_path(), "rules/nested");
+    assert!(!report.complete());
+}
+
 fn normalized(path: &str, byte: u8) -> AgentArtifact {
     AgentArtifact::new(
         path,

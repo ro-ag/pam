@@ -19,6 +19,7 @@ pub const DEFAULT_MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACTS: usize = 4096;
 pub const DEFAULT_MAX_AGGREGATE_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_TRAVERSAL_DEPTH: usize = 16;
+pub const DEFAULT_MAX_DIRECTORY_ENTRIES: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanLimits {
@@ -26,6 +27,7 @@ pub struct ScanLimits {
     pub max_artifacts: usize,
     pub max_aggregate_bytes: usize,
     pub max_traversal_depth: usize,
+    pub max_directory_entries: usize,
 }
 
 impl Default for ScanLimits {
@@ -35,6 +37,7 @@ impl Default for ScanLimits {
             max_artifacts: DEFAULT_MAX_ARTIFACTS,
             max_aggregate_bytes: DEFAULT_MAX_AGGREGATE_BYTES,
             max_traversal_depth: DEFAULT_MAX_TRAVERSAL_DEPTH,
+            max_directory_entries: DEFAULT_MAX_DIRECTORY_ENTRIES,
         }
     }
 }
@@ -45,6 +48,7 @@ pub enum ScanDiagnosticKind {
     AggregateBytesExceeded,
     ArtifactLimitExceeded,
     DuplicateArtifactIdentity,
+    DirectoryEntryLimitExceeded,
     FileTooLarge,
     InvalidArtifact,
     InvalidFrontmatter,
@@ -181,6 +185,8 @@ pub(crate) struct ScanSession {
     total_bytes: usize,
     aggregate_exhausted: bool,
     artifact_limit_reported: bool,
+    visited_directory_entries: usize,
+    directory_entry_limit_exhausted: bool,
     artifacts: BTreeMap<ArtifactKey, AgentArtifact>,
     diagnostics: Vec<ScanDiagnostic>,
 }
@@ -192,6 +198,8 @@ impl ScanSession {
             total_bytes: 0,
             aggregate_exhausted: false,
             artifact_limit_reported: false,
+            visited_directory_entries: 0,
+            directory_entry_limit_exhausted: false,
             artifacts: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
@@ -351,18 +359,14 @@ impl ScanSession {
         let mut stack = vec![(relative_directory.to_path_buf(), directory, 0_usize)];
         let mut files = Vec::new();
         while let Some((relative, absolute, depth)) = stack.pop() {
+            let path = root
+                .logical_path(&relative)
+                .unwrap_or_else(|_| "<invalid-path>".to_owned());
             let Ok(entries) = fs::read_dir(&absolute) else {
-                let path = root
-                    .logical_path(&relative)
-                    .unwrap_or_else(|_| "<invalid-path>".to_owned());
                 self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
                 continue;
             };
-            let Ok(mut entries) = entries.collect::<Result<Vec<_>, _>>() else {
-                let path = root
-                    .logical_path(&relative)
-                    .unwrap_or_else(|_| "<invalid-path>".to_owned());
-                self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
+            let Some(mut entries) = self.collect_directory_entries(entries, &path) else {
                 continue;
             };
             entries.sort_unstable_by_key(fs::DirEntry::file_name);
@@ -427,11 +431,10 @@ impl ScanSession {
             self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
             return Vec::new();
         };
-        let Ok(mut entries) = entries.collect::<Result<Vec<_>, _>>() else {
-            let path = root
-                .logical_path(relative_directory)
-                .unwrap_or_else(|_| "<invalid-path>".to_owned());
-            self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
+        let path = root
+            .logical_path(relative_directory)
+            .unwrap_or_else(|_| "<invalid-path>".to_owned());
+        let Some(mut entries) = self.collect_directory_entries(entries, &path) else {
             return Vec::new();
         };
         entries.sort_unstable_by_key(fs::DirEntry::file_name);
@@ -507,6 +510,35 @@ impl ScanSession {
             complete: self.diagnostics.is_empty(),
             diagnostics: self.diagnostics,
         }
+    }
+
+    fn collect_directory_entries(
+        &mut self,
+        entries: fs::ReadDir,
+        diagnostic_path: &str,
+    ) -> Option<Vec<fs::DirEntry>> {
+        if self.directory_entry_limit_exhausted {
+            return None;
+        }
+
+        let mut collected = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                self.diagnostic(diagnostic_path, ScanDiagnosticKind::ReadDirectory);
+                return None;
+            };
+            if self.visited_directory_entries >= self.limits.max_directory_entries {
+                self.directory_entry_limit_exhausted = true;
+                self.diagnostic(
+                    diagnostic_path,
+                    ScanDiagnosticKind::DirectoryEntryLimitExceeded,
+                );
+                return None;
+            }
+            self.visited_directory_entries += 1;
+            collected.push(entry);
+        }
+        Some(collected)
     }
 
     fn open_bounded_file(

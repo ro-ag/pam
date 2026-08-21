@@ -92,7 +92,7 @@ fn discovers_user_and_project_artifacts_with_safe_semantics() {
         .load_semantics(),
         LoadSemantics::EventTriggered
     );
-    for path in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
+    for path in ["CLAUDE.md", ".claude/CLAUDE.md"] {
         assert_eq!(
             artifact(
                 report.artifacts(),
@@ -104,6 +104,16 @@ fn discovers_user_and_project_artifacts_with_safe_semantics() {
             LoadSemantics::Always
         );
     }
+    assert_eq!(
+        artifact(
+            report.artifacts(),
+            "CLAUDE.local.md",
+            ArtifactKind::Instruction,
+            ArtifactScope::Local,
+        )
+        .load_semantics(),
+        LoadSemantics::Always
+    );
     assert!(!report.artifacts().iter().any(|artifact| {
         artifact.logical_path().contains("plugins/cache") || artifact.name() == "do-not-run"
     }));

@@ -95,13 +95,15 @@ fn scan_user(session: &mut ScanSession, root: &RootedPath) {
 }
 
 fn scan_project(session: &mut ScanSession, root: &RootedPath) {
-    for path in [
-        Path::new("CLAUDE.md"),
-        Path::new(".claude/CLAUDE.md"),
-        Path::new("CLAUDE.local.md"),
-    ] {
+    for path in [Path::new("CLAUDE.md"), Path::new(".claude/CLAUDE.md")] {
         scan_instruction(session, root, path, ArtifactScope::Project);
     }
+    scan_instruction(
+        session,
+        root,
+        Path::new("CLAUDE.local.md"),
+        ArtifactScope::Local,
+    );
     scan_standard_directories(session, root, ArtifactScope::Project);
     scan_settings(
         session,

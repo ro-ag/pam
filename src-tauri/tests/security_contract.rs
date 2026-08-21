@@ -88,6 +88,7 @@ fn build_manifest_and_handler_expose_the_same_bounded_commands() {
 #[test]
 fn production_window_and_csp_are_exact_and_remote_free() {
     let config = read_json(manifest_dir().join("tauri.conf.json"));
+    let vite_config = read(manifest_dir().join("../frontend/vite.config.ts"));
     let windows = config["app"]["windows"]
         .as_array()
         .expect("windows must be an array");
@@ -99,7 +100,7 @@ fn production_window_and_csp_are_exact_and_remote_free() {
     assert_eq!(windows[0]["label"], "main");
     assert_eq!(windows[0]["width"], 1_440);
     assert_eq!(windows[0]["height"], 900);
-    assert_eq!(windows[0]["minWidth"], 800);
+    assert_eq!(windows[0]["minWidth"], 320);
     assert_eq!(windows[0]["minHeight"], 600);
     assert_eq!(
         config["app"]["security"]["capabilities"],
@@ -112,6 +113,10 @@ fn production_window_and_csp_are_exact_and_remote_free() {
     for forbidden in ["'unsafe-inline'", "ws://", "wss://", "https://"] {
         assert!(!csp.contains(forbidden));
     }
+    assert!(
+        vite_config.contains("assetsInlineLimit: 0"),
+        "production assets must be emitted as files because font-src permits only 'self'"
+    );
 }
 
 #[test]

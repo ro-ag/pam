@@ -49,6 +49,32 @@ describe("native DTO selectors", () => {
     expect(selectControlCenter(snapshot.data, catalog, false).access[0]?.state).toBe("unavailable");
   });
 
+  it.each([
+    [
+      "terminal punctuation",
+      "System trust is protocol-observed.",
+      "System trust is protocol-observed. The network.diagnostics capability was observed; no other capability is inferred.",
+    ],
+    [
+      "no punctuation",
+      "System trust is protocol-observed",
+      "System trust is protocol-observed. The network.diagnostics capability was observed; no other capability is inferred.",
+    ],
+  ])("preserves access truth with %s", async (_case, truth, expected) => {
+    const bridge = fixtureBridge();
+    const snapshot = await bridge.bootstrap();
+    const catalog = await bridge.catalog();
+    if (snapshot.data.access.status !== "available") {
+      throw new Error("available access fixture missing");
+    }
+    snapshot.data.access.truth = truth;
+
+    const policy = selectControlCenter(snapshot.data, catalog, false).access
+      .find(({ id }) => id === "policy");
+
+    expect(policy?.summary).toBe(expected);
+  });
+
   it("maps durable leased, cancellation, and cancelled request states exactly", async () => {
     const bridge = fixtureBridge("active");
     const snapshot = await bridge.bootstrap();

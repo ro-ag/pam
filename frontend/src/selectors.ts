@@ -95,7 +95,6 @@ export interface AccessGrantView {
 }
 
 export interface ControlCenterView {
-  nowIso: string;
   project: ProjectView;
   catalog: ProjectView[];
   catalogWarning: string | null;
@@ -243,6 +242,7 @@ function accessView(access: AccessConfigDto): AccessGrantView[] {
   if (access.status === "unavailable") {
     return [{ id: "access-recovery", name: "Access configuration", summary: [access.failure.detail, access.failure.recovery].filter(Boolean).join(" "), state: "unavailable" }];
   }
+  const truthSeparator = /\p{P}$/u.test(access.truth) ? " " : ". ";
   return [
     {
       id: "model",
@@ -253,7 +253,7 @@ function accessView(access: AccessConfigDto): AccessGrantView[] {
     {
       id: "policy",
       name: "Access policy",
-      summary: `${access.truth}. The network.diagnostics capability was observed; no other capability is inferred.`,
+      summary: `${access.truth}${truthSeparator}The network.diagnostics capability was observed; no other capability is inferred.`,
       state: "observed",
     },
     {
@@ -289,7 +289,6 @@ export function selectControlCenter(data: SnapshotDataDto, catalog: CatalogDto, 
   const health = healthView(data.health);
   const projects = catalog.projects.length > 0 ? catalog.projects : [data.project];
   return {
-    nowIso: new Date().toISOString(),
     project: projectView(data.project, data, health.health),
     catalog: projects.map((project) => projectView(project, data, health.health)),
     catalogWarning: catalog.warning ?? data.catalogWarning,

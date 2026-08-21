@@ -1,10 +1,8 @@
-import { fileURLToPath, URL } from "node:url";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [react()],
-  publicDir: fileURLToPath(new URL("../prototype/public", import.meta.url)),
   clearScreen: false,
   server: {
     host: "127.0.0.1",
@@ -15,9 +13,11 @@ export default defineConfig({
     target: ["es2021", "chrome105", "safari13"],
     outDir: "dist",
     emptyOutDir: true,
+    assetsInlineLimit: 0,
   },
   test: {
     environment: "jsdom",
+    exclude: [...configDefaults.exclude, "e2e/**"],
     setupFiles: ["./vitest.setup.ts"],
     restoreMocks: true,
   },

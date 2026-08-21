@@ -34,6 +34,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             commands::decide_approval,
             commands::load_evidence,
             commands::load_flow_workspace,
+            commands::load_skill_inventory,
             commands::open_flow,
             commands::validate_flow,
             commands::save_flow,

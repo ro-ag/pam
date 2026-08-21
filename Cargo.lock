@@ -3015,6 +3015,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "clap",
+ "directories",
  "pam_core",
  "pam_daemon",
  "pam_flow",
@@ -3022,7 +3023,10 @@ dependencies = [
  "pam_platform",
  "pam_policy",
  "pam_protocol",
+ "pam_skills",
  "pam_store",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "uuid",
@@ -3101,11 +3105,14 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "directories",
  "pam_core",
  "pam_daemon",
  "pam_flow",
  "pam_platform",
  "pam_protocol",
+ "pam_skills",
+ "pam_store",
  "serde",
  "serde_json",
  "tokio",
@@ -3171,6 +3178,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_skills"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "pam_core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
 name = "pam_store"
 version = "0.1.0"
 dependencies = [
@@ -3181,6 +3201,7 @@ dependencies = [
  "pam_flow",
  "pam_model",
  "pam_policy",
+ "pam_skills",
  "rmp-serde",
  "rusqlite",
  "serde",

@@ -15,6 +15,7 @@
     "allow-decide-approval",
     "allow-load-evidence",
     "allow-load-flow-workspace",
+    "allow-load-skill-inventory",
     "allow-open-flow",
     "allow-validate-flow",
     "allow-save-flow"

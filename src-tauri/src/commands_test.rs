@@ -73,3 +73,21 @@ fn approval_request_requires_the_complete_fence() {
 
     assert!(serde_json::from_value::<ApprovalRequest>(missing_generation).is_err());
 }
+
+#[test]
+fn inventory_request_rejects_paths_and_accepts_only_the_fence() {
+    let valid = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID
+    });
+    let ambient_path = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID,
+        "projectRoot": "/tmp/untrusted"
+    });
+
+    assert!(serde_json::from_value::<FencedRequest>(valid).is_ok());
+    assert!(serde_json::from_value::<FencedRequest>(ambient_path).is_err());
+}

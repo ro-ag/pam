@@ -1,0 +1,6 @@
+---
+alwaysApply: false
+globs:
+  - "**/*.rs"
+---
+Native fixture.

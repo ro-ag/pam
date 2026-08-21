@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Component, Path, PathBuf},
     sync::mpsc,
     thread,
@@ -20,6 +21,10 @@ use pam_policy::{
     ApprovalRequirement, CapabilityName, Decision, Effect, EffectFingerprint, Grant, ResourceName,
     ResourceScope, evaluate, redact_audit_detail,
 };
+use pam_skills::{
+    AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent,
+    ScanReport,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -38,9 +43,10 @@ use crate::{
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
     MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
     MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
-    ProjectCurrent, ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant,
-    Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, StoreError, StoredResult,
-    TerminalState,
+    MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, ProjectCurrent, ProjectPolicy,
+    ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant, Replay, RequestSnapshot,
+    RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError, StoredAgentArtifact,
+    StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -51,7 +57,7 @@ const STATUS_OPERATION_KIND: &str = "status";
 const LEGACY_STATUS_OPERATION_KIND: &str = "daemon_status";
 const FLOW_CAPABILITY_NAME: &str = "flow.run";
 const EFFECT_APPROVAL_AUDIT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 9;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 11;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
@@ -67,6 +73,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         9,
         include_str!("../migrations/0009_flow_authorizations.sql"),
+    ),
+    (10, include_str!("../migrations/0010_agent_artifacts.sql")),
+    (
+        11,
+        include_str!("../migrations/0011_agent_artifact_inventory.sql"),
     ),
 ];
 
@@ -631,6 +642,83 @@ impl Store {
         let (response_tx, response_rx) = oneshot::channel();
         self.send(Command::Model(ModelCommand::Get {
             key,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Atomically replaces one project's active skill inventory with a complete scan.
+    ///
+    /// The store rejects incomplete reports before they reach the durable worker, so
+    /// partial filesystem failures can never remove previously known artifacts. Each
+    /// complete observation, including an empty one, advances a durable project
+    /// watermark. Equal timestamps are idempotent only for an identical active
+    /// snapshot; a different same-time snapshot is rejected.
+    ///
+    /// Removed identities retain resurrection history up to
+    /// [`MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT`]. Older tombstones are pruned in
+    /// deterministic newest-removal order and return as newly seen if rediscovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an incomplete report, invalid timestamp, corrupt prior
+    /// state, timestamp regression, or unavailable durable state.
+    pub async fn rescan_skill_inventory(
+        &self,
+        project_id: ProjectId,
+        report: ScanReport,
+        observed_at_ms: u64,
+    ) -> Result<SkillInventoryDrift, StoreError> {
+        if !report.complete() {
+            return Err(StoreError::IncompleteSkillInventory(
+                report.diagnostics().to_vec(),
+            ));
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Inventory(InventoryCommand::Rescan {
+            project_id,
+            artifacts: report.into_artifacts(),
+            observed_at_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Lists the active skill inventory for one project in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt or unavailable durable state.
+    pub async fn skill_artifacts(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<StoredAgentArtifact>, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Inventory(InventoryCommand::List {
+            project_id,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Returns one active skill artifact by its exact stable identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact is absent, removed, corrupt, or durable
+    /// state is unavailable.
+    pub async fn skill_artifact(
+        &self,
+        project_id: ProjectId,
+        artifact_id: AgentArtifactId,
+    ) -> Result<StoredAgentArtifact, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Inventory(InventoryCommand::Get {
+            project_id,
+            artifact_id,
             response: response_tx,
         }))
         .await?;
@@ -1294,6 +1382,7 @@ enum Command {
     Policy(PolicyCommand),
     Audit(AuditCommand),
     Model(ModelCommand),
+    Inventory(InventoryCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -1399,6 +1488,24 @@ enum ModelCommand {
     Get {
         key: ModelKey,
         response: Response<RegisteredModel>,
+    },
+}
+
+enum InventoryCommand {
+    Rescan {
+        project_id: ProjectId,
+        artifacts: Vec<AgentArtifact>,
+        observed_at_ms: u64,
+        response: Response<SkillInventoryDrift>,
+    },
+    List {
+        project_id: ProjectId,
+        response: Response<Vec<StoredAgentArtifact>>,
+    },
+    Get {
+        project_id: ProjectId,
+        artifact_id: AgentArtifactId,
+        response: Response<StoredAgentArtifact>,
     },
 }
 
@@ -1538,6 +1645,7 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
             Command::Policy(command) => run_policy_command(&mut connection, command),
             Command::Audit(command) => run_audit_command(&mut connection, command),
             Command::Model(command) => run_model_command(&mut connection, command),
+            Command::Inventory(command) => run_inventory_command(&mut connection, command),
             Command::Accept {
                 request,
                 now_ms,
@@ -2054,6 +2162,491 @@ fn safe_stored_source(source: &str) -> bool {
 
 fn invalid_model_record() -> StoreError {
     StoreError::InvalidModelRecord("model metadata failed validation")
+}
+
+fn run_inventory_command(connection: &mut Connection, command: InventoryCommand) {
+    match command {
+        InventoryCommand::Rescan {
+            project_id,
+            artifacts,
+            observed_at_ms,
+            response,
+        } => respond(
+            response,
+            rescan_skill_inventory(connection, &project_id, artifacts, observed_at_ms),
+        ),
+        InventoryCommand::List {
+            project_id,
+            response,
+        } => respond(response, list_skill_artifacts(connection, &project_id)),
+        InventoryCommand::Get {
+            project_id,
+            artifact_id,
+            response,
+        } => respond(
+            response,
+            get_skill_artifact(connection, &project_id, &artifact_id),
+        ),
+    }
+}
+
+fn rescan_skill_inventory(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+    artifacts: Vec<AgentArtifact>,
+    observed_at_ms: u64,
+) -> Result<SkillInventoryDrift, StoreError> {
+    let observed_at = sql_integer(observed_at_ms)?;
+    let current = current_skill_artifacts(artifacts)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    if let Some(stored_at_ms) = skill_inventory_observation(&transaction, project_id)? {
+        if observed_at_ms < stored_at_ms {
+            return Err(StoreError::SkillInventoryObservationRegression {
+                project_id: project_id.clone(),
+                observed_at_ms,
+                stored_at_ms,
+            });
+        }
+        if observed_at_ms == stored_at_ms {
+            if active_skill_inventory_matches(&transaction, project_id, &current)? {
+                prune_skill_inventory_tombstones(&transaction, project_id)?;
+                transaction.commit()?;
+                return Ok(SkillInventoryDrift::default());
+            }
+            return Err(StoreError::SkillInventoryObservationConflict {
+                project_id: project_id.clone(),
+                observed_at_ms,
+            });
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO projects(project_id) VALUES (?1)
+         ON CONFLICT(project_id) DO NOTHING",
+        [project_id.as_str()],
+    )?;
+    prune_skill_inventory_tombstones(&transaction, project_id)?;
+    let existing = all_skill_artifacts(&transaction, project_id)?;
+    let mut existing = existing
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut drift = SkillInventoryDrift::default();
+
+    for (id, artifact) in current {
+        match existing.remove(&id) {
+            None => add_skill_artifact(
+                &transaction,
+                project_id,
+                id,
+                artifact,
+                observed_at,
+                observed_at_ms,
+                &mut drift,
+            )?,
+            Some(stored) => reconcile_skill_artifact(
+                &transaction,
+                project_id,
+                artifact,
+                stored,
+                observed_at,
+                observed_at_ms,
+                &mut drift,
+            )?,
+        }
+    }
+    for stored in existing
+        .into_values()
+        .filter(|stored| stored.removed_at_ms.is_none())
+    {
+        remove_skill_artifact(
+            &transaction,
+            project_id,
+            stored,
+            observed_at,
+            observed_at_ms,
+            &mut drift,
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO agent_artifact_inventory(project_id, observed_at_ms)
+         VALUES (?1, ?2)
+         ON CONFLICT(project_id) DO UPDATE SET observed_at_ms = excluded.observed_at_ms",
+        params![project_id.as_str(), observed_at],
+    )?;
+    prune_skill_inventory_tombstones(&transaction, project_id)?;
+    transaction.commit()?;
+    sort_inventory_drift(&mut drift);
+    Ok(drift)
+}
+
+fn skill_inventory_observation(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Option<u64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT observed_at_ms FROM agent_artifact_inventory WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(inventory_integer)
+        .transpose()
+}
+
+fn active_skill_inventory_matches(
+    connection: &Connection,
+    project_id: &ProjectId,
+    current: &BTreeMap<AgentArtifactId, AgentArtifact>,
+) -> Result<bool, StoreError> {
+    let active = list_skill_artifacts(connection, project_id)?;
+    if active.len() != current.len() {
+        return Ok(false);
+    }
+    Ok(active.iter().all(|stored| {
+        current
+            .get(&stored.id)
+            .is_some_and(|artifact| artifact == &stored.artifact)
+    }))
+}
+
+fn prune_skill_inventory_tombstones(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+) -> Result<(), StoreError> {
+    let limit = i64::try_from(MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT)
+        .expect("skill inventory tombstone limit fits SQLite INTEGER");
+    transaction.execute(
+        "DELETE FROM agent_artifacts
+         WHERE project_id = ?1
+           AND removed_at_ms IS NOT NULL
+           AND artifact_id NOT IN (
+               SELECT retained.artifact_id
+               FROM agent_artifacts AS retained
+               WHERE retained.project_id = ?1
+                 AND retained.removed_at_ms IS NOT NULL
+               ORDER BY retained.removed_at_ms DESC, retained.artifact_id
+               LIMIT ?2
+           )",
+        params![project_id.as_str(), limit],
+    )?;
+    Ok(())
+}
+
+fn current_skill_artifacts(
+    artifacts: Vec<AgentArtifact>,
+) -> Result<BTreeMap<AgentArtifactId, AgentArtifact>, StoreError> {
+    let mut current = BTreeMap::new();
+    for artifact in artifacts {
+        let id = artifact.id();
+        if current.insert(id, artifact).is_some() {
+            return Err(StoreError::InvalidSkillInventory(
+                "snapshot contains a duplicate artifact identity",
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn add_skill_artifact(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    id: AgentArtifactId,
+    artifact: AgentArtifact,
+    observed_at: i64,
+    observed_at_ms: u64,
+    drift: &mut SkillInventoryDrift,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO agent_artifacts(
+             project_id, artifact_id, name, logical_path, kind, scope, origin,
+             load_semantics, content_hash, first_seen_at_ms, last_changed_at_ms,
+             removed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL)",
+        params![
+            project_id.as_str(),
+            id.as_str(),
+            artifact.name(),
+            artifact.logical_path(),
+            artifact.kind().as_str(),
+            artifact.scope().as_str(),
+            artifact.origin().as_str(),
+            artifact.load_semantics().as_str(),
+            artifact.content_hash().as_str(),
+            observed_at,
+        ],
+    )?;
+    drift.added.push(StoredAgentArtifact {
+        id,
+        artifact,
+        first_seen_at_ms: observed_at_ms,
+        last_changed_at_ms: observed_at_ms,
+        removed_at_ms: None,
+    });
+    Ok(())
+}
+
+fn reconcile_skill_artifact(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    artifact: AgentArtifact,
+    mut stored: StoredAgentArtifact,
+    observed_at: i64,
+    observed_at_ms: u64,
+    drift: &mut SkillInventoryDrift,
+) -> Result<(), StoreError> {
+    if let Some(removed_at_ms) = stored.removed_at_ms {
+        ensure_inventory_time(&stored.id, observed_at_ms, removed_at_ms)?;
+        let changed = stored.artifact != artifact;
+        if changed {
+            ensure_inventory_time(&stored.id, observed_at_ms, stored.last_changed_at_ms)?;
+            stored.last_changed_at_ms = observed_at_ms;
+        }
+        update_skill_artifact(
+            transaction,
+            project_id,
+            &stored.id,
+            &artifact,
+            if changed {
+                observed_at
+            } else {
+                sql_integer(stored.last_changed_at_ms)?
+            },
+            None,
+        )?;
+        stored.artifact = artifact;
+        stored.removed_at_ms = None;
+        drift.resurrected.push(stored);
+    } else if stored.artifact != artifact {
+        ensure_inventory_time(&stored.id, observed_at_ms, stored.last_changed_at_ms)?;
+        update_skill_artifact(
+            transaction,
+            project_id,
+            &stored.id,
+            &artifact,
+            observed_at,
+            None,
+        )?;
+        stored.artifact = artifact;
+        stored.last_changed_at_ms = observed_at_ms;
+        drift.changed.push(stored);
+    }
+    Ok(())
+}
+
+fn remove_skill_artifact(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    mut stored: StoredAgentArtifact,
+    observed_at: i64,
+    observed_at_ms: u64,
+    drift: &mut SkillInventoryDrift,
+) -> Result<(), StoreError> {
+    ensure_inventory_time(&stored.id, observed_at_ms, stored.last_changed_at_ms)?;
+    transaction.execute(
+        "UPDATE agent_artifacts SET removed_at_ms = ?3
+         WHERE project_id = ?1 AND artifact_id = ?2 AND removed_at_ms IS NULL",
+        params![project_id.as_str(), stored.id.as_str(), observed_at],
+    )?;
+    stored.removed_at_ms = Some(observed_at_ms);
+    drift.removed.push(stored);
+    Ok(())
+}
+
+fn update_skill_artifact(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    id: &AgentArtifactId,
+    artifact: &AgentArtifact,
+    last_changed_at: i64,
+    removed_at: Option<i64>,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE agent_artifacts SET
+             name = ?3, load_semantics = ?4, content_hash = ?5,
+             last_changed_at_ms = ?6, removed_at_ms = ?7
+         WHERE project_id = ?1 AND artifact_id = ?2",
+        params![
+            project_id.as_str(),
+            id.as_str(),
+            artifact.name(),
+            artifact.load_semantics().as_str(),
+            artifact.content_hash().as_str(),
+            last_changed_at,
+            removed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_inventory_time(
+    id: &AgentArtifactId,
+    observed_at_ms: u64,
+    stored_at_ms: u64,
+) -> Result<(), StoreError> {
+    if observed_at_ms < stored_at_ms {
+        Err(StoreError::SkillInventoryTimestampRegression {
+            artifact_id: id.clone(),
+            observed_at_ms,
+            stored_at_ms,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn sort_inventory_drift(drift: &mut SkillInventoryDrift) {
+    for records in [
+        &mut drift.added,
+        &mut drift.changed,
+        &mut drift.removed,
+        &mut drift.resurrected,
+    ] {
+        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    }
+}
+
+fn list_skill_artifacts(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Vec<StoredAgentArtifact>, StoreError> {
+    query_skill_artifacts(
+        connection,
+        "SELECT artifact_id, name, logical_path, kind, scope, origin,
+                load_semantics, content_hash, first_seen_at_ms,
+                last_changed_at_ms, removed_at_ms
+         FROM agent_artifacts
+         WHERE project_id = ?1 AND removed_at_ms IS NULL
+         ORDER BY origin, scope, kind, logical_path",
+        project_id,
+    )
+}
+
+fn all_skill_artifacts(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Vec<StoredAgentArtifact>, StoreError> {
+    query_skill_artifacts(
+        connection,
+        "SELECT artifact_id, name, logical_path, kind, scope, origin,
+                load_semantics, content_hash, first_seen_at_ms,
+                last_changed_at_ms, removed_at_ms
+         FROM agent_artifacts
+         WHERE project_id = ?1
+         ORDER BY artifact_id",
+        project_id,
+    )
+}
+
+fn query_skill_artifacts(
+    connection: &Connection,
+    sql: &str,
+    project_id: &ProjectId,
+) -> Result<Vec<StoredAgentArtifact>, StoreError> {
+    let mut statement = connection.prepare_cached(sql)?;
+    let rows = statement.query_map([project_id.as_str()], stored_skill_artifact_row)?;
+    rows.map(|row| {
+        row.map_err(StoreError::from)
+            .and_then(decode_skill_artifact)
+    })
+    .collect()
+}
+
+fn get_skill_artifact(
+    connection: &Connection,
+    project_id: &ProjectId,
+    artifact_id: &AgentArtifactId,
+) -> Result<StoredAgentArtifact, StoreError> {
+    connection
+        .query_row(
+            "SELECT artifact_id, name, logical_path, kind, scope, origin,
+                    load_semantics, content_hash, first_seen_at_ms,
+                    last_changed_at_ms, removed_at_ms
+             FROM agent_artifacts
+             WHERE project_id = ?1 AND artifact_id = ?2 AND removed_at_ms IS NULL",
+            params![project_id.as_str(), artifact_id.as_str()],
+            stored_skill_artifact_row,
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::SkillArtifactNotFound {
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+        })
+        .and_then(decode_skill_artifact)
+}
+
+type StoredSkillArtifactRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+);
+
+fn stored_skill_artifact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSkillArtifactRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn decode_skill_artifact(row: StoredSkillArtifactRow) -> Result<StoredAgentArtifact, StoreError> {
+    let (id, name, path, kind, scope, origin, semantics, hash, first, changed, removed) = row;
+    let id = AgentArtifactId::parse(id).map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let kind = kind
+        .parse::<ArtifactKind>()
+        .map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let scope = scope
+        .parse::<ArtifactScope>()
+        .map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let origin = origin
+        .parse::<OriginAgent>()
+        .map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let semantics = semantics
+        .parse::<LoadSemantics>()
+        .map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let hash = ContentDigest::parse(hash).map_err(|_| StoreError::CorruptSkillArtifact)?;
+    let artifact = AgentArtifact::new(name, path, kind, scope, origin, semantics, hash)
+        .map_err(|_| StoreError::CorruptSkillArtifact)?;
+    if artifact.id() != id {
+        return Err(StoreError::CorruptSkillArtifact);
+    }
+    let first_seen_at_ms = inventory_integer(first)?;
+    let last_changed_at_ms = inventory_integer(changed)?;
+    let removed_at_ms = removed.map(inventory_integer).transpose()?;
+    if last_changed_at_ms < first_seen_at_ms
+        || removed_at_ms.is_some_and(|removed| removed < last_changed_at_ms)
+    {
+        return Err(StoreError::CorruptSkillArtifact);
+    }
+    Ok(StoredAgentArtifact {
+        id,
+        artifact,
+        first_seen_at_ms,
+        last_changed_at_ms,
+        removed_at_ms,
+    })
+}
+
+fn inventory_integer(value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::CorruptSkillArtifact)
 }
 
 fn append_audit_event(

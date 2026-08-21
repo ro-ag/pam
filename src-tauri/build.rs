@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "decide_approval",
     "load_evidence",
     "load_flow_workspace",
+    "load_skill_inventory",
     "open_flow",
     "validate_flow",
     "save_flow",

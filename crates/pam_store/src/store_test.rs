@@ -13,7 +13,10 @@ use pam_model::{
     GgufMetadata, LicenseSnapshot, ModelDescriptor, ModelKey, ModelSource, RegisteredModel,
 };
 use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
-use rusqlite::Connection;
+use pam_skills::{
+    AgentArtifact, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent, ScanReport,
+};
+use rusqlite::{Connection, params};
 
 use super::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
@@ -144,6 +147,23 @@ fn registered_model(path: &Path) -> RegisteredModel {
         source: ModelSource::https("https://models.example/model.gguf").unwrap(),
         registered_at_ms: 42,
     }
+}
+
+fn inventory_artifact(path: &str, hash_byte: u8) -> AgentArtifact {
+    AgentArtifact::new(
+        path.rsplit('/').next().unwrap(),
+        path,
+        ArtifactKind::Skill,
+        ArtifactScope::Project,
+        OriginAgent::ClaudeCode,
+        LoadSemantics::ModelSelected,
+        ContentDigest::from_sha256([hash_byte; 32]),
+    )
+    .unwrap()
+}
+
+fn inventory_report(artifacts: impl IntoIterator<Item = AgentArtifact>) -> ScanReport {
+    ScanReport::from_artifacts(artifacts)
 }
 
 async fn open_approval_store(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Store) {
@@ -5778,5 +5798,510 @@ async fn terminal_cancellation_override_requires_its_exact_durable_transition() 
         Err(StoreError::CorruptFlowCheckpoint(corrupt_id))
             if corrupt_id == RequestId::from(request_id)
     ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exercises every drift category, restart, and partial rejection.
+async fn skill_inventory_rescan_is_atomic_idempotent_and_survives_restart() {
+    let (directory, path) = database_path("skill-inventory-lifecycle");
+    let project_id = ProjectId::from("inventory-project");
+    let store = Store::open(&path).unwrap();
+    let alpha = inventory_artifact(".claude/skills/alpha/SKILL.md", 1);
+    let beta = inventory_artifact(".claude/skills/beta/SKILL.md", 2);
+
+    let added = store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([beta.clone(), alpha.clone()]),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.added.len(), 2);
+    assert!(added.changed.is_empty());
+    assert!(added.removed.is_empty());
+    assert!(added.resurrected.is_empty());
+    let initial = store.skill_artifacts(project_id.clone()).await.unwrap();
+    assert_eq!(initial.len(), 2);
+    assert_eq!(initial[0].artifact.logical_path(), alpha.logical_path());
+    assert_eq!(initial[1].artifact.logical_path(), beta.logical_path());
+    assert!(initial.iter().all(|record| {
+        record.first_seen_at_ms == 10
+            && record.last_changed_at_ms == 10
+            && record.removed_at_ms.is_none()
+    }));
+    assert_eq!(
+        store
+            .skill_artifact(project_id.clone(), alpha.id())
+            .await
+            .unwrap()
+            .artifact,
+        alpha
+    );
+
+    let repeated = store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([alpha.clone(), beta.clone()]),
+            20,
+        )
+        .await
+        .unwrap();
+    assert!(repeated.is_empty());
+    assert_eq!(
+        store.skill_artifacts(project_id.clone()).await.unwrap(),
+        initial
+    );
+
+    let changed_alpha = inventory_artifact(".claude/skills/alpha/SKILL.md", 3);
+    let changed = store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([changed_alpha.clone(), beta.clone()]),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.changed.len(), 1);
+    assert_eq!(changed.changed[0].id, alpha.id());
+    assert_eq!(changed.changed[0].first_seen_at_ms, 10);
+    assert_eq!(changed.changed[0].last_changed_at_ms, 30);
+
+    let renamed_beta = inventory_artifact(".claude/skills/beta-renamed/SKILL.md", 2);
+    let renamed = store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([changed_alpha.clone(), renamed_beta.clone()]),
+            40,
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.added.len(), 1);
+    assert_eq!(renamed.added[0].id, renamed_beta.id());
+    assert_eq!(renamed.removed.len(), 1);
+    assert_eq!(renamed.removed[0].id, beta.id());
+
+    let conflicting = inventory_artifact(".claude/skills/conflict/SKILL.md", 5);
+    let incomplete = inventory_report([
+        conflicting.clone(),
+        inventory_artifact(conflicting.logical_path(), 6),
+    ]);
+    assert!(!incomplete.complete());
+    let before_incomplete = store.skill_artifacts(project_id.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(project_id.clone(), incomplete, 45)
+            .await,
+        Err(StoreError::IncompleteSkillInventory(diagnostics)) if !diagnostics.is_empty()
+    ));
+    assert_eq!(
+        store.skill_artifacts(project_id.clone()).await.unwrap(),
+        before_incomplete
+    );
+
+    let removed = store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([]), 50)
+        .await
+        .unwrap();
+    assert_eq!(removed.removed.len(), 2);
+    assert!(
+        store
+            .skill_artifacts(project_id.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        store.skill_artifact(project_id.clone(), alpha.id()).await,
+        Err(StoreError::SkillArtifactNotFound { .. })
+    ));
+    assert!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([]), 60)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let resurrected_alpha = inventory_artifact(".claude/skills/alpha/SKILL.md", 7);
+    let resurrected = store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([resurrected_alpha.clone()]),
+            70,
+        )
+        .await
+        .unwrap();
+    assert!(resurrected.changed.is_empty());
+    assert_eq!(resurrected.resurrected.len(), 1);
+    assert_eq!(resurrected.resurrected[0].first_seen_at_ms, 10);
+    assert_eq!(resurrected.resurrected[0].last_changed_at_ms, 70);
+
+    store.shutdown().await.unwrap();
+    let store = Store::open(&path).unwrap();
+    let after_restart = store.skill_artifacts(project_id).await.unwrap();
+    assert_eq!(after_restart.len(), 1);
+    assert_eq!(after_restart[0].artifact, resurrected_alpha);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skill_inventory_preserves_unchanged_resurrection_history_and_project_isolation() {
+    let (directory, path) = database_path("skill-inventory-isolation");
+    let store = Store::open(&path).unwrap();
+    let first_project = ProjectId::from("first-project");
+    let second_project = ProjectId::from("second-project");
+    let artifact = inventory_artifact(".claude/skills/shared/SKILL.md", 1);
+    for project_id in [&first_project, &second_project] {
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([artifact.clone()]), 10)
+            .await
+            .unwrap();
+    }
+    store
+        .rescan_skill_inventory(first_project.clone(), inventory_report([]), 20)
+        .await
+        .unwrap();
+    let resurrected = store
+        .rescan_skill_inventory(
+            first_project.clone(),
+            inventory_report([artifact.clone()]),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resurrected.resurrected.len(), 1);
+    assert_eq!(resurrected.resurrected[0].first_seen_at_ms, 10);
+    assert_eq!(resurrected.resurrected[0].last_changed_at_ms, 10);
+    assert_eq!(
+        store.skill_artifacts(second_project).await.unwrap().len(),
+        1
+    );
+    assert_eq!(store.skill_artifacts(first_project).await.unwrap().len(), 1);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skill_inventory_rejects_timestamp_regression_without_writes() {
+    let (directory, path) = database_path("skill-inventory-time");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let artifact = inventory_artifact(".claude/skills/time/SKILL.md", 1);
+    store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([artifact.clone()]),
+            100,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([]), 99)
+            .await,
+        Err(StoreError::SkillInventoryObservationRegression {
+            observed_at_ms: 99,
+            stored_at_ms: 100,
+            ..
+        })
+    ));
+    let active = store.skill_artifacts(project_id).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].artifact, artifact);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skill_inventory_watermark_orders_empty_and_equal_time_snapshots() {
+    let (directory, path) = database_path("skill-inventory-watermark");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let artifact = inventory_artifact(".claude/skills/time/SKILL.md", 1);
+    let changed = inventory_artifact(".claude/skills/time/SKILL.md", 2);
+
+    store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([artifact.clone()]),
+            200,
+        )
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let store = Store::open(&path).unwrap();
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([]), 100)
+            .await,
+        Err(StoreError::SkillInventoryObservationRegression {
+            observed_at_ms: 100,
+            stored_at_ms: 200,
+            ..
+        })
+    ));
+    assert!(
+        store
+            .rescan_skill_inventory(
+                project_id.clone(),
+                inventory_report([artifact.clone()]),
+                200,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([changed.clone()]), 200,)
+            .await,
+        Err(StoreError::SkillInventoryObservationConflict {
+            observed_at_ms: 200,
+            ..
+        })
+    ));
+
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([]), 300)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(
+                project_id.clone(),
+                inventory_report([artifact.clone()]),
+                250,
+            )
+            .await,
+        Err(StoreError::SkillInventoryObservationRegression {
+            observed_at_ms: 250,
+            stored_at_ms: 300,
+            ..
+        })
+    ));
+    assert!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([]), 300)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        store
+            .rescan_skill_inventory(project_id.clone(), inventory_report([artifact]), 300)
+            .await,
+        Err(StoreError::SkillInventoryObservationConflict {
+            observed_at_ms: 300,
+            ..
+        })
+    ));
+    assert!(store.skill_artifacts(project_id).await.unwrap().is_empty());
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skill_inventory_rejects_distinct_equal_time_snapshots_across_workers() {
+    let (directory, path) = database_path("skill-inventory-equal-race");
+    let first_store = Store::open(&path).unwrap();
+    let second_store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let first = inventory_artifact(".claude/skills/first/SKILL.md", 1);
+    let second = inventory_artifact(".claude/skills/second/SKILL.md", 2);
+
+    let (first_result, second_result) = tokio::join!(
+        first_store.rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([first.clone()]),
+            100,
+        ),
+        second_store.rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([second.clone()]),
+            100,
+        ),
+    );
+    let expected = match (first_result, second_result) {
+        (Ok(drift), Err(StoreError::SkillInventoryObservationConflict { .. })) => {
+            assert_eq!(drift.added.len(), 1);
+            first
+        }
+        (Err(StoreError::SkillInventoryObservationConflict { .. }), Ok(drift)) => {
+            assert_eq!(drift.added.len(), 1);
+            second
+        }
+        (first_result, second_result) => {
+            panic!(
+                "expected one winner and one equal-time conflict: {first_result:?}, {second_result:?}"
+            )
+        }
+    };
+    let active = first_store.skill_artifacts(project_id).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].artifact, expected);
+
+    first_store.shutdown().await.unwrap();
+    second_store.shutdown().await.unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn skill_inventory_tombstone_retention_has_a_deterministic_boundary() {
+    let (directory, path) = database_path("skill-inventory-tombstones");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let artifacts = (0..super::MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT)
+        .map(|index| inventory_artifact(&format!(".claude/skills/old-{index}/SKILL.md"), 1))
+        .collect::<Vec<_>>();
+    let pruned = artifacts
+        .iter()
+        .max_by_key(|artifact| artifact.id())
+        .unwrap()
+        .clone();
+
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report(artifacts), 10)
+        .await
+        .unwrap();
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([]), 20)
+        .await
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let at_boundary: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_artifacts
+             WHERE project_id = ?1 AND removed_at_ms IS NOT NULL",
+            [project_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        at_boundary,
+        u32::try_from(super::MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT).unwrap()
+    );
+    drop(connection);
+
+    let newest = inventory_artifact(".claude/skills/newest/SKILL.md", 2);
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([newest.clone()]), 30)
+        .await
+        .unwrap();
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([]), 40)
+        .await
+        .unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let retained: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_artifacts
+             WHERE project_id = ?1 AND removed_at_ms IS NOT NULL",
+            [project_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let newest_retained: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_artifacts
+             WHERE project_id = ?1 AND artifact_id = ?2",
+            params![project_id.as_str(), newest.id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let oldest_tie_break_pruned: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_artifacts
+             WHERE project_id = ?1 AND artifact_id = ?2",
+            params![project_id.as_str(), pruned.id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        u32::try_from(super::MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT).unwrap()
+    );
+    assert_eq!(newest_retained, 1);
+    assert_eq!(oldest_tie_break_pruned, 0);
+    drop(connection);
+
+    let resurrected = store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([newest.clone()]), 50)
+        .await
+        .unwrap();
+    assert_eq!(resurrected.resurrected.len(), 1);
+    assert_eq!(resurrected.resurrected[0].first_seen_at_ms, 30);
+    let readded = store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([pruned]), 60)
+        .await
+        .unwrap();
+    assert_eq!(readded.added.len(), 1);
+    assert_eq!(readded.added[0].first_seen_at_ms, 60);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skill_inventory_reports_corrupt_id_enum_and_digest() {
+    let (directory, path) = database_path("skill-inventory-corruption");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let artifact = inventory_artifact(".claude/skills/corrupt/SKILL.md", 1);
+    let artifact_id = artifact.id();
+    store
+        .rescan_skill_inventory(project_id.clone(), inventory_report([artifact.clone()]), 10)
+        .await
+        .unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let other_id = format!("artifact:sha256:{}", "0".repeat(64));
+    connection
+        .execute(
+            "UPDATE agent_artifacts SET artifact_id = ?1 WHERE project_id = ?2",
+            rusqlite::params![other_id, project_id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.skill_artifacts(project_id.clone()).await,
+        Err(StoreError::CorruptSkillArtifact)
+    ));
+    connection
+        .execute(
+            "UPDATE agent_artifacts SET artifact_id = ?1 WHERE project_id = ?2",
+            rusqlite::params![artifact_id.as_str(), project_id.as_str()],
+        )
+        .unwrap();
+
+    connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_artifacts SET origin = 'unknown' WHERE project_id = ?1",
+            [project_id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.skill_artifacts(project_id.clone()).await,
+        Err(StoreError::CorruptSkillArtifact)
+    ));
+    connection
+        .execute(
+            "UPDATE agent_artifacts SET origin = 'claude_code' WHERE project_id = ?1",
+            [project_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_artifacts SET content_hash = 'sha256:not-a-digest'
+             WHERE project_id = ?1",
+            [project_id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.skill_artifacts(project_id).await,
+        Err(StoreError::CorruptSkillArtifact)
+    ));
+
+    drop(connection);
     close(store, &directory).await;
 }

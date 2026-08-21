@@ -31,6 +31,7 @@ use crate::{
         ActionAuthority, DaemonAuthority, DryRunCondition, FlowDryRunPlan, FlowEditorDocument,
         FlowEditorError, FlowEditorModel, FlowIdentity, FlowVersionDiff, FlowVersionDiffLineKind,
     },
+    skill_inventory::{SkillInventoryDto, SkillInventoryEnvironment, load_skill_inventory},
 };
 
 const MAX_OPERATIONS: usize = 256;
@@ -155,7 +156,11 @@ pub struct DesktopErrorDto {
 }
 
 impl DesktopErrorDto {
-    fn new(kind: DesktopErrorKind, message: impl Into<String>, recovery: Option<String>) -> Self {
+    pub(crate) fn new(
+        kind: DesktopErrorKind,
+        message: impl Into<String>,
+        recovery: Option<String>,
+    ) -> Self {
         Self {
             kind,
             message: bounded_detail(message.into()),
@@ -175,7 +180,7 @@ impl DesktopErrorDto {
         )
     }
 
-    fn unavailable(message: impl Into<String>, recovery: Option<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>, recovery: Option<String>) -> Self {
         Self::new(DesktopErrorKind::Unavailable, message, recovery)
     }
 }
@@ -1070,6 +1075,22 @@ impl DesktopCore {
                 definitions: result,
             },
         })
+    }
+
+    /// Scans and persists the active project's bounded local agent artifact inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for stale authority, incomplete filesystem scans,
+    /// malformed plugin registries, or unavailable durable state.
+    pub async fn skill_inventory(&self, fence: CommandFence) -> DesktopResult<SkillInventoryDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let environment = SkillInventoryEnvironment::discover(active.catalog.root.clone())?;
+        let data = load_skill_inventory(active.project_id.clone(), environment).await?;
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        Ok(SkillInventoryDto { fence, data })
     }
 
     /// Opens one flow selected only by an opaque catalog handle.

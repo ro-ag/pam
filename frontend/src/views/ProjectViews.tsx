@@ -20,7 +20,9 @@ import {
 } from "@phosphor-icons/react";
 import { useState } from "react";
 import { StatusDot } from "../components/Shell";
+import type { CommandFence, PamBridge } from "../domain";
 import type { AgentBriefView, ControlCenterView, TimelineItemView } from "../selectors";
+import { SkillInventoryPanel } from "./SkillInventoryPanel";
 
 function formatClock(iso: string): string {
   const date = new Date(iso);
@@ -232,9 +234,11 @@ export function CurrentView({
 
 export interface AccessViewProps {
   data: ControlCenterView;
+  bridge: PamBridge;
+  fence: CommandFence;
 }
 
-export function AccessView({ data }: AccessViewProps) {
+export function AccessView({ data, bridge, fence }: AccessViewProps) {
   const accessIcon = (id: string) => id === "model"
     ? Pulse
     : id === "policy"
@@ -260,6 +264,7 @@ export function AccessView({ data }: AccessViewProps) {
           })}
         </div>
       </section>
+      <SkillInventoryPanel bridge={bridge} fence={fence} />
     </main>
   );
 }

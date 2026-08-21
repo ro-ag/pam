@@ -10,6 +10,7 @@ import type {
   PamBridge,
   ProjectSummaryDto,
   SnapshotDataDto,
+  SkillInventoryDataDto,
 } from "./domain";
 
 const projects: ProjectSummaryDto[] = [
@@ -154,6 +155,44 @@ function solvedSnapshot(project: ProjectSummaryDto, daemonRunning: boolean): Sna
   }
 
   return data;
+}
+
+function skillInventory(empty: boolean): SkillInventoryDataDto {
+  const artifacts = empty
+    ? []
+    : [
+        {
+          id: "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          name: "Review changes",
+          logicalPath: ".claude/skills/review/SKILL.md",
+          kind: "skill",
+          scope: "project",
+          origin: "claude_code",
+          loadSemantics: "model_selected",
+          contentHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          firstSeenAtMs: 1_777_000_000_000,
+          lastChangedAtMs: 1_777_000_000_000,
+        },
+        {
+          id: "artifact:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          name: "Project instructions",
+          logicalPath: "AGENTS.md",
+          kind: "instruction",
+          scope: "project",
+          origin: "codex",
+          loadSemantics: "always",
+          contentHash: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          firstSeenAtMs: 1_777_000_000_000,
+          lastChangedAtMs: 1_777_000_000_000,
+        },
+      ];
+  return {
+    artifacts,
+    total: artifacts.length,
+    truncated: false,
+    drift: { added: artifacts.length, changed: 0, removed: 0, resurrected: 0 },
+    cursorGlobalRulesStatus: "not_locally_discoverable",
+  };
 }
 
 function snapshot(project: ProjectSummaryDto, daemonRunning: boolean, scenario: FixtureScenario): SnapshotDataDto {
@@ -336,6 +375,7 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
       return fenceResponse(fence, data);
     },
     async loadFlowWorkspace(fence) { return fenceResponse(fence, workspace()); },
+    async loadSkillInventory(fence) { return fenceResponse(fence, skillInventory(scenario === "empty")); },
     async openFlow(fence, flowHandle) {
       if (flowHandle !== definitionHandle) throw new Error("This fixture definition has no editable document.");
       return fenceResponse(fence, document());

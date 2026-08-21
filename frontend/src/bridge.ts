@@ -10,6 +10,7 @@ import type {
   FlowSaveDto,
   FlowWorkspaceDto,
   PamBridge,
+  SkillInventoryDto,
   SnapshotDto,
 } from "./domain";
 import { fixtureBridge, type FixtureScenario } from "./fixtures";
@@ -82,6 +83,8 @@ export function createTauriBridge(invokeCommand: Invoke = invoke): PamBridge {
       })),
     loadFlowWorkspace: (fence) =>
       invokeCommand<FlowWorkspaceDto>("load_flow_workspace", request(flatFence(fence))),
+    loadSkillInventory: (fence) =>
+      invokeCommand<SkillInventoryDto>("load_skill_inventory", request(flatFence(fence))),
     openFlow: (fence, flowHandle) =>
       invokeCommand<FlowDocumentDto>(
         "open_flow",

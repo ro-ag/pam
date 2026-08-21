@@ -137,6 +137,7 @@ impl SkillInventoryEnvironment {
             codex_home: self.codex_home.as_deref(),
             project_root: &self.project_root,
             current_working_directory: &self.current_working_directory,
+            codex_project_trusted: false,
             cursor_global_rule: None,
         }
     }

@@ -5,6 +5,7 @@ use std::{
 };
 
 use pam_core::{ContentDigest, ProjectId};
+use pam_platform::discover_project;
 use pam_skills::{
     AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, CursorGlobalRulesStatus,
     LoadSemantics, LocalInventoryRoots, OriginAgent,
@@ -13,8 +14,8 @@ use pam_store::{SkillInventoryDrift, StoreError, StoredAgentArtifact};
 use serde_json::json;
 
 use super::skills::{
-    InventoryOutput, InventoryRecords, InventoryRequest, InventorySelection, SkillsError,
-    render_inventory, run_inventory,
+    InventoryOutput, InventoryRecords, InventoryRequest, InventorySelection, SkillsEnvironment,
+    SkillsError, render_inventory, run_inventory,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -160,6 +161,70 @@ async fn merged_scan_is_persisted_idempotently_and_show_not_found_is_typed() {
     ));
 }
 
+#[tokio::test]
+async fn nested_discovery_scans_the_canonical_root_and_avoids_false_drift() {
+    let project = TestDirectory::new("nested-inventory-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"11111111-1111-4111-8111-111111111111\"\n",
+    );
+    project.write("AGENTS.md", b"root instructions\n");
+    project.write("nested/deeper/AGENTS.md", b"nested instructions\n");
+    let nested = project.path().join("nested/deeper");
+    let home = TestDirectory::new("nested-inventory-home");
+    let state = TestDirectory::new("nested-inventory-state");
+    let state_path = state.path().join("state.sqlite3");
+    let identity = discover_project(&nested).unwrap();
+
+    let nested_environment =
+        SkillsEnvironment::for_test(&nested, home.path().to_path_buf(), state_path.clone())
+            .unwrap();
+    assert_eq!(
+        nested_environment.roots().current_working_directory,
+        identity.root()
+    );
+    let first = run_inventory(
+        InventoryRequest {
+            roots: nested_environment.roots(),
+            project_id: identity.id(),
+            state_path: &state_path,
+            observed_at_ms: 10,
+        },
+        InventorySelection::List,
+    )
+    .await
+    .unwrap();
+
+    let root_environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state_path.clone(),
+    )
+    .unwrap();
+    let second = run_inventory(
+        InventoryRequest {
+            roots: root_environment.roots(),
+            project_id: identity.id(),
+            state_path: &state_path,
+            observed_at_ms: 20,
+        },
+        InventorySelection::List,
+    )
+    .await
+    .unwrap();
+
+    assert!(!first.drift.added.is_empty());
+    assert!(second.drift.is_empty());
+    let InventoryRecords::List(records) = second.records else {
+        panic!("expected list records");
+    };
+    assert!(
+        records
+            .iter()
+            .all(|record| record.artifact.logical_path() != "nested/deeper/AGENTS.md")
+    );
+}
+
 fn request<'a>(
     project: &'a TestDirectory,
     state_path: &'a Path,
@@ -174,6 +239,7 @@ fn request<'a>(
             codex_home: None,
             project_root: project.path(),
             current_working_directory: project.path(),
+            codex_project_trusted: false,
             cursor_global_rule: None,
         },
         project_id,

@@ -53,9 +53,8 @@ async fn execute(selection: InventorySelection, json: bool) -> i32 {
     0
 }
 
-struct SkillsEnvironment {
+pub(crate) struct SkillsEnvironment {
     project: ProjectIdentity,
-    current_working_directory: PathBuf,
     user_home: PathBuf,
     claude_plugin_registry_root: Option<PathBuf>,
     codex_system_config_root: Option<PathBuf>,
@@ -90,7 +89,6 @@ impl SkillsEnvironment {
             .join("state.sqlite3");
         Ok(Self {
             project,
-            current_working_directory,
             user_home,
             claude_plugin_registry_root,
             codex_system_config_root,
@@ -99,16 +97,33 @@ impl SkillsEnvironment {
         })
     }
 
-    fn roots(&self) -> LocalInventoryRoots<'_> {
+    pub(crate) fn roots(&self) -> LocalInventoryRoots<'_> {
         LocalInventoryRoots {
             user_home: Some(&self.user_home),
             claude_plugin_registry_root: self.claude_plugin_registry_root.as_deref(),
             codex_system_config_root: self.codex_system_config_root.as_deref(),
             codex_home: self.codex_home.as_deref(),
             project_root: self.project.root(),
-            current_working_directory: &self.current_working_directory,
+            current_working_directory: self.project.root(),
+            codex_project_trusted: false,
             cursor_global_rule: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        current_working_directory: &Path,
+        user_home: PathBuf,
+        state_path: PathBuf,
+    ) -> Result<Self, SkillsError> {
+        Ok(Self {
+            project: discover_project(current_working_directory).map_err(SkillsError::Identity)?,
+            user_home,
+            claude_plugin_registry_root: None,
+            codex_system_config_root: None,
+            codex_home: None,
+            state_path,
+        })
     }
 }
 

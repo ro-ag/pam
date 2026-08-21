@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, error::Error, fmt, path::Path, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt, fs,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentArtifact, ClaudePluginRoot, ClaudeScanRoots, CursorGlobalRuleSource,
+    AgentArtifact, ArtifactScope, ClaudePluginRoot, ClaudeScanRoots, CursorGlobalRuleSource,
     CursorGlobalRulesStatus, CursorScanRoots, ScanDiagnostic, ScanLimits, ScanReport,
     claude::valid_plugin_id,
     scan::{ScanSession, merge_scan_reports},
@@ -11,6 +16,9 @@ use crate::{
 };
 
 const PLUGIN_REGISTRY_FILE: &str = "installed_plugins.json";
+const USER_SETTINGS_FILE: &str = ".claude/settings.json";
+const PROJECT_SETTINGS_FILE: &str = ".claude/settings.json";
+const LOCAL_SETTINGS_FILE: &str = ".claude/settings.local.json";
 const SUPPORTED_PLUGIN_REGISTRY_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +29,7 @@ pub struct LocalInventoryRoots<'a> {
     pub codex_home: Option<&'a Path>,
     pub project_root: &'a Path,
     pub current_working_directory: &'a Path,
+    pub codex_project_trusted: bool,
     pub cursor_global_rule: Option<CursorGlobalRuleSource<'a>>,
 }
 
@@ -72,10 +81,7 @@ pub fn scan_local_inventory(
     roots: LocalInventoryRoots<'_>,
     limits: ScanLimits,
 ) -> Result<LocalInventoryReport, LocalInventoryError> {
-    let plugins = match roots.claude_plugin_registry_root {
-        Some(root) => plugin_roots(root, limits)?,
-        None => Vec::new(),
-    };
+    let plugins = plugin_roots(roots, limits)?;
     let plugin_views = plugins
         .iter()
         .map(|plugin| ClaudePluginRoot::new(&plugin.id, &plugin.path))
@@ -90,7 +96,7 @@ pub fn scan_local_inventory(
             roots.codex_home,
             Some(roots.project_root),
             Some(roots.current_working_directory),
-            true,
+            roots.codex_project_trusted,
         ),
         limits,
     );
@@ -126,57 +132,234 @@ struct PluginRegistry {
 #[serde(rename_all = "camelCase")]
 struct PluginInstallation {
     install_path: PathBuf,
+    scope: PluginScope,
+    project_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum PluginScope {
+    Managed,
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSettings {
+    #[serde(default)]
+    enabled_plugins: BTreeMap<String, bool>,
 }
 
 fn plugin_roots(
-    registry_root: &Path,
+    roots: LocalInventoryRoots<'_>,
     limits: ScanLimits,
 ) -> Result<Vec<OwnedPluginRoot>, LocalInventoryError> {
     let mut session = ScanSession::new(limits);
-    let root = session.open_root(registry_root, "", "claude_plugin_registry");
-    let file = root
+    let registry_root = roots
+        .claude_plugin_registry_root
+        .and_then(|root| session.open_root(root, "", "claude_plugin_registry"));
+    let registry_file = registry_root
         .as_ref()
         .and_then(|root| session.read_optional_file(root, Path::new(PLUGIN_REGISTRY_FILE)));
+
+    let user_root = roots
+        .user_home
+        .and_then(|root| session.open_root(root, "", "claude_user_home"));
+    let user_settings = user_root
+        .as_ref()
+        .and_then(|root| session.read_optional_file(root, Path::new(USER_SETTINGS_FILE)));
+
+    let project_root = session.open_root(roots.project_root, "", "claude_project");
+    let project_settings = project_root
+        .as_ref()
+        .and_then(|root| session.read_optional_file(root, Path::new(PROJECT_SETTINGS_FILE)));
+    let local_settings = project_root
+        .as_ref()
+        .and_then(|root| session.read_optional_file(root, Path::new(LOCAL_SETTINGS_FILE)));
+
     let diagnostics = session.finish().diagnostics().to_vec();
     if !diagnostics.is_empty() {
         return Err(LocalInventoryError::PluginRegistryScan(diagnostics));
     }
-    let Some(file) = file else {
-        return Ok(Vec::new());
+
+    let registry = parse_registry(registry_file.as_ref().map(|file| file.bytes.as_slice()))?;
+    let mut enabled_plugins = parse_settings(user_settings, ArtifactScope::User)?;
+    enabled_plugins.extend(parse_settings(project_settings, ArtifactScope::Project)?);
+    enabled_plugins.extend(parse_settings(local_settings, ArtifactScope::Local)?);
+    select_plugin_roots(registry, enabled_plugins, roots.project_root)
+}
+
+fn parse_registry(bytes: Option<&[u8]>) -> Result<PluginRegistry, LocalInventoryError> {
+    let Some(bytes) = bytes else {
+        return Ok(PluginRegistry {
+            version: SUPPORTED_PLUGIN_REGISTRY_VERSION,
+            plugins: BTreeMap::new(),
+        });
     };
-    let registry = serde_json::from_slice::<PluginRegistry>(&file.bytes)
+    let registry = serde_json::from_slice::<PluginRegistry>(bytes)
         .map_err(|_| LocalInventoryError::MalformedPluginRegistry)?;
     if registry.version != SUPPORTED_PLUGIN_REGISTRY_VERSION {
         return Err(LocalInventoryError::UnsupportedPluginRegistryVersion(
             registry.version,
         ));
     }
-    let mut plugins = Vec::new();
-    for (id, installations) in registry.plugins {
-        if !valid_plugin_id(&id) {
+    for (id, installations) in &registry.plugins {
+        if !valid_registry_plugin_id(id) {
             return Err(LocalInventoryError::MalformedPluginRegistry);
         }
         for installation in installations {
-            if !installation.install_path.is_absolute() {
-                return Err(LocalInventoryError::UnsafePluginInstallPath);
-            }
-            plugins.push(OwnedPluginRoot {
-                id: id.clone(),
-                path: installation.install_path,
-            });
+            validate_installation(id, installation)?;
         }
     }
-    plugins.sort_unstable();
-    plugins.dedup();
-    Ok(plugins)
+    Ok(registry)
+}
+
+fn parse_settings(
+    file: Option<crate::scan::ScannedFile>,
+    scope: ArtifactScope,
+) -> Result<BTreeMap<String, bool>, LocalInventoryError> {
+    let Some(file) = file else {
+        return Ok(BTreeMap::new());
+    };
+    let settings = serde_json::from_slice::<ClaudeSettings>(&file.bytes)
+        .map_err(|_| LocalInventoryError::MalformedClaudeSettings(scope))?;
+    if settings
+        .enabled_plugins
+        .keys()
+        .any(|id| !valid_registry_plugin_id(id))
+    {
+        return Err(LocalInventoryError::MalformedClaudeSettings(scope));
+    }
+    Ok(settings.enabled_plugins)
+}
+
+fn select_plugin_roots(
+    registry: PluginRegistry,
+    mut enabled_plugins: BTreeMap<String, bool>,
+    project_root: &Path,
+) -> Result<Vec<OwnedPluginRoot>, LocalInventoryError> {
+    let canonical_project_root = fs::canonicalize(project_root)
+        .map_err(|_| LocalInventoryError::UnsafePluginProjectPath("<project>".to_owned()))?;
+    let mut selected = Vec::new();
+
+    for (id, installations) in registry.plugins {
+        let applicable = installations
+            .into_iter()
+            .filter(|installation| installation_applies(installation, &canonical_project_root))
+            .collect::<Vec<_>>();
+        let enabled = enabled_plugins.remove(&id);
+        if applicable.is_empty() {
+            if enabled == Some(true) {
+                return Err(LocalInventoryError::EnabledPluginNotInstalled(id));
+            }
+            continue;
+        }
+        let Some(enabled) = enabled else {
+            return Err(LocalInventoryError::IndeterminatePluginEnablement(id));
+        };
+        if !enabled {
+            continue;
+        }
+
+        let mut eligible = BTreeSet::new();
+        for installation in applicable {
+            let canonical = fs::canonicalize(&installation.install_path)
+                .map_err(|_| LocalInventoryError::UnsafePluginInstallPath)?;
+            if !canonical.is_dir() {
+                return Err(LocalInventoryError::UnsafePluginInstallPath);
+            }
+            eligible.insert(canonical);
+        }
+
+        let path = match eligible.len() {
+            0 => return Err(LocalInventoryError::EnabledPluginNotInstalled(id)),
+            1 => eligible.pop_first().expect("one eligible plugin root"),
+            _ => return Err(LocalInventoryError::AmbiguousPluginInstallations(id)),
+        };
+        selected.push(OwnedPluginRoot { id, path });
+    }
+
+    if let Some((id, _)) = enabled_plugins.into_iter().find(|(_, enabled)| *enabled) {
+        return Err(LocalInventoryError::EnabledPluginNotInstalled(id));
+    }
+
+    selected.sort_unstable();
+    Ok(selected)
+}
+
+fn installation_applies(installation: &PluginInstallation, project_root: &Path) -> bool {
+    match installation.scope {
+        PluginScope::Managed => false,
+        PluginScope::User => true,
+        PluginScope::Project | PluginScope::Local => installation
+            .project_path
+            .as_deref()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|path| path == project_root),
+    }
+}
+
+fn validate_installation(
+    id: &str,
+    installation: &PluginInstallation,
+) -> Result<(), LocalInventoryError> {
+    if !safe_absolute_path(&installation.install_path) {
+        return Err(LocalInventoryError::UnsafePluginInstallPath);
+    }
+    if matches!(
+        installation.scope,
+        PluginScope::Project | PluginScope::Local
+    ) && !installation
+        .project_path
+        .as_deref()
+        .is_some_and(safe_absolute_path)
+    {
+        return Err(LocalInventoryError::UnsafePluginProjectPath(id.to_owned()));
+    }
+    Ok(())
+}
+
+fn safe_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.as_os_str().as_encoded_bytes().contains(&0)
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+}
+
+fn valid_registry_plugin_id(id: &str) -> bool {
+    let Some((plugin, marketplace)) = id.split_once('@') else {
+        return false;
+    };
+    valid_plugin_id(id)
+        && !marketplace.contains('@')
+        && valid_plugin_id_part(plugin)
+        && valid_plugin_id_part(marketplace)
+}
+
+fn valid_plugin_id_part(part: &str) -> bool {
+    let mut characters = part.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalInventoryError {
     PluginRegistryScan(Vec<ScanDiagnostic>),
     MalformedPluginRegistry,
+    MalformedClaudeSettings(ArtifactScope),
     UnsupportedPluginRegistryVersion(u32),
     UnsafePluginInstallPath,
+    UnsafePluginProjectPath(String),
+    IndeterminatePluginEnablement(String),
+    EnabledPluginNotInstalled(String),
+    AmbiguousPluginInstallations(String),
 }
 
 impl fmt::Display for LocalInventoryError {
@@ -190,6 +373,13 @@ impl fmt::Display for LocalInventoryError {
             Self::MalformedPluginRegistry => {
                 formatter.write_str("Claude plugin registry is malformed")
             }
+            Self::MalformedClaudeSettings(scope) => {
+                write!(
+                    formatter,
+                    "Claude {} settings are malformed",
+                    scope.as_str()
+                )
+            }
             Self::UnsupportedPluginRegistryVersion(version) => write!(
                 formatter,
                 "Claude plugin registry version {version} is unsupported"
@@ -197,6 +387,24 @@ impl fmt::Display for LocalInventoryError {
             Self::UnsafePluginInstallPath => {
                 formatter.write_str("Claude plugin registry contains a non-absolute install path")
             }
+            Self::UnsafePluginProjectPath(id) => write!(
+                formatter,
+                "Claude plugin {id} has an unsafe or missing project path"
+            ),
+            Self::IndeterminatePluginEnablement(id) => write!(
+                formatter,
+                "Claude plugin {id} has no explicit enabledPlugins state"
+            ),
+            Self::EnabledPluginNotInstalled(id) => {
+                write!(
+                    formatter,
+                    "enabled Claude plugin {id} is not installed here"
+                )
+            }
+            Self::AmbiguousPluginInstallations(id) => write!(
+                formatter,
+                "enabled Claude plugin {id} has multiple applicable install roots"
+            ),
         }
     }
 }

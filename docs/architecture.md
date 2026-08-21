@@ -163,6 +163,44 @@ after its blob was unlinked.
 PAM integrates with `ptrack` through its supported command or future protocol.
 It does not read or mutate `ptrack`'s database schema directly.
 
+## Canonical skill library
+
+PAM keeps exact skill bytes in an isolated, digest-addressed library below the
+resolved p-track home's PAM namespace. The manifest records canonical entry
+IDs, immutable versions, metadata-only installation provenance, and exact
+project/agent enablement keys. Managed-copy ownership is additionally bound to
+a non-sensitive identity of the validated canonical agent root, without storing
+or exposing that root path. Live discovery remains a
+separate observation: finding an artifact does not enable it, and enabling a
+version does not claim that a destination was published or remains clean.
+
+Replacement materialization is failure-atomic and no-clobber rather than a
+continuous-pathname crash transaction. PAM atomically moves the live target to
+a private sibling quarantine, verifies the held bytes, and publishes the new
+file without replacement. If the process stops between those operations, the
+exact prior bytes remain under `.pam-quarantine-*/previous-destination` for
+explicit recovery; PAM never trades that recovery copy for silently overwriting
+a non-cooperating writer.
+
+The Desktop Access surface uses one strict, schema-versioned
+`manage_skill_library` command. Its public authority is the existing opaque
+project handle, generation, and fresh operation UUID; the Rust boundary derives
+the internal library project key and never exposes it. Actions are explicit:
+load, adopt, local or Git install, enable/disable, materialization
+preview/apply, drift inspection, and resync preview/apply. Responses contain
+only entry/version/agent identities, digests, byte counts, dispositions, typed
+drift, and ownership outcomes. Explicit local paths and Git URLs exist only in
+the submitted install form/request; source bytes, destination roots, backup
+paths, and those request-only source values never return in a response or enter
+the displayed library snapshot.
+
+Desktop previews are advisory metadata, not write authority. Apply recomputes
+and revalidates the exact plan in Rust. React rejects stale sequences, mismatched
+fences, and substituted entry/version/agent identities; after a mutation it
+loads library state again before presenting success. Switching project or
+generation remounts the Access library and clears forms, previews, inspections,
+and prior-project metadata.
+
 ## Evidence pipeline
 
 ```mermaid

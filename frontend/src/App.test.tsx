@@ -161,6 +161,11 @@ describe("control center", () => {
     expect(screen.getByText("Certificates")).toBeInTheDocument();
     expect(screen.getByText("Network configuration")).toBeInTheDocument();
     expect(screen.getByText(/Operating-system certificate verifier enabled/)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Skill library" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Library state definitions")).toHaveTextContent("Observed");
+    expect(screen.getByRole("button", { name: "Adopt into library" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install into library" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Inspect drift" })).toBeInTheDocument();
   });
 
   it("renders policy-blocked Access without available diagnostics", async () => {

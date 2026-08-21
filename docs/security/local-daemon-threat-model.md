@@ -45,6 +45,8 @@ is a presentation layer and is not a production security boundary.
   directories, and native keyring.
 - User-owned GGUF weights, verified model registrations, exact license consent,
   and ephemeral model prompts and generated text.
+- Canonical skill-library bytes and manifests, installation provenance,
+  project/agent enablements, managed-copy ownership, backups, and drift truth.
 - Future connector credentials, flow definitions, and external effects. These
   are design assets but are not yet exposed by production code.
 
@@ -94,6 +96,11 @@ is a presentation layer and is not a production security boundary.
    evidence files cannot be changed in one atomic transaction. Logical deletion
    commits first; descriptor-relative, no-follow physical cleanup is idempotent
    and reports pending or unresolved state without claiming unknown deletion.
+   The canonical skill library is a separate p-track-home filesystem authority:
+   its manifest and digest-addressed bytes publish atomically under a library
+   lock, while agent destinations use per-root locks and verify-or-restore
+   materialization. These filesystems are not one transaction, so ownership is
+   recorded only for a verified create or replace outcome.
 7. **Subprocess boundary.** PAM invokes fixed `ptrack` commands without a shell,
    with a fixed working directory, timeouts, output caps, JSON parsing, and exact
    project-root validation. The binary found through `PATH` is still executable
@@ -145,6 +152,13 @@ is a presentation layer and is not a production security boundary.
 - Model load fails closed when the exact runtime projection exceeds the 20 GB
   ceiling or fresh host pressure, availability, swap trend, physical reserve,
   or Metal working-set evidence is unavailable or insufficient.
+- Observed, enabled, managed, and drift are independent skill states. A scan
+  cannot grant enablement; enablement cannot claim ownership; ownership cannot
+  claim clean drift without a fresh exact comparison.
+- Skill-library Desktop responses never expose source bodies, local source
+  paths, Git URLs, destination roots, backup paths, or internal project keys.
+  Every mutation is fenced to an opaque project handle, generation, fresh
+  operation UUID, and exact entry/version/agent identity.
 - At most one native inference is active and one is queued; additional callers
   receive a typed busy result rather than blocking an async executor.
 - Unavailable sources and failed operations are reported as unavailable,
@@ -318,6 +332,51 @@ unredacted `ptrack` JSON are plaintext at rest under the per-user data directory
 retention does not promise secure erasure from storage media or backups. Each
 bounded range read currently verifies the whole blob, so repeated small reads
 can amplify hashing and I/O work.
+
+### Canonical skill library and materialization
+
+An attacker may substitute a scanned artifact, race a local source, redirect a
+Git fetch, corrupt canonical bytes, replace an agent destination with a symlink,
+or replay a preview after enablement or project authority changes. Adoption
+requires a complete bounded scan and reopens exact source bytes without
+following links; local installation validates one held file across both reads;
+Git installation uses a private temporary workspace, fixed noninteractive Git
+configuration, protocol restrictions, bounded output, deadline-driven process
+tree termination, and an exact resolved commit/blob read. Canonical publication
+is digest-verified and atomic. Materialization uses fixed agent-relative paths,
+descriptor-relative no-follow I/O, per-root locks, batch preflight and
+revalidation, independent backups, and verify-or-restore failure handling. A
+managed-copy record is bound to an opaque digest of the validated canonical
+root, so changing a configured root cannot transfer cleanup or resync authority.
+Portable materialization replacement prioritizes no-clobber recovery over
+continuous pathname availability: the old inode moves atomically into a private
+sibling quarantine before a no-replace publication. A process or power loss in
+that bounded interval can leave the destination absent, but the exact prior
+bytes remain at `.pam-quarantine-*/previous-destination`; ordinary replacement
+never overwrites an uncooperating writer in place.
+
+The Desktop boundary exposes one tagged metadata-only action contract. It
+derives the internal library project key from the active project's durable
+`ProjectId`, checks the opaque handle/generation/operation fences, and returns no source body,
+local source path, Git URL, destination root, backup path, or internal key.
+Preview results contain only exact keys, actions, bounded file metadata, and a
+backup-planned flag. Apply rebuilds the plan in Rust; the React client also
+rejects stale response sequences and mismatched fences or exact keys, then
+reloads durable library state before claiming mutation success.
+
+Disabling removes only an exact clean managed copy, clears an already missing
+copy, and preserves modified, symlinked, or unowned content while leaving the
+enablement disabled. Drift inspection is read-only and closed-state: clean,
+missing, modified with a digest, or a typed conflict. “Not inspected” is a UI
+absence of a current result, never a backend claim that the target is clean.
+
+Residual risk: a malicious same-user process is inside the documented local
+administrator boundary and can still alter the library or agent roots directly.
+Local and Git source values exist transiently in the native request needed to
+perform the explicit install, and fetched repositories may be sensitive while
+the private temporary workspace exists. Backup files intentionally preserve
+pre-replacement bytes and rely on per-user filesystem protection and deliberate
+operator cleanup; PAM does not promise secure erasure.
 
 ### Native trust, proxies, and diagnostics
 

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, RequestId};
 use pam_model::ModelKey;
 use pam_policy::{CapabilityName, ResourceName};
-use pam_skills::AgentArtifactId;
+use pam_skills::{AgentArtifactId, CanonicalEntryId, MaterializationAgent, OriginAgent};
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
@@ -155,6 +155,127 @@ enum SkillsCommand {
         #[arg(value_parser = parse_agent_artifact_id)]
         artifact_id: AgentArtifactId,
         /// Emit the stable versioned JSON contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage the canonical skill library and agent materializations.
+    Library {
+        #[command(subcommand)]
+        command: SkillsLibraryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsLibraryCommand {
+    /// List canonical library entries and project-scoped state.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Adopt one exact artifact from a new complete live scan.
+    Adopt {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_agent_artifact_id)]
+        artifact_id: AgentArtifactId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install one exact local or Git artifact into the canonical library.
+    Install {
+        #[command(subcommand)]
+        source: SkillsInstallCommand,
+    },
+    /// Enable one exact library version for this project and agent.
+    Enable {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_content_digest)]
+        version: ContentDigest,
+        #[arg(long, value_enum)]
+        agent: SkillsAgentArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable one exact version and safely clean up its managed copy.
+    Disable {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_content_digest)]
+        version: ContentDigest,
+        #[arg(long, value_enum)]
+        agent: SkillsAgentArg,
+        #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = parse_agent_root)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview or explicitly apply one library version to an agent root.
+    Materialize {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_content_digest)]
+        version: ContentDigest,
+        #[arg(long, value_enum)]
+        agent: SkillsAgentArg,
+        #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = parse_agent_root)]
+        root: Option<PathBuf>,
+        /// Apply the preview. Without this flag the command performs no writes.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one enabled managed copy for drift.
+    Drift {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_content_digest)]
+        version: ContentDigest,
+        #[arg(long, value_enum)]
+        agent: SkillsAgentArg,
+        #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = parse_agent_root)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview or explicitly apply a drift resynchronization.
+    Resync {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_parser = parse_content_digest)]
+        version: ContentDigest,
+        #[arg(long, value_enum)]
+        agent: SkillsAgentArg,
+        #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = parse_agent_root)]
+        root: Option<PathBuf>,
+        /// Apply the preview. Without this flag the command performs no writes.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsInstallCommand {
+    /// Install an absolute local regular file.
+    Local {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_name = "ABSOLUTE_FILE", value_parser = parse_install_path)]
+        source: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install one repository-relative file from a validated Git URL.
+    Git {
+        #[arg(value_parser = parse_canonical_entry_id)]
+        entry_id: CanonicalEntryId,
+        #[arg(value_name = "URL")]
+        url: String,
+        #[arg(value_name = "REPOSITORY_PATH")]
+        artifact_path: String,
         #[arg(long)]
         json: bool,
     },
@@ -401,6 +522,48 @@ pub(crate) enum RetentionScopeArg {
     Project,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SkillsAgentArg {
+    Claude,
+    Codex,
+    Cursor,
+}
+
+impl SkillsAgentArg {
+    #[must_use]
+    pub(crate) const fn materialization_agent(self) -> MaterializationAgent {
+        match self {
+            Self::Claude => MaterializationAgent::Claude,
+            Self::Codex => MaterializationAgent::Codex,
+            Self::Cursor => MaterializationAgent::Cursor,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn origin(self) -> OriginAgent {
+        match self {
+            Self::Claude => OriginAgent::ClaudeCode,
+            Self::Codex => OriginAgent::Codex,
+            Self::Cursor => OriginAgent::Cursor,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum SkillsInstallSourceArg {
+    Local(PathBuf),
+    Git { url: String, artifact_path: String },
+}
+
+impl fmt::Debug for SkillsInstallSourceArg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(_) => formatter.write_str("Local(..)"),
+            Self::Git { .. } => formatter.write_str("Git(..)"),
+        }
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub(crate) enum Mode {
     Client,
@@ -461,11 +624,60 @@ pub(crate) enum Mode {
     SkillsList {
         json: bool,
     },
+    SkillsLibraryList {
+        json: bool,
+    },
     SkillsShow {
         artifact_id: AgentArtifactId,
         json: bool,
     },
     SkillsAudit {
+        json: bool,
+    },
+    SkillsAdopt {
+        entry_id: CanonicalEntryId,
+        artifact_id: AgentArtifactId,
+        json: bool,
+    },
+    SkillsInstall {
+        entry_id: CanonicalEntryId,
+        source: SkillsInstallSourceArg,
+        json: bool,
+    },
+    SkillsEnable {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        json: bool,
+    },
+    SkillsDisable {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        json: bool,
+    },
+    SkillsMaterialize {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        apply: bool,
+        json: bool,
+    },
+    SkillsDrift {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        json: bool,
+    },
+    SkillsResync {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        apply: bool,
         json: bool,
     },
     CallerRegister {
@@ -623,8 +835,16 @@ impl fmt::Debug for Mode {
             Self::FlowResult { .. } => formatter.write_str("FlowResult"),
             Self::EvidenceShow { .. } => formatter.write_str("EvidenceShow"),
             Self::SkillsList { .. } => formatter.write_str("SkillsList"),
+            Self::SkillsLibraryList { .. } => formatter.write_str("SkillsLibraryList"),
             Self::SkillsShow { .. } => formatter.write_str("SkillsShow"),
             Self::SkillsAudit { .. } => formatter.write_str("SkillsAudit"),
+            Self::SkillsAdopt { .. } => formatter.write_str("SkillsAdopt"),
+            Self::SkillsInstall { .. } => formatter.write_str("SkillsInstall"),
+            Self::SkillsEnable { .. } => formatter.write_str("SkillsEnable"),
+            Self::SkillsDisable { .. } => formatter.write_str("SkillsDisable"),
+            Self::SkillsMaterialize { .. } => formatter.write_str("SkillsMaterialize"),
+            Self::SkillsDrift { .. } => formatter.write_str("SkillsDrift"),
+            Self::SkillsResync { .. } => formatter.write_str("SkillsResync"),
             Self::CallerRegister { .. } => formatter.write_str("CallerRegister"),
             Self::CallerRevoke { .. } => formatter.write_str("CallerRevoke"),
             Self::ModelImport { .. } => formatter.write_str("ModelImport"),
@@ -788,6 +1008,110 @@ fn skills_mode(command: SkillsCommand) -> Mode {
         SkillsCommand::Audit { json } => Mode::SkillsAudit { json },
         SkillsCommand::List { json } => Mode::SkillsList { json },
         SkillsCommand::Show { artifact_id, json } => Mode::SkillsShow { artifact_id, json },
+        SkillsCommand::Library { command } => skills_library_mode(command),
+    }
+}
+
+fn skills_library_mode(command: SkillsLibraryCommand) -> Mode {
+    match command {
+        SkillsLibraryCommand::List { json } => Mode::SkillsLibraryList { json },
+        SkillsLibraryCommand::Adopt {
+            entry_id,
+            artifact_id,
+            json,
+        } => Mode::SkillsAdopt {
+            entry_id,
+            artifact_id,
+            json,
+        },
+        SkillsLibraryCommand::Install { source } => match source {
+            SkillsInstallCommand::Local {
+                entry_id,
+                source,
+                json,
+            } => Mode::SkillsInstall {
+                entry_id,
+                source: SkillsInstallSourceArg::Local(source),
+                json,
+            },
+            SkillsInstallCommand::Git {
+                entry_id,
+                url,
+                artifact_path,
+                json,
+            } => Mode::SkillsInstall {
+                entry_id,
+                source: SkillsInstallSourceArg::Git { url, artifact_path },
+                json,
+            },
+        },
+        SkillsLibraryCommand::Enable {
+            entry_id,
+            version,
+            agent,
+            json,
+        } => Mode::SkillsEnable {
+            entry_id,
+            version,
+            agent,
+            json,
+        },
+        SkillsLibraryCommand::Disable {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        } => Mode::SkillsDisable {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        },
+        SkillsLibraryCommand::Materialize {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        } => Mode::SkillsMaterialize {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        },
+        SkillsLibraryCommand::Drift {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        } => Mode::SkillsDrift {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        },
+        SkillsLibraryCommand::Resync {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        } => Mode::SkillsResync {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        },
     }
 }
 
@@ -911,6 +1235,31 @@ fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {
 
 fn parse_agent_artifact_id(value: &str) -> Result<AgentArtifactId, String> {
     AgentArtifactId::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_canonical_entry_id(value: &str) -> Result<CanonicalEntryId, String> {
+    CanonicalEntryId::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_agent_root(value: &str) -> Result<PathBuf, String> {
+    parse_bounded_absolute_path(value, "agent root")
+}
+
+fn parse_install_path(value: &str) -> Result<PathBuf, String> {
+    parse_bounded_absolute_path(value, "local install source")
+}
+
+fn parse_bounded_absolute_path(value: &str, label: &str) -> Result<PathBuf, String> {
+    const MAX_CLI_PATH_BYTES: usize = 4_096;
+    let path = PathBuf::from(value);
+    if value.is_empty()
+        || value.len() > MAX_CLI_PATH_BYTES
+        || value.chars().any(char::is_control)
+        || !path.is_absolute()
+    {
+        return Err(format!("{label} must be an absolute bounded path"));
+    }
+    Ok(path)
 }
 
 fn parse_capability_name(value: &str) -> Result<CapabilityName, String> {

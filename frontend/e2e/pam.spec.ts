@@ -329,3 +329,88 @@ test.describe("Access skill audit", () => {
     await expect(page.getByText("Saturation grade")).toHaveCount(0);
   });
 });
+
+test.describe("Access skill library", () => {
+  test("keeps exact target identity through drift, resync, and refreshed mutation truth", async ({ page }) => {
+    await page.setViewportSize({ width: 1_180, height: 1_000 });
+    await openFixture(page, "solved", "access");
+    const panel = page.getByRole("region", { name: "Skill library" });
+    await expect(panel).toBeVisible();
+    await expect(panel.getByText("Git install · commit")).toBeVisible();
+    await expect(panel.getByText("Local install · source path not retained")).toBeVisible();
+    await expect(panel.getByText("not inspected").first()).toBeVisible();
+
+    await panel.getByRole("combobox", { name: "Library entry" }).selectOption("review-changes");
+    await panel.getByRole("combobox", { name: "Library agent" }).selectOption("cursor");
+    await panel.getByRole("button", { name: "Inspect drift" }).click();
+    const inspection = panel.getByRole("region", { name: "Verified drift inspection" });
+    await expect(inspection).toBeVisible();
+    await expect(inspection.getByText("modified", { exact: true })).toBeVisible();
+
+    await panel.getByRole("button", { name: "Preview resync" }).click();
+    const preview = panel.getByRole("region", { name: "Verified resync preview" });
+    await expect(preview).toBeVisible();
+    await expect(preview.getByText("replace", { exact: true })).toBeVisible();
+    await expect(preview.getByText("Backup planned before replacement")).toBeVisible();
+    await preview.getByRole("button", { name: "Apply exact resync" }).click();
+    await expect(panel.getByText("Resync verified against refreshed library state.")).toBeVisible();
+    await expect(preview).toHaveCount(0);
+    let result = panel.getByRole("region", { name: "Verified operation result" });
+    await expect(result.getByText("Ownership recorded: yes")).toBeVisible();
+    await expect(result.getByText(/Backup: 1024 bytes/)).toBeVisible();
+
+    await panel.getByRole("button", { name: "Disable target" }).click();
+    await expect(panel.getByText("Disablement verified against refreshed library state.")).toBeVisible();
+    result = panel.getByRole("region", { name: "Verified operation result" });
+    await expect(result.getByText("removed", { exact: true })).toBeVisible();
+    await panel.getByRole("button", { name: "Enable target" }).click();
+    await expect(panel.getByText("Enablement verified against refreshed library state.")).toBeVisible();
+    result = panel.getByRole("region", { name: "Verified operation result" });
+    await expect(result.getByText("yes", { exact: true })).toHaveCount(2);
+
+    await panel.getByLabel("Library entry ID", { exact: true }).first().fill("adopted-review");
+    await panel.getByLabel("Observed inventory artifact").selectOption("artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    await panel.getByRole("button", { name: "Adopt into library" }).click();
+    await expect(panel.getByText("Adoption verified against refreshed library state.")).toBeVisible();
+    await expect(panel.getByRole("region", { name: "Verified operation result" }).getByText("inserted", { exact: true })).toBeVisible();
+    await expect(panel.getByLabel("Canonical library entries").getByText("adopted-review")).toBeVisible();
+  });
+
+  test("keeps every library form and preview/apply action reachable at effective 320px", async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 800 });
+    await openFixture(page, "solved", "access");
+    const panel = page.getByRole("region", { name: "Skill library" });
+    await panel.scrollIntoViewIfNeeded();
+
+    for (const name of [
+      "Adopt into library",
+      "Install into library",
+      "Enable target",
+      "Inspect drift",
+    ]) {
+      const action = panel.getByRole("button", { name });
+      await action.scrollIntoViewIfNeeded();
+      await expect(action).toBeVisible();
+      const box = await action.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.x).toBeGreaterThanOrEqual(0);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(320);
+    }
+
+    await panel.getByRole("combobox", { name: "Library entry" }).selectOption("review-changes");
+    await panel.getByRole("combobox", { name: "Library agent" }).selectOption("cursor");
+    await panel.getByRole("button", { name: "Preview resync" }).click();
+    const apply = panel.getByRole("button", { name: "Apply exact resync" });
+    await apply.scrollIntoViewIfNeeded();
+    await expect(apply).toBeVisible();
+    const applyBox = await apply.boundingBox();
+    expect(applyBox).not.toBeNull();
+    expect(applyBox!.x).toBeGreaterThanOrEqual(0);
+    expect(applyBox!.x + applyBox!.width).toBeLessThanOrEqual(320);
+
+    const horizontal = await horizontalMetrics(page);
+    expect(horizontal.htmlScroll).toBe(horizontal.htmlClient);
+    expect(horizontal.bodyScroll).toBe(horizontal.bodyClient);
+    expect(horizontal.shellScroll).toBe(horizontal.shellClient);
+  });
+});

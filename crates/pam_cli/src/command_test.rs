@@ -1,11 +1,13 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use pam_core::{ApprovalId, EvidenceHandle, IdempotencyKey, RequestId};
+use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, IdempotencyKey, RequestId};
 use pam_policy::{CapabilityName, ResourceName};
-use pam_skills::AgentArtifactId;
+use pam_skills::{AgentArtifactId, CanonicalEntryId};
 
-use super::command::{CallerKindArg, Cli, Mode, RetentionScopeArg};
+use super::command::{
+    CallerKindArg, Cli, Mode, RetentionScopeArg, SkillsAgentArg, SkillsInstallSourceArg,
+};
 
 #[test]
 fn no_subcommand_selects_client_mode() {
@@ -57,6 +59,227 @@ fn skills_audit_debug_is_redacted_to_the_mode_name() {
     let cli = Cli::try_parse_from(["pam", "skills", "audit", "--json"]).unwrap();
     assert_eq!(format!("{cli:?}"), "Cli { command: Some(Skills) }");
     assert_eq!(format!("{:?}", cli.mode()), "SkillsAudit");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn skills_library_commands_parse_under_the_compatible_namespace() {
+    let entry_id = CanonicalEntryId::parse("review").unwrap();
+    let artifact_id =
+        AgentArtifactId::parse(format!("artifact:sha256:{}", "ab".repeat(32))).unwrap();
+    let version = ContentDigest::from_sha256([0xcd; 32]);
+    let version_text = version.to_string();
+    let root = std::env::temp_dir().join("pam-cli-agent-root");
+    let root_text = root.to_string_lossy().into_owned();
+
+    assert_eq!(
+        Cli::try_parse_from(["pam", "skills", "library", "list", "--json"])
+            .unwrap()
+            .mode(),
+        Mode::SkillsLibraryList { json: true }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "skills",
+            "library",
+            "adopt",
+            entry_id.as_str(),
+            artifact_id.as_str(),
+        ])
+        .unwrap()
+        .mode(),
+        Mode::SkillsAdopt {
+            entry_id: entry_id.clone(),
+            artifact_id: artifact_id.clone(),
+            json: false,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "skills",
+            "library",
+            "install",
+            "local",
+            entry_id.as_str(),
+            &root_text,
+            "--json",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::SkillsInstall {
+            entry_id: entry_id.clone(),
+            source: SkillsInstallSourceArg::Local(root.clone()),
+            json: true,
+        }
+    );
+    assert_eq!(
+        Cli::try_parse_from([
+            "pam",
+            "skills",
+            "library",
+            "install",
+            "git",
+            entry_id.as_str(),
+            "https://example.invalid/repo.git",
+            "skills/review/SKILL.md",
+        ])
+        .unwrap()
+        .mode(),
+        Mode::SkillsInstall {
+            entry_id: entry_id.clone(),
+            source: SkillsInstallSourceArg::Git {
+                url: "https://example.invalid/repo.git".to_owned(),
+                artifact_path: "skills/review/SKILL.md".to_owned(),
+            },
+            json: false,
+        }
+    );
+    for (name, expected) in [
+        (
+            "enable",
+            Mode::SkillsEnable {
+                entry_id: entry_id.clone(),
+                version: version.clone(),
+                agent: SkillsAgentArg::Codex,
+                json: false,
+            },
+        ),
+        (
+            "disable",
+            Mode::SkillsDisable {
+                entry_id: entry_id.clone(),
+                version: version.clone(),
+                agent: SkillsAgentArg::Codex,
+                root: Some(root.clone()),
+                json: false,
+            },
+        ),
+        (
+            "materialize",
+            Mode::SkillsMaterialize {
+                entry_id: entry_id.clone(),
+                version: version.clone(),
+                agent: SkillsAgentArg::Codex,
+                root: Some(root.clone()),
+                apply: true,
+                json: false,
+            },
+        ),
+        (
+            "drift",
+            Mode::SkillsDrift {
+                entry_id: entry_id.clone(),
+                version: version.clone(),
+                agent: SkillsAgentArg::Codex,
+                root: Some(root.clone()),
+                json: false,
+            },
+        ),
+        (
+            "resync",
+            Mode::SkillsResync {
+                entry_id: entry_id.clone(),
+                version: version.clone(),
+                agent: SkillsAgentArg::Codex,
+                root: Some(root.clone()),
+                apply: true,
+                json: false,
+            },
+        ),
+    ] {
+        let mut arguments = vec![
+            "pam",
+            "skills",
+            "library",
+            name,
+            entry_id.as_str(),
+            &version_text,
+            "--agent",
+            "codex",
+        ];
+        if name != "enable" {
+            arguments.extend(["--root", &root_text]);
+        }
+        if matches!(name, "materialize" | "resync") {
+            arguments.push("--apply");
+        }
+        assert_eq!(Cli::try_parse_from(arguments).unwrap().mode(), expected);
+    }
+}
+
+#[test]
+fn skills_library_rejects_legacy_placement_and_invalid_flag_combinations() {
+    let artifact_id = format!("artifact:sha256:{}", "ab".repeat(32));
+    let version = ContentDigest::from_sha256([0xcd; 32]).to_string();
+    for arguments in [
+        vec!["pam", "skills", "adopt", "review", &artifact_id],
+        vec![
+            "pam",
+            "skills",
+            "library",
+            "install",
+            "local",
+            "review",
+            "relative.md",
+        ],
+        vec![
+            "pam",
+            "skills",
+            "library",
+            "install",
+            "git",
+            "review",
+            "https://example.invalid/repo.git",
+        ],
+        vec![
+            "pam", "skills", "library", "enable", "review", &version, "--agent", "pam",
+        ],
+        vec![
+            "pam",
+            "skills",
+            "library",
+            "materialize",
+            "review",
+            &version,
+            "--agent",
+            "codex",
+            "--root",
+            "relative",
+        ],
+        vec![
+            "pam",
+            "skills",
+            "library",
+            "resync",
+            "review",
+            &version,
+            "--agent",
+            "codex",
+            "--dry-run",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
+}
+
+#[test]
+fn skills_library_debug_never_exposes_source_or_root_arguments() {
+    let secret_path = std::env::temp_dir().join("private-library-source-token");
+    let secret = secret_path.to_string_lossy();
+    let cli = Cli::try_parse_from([
+        "pam",
+        "skills",
+        "library",
+        "install",
+        "local",
+        "review",
+        secret.as_ref(),
+    ])
+    .unwrap();
+    assert!(!format!("{cli:?}").contains(secret.as_ref()));
+    assert!(!format!("{:?}", cli.mode()).contains(secret.as_ref()));
 }
 
 #[test]
@@ -351,11 +574,11 @@ fn direct_model_runtime_and_import_require_explicit_bounded_inputs() {
         Mode::ModelImport {
             model,
             path: PathBuf::from("/tmp/model.gguf"),
-            digest: pam_core::ContentDigest::parse(digest).unwrap(),
+            digest: ContentDigest::parse(digest).unwrap(),
             size_bytes: 16_492_334_496,
             license_id: "Apache-2.0".to_owned(),
             license_url: "https://example.test/LICENSE".to_owned(),
-            license_notice_digest: pam_core::ContentDigest::parse(license_digest).unwrap(),
+            license_notice_digest: ContentDigest::parse(license_digest).unwrap(),
             accept_license: true,
             approval_id: None,
         }

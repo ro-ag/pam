@@ -14,6 +14,7 @@ const COMMANDS: &[&str] = &[
     "load_evidence",
     "load_flow_workspace",
     "load_skill_inventory",
+    "manage_skill_library",
     "load_skill_audit",
     "run_skill_audit",
     "open_flow",

@@ -114,7 +114,9 @@ must not be described as one. Its icon-rail/overlay navigation is PAM-specific.
 Effective 320 CSS-pixel acceptance comes from the 600px reflow rules under 400%
 zoom, not from a new 320px breakpoint. It must have no horizontal document
 scroll, long identifiers must wrap or elide accessibly, and every handoff action
-must remain reachable.
+must remain reachable. Access library forms, exact-target selectors, preview
+actions, and their apply buttons follow the same rule: they stack to the
+available width and never require horizontal scrolling to reach an action.
 
 Every interactive element has a visible `:focus-visible` treatment using PAM
 aqua; clipped controls use a 2px inward outline. Focus order follows visual
@@ -143,6 +145,22 @@ facts. Production UI obeys these rules:
 - Access distinguishes observed, policy-gated, disabled, and unavailable facts.
   Approval copy states the exact bounded effect, project, capability/policy,
   expiry, and opaque handle supplied by the protocol.
+- Access keeps four skill facts separate. **Observed** means the bounded project
+  inventory detected an artifact; it does not enable or claim ownership.
+  **Enabled** is the returned exact entry/version/agent selection for the active
+  project. **Managed** means PAM recorded ownership only after verified
+  publication. **Drift** is unknown until an explicit read-only inspection and
+  then renders only the returned closed state (`clean`, `missing`, `modified`,
+  or a typed conflict). The UI never derives one fact from another.
+- Library additions and target mutations are explicit forms or buttons. Every
+  request carries a fresh operation UUID plus the active opaque project handle
+  and generation. A preview is applyable only for the same entry, version, and
+  agent; selection or project changes discard it. Mutation success appears only
+  after an exact fenced result and a second verified library load. Source bytes,
+  local source paths, and Git URLs exist only in the explicit install form and
+  outbound request, are cleared after verified success, and never return in the
+  library snapshot or appear as provenance. Destination roots and internal
+  project keys never cross the Desktop response boundary.
 - Solved, unresolved, blocked, cancelled, loading, offline, credential-recovery,
   and stale-project states retain their truthful terminal meaning. A decorative
   or fixture success must never leak into production.
@@ -157,6 +175,7 @@ distribution and portability coverage.
 
 The deterministic Vitest and Playwright suites own the complete typed state and
 interaction matrix: Current lifecycle states, Access available/blocked,
+library load/adopt/install/enable/disable/preview/apply/drift/resync,
 evidence loading/text/binary/truncated/failure, Flows valid/invalid,
 drawers/dialogs, keyboard navigation, reduced motion, forced colors, 780px,
 and effective-320px reflow. Each native renderer must additionally launch the

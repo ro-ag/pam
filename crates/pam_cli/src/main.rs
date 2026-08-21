@@ -25,6 +25,8 @@ mod render_test;
 #[cfg(test)]
 mod request_test;
 #[cfg(test)]
+mod skill_round_trip_test;
+#[cfg(test)]
 mod skills_test;
 
 use clap::Parser;
@@ -87,6 +89,53 @@ async fn main() {
         Mode::SkillsList { json } => skills::list(json).await,
         Mode::SkillsShow { artifact_id, json } => skills::show(artifact_id, json).await,
         Mode::SkillsAudit { json } => skills::audit(json).await,
+        Mode::SkillsLibraryList { json } => skills::library_list(json),
+        Mode::SkillsAdopt {
+            entry_id,
+            artifact_id,
+            json,
+        } => skills::adopt(entry_id, artifact_id, json),
+        Mode::SkillsInstall {
+            entry_id,
+            source,
+            json,
+        } => skills::install(entry_id, source, json),
+        Mode::SkillsEnable {
+            entry_id,
+            version,
+            agent,
+            json,
+        } => skills::enable(entry_id, version, agent, json),
+        Mode::SkillsDisable {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        } => skills::disable(entry_id, version, agent, root, json),
+        Mode::SkillsMaterialize {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        } => skills::materialize(entry_id, version, agent, root, apply, json),
+        Mode::SkillsDrift {
+            entry_id,
+            version,
+            agent,
+            root,
+            json,
+        } => skills::drift(entry_id, version, agent, root, json),
+        Mode::SkillsResync {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+            json,
+        } => skills::resync(entry_id, version, agent, root, apply, json),
         Mode::CallerRegister { kind } => app::caller_register(kind).await,
         Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
         Mode::ModelImport {

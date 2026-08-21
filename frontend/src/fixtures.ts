@@ -12,6 +12,13 @@ import type {
   SnapshotDataDto,
   SkillAuditDataDto,
   SkillInventoryDataDto,
+  SkillLibraryActionResultDto,
+  SkillLibraryAgentDto,
+  SkillLibraryDriftStateDto,
+  SkillLibraryEntryDto,
+  SkillLibraryKeyDto,
+  SkillLibraryMaterializationActionDto,
+  SkillLibraryVersionDto,
 } from "./domain";
 
 const projects: ProjectSummaryDto[] = [
@@ -275,6 +282,56 @@ function skillAudit(evaluation: SkillAuditDataDto["evaluation"] = {
   };
 }
 
+function skillLibraryFixture(): SkillLibraryEntryDto[] {
+  return [
+    {
+      entryId: "release-confidence",
+      versions: [{
+        version: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        installation: { kind: "local" },
+        enabledAgents: ["codex"],
+        managedAgents: ["codex"],
+      }],
+    },
+    {
+      entryId: "review-changes",
+      versions: [{
+        version: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        installation: {
+          kind: "git",
+          commit: "0123456789abcdef0123456789abcdef01234567",
+        },
+        enabledAgents: ["claude", "cursor"],
+        managedAgents: ["claude", "cursor"],
+      }],
+    },
+  ];
+}
+
+function libraryVersion(
+  entries: SkillLibraryEntryDto[],
+  key: SkillLibraryKeyDto,
+): SkillLibraryVersionDto {
+  const version = entries
+    .find((entry) => entry.entryId === key.entryId)
+    ?.versions.find((candidate) => candidate.version === key.version);
+  if (!version) throw new Error("The exact fixture library version is unavailable.");
+  return version;
+}
+
+function setAgent(values: SkillLibraryAgentDto[], agent: SkillLibraryAgentDto, present: boolean) {
+  const index = values.indexOf(agent);
+  if (present && index === -1) values.push(agent);
+  if (!present && index !== -1) values.splice(index, 1);
+  values.sort();
+}
+
+function fixturePlanAction(managed: boolean, drift: SkillLibraryDriftStateDto): SkillLibraryMaterializationActionDto {
+  if (managed && drift.state === "clean") return "no_op";
+  if (drift.state === "missing") return "create";
+  return "replace";
+}
+
 function snapshot(project: ProjectSummaryDto, daemonRunning: boolean, scenario: FixtureScenario): SnapshotDataDto {
   const data = solvedSnapshot(project, daemonRunning);
   if (!daemonRunning || scenario === "solved" || scenario.startsWith("evidence-")) return data;
@@ -381,6 +438,16 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
   let generation = "99999999-9999-4999-8999-999999999999";
   let daemonRunning = true;
   let savedSource = flowSource;
+  const libraryEntries = skillLibraryFixture();
+  const libraryDrift = new Map<string, SkillLibraryDriftStateDto>([
+    ["release-confidence:sha256:1111111111111111111111111111111111111111111111111111111111111111:codex", { state: "missing" }],
+    ["review-changes:sha256:2222222222222222222222222222222222222222222222222222222222222222:claude", { state: "clean" }],
+    ["review-changes:sha256:2222222222222222222222222222222222222222222222222222222222222222:cursor", {
+      state: "modified",
+      actualDigest: "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    }],
+  ]);
+  const driftKey = (key: SkillLibraryKeyDto) => `${key.entryId}:${key.version}:${key.agent}`;
   const fenceResponse = <T,>(fence: CommandFence, data: T) => ({ fence: clone(fence), data: clone(data) });
   const currentFence = (operationId: string): CommandFence => ({ projectHandle: active.handle, generation, operationId });
   const identity = { fileName: "after-merge-checks.toml", id: "after-merge-checks", revision: 4, digest: "sha256:fixture-after-merge" };
@@ -456,6 +523,125 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
     },
     async loadFlowWorkspace(fence) { return fenceResponse(fence, workspace()); },
     async loadSkillInventory(fence) { return fenceResponse(fence, skillInventory(scenario === "empty")); },
+    async manageSkillLibrary(fence, action) {
+      let data: SkillLibraryActionResultDto;
+      if (action.action === "load") {
+        data = { schemaVersion: 1, action: "load", entries: libraryEntries };
+      } else if (action.action === "adopt" || action.action === "install_local" || action.action === "install_git") {
+        const version = action.action === "adopt"
+          ? "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : action.action === "install_local"
+            ? "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+            : "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+        let entry = libraryEntries.find((candidate) => candidate.entryId === action.entryId);
+        const alreadyPresent = entry?.versions.some((candidate) => candidate.version === version) ?? false;
+        if (!entry) {
+          entry = { entryId: action.entryId, versions: [] };
+          libraryEntries.push(entry);
+          libraryEntries.sort((left, right) => left.entryId.localeCompare(right.entryId));
+        }
+        if (!alreadyPresent) {
+          entry.versions.push({
+            version,
+            installation: action.action === "install_git"
+              ? { kind: "git", commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd" }
+              : action.action === "install_local"
+                ? { kind: "local" }
+                : null,
+            enabledAgents: [],
+            managedAgents: [],
+          });
+          entry.versions.sort((left, right) => left.version.localeCompare(right.version));
+        }
+        const disposition = alreadyPresent ? "already_present" : "inserted";
+        data = action.action === "adopt"
+          ? {
+              schemaVersion: 1,
+              action: "adopt",
+              entryId: action.entryId,
+              version,
+              artifactId: action.artifactId,
+              disposition,
+            }
+          : {
+              schemaVersion: 1,
+              action: action.action,
+              entryId: action.entryId,
+              version,
+              disposition,
+            };
+      } else {
+        const key: SkillLibraryKeyDto = {
+          entryId: action.entryId,
+          version: action.version,
+          agent: action.agent,
+        };
+        const version = libraryVersion(libraryEntries, key);
+        const enabled = version.enabledAgents.includes(key.agent);
+        const managed = version.managedAgents.includes(key.agent);
+        const drift = libraryDrift.get(driftKey(key))
+          ?? { state: "conflict", reason: enabled ? "unowned" : "disabled" } as const;
+        if (action.action === "enable") {
+          const changed = !enabled;
+          setAgent(version.enabledAgents, key.agent, true);
+          data = { schemaVersion: 1, action: "enable", key, enabled: true, changed };
+        } else if (action.action === "disable") {
+          const stateChanged = enabled;
+          const cleanup = !managed
+            ? "preserved_unowned"
+            : drift.state === "missing"
+              ? "missing"
+              : drift.state === "modified"
+                ? "preserved_modified"
+                : drift.state === "conflict" && drift.reason === "symlink"
+                  ? "preserved_symlink"
+                  : "removed";
+          setAgent(version.enabledAgents, key.agent, false);
+          if (cleanup === "removed" || cleanup === "missing") setAgent(version.managedAgents, key.agent, false);
+          libraryDrift.set(driftKey(key), { state: "conflict", reason: "disabled" });
+          data = { schemaVersion: 1, action: "disable", key, stateChanged, cleanup };
+        } else if (action.action === "preview_materialization" || action.action === "preview_resync") {
+          data = {
+            schemaVersion: 1,
+            action: action.action,
+            items: [{
+              key,
+              action: fixturePlanAction(managed, drift),
+              existing: drift.state === "modified" ? { byteLen: 1_024, digest: drift.actualDigest } : null,
+              backupPlanned: drift.state === "modified",
+            }],
+          };
+        } else if (action.action === "apply_materialization" || action.action === "apply_resync") {
+          const outcomeAction = fixturePlanAction(managed, drift);
+          const ownershipRecorded = action.action === "apply_resync" || outcomeAction !== "no_op" || managed;
+          if (ownershipRecorded) setAgent(version.managedAgents, key.agent, true);
+          libraryDrift.set(driftKey(key), { state: "clean" });
+          data = {
+            schemaVersion: 1,
+            action: action.action,
+            outcomes: [{
+              key,
+              action: outcomeAction,
+              backup: outcomeAction === "replace"
+                ? { byteLen: 1_024, digest: "sha256:6666666666666666666666666666666666666666666666666666666666666666" }
+                : null,
+              ownershipRecorded,
+            }],
+          };
+        } else {
+          data = {
+            schemaVersion: 1,
+            action: "inspect_drift",
+            inspection: {
+              key,
+              expectedDigest: key.version,
+              state: drift,
+            },
+          };
+        }
+      }
+      return fenceResponse(fence, data);
+    },
     async loadSkillAudit(fence) {
       if (scenario === "skill-audit-load-error") throw new Error("The latest skill audit could not be loaded.");
       if (scenario === "skill-audit-empty" || scenario === "empty") return fenceResponse(fence, null);

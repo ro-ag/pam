@@ -14,7 +14,9 @@ mod migration_test;
 mod store_test;
 
 pub use error::StoreError;
-pub use inventory::{SkillInventoryDrift, StoredAgentArtifact};
+pub use inventory::{
+    MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, SkillInventoryDrift, StoredAgentArtifact,
+};
 pub use model::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
     ApprovalDecisionOutcome, AuditEventRecord, AuditExport, AuditPruneOutcome, AuthorizationAudit,

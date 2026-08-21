@@ -43,9 +43,10 @@ use crate::{
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
     MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
     MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
-    ProjectCurrent, ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant,
-    Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError,
-    StoredAgentArtifact, StoredResult, TerminalState,
+    MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, ProjectCurrent, ProjectPolicy,
+    ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant, Replay, RequestSnapshot,
+    RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError, StoredAgentArtifact,
+    StoredResult, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -56,7 +57,7 @@ const STATUS_OPERATION_KIND: &str = "status";
 const LEGACY_STATUS_OPERATION_KIND: &str = "daemon_status";
 const FLOW_CAPABILITY_NAME: &str = "flow.run";
 const EFFECT_APPROVAL_AUDIT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 10;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 11;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
@@ -74,6 +75,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0009_flow_authorizations.sql"),
     ),
     (10, include_str!("../migrations/0010_agent_artifacts.sql")),
+    (
+        11,
+        include_str!("../migrations/0011_agent_artifact_inventory.sql"),
+    ),
 ];
 
 type Response<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -646,7 +651,14 @@ impl Store {
     /// Atomically replaces one project's active skill inventory with a complete scan.
     ///
     /// The store rejects incomplete reports before they reach the durable worker, so
-    /// partial filesystem failures can never remove previously known artifacts.
+    /// partial filesystem failures can never remove previously known artifacts. Each
+    /// complete observation, including an empty one, advances a durable project
+    /// watermark. Equal timestamps are idempotent only for an identical active
+    /// snapshot; a different same-time snapshot is rejected.
+    ///
+    /// Removed identities retain resurrection history up to
+    /// [`MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT`]. Older tombstones are pruned in
+    /// deterministic newest-removal order and return as newly seen if rediscovered.
     ///
     /// # Errors
     ///
@@ -2187,11 +2199,34 @@ fn rescan_skill_inventory(
     let observed_at = sql_integer(observed_at_ms)?;
     let current = current_skill_artifacts(artifacts)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    if let Some(stored_at_ms) = skill_inventory_observation(&transaction, project_id)? {
+        if observed_at_ms < stored_at_ms {
+            return Err(StoreError::SkillInventoryObservationRegression {
+                project_id: project_id.clone(),
+                observed_at_ms,
+                stored_at_ms,
+            });
+        }
+        if observed_at_ms == stored_at_ms {
+            if active_skill_inventory_matches(&transaction, project_id, &current)? {
+                prune_skill_inventory_tombstones(&transaction, project_id)?;
+                transaction.commit()?;
+                return Ok(SkillInventoryDrift::default());
+            }
+            return Err(StoreError::SkillInventoryObservationConflict {
+                project_id: project_id.clone(),
+                observed_at_ms,
+            });
+        }
+    }
+
     transaction.execute(
         "INSERT INTO projects(project_id) VALUES (?1)
          ON CONFLICT(project_id) DO NOTHING",
         [project_id.as_str()],
     )?;
+    prune_skill_inventory_tombstones(&transaction, project_id)?;
     let existing = all_skill_artifacts(&transaction, project_id)?;
     let mut existing = existing
         .into_iter()
@@ -2234,9 +2269,70 @@ fn rescan_skill_inventory(
             &mut drift,
         )?;
     }
+    transaction.execute(
+        "INSERT INTO agent_artifact_inventory(project_id, observed_at_ms)
+         VALUES (?1, ?2)
+         ON CONFLICT(project_id) DO UPDATE SET observed_at_ms = excluded.observed_at_ms",
+        params![project_id.as_str(), observed_at],
+    )?;
+    prune_skill_inventory_tombstones(&transaction, project_id)?;
     transaction.commit()?;
     sort_inventory_drift(&mut drift);
     Ok(drift)
+}
+
+fn skill_inventory_observation(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Option<u64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT observed_at_ms FROM agent_artifact_inventory WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(inventory_integer)
+        .transpose()
+}
+
+fn active_skill_inventory_matches(
+    connection: &Connection,
+    project_id: &ProjectId,
+    current: &BTreeMap<AgentArtifactId, AgentArtifact>,
+) -> Result<bool, StoreError> {
+    let active = list_skill_artifacts(connection, project_id)?;
+    if active.len() != current.len() {
+        return Ok(false);
+    }
+    Ok(active.iter().all(|stored| {
+        current
+            .get(&stored.id)
+            .is_some_and(|artifact| artifact == &stored.artifact)
+    }))
+}
+
+fn prune_skill_inventory_tombstones(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+) -> Result<(), StoreError> {
+    let limit = i64::try_from(MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT)
+        .expect("skill inventory tombstone limit fits SQLite INTEGER");
+    transaction.execute(
+        "DELETE FROM agent_artifacts
+         WHERE project_id = ?1
+           AND removed_at_ms IS NOT NULL
+           AND artifact_id NOT IN (
+               SELECT retained.artifact_id
+               FROM agent_artifacts AS retained
+               WHERE retained.project_id = ?1
+                 AND retained.removed_at_ms IS NOT NULL
+               ORDER BY retained.removed_at_ms DESC, retained.artifact_id
+               LIMIT ?2
+           )",
+        params![project_id.as_str(), limit],
+    )?;
+    Ok(())
 }
 
 fn current_skill_artifacts(

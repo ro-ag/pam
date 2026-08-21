@@ -117,6 +117,15 @@ pub enum StoreError {
         observed_at_ms: u64,
         stored_at_ms: u64,
     },
+    SkillInventoryObservationRegression {
+        project_id: ProjectId,
+        observed_at_ms: u64,
+        stored_at_ms: u64,
+    },
+    SkillInventoryObservationConflict {
+        project_id: ProjectId,
+        observed_at_ms: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -223,7 +232,9 @@ impl fmt::Display for StoreError {
             | Self::InvalidSkillInventory(_)
             | Self::CorruptSkillArtifact
             | Self::SkillArtifactNotFound { .. }
-            | Self::SkillInventoryTimestampRegression { .. } => {
+            | Self::SkillInventoryTimestampRegression { .. }
+            | Self::SkillInventoryObservationRegression { .. }
+            | Self::SkillInventoryObservationConflict { .. } => {
                 format_skill_inventory_error(self, formatter)
             }
         }
@@ -272,6 +283,21 @@ fn format_skill_inventory_error(
         } => write!(
             formatter,
             "skill artifact {artifact_id} was observed at {observed_at_ms}, before stored timestamp {stored_at_ms}"
+        ),
+        StoreError::SkillInventoryObservationRegression {
+            project_id,
+            observed_at_ms,
+            stored_at_ms,
+        } => write!(
+            formatter,
+            "skill inventory for project {project_id} was observed at {observed_at_ms}, before project watermark {stored_at_ms}"
+        ),
+        StoreError::SkillInventoryObservationConflict {
+            project_id,
+            observed_at_ms,
+        } => write!(
+            formatter,
+            "skill inventory for project {project_id} conflicts with a different snapshot already observed at {observed_at_ms}"
         ),
         _ => unreachable!("format_skill_inventory_error requires an inventory error"),
     }
@@ -474,7 +500,9 @@ impl Error for StoreError {
             | Self::InvalidSkillInventory(_)
             | Self::CorruptSkillArtifact
             | Self::SkillArtifactNotFound { .. }
-            | Self::SkillInventoryTimestampRegression { .. } => None,
+            | Self::SkillInventoryTimestampRegression { .. }
+            | Self::SkillInventoryObservationRegression { .. }
+            | Self::SkillInventoryObservationConflict { .. } => None,
         }
     }
 }

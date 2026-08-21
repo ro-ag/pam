@@ -1,5 +1,13 @@
 use pam_skills::{AgentArtifact, AgentArtifactId};
 
+/// Maximum removed artifact identities retained for one project.
+///
+/// Active artifacts do not count toward this limit. Tombstones are retained newest
+/// removal first, with artifact identity as the deterministic tie-break. A retained
+/// tombstone preserves first-seen history if that identity is resurrected; identities
+/// older than the cap are treated as new if they return.
+pub const MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT: usize = 4_096;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredAgentArtifact {
     pub id: AgentArtifactId,

@@ -745,6 +745,79 @@ fn agent_artifact_migration_upgrades_v9_without_replacing_existing_state() {
 }
 
 #[test]
+fn inventory_observation_migration_upgrades_v10_and_seeds_the_watermark() {
+    let (directory, path) = database_path("migration-v10-inventory-observation");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+        include_str!("../migrations/0007_models.sql"),
+        include_str!("../migrations/0008_flows.sql"),
+        include_str!("../migrations/0009_flow_authorizations.sql"),
+        include_str!("../migrations/0010_agent_artifacts.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 10).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('preserved')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_artifacts(
+                 project_id, artifact_id, name, logical_path, kind, scope, origin,
+                 load_semantics, content_hash, first_seen_at_ms, last_changed_at_ms,
+                 removed_at_ms
+             ) VALUES (
+                 'preserved', ?1, 'SKILL.md', '.claude/skills/old/SKILL.md',
+                 'skill', 'project', 'claude_code', 'model_selected', ?2, 10, 12, 15
+             )",
+            [
+                format!("artifact:sha256:{}", "1".repeat(64)),
+                format!("sha256:{}", "2".repeat(64)),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let observed_at_ms: i64 = connection
+        .query_row(
+            "SELECT observed_at_ms FROM agent_artifact_inventory
+             WHERE project_id = 'preserved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preserved_artifacts: u32 = connection
+        .query_row("SELECT COUNT(*) FROM agent_artifacts", [], |row| row.get(0))
+        .unwrap();
+    let removed_index: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name = 'agent_artifacts_removed_order'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(observed_at_ms, 15);
+    assert_eq!(preserved_artifacts, 1);
+    assert_eq!(removed_index, 1);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

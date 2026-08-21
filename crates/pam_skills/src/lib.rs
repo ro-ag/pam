@@ -14,6 +14,8 @@ mod codex_test;
 #[cfg(test)]
 mod cursor_test;
 #[cfg(test)]
+mod fixture_test;
+#[cfg(test)]
 mod local_test;
 #[cfg(test)]
 mod model_test;

@@ -1,0 +1,5 @@
+---
+paths:
+  - "**/*.rs"
+---
+Native fixture.

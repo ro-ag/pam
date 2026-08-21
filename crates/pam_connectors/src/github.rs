@@ -33,6 +33,7 @@ const MAX_REMOTE_TEXT_BYTES: usize = 2048;
 const MAX_TOKEN_BYTES: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SECONDARY_RATE_LIMIT_BACKOFF: Duration = Duration::from_mins(1);
 
 /// A validated GitHub repository coordinate.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -734,11 +735,7 @@ impl<T: GitHubTransport> Connector<CollectRunLogs> for GitHubActions<T> {
             let mut logs = Vec::new();
             let mut artifacts = Vec::new();
             for job in envelope.jobs.iter().filter(|job| job.failed()) {
-                if context.cancellation().is_cancelled() || context.remaining().is_none() {
-                    return context.preflight(OperationEffect::ReadOnly).and_then(|()| {
-                        Err(remote_failure("GitHub log collection stopped unexpectedly"))
-                    });
-                }
+                context.preflight(OperationEffect::ReadOnly)?;
                 let remaining = request.max_total_log_bytes.saturating_sub(total_log_bytes);
                 if remaining == 0 {
                     partial_reasons.push("aggregate log byte limit was reached".to_owned());
@@ -760,11 +757,17 @@ impl<T: GitHubTransport> Connector<CollectRunLogs> for GitHubActions<T> {
                         });
                         artifacts.push(artifact);
                     }
-                    Err(failure) => partial_reasons.push(format!(
-                        "job {} log unavailable ({:?})",
-                        job.id,
-                        failure.kind()
-                    )),
+                    Err(failure) => {
+                        if failure.kind() == FailureKind::Cancelled {
+                            return Err(failure);
+                        }
+                        context.preflight(OperationEffect::ReadOnly)?;
+                        partial_reasons.push(format!(
+                            "job {} log unavailable ({:?})",
+                            job.id,
+                            failure.kind()
+                        ));
+                    }
                 }
             }
 
@@ -829,7 +832,9 @@ impl<T: GitHubTransport> Connector<RerunFailedJobs> for GitHubActions<T> {
                 ));
             }
 
-            let approval_id = context.authorize_effect::<RerunFailedJobs>(&request)?;
+            let approval_id = context
+                .authorize_effect::<RerunFailedJobs>(&request)
+                .await?;
             let root = request.repository.api_path();
             let path = format!("{root}/runs/{}/rerun-failed-jobs", request.run_id.get());
             let response = self
@@ -891,7 +896,7 @@ impl<T: GitHubTransport> GitHubActions<T> {
     ) -> Result<Vec<u8>, ConnectorFailure> {
         let response = self
             .transport
-            .get(self.api_request(api_path, 0)?, context)
+            .get(self.api_request(api_path, response_limit)?, context)
             .await?;
         if !is_redirect(response.status) {
             require_status(&response, StatusCode::OK)?;
@@ -1232,9 +1237,13 @@ fn require_status(
     match response.status {
         401 => Err(ConnectorFailure::authentication(message)),
         403 if response.header("x-ratelimit-remaining") == Some("0")
-            || response.header("retry-after").is_some() =>
+            || response.header("retry-after").is_some()
+            || is_secondary_rate_limit(response) =>
         {
-            Err(ConnectorFailure::rate_limit(message, retry_delay(response)))
+            let delay = retry_delay(response).or_else(|| {
+                is_secondary_rate_limit(response).then_some(SECONDARY_RATE_LIMIT_BACKOFF)
+            });
+            Err(ConnectorFailure::rate_limit(message, delay))
         }
         403 => Err(ConnectorFailure::forbidden(message)),
         404 => Err(ConnectorFailure::not_found(message)),
@@ -1246,6 +1255,20 @@ fn require_status(
 
 fn retry_delay(response: &TransportResponse) -> Option<Duration> {
     rate_limit_delay_at(response, unix_time_seconds())
+}
+
+fn is_secondary_rate_limit(response: &TransportResponse) -> bool {
+    [
+        b"secondary rate limit".as_slice(),
+        b"abuse detection mechanism".as_slice(),
+    ]
+    .iter()
+    .any(|pattern| {
+        response
+            .body
+            .windows(pattern.len())
+            .any(|window| window.eq_ignore_ascii_case(pattern))
+    })
 }
 
 pub(crate) fn rate_limit_delay_at(

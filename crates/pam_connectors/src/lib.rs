@@ -7,15 +7,14 @@ use std::{
     num::NonZeroU32,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-pub use pam_core::{ApprovalId, EvidenceHandle, IdempotencyKey};
-use pam_policy::{Approval, ApprovalTransitionError, EffectFingerprint};
-pub use pam_policy::{ApprovalState, CapabilityName, ResourceName};
+pub use pam_core::{ApprovalId, CallerId, EvidenceHandle, IdempotencyKey, ProjectId};
+pub use pam_policy::{CapabilityName, ResourceName};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(test)]
@@ -200,6 +199,7 @@ pub struct InvocationContext {
     cancellation: CancellationToken,
     attempt: NonZeroU32,
     idempotency_key: Option<IdempotencyKey>,
+    identity: Option<InvocationIdentity>,
     effect_approval: Option<EffectApproval>,
 }
 
@@ -226,8 +226,16 @@ impl InvocationContext {
             cancellation,
             attempt,
             idempotency_key,
+            identity: None,
             effect_approval: None,
         })
+    }
+
+    /// Binds the authenticated caller and project selected by the trusted runtime.
+    #[must_use]
+    pub fn with_identity(mut self, caller: CallerId, project: ProjectId) -> Self {
+        self.identity = Some(InvocationIdentity { caller, project });
+        self
     }
 
     /// Attaches one policy approval for exact, one-time consumption at a stateful effect boundary.
@@ -260,6 +268,11 @@ impl InvocationContext {
     #[must_use]
     pub fn effect_approval(&self) -> Option<&EffectApproval> {
         self.effect_approval.as_ref()
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> Option<&InvocationIdentity> {
+        self.identity.as_ref()
     }
 
     #[must_use]
@@ -296,7 +309,7 @@ impl InvocationContext {
     ///
     /// Returns a sanitized forbidden failure unless an unexpired approved receipt matches the
     /// operation's exact capability and resource and has not previously been consumed.
-    pub fn authorize_effect<O: Operation>(
+    pub async fn authorize_effect<O: Operation>(
         &self,
         request: &O::Request,
     ) -> Result<ApprovalId, ConnectorFailure> {
@@ -311,7 +324,21 @@ impl InvocationContext {
                 "stateful operation requires an exact approval",
             ))
         })?;
-        approval.consume(&O::coordinates(request))
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            ConnectorFailure::forbidden(FailureMessage::trusted(
+                "stateful operation requires an authenticated invocation identity",
+            ))
+        })?;
+        approval
+            .authority
+            .consume(
+                &approval.approval_id,
+                &identity.caller,
+                &identity.project,
+                &O::coordinates(request),
+            )
+            .await?;
+        Ok(approval.approval_id.clone())
     }
 }
 
@@ -323,74 +350,66 @@ impl fmt::Debug for InvocationContext {
             .field("cancellation", &self.cancellation)
             .field("attempt", &self.attempt)
             .field("has_idempotency_key", &self.idempotency_key.is_some())
+            .field("has_identity", &self.identity.is_some())
             .field("has_effect_approval", &self.effect_approval.is_some())
             .finish()
     }
 }
 
-/// A shareable handle to one policy approval consumed at an exact connector effect boundary.
+/// Authenticated caller and project identity supplied by PAM's trusted runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationIdentity {
+    caller: CallerId,
+    project: ProjectId,
+}
+
+impl InvocationIdentity {
+    #[must_use]
+    pub const fn caller(&self) -> &CallerId {
+        &self.caller
+    }
+
+    #[must_use]
+    pub const fn project(&self) -> &ProjectId {
+        &self.project
+    }
+}
+
+/// Durable authority that atomically validates and consumes one exact approval receipt.
+pub trait EffectApprovalAuthority: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns a sanitized failure unless the approval is approved, unexpired, unused, and bound
+    /// to the authenticated caller, project, capability, and resource.
+    fn consume<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        caller: &'a CallerId,
+        project: &'a ProjectId,
+        coordinates: &'a OperationCoordinates,
+    ) -> ConnectorFuture<'a, Result<(), ConnectorFailure>>;
+}
+
+/// Opaque handle to a durable approval receipt consumed at an exact connector effect boundary.
 #[derive(Clone)]
 pub struct EffectApproval {
-    approval: Arc<Mutex<Approval>>,
+    approval_id: ApprovalId,
+    authority: Arc<dyn EffectApprovalAuthority>,
 }
 
 impl EffectApproval {
     #[must_use]
-    pub fn new(approval: Approval) -> Self {
+    pub fn new(approval_id: ApprovalId, authority: Arc<dyn EffectApprovalAuthority>) -> Self {
         Self {
-            approval: Arc::new(Mutex::new(approval)),
+            approval_id,
+            authority,
         }
     }
 
     #[must_use]
     pub fn id(&self) -> ApprovalId {
-        self.with_approval(|approval| approval.id().clone())
+        self.approval_id.clone()
     }
-
-    #[must_use]
-    pub fn state(&self) -> ApprovalState {
-        self.with_approval(|approval| approval.state())
-    }
-
-    fn consume(&self, coordinates: &OperationCoordinates) -> Result<ApprovalId, ConnectorFailure> {
-        self.with_approval(|approval| {
-            let fingerprint = EffectFingerprint::compute(
-                approval.caller(),
-                approval.project(),
-                coordinates.capability(),
-                coordinates.resource(),
-            );
-            match approval.consume(&fingerprint, unix_time_ms()) {
-                Ok(ApprovalState::Consumed) => Ok(approval.id().clone()),
-                Ok(_) | Err(ApprovalTransitionError::InvalidTransition) => {
-                    Err(ConnectorFailure::forbidden(FailureMessage::trusted(
-                        "effect approval is not approved and unexpired",
-                    )))
-                }
-                Err(ApprovalTransitionError::FingerprintMismatch) => {
-                    Err(ConnectorFailure::forbidden(FailureMessage::trusted(
-                        "effect approval does not match the exact operation",
-                    )))
-                }
-            }
-        })
-    }
-
-    fn with_approval<T>(&self, operation: impl FnOnce(&mut Approval) -> T) -> T {
-        let mut approval = self
-            .approval
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        operation(&mut approval)
-    }
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 impl fmt::Debug for EffectApproval {
@@ -398,7 +417,6 @@ impl fmt::Debug for EffectApproval {
         formatter
             .debug_struct("EffectApproval")
             .field("id", &self.id())
-            .field("state", &self.state())
             .finish_non_exhaustive()
     }
 }

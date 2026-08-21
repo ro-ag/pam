@@ -10,7 +10,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    BoundedSummary, ExactArtifact,
+    BoundedSummary, ConnectorOutput, ExactArtifact,
     github::{
         CollectRunLogsResponse, MAX_COLLECTED_JOBS, MAX_LOG_BYTES_PER_JOB, MAX_TOTAL_LOG_BYTES,
     },
@@ -252,19 +252,17 @@ impl RunDiagnosis {
 
 /// Validates, compacts, and lexically classifies exact collected logs without model calls.
 ///
-/// `input_complete` is authoritative only in the restrictive direction: `false` always produces
-/// [`DiagnosisStatus::Partial`], even when a lexical failure signature is present.
-///
 /// # Errors
 ///
 /// Returns an error for inconsistent jobs/artifacts/evidence, exceeded bounds, digest mismatch,
 /// compaction failure, or a manifest that cannot fit its fixed byte budget.
 pub fn diagnose_run(
-    response: &CollectRunLogsResponse,
-    input_complete: bool,
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
     exact_logs: Vec<ExactJobLog>,
 ) -> Result<RunDiagnosis, DiagnosisError> {
-    validate_response_bounds(response, input_complete, &exact_logs)?;
+    let response = collection.value();
+    let input_complete = collection.truth().is_complete();
+    validate_response_bounds(collection, &exact_logs)?;
 
     let mut exact_logs = exact_logs;
     exact_logs.sort_by_key(ExactJobLog::job_id);
@@ -336,10 +334,11 @@ pub fn diagnose_run(
 }
 
 fn validate_response_bounds(
-    response: &CollectRunLogsResponse,
-    input_complete: bool,
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
     exact_logs: &[ExactJobLog],
 ) -> Result<(), DiagnosisError> {
+    let response = collection.value();
+    let input_complete = collection.truth().is_complete();
     if response.jobs().len() > MAX_COLLECTED_JOBS
         || response.logs().len() > MAX_DIAGNOSIS_LOGS
         || exact_logs.len() > MAX_DIAGNOSIS_LOGS
@@ -388,7 +387,54 @@ fn validate_response_bounds(
             });
         }
     }
+    if input_complete
+        && response
+            .jobs()
+            .iter()
+            .filter(|job| job.conclusion() == Some("failure"))
+            .any(|job| !collected_ids.contains(&job.id()))
+    {
+        return Err(DiagnosisError::ContradictoryCompleteness);
+    }
 
+    validate_artifact_payloads(collection, response)?;
+    validate_exact_evidence(collection, response, exact_logs, &collected_ids)
+}
+
+fn validate_artifact_payloads(
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
+    response: &CollectRunLogsResponse,
+) -> Result<(), DiagnosisError> {
+    if collection.artifacts().len() != response.logs().len() {
+        return Err(DiagnosisError::ArtifactPayloadCountMismatch);
+    }
+    let mut artifact_names = BTreeSet::new();
+    for artifact in collection.artifacts() {
+        if !artifact_names.insert(artifact.name()) {
+            return Err(DiagnosisError::DuplicateArtifactPayload);
+        }
+        let Some(log) = response
+            .logs()
+            .iter()
+            .find(|log| log.artifact_name() == artifact.name())
+        else {
+            return Err(DiagnosisError::UnexpectedArtifactPayload);
+        };
+        if log.byte_len() != artifact.bytes().len() {
+            return Err(DiagnosisError::ArtifactPayloadMismatch {
+                job_id: log.job_id(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_evidence(
+    collection: &ConnectorOutput<CollectRunLogsResponse>,
+    response: &CollectRunLogsResponse,
+    exact_logs: &[ExactJobLog],
+    collected_ids: &BTreeSet<u64>,
+) -> Result<(), DiagnosisError> {
     let mut exact_ids = BTreeSet::new();
     let mut total_bytes = 0_usize;
     for exact in exact_logs {
@@ -411,11 +457,21 @@ fn validate_response_bounds(
                 job_id: exact.job_id,
             });
         }
+        let artifact = collection
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.name() == log.artifact_name())
+            .ok_or(DiagnosisError::ArtifactPayloadCountMismatch)?;
+        if artifact.bytes() != exact.bytes {
+            return Err(DiagnosisError::ArtifactPayloadMismatch {
+                job_id: exact.job_id,
+            });
+        }
         total_bytes = total_bytes
             .checked_add(exact.bytes.len())
             .ok_or(DiagnosisError::TotalLogBytesTooLarge)?;
     }
-    if exact_ids != collected_ids {
+    if &exact_ids != collected_ids {
         let missing = collected_ids
             .difference(&exact_ids)
             .next()
@@ -591,6 +647,10 @@ pub enum DiagnosisError {
     DuplicateEvidence { job_id: u64 },
     ArtifactWithoutJob { job_id: u64 },
     ArtifactNameMismatch { job_id: u64 },
+    ArtifactPayloadCountMismatch,
+    DuplicateArtifactPayload,
+    UnexpectedArtifactPayload,
+    ArtifactPayloadMismatch { job_id: u64 },
     EvidenceWithoutArtifact { job_id: u64 },
     MissingEvidence { job_id: u64 },
     ByteLengthMismatch { job_id: u64 },
@@ -627,6 +687,21 @@ impl fmt::Display for DiagnosisError {
             }
             Self::ArtifactNameMismatch { job_id } => {
                 write!(formatter, "job {job_id} artifact name is not canonical")
+            }
+            Self::ArtifactPayloadCountMismatch => {
+                formatter.write_str("collected log metadata and artifact payload counts differ")
+            }
+            Self::DuplicateArtifactPayload => {
+                formatter.write_str("collected artifact payload name is duplicated")
+            }
+            Self::UnexpectedArtifactPayload => {
+                formatter.write_str("collected artifact payload has no log metadata")
+            }
+            Self::ArtifactPayloadMismatch { job_id } => {
+                write!(
+                    formatter,
+                    "job {job_id} exact evidence differs from its collected artifact payload"
+                )
             }
             Self::EvidenceWithoutArtifact { job_id } => {
                 write!(formatter, "job {job_id} evidence has no collected artifact")

@@ -17,7 +17,10 @@ use super::github_diagnosis::{
     DiagnosisError, DiagnosisStatus, ExactJobLog, FindingCategory, MAX_DIAGNOSIS_FINDINGS,
     MAX_DIAGNOSIS_LOGS, diagnose_run,
 };
-use super::{CancellationToken, Connector, InvocationContext};
+use super::{
+    BoundedSummary, CancellationToken, Connector, ConnectorOutput, ExactArtifact,
+    InvocationContext, Truth,
+};
 
 const RUN_ID: u64 = 42;
 
@@ -81,11 +84,43 @@ fn response(entries: &[(u64, usize)], total_jobs: u64) -> CollectRunLogsResponse
     .unwrap()
 }
 
+fn collection(
+    response: CollectRunLogsResponse,
+    complete: bool,
+    payloads: Vec<(u64, Vec<u8>)>,
+) -> ConnectorOutput<CollectRunLogsResponse> {
+    let artifacts = payloads
+        .into_iter()
+        .map(|(job_id, bytes)| {
+            ExactArtifact::new(format!("github-run-{RUN_ID}-job-{job_id}.log"), bytes).unwrap()
+        })
+        .collect();
+    let truth = if complete {
+        Truth::Complete
+    } else {
+        Truth::Partial {
+            reason: BoundedSummary::new("one or more failed job logs were unavailable").unwrap(),
+        }
+    };
+    ConnectorOutput::new(
+        response,
+        BoundedSummary::new("collected test logs").unwrap(),
+        truth,
+        Vec::new(),
+        artifacts,
+    )
+    .unwrap()
+}
+
 #[test]
 fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
     let bytes = b"setup ok\nerror[E0308]: mismatched types\ntest result: FAILED. 1 failed\ncodesign validation failed\ndeadline exceeded\npermission denied\nerror: upstream response\n";
-    let response = response(&[(7, bytes.len())], 1);
-    let diagnosis = diagnose_run(&response, true, vec![exact_log(7, bytes)]).unwrap();
+    let collection = collection(
+        response(&[(7, bytes.len())], 1),
+        true,
+        vec![(7, bytes.to_vec())],
+    );
+    let diagnosis = diagnose_run(&collection, vec![exact_log(7, bytes)]).unwrap();
 
     assert_eq!(diagnosis.status(), DiagnosisStatus::Diagnosed);
     assert_eq!(diagnosis.logs().len(), 1);
@@ -135,9 +170,13 @@ fn findings_are_lexical_inferences_with_exact_hash_and_span_provenance() {
 #[test]
 fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
     let bytes = b"compile\nerror[E0425]: missing value\n";
-    let response = response(&[(9, bytes.len())], 1);
-    let first = diagnose_run(&response, true, vec![exact_log(9, bytes)]).unwrap();
-    let second = diagnose_run(&response, true, vec![exact_log(9, bytes)]).unwrap();
+    let collection = collection(
+        response(&[(9, bytes.len())], 1),
+        true,
+        vec![(9, bytes.to_vec())],
+    );
+    let first = diagnose_run(&collection, vec![exact_log(9, bytes)]).unwrap();
+    let second = diagnose_run(&collection, vec![exact_log(9, bytes)]).unwrap();
     assert_eq!(first.manifest().bytes(), second.manifest().bytes());
     assert_eq!(first.manifest().name(), "github-run-42-diagnosis.json");
 
@@ -161,15 +200,23 @@ fn canonical_manifest_is_byte_stable_and_contains_exact_provenance() {
 #[test]
 fn partial_input_never_becomes_diagnosed_and_benign_complete_input_is_unresolved() {
     let failing = b"error[E0308]: mismatch\n";
-    let partial_response = response(&[(1, failing.len())], 3);
-    let partial = diagnose_run(&partial_response, false, vec![exact_log(1, failing)]).unwrap();
+    let partial_collection = collection(
+        response(&[(1, failing.len())], 1),
+        false,
+        vec![(1, failing.to_vec())],
+    );
+    let partial = diagnose_run(&partial_collection, vec![exact_log(1, failing)]).unwrap();
     assert_eq!(partial.status(), DiagnosisStatus::Partial);
     assert_eq!(partial.findings().len(), 1);
     assert!(partial.summary().as_str().starts_with("partial"));
 
     let benign = b"checkout complete\nbuild cache restored\nall steps completed\n";
-    let complete_response = response(&[(2, benign.len())], 1);
-    let unresolved = diagnose_run(&complete_response, true, vec![exact_log(2, benign)]).unwrap();
+    let complete_collection = collection(
+        response(&[(2, benign.len())], 1),
+        true,
+        vec![(2, benign.to_vec())],
+    );
+    let unresolved = diagnose_run(&complete_collection, vec![exact_log(2, benign)]).unwrap();
     assert_eq!(unresolved.status(), DiagnosisStatus::Unresolved);
     assert!(unresolved.findings().is_empty());
 }
@@ -183,7 +230,12 @@ fn findings_are_deduplicated_and_truncated_to_the_global_bound() {
     let logs = (1..=MAX_DIAGNOSIS_LOGS as u64)
         .map(|job_id| exact_log(job_id, bytes))
         .collect();
-    let diagnosis = diagnose_run(&response(&entries, entries.len() as u64), true, logs).unwrap();
+    let payloads = entries
+        .iter()
+        .map(|(job_id, _)| (*job_id, bytes.to_vec()))
+        .collect();
+    let collection = collection(response(&entries, entries.len() as u64), true, payloads);
+    let diagnosis = diagnose_run(&collection, logs).unwrap();
 
     assert_eq!(diagnosis.findings().len(), MAX_DIAGNOSIS_FINDINGS);
     assert_eq!(diagnosis.status(), DiagnosisStatus::Partial);
@@ -214,23 +266,51 @@ fn malformed_digest_and_artifact_correspondence_are_rejected() {
         bytes.to_vec(),
     )
     .unwrap();
+    let collected = collection(collected_response.clone(), true, vec![(4, bytes.to_vec())]);
     assert!(matches!(
-        diagnose_run(&collected_response, true, vec![bad_digest]),
+        diagnose_run(&collected, vec![bad_digest]),
         Err(DiagnosisError::DigestMismatch { job_id: 4 })
     ));
 
     let wrong_length = response(&[(4, bytes.len() + 1)], 1);
+    let mut longer_artifact = bytes.to_vec();
+    longer_artifact.push(b'x');
+    let wrong_length = collection(wrong_length, true, vec![(4, longer_artifact)]);
     assert!(matches!(
-        diagnose_run(&wrong_length, true, vec![exact_log(4, bytes)]),
+        diagnose_run(&wrong_length, vec![exact_log(4, bytes)]),
         Err(DiagnosisError::ByteLengthMismatch { job_id: 4 })
     ));
 
     let mut value = serde_json::to_value(collected_response).unwrap();
     value["logs"][0]["artifact_name"] = json!("not-canonical.log");
     let wrong_name: CollectRunLogsResponse = serde_json::from_value(value).unwrap();
+    let wrong_name = collection(wrong_name, true, vec![(4, bytes.to_vec())]);
     assert!(matches!(
-        diagnose_run(&wrong_name, true, vec![exact_log(4, bytes)]),
+        diagnose_run(&wrong_name, vec![exact_log(4, bytes)]),
         Err(DiagnosisError::ArtifactNameMismatch { job_id: 4 })
+    ));
+
+    let replacement = b"fatal: altered dat\n";
+    assert_eq!(replacement.len(), bytes.len());
+    assert!(matches!(
+        diagnose_run(&collected, vec![exact_log(4, replacement)]),
+        Err(DiagnosisError::ArtifactPayloadMismatch { job_id: 4 })
+    ));
+}
+
+#[test]
+fn complete_truth_requires_artifact_and_evidence_for_every_failed_job() {
+    let first = b"error: first\n";
+    let second = b"error: other\n";
+    let complete_response = response(&[(1, first.len()), (2, second.len())], 2);
+    let mut value = serde_json::to_value(complete_response).unwrap();
+    value["logs"].as_array_mut().unwrap().pop();
+    let missing_log: CollectRunLogsResponse = serde_json::from_value(value).unwrap();
+    let collection = collection(missing_log, true, vec![(1, first.to_vec())]);
+
+    assert!(matches!(
+        diagnose_run(&collection, vec![exact_log(1, first)]),
+        Err(DiagnosisError::ContradictoryCompleteness)
     ));
 }
 
@@ -240,8 +320,9 @@ fn log_count_and_payload_bounds_reject_overflow() {
     let entries = (1..=(MAX_DIAGNOSIS_LOGS + 1) as u64)
         .map(|job_id| (job_id, bytes.len()))
         .collect::<Vec<_>>();
+    let collection = collection(response(&entries, entries.len() as u64), true, Vec::new());
     assert!(matches!(
-        diagnose_run(&response(&entries, entries.len() as u64), true, Vec::new()),
+        diagnose_run(&collection, Vec::new()),
         Err(DiagnosisError::TooManyLogs)
     ));
 
@@ -326,12 +407,7 @@ async fn live_failed_run_is_diagnosed_with_compact_exact_evidence() {
             .unwrap()
         })
         .collect();
-    let diagnosis = diagnose_run(
-        collection.value(),
-        collection.truth().is_complete(),
-        exact_logs,
-    )
-    .unwrap();
+    let diagnosis = diagnose_run(&collection, exact_logs).unwrap();
     assert_eq!(diagnosis.status(), DiagnosisStatus::Diagnosed);
     assert!(diagnosis.findings().iter().any(|finding| {
         finding.category() == FindingCategory::SigningOrPackaging

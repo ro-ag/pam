@@ -18,11 +18,14 @@ pub use pam_policy::{CapabilityName, ResourceName};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(test)]
+mod github_diagnosis_test;
+#[cfg(test)]
 mod github_test;
 #[cfg(test)]
 mod lib_test;
 
 pub mod github;
+pub mod github_diagnosis;
 
 pub const MAX_CONNECTOR_NAME_BYTES: usize = 128;
 pub const MAX_CONNECTOR_VERSION_BYTES: usize = 64;

@@ -3171,6 +3171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_skills"
+version = "0.1.0"
+dependencies = [
+ "pam_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pam_store"
 version = "0.1.0"
 dependencies = [

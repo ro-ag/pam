@@ -10,6 +10,7 @@ members = [
     "crates/pam_store",
     "crates/pam_compact",
     "crates/pam_connectors",
+    "crates/pam_skills",
     "crates/pam_model",
     "crates/pam_flow",
     "src-tauri",
@@ -56,6 +57,7 @@ pam_gui = { path = "crates/pam_gui" }
 pam_store = { path = "crates/pam_store" }
 pam_compact = { path = "crates/pam_compact" }
 pam_connectors = { path = "crates/pam_connectors" }
+pam_skills = { path = "crates/pam_skills" }
 pam_model = { path = "crates/pam_model" }
 pam_flow = { path = "crates/pam_flow" }
 

@@ -1,0 +1,14 @@
+[package]
+name = "pam_connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pam_core.workspace = true
+pam_policy.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

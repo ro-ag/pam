@@ -3038,6 +3038,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_connectors"
+version = "0.1.0"
+dependencies = [
+ "pam_core",
+ "pam_policy",
+ "serde",
+]
+
+[[package]]
 name = "pam_core"
 version = "0.1.0"
 dependencies = [

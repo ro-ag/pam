@@ -86,6 +86,7 @@ async fn main() {
         } => app::evidence_show(handle, raw, output.as_deref()).await,
         Mode::SkillsList { json } => skills::list(json).await,
         Mode::SkillsShow { artifact_id, json } => skills::show(artifact_id, json).await,
+        Mode::SkillsAudit { json } => skills::audit(json).await,
         Mode::CallerRegister { kind } => app::caller_register(kind).await,
         Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
         Mode::ModelImport {

@@ -23,7 +23,7 @@ use pam_policy::{
 };
 use pam_skills::{
     AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent,
-    ScanReport,
+    SKILLS_AUDIT_REPORT_SCHEMA_VERSION, ScanReport,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -43,10 +43,10 @@ use crate::{
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_DETAIL_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
     MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
     MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
-    MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, ProjectCurrent, ProjectPolicy,
-    ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant, Replay, RequestSnapshot,
-    RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError, StoredAgentArtifact,
-    StoredResult, TerminalState,
+    MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, MAX_SKILLS_AUDIT_REPORT_BYTES, ProjectCurrent,
+    ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant, Replay,
+    RequestSnapshot, RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError,
+    StoredAgentArtifact, StoredResult, StoredSkillsAuditReport, TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -57,7 +57,7 @@ const STATUS_OPERATION_KIND: &str = "status";
 const LEGACY_STATUS_OPERATION_KIND: &str = "daemon_status";
 const FLOW_CAPABILITY_NAME: &str = "flow.run";
 const EFFECT_APPROVAL_AUDIT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-pub(super) const LATEST_SCHEMA_VERSION: u32 = 11;
+pub(super) const LATEST_SCHEMA_VERSION: u32 = 12;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_evidence.sql")),
@@ -78,6 +78,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         11,
         include_str!("../migrations/0011_agent_artifact_inventory.sql"),
+    ),
+    (
+        12,
+        include_str!("../migrations/0012_skills_audit_reports.sql"),
     ),
 ];
 
@@ -719,6 +723,94 @@ impl Store {
         self.send(Command::Inventory(InventoryCommand::Get {
             project_id,
             artifact_id,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Stores the latest bounded serialized skills audit report for one project.
+    ///
+    /// A newer observation replaces the prior report. Repeating the exact report at
+    /// the same timestamp is idempotent; older observations and different reports at
+    /// the same timestamp are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid report, unsupported schema, oversized report,
+    /// timestamp regression or conflict, corrupt prior state, or unavailable storage.
+    pub async fn put_skills_audit_report(
+        &self,
+        project_id: ProjectId,
+        observed_at_ms: u64,
+        schema_version: u32,
+        report_json: String,
+    ) -> Result<StoredSkillsAuditReport, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::SkillsAuditReport(SkillsAuditReportCommand::Put {
+            project_id,
+            observed_at_ms,
+            schema_version,
+            report_json,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Atomically stores one complete skill inventory snapshot and its audit report.
+    ///
+    /// Both records use the same observation timestamp and commit in one immediate
+    /// transaction. If either side is stale, conflicting, invalid, or corrupt, neither
+    /// side is changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns any inventory or report validation, ordering, corruption, or storage
+    /// error that would be returned by the corresponding standalone operation.
+    pub async fn put_skills_audit_snapshot(
+        &self,
+        project_id: ProjectId,
+        inventory: ScanReport,
+        observed_at_ms: u64,
+        schema_version: u32,
+        report_json: String,
+    ) -> Result<StoredSkillsAuditReport, StoreError> {
+        if !inventory.complete() {
+            return Err(StoreError::IncompleteSkillInventory(
+                inventory.diagnostics().to_vec(),
+            ));
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::SkillsAuditReport(
+            SkillsAuditReportCommand::PutSnapshot {
+                project_id,
+                artifacts: inventory.into_artifacts(),
+                observed_at_ms,
+                schema_version,
+                report_json,
+                response: response_tx,
+            },
+        ))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Returns the latest serialized skills audit report for one project, if present.
+    ///
+    /// The stored schema, UTF-8 JSON shape, size, and SHA-256 digest are revalidated
+    /// before report contents are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt or unavailable durable state.
+    pub async fn skills_audit_report(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<StoredSkillsAuditReport>, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::SkillsAuditReport(SkillsAuditReportCommand::Get {
+            project_id,
             response: response_tx,
         }))
         .await?;
@@ -1383,6 +1475,7 @@ enum Command {
     Audit(AuditCommand),
     Model(ModelCommand),
     Inventory(InventoryCommand),
+    SkillsAuditReport(SkillsAuditReportCommand),
     Accept {
         request: AcceptRequest,
         now_ms: u64,
@@ -1506,6 +1599,28 @@ enum InventoryCommand {
         project_id: ProjectId,
         artifact_id: AgentArtifactId,
         response: Response<StoredAgentArtifact>,
+    },
+}
+
+enum SkillsAuditReportCommand {
+    Put {
+        project_id: ProjectId,
+        observed_at_ms: u64,
+        schema_version: u32,
+        report_json: String,
+        response: Response<StoredSkillsAuditReport>,
+    },
+    PutSnapshot {
+        project_id: ProjectId,
+        artifacts: Vec<AgentArtifact>,
+        observed_at_ms: u64,
+        schema_version: u32,
+        report_json: String,
+        response: Response<StoredSkillsAuditReport>,
+    },
+    Get {
+        project_id: ProjectId,
+        response: Response<Option<StoredSkillsAuditReport>>,
     },
 }
 
@@ -1646,6 +1761,9 @@ fn run_worker(mut connection: Connection, mut commands: tokio_mpsc::Receiver<Com
             Command::Audit(command) => run_audit_command(&mut connection, command),
             Command::Model(command) => run_model_command(&mut connection, command),
             Command::Inventory(command) => run_inventory_command(&mut connection, command),
+            Command::SkillsAuditReport(command) => {
+                run_skills_audit_report_command(&mut connection, command);
+            }
             Command::Accept {
                 request,
                 now_ms,
@@ -2190,6 +2308,319 @@ fn run_inventory_command(connection: &mut Connection, command: InventoryCommand)
     }
 }
 
+fn run_skills_audit_report_command(connection: &mut Connection, command: SkillsAuditReportCommand) {
+    match command {
+        SkillsAuditReportCommand::Put {
+            project_id,
+            observed_at_ms,
+            schema_version,
+            report_json,
+            response,
+        } => respond(
+            response,
+            put_skills_audit_report(
+                connection,
+                &project_id,
+                observed_at_ms,
+                schema_version,
+                report_json,
+            ),
+        ),
+        SkillsAuditReportCommand::PutSnapshot {
+            project_id,
+            artifacts,
+            observed_at_ms,
+            schema_version,
+            report_json,
+            response,
+        } => respond(
+            response,
+            put_skills_audit_snapshot(
+                connection,
+                &project_id,
+                artifacts,
+                observed_at_ms,
+                schema_version,
+                report_json,
+            ),
+        ),
+        SkillsAuditReportCommand::Get {
+            project_id,
+            response,
+        } => respond(response, skills_audit_report(connection, &project_id)),
+    }
+}
+
+fn put_skills_audit_report(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+    observed_at_ms: u64,
+    schema_version: u32,
+    report_json: String,
+) -> Result<StoredSkillsAuditReport, StoreError> {
+    let candidate = prepare_skills_audit_report(
+        connection,
+        project_id,
+        observed_at_ms,
+        schema_version,
+        report_json,
+    )?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored = put_skills_audit_report_in_transaction(&transaction, &candidate)?;
+    transaction.commit()?;
+    Ok(stored)
+}
+
+fn put_skills_audit_snapshot(
+    connection: &mut Connection,
+    project_id: &ProjectId,
+    artifacts: Vec<AgentArtifact>,
+    observed_at_ms: u64,
+    schema_version: u32,
+    report_json: String,
+) -> Result<StoredSkillsAuditReport, StoreError> {
+    let observed_at = sql_integer(observed_at_ms)?;
+    let current = current_skill_artifacts(artifacts)?;
+    let candidate = prepare_skills_audit_report(
+        connection,
+        project_id,
+        observed_at_ms,
+        schema_version,
+        report_json,
+    )?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    rescan_skill_inventory_in_transaction(
+        &transaction,
+        project_id,
+        current,
+        observed_at,
+        observed_at_ms,
+    )?;
+    let stored = put_skills_audit_report_in_transaction(&transaction, &candidate)?;
+    transaction.commit()?;
+    Ok(stored)
+}
+
+fn prepare_skills_audit_report(
+    connection: &Connection,
+    project_id: &ProjectId,
+    observed_at_ms: u64,
+    schema_version: u32,
+    report_json: String,
+) -> Result<StoredSkillsAuditReport, StoreError> {
+    validate_skills_audit_report_input(schema_version, &report_json)?;
+    if !is_valid_json_object(connection, &report_json)? {
+        return Err(StoreError::InvalidSkillsAuditReport(
+            "report must be one valid JSON object",
+        ));
+    }
+    sql_integer(observed_at_ms)?;
+    let digest = skills_audit_report_digest(&report_json);
+    let candidate = StoredSkillsAuditReport {
+        project_id: project_id.clone(),
+        observed_at_ms,
+        schema_version,
+        report_json,
+        digest,
+    };
+    Ok(candidate)
+}
+
+fn put_skills_audit_report_in_transaction(
+    transaction: &Transaction<'_>,
+    candidate: &StoredSkillsAuditReport,
+) -> Result<StoredSkillsAuditReport, StoreError> {
+    if let Some(existing) = skills_audit_report(transaction, &candidate.project_id)? {
+        if candidate.observed_at_ms < existing.observed_at_ms {
+            return Err(StoreError::SkillsAuditReportTimestampRegression {
+                project_id: candidate.project_id.clone(),
+                observed_at_ms: candidate.observed_at_ms,
+                stored_at_ms: existing.observed_at_ms,
+            });
+        }
+        if candidate.observed_at_ms == existing.observed_at_ms {
+            if &existing == candidate {
+                return Ok(existing);
+            }
+            return Err(StoreError::SkillsAuditReportConflict {
+                project_id: candidate.project_id.clone(),
+                observed_at_ms: candidate.observed_at_ms,
+            });
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO projects(project_id) VALUES (?1)
+         ON CONFLICT(project_id) DO NOTHING",
+        [candidate.project_id.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO skills_audit_reports(
+             project_id, observed_at_ms, schema_version, report_json, report_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id) DO UPDATE SET
+             observed_at_ms = excluded.observed_at_ms,
+             schema_version = excluded.schema_version,
+             report_json = excluded.report_json,
+             report_digest = excluded.report_digest",
+        params![
+            candidate.project_id.as_str(),
+            sql_integer(candidate.observed_at_ms)?,
+            candidate.schema_version,
+            candidate.report_json,
+            candidate.digest.as_str(),
+        ],
+    )?;
+    Ok(candidate.clone())
+}
+
+type StoredSkillsAuditReportRow = (
+    String,
+    Vec<u8>,
+    String,
+    Vec<u8>,
+    String,
+    Vec<u8>,
+    String,
+    Vec<u8>,
+);
+
+fn skills_audit_report(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Option<StoredSkillsAuditReport>, StoreError> {
+    let stored: Option<StoredSkillsAuditReportRow> = connection
+        .query_row(
+            "SELECT
+                 typeof(observed_at_ms), CAST(observed_at_ms AS BLOB),
+                 typeof(schema_version), CAST(schema_version AS BLOB),
+                 typeof(report_json), CAST(report_json AS BLOB),
+                 typeof(report_digest), CAST(report_digest AS BLOB)
+             FROM skills_audit_reports WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(|stored| decode_skills_audit_report(connection, project_id, stored))
+        .transpose()
+}
+
+fn decode_skills_audit_report(
+    connection: &Connection,
+    project_id: &ProjectId,
+    stored: StoredSkillsAuditReportRow,
+) -> Result<StoredSkillsAuditReport, StoreError> {
+    let corrupt = || StoreError::CorruptSkillsAuditReport(project_id.clone());
+    let (
+        observed_type,
+        observed_bytes,
+        schema_type,
+        schema_bytes,
+        report_type,
+        report_bytes,
+        digest_type,
+        digest_bytes,
+    ) = stored;
+    if observed_type != "integer"
+        || schema_type != "integer"
+        || report_type != "text"
+        || digest_type != "text"
+    {
+        return Err(corrupt());
+    }
+    let observed_at_ms = std::str::from_utf8(&observed_bytes)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(&corrupt)?;
+    let schema_version = std::str::from_utf8(&schema_bytes)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(&corrupt)?;
+    let report_json = String::from_utf8(report_bytes).map_err(|_| corrupt())?;
+    let digest_text = String::from_utf8(digest_bytes).map_err(|_| corrupt())?;
+    if schema_version != SKILLS_AUDIT_REPORT_SCHEMA_VERSION
+        || report_json.len() > MAX_SKILLS_AUDIT_REPORT_BYTES
+        || !skills_audit_report_has_text_shape(&report_json)
+        || !is_valid_json_object(connection, &report_json)?
+    {
+        return Err(corrupt());
+    }
+    let digest = ContentDigest::parse(digest_text).map_err(|_| corrupt())?;
+    if digest != skills_audit_report_digest(&report_json) {
+        return Err(corrupt());
+    }
+    Ok(StoredSkillsAuditReport {
+        project_id: project_id.clone(),
+        observed_at_ms,
+        schema_version,
+        report_json,
+        digest,
+    })
+}
+
+fn validate_skills_audit_report_input(
+    schema_version: u32,
+    report_json: &str,
+) -> Result<(), StoreError> {
+    if schema_version == 0 {
+        return Err(StoreError::InvalidSkillsAuditReport(
+            "schema version must be non-zero",
+        ));
+    }
+    if schema_version != SKILLS_AUDIT_REPORT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSkillsAuditReportSchema {
+            schema_version,
+            supported: SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+        });
+    }
+    if report_json.len() > MAX_SKILLS_AUDIT_REPORT_BYTES {
+        return Err(StoreError::SkillsAuditReportTooLarge {
+            size_bytes: report_json.len(),
+            maximum_bytes: MAX_SKILLS_AUDIT_REPORT_BYTES,
+        });
+    }
+    if !skills_audit_report_has_text_shape(report_json) {
+        return Err(StoreError::InvalidSkillsAuditReport(
+            "report must be bounded UTF-8 JSON object text",
+        ));
+    }
+    Ok(())
+}
+
+fn skills_audit_report_has_text_shape(report_json: &str) -> bool {
+    let trimmed = report_json.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}') && !report_json.contains('\0')
+}
+
+fn is_valid_json_object(connection: &Connection, report_json: &str) -> Result<bool, StoreError> {
+    let valid: bool = connection.query_row(
+        "SELECT CASE
+             WHEN json_valid(?1) THEN json_type(?1) = 'object'
+             ELSE 0
+         END",
+        [report_json],
+        |row| row.get(0),
+    )?;
+    Ok(valid)
+}
+
+fn skills_audit_report_digest(report_json: &str) -> ContentDigest {
+    ContentDigest::from_sha256(Sha256::digest(report_json.as_bytes()).into())
+}
+
 fn rescan_skill_inventory(
     connection: &mut Connection,
     project_id: &ProjectId,
@@ -2199,8 +2630,25 @@ fn rescan_skill_inventory(
     let observed_at = sql_integer(observed_at_ms)?;
     let current = current_skill_artifacts(artifacts)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let drift = rescan_skill_inventory_in_transaction(
+        &transaction,
+        project_id,
+        current,
+        observed_at,
+        observed_at_ms,
+    )?;
+    transaction.commit()?;
+    Ok(drift)
+}
 
-    if let Some(stored_at_ms) = skill_inventory_observation(&transaction, project_id)? {
+fn rescan_skill_inventory_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    current: BTreeMap<AgentArtifactId, AgentArtifact>,
+    observed_at: i64,
+    observed_at_ms: u64,
+) -> Result<SkillInventoryDrift, StoreError> {
+    if let Some(stored_at_ms) = skill_inventory_observation(transaction, project_id)? {
         if observed_at_ms < stored_at_ms {
             return Err(StoreError::SkillInventoryObservationRegression {
                 project_id: project_id.clone(),
@@ -2209,9 +2657,8 @@ fn rescan_skill_inventory(
             });
         }
         if observed_at_ms == stored_at_ms {
-            if active_skill_inventory_matches(&transaction, project_id, &current)? {
-                prune_skill_inventory_tombstones(&transaction, project_id)?;
-                transaction.commit()?;
+            if active_skill_inventory_matches(transaction, project_id, &current)? {
+                prune_skill_inventory_tombstones(transaction, project_id)?;
                 return Ok(SkillInventoryDrift::default());
             }
             return Err(StoreError::SkillInventoryObservationConflict {
@@ -2226,8 +2673,8 @@ fn rescan_skill_inventory(
          ON CONFLICT(project_id) DO NOTHING",
         [project_id.as_str()],
     )?;
-    prune_skill_inventory_tombstones(&transaction, project_id)?;
-    let existing = all_skill_artifacts(&transaction, project_id)?;
+    prune_skill_inventory_tombstones(transaction, project_id)?;
+    let existing = all_skill_artifacts(transaction, project_id)?;
     let mut existing = existing
         .into_iter()
         .map(|record| (record.id.clone(), record))
@@ -2237,7 +2684,7 @@ fn rescan_skill_inventory(
     for (id, artifact) in current {
         match existing.remove(&id) {
             None => add_skill_artifact(
-                &transaction,
+                transaction,
                 project_id,
                 id,
                 artifact,
@@ -2246,7 +2693,7 @@ fn rescan_skill_inventory(
                 &mut drift,
             )?,
             Some(stored) => reconcile_skill_artifact(
-                &transaction,
+                transaction,
                 project_id,
                 artifact,
                 stored,
@@ -2261,7 +2708,7 @@ fn rescan_skill_inventory(
         .filter(|stored| stored.removed_at_ms.is_none())
     {
         remove_skill_artifact(
-            &transaction,
+            transaction,
             project_id,
             stored,
             observed_at,
@@ -2275,8 +2722,7 @@ fn rescan_skill_inventory(
          ON CONFLICT(project_id) DO UPDATE SET observed_at_ms = excluded.observed_at_ms",
         params![project_id.as_str(), observed_at],
     )?;
-    prune_skill_inventory_tombstones(&transaction, project_id)?;
-    transaction.commit()?;
+    prune_skill_inventory_tombstones(transaction, project_id)?;
     sort_inventory_drift(&mut drift);
     Ok(drift)
 }

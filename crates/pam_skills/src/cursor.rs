@@ -328,16 +328,21 @@ fn add_file_artifact(
     scope: ArtifactScope,
     load_semantics: LoadSemantics,
 ) {
+    let ScannedFile {
+        logical_path,
+        bytes,
+        content_hash,
+    } = file;
     match AgentArtifact::new(
         name,
-        &file.logical_path,
+        &logical_path,
         kind,
         scope,
         OriginAgent::Cursor,
         load_semantics,
-        file.content_hash,
+        content_hash,
     ) {
-        Ok(artifact) => session.push_artifact(artifact),
-        Err(_) => session.diagnostic(&file.logical_path, ScanDiagnosticKind::InvalidArtifact),
+        Ok(artifact) => session.push_artifact_with_content(artifact, bytes),
+        Err(_) => session.diagnostic(&logical_path, ScanDiagnosticKind::InvalidArtifact),
     }
 }

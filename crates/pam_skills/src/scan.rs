@@ -14,6 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{AgentArtifact, ArtifactKind, ArtifactScope, OriginAgent};
+use crate::{AgentArtifactId, LoadSemantics};
 
 pub const DEFAULT_MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACTS: usize = 4096;
@@ -89,11 +90,34 @@ impl ScanDiagnostic {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ScanReport {
     artifacts: Vec<AgentArtifact>,
     diagnostics: Vec<ScanDiagnostic>,
     complete: bool,
+    #[serde(skip)]
+    always_loaded_sources: AlwaysLoadedSources,
+}
+
+impl std::fmt::Debug for ScanReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScanReport")
+            .field("artifacts", &self.artifacts)
+            .field("diagnostics", &self.diagnostics)
+            .field("complete", &self.complete)
+            .field("always_loaded_sources", &self.always_loaded_sources)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+struct AlwaysLoadedSources(BTreeMap<AgentArtifactId, Vec<u8>>);
+
+impl std::fmt::Debug for AlwaysLoadedSources {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<redacted:{} sources>", self.0.len())
+    }
 }
 
 impl ScanReport {
@@ -113,14 +137,7 @@ impl ScanReport {
     /// Merges ecosystem reports into one atomic snapshot for persistence.
     #[must_use]
     pub fn merge(reports: impl IntoIterator<Item = Self>) -> Self {
-        let mut session = ScanSession::new(ScanLimits::default());
-        for report in reports {
-            for artifact in report.artifacts {
-                session.push_artifact(artifact);
-            }
-            session.diagnostics.extend(report.diagnostics);
-        }
-        session.finish()
+        merge_scan_reports(reports, ScanLimits::default())
     }
 
     #[must_use]
@@ -141,6 +158,10 @@ impl ScanReport {
     #[must_use]
     pub fn into_artifacts(self) -> Vec<AgentArtifact> {
         self.artifacts
+    }
+
+    pub(crate) fn always_loaded_source(&self, id: &AgentArtifactId) -> Option<&[u8]> {
+        self.always_loaded_sources.0.get(id).map(Vec::as_slice)
     }
 }
 
@@ -188,6 +209,7 @@ pub(crate) struct ScanSession {
     visited_directory_entries: usize,
     directory_entry_limit_exhausted: bool,
     artifacts: BTreeMap<ArtifactKey, AgentArtifact>,
+    always_loaded_sources: AlwaysLoadedSources,
     diagnostics: Vec<ScanDiagnostic>,
 }
 
@@ -201,6 +223,7 @@ impl ScanSession {
             visited_directory_entries: 0,
             directory_entry_limit_exhausted: false,
             artifacts: BTreeMap::new(),
+            always_loaded_sources: AlwaysLoadedSources::default(),
             diagnostics: Vec::new(),
         }
     }
@@ -467,6 +490,23 @@ impl ScanSession {
     }
 
     pub(crate) fn push_artifact(&mut self, artifact: AgentArtifact) {
+        self.push_artifact_inner(artifact, None, false);
+    }
+
+    pub(crate) fn push_artifact_with_content(&mut self, artifact: AgentArtifact, content: Vec<u8>) {
+        self.push_artifact_inner(artifact, Some(content), false);
+    }
+
+    fn push_merged_artifact_with_content(&mut self, artifact: AgentArtifact, content: Vec<u8>) {
+        self.push_artifact_inner(artifact, Some(content), true);
+    }
+
+    fn push_artifact_inner(
+        &mut self,
+        artifact: AgentArtifact,
+        content: Option<Vec<u8>>,
+        charge_retained_source: bool,
+    ) {
         let key = ArtifactKey {
             origin: artifact.origin(),
             kind: artifact.kind(),
@@ -482,6 +522,10 @@ impl ScanSession {
             }
             return;
         }
+        let mut source = (artifact.load_semantics() == LoadSemantics::Always)
+            .then_some(content)
+            .flatten();
+        let artifact_id = artifact.id();
         if self.artifacts.len() >= self.limits.max_artifacts {
             if !self.artifact_limit_reported {
                 self.artifact_limit_reported = true;
@@ -492,7 +536,33 @@ impl ScanSession {
             }
             return;
         }
+        if charge_retained_source {
+            source = source.filter(|source| {
+                self.charge_retained_source(artifact.logical_path(), source.len())
+            });
+        }
         self.artifacts.insert(key, artifact);
+        if let Some(source) = source {
+            self.always_loaded_sources.0.insert(artifact_id, source);
+        }
+    }
+
+    fn charge_retained_source(&mut self, logical_path: &str, bytes: usize) -> bool {
+        if self.aggregate_exhausted {
+            return false;
+        }
+        let Some(total) = self.total_bytes.checked_add(bytes) else {
+            self.aggregate_exhausted = true;
+            self.diagnostic(logical_path, ScanDiagnosticKind::AggregateBytesExceeded);
+            return false;
+        };
+        if total > self.limits.max_aggregate_bytes {
+            self.aggregate_exhausted = true;
+            self.diagnostic(logical_path, ScanDiagnosticKind::AggregateBytesExceeded);
+            return false;
+        }
+        self.total_bytes = total;
+        true
     }
 
     pub(crate) fn diagnostic(&mut self, path: &str, kind: ScanDiagnosticKind) {
@@ -509,6 +579,7 @@ impl ScanSession {
             artifacts: self.artifacts.into_values().collect(),
             complete: self.diagnostics.is_empty(),
             diagnostics: self.diagnostics,
+            always_loaded_sources: self.always_loaded_sources,
         }
     }
 
@@ -654,9 +725,20 @@ pub(crate) fn merge_scan_reports(
 ) -> ScanReport {
     let mut session = ScanSession::new(limits);
     for report in reports {
-        session.diagnostics.extend(report.diagnostics);
-        for artifact in report.artifacts {
-            session.push_artifact(artifact);
+        let ScanReport {
+            artifacts,
+            diagnostics,
+            mut always_loaded_sources,
+            ..
+        } = report;
+        session.diagnostics.extend(diagnostics);
+        for artifact in artifacts {
+            let source = always_loaded_sources.0.remove(&artifact.id());
+            if let Some(source) = source {
+                session.push_merged_artifact_with_content(artifact, source);
+            } else {
+                session.push_artifact(artifact);
+            }
         }
     }
     session.finish()

@@ -91,3 +91,22 @@ fn inventory_request_rejects_paths_and_accepts_only_the_fence() {
     assert!(serde_json::from_value::<FencedRequest>(valid).is_ok());
     assert!(serde_json::from_value::<FencedRequest>(ambient_path).is_err());
 }
+
+#[test]
+fn audit_requests_accept_only_the_canonical_fence_contract() {
+    let valid = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID
+    });
+    let ambient_evaluator = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID,
+        "path": "/tmp/evaluator",
+        "evaluatorConfig": { "deadlineMs": 1 }
+    });
+
+    assert!(serde_json::from_value::<FencedRequest>(valid).is_ok());
+    assert!(serde_json::from_value::<FencedRequest>(ambient_evaluator).is_err());
+}

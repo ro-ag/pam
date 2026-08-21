@@ -293,6 +293,30 @@ async fn skill_inventory_rejects_a_stale_project_before_scanning() {
     assert_eq!(error.kind, super::desktop::DesktopErrorKind::Stale);
 }
 
+#[tokio::test]
+async fn skill_audit_commands_reject_a_stale_project_before_storage_or_scan_work() {
+    let project = ProjectHandle::new();
+    let generation = GenerationId::new();
+    let core = active_core_for_test(&project, generation.clone());
+    switch_authority_for_test(&core, ProjectHandle::new(), GenerationId::new()).await;
+
+    let load_error = core
+        .load_skill_audit(CommandFence::new(
+            project.clone(),
+            generation.clone(),
+            OperationId::new(),
+        ))
+        .await
+        .unwrap_err();
+    let run_error = core
+        .run_skill_audit(CommandFence::new(project, generation, OperationId::new()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(load_error.kind, super::desktop::DesktopErrorKind::Stale);
+    assert_eq!(run_error.kind, super::desktop::DesktopErrorKind::Stale);
+}
+
 #[test]
 fn approval_dto_exposes_no_credential_envelope_or_project_authority() {
     let request = RequestEnvelope::project_current(

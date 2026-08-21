@@ -252,3 +252,80 @@ test.describe("production-shaped interactions", () => {
     expect(Number.parseFloat(focus.outlineWidth)).toBeGreaterThanOrEqual(2);
   });
 });
+
+test.describe("Access skill audit", () => {
+  test("preserves the shell and renders the evaluated audit truth at 1180px", async ({ page }) => {
+    await page.setViewportSize({ width: 1_180, height: 1_000 });
+    await openFixture(page, "solved", "access");
+    await expect(page.getByRole("heading", { name: "Evaluator verdict" })).toBeVisible();
+
+    const navigationLabels = await page.getByRole("navigation", { name: "Primary" })
+      .getByRole("button")
+      .evaluateAll((buttons) => buttons.map((button) => button.getAttribute("aria-label")));
+    expect(navigationLabels).toEqual(["Current", "Flows", "Access"]);
+    const geometry = await page.evaluate(() => {
+      const width = (selector: string) => document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().width ?? -1;
+      const workspace = document.querySelector<HTMLElement>(".workspace")?.getBoundingClientRect();
+      const toolbar = document.querySelector<HTMLElement>(".toolbar")?.getBoundingClientRect();
+      return {
+        sidebar: width(".sidebar"),
+        separator: width(".resize-separator"),
+        toolbar: toolbar?.height ?? -1,
+        workspaceRight: workspace?.right ?? -1,
+      };
+    });
+    expect(geometry).toEqual({ sidebar: 248, separator: 5, toolbar: 44, workspaceRight: 1_172 });
+
+    const ranked = page.getByRole("region", { name: "Ranked artifacts" });
+    const verdict = page.getByRole("region", { name: "Evaluator verdict" });
+    await expect(ranked.getByText("Project instructions")).toBeVisible();
+    await expect(ranked.getByText("AGENTS.md")).toBeVisible();
+    await expect(verdict.getByText("codex", { exact: true })).toBeVisible();
+    await expect(verdict.getByText("elevated", { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Overlaps" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Conflicts" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Stale candidates" })).toBeVisible();
+    await page.locator(".skill-audit-panel").scrollIntoViewIfNeeded();
+    await expect(page).toHaveScreenshot("access-audit-evaluated-1180x1000.png");
+  });
+
+  test("keeps Run and Retry audit actions reachable at effective 320px", async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 800 });
+    await openFixture(page, "skill-audit-empty", "access");
+    const run = page.getByRole("button", { name: "Run audit" });
+    await run.scrollIntoViewIfNeeded();
+    await expect(run).toBeVisible();
+    const runBox = await run.boundingBox();
+    expect(runBox).not.toBeNull();
+    expect(runBox!.x).toBeGreaterThanOrEqual(0);
+    expect(runBox!.x + runBox!.width).toBeLessThanOrEqual(320);
+    let horizontal = await horizontalMetrics(page);
+    expect(horizontal.htmlScroll).toBe(horizontal.htmlClient);
+    expect(horizontal.bodyScroll).toBe(horizontal.bodyClient);
+    expect(horizontal.shellScroll).toBe(horizontal.shellClient);
+
+    await openFixture(page, "skill-audit-load-error", "access");
+    const retry = page.getByRole("button", { name: "Retry audit" });
+    await retry.scrollIntoViewIfNeeded();
+    await expect(retry).toBeVisible();
+    const retryBox = await retry.boundingBox();
+    expect(retryBox).not.toBeNull();
+    expect(retryBox!.x).toBeGreaterThanOrEqual(0);
+    expect(retryBox!.x + retryBox!.width).toBeLessThanOrEqual(320);
+    horizontal = await horizontalMetrics(page);
+    expect(horizontal.htmlScroll).toBe(horizontal.htmlClient);
+    expect(horizontal.bodyScroll).toBe(horizontal.bodyClient);
+    expect(horizontal.shellScroll).toBe(horizontal.shellClient);
+  });
+
+  test("shows deterministic footprint fallback without a qualitative verdict", async ({ page }) => {
+    await page.setViewportSize({ width: 1_180, height: 800 });
+    await openFixture(page, "skill-audit-no-evaluator", "access");
+
+    await expect(page.getByText(
+      "Deterministic footprint only — no supported evaluator was available, so PAM did not produce a qualitative verdict.",
+    )).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Evaluator verdict" })).toHaveCount(0);
+    await expect(page.getByText("Saturation grade")).toHaveCount(0);
+  });
+});

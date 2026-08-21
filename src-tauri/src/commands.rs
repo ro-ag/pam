@@ -4,7 +4,7 @@ use pam_gui::{
     ApprovalDecisionDto, ApprovalDecisionResponseDto, ApprovalHandle, CatalogDto, CommandFence,
     DesktopCore, DesktopErrorDto, EvidenceDto, EvidenceHandleDto, FlowDefinitionHandle,
     FlowDocumentDto, FlowDocumentHandle, FlowReviewDto, FlowSaveDto, FlowWorkspaceDto,
-    GenerationId, OperationId, ProjectHandle, SkillInventoryDto, SnapshotDto,
+    GenerationId, OperationId, ProjectHandle, SkillAuditDto, SkillInventoryDto, SnapshotDto,
 };
 use serde::{Deserialize, Deserializer, de::Error as _};
 use tauri::State;
@@ -257,6 +257,22 @@ pub(crate) async fn load_skill_inventory(
     request: FencedRequest,
 ) -> Result<SkillInventoryDto, DesktopErrorDto> {
     state.core.skill_inventory(request.into_fence()).await
+}
+
+#[tauri::command]
+pub(crate) async fn load_skill_audit(
+    state: State<'_, DesktopState>,
+    request: FencedRequest,
+) -> Result<SkillAuditDto, DesktopErrorDto> {
+    state.core.load_skill_audit(request.into_fence()).await
+}
+
+#[tauri::command]
+pub(crate) async fn run_skill_audit(
+    state: State<'_, DesktopState>,
+    request: FencedRequest,
+) -> Result<SkillAuditDto, DesktopErrorDto> {
+    state.core.run_skill_audit(request.into_fence()).await
 }
 
 #[tauri::command]

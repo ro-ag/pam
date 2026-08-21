@@ -1,3 +1,4 @@
 native-project/.claude/rules/native.md text eol=lf
 "native-project/workspace child/.codex/config.toml" text eol=crlf
 "native-project/workspace child/.cursor/rules/native.mdc" text eol=crlf
+audit-golden/static-footprint.json text eol=lf

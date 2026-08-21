@@ -9,10 +9,14 @@ rust-version.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 pam_core.workspace = true
+pam_policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["process", "signal"] }
 
 [lints]
 workspace = true

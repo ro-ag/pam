@@ -14,9 +14,11 @@ use pam_model::{
 };
 use pam_policy::{ApprovalRequirement, CapabilityName, Effect, Grant, ResourceName, ResourceScope};
 use pam_skills::{
-    AgentArtifact, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent, ScanReport,
+    AgentArtifact, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent,
+    SKILLS_AUDIT_REPORT_SCHEMA_VERSION, ScanReport,
 };
 use rusqlite::{Connection, params};
+use sha2::{Digest as _, Sha256};
 
 use super::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
@@ -27,7 +29,8 @@ use super::{
     MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
     MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
     MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_PROJECT_CURRENT_QUEUED,
-    ProjectWorkload, PutGrant, RequestState, SaveFlowCheckpoint, Store, StoreError, TerminalState,
+    MAX_SKILLS_AUDIT_REPORT_BYTES, ProjectWorkload, PutGrant, RequestState, SaveFlowCheckpoint,
+    Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -6303,5 +6306,399 @@ async fn skill_inventory_reports_corrupt_id_enum_and_digest() {
     ));
 
     drop(connection);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers the full report lifecycle and project isolation.
+async fn skills_audit_report_put_get_replace_restart_isolate_and_cascade() {
+    let (directory, path) = database_path("skills-audit-report-lifecycle");
+    let store = Store::open(&path).unwrap();
+    let first_project = ProjectId::from("first-project");
+    let second_project = ProjectId::from("second-project");
+    assert!(
+        store
+            .skills_audit_report(first_project.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let secret_report = r#"{"schemaVersion":1,"secret":"must-not-appear-in-debug"}"#.to_owned();
+    let first = store
+        .put_skills_audit_report(
+            first_project.clone(),
+            10,
+            SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+            secret_report.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.project_id, first_project);
+    assert_eq!(first.observed_at_ms, 10);
+    assert_eq!(first.schema_version, SKILLS_AUDIT_REPORT_SCHEMA_VERSION);
+    assert_eq!(first.report_json, secret_report);
+    assert_eq!(
+        first.digest,
+        ContentDigest::from_sha256(Sha256::digest(first.report_json.as_bytes()).into())
+    );
+    let debug = format!("{first:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("must-not-appear-in-debug"));
+    assert_eq!(
+        store
+            .put_skills_audit_report(
+                first_project.clone(),
+                10,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                first.report_json.clone(),
+            )
+            .await
+            .unwrap(),
+        first
+    );
+
+    let replacement_json = r#"{"schemaVersion":1,"revision":2}"#.to_owned();
+    let replacement = store
+        .put_skills_audit_report(
+            first_project.clone(),
+            20,
+            SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+            replacement_json.clone(),
+        )
+        .await
+        .unwrap();
+    let isolated = store
+        .put_skills_audit_report(
+            second_project.clone(),
+            15,
+            SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+            r#"{"schemaVersion":1,"project":"second"}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.report_json, replacement_json);
+    assert_ne!(replacement, isolated);
+
+    store.shutdown().await.unwrap();
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store
+            .skills_audit_report(first_project.clone())
+            .await
+            .unwrap(),
+        Some(replacement)
+    );
+    assert_eq!(
+        store
+            .skills_audit_report(second_project.clone())
+            .await
+            .unwrap(),
+        Some(isolated.clone())
+    );
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            [first_project.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    assert!(
+        store
+            .skills_audit_report(first_project)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.skills_audit_report(second_project).await.unwrap(),
+        Some(isolated)
+    );
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skills_audit_report_rejects_timestamp_regression_and_equal_time_conflict() {
+    let (directory, path) = database_path("skills-audit-report-ordering");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let original_json = r#"{"schemaVersion":1,"revision":1}"#.to_owned();
+    let original = store
+        .put_skills_audit_report(
+            project_id.clone(),
+            100,
+            SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+            original_json.clone(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .put_skills_audit_report(
+                project_id.clone(),
+                99,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                original_json,
+            )
+            .await,
+        Err(StoreError::SkillsAuditReportTimestampRegression {
+            observed_at_ms: 99,
+            stored_at_ms: 100,
+            ..
+        })
+    ));
+    assert!(matches!(
+        store
+            .put_skills_audit_report(
+                project_id.clone(),
+                100,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                r#"{"schemaVersion":1,"revision":2}"#.to_owned(),
+            )
+            .await,
+        Err(StoreError::SkillsAuditReportConflict {
+            observed_at_ms: 100,
+            ..
+        })
+    ));
+    assert_eq!(
+        store.skills_audit_report(project_id).await.unwrap(),
+        Some(original)
+    );
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skills_audit_report_rejects_unsupported_malformed_oversized_and_invalid_time_input() {
+    let (directory, path) = database_path("skills-audit-report-invalid");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    assert!(matches!(
+        store
+            .put_skills_audit_report(project_id.clone(), 1, 0, "{}".to_owned())
+            .await,
+        Err(StoreError::InvalidSkillsAuditReport(_))
+    ));
+    assert!(matches!(
+        store
+            .put_skills_audit_report(
+                project_id.clone(),
+                1,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION + 1,
+                "{}".to_owned(),
+            )
+            .await,
+        Err(StoreError::UnsupportedSkillsAuditReportSchema { .. })
+    ));
+    for invalid in ["[]", "{broken}", "{\"nul\":\"\0\"}"] {
+        assert!(matches!(
+            store
+                .put_skills_audit_report(
+                    project_id.clone(),
+                    1,
+                    SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                    invalid.to_owned(),
+                )
+                .await,
+            Err(StoreError::InvalidSkillsAuditReport(_))
+        ));
+    }
+    let oversized = format!(
+        "{{\"report\":\"{}\"}}",
+        "x".repeat(MAX_SKILLS_AUDIT_REPORT_BYTES)
+    );
+    assert!(oversized.len() > MAX_SKILLS_AUDIT_REPORT_BYTES);
+    assert!(matches!(
+        store
+            .put_skills_audit_report(
+                project_id.clone(),
+                1,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                oversized,
+            )
+            .await,
+        Err(StoreError::SkillsAuditReportTooLarge {
+            maximum_bytes: MAX_SKILLS_AUDIT_REPORT_BYTES,
+            ..
+        })
+    ));
+    assert!(matches!(
+        store
+            .put_skills_audit_report(
+                project_id.clone(),
+                u64::MAX,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                "{}".to_owned(),
+            )
+            .await,
+        Err(StoreError::TimestampOutOfRange(u64::MAX))
+    ));
+    assert!(
+        store
+            .skills_audit_report(project_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skills_audit_snapshot_rolls_back_inventory_when_report_conflicts() {
+    let (directory, path) = database_path("skills-audit-snapshot-rollback");
+    let store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let original_artifact = inventory_artifact(".claude/skills/original/SKILL.md", 1);
+    let changed_artifact = inventory_artifact(".claude/skills/changed/SKILL.md", 2);
+    store
+        .rescan_skill_inventory(
+            project_id.clone(),
+            inventory_report([original_artifact.clone()]),
+            50,
+        )
+        .await
+        .unwrap();
+    let original_report = store
+        .put_skills_audit_report(
+            project_id.clone(),
+            100,
+            SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+            r#"{"schemaVersion":1,"revision":1}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .put_skills_audit_snapshot(
+                project_id.clone(),
+                inventory_report([changed_artifact]),
+                100,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                r#"{"schemaVersion":1,"revision":2}"#.to_owned(),
+            )
+            .await,
+        Err(StoreError::SkillsAuditReportConflict {
+            observed_at_ms: 100,
+            ..
+        })
+    ));
+    let active = store.skill_artifacts(project_id.clone()).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].artifact, original_artifact);
+    assert_eq!(
+        store.skills_audit_report(project_id).await.unwrap(),
+        Some(original_report)
+    );
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn skills_audit_snapshot_serializes_concurrent_observations_as_one_snapshot() {
+    let (directory, path) = database_path("skills-audit-snapshot-concurrent");
+    let first_store = Store::open(&path).unwrap();
+    let second_store = Store::open(&path).unwrap();
+    let project_id = ProjectId::from("project");
+    let older_artifact = inventory_artifact(".claude/skills/older/SKILL.md", 1);
+    let newest_artifact = inventory_artifact(".claude/skills/newest/SKILL.md", 2);
+
+    let older = first_store.put_skills_audit_snapshot(
+        project_id.clone(),
+        inventory_report([older_artifact]),
+        100,
+        SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+        r#"{"schemaVersion":1,"revision":1}"#.to_owned(),
+    );
+    let newest = second_store.put_skills_audit_snapshot(
+        project_id.clone(),
+        inventory_report([newest_artifact.clone()]),
+        200,
+        SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+        r#"{"schemaVersion":1,"revision":2}"#.to_owned(),
+    );
+    let (older_result, newest_result) = tokio::join!(older, newest);
+    assert!(
+        older_result.is_ok()
+            || matches!(
+                older_result,
+                Err(StoreError::SkillInventoryObservationRegression { .. }
+                    | StoreError::SkillsAuditReportTimestampRegression { .. })
+            )
+    );
+    assert_eq!(newest_result.unwrap().observed_at_ms, 200);
+
+    let active = first_store
+        .skill_artifacts(project_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].artifact, newest_artifact);
+    let report = first_store
+        .skills_audit_report(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.observed_at_ms, 200);
+    assert!(report.report_json.contains(r#""revision":2"#));
+
+    first_store.shutdown().await.unwrap();
+    close(second_store, &directory).await;
+}
+
+#[tokio::test]
+async fn skills_audit_report_reads_reject_corrupt_schema_and_digest_without_contents() {
+    let (directory, path) = database_path("skills-audit-report-corrupt");
+    let store = Store::open(&path).unwrap();
+    for project in ["digest-project", "schema-project"] {
+        store
+            .put_skills_audit_report(
+                ProjectId::from(project),
+                10,
+                SKILLS_AUDIT_REPORT_SCHEMA_VERSION,
+                format!(r#"{{"schemaVersion":1,"secret":"{project}"}}"#),
+            )
+            .await
+            .unwrap();
+    }
+    store.shutdown().await.unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE skills_audit_reports
+             SET report_json = '{\"schemaVersion\":1,\"secret\":\"changed\"}'
+             WHERE project_id = 'digest-project'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE skills_audit_reports SET schema_version = ?1
+             WHERE project_id = 'schema-project'",
+            [SKILLS_AUDIT_REPORT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+    for project in ["digest-project", "schema-project"] {
+        let error = store
+            .skills_audit_report(ProjectId::from(project))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::CorruptSkillsAuditReport(_)));
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("changed"));
+        assert!(!debug.contains("secret"));
+    }
     close(store, &directory).await;
 }

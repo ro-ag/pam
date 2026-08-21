@@ -173,6 +173,27 @@ describe("control center", () => {
     expect(screen.queryByText("Certificates")).not.toBeInTheDocument();
   });
 
+  it("removes the prior project audit in the project-switch commit", async () => {
+    const priorAuditSummary =
+      "The always-loaded footprint is usable, with one overlapping review pair and one stale candidate to inspect.";
+    const user = userEvent.setup();
+    const bridge = fixtureBridge();
+    const loadFirstAudit = bridge.loadSkillAudit.bind(bridge);
+    bridge.loadSkillAudit = vi
+      .fn()
+      .mockImplementationOnce(loadFirstAudit)
+      .mockImplementation(() => new Promise<never>(() => undefined));
+    render(<App bridge={bridge} initialView="access" />);
+
+    expect(await screen.findByText(priorAuditSummary)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "payments-api" }));
+    await user.click(await screen.findByRole("menuitemradio", { name: /ledger-web/ }));
+
+    expect(await screen.findByRole("button", { name: "ledger-web" })).toBeInTheDocument();
+    expect(screen.queryByText(priorAuditSummary)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading latest skill audit…")).toBeInTheDocument();
+  });
+
   it("activates only the newest overlay and restores its underlay and exact openers", async () => {
     const user = userEvent.setup();
     const bridge = fixtureBridge();

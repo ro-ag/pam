@@ -1,3 +1,5 @@
+use std::fmt;
+
 use pam_core::{
     ApprovalId, CallerId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, ProjectId,
     RequestId,
@@ -21,6 +23,31 @@ pub const MAX_AUDIT_PROJECT_ID_BYTES: usize = 256;
 pub const MAX_FLOW_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FLOW_TRANSITION_BYTES: usize = 64 * 1024;
 pub const MAX_FLOW_TERMINAL_RESULT_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 size of one durable serialized skills audit report.
+pub const MAX_SKILLS_AUDIT_REPORT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Latest durable serialized skills audit report for one project.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StoredSkillsAuditReport {
+    pub project_id: ProjectId,
+    pub observed_at_ms: u64,
+    pub schema_version: u32,
+    pub report_json: String,
+    pub digest: ContentDigest,
+}
+
+impl fmt::Debug for StoredSkillsAuditReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredSkillsAuditReport")
+            .field("project_id", &self.project_id)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("schema_version", &self.schema_version)
+            .field("report_json", &"<redacted>")
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
 
 /// One audit event to append to the durable ledger.
 ///

@@ -10,6 +10,7 @@ import type {
   FlowSaveDto,
   FlowWorkspaceDto,
   PamBridge,
+  SkillAuditDto,
   SkillInventoryDto,
   SnapshotDto,
 } from "./domain";
@@ -85,6 +86,10 @@ export function createTauriBridge(invokeCommand: Invoke = invoke): PamBridge {
       invokeCommand<FlowWorkspaceDto>("load_flow_workspace", request(flatFence(fence))),
     loadSkillInventory: (fence) =>
       invokeCommand<SkillInventoryDto>("load_skill_inventory", request(flatFence(fence))),
+    loadSkillAudit: (fence) =>
+      invokeCommand<SkillAuditDto>("load_skill_audit", request(flatFence(fence))),
+    runSkillAudit: (fence) =>
+      invokeCommand<SkillAuditDto>("run_skill_audit", request(flatFence(fence))),
     openFlow: (fence, flowHandle) =>
       invokeCommand<FlowDocumentDto>(
         "open_flow",

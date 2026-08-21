@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use pam_core::{
     ApprovalId, CallerId, ContentDigest, EvidenceHandle, GrantId, ProjectId, RequestId,
 };
+use pam_skills::{AgentArtifactId, ScanDiagnostic};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -104,9 +105,22 @@ pub enum StoreError {
     InvalidModelRecord(&'static str),
     ModelConflict(String),
     ModelNotFound(String),
+    IncompleteSkillInventory(Vec<ScanDiagnostic>),
+    InvalidSkillInventory(&'static str),
+    CorruptSkillArtifact,
+    SkillArtifactNotFound {
+        project_id: ProjectId,
+        artifact_id: AgentArtifactId,
+    },
+    SkillInventoryTimestampRegression {
+        artifact_id: AgentArtifactId,
+        observed_at_ms: u64,
+        stored_at_ms: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
+    #[allow(clippy::too_many_lines)] // Keep the exhaustive public error mapping auditable.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(_) => formatter.write_str("PAM could not prepare its durable state path."),
@@ -205,6 +219,13 @@ impl fmt::Display for StoreError {
             Self::InvalidModelRecord(_) | Self::ModelConflict(_) | Self::ModelNotFound(_) => {
                 format_model_error(self, formatter)
             }
+            Self::IncompleteSkillInventory(_)
+            | Self::InvalidSkillInventory(_)
+            | Self::CorruptSkillArtifact
+            | Self::SkillArtifactNotFound { .. }
+            | Self::SkillInventoryTimestampRegression { .. } => {
+                format_skill_inventory_error(self, formatter)
+            }
         }
     }
 }
@@ -218,6 +239,41 @@ fn format_caller_error(error: &StoreError, formatter: &mut fmt::Formatter<'_>) -
             write!(formatter, "caller {caller_id} is already registered")
         }
         _ => unreachable!("format_caller_error requires a caller error"),
+    }
+}
+
+fn format_skill_inventory_error(
+    error: &StoreError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match error {
+        StoreError::IncompleteSkillInventory(diagnostics) => write!(
+            formatter,
+            "skill inventory scan is incomplete ({} diagnostics)",
+            diagnostics.len()
+        ),
+        StoreError::InvalidSkillInventory(reason) => {
+            write!(formatter, "skill inventory is invalid: {reason}")
+        }
+        StoreError::CorruptSkillArtifact => {
+            formatter.write_str("stored skill artifact metadata is corrupt")
+        }
+        StoreError::SkillArtifactNotFound {
+            project_id,
+            artifact_id,
+        } => write!(
+            formatter,
+            "skill artifact {artifact_id} does not exist in project {project_id}"
+        ),
+        StoreError::SkillInventoryTimestampRegression {
+            artifact_id,
+            observed_at_ms,
+            stored_at_ms,
+        } => write!(
+            formatter,
+            "skill artifact {artifact_id} was observed at {observed_at_ms}, before stored timestamp {stored_at_ms}"
+        ),
+        _ => unreachable!("format_skill_inventory_error requires an inventory error"),
     }
 }
 
@@ -413,7 +469,12 @@ impl Error for StoreError {
             | Self::UnsafeEvidencePath
             | Self::InvalidModelRecord(_)
             | Self::ModelConflict(_)
-            | Self::ModelNotFound(_) => None,
+            | Self::ModelNotFound(_)
+            | Self::IncompleteSkillInventory(_)
+            | Self::InvalidSkillInventory(_)
+            | Self::CorruptSkillArtifact
+            | Self::SkillArtifactNotFound { .. }
+            | Self::SkillInventoryTimestampRegression { .. } => None,
         }
     }
 }

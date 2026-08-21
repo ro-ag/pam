@@ -672,6 +672,79 @@ fn flow_checkpoint_migration_upgrades_v7_without_replacing_existing_state() {
 }
 
 #[test]
+fn agent_artifact_migration_upgrades_v9_without_replacing_existing_state() {
+    let (directory, path) = database_path("migration-v9-agent-artifacts");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+        include_str!("../migrations/0007_models.sql"),
+        include_str!("../migrations/0008_flows.sql"),
+        include_str!("../migrations/0009_flow_authorizations.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 9).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('preserved')", [])
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved_projects: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE project_id = 'preserved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let artifact_table: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'agent_artifacts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let artifact_columns: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_artifacts')
+             WHERE name IN (
+                 'artifact_id', 'name', 'logical_path', 'kind', 'scope', 'origin',
+                 'load_semantics', 'content_hash', 'first_seen_at_ms',
+                 'last_changed_at_ms', 'removed_at_ms'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let active_index: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name = 'agent_artifacts_active_order'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(preserved_projects, 1);
+    assert_eq!(artifact_table, 1);
+    assert_eq!(artifact_columns, 11);
+    assert_eq!(active_index, 1);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

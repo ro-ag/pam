@@ -5,6 +5,8 @@ use std::{
 };
 
 use super::scan::{ScanDiagnosticKind, ScanLimits, ScanSession};
+use crate::{AgentArtifact, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent, ScanReport};
+use pam_core::ContentDigest;
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -120,4 +122,45 @@ fn recursive_walk_enforces_traversal_depth() {
             && diagnostic.logical_path() == "rules/a/b"
     }));
     assert!(!report.complete());
+}
+
+fn normalized(path: &str, byte: u8) -> AgentArtifact {
+    AgentArtifact::new(
+        path,
+        path,
+        ArtifactKind::Rule,
+        ArtifactScope::Project,
+        OriginAgent::Cursor,
+        LoadSemantics::Always,
+        ContentDigest::from_sha256([byte; 32]),
+    )
+    .unwrap()
+}
+
+#[test]
+fn report_merge_is_atomic_deterministic_and_rejects_conflicting_identity() {
+    let left = ScanReport::from_artifacts([normalized("z.mdc", 1)]);
+    let right = ScanReport::from_artifacts([normalized("a.mdc", 1)]);
+    let merged = ScanReport::merge([left, right]);
+    assert!(merged.complete());
+    assert_eq!(
+        merged
+            .artifacts()
+            .iter()
+            .map(AgentArtifact::logical_path)
+            .collect::<Vec<_>>(),
+        ["a.mdc", "z.mdc"]
+    );
+
+    let conflict = ScanReport::merge([
+        ScanReport::from_artifacts([normalized("same.mdc", 1)]),
+        ScanReport::from_artifacts([normalized("same.mdc", 2)]),
+    ]);
+    assert!(!conflict.complete());
+    assert_eq!(conflict.artifacts().len(), 1);
+    assert!(
+        conflict.diagnostics().iter().any(|diagnostic| {
+            diagnostic.kind() == ScanDiagnosticKind::DuplicateArtifactIdentity
+        })
+    );
 }

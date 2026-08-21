@@ -1,12 +1,12 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, str::FromStr as _};
 
 use pam_core::ContentDigest;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 
 use super::{
-    AgentArtifact, ArtifactKind, ArtifactScope, InvalidAgentArtifact, LoadSemantics,
-    MAX_ARTIFACT_LOGICAL_PATH_BYTES, MAX_ARTIFACT_NAME_BYTES, OriginAgent,
+    AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, InvalidAgentArtifact,
+    LoadSemantics, MAX_ARTIFACT_LOGICAL_PATH_BYTES, MAX_ARTIFACT_NAME_BYTES, OriginAgent,
 };
 
 fn digest(byte: u8) -> ContentDigest {
@@ -204,6 +204,7 @@ fn identity_and_total_order_are_stable_across_content_changes() {
     let older = artifact("skills/deploy/SKILL.md", 1);
     let newer = artifact("skills/deploy/SKILL.md", 2);
     assert_eq!(older.identity(), newer.identity());
+    assert_eq!(older.id(), newer.id());
     assert!(older < newer);
 
     let mut ordered = BTreeSet::new();
@@ -214,4 +215,42 @@ fn identity_and_total_order_are_stable_across_content_changes() {
         .map(AgentArtifact::logical_path)
         .collect::<Vec<_>>();
     assert_eq!(paths, ["skills/a/SKILL.md", "skills/z/SKILL.md"]);
+}
+
+#[test]
+fn stable_id_is_canonical_and_identity_bound() {
+    let first = artifact("skills/deploy/SKILL.md", 1);
+    let same_identity = artifact("skills/deploy/SKILL.md", 2);
+    let other_path = artifact("skills/release/SKILL.md", 1);
+    assert_eq!(first.id(), same_identity.id());
+    assert_ne!(first.id(), other_path.id());
+    assert_eq!(
+        AgentArtifactId::from_str(first.id().as_str()).unwrap(),
+        first.id()
+    );
+    assert_eq!(
+        serde_json::from_str::<AgentArtifactId>(&serde_json::to_string(&first.id()).unwrap())
+            .unwrap(),
+        first.id()
+    );
+    for invalid in ["", "sha256:00", "artifact:sha256:AB", "artifact:sha256:00"] {
+        assert!(AgentArtifactId::from_str(invalid).is_err());
+    }
+}
+
+#[test]
+fn enum_text_round_trips_match_serde_names() {
+    for value in [ArtifactKind::Skill, ArtifactKind::WasmComponent] {
+        assert_eq!(ArtifactKind::from_str(value.as_str()).unwrap(), value);
+    }
+    for value in [ArtifactScope::Managed, ArtifactScope::Local] {
+        assert_eq!(ArtifactScope::from_str(value.as_str()).unwrap(), value);
+    }
+    for value in [OriginAgent::ClaudeCode, OriginAgent::Pam] {
+        assert_eq!(OriginAgent::from_str(value.as_str()).unwrap(), value);
+    }
+    for value in [LoadSemantics::Always, LoadSemantics::Unavailable] {
+        assert_eq!(LoadSemantics::from_str(value.as_str()).unwrap(), value);
+    }
+    assert!(ArtifactKind::from_str("unknown").is_err());
 }

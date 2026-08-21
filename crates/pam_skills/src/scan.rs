@@ -93,6 +93,32 @@ pub struct ScanReport {
 }
 
 impl ScanReport {
+    /// Builds a deterministic complete report from already-normalized artifacts.
+    ///
+    /// Duplicate conflicting identities and the global artifact limit are converted
+    /// into diagnostics, making the returned report incomplete.
+    #[must_use]
+    pub fn from_artifacts(artifacts: impl IntoIterator<Item = AgentArtifact>) -> Self {
+        let mut session = ScanSession::new(ScanLimits::default());
+        for artifact in artifacts {
+            session.push_artifact(artifact);
+        }
+        session.finish()
+    }
+
+    /// Merges ecosystem reports into one atomic snapshot for persistence.
+    #[must_use]
+    pub fn merge(reports: impl IntoIterator<Item = Self>) -> Self {
+        let mut session = ScanSession::new(ScanLimits::default());
+        for report in reports {
+            for artifact in report.artifacts {
+                session.push_artifact(artifact);
+            }
+            session.diagnostics.extend(report.diagnostics);
+        }
+        session.finish()
+    }
+
     #[must_use]
     pub fn artifacts(&self) -> &[AgentArtifact] {
         &self.artifacts

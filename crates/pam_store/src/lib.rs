@@ -2,6 +2,7 @@
 
 mod error;
 mod evidence;
+mod inventory;
 mod model;
 mod store;
 
@@ -13,6 +14,7 @@ mod migration_test;
 mod store_test;
 
 pub use error::StoreError;
+pub use inventory::{SkillInventoryDrift, StoredAgentArtifact};
 pub use model::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
     ApprovalDecisionOutcome, AuditEventRecord, AuditExport, AuditPruneOutcome, AuthorizationAudit,

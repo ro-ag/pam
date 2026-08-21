@@ -1,10 +1,14 @@
-use std::{cmp::Ordering, error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt, str::FromStr};
 
 use pam_core::ContentDigest;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 256;
 pub const MAX_ARTIFACT_LOGICAL_PATH_BYTES: usize = 4096;
+const ARTIFACT_ID_PREFIX: &str = "artifact:sha256:";
+const ARTIFACT_ID_HEX_BYTES: usize = 64;
+const ARTIFACT_ID_DOMAIN: &[u8] = b"pam-agent-artifact-id-v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +28,27 @@ pub enum ArtifactKind {
     WasmComponent,
 }
 
+impl ArtifactKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Plugin => "plugin",
+            Self::Agent => "agent",
+            Self::Hook => "hook",
+            Self::Instruction => "instruction",
+            Self::Config => "config",
+            Self::Prompt => "prompt",
+            Self::Rule => "rule",
+            Self::Embedding => "embedding",
+            Self::Reranker => "reranker",
+            Self::Compressor => "compressor",
+            Self::Analyzer => "analyzer",
+            Self::WasmComponent => "wasm_component",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactScope {
@@ -35,6 +60,20 @@ pub enum ArtifactScope {
     Plugin,
 }
 
+impl ArtifactScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::System => "system",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Local => "local",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OriginAgent {
@@ -42,6 +81,18 @@ pub enum OriginAgent {
     Codex,
     Cursor,
     Pam,
+}
+
+impl OriginAgent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Pam => "pam",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -58,6 +109,78 @@ pub enum LoadSemantics {
     Unavailable,
 }
 
+impl LoadSemantics {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Explicit => "explicit",
+            Self::ModelSelected => "model_selected",
+            Self::PathConditional => "path_conditional",
+            Self::EventTriggered => "event_triggered",
+            Self::ConfigurationLayer => "configuration_layer",
+            Self::PluginEnabled => "plugin_enabled",
+            Self::DisabledOrInstalledOnly => "disabled_or_installed_only",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+macro_rules! impl_from_str {
+    ($type:ty, $($variant:ident),+ $(,)?) => {
+        impl FromStr for $type {
+            type Err = InvalidArtifactEnum;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                $(if value == Self::$variant.as_str() { return Ok(Self::$variant); })+
+                Err(InvalidArtifactEnum)
+            }
+        }
+    };
+}
+
+impl_from_str!(
+    ArtifactKind,
+    Skill,
+    Plugin,
+    Agent,
+    Hook,
+    Instruction,
+    Config,
+    Prompt,
+    Rule,
+    Embedding,
+    Reranker,
+    Compressor,
+    Analyzer,
+    WasmComponent,
+);
+impl_from_str!(ArtifactScope, Managed, System, User, Project, Local, Plugin);
+impl_from_str!(OriginAgent, ClaudeCode, Codex, Cursor, Pam);
+impl_from_str!(
+    LoadSemantics,
+    Always,
+    Explicit,
+    ModelSelected,
+    PathConditional,
+    EventTriggered,
+    ConfigurationLayer,
+    PluginEnabled,
+    DisabledOrInstalledOnly,
+    Unavailable,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidArtifactEnum;
+
+impl fmt::Display for InvalidArtifactEnum {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown normalized artifact enum value")
+    }
+}
+
+impl Error for InvalidArtifactEnum {}
+
 /// The durable identity of an artifact independent of its content and display metadata.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct AgentArtifactIdentity<'a> {
@@ -66,6 +189,98 @@ pub struct AgentArtifactIdentity<'a> {
     pub scope: ArtifactScope,
     pub logical_path: &'a str,
 }
+
+/// Stable versioned identity used by durable inventory and exact CLI selection.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct AgentArtifactId(String);
+
+impl AgentArtifactId {
+    #[must_use]
+    pub fn from_identity(identity: AgentArtifactIdentity<'_>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(ARTIFACT_ID_DOMAIN);
+        for field in [
+            identity.origin.as_str(),
+            identity.kind.as_str(),
+            identity.scope.as_str(),
+            identity.logical_path,
+        ] {
+            let bytes = field.as_bytes();
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(bytes);
+        }
+        let digest = hasher.finalize();
+        let mut value = String::with_capacity(ARTIFACT_ID_PREFIX.len() + ARTIFACT_ID_HEX_BYTES);
+        value.push_str(ARTIFACT_ID_PREFIX);
+        for byte in digest {
+            use fmt::Write as _;
+            write!(value, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Self(value)
+    }
+
+    /// Parses a canonical stable artifact ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidAgentArtifactId`] for another prefix, an invalid length,
+    /// or non-lowercase hexadecimal digest text.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidAgentArtifactId> {
+        let value = value.into();
+        let Some(hex) = value.strip_prefix(ARTIFACT_ID_PREFIX) else {
+            return Err(InvalidAgentArtifactId);
+        };
+        if hex.len() != ARTIFACT_ID_HEX_BYTES
+            || !hex
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(InvalidAgentArtifactId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AgentArtifactId {
+    type Err = InvalidAgentArtifactId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentArtifactId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidAgentArtifactId;
+
+impl fmt::Display for InvalidAgentArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("artifact ID must be canonical artifact:sha256:<lowercase hex>")
+    }
+}
+
+impl Error for InvalidAgentArtifactId {}
 
 /// A normalized agent artifact discovered by an ecosystem-specific adapter.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -158,6 +373,11 @@ impl AgentArtifact {
             scope: self.scope,
             logical_path: &self.logical_path,
         }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> AgentArtifactId {
+        AgentArtifactId::from_identity(self.identity())
     }
 }
 

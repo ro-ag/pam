@@ -12,6 +12,7 @@ pam_core.workspace = true
 pam_flow.workspace = true
 pam_model.workspace = true
 pam_policy.workspace = true
+pam_skills.workspace = true
 rmp-serde.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true

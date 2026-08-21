@@ -23,7 +23,8 @@ pub use cursor::{
     CursorGlobalRuleSource, CursorGlobalRulesStatus, CursorScanReport, CursorScanRoots, scan_cursor,
 };
 pub use model::{
-    AgentArtifact, AgentArtifactIdentity, ArtifactKind, ArtifactScope, InvalidAgentArtifact,
-    LoadSemantics, MAX_ARTIFACT_LOGICAL_PATH_BYTES, MAX_ARTIFACT_NAME_BYTES, OriginAgent,
+    AgentArtifact, AgentArtifactId, AgentArtifactIdentity, ArtifactKind, ArtifactScope,
+    InvalidAgentArtifact, InvalidAgentArtifactId, InvalidArtifactEnum, LoadSemantics,
+    MAX_ARTIFACT_LOGICAL_PATH_BYTES, MAX_ARTIFACT_NAME_BYTES, OriginAgent,
 };
 pub use scan::{ScanDiagnostic, ScanDiagnosticKind, ScanLimits, ScanReport};

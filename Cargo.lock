@@ -3194,6 +3194,7 @@ dependencies = [
  "pam_flow",
  "pam_model",
  "pam_policy",
+ "pam_skills",
  "rmp-serde",
  "rusqlite",
  "serde",

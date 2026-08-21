@@ -1,5 +1,8 @@
 import type { CatalogDto, CommandFence, SnapshotDataDto, SnapshotDto, ViewId } from "./domain";
 import { sameFence } from "./bridge";
+import { clampSidebarWidth } from "./layout";
+
+export { clampSidebarWidth };
 
 export type LoadState = "loading" | "ready" | "recovering";
 
@@ -21,7 +24,8 @@ export type AppAction =
   | { type: "commandSucceeded"; response: SnapshotDto }
   | { type: "commandFailed"; fence: CommandFence; message: string }
   | { type: "navigate"; view: ViewId }
-  | { type: "resizeSidebar"; width: number }
+  | { type: "resizeSidebar"; width: number; viewportWidth: number }
+  | { type: "setSidebarCollapsed"; collapsed: boolean }
   | { type: "toggleSidebar" }
   | { type: "retry" };
 
@@ -36,10 +40,6 @@ export const initialState: AppState = {
   sidebarCollapsed: false,
   error: null,
 };
-
-export function clampSidebarWidth(width: number): number {
-  return Math.min(368, Math.max(208, Math.round(width / 8) * 8));
-}
 
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
@@ -78,7 +78,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "navigate":
       return { ...state, activeView: action.view };
     case "resizeSidebar":
-      return { ...state, sidebarWidth: clampSidebarWidth(action.width), sidebarCollapsed: false };
+      return { ...state, sidebarWidth: clampSidebarWidth(action.width, action.viewportWidth), sidebarCollapsed: false };
+    case "setSidebarCollapsed":
+      return { ...state, sidebarCollapsed: action.collapsed };
     case "toggleSidebar":
       return { ...state, sidebarCollapsed: !state.sidebarCollapsed };
     case "retry":

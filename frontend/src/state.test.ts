@@ -33,10 +33,27 @@ describe("app reducer", () => {
     expect(next.activeFence?.generation).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  it("keeps sidebar width within the p-track bounds", () => {
-    expect(clampSidebarWidth(40)).toBe(208);
-    expect(clampSidebarWidth(279.6)).toBe(280);
-    expect(clampSidebarWidth(800)).toBe(368);
+  it("keeps sidebar width within the responsive layout bounds", () => {
+    expect(clampSidebarWidth(40, 1_400)).toBe(180);
+    expect(clampSidebarWidth(280.6, 1_400)).toBe(281);
+    expect(clampSidebarWidth(800, 1_400)).toBe(420);
+    expect(clampSidebarWidth(800, 640)).toBe(288);
+
+    const resized = appReducer(
+      { ...initialState, sidebarCollapsed: true },
+      { type: "resizeSidebar", width: 800, viewportWidth: 640 },
+    );
+    expect(resized.sidebarWidth).toBe(288);
+    expect(resized.sidebarCollapsed).toBe(false);
+  });
+
+  it("sets sidebar collapse state explicitly without changing its width", () => {
+    const collapsed = appReducer(initialState, { type: "setSidebarCollapsed", collapsed: true });
+    const expanded = appReducer(collapsed, { type: "setSidebarCollapsed", collapsed: false });
+
+    expect(collapsed.sidebarCollapsed).toBe(true);
+    expect(collapsed.sidebarWidth).toBe(initialState.sidebarWidth);
+    expect(expanded.sidebarCollapsed).toBe(false);
   });
 
   it("bounds and strips control characters from displayed errors", () => {

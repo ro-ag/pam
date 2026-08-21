@@ -26,21 +26,34 @@ describe("visual QA fixture scenarios", () => {
     expect(missing.data.access.status).toBe("unavailable");
   });
 
-  it("renders distinct offline, approval, queued, and active wire states", async () => {
+  it("renders distinct offline, approval, queued, empty, blocked, and active wire states", async () => {
     const offline = await fixtureBridge("offline").bootstrap();
     const approval = await fixtureBridge("approval").bootstrap();
     const queued = await fixtureBridge("queued").bootstrap();
+    const empty = await fixtureBridge("empty").bootstrap();
+    const currentBlocked = await fixtureBridge("current-blocked").bootstrap();
     const active = await fixtureBridge("active").bootstrap();
 
     expect(offline.data.health.status).toBe("offline");
     expect(offline.data.current.status).toBe("unavailable");
     expect(approval.data.current.status).toBe("approval_required");
     expect(queued.data.current).toMatchObject({ status: "available", run: null });
+    expect(empty.data.current).toEqual({ status: "available", queued: [], truncated: false, run: null });
+    expect(currentBlocked.data.current).toMatchObject({
+      status: "blocked",
+      failure: { kind: "blocked", code: "project_current_blocked" },
+    });
     expect(active.data.current).toMatchObject({
       status: "available",
       run: { request: { state: "leased", completedAtMs: null }, outcome: null },
     });
     expect(approval.data.current).toMatchObject({ expiresAtMs: 2_000_000_000_000 });
+  });
+
+  it("keeps startup transport failure separate from protocol snapshots", async () => {
+    await expect(fixtureBridge("startup-error").bootstrap()).rejects.toThrow(
+      "The PAM daemon fixture is unavailable.",
+    );
   });
 
   it("keeps unresolved, blocked, and cancelled terminal reports distinct from solved", async () => {

@@ -22,7 +22,7 @@
         "title": "PAM Project Workspace",
         "width": 1440,
         "height": 900,
-        "minWidth": 800,
+        "minWidth": 320,
         "minHeight": 600,
         "backgroundColor": "#101520",
         "resizable": true,

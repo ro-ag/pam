@@ -1,8 +1,26 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { MAX_EVIDENCE_TEXT } from "./domain";
 import { fixtureBridge } from "./fixtures";
+
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() { return values.size; },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => [...values.keys()][index] ?? null,
+    removeItem: (key) => values.delete(key),
+    setItem: (key, value) => values.set(key, value),
+  };
+}
+
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: memoryStorage(),
+});
 
 function deferred() {
   let resolve!: () => void;
@@ -15,6 +33,8 @@ function deferred() {
 }
 
 describe("control center", () => {
+  beforeEach(() => window.localStorage.clear());
+
   it("renders the p-track spatial grammar and provenance-backed current outcome", async () => {
     render(<App bridge={fixtureBridge()} />);
 
@@ -47,6 +67,70 @@ describe("control center", () => {
     expect(screen.queryByRole("heading", { name: "No current activity" })).not.toBeInTheDocument();
   });
 
+  it("keeps loading inside the shared shell without project claims", () => {
+    render(<App bridge={fixtureBridge("loading")} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Finding the last registered project…");
+    expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
+  });
+
+  it("renders the exact empty current state", async () => {
+    render(<App bridge={fixtureBridge("empty")} />);
+
+    expect(await screen.findByRole("heading", { name: "No current activity" })).toBeInTheDocument();
+    expect(screen.queryByText("Ready for the next agent")).not.toBeInTheDocument();
+  });
+
+  it("renders offline current recovery without an available-state claim", async () => {
+    render(<App bridge={fixtureBridge("offline")} />);
+
+    expect(await screen.findByRole("heading", { name: "Authenticated project state is unavailable" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start PAM" })).toBeEnabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("The authenticated daemon is unavailable for this project.");
+    expect(screen.queryByRole("heading", { name: "Ready for the next agent" })).not.toBeInTheDocument();
+  });
+
+  it("renders a queued-only current state before durable work starts", async () => {
+    render(<App bridge={fixtureBridge("queued")} />);
+
+    expect(await screen.findByRole("heading", { name: "2 project requests are queued" })).toBeInTheDocument();
+    expect(screen.getByText("Next: after-merge-checks. PAM remains on watch while durable work waits.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open project queue" })).toBeEnabled();
+    expect(screen.queryByRole("heading", { name: "No current activity" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a policy-blocked current response distinct from a blocked terminal report", async () => {
+    render(<App bridge={fixtureBridge("current-blocked")} />);
+
+    expect(await screen.findByText(/Project policy blocked access to the bounded current state\./)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Authenticated project state is unavailable" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Run is blocked" })).not.toBeInTheDocument();
+  });
+
+  it("renders unresolved terminal truth without a solved claim", async () => {
+    render(<App bridge={fixtureBridge("unresolved")} />);
+
+    expect(await screen.findByRole("heading", { name: "Run needs follow-up" })).toBeInTheDocument();
+    expect(screen.getByText("Terminal result · follow-up required")).toBeInTheDocument();
+    expect(screen.queryByText("Terminal result · solved")).not.toBeInTheDocument();
+  });
+
+  it("renders cancelled terminal truth without a solved claim", async () => {
+    render(<App bridge={fixtureBridge("cancelled")} />);
+
+    expect(await screen.findByRole("heading", { name: "Run was cancelled" })).toBeInTheDocument();
+    expect(screen.getByText("Terminal result · follow-up required")).toBeInTheDocument();
+    expect(screen.queryByText("Terminal result · solved")).not.toBeInTheDocument();
+  });
+
+  it("renders startup transport failure in the bounded recovery shell", async () => {
+    render(<App bridge={fixtureBridge("startup-error")} />);
+
+    expect(await screen.findByRole("heading", { name: "PAM needs a moment" })).toBeInTheDocument();
+    expect(screen.getByText("The PAM daemon fixture is unavailable.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry safely" })).toBeEnabled();
+  });
+
   it("supports keyboard resizing, view shortcuts, and Escape drawer recovery", async () => {
     const user = userEvent.setup();
     render(<App bridge={fixtureBridge()} />);
@@ -54,18 +138,88 @@ describe("control center", () => {
 
     const separator = screen.getByRole("separator", { name: "Resize project sidebar" });
     fireEvent.keyDown(separator, { key: "ArrowRight" });
-    expect(separator).toHaveAttribute("aria-valuenow", "256");
+    expect(separator).toHaveAttribute("aria-valuenow", "264");
+    expect(window.localStorage.getItem("pam-sidebar-width")).toBe("264");
 
     fireEvent.keyDown(window, { key: "3", metaKey: true });
     expect(await screen.findByRole("heading", { name: "Access" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Open queue" }));
     expect(screen.getByRole("dialog", { name: "Project queue" })).toBeInTheDocument();
-    fireEvent.keyDown(window, { key: "Escape" });
+    await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Project queue" })).not.toBeInTheDocument());
   });
 
+  it("renders the available Access facts supplied by the active project", async () => {
+    render(<App bridge={fixtureBridge("access-available")} initialView="access" />);
+
+    expect(await screen.findByRole("heading", { name: "Access" })).toBeInTheDocument();
+    expect(screen.getByText("Model access")).toBeInTheDocument();
+    expect(screen.getByText("Access policy")).toBeInTheDocument();
+    expect(screen.getByText("Certificates")).toBeInTheDocument();
+    expect(screen.getByText("Network configuration")).toBeInTheDocument();
+    expect(screen.getByText(/Operating-system certificate verifier enabled/)).toBeInTheDocument();
+  });
+
+  it("renders policy-blocked Access without available diagnostics", async () => {
+    render(<App bridge={fixtureBridge("access-blocked")} initialView="access" />);
+
+    expect(await screen.findByRole("heading", { name: "Access" })).toBeInTheDocument();
+    expect(screen.getByText("Access policy")).toBeInTheDocument();
+    expect(screen.getByText("policy-gated")).toBeInTheDocument();
+    expect(screen.getByText(/Network diagnostics are blocked by the selected project's policy/)).toBeInTheDocument();
+    expect(screen.queryByText("Certificates")).not.toBeInTheDocument();
+  });
+
+  it("activates only the newest overlay and restores its underlay and exact openers", async () => {
+    const user = userEvent.setup();
+    const bridge = fixtureBridge();
+    const approvalSnapshot = await fixtureBridge("approval").bootstrap();
+    const refreshGate = deferred();
+    bridge.refreshProject = vi.fn(async (fence) => {
+      await refreshGate.promise;
+      return { fence: structuredClone(fence), data: structuredClone(approvalSnapshot.data) };
+    });
+    render(<App bridge={bridge} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    await user.click(screen.getByRole("button", { name: "Refresh project" }));
+    const queueOpener = screen.getByRole("button", { name: "Open queue" });
+    await user.click(queueOpener);
+    expect(await screen.findByRole("dialog", { name: "Project queue" })).toBeInTheDocument();
+
+    await act(async () => { refreshGate.resolve(); });
+    const approval = await screen.findByRole("dialog", { name: "Approval required" });
+    const queueUnderlay = screen.getByRole("dialog", { name: "Project queue", hidden: true });
+    const approvalLayer = approval.closest<HTMLElement>("[data-application-overlay-layer]");
+    const queueLayer = queueUnderlay.closest<HTMLElement>("[data-application-overlay-layer]");
+    const appShell = document.querySelector<HTMLElement>(".app-shell");
+
+    expect(screen.getAllByRole("dialog")).toEqual([approval]);
+    expect(document.querySelectorAll('[data-application-overlay-layer="active"]')).toHaveLength(1);
+    expect(approvalLayer).toHaveAttribute("data-application-overlay-layer", "active");
+    expect(queueLayer).toHaveAttribute("data-application-overlay-layer", "underlay");
+    expect(queueLayer).toHaveAttribute("aria-hidden", "true");
+    expect(queueLayer).toHaveAttribute("inert");
+    expect(appShell).toHaveAttribute("aria-hidden", "true");
+    expect(appShell).toHaveAttribute("inert");
+
+    await user.keyboard("{Escape}");
+    const restoredQueue = await screen.findByRole("dialog", { name: "Project queue" });
+    await waitFor(() => expect(within(restoredQueue).getByRole("button", { name: "Close Project queue" })).toHaveFocus());
+    expect(screen.queryByRole("dialog", { name: "Approval required" })).not.toBeInTheDocument();
+    expect(appShell).toHaveAttribute("aria-hidden", "true");
+    expect(appShell).toHaveAttribute("inert");
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Project queue" })).not.toBeInTheDocument());
+    expect(queueOpener).toHaveFocus();
+    expect(appShell).not.toHaveAttribute("aria-hidden");
+    expect(appShell).not.toHaveAttribute("inert");
+  });
+
   it("moves focus into and out of the compact sidebar while the workspace is inert", async () => {
+    window.localStorage.setItem("pam-sidebar-collapsed", "false");
     const originalMatchMedia = window.matchMedia;
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
@@ -89,14 +243,76 @@ describe("control center", () => {
 
       const workspace = document.querySelector<HTMLElement>(".workspace");
       const sidebar = screen.getByRole("complementary", { name: "Project navigation" });
-      await waitFor(() => expect(within(sidebar).getByRole("button", { name: "payments-api" })).toHaveFocus());
+      const switcher = within(sidebar).getByRole("button", { name: "payments-api" });
+      await waitFor(() => expect(switcher).toHaveFocus());
       expect(workspace).toHaveAttribute("inert");
       expect(workspace).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByText("Skip to content")).toHaveAttribute("tabindex", "-1");
+      expect(screen.getByRole("button", { name: "Close project sidebar" })).toHaveAttribute("tabindex", "-1");
+      expect(screen.getByRole("separator", { name: "Resize project sidebar" })).toHaveAttribute("tabindex", "-1");
 
-      await user.click(screen.getByRole("button", { name: "Close project sidebar" }));
+      const enabledSidebarButtons = within(sidebar).getAllByRole("button").filter((button) => !button.hasAttribute("disabled"));
+      const lastSidebarButton = enabledSidebarButtons[enabledSidebarButtons.length - 1];
+      await user.tab({ shift: true });
+      expect(lastSidebarButton).toHaveFocus();
+      await user.tab();
+      expect(switcher).toHaveFocus();
+
+      await user.keyboard("{ArrowDown}");
+      await waitFor(() => expect(screen.getByRole("menuitemradio", { name: /payments-api/ })).toHaveFocus());
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Close project sidebar" })).toBeInTheDocument();
+      expect(switcher).toHaveFocus();
+
+      await user.keyboard("{Escape}");
       await waitFor(() => expect(screen.getByRole("button", { name: "Expand sidebar" })).toHaveFocus());
       expect(workspace).not.toHaveAttribute("inert");
       expect(workspace).not.toHaveAttribute("aria-hidden");
+      expect(window.localStorage.getItem("pam-sidebar-collapsed")).toBe("false");
+    } finally {
+      Object.defineProperty(window, "matchMedia", { configurable: true, value: originalMatchMedia });
+    }
+  });
+
+  it("yields compact-sidebar focus containment to an active application overlay", async () => {
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string) => ({
+        matches: query.includes("max-width: 780px"),
+        media: query,
+        onchange: null,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        dispatchEvent: () => false,
+      }),
+    });
+    try {
+      const user = userEvent.setup();
+      const bridge = fixtureBridge();
+      const approvalSnapshot = await fixtureBridge("approval").bootstrap();
+      const refreshGate = deferred();
+      bridge.refreshProject = vi.fn(async (fence) => {
+        await refreshGate.promise;
+        return { fence: structuredClone(fence), data: structuredClone(approvalSnapshot.data) };
+      });
+      render(<App bridge={bridge} />);
+      await screen.findByRole("heading", { name: "payments-api" });
+
+      await user.click(screen.getByRole("button", { name: "Refresh project" }));
+      await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+      const sidebar = screen.getByRole("complementary", { name: "Project navigation" });
+      await waitFor(() => expect(within(sidebar).getByRole("button", { name: "payments-api" })).toHaveFocus());
+
+      await act(async () => { refreshGate.resolve(); });
+      const dialog = await screen.findByRole("dialog", { name: "Approval required" });
+      await waitFor(() => expect(within(dialog).getByRole("button", { name: "Close Approval required" })).toHaveFocus());
+      await user.tab();
+      expect(dialog).toContainElement(document.activeElement as HTMLElement);
+      expect(sidebar).not.toContainElement(document.activeElement as HTMLElement);
     } finally {
       Object.defineProperty(window, "matchMedia", { configurable: true, value: originalMatchMedia });
     }
@@ -145,18 +361,94 @@ describe("control center", () => {
     expect(await screen.findByRole("heading", { name: "docs" })).toBeInTheDocument();
   });
 
+  it("filters and runs command-palette actions with keyboard focus restoration", async () => {
+    const user = userEvent.setup();
+    render(<App bridge={fixtureBridge()} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+    const commandOpener = screen.getByRole("button", { name: "Open command palette (⌘K)" });
+    commandOpener.focus();
+
+    await user.keyboard("{Control>}k{/Control}");
+    let palette = await screen.findByRole("dialog", { name: "Command palette" });
+    let search = within(palette).getByRole("searchbox", { name: "Search commands" });
+    await waitFor(() => expect(search).toHaveFocus());
+    await user.type(search, "access");
+    expect(within(palette).getAllByRole("option")).toHaveLength(1);
+    const accessCommand = within(palette).getByRole("option", { name: /Open Access/ });
+    await user.keyboard("{ArrowDown}");
+    await waitFor(() => expect(accessCommand).toHaveFocus());
+    await user.keyboard("{Enter}");
+
+    expect(await screen.findByRole("heading", { name: "Access" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+    await waitFor(() => expect(commandOpener).toHaveFocus());
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    palette = await screen.findByRole("dialog", { name: "Command palette" });
+    search = within(palette).getByRole("searchbox", { name: "Search commands" });
+    await user.type(search, "queue");
+    const queueCommand = within(palette).getByRole("option", { name: /Open project queue/ });
+    await user.keyboard("{ArrowUp}");
+    await waitFor(() => expect(queueCommand).toHaveFocus());
+    await user.keyboard("{Enter}");
+
+    expect(await screen.findByRole("dialog", { name: "Project queue" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Command palette", hidden: true })).not.toBeInTheDocument();
+    expect(document.querySelectorAll('[data-application-overlay-layer="underlay"]')).toHaveLength(0);
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
   it("loads bounded evidence as escaped text", async () => {
     const user = userEvent.setup();
     render(<App bridge={fixtureBridge()} />);
     await screen.findByRole("heading", { name: "payments-api" });
 
     const opener = screen.getByRole("button", { name: "Open Evidence 1" });
+    expect(opener).toHaveAccessibleDescription("44444444-4444-4444-8444-444444444444");
     await user.click(opener);
     expect(await screen.findByRole("dialog", { name: "Evidence" })).toBeInTheDocument();
     expect(await screen.findByText(/Null currency in fixture/)).toBeInTheDocument();
     expect(document.querySelector(".evidence-document pre script")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Close Evidence" }));
     await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("keeps retryable evidence failure inside the bounded drawer", async () => {
+    const user = userEvent.setup();
+    render(<App bridge={fixtureBridge("evidence-failed")} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    await user.click(screen.getByRole("button", { name: "Open Evidence 1" }));
+    const drawer = await screen.findByRole("dialog", { name: "Evidence" });
+    expect(within(drawer).getByRole("alert")).toHaveTextContent("The bounded evidence preview could not be loaded.");
+    expect(within(drawer).getByRole("button", { name: "Retry evidence" })).toBeEnabled();
+  });
+
+  it("renders binary evidence metadata without inventing a text preview", async () => {
+    const user = userEvent.setup();
+    render(<App bridge={fixtureBridge("evidence-binary")} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    await user.click(screen.getByRole("button", { name: "Open Evidence 1" }));
+    const drawer = await screen.findByRole("dialog", { name: "Evidence" });
+    expect(within(drawer).getByRole("heading", { name: "Binary evidence metadata" })).toBeInTheDocument();
+    expect(within(drawer).getByText(/application\/octet-stream/)).toBeInTheDocument();
+    expect(within(drawer).getByText("This evidence has no text preview.")).toBeInTheDocument();
+  });
+
+  it("bounds truncated evidence text and labels the preview", async () => {
+    const user = userEvent.setup();
+    render(<App bridge={fixtureBridge("evidence-truncated")} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    await user.click(screen.getByRole("button", { name: "Open Evidence 1" }));
+    const drawer = await screen.findByRole("dialog", { name: "Evidence" });
+    expect(within(drawer).getByText(/bounded preview/)).toBeInTheDocument();
+    const preview = drawer.querySelector(".evidence-document pre");
+    expect(preview).not.toBeNull();
+    expect(preview).toHaveTextContent("retained evidence line");
+    expect(preview?.textContent).toHaveLength(MAX_EVIDENCE_TEXT);
+    expect(preview).not.toHaveTextContent("preview stops at the bounded read limit");
   });
 
   it("hides evidence retry when a mismatched response invalidates the handle", async () => {
@@ -186,11 +478,14 @@ describe("control center", () => {
     expect(within(dialog).queryByText(/fixture-request/)).not.toBeInTheDocument();
   });
 
-  it("traps drawer focus and returns it to the approval opener", async () => {
+  it("keeps auto approval dismissed until explicit reopen, then restores focus", async () => {
     const user = userEvent.setup();
     render(<App bridge={fixtureBridge("approval")} />);
     const initialDialog = await screen.findByRole("dialog", { name: "Approval required" });
     await user.click(within(initialDialog).getByRole("button", { name: "Close Approval required" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Approval required" })).not.toBeInTheDocument());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByRole("dialog", { name: "Approval required" })).not.toBeInTheDocument();
     const opener = screen.getByRole("button", { name: "Review exact effect" });
     await user.click(opener);
     const dialog = await screen.findByRole("dialog", { name: "Approval required" });
@@ -220,7 +515,7 @@ describe("control center", () => {
     const dialog = await screen.findByRole("dialog", { name: "Approval required" });
     await user.click(within(dialog).getByRole("button", { name: "Approve exact request" }));
 
-    expect(await screen.findByText(/Approval response was not observed/)).toBeInTheDocument();
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Approval response was not observed");
     expect(screen.getByRole("dialog", { name: "Approval required" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Approve exact request" }));
     expect(await screen.findByRole("heading", { name: "Ready for the next agent" })).toBeInTheDocument();
@@ -330,20 +625,27 @@ describe("control center", () => {
     const user = userEvent.setup();
     const bridge = fixtureBridge();
     const originalLoadEvidence = bridge.loadEvidence.bind(bridge);
-    const gate = deferred();
+    const loadGate = deferred();
+    const activateGate = deferred();
     bridge.loadEvidence = vi.fn(async (fence, handle) => {
-      await gate.promise;
+      await loadGate.promise;
       return originalLoadEvidence(fence, handle);
+    });
+    const originalActivateProject = bridge.activateProject.bind(bridge);
+    bridge.activateProject = vi.fn(async (handle, operationId) => {
+      await activateGate.promise;
+      return originalActivateProject(handle, operationId);
     });
     render(<App bridge={bridge} />);
     await screen.findByRole("heading", { name: "payments-api" });
 
-    await user.click(screen.getByRole("button", { name: "Open Evidence 1" }));
     await user.click(screen.getByRole("button", { name: "payments-api" }));
     await user.click(screen.getByRole("menuitemradio", { name: /ledger-web/ }));
+    await user.click(screen.getByRole("button", { name: "Open Evidence 1" }));
+    await act(async () => { activateGate.resolve(); });
     expect(await screen.findByRole("heading", { name: "ledger-web" })).toBeInTheDocument();
 
-    await act(async () => { gate.resolve(); });
+    await act(async () => { loadGate.resolve(); });
     expect(screen.queryByRole("dialog", { name: "Evidence" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Null currency in fixture/)).not.toBeInTheDocument();
   });
@@ -365,8 +667,19 @@ describe("control center", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Validate" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Validate" }));
     expect(await screen.findByText(/Valid · 1 dry-run steps/)).toBeInTheDocument();
-    await user.click(screen.getByRole("tab", { name: /Version diff · changed/ }));
-    expect(screen.getByRole("tabpanel", { name: "Version diff" })).toHaveTextContent("revision = 4");
+    const dryRunTab = screen.getByRole("tab", { name: "Dry run" });
+    const diffTab = screen.getByRole("tab", { name: /Version diff · changed/ });
+    dryRunTab.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(diffTab).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{ArrowLeft}");
+    expect(dryRunTab).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{End}");
+    expect(diffTab).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Home}");
+    expect(dryRunTab).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tabpanel", { name: /Version diff · changed/ })).toHaveTextContent("revision = 4");
     await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText(/saved durably/i)).toBeInTheDocument();

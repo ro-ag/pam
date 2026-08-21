@@ -69,10 +69,12 @@ export const fixtureScenarios = [
   "missing-credential",
   "approval",
   "queued",
+  "empty",
   "active",
   "solved",
   "unresolved",
   "blocked",
+  "current-blocked",
   "cancelled",
   "access-available",
   "access-blocked",
@@ -81,6 +83,7 @@ export const fixtureScenarios = [
   "evidence-failed",
   "evidence-binary",
   "evidence-truncated",
+  "startup-error",
 ] as const;
 
 export type FixtureScenario = typeof fixtureScenarios[number];
@@ -208,6 +211,20 @@ function snapshot(project: ProjectSummaryDto, daemonRunning: boolean, scenario: 
   if (scenario === "queued") {
     data.current = { status: "available", queued: data.current.status === "available" ? data.current.queued : [], truncated: false, run: null };
   }
+  if (scenario === "empty") {
+    data.current = { status: "available", queued: [], truncated: false, run: null };
+  }
+  if (scenario === "current-blocked") {
+    data.current = {
+      status: "blocked",
+      failure: {
+        kind: "blocked",
+        code: "project_current_blocked",
+        detail: "Project policy blocked access to the bounded current state.",
+        recovery: "Grant project.current for this GUI caller and project, then retry.",
+      },
+    };
+  }
   if (scenario === "active" && data.current.status === "available" && data.current.run) {
     data.current = {
       ...data.current,
@@ -260,6 +277,7 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
     mode: "fixture",
     async bootstrap() {
       if (scenario === "loading") return new Promise(() => {});
+      if (scenario === "startup-error") throw new Error("The PAM daemon fixture is unavailable.");
       return fenceResponse(currentFence("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), snapshot(active, daemonRunning, scenario));
     },
     async catalog(): Promise<CatalogDto> {

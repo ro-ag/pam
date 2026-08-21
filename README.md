@@ -219,6 +219,11 @@ for seven days; because this repository is public, those artifacts are public
 to repository readers. They are previews, not a tagged GitHub Release, and no
 package registry is published.
 
+Plan 13 UI acceptance is intentionally separate from this distribution matrix:
+it records current native-renderer evidence on the available macOS host and
+Parallels Ubuntu guest, without claiming Windows or duplicate CPU architectures
+as independently exercised UI surfaces.
+
 Project continuity still requires a local `ptrack` installation. Desktop
 launches resolve it from an explicit absolute `PAM_PTRACK_EXECUTABLE`, beside
 the application, common per-user install directories such as `~/.local/bin`,

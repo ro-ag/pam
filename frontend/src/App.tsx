@@ -477,7 +477,7 @@ export function App({ bridge, initialView = "current" }: AppProps) {
           {state.loadState === "recovering" && state.error && <div className="inline-recovery" role="alert"><WarningCircle size={18} /><span>{state.error}</span><button type="button" onClick={refresh}>Retry</button></div>}
           {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} onOpenQueue={openQueue} onOpenApproval={() => { if (approvalKey && overlayAuthority) openOverlay({ id: `approval:${approvalKey}`, kind: "approval", authority: overlayAuthority, approvalKey }, false, true); }} onRecoverDaemon={toggleDaemon} onRefresh={refresh} onRegisterCaller={registerGuiCaller} registrationBusy={pending} />}
           {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
-          {state.activeView === "access" && <AccessView data={data} />}
+          {state.activeView === "access" && <AccessView data={data} bridge={bridge} fence={state.activeFence} />}
         </section>
       </div>
       {effectiveOverlays.stack.map((entry) => {

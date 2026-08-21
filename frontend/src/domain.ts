@@ -197,6 +197,36 @@ export interface FlowSaveDataDto {
 
 export type FlowSaveDto = FencedResponse<FlowSaveDataDto>;
 
+export interface SkillArtifactDto {
+  id: string;
+  name: string;
+  logicalPath: string;
+  kind: string;
+  scope: string;
+  origin: string;
+  loadSemantics: string;
+  contentHash: string;
+  firstSeenAtMs: number;
+  lastChangedAtMs: number;
+}
+
+export interface SkillInventoryDriftDto {
+  added: number;
+  changed: number;
+  removed: number;
+  resurrected: number;
+}
+
+export interface SkillInventoryDataDto {
+  artifacts: SkillArtifactDto[];
+  total: number;
+  truncated: boolean;
+  drift: SkillInventoryDriftDto;
+  cursorGlobalRulesStatus: "not_locally_discoverable" | "explicitly_configured";
+}
+
+export type SkillInventoryDto = FencedResponse<SkillInventoryDataDto>;
+
 export interface PamBridge {
   readonly mode: BridgeMode;
   bootstrap(): Promise<SnapshotDto>;
@@ -209,6 +239,7 @@ export interface PamBridge {
   decideApproval(fence: CommandFence, approvalHandle: string, decision: ApprovalDecision): Promise<ApprovalDecisionResponseDto>;
   loadEvidence(fence: CommandFence, evidenceHandle: string): Promise<EvidenceDto>;
   loadFlowWorkspace(fence: CommandFence): Promise<FlowWorkspaceDto>;
+  loadSkillInventory(fence: CommandFence): Promise<SkillInventoryDto>;
   openFlow(fence: CommandFence, flowHandle: string): Promise<FlowDocumentDto>;
   validateFlow(fence: CommandFence, documentHandle: string, source: string): Promise<FlowReviewDto>;
   saveFlow(fence: CommandFence, documentHandle: string, source: string): Promise<FlowSaveDto>;

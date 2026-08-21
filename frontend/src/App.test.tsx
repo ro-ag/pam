@@ -39,7 +39,9 @@ describe("control center", () => {
     render(<App bridge={fixtureBridge()} />);
 
     expect(await screen.findByRole("heading", { name: "payments-api" })).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    const navigation = screen.getByRole("navigation", { name: "Primary" });
+    expect(within(navigation).getAllByRole("button").map((button) => button.getAttribute("aria-label")))
+      .toEqual(["Current", "Flows", "Access"]);
     expect(screen.getByRole("separator", { name: "Resize project sidebar" })).toHaveAttribute("aria-valuenow", "248");
     expect(screen.getByRole("heading", { name: "Ready for the next agent" })).toBeInTheDocument();
     expect(screen.getByText("SOLVED")).toBeInTheDocument();

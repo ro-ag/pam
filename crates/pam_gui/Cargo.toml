@@ -9,6 +9,7 @@ autobins = false
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
+directories.workspace = true
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true
@@ -17,6 +18,8 @@ pam_daemon.workspace = true
 pam_flow.workspace = true
 pam_platform.workspace = true
 pam_protocol.workspace = true
+pam_skills.workspace = true
+pam_store.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

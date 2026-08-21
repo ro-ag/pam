@@ -280,6 +280,19 @@ async fn operation_generation_and_project_switches_are_fenced() {
     assert!(reserve_for_test(&core, &stale_project).await.is_err());
 }
 
+#[tokio::test]
+async fn skill_inventory_rejects_a_stale_project_before_scanning() {
+    let project = ProjectHandle::new();
+    let generation = GenerationId::new();
+    let core = active_core_for_test(&project, generation.clone());
+    let stale = CommandFence::new(project.clone(), generation, OperationId::new());
+    switch_authority_for_test(&core, ProjectHandle::new(), GenerationId::new()).await;
+
+    let error = core.skill_inventory(stale).await.unwrap_err();
+
+    assert_eq!(error.kind, super::desktop::DesktopErrorKind::Stale);
+}
+
 #[test]
 fn approval_dto_exposes_no_credential_envelope_or_project_authority() {
     let request = RequestEnvelope::project_current(

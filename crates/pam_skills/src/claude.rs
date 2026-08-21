@@ -242,11 +242,6 @@ fn scan_plugin(session: &mut ScanSession, plugin: &ClaudePluginRoot<'_>) {
             ArtifactScope::Plugin,
             LoadSemantics::PluginEnabled,
         );
-    } else {
-        session.diagnostic(
-            &format!("plugins/{}/.claude-plugin/plugin.json", plugin.id),
-            ScanDiagnosticKind::MissingPluginManifest,
-        );
     }
 
     let skills = session.walk_files(&root, Path::new("skills"), |path| {
@@ -294,6 +289,37 @@ fn scan_plugin(session: &mut ScanSession, plugin: &ClaudePluginRoot<'_>) {
             ArtifactScope::Plugin,
             LoadSemantics::EventTriggered,
         );
+    }
+
+    let rules = session.walk_files(&root, Path::new("rules"), is_markdown);
+    for path in rules {
+        if let Some(file) = session.read_optional_file(&root, &path) {
+            let name = path.file_stem().and_then(|name| name.to_str());
+            let semantics = rule_semantics(session, &file);
+            add_file_artifact(
+                session,
+                file,
+                name,
+                ArtifactKind::Rule,
+                ArtifactScope::Plugin,
+                semantics,
+            );
+        }
+    }
+
+    let instructions = session.walk_files(&root, Path::new("instructions"), is_markdown);
+    for path in instructions {
+        if let Some(file) = session.read_optional_file(&root, &path) {
+            let name = path.file_stem().and_then(|name| name.to_str());
+            add_file_artifact(
+                session,
+                file,
+                name,
+                ArtifactKind::Instruction,
+                ArtifactScope::Plugin,
+                LoadSemantics::Always,
+            );
+        }
     }
 }
 

@@ -272,12 +272,9 @@ fn artifact_and_file_limits_produce_partial_sorted_output() {
 }
 
 #[test]
-fn invalid_plugin_id_and_missing_manifest_are_typed_diagnostics() {
+fn invalid_plugin_id_is_a_typed_diagnostic() {
     let plugin = TestDirectory::new("claude-plugin-invalid");
-    let plugins = [
-        ClaudePluginRoot::new("../escape", plugin.path()),
-        ClaudePluginRoot::new("missing-manifest", plugin.path()),
-    ];
+    let plugins = [ClaudePluginRoot::new("../escape", plugin.path())];
     let report = scan_claude_code(
         ClaudeScanRoots::new(None, None, &plugins),
         ScanLimits::default(),
@@ -290,12 +287,108 @@ fn invalid_plugin_id_and_missing_manifest_are_typed_diagnostics() {
             .iter()
             .any(|diagnostic| { diagnostic.kind() == ScanDiagnosticKind::InvalidPluginId })
     );
-    assert!(
-        report
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| { diagnostic.kind() == ScanDiagnosticKind::MissingPluginManifest })
+}
+
+#[test]
+fn manifestless_enabled_plugin_scans_component_directories() {
+    let plugin = TestDirectory::new("claude-plugin-manifestless");
+    plugin.write("skills/audit/SKILL.md", b"# Audit\n");
+    plugin.write("agents/reviewer.md", b"# Reviewer\n");
+    plugin.write("hooks/hooks.json", br#"{"hooks":{}}"#);
+    plugin.write(
+        "rules/rust/path.md",
+        b"---\npaths:\n  - crates/**/*.rs\n---\nUse clippy.\n",
     );
+    plugin.write("instructions/release.md", b"Release carefully.\n");
+    let plugins = [ClaudePluginRoot::new("quality", plugin.path())];
+
+    let report = scan_claude_code(
+        ClaudeScanRoots::new(None, None, &plugins),
+        ScanLimits::default(),
+    );
+    assert!(report.complete(), "{:?}", report.diagnostics());
+    assert_eq!(report.artifacts().len(), 5);
+    assert!(!report.artifacts().iter().any(|artifact| {
+        artifact.kind() == ArtifactKind::Plugin
+            || artifact
+                .logical_path()
+                .contains(".claude-plugin/plugin.json")
+    }));
+    artifact(
+        report.artifacts(),
+        "plugins/quality/skills/audit/SKILL.md",
+        ArtifactKind::Skill,
+        ArtifactScope::Plugin,
+    );
+    artifact(
+        report.artifacts(),
+        "plugins/quality/agents/reviewer.md",
+        ArtifactKind::Agent,
+        ArtifactScope::Plugin,
+    );
+    artifact(
+        report.artifacts(),
+        "plugins/quality/hooks/hooks.json",
+        ArtifactKind::Hook,
+        ArtifactScope::Plugin,
+    );
+    assert_eq!(
+        artifact(
+            report.artifacts(),
+            "plugins/quality/rules/rust/path.md",
+            ArtifactKind::Rule,
+            ArtifactScope::Plugin,
+        )
+        .load_semantics(),
+        LoadSemantics::PathConditional
+    );
+    assert_eq!(
+        artifact(
+            report.artifacts(),
+            "plugins/quality/instructions/release.md",
+            ArtifactKind::Instruction,
+            ArtifactScope::Plugin,
+        )
+        .load_semantics(),
+        LoadSemantics::Always
+    );
+}
+
+#[test]
+fn empty_manifestless_enabled_plugin_is_complete_without_a_plugin_artifact() {
+    let plugin = TestDirectory::new("claude-plugin-empty-manifestless");
+    let plugins = [ClaudePluginRoot::new("empty", plugin.path())];
+
+    let report = scan_claude_code(
+        ClaudeScanRoots::new(None, None, &plugins),
+        ScanLimits::default(),
+    );
+    assert!(report.complete(), "{:?}", report.diagnostics());
+    assert!(report.artifacts().is_empty());
+}
+
+#[test]
+fn malformed_existing_plugin_manifest_remains_a_typed_diagnostic() {
+    let plugin = TestDirectory::new("claude-plugin-malformed-manifest");
+    plugin.write(".claude-plugin/plugin.json", br#"{"name":"broken""#);
+    let plugins = [ClaudePluginRoot::new("broken", plugin.path())];
+
+    let report = scan_claude_code(
+        ClaudeScanRoots::new(None, None, &plugins),
+        ScanLimits::default(),
+    );
+    assert!(!report.complete());
+    assert_eq!(report.artifacts().len(), 1);
+    artifact(
+        report.artifacts(),
+        "plugins/broken/.claude-plugin/plugin.json",
+        ArtifactKind::Plugin,
+        ArtifactScope::Plugin,
+    );
+    assert!(report.diagnostics().iter().any(|diagnostic| {
+        diagnostic.kind() == ScanDiagnosticKind::InvalidJson
+            && diagnostic.logical_path() == "plugins/broken/.claude-plugin/plugin.json"
+    }));
 }
 
 #[test]

@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
     env,
+    error::Error,
+    fmt,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -17,8 +19,19 @@ use crate::github::{
     CollectRunLogs, CollectRunLogsRequest, DiscoverFailedRuns, DiscoverRunsRequest, GitHubActions,
     GitHubTransport, MAX_DISCOVERED_RUNS, MAX_JOB_STEPS, MAX_LOG_BYTES_PER_JOB, Repository,
     ReqwestGitHubTransport, RerunDisposition, RerunFailedJobs, RerunFailedJobsRequest, RunId,
-    TransportRequest, TransportResponse,
+    TransportRequest, TransportResponse, classify_transport_failure, rate_limit_delay_at,
 };
+
+#[derive(Debug)]
+struct SyntheticTransportError(&'static str);
+
+impl fmt::Display for SyntheticTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for SyntheticTransportError {}
 
 #[derive(Debug)]
 struct SeenRequest {
@@ -384,6 +397,118 @@ async fn rate_limits_and_unsafe_log_redirects_are_typed_without_leaking_targets(
         .unwrap();
     assert!(!output.truth().is_complete());
     assert!(!format!("{:?}", output.truth()).contains("signature=secret"));
+}
+
+#[tokio::test]
+async fn secondary_rate_limits_and_reset_deadlines_produce_bounded_backoff() {
+    let reset = TransportResponse::new(
+        403,
+        vec![("X-RateLimit-Reset".to_owned(), "150".to_owned())],
+        Vec::new(),
+    );
+    assert_eq!(
+        rate_limit_delay_at(&reset, 100),
+        Some(Duration::from_secs(50))
+    );
+    assert_eq!(
+        rate_limit_delay_at(&reset, 200),
+        Some(Duration::from_secs(0))
+    );
+    let capped = TransportResponse::new(
+        403,
+        vec![("X-RateLimit-Reset".to_owned(), u64::MAX.to_string())],
+        Vec::new(),
+    );
+    assert_eq!(
+        rate_limit_delay_at(&capped, 0),
+        Some(Duration::from_hours(24))
+    );
+
+    let connector = connector(FakeTransport::new([Reply::Response(
+        TransportResponse::new(
+            403,
+            vec![("Retry-After".to_owned(), "7".to_owned())],
+            Vec::new(),
+        ),
+    )]));
+    let request = DiscoverRunsRequest::new(Repository::parse("ro-ag/pam").unwrap(), 1).unwrap();
+    let result = Connector::<DiscoverFailedRuns>::execute(&connector, request, context()).await;
+    let Err(failure) = result else {
+        panic!("secondary rate limit must fail with backoff")
+    };
+    assert_eq!(failure.kind(), FailureKind::RateLimit);
+    assert_eq!(
+        failure.retry_guidance(),
+        RetryGuidance::AfterBackoff {
+            delay: Some(Duration::from_secs(7))
+        }
+    );
+}
+
+#[test]
+fn timeout_certificate_network_and_remote_failures_are_distinct() {
+    let certificate = SyntheticTransportError("invalid peer certificate: unknown issuer");
+    let network = SyntheticTransportError("connection refused");
+    assert_eq!(
+        classify_transport_failure(&certificate, false, true),
+        FailureKind::Certificate
+    );
+    assert_eq!(
+        classify_transport_failure(&network, true, true),
+        FailureKind::Timeout
+    );
+    assert_eq!(
+        classify_transport_failure(&network, false, true),
+        FailureKind::Network
+    );
+    assert_eq!(
+        classify_transport_failure(&network, false, false),
+        FailureKind::Remote
+    );
+}
+
+#[tokio::test]
+async fn certificate_and_timeout_log_failures_preserve_successful_partial_data() {
+    let jobs = format!(
+        r#"{{"total_count":3,"jobs":[{},{},{}]}}"#,
+        job_json(3, "first", "failure"),
+        job_json(5, "second", "failure"),
+        job_json(7, "third", "failure")
+    );
+    let connector = connector(FakeTransport::new([
+        response(200, run_json(42, 1, "CI")),
+        response(200, jobs),
+        redirect("https://results.example.test/job-3"),
+        response(200, b"exact first log".to_vec()),
+        redirect("https://results.example.test/job-5"),
+        Reply::Failure(super::ConnectorFailure::certificate(
+            super::FailureMessage::new("certificate verification failed").unwrap(),
+        )),
+        redirect("https://results.example.test/job-7"),
+        Reply::Failure(super::ConnectorFailure::timeout()),
+    ]));
+    let request = CollectRunLogsRequest::new(
+        Repository::parse("ro-ag/pam").unwrap(),
+        RunId::new(42).unwrap(),
+        3,
+        1024,
+        3072,
+    )
+    .unwrap();
+
+    let output = Connector::<CollectRunLogs>::execute(&connector, request, context())
+        .await
+        .unwrap();
+
+    assert!(!output.truth().is_complete());
+    assert_eq!(output.value().jobs().len(), 3);
+    assert_eq!(output.value().logs().len(), 1);
+    assert_eq!(output.artifacts().len(), 1);
+    assert_eq!(output.artifacts()[0].bytes(), b"exact first log");
+    let partial = format!("{:?}", output.truth());
+    assert!(partial.contains("Certificate"));
+    assert!(partial.contains("Timeout"));
+    assert!(connector.transport().is_empty());
 }
 
 #[tokio::test]

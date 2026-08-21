@@ -1,6 +1,12 @@
 //! Typed GitHub Actions operations.
 
-use std::{collections::BTreeMap, error::Error, fmt, num::NonZeroU64, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    num::NonZeroU64,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -8,9 +14,9 @@ use url::Url;
 
 use crate::{
     ApprovalId, BoundedSummary, CapabilityName, Connector, ConnectorDescriptor, ConnectorFailure,
-    ConnectorFuture, ConnectorOutput, ExactArtifact, FailureMessage, IdempotencyDeclaration,
-    InvocationContext, Operation, OperationCoordinates, OperationEffect, ReconciliationDeclaration,
-    ResourceName, StatefulContract, Truth,
+    ConnectorFuture, ConnectorOutput, ExactArtifact, FailureKind, FailureMessage,
+    IdempotencyDeclaration, InvocationContext, Operation, OperationCoordinates, OperationEffect,
+    ReconciliationDeclaration, ResourceName, StatefulContract, Truth,
 };
 
 pub const GITHUB_API_VERSION: &str = "2026-03-10";
@@ -1225,7 +1231,9 @@ fn require_status(
     let message = safe_message("GitHub API request failed");
     match response.status {
         401 => Err(ConnectorFailure::authentication(message)),
-        403 if response.header("x-ratelimit-remaining") == Some("0") => {
+        403 if response.header("x-ratelimit-remaining") == Some("0")
+            || response.header("retry-after").is_some() =>
+        {
             Err(ConnectorFailure::rate_limit(message, retry_delay(response)))
         }
         403 => Err(ConnectorFailure::forbidden(message)),
@@ -1237,20 +1245,83 @@ fn require_status(
 }
 
 fn retry_delay(response: &TransportResponse) -> Option<Duration> {
-    response
+    rate_limit_delay_at(response, unix_time_seconds())
+}
+
+pub(crate) fn rate_limit_delay_at(
+    response: &TransportResponse,
+    now_epoch_seconds: u64,
+) -> Option<Duration> {
+    if let Some(delay) = response
         .header("retry-after")
         .and_then(|value| value.parse::<u64>().ok())
         .map(|seconds| Duration::from_secs(seconds.min(24 * 60 * 60)))
+    {
+        return Some(delay);
+    }
+    response
+        .header("x-ratelimit-reset")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|reset| Duration::from_secs(reset.saturating_sub(now_epoch_seconds).min(24 * 60 * 60)))
 }
 
 fn map_reqwest_failure(error: &reqwest::Error) -> ConnectorFailure {
-    if error.is_timeout() {
-        ConnectorFailure::timeout()
-    } else if error.is_connect() {
-        ConnectorFailure::network(safe_message("GitHub network connection failed"))
-    } else {
-        ConnectorFailure::remote(safe_message("GitHub HTTP request failed"), true)
+    match classify_transport_failure(error, error.is_timeout(), error.is_connect()) {
+        FailureKind::Timeout => ConnectorFailure::timeout(),
+        FailureKind::Certificate => {
+            ConnectorFailure::certificate(safe_message("GitHub certificate verification failed"))
+        }
+        FailureKind::Network => {
+            ConnectorFailure::network(safe_message("GitHub network connection failed"))
+        }
+        FailureKind::Remote => {
+            ConnectorFailure::remote(safe_message("GitHub HTTP request failed"), true)
+        }
+        _ => unreachable!("transport classifier returned a non-transport failure"),
     }
+}
+
+pub(crate) fn classify_transport_failure(
+    error: &(dyn Error + 'static),
+    is_timeout: bool,
+    is_connect: bool,
+) -> FailureKind {
+    if is_timeout {
+        FailureKind::Timeout
+    } else if error_chain_indicates_certificate(error) {
+        FailureKind::Certificate
+    } else if is_connect {
+        FailureKind::Network
+    } else {
+        FailureKind::Remote
+    }
+}
+
+fn error_chain_indicates_certificate(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        let message = source.to_string().to_ascii_lowercase();
+        if [
+            "certificate",
+            "cert verify",
+            "certverify",
+            "unknown issuer",
+            "invalid peer cert",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn validate_run(run: &WorkflowRun) -> Result<(), ConnectorFailure> {

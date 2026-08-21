@@ -49,6 +49,8 @@ pub enum ScanDiagnosticKind {
     InvalidArtifact,
     InvalidJson,
     InvalidPluginId,
+    InvalidProjectRootRelation,
+    InvalidToml,
     MissingPluginManifest,
     NonUtf8Content,
     NonUtf8Path,
@@ -58,8 +60,10 @@ pub enum ScanDiagnosticKind {
     RootUnavailable,
     TraversalDepthExceeded,
     UnsafeFileType,
+    UnsafeFallbackFilename,
     UnsafePath,
     UnsafeSymlink,
+    UntrustedProjectConfig,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -116,6 +120,10 @@ pub(crate) struct RootedPath {
 }
 
 impl RootedPath {
+    pub(crate) fn canonical_path(&self) -> &Path {
+        &self.root
+    }
+
     fn logical_path(&self, relative: &Path) -> Result<String, ScanDiagnosticKind> {
         let relative = relative_to_logical(relative)?;
         if self.logical_prefix.is_empty() {
@@ -264,6 +272,35 @@ impl ScanSession {
         })
     }
 
+    pub(crate) fn inspect_optional_file(
+        &mut self,
+        root: &RootedPath,
+        relative: &Path,
+    ) -> Option<String> {
+        let diagnostic_path = root
+            .logical_path(relative)
+            .unwrap_or_else(|_| "<invalid-path>".to_owned());
+        let candidate = match Self::resolve(root, relative, false) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return None,
+            Err(kind) => {
+                self.diagnostic(&diagnostic_path, kind);
+                return None;
+            }
+        };
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.is_file() => Some(diagnostic_path),
+            Ok(_) => {
+                self.diagnostic(&diagnostic_path, ScanDiagnosticKind::UnsafeFileType);
+                None
+            }
+            Err(_) => {
+                self.diagnostic(&diagnostic_path, ScanDiagnosticKind::ReadFile);
+                None
+            }
+        }
+    }
+
     pub(crate) fn walk_files<F>(
         &mut self,
         root: &RootedPath,
@@ -333,6 +370,69 @@ impl ScanSession {
             }
         }
         files.sort_unstable();
+        files
+    }
+
+    pub(crate) fn list_files<F>(
+        &mut self,
+        root: &RootedPath,
+        relative_directory: &Path,
+        mut include: F,
+    ) -> Vec<PathBuf>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        let directory = match Self::resolve(root, relative_directory, true) {
+            Ok(Some(directory)) => directory,
+            Ok(None) => return Vec::new(),
+            Err(kind) => {
+                let path = root
+                    .logical_path(relative_directory)
+                    .unwrap_or_else(|_| "<invalid-path>".to_owned());
+                self.diagnostic(&path, kind);
+                return Vec::new();
+            }
+        };
+        let Ok(entries) = fs::read_dir(directory) else {
+            let path = root
+                .logical_path(relative_directory)
+                .unwrap_or_else(|_| "<invalid-path>".to_owned());
+            self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
+            return Vec::new();
+        };
+        let Ok(mut entries) = entries.collect::<Result<Vec<_>, _>>() else {
+            let path = root
+                .logical_path(relative_directory)
+                .unwrap_or_else(|_| "<invalid-path>".to_owned());
+            self.diagnostic(&path, ScanDiagnosticKind::ReadDirectory);
+            return Vec::new();
+        };
+        entries.sort_unstable_by_key(fs::DirEntry::file_name);
+        let mut files = Vec::new();
+        for entry in entries {
+            let relative = relative_directory.join(entry.file_name());
+            if !include(&relative) {
+                continue;
+            }
+            let logical_path = match root.logical_path(&relative) {
+                Ok(path) => path,
+                Err(kind) => {
+                    self.diagnostic("<non-utf8-path>", kind);
+                    continue;
+                }
+            };
+            let Ok(file_type) = entry.file_type() else {
+                self.diagnostic(&logical_path, ScanDiagnosticKind::ReadFile);
+                continue;
+            };
+            if file_type.is_symlink() {
+                self.diagnostic(&logical_path, ScanDiagnosticKind::UnsafeSymlink);
+            } else if file_type.is_file() {
+                files.push(relative);
+            } else {
+                self.diagnostic(&logical_path, ScanDiagnosticKind::UnsafeFileType);
+            }
+        }
         files
     }
 

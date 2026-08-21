@@ -18,7 +18,11 @@ pub use pam_policy::{CapabilityName, ResourceName};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[cfg(test)]
+mod github_test;
+#[cfg(test)]
 mod lib_test;
+
+pub mod github;
 
 pub const MAX_CONNECTOR_NAME_BYTES: usize = 128;
 pub const MAX_CONNECTOR_VERSION_BYTES: usize = 64;
@@ -148,7 +152,7 @@ pub enum OperationEffect {
 /// A serializable typed connector operation.
 pub trait Operation: Send + Sync + 'static {
     type Request: DeserializeOwned + Serialize + Send + 'static;
-    type Response: DeserializeOwned + Serialize + Send + 'static;
+    type Response: Serialize + Send + 'static;
 
     const EFFECT: OperationEffect;
 

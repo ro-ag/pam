@@ -3043,7 +3043,11 @@ version = "0.1.0"
 dependencies = [
  "pam_core",
  "pam_policy",
+ "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

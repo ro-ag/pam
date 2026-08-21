@@ -3,6 +3,7 @@
 mod claude;
 mod codex;
 mod cursor;
+mod local;
 mod model;
 mod scan;
 
@@ -13,6 +14,8 @@ mod codex_test;
 #[cfg(test)]
 mod cursor_test;
 #[cfg(test)]
+mod local_test;
+#[cfg(test)]
 mod model_test;
 #[cfg(test)]
 mod scan_test;
@@ -21,6 +24,9 @@ pub use claude::{ClaudePluginRoot, ClaudeScanRoots, scan_claude_code};
 pub use codex::{CodexScanRoots, scan_codex};
 pub use cursor::{
     CursorGlobalRuleSource, CursorGlobalRulesStatus, CursorScanReport, CursorScanRoots, scan_cursor,
+};
+pub use local::{
+    LocalInventoryError, LocalInventoryReport, LocalInventoryRoots, scan_local_inventory,
 };
 pub use model::{
     AgentArtifact, AgentArtifactId, AgentArtifactIdentity, ArtifactKind, ArtifactScope,

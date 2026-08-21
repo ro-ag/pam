@@ -383,7 +383,7 @@ fn nonempty_json(value: &Value) -> bool {
     }
 }
 
-fn valid_plugin_id(id: &str) -> bool {
+pub(crate) fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ARTIFACT_NAME_BYTES
         && !id.contains('/')

@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pam_core::{ApprovalId, ContentDigest, EvidenceHandle, GrantId, IdempotencyKey, RequestId};
 use pam_model::ModelKey;
 use pam_policy::{CapabilityName, ResourceName};
+use pam_skills::AgentArtifactId;
 
 const DEFAULT_WAIT_TIMEOUT: &str = "30s";
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(24);
@@ -66,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         command: EvidenceCommand,
     },
+    /// Inventory normalized local agent skills, rules, and configuration.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     /// Manage revocable local caller credentials.
     Caller {
         #[command(subcommand)]
@@ -127,6 +133,24 @@ enum EvidenceCommand {
         /// Write exact evidence bytes to this platform-native path.
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCommand {
+    /// Rescan and list active normalized artifacts.
+    List {
+        /// Emit the stable versioned JSON contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rescan and show one active artifact by exact stable ID.
+    Show {
+        #[arg(value_parser = parse_agent_artifact_id)]
+        artifact_id: AgentArtifactId,
+        /// Emit the stable versioned JSON contract.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -428,6 +452,13 @@ pub(crate) enum Mode {
         raw: bool,
         output: Option<PathBuf>,
     },
+    SkillsList {
+        json: bool,
+    },
+    SkillsShow {
+        artifact_id: AgentArtifactId,
+        json: bool,
+    },
     CallerRegister {
         kind: CallerKindArg,
     },
@@ -512,6 +543,7 @@ impl fmt::Debug for Command {
             Self::Result { .. } => formatter.write_str("Result"),
             Self::Flow { .. } => formatter.write_str("Flow"),
             Self::Evidence { .. } => formatter.write_str("Evidence"),
+            Self::Skills { .. } => formatter.write_str("Skills"),
             Self::Caller { .. } => formatter.write_str("Caller"),
             Self::Access { .. } => formatter.write_str("Access"),
             Self::Approval { .. } => formatter.write_str("Approval"),
@@ -581,6 +613,8 @@ impl fmt::Debug for Mode {
             Self::FlowWait { .. } => formatter.write_str("FlowWait"),
             Self::FlowResult { .. } => formatter.write_str("FlowResult"),
             Self::EvidenceShow { .. } => formatter.write_str("EvidenceShow"),
+            Self::SkillsList { .. } => formatter.write_str("SkillsList"),
+            Self::SkillsShow { .. } => formatter.write_str("SkillsShow"),
             Self::CallerRegister { .. } => formatter.write_str("CallerRegister"),
             Self::CallerRevoke { .. } => formatter.write_str("CallerRevoke"),
             Self::ModelImport { .. } => formatter.write_str("ModelImport"),
@@ -624,6 +658,7 @@ impl Cli {
             },
             Some(Command::Flow { command }) => flow_mode(command),
             Some(Command::Evidence { command }) => evidence_mode(command),
+            Some(Command::Skills { command }) => skills_mode(command),
             Some(Command::Caller {
                 command: CallerCommand::Register { kind },
             }) => Mode::CallerRegister { kind },
@@ -735,6 +770,13 @@ impl Cli {
             Some(Command::Daemon { recover, model }) => Mode::Daemon { recover, model },
             Some(Command::Gui) => Mode::Gui,
         }
+    }
+}
+
+fn skills_mode(command: SkillsCommand) -> Mode {
+    match command {
+        SkillsCommand::List { json } => Mode::SkillsList { json },
+        SkillsCommand::Show { artifact_id, json } => Mode::SkillsShow { artifact_id, json },
     }
 }
 
@@ -854,6 +896,10 @@ fn parse_flow_after(value: &str) -> Result<u64, String> {
 
 fn parse_evidence_handle(value: &str) -> Result<EvidenceHandle, String> {
     EvidenceHandle::parse(value.to_owned()).map_err(|error| error.to_string())
+}
+
+fn parse_agent_artifact_id(value: &str) -> Result<AgentArtifactId, String> {
+    AgentArtifactId::parse(value.to_owned()).map_err(|error| error.to_string())
 }
 
 fn parse_capability_name(value: &str) -> Result<CapabilityName, String> {

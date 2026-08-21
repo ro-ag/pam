@@ -3,12 +3,41 @@ use std::{path::PathBuf, time::Duration};
 use clap::Parser;
 use pam_core::{ApprovalId, EvidenceHandle, IdempotencyKey, RequestId};
 use pam_policy::{CapabilityName, ResourceName};
+use pam_skills::AgentArtifactId;
 
 use super::command::{CallerKindArg, Cli, Mode, RetentionScopeArg};
 
 #[test]
 fn no_subcommand_selects_client_mode() {
     assert_eq!(Cli::try_parse_from(["pam"]).unwrap().mode(), Mode::Client);
+}
+
+#[test]
+fn skills_commands_parse_json_and_exact_ids() {
+    assert_eq!(
+        Cli::try_parse_from(["pam", "skills", "list", "--json"])
+            .unwrap()
+            .mode(),
+        Mode::SkillsList { json: true }
+    );
+    let id = format!("artifact:sha256:{}", "ab".repeat(32));
+    assert_eq!(
+        Cli::try_parse_from(["pam", "skills", "show", &id, "--json"])
+            .unwrap()
+            .mode(),
+        Mode::SkillsShow {
+            artifact_id: AgentArtifactId::parse(id).unwrap(),
+            json: true,
+        }
+    );
+    let invalid = [
+        "sha256:abc".to_owned(),
+        "artifact:sha256:abc".to_owned(),
+        format!("artifact:sha256:{}", "AB".repeat(32)),
+    ];
+    for invalid in invalid {
+        assert!(Cli::try_parse_from(["pam", "skills", "show", &invalid]).is_err());
+    }
 }
 
 #[test]

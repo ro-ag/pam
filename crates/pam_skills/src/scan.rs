@@ -615,3 +615,17 @@ fn relative_to_logical(path: &Path) -> Result<String, ScanDiagnosticKind> {
 pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("md")
 }
+
+pub(crate) fn merge_scan_reports(
+    reports: impl IntoIterator<Item = ScanReport>,
+    limits: ScanLimits,
+) -> ScanReport {
+    let mut session = ScanSession::new(limits);
+    for report in reports {
+        session.diagnostics.extend(report.diagnostics);
+        for artifact in report.artifacts {
+            session.push_artifact(artifact);
+        }
+    }
+    session.finish()
+}

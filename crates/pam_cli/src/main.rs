@@ -6,6 +6,7 @@ mod flow;
 mod gui;
 mod render;
 mod request;
+mod skills;
 
 #[cfg(test)]
 mod app_test;
@@ -23,6 +24,8 @@ mod gui_test;
 mod render_test;
 #[cfg(test)]
 mod request_test;
+#[cfg(test)]
+mod skills_test;
 
 use clap::Parser;
 use command::{Cli, Mode};
@@ -81,6 +84,8 @@ async fn main() {
             raw,
             output,
         } => app::evidence_show(handle, raw, output.as_deref()).await,
+        Mode::SkillsList { json } => skills::list(json).await,
+        Mode::SkillsShow { artifact_id, json } => skills::show(artifact_id, json).await,
         Mode::CallerRegister { kind } => app::caller_register(kind).await,
         Mode::CallerRevoke { kind } => app::caller_revoke(kind).await,
         Mode::ModelImport {

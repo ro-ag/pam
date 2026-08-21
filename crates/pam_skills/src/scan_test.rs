@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::scan::{ScanDiagnosticKind, ScanLimits, ScanSession};
+use super::scan::{ScanDiagnosticKind, ScanLimits, ScanSession, merge_scan_reports};
 use crate::{AgentArtifact, ArtifactKind, ArtifactScope, LoadSemantics, OriginAgent, ScanReport};
 use pam_core::ContentDigest;
 
@@ -218,6 +218,80 @@ fn normalized(path: &str, byte: u8) -> AgentArtifact {
         ContentDigest::from_sha256([byte; 32]),
     )
     .unwrap()
+}
+
+fn report_with_retained_source(path: &str, byte: u8, source: &[u8]) -> ScanReport {
+    let artifact = normalized(path, byte);
+    let mut session = ScanSession::new(ScanLimits::default());
+    session.push_artifact_with_content(artifact, source.to_vec());
+    session.finish()
+}
+
+#[test]
+fn report_merge_accepts_exact_multi_report_retained_source_boundary() {
+    let limits = ScanLimits {
+        max_aggregate_bytes: 5,
+        ..ScanLimits::default()
+    };
+    let merged = merge_scan_reports(
+        [
+            report_with_retained_source("a.mdc", 1, b"12"),
+            report_with_retained_source("b.mdc", 2, b"345"),
+        ],
+        limits,
+    );
+
+    assert!(merged.complete(), "{:?}", merged.diagnostics());
+    assert_eq!(merged.artifacts().len(), 2);
+    for artifact in merged.artifacts() {
+        assert!(merged.always_loaded_source(&artifact.id()).is_some());
+    }
+}
+
+#[test]
+fn report_merge_rejects_one_over_global_retained_source_budget_atomically() {
+    let limits = ScanLimits {
+        max_aggregate_bytes: 5,
+        ..ScanLimits::default()
+    };
+    let merged = merge_scan_reports(
+        [
+            report_with_retained_source("a.mdc", 1, b"123"),
+            report_with_retained_source("b.mdc", 2, b"456"),
+        ],
+        limits,
+    );
+
+    assert!(!merged.complete());
+    assert_eq!(
+        merged
+            .artifacts()
+            .iter()
+            .map(AgentArtifact::logical_path)
+            .collect::<Vec<_>>(),
+        ["a.mdc", "b.mdc"]
+    );
+    assert_eq!(merged.diagnostics().len(), 1);
+    assert_eq!(
+        merged.diagnostics()[0].kind(),
+        ScanDiagnosticKind::AggregateBytesExceeded
+    );
+    assert_eq!(merged.diagnostics()[0].logical_path(), "b.mdc");
+    let first = merged
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.logical_path() == "a.mdc")
+        .unwrap();
+    let second = merged
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.logical_path() == "b.mdc")
+        .unwrap();
+    assert_eq!(
+        merged.always_loaded_source(&first.id()),
+        Some(b"123".as_slice())
+    );
+    assert_eq!(merged.always_loaded_source(&second.id()), None);
 }
 
 #[test]

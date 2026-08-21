@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "estimator": "raw_bytes_div_4_ceil_v1",
+  "alwaysLoadedArtifactCount": 9,
+  "allSessionRawBytes": 156,
+  "allSessionEstimatedTokens": 42,
+  "artifacts": [
+    {
+      "rank": 1,
+      "id": "artifact:sha256:99ddf4c7ece8f7598638c2ce2932902cdd680297d3d76bb20357a3001c79c60b",
+      "name": "line ending CRLF",
+      "logicalPath": "cursor/line-endings-crlf.toml",
+      "kind": "config",
+      "scope": "project",
+      "origin": "cursor",
+      "loadSemantics": "always",
+      "contentHash": "sha256:e9e708d21a69ed783e51c1c5d566a1b8b84d6f8db668adaddc71fd17635215b9",
+      "rawBytes": 46,
+      "estimatedTokens": 12
+    },
+    {
+      "rank": 2,
+      "id": "artifact:sha256:13f8f356b760ab0ce13dc6d73e81baa0941847f08c7277ba37fcbbd71b4dafcc",
+      "name": "native LF",
+      "logicalPath": "claude/native-lf.md",
+      "kind": "rule",
+      "scope": "user",
+      "origin": "claude_code",
+      "loadSemantics": "always",
+      "contentHash": "sha256:e685bc49e323d1f0fad1c60fd962638565bf08bedd67d416232d6d9f97e99195",
+      "rawBytes": 45,
+      "estimatedTokens": 12
+    },
+    {
+      "rank": 3,
+      "id": "artifact:sha256:bc41b1733b86b97a5a6235b92391624caeb5636c1ab10621c62b4408a17a447f",
+      "name": "line ending LF",
+      "logicalPath": "codex/line-endings-lf.toml",
+      "kind": "config",
+      "scope": "project",
+      "origin": "codex",
+      "loadSemantics": "always",
+      "contentHash": "sha256:01c02a7abcfff0ab883492a213f1f319fd4fb98c759b537a41a1fd9d7225d821",
+      "rawBytes": 45,
+      "estimatedTokens": 12
+    },
+    {
+      "rank": 4,
+      "id": "artifact:sha256:6cc3c0bf6a70f5e0d375ca5c134772313a7661ea35690de9c35338109a45ce9e",
+      "name": "unicode",
+      "logicalPath": "pam/unicode.md",
+      "kind": "instruction",
+      "scope": "managed",
+      "origin": "pam",
+      "loadSemantics": "always",
+      "contentHash": "sha256:7deb57a48aeb957f8a3685e3bc27c04c9ab41b0cdf230090a7cd0b554ebb0912",
+      "rawBytes": 7,
+      "estimatedTokens": 2
+    },
+    {
+      "rank": 5,
+      "id": "artifact:sha256:5b642073958b6b8bb15000023878f30756cedf7099ab74f71d02cb15dd726c2a",
+      "name": "duplicate B",
+      "logicalPath": "codex/duplicate-b.md",
+      "kind": "instruction",
+      "scope": "system",
+      "origin": "codex",
+      "loadSemantics": "always",
+      "contentHash": "sha256:0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5",
+      "rawBytes": 4,
+      "estimatedTokens": 1
+    },
+    {
+      "rank": 6,
+      "id": "artifact:sha256:5d659ae78171e6d1e6d2869ba62f49025d9f14565ec4c85f9ba5ea354145f61d",
+      "name": "ceil four",
+      "logicalPath": "cursor/four.txt",
+      "kind": "prompt",
+      "scope": "plugin",
+      "origin": "cursor",
+      "loadSemantics": "always",
+      "contentHash": "sha256:03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4",
+      "rawBytes": 4,
+      "estimatedTokens": 1
+    },
+    {
+      "rank": 7,
+      "id": "artifact:sha256:bed95aaf123ed68e7e7ae58e53911f061cfc063a4d73249335ecedd984ae7671",
+      "name": "duplicate A",
+      "logicalPath": "claude/duplicate-a.md",
+      "kind": "instruction",
+      "scope": "project",
+      "origin": "claude_code",
+      "loadSemantics": "always",
+      "contentHash": "sha256:0967115f2813a3541eaef77de9d9d5773f1c0c04314b0bbfe4ff3b3b1c55b5d5",
+      "rawBytes": 4,
+      "estimatedTokens": 1
+    },
+    {
+      "rank": 8,
+      "id": "artifact:sha256:88809af8240723173ea3853dd9eea56b0a26eb3e0a4831e36835ef184bae65d0",
+      "name": "ceil one",
+      "logicalPath": "pam/one.txt",
+      "kind": "prompt",
+      "scope": "user",
+      "origin": "pam",
+      "loadSemantics": "always",
+      "contentHash": "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "rawBytes": 1,
+      "estimatedTokens": 1
+    },
+    {
+      "rank": 9,
+      "id": "artifact:sha256:f8a72f7a432bb0fbc2ffeff661c5f9005667a85d338bcd9d0a170ad1da546ce7",
+      "name": "empty",
+      "logicalPath": "codex/empty.md",
+      "kind": "instruction",
+      "scope": "local",
+      "origin": "codex",
+      "loadSemantics": "always",
+      "contentHash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "rawBytes": 0,
+      "estimatedTokens": 0
+    }
+  ],
+  "originAgentSessionTotals": [
+    {
+      "origin": "claude_code",
+      "artifactCount": 2,
+      "rawBytes": 49,
+      "estimatedTokens": 13
+    },
+    {
+      "origin": "codex",
+      "artifactCount": 3,
+      "rawBytes": 49,
+      "estimatedTokens": 13
+    },
+    {
+      "origin": "cursor",
+      "artifactCount": 2,
+      "rawBytes": 50,
+      "estimatedTokens": 13
+    },
+    {
+      "origin": "pam",
+      "artifactCount": 2,
+      "rawBytes": 8,
+      "estimatedTokens": 3
+    }
+  ],
+  "allSessionScopeTotals": [
+    {
+      "scope": "managed",
+      "artifactCount": 1,
+      "rawBytes": 7,
+      "estimatedTokens": 2
+    },
+    {
+      "scope": "system",
+      "artifactCount": 1,
+      "rawBytes": 4,
+      "estimatedTokens": 1
+    },
+    {
+      "scope": "user",
+      "artifactCount": 2,
+      "rawBytes": 46,
+      "estimatedTokens": 13
+    },
+    {
+      "scope": "project",
+      "artifactCount": 3,
+      "rawBytes": 95,
+      "estimatedTokens": 25
+    },
+    {
+      "scope": "local",
+      "artifactCount": 1,
+      "rawBytes": 0,
+      "estimatedTokens": 0
+    },
+    {
+      "scope": "plugin",
+      "artifactCount": 1,
+      "rawBytes": 4,
+      "estimatedTokens": 1
+    }
+  ]
+}

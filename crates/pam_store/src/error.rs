@@ -126,6 +126,25 @@ pub enum StoreError {
         project_id: ProjectId,
         observed_at_ms: u64,
     },
+    InvalidSkillsAuditReport(&'static str),
+    SkillsAuditReportTooLarge {
+        size_bytes: usize,
+        maximum_bytes: usize,
+    },
+    UnsupportedSkillsAuditReportSchema {
+        schema_version: u32,
+        supported: u32,
+    },
+    SkillsAuditReportTimestampRegression {
+        project_id: ProjectId,
+        observed_at_ms: u64,
+        stored_at_ms: u64,
+    },
+    SkillsAuditReportConflict {
+        project_id: ProjectId,
+        observed_at_ms: u64,
+    },
+    CorruptSkillsAuditReport(ProjectId),
 }
 
 impl fmt::Display for StoreError {
@@ -237,7 +256,60 @@ impl fmt::Display for StoreError {
             | Self::SkillInventoryObservationConflict { .. } => {
                 format_skill_inventory_error(self, formatter)
             }
+            Self::InvalidSkillsAuditReport(_)
+            | Self::SkillsAuditReportTooLarge { .. }
+            | Self::UnsupportedSkillsAuditReportSchema { .. }
+            | Self::SkillsAuditReportTimestampRegression { .. }
+            | Self::SkillsAuditReportConflict { .. }
+            | Self::CorruptSkillsAuditReport(_) => {
+                format_skills_audit_report_error(self, formatter)
+            }
         }
+    }
+}
+
+fn format_skills_audit_report_error(
+    error: &StoreError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match error {
+        StoreError::InvalidSkillsAuditReport(reason) => {
+            write!(formatter, "skills audit report is invalid: {reason}")
+        }
+        StoreError::SkillsAuditReportTooLarge {
+            size_bytes,
+            maximum_bytes,
+        } => write!(
+            formatter,
+            "skills audit report is {size_bytes} bytes; the maximum is {maximum_bytes} bytes"
+        ),
+        StoreError::UnsupportedSkillsAuditReportSchema {
+            schema_version,
+            supported,
+        } => write!(
+            formatter,
+            "skills audit report schema {schema_version} is unsupported; supported schema is {supported}"
+        ),
+        StoreError::SkillsAuditReportTimestampRegression {
+            project_id,
+            observed_at_ms,
+            stored_at_ms,
+        } => write!(
+            formatter,
+            "skills audit report for project {project_id} was observed at {observed_at_ms}, before stored timestamp {stored_at_ms}"
+        ),
+        StoreError::SkillsAuditReportConflict {
+            project_id,
+            observed_at_ms,
+        } => write!(
+            formatter,
+            "skills audit report for project {project_id} conflicts with a different report already observed at {observed_at_ms}"
+        ),
+        StoreError::CorruptSkillsAuditReport(project_id) => write!(
+            formatter,
+            "stored skills audit report for project {project_id} is corrupt"
+        ),
+        _ => unreachable!("format_skills_audit_report_error requires a report error"),
     }
 }
 
@@ -502,7 +574,13 @@ impl Error for StoreError {
             | Self::SkillArtifactNotFound { .. }
             | Self::SkillInventoryTimestampRegression { .. }
             | Self::SkillInventoryObservationRegression { .. }
-            | Self::SkillInventoryObservationConflict { .. } => None,
+            | Self::SkillInventoryObservationConflict { .. }
+            | Self::InvalidSkillsAuditReport(_)
+            | Self::SkillsAuditReportTooLarge { .. }
+            | Self::UnsupportedSkillsAuditReportSchema { .. }
+            | Self::SkillsAuditReportTimestampRegression { .. }
+            | Self::SkillsAuditReportConflict { .. }
+            | Self::CorruptSkillsAuditReport(_) => None,
         }
     }
 }

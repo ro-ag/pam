@@ -227,6 +227,80 @@ export interface SkillInventoryDataDto {
 
 export type SkillInventoryDto = FencedResponse<SkillInventoryDataDto>;
 
+export interface SkillAuditOriginSessionDto {
+  origin: string;
+  artifactCount: number;
+  rawBytes: number;
+  estimatedTokens: number;
+}
+
+export interface SkillAuditScopeTotalDto {
+  scope: string;
+  artifactCount: number;
+  rawBytes: number;
+  estimatedTokens: number;
+}
+
+export interface SkillAuditArtifactDto {
+  rank: number;
+  id: string;
+  name: string;
+  logicalPath: string;
+  kind: string;
+  scope: string;
+  origin: string;
+  loadSemantics: string;
+  contentHash: string;
+  rawBytes: number;
+  estimatedTokens: number;
+}
+
+export interface SkillAuditFootprintDto {
+  estimator: string;
+  alwaysLoadedArtifactCount: number;
+  allSessionRawBytes: number;
+  allSessionEstimatedTokens: number;
+  originSessions: SkillAuditOriginSessionDto[];
+  scopeTotals: SkillAuditScopeTotalDto[];
+  rankedArtifacts: SkillAuditArtifactDto[];
+  rankedArtifactsTotal: number;
+  rankedArtifactsTruncated: boolean;
+}
+
+export interface SkillAuditMultiArtifactFindingDto {
+  artifactIds: string[];
+  summary: string;
+}
+
+export interface SkillAuditStaleCandidateDto {
+  artifactId: string;
+  reason: string;
+}
+
+export interface SkillAuditVerdictDto {
+  overlaps: SkillAuditMultiArtifactFindingDto[];
+  conflicts: SkillAuditMultiArtifactFindingDto[];
+  staleCandidates: SkillAuditStaleCandidateDto[];
+  saturationGrade: "healthy" | "elevated" | "high" | "critical";
+  overallSummary: string;
+}
+
+export type SkillAuditEvaluatorDto = "claude" | "codex" | "cursor_agent";
+export type SkillAuditFailureDto = "invalid_corpus" | "prompt_too_large" | "invocation_failed" | "invalid_verdict";
+
+export type SkillAuditEvaluationDto =
+  | { status: "no_evaluator" }
+  | { status: "failed"; evaluator: SkillAuditEvaluatorDto; failure: SkillAuditFailureDto }
+  | { status: "evaluated"; evaluator: SkillAuditEvaluatorDto; verdict: SkillAuditVerdictDto };
+
+export interface SkillAuditDataDto {
+  observedAtMs: number;
+  footprint: SkillAuditFootprintDto;
+  evaluation: SkillAuditEvaluationDto;
+}
+
+export type SkillAuditDto = FencedResponse<SkillAuditDataDto | null>;
+
 export interface PamBridge {
   readonly mode: BridgeMode;
   bootstrap(): Promise<SnapshotDto>;
@@ -240,6 +314,8 @@ export interface PamBridge {
   loadEvidence(fence: CommandFence, evidenceHandle: string): Promise<EvidenceDto>;
   loadFlowWorkspace(fence: CommandFence): Promise<FlowWorkspaceDto>;
   loadSkillInventory(fence: CommandFence): Promise<SkillInventoryDto>;
+  loadSkillAudit(fence: CommandFence): Promise<SkillAuditDto>;
+  runSkillAudit(fence: CommandFence): Promise<SkillAuditDto>;
   openFlow(fence: CommandFence, flowHandle: string): Promise<FlowDocumentDto>;
   validateFlow(fence: CommandFence, documentHandle: string, source: string): Promise<FlowReviewDto>;
   saveFlow(fence: CommandFence, documentHandle: string, source: string): Promise<FlowSaveDto>;

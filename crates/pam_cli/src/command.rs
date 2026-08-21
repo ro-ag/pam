@@ -138,6 +138,12 @@ enum EvidenceCommand {
 
 #[derive(Debug, Subcommand)]
 enum SkillsCommand {
+    /// Audit always-loaded context and persist the versioned report.
+    Audit {
+        /// Emit the exact persisted versioned JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rescan and list active normalized artifacts.
     List {
         /// Emit the stable versioned JSON contract.
@@ -459,6 +465,9 @@ pub(crate) enum Mode {
         artifact_id: AgentArtifactId,
         json: bool,
     },
+    SkillsAudit {
+        json: bool,
+    },
     CallerRegister {
         kind: CallerKindArg,
     },
@@ -615,6 +624,7 @@ impl fmt::Debug for Mode {
             Self::EvidenceShow { .. } => formatter.write_str("EvidenceShow"),
             Self::SkillsList { .. } => formatter.write_str("SkillsList"),
             Self::SkillsShow { .. } => formatter.write_str("SkillsShow"),
+            Self::SkillsAudit { .. } => formatter.write_str("SkillsAudit"),
             Self::CallerRegister { .. } => formatter.write_str("CallerRegister"),
             Self::CallerRevoke { .. } => formatter.write_str("CallerRevoke"),
             Self::ModelImport { .. } => formatter.write_str("ModelImport"),
@@ -775,6 +785,7 @@ impl Cli {
 
 fn skills_mode(command: SkillsCommand) -> Mode {
     match command {
+        SkillsCommand::Audit { json } => Mode::SkillsAudit { json },
         SkillsCommand::List { json } => Mode::SkillsList { json },
         SkillsCommand::Show { artifact_id, json } => Mode::SkillsShow { artifact_id, json },
     }

@@ -1,5 +1,7 @@
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsStr,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,8 +10,10 @@ use directories::BaseDirs;
 use pam_core::ProjectId;
 use pam_platform::{IdentityError, ProjectIdentity, discover_project, user_data_dir};
 use pam_skills::{
-    AgentArtifactId, CursorGlobalRulesStatus, LocalInventoryError, LocalInventoryRoots,
-    ScanDiagnostic, ScanLimits, scan_local_inventory,
+    AgentArtifactId, CursorGlobalRulesStatus, EvaluatorKind, EvaluatorRunConfig,
+    LocalInventoryError, LocalInventoryRoots, ScanDiagnostic, ScanLimits, SkillsAuditError,
+    SkillsAuditEvaluationStatus, SkillsAuditFailureReason, SkillsAuditReport, run_skills_audit,
+    scan_local_inventory,
 };
 use pam_store::{SkillInventoryDrift, Store, StoreError, StoredAgentArtifact};
 use serde::Serialize;
@@ -24,6 +28,34 @@ pub(crate) async fn list(json: bool) -> i32 {
 
 pub(crate) async fn show(artifact_id: AgentArtifactId, json: bool) -> i32 {
     execute(InventorySelection::Show(artifact_id), json).await
+}
+
+pub(crate) async fn audit(json: bool) -> i32 {
+    let environment = match SkillsEnvironment::discover() {
+        Ok(environment) => environment,
+        Err(error) => return report_error(&error),
+    };
+    let injected_path = env::var_os("PATH").unwrap_or_default();
+    let observed_at_ms = match now_ms() {
+        Ok(now) => now,
+        Err(error) => return report_error(&error),
+    };
+    let output = match run_audit(AuditRequest {
+        roots: environment.roots(),
+        project_id: environment.project.id(),
+        state_path: &environment.state_path,
+        observed_at_ms,
+        injected_path: &injected_path,
+        evaluator_config: EvaluatorRunConfig::default(),
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return report_error(&error),
+    };
+    let rendered = render_audit(&output, json);
+    println!("{rendered}");
+    0
 }
 
 async fn execute(selection: InventorySelection, json: bool) -> i32 {
@@ -135,6 +167,15 @@ pub(crate) struct InventoryRequest<'a> {
     pub(crate) observed_at_ms: u64,
 }
 
+pub(crate) struct AuditRequest<'a> {
+    pub(crate) roots: LocalInventoryRoots<'a>,
+    pub(crate) project_id: &'a ProjectId,
+    pub(crate) state_path: &'a Path,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) injected_path: &'a OsStr,
+    pub(crate) evaluator_config: EvaluatorRunConfig,
+}
+
 pub(crate) enum InventorySelection {
     List,
     Show(AgentArtifactId),
@@ -152,6 +193,14 @@ pub(crate) struct InventoryOutput {
     pub(crate) cursor_global_rules_status: CursorGlobalRulesStatus,
     pub(crate) drift: SkillInventoryDrift,
     pub(crate) records: InventoryRecords,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuditOutput {
+    pub(crate) project_id: ProjectId,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) report: SkillsAuditReport,
+    pub(crate) report_json: String,
 }
 
 pub(crate) async fn run_inventory(
@@ -194,6 +243,44 @@ pub(crate) async fn run_inventory(
         cursor_global_rules_status,
         drift,
         records,
+    })
+}
+
+pub(crate) async fn run_audit(request: AuditRequest<'_>) -> Result<AuditOutput, SkillsError> {
+    let inventory = scan_local_inventory(request.roots, ScanLimits::default())
+        .map_err(SkillsError::LocalInventory)?;
+    if !inventory.complete() {
+        return Err(SkillsError::IncompleteScan(
+            inventory.diagnostics().to_vec(),
+        ));
+    }
+    let report = run_skills_audit(
+        inventory.scan_report(),
+        request.roots.project_root,
+        request.injected_path,
+        request.evaluator_config,
+    )
+    .map_err(SkillsError::Audit)?;
+    let report_json = serde_json::to_string_pretty(&report).map_err(SkillsError::Json)?;
+    let schema_version = report.schema_version();
+    let store = Store::open(request.state_path).map_err(SkillsError::Store)?;
+    let operation = store
+        .put_skills_audit_snapshot(
+            request.project_id.clone(),
+            inventory.into_scan_report(),
+            request.observed_at_ms,
+            schema_version,
+            report_json,
+        )
+        .await;
+    let shutdown = store.shutdown().await;
+    let stored = operation.map_err(SkillsError::Store)?;
+    shutdown.map_err(SkillsError::Store)?;
+    Ok(AuditOutput {
+        project_id: request.project_id.clone(),
+        observed_at_ms: request.observed_at_ms,
+        report,
+        report_json: stored.report_json,
     })
 }
 
@@ -298,6 +385,151 @@ pub(crate) fn render_inventory(
         InventoryRecords::List(records) => render_human_list(output, records),
         InventoryRecords::Show(record) => render_human_show(output, record),
     })
+}
+
+pub(crate) fn render_audit(output: &AuditOutput, json: bool) -> String {
+    if json {
+        return output.report_json.clone();
+    }
+    render_human_audit(output)
+}
+
+fn render_human_audit(output: &AuditOutput) -> String {
+    let footprint = output.report.footprint();
+    let mut lines = vec![
+        format!("Project: {}", escape_text(output.project_id.as_str())),
+        format!("Observed at (ms): {}", output.observed_at_ms),
+        "Agent session totals:".to_owned(),
+    ];
+    if footprint.origin_agent_session_totals().is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        for totals in footprint.origin_agent_session_totals() {
+            lines.push(format!(
+                "  {}  artifacts={} raw_bytes={} estimated_tokens={}",
+                escape_text(totals.origin().as_str()),
+                totals.artifact_count(),
+                totals.raw_bytes(),
+                totals.estimated_tokens(),
+            ));
+        }
+    }
+    lines.push(format!(
+        "All sessions: artifacts={} raw_bytes={} estimated_tokens={}",
+        footprint.always_loaded_artifact_count(),
+        footprint.all_session_raw_bytes(),
+        footprint.all_session_estimated_tokens(),
+    ));
+    lines.push("All-session scope totals:".to_owned());
+    if footprint.all_session_scope_totals().is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        for totals in footprint.all_session_scope_totals() {
+            lines.push(format!(
+                "  {}  artifacts={} raw_bytes={} estimated_tokens={}",
+                escape_text(totals.scope().as_str()),
+                totals.artifact_count(),
+                totals.raw_bytes(),
+                totals.estimated_tokens(),
+            ));
+        }
+    }
+    lines.push("Ranked always-loaded artifacts:".to_owned());
+    if footprint.artifacts().is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        for artifact in footprint.artifacts() {
+            lines.push(format!(
+                "  #{}  estimated_tokens={} raw_bytes={} origin={} scope={} path={}",
+                artifact.rank(),
+                artifact.estimated_tokens(),
+                artifact.raw_bytes(),
+                escape_text(artifact.origin().as_str()),
+                escape_text(artifact.scope().as_str()),
+                escape_text(artifact.logical_path()),
+            ));
+        }
+    }
+    render_evaluation(&mut lines, output.report.evaluation());
+    lines.join("\n")
+}
+
+fn render_evaluation(lines: &mut Vec<String>, evaluation: &SkillsAuditEvaluationStatus) {
+    match evaluation {
+        SkillsAuditEvaluationStatus::NoEvaluator => {
+            lines.push("Evaluation: no_evaluator".to_owned());
+            lines
+                .push("Deterministic footprint only; no supported evaluator was found.".to_owned());
+        }
+        SkillsAuditEvaluationStatus::Failed { evaluator, reason } => {
+            lines.push("Evaluation: failed".to_owned());
+            lines.push(format!("Evaluator: {}", evaluator_label(*evaluator)));
+            lines.push(format!("Failure reason: {}", failure_label(*reason)));
+        }
+        SkillsAuditEvaluationStatus::Evaluated { evaluator, verdict } => {
+            lines.push("Evaluation: evaluated".to_owned());
+            lines.push(format!("Evaluator: {}", evaluator_label(*evaluator)));
+            lines.push(format!(
+                "Saturation grade: {}",
+                escape_text(verdict.saturation_grade().as_str())
+            ));
+            lines.push(format!(
+                "Overall summary: {}",
+                escape_text(verdict.overall_summary())
+            ));
+            lines.push("Overlaps:".to_owned());
+            if verdict.overlaps().is_empty() {
+                lines.push("  none".to_owned());
+            } else {
+                for overlap in verdict.overlaps() {
+                    lines.push(format!(
+                        "  artifacts={}  summary={}",
+                        escaped_artifact_ids(overlap.artifact_ids()),
+                        escape_text(overlap.summary()),
+                    ));
+                }
+            }
+            lines.push("Conflicts:".to_owned());
+            if verdict.conflicts().is_empty() {
+                lines.push("  none".to_owned());
+            } else {
+                for conflict in verdict.conflicts() {
+                    lines.push(format!(
+                        "  artifacts={}  summary={}",
+                        escaped_artifact_ids(conflict.artifact_ids()),
+                        escape_text(conflict.summary()),
+                    ));
+                }
+            }
+            lines.push("Stale candidates:".to_owned());
+            if verdict.stale_candidates().is_empty() {
+                lines.push("  none".to_owned());
+            } else {
+                for candidate in verdict.stale_candidates() {
+                    lines.push(format!(
+                        "  artifact={}  reason={}",
+                        escape_text(candidate.artifact_id().as_str()),
+                        escape_text(candidate.reason()),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn escaped_artifact_ids(ids: &[AgentArtifactId]) -> String {
+    ids.iter()
+        .map(|id| escape_text(id.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn evaluator_label(evaluator: EvaluatorKind) -> String {
+    escape_text(evaluator.as_str())
+}
+
+fn failure_label(reason: SkillsAuditFailureReason) -> String {
+    escape_text(reason.as_str())
 }
 
 fn render_human_list(output: &InventoryOutput, records: &[StoredAgentArtifact]) -> String {
@@ -407,6 +639,7 @@ pub(crate) enum SkillsError {
     Clock,
     LocalInventory(LocalInventoryError),
     IncompleteScan(Vec<ScanDiagnostic>),
+    Audit(SkillsAuditError),
     Store(StoreError),
     Json(serde_json::Error),
 }
@@ -428,8 +661,9 @@ impl std::fmt::Display for SkillsError {
                 "Skill scan is incomplete ({} diagnostics); inventory was not changed.",
                 diagnostics.len()
             ),
-            Self::Store(error) => write!(formatter, "Skill inventory store failed: {error}."),
-            Self::Json(_) => formatter.write_str("PAM could not encode skill inventory JSON."),
+            Self::Audit(error) => write!(formatter, "Skills audit failed: {error}."),
+            Self::Store(error) => write!(formatter, "Skills store failed: {error}."),
+            Self::Json(_) => formatter.write_str("PAM could not encode skills JSON."),
         }
     }
 }
@@ -440,6 +674,7 @@ impl std::error::Error for SkillsError {
             Self::CurrentDirectory(error) => Some(error),
             Self::Identity(error) => Some(error),
             Self::LocalInventory(error) => Some(error),
+            Self::Audit(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::HomeUnavailable | Self::Clock | Self::IncompleteScan(_) => None,

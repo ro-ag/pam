@@ -15,6 +15,18 @@ fn no_subcommand_selects_client_mode() {
 #[test]
 fn skills_commands_parse_json_and_exact_ids() {
     assert_eq!(
+        Cli::try_parse_from(["pam", "skills", "audit"])
+            .unwrap()
+            .mode(),
+        Mode::SkillsAudit { json: false }
+    );
+    assert_eq!(
+        Cli::try_parse_from(["pam", "skills", "audit", "--json"])
+            .unwrap()
+            .mode(),
+        Mode::SkillsAudit { json: true }
+    );
+    assert_eq!(
         Cli::try_parse_from(["pam", "skills", "list", "--json"])
             .unwrap()
             .mode(),
@@ -38,6 +50,13 @@ fn skills_commands_parse_json_and_exact_ids() {
     for invalid in invalid {
         assert!(Cli::try_parse_from(["pam", "skills", "show", &invalid]).is_err());
     }
+}
+
+#[test]
+fn skills_audit_debug_is_redacted_to_the_mode_name() {
+    let cli = Cli::try_parse_from(["pam", "skills", "audit", "--json"]).unwrap();
+    assert_eq!(format!("{cli:?}"), "Cli { command: Some(Skills) }");
+    assert_eq!(format!("{:?}", cli.mode()), "SkillsAudit");
 }
 
 #[test]

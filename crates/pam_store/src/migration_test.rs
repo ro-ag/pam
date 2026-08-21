@@ -818,6 +818,153 @@ fn inventory_observation_migration_upgrades_v10_and_seeds_the_watermark() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Covers schema shape, preservation, uniqueness, and cascade.
+fn skills_audit_report_migration_upgrades_v11_and_preserves_inventory_state() {
+    let (directory, path) = database_path("migration-v11-skills-audit-report");
+    fs::create_dir_all(&directory).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_evidence.sql"),
+        include_str!("../migrations/0003_callers.sql"),
+        include_str!("../migrations/0004_policy.sql"),
+        include_str!("../migrations/0005_audit.sql"),
+        include_str!("../migrations/0006_policy_resource_bound.sql"),
+        include_str!("../migrations/0007_models.sql"),
+        include_str!("../migrations/0008_flows.sql"),
+        include_str!("../migrations/0009_flow_authorizations.sql"),
+        include_str!("../migrations/0010_agent_artifacts.sql"),
+        include_str!("../migrations/0011_agent_artifact_inventory.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 11).unwrap();
+    connection
+        .execute("INSERT INTO projects(project_id) VALUES ('preserved')", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_artifact_inventory(project_id, observed_at_ms)
+             VALUES ('preserved', 17)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let connection = open_connection(&path).unwrap();
+    let preserved_observation: i64 = connection
+        .query_row(
+            "SELECT observed_at_ms FROM agent_artifact_inventory
+             WHERE project_id = 'preserved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let report_columns: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('skills_audit_reports')
+             WHERE name IN (
+                 'project_id', 'observed_at_ms', 'schema_version',
+                 'report_json', 'report_digest'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (without_rowid, strict): (u32, u32) = connection
+        .query_row(
+            "SELECT wr, strict FROM pragma_table_list
+             WHERE name = 'skills_audit_reports'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let cascade_foreign_key: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('skills_audit_reports')
+             WHERE \"table\" = 'projects'
+               AND \"from\" = 'project_id'
+               AND \"to\" = 'project_id'
+               AND on_delete = 'CASCADE'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved_observation, 17);
+    assert_eq!(report_columns, 5);
+    assert_eq!((without_rowid, strict), (1, 1));
+    assert_eq!(cascade_foreign_key, 1);
+
+    connection
+        .execute(
+            "INSERT INTO skills_audit_reports(
+                 project_id, observed_at_ms, schema_version, report_json, report_digest
+             ) VALUES ('preserved', 20, 1, '{}', ?1)",
+            [format!("sha256:{}", "0".repeat(64))],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO skills_audit_reports(
+                     project_id, observed_at_ms, schema_version, report_json, report_digest
+                 ) VALUES ('preserved', 21, 1, '{}', ?1)",
+                [format!("sha256:{}", "1".repeat(64))],
+            )
+            .is_err()
+    );
+    connection
+        .execute_batch(
+            "INSERT INTO projects(project_id) VALUES ('invalid-time');
+             INSERT INTO projects(project_id) VALUES ('invalid-schema');
+             INSERT INTO projects(project_id) VALUES ('invalid-json');
+             INSERT INTO projects(project_id) VALUES ('invalid-digest');",
+        )
+        .unwrap();
+    let valid_digest = format!("sha256:{}", "0".repeat(64));
+    for (project_id, observed_at_ms, schema_version, report_json, digest) in [
+        ("invalid-time", -1_i64, 1_i64, "{}", valid_digest.as_str()),
+        ("invalid-schema", 1, 0, "{}", valid_digest.as_str()),
+        ("invalid-json", 1, 1, "[]", valid_digest.as_str()),
+        ("invalid-digest", 1, 1, "{}", "sha256:not-a-digest"),
+    ] {
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO skills_audit_reports(
+                         project_id, observed_at_ms, schema_version,
+                         report_json, report_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        project_id,
+                        observed_at_ms,
+                        schema_version,
+                        report_json,
+                        digest
+                    ],
+                )
+                .is_err()
+        );
+    }
+    connection
+        .execute("DELETE FROM projects WHERE project_id = 'preserved'", [])
+        .unwrap();
+    let cascaded_reports: u32 = connection
+        .query_row("SELECT COUNT(*) FROM skills_audit_reports", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(cascaded_reports, 0);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+    drop(connection);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn future_schema_is_refused_without_deleting_the_database() {
     let (directory, path) = database_path("future-schema");
     fs::create_dir_all(&directory).unwrap();

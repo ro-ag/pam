@@ -5,6 +5,7 @@ mod control_center;
 mod current;
 mod desktop;
 mod flow_editor;
+mod skill_audit;
 mod skill_inventory;
 
 #[cfg(test)]
@@ -17,6 +18,8 @@ mod current_test;
 mod desktop_test;
 #[cfg(test)]
 mod flow_editor_test;
+#[cfg(test)]
+mod skill_audit_test;
 #[cfg(test)]
 mod skill_inventory_test;
 
@@ -36,6 +39,13 @@ pub use desktop::{
 pub use skill_inventory::{
     CursorGlobalRulesStatusDto, SkillArtifactDto, SkillInventoryDataDto, SkillInventoryDriftDto,
     SkillInventoryDto,
+};
+
+pub use skill_audit::{
+    SkillAuditArtifactDto, SkillAuditDataDto, SkillAuditDto, SkillAuditEvaluationDto,
+    SkillAuditEvaluatorDto, SkillAuditFailureDto, SkillAuditFootprintDto,
+    SkillAuditMultiArtifactFindingDto, SkillAuditOriginSessionDto, SkillAuditSaturationGradeDto,
+    SkillAuditScopeTotalDto, SkillAuditStaleCandidateDto, SkillAuditVerdictDto,
 };
 
 pub use flow_editor::{

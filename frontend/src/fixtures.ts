@@ -10,6 +10,7 @@ import type {
   PamBridge,
   ProjectSummaryDto,
   SnapshotDataDto,
+  SkillAuditDataDto,
   SkillInventoryDataDto,
 } from "./domain";
 
@@ -85,6 +86,10 @@ export const fixtureScenarios = [
   "evidence-binary",
   "evidence-truncated",
   "startup-error",
+  "skill-audit-empty",
+  "skill-audit-no-evaluator",
+  "skill-audit-failed",
+  "skill-audit-load-error",
 ] as const;
 
 export type FixtureScenario = typeof fixtureScenarios[number];
@@ -192,6 +197,81 @@ function skillInventory(empty: boolean): SkillInventoryDataDto {
     truncated: false,
     drift: { added: artifacts.length, changed: 0, removed: 0, resurrected: 0 },
     cursorGlobalRulesStatus: "not_locally_discoverable",
+  };
+}
+
+function skillAudit(evaluation: SkillAuditDataDto["evaluation"] = {
+  status: "evaluated",
+  evaluator: "codex",
+  verdict: {
+    saturationGrade: "elevated",
+    overallSummary: "The always-loaded footprint is usable, with one overlapping review pair and one stale candidate to inspect.",
+    overlaps: [{
+      artifactIds: [
+        "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "artifact:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      ],
+      summary: "Two review instructions cover the same change-verification responsibility.",
+    }],
+    conflicts: [{
+      artifactIds: [
+        "artifact:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ],
+      summary: "The project instructions and review skill disagree about when local checks may be skipped.",
+    }],
+    staleCandidates: [{
+      artifactId: "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      reason: "This review skill references a command no longer present in the project.",
+    }],
+  },
+}): SkillAuditDataDto {
+  return {
+    observedAtMs: 1_777_001_800_000,
+    footprint: {
+      estimator: "raw_bytes_div_4_ceil_v1",
+      alwaysLoadedArtifactCount: 2,
+      allSessionRawBytes: 14_336,
+      allSessionEstimatedTokens: 3_584,
+      originSessions: [
+        { origin: "codex", artifactCount: 1, rawBytes: 8_192, estimatedTokens: 2_048 },
+        { origin: "claude_code", artifactCount: 1, rawBytes: 6_144, estimatedTokens: 1_536 },
+      ],
+      scopeTotals: [
+        { scope: "project", artifactCount: 2, rawBytes: 14_336, estimatedTokens: 3_584 },
+      ],
+      rankedArtifacts: [
+        {
+          rank: 1,
+          id: "artifact:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          name: "Project instructions",
+          logicalPath: "AGENTS.md",
+          kind: "instruction",
+          scope: "project",
+          origin: "codex",
+          loadSemantics: "always",
+          contentHash: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          rawBytes: 8_192,
+          estimatedTokens: 2_048,
+        },
+        {
+          rank: 2,
+          id: "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          name: "Review changes",
+          logicalPath: ".claude/skills/review/SKILL.md",
+          kind: "skill",
+          scope: "project",
+          origin: "claude_code",
+          loadSemantics: "always",
+          contentHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          rawBytes: 6_144,
+          estimatedTokens: 1_536,
+        },
+      ],
+      rankedArtifactsTotal: 2,
+      rankedArtifactsTruncated: false,
+    },
+    evaluation,
   };
 }
 
@@ -376,6 +456,16 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
     },
     async loadFlowWorkspace(fence) { return fenceResponse(fence, workspace()); },
     async loadSkillInventory(fence) { return fenceResponse(fence, skillInventory(scenario === "empty")); },
+    async loadSkillAudit(fence) {
+      if (scenario === "skill-audit-load-error") throw new Error("The latest skill audit could not be loaded.");
+      if (scenario === "skill-audit-empty" || scenario === "empty") return fenceResponse(fence, null);
+      if (scenario === "skill-audit-no-evaluator") return fenceResponse(fence, skillAudit({ status: "no_evaluator" }));
+      if (scenario === "skill-audit-failed") {
+        return fenceResponse(fence, skillAudit({ status: "failed", evaluator: "cursor_agent", failure: "invalid_verdict" }));
+      }
+      return fenceResponse(fence, skillAudit());
+    },
+    async runSkillAudit(fence) { return fenceResponse(fence, skillAudit()); },
     async openFlow(fence, flowHandle) {
       if (flowHandle !== definitionHandle) throw new Error("This fixture definition has no editable document.");
       return fenceResponse(fence, document());

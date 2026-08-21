@@ -66,19 +66,23 @@ describe("Tauri bridge ABI", () => {
     await bridge.registerGuiCaller(fence);
     await bridge.loadFlowWorkspace(fence);
     await bridge.loadSkillInventory(fence);
+    await bridge.loadSkillAudit(fence);
+    await bridge.runSkillAudit(fence);
     await bridge.openFlow(fence, "55555555-5555-4555-8555-555555555555");
     await bridge.saveFlow(fence, "66666666-6666-4666-8666-666666666666", "schema_version = 2");
 
     expect(calls.map(([command]) => command)).toEqual([
-      "catalog", "activate_project", "start_daemon", "stop_daemon", "register_gui_caller", "load_flow_workspace", "load_skill_inventory", "open_flow", "save_flow",
+      "catalog", "activate_project", "start_daemon", "stop_daemon", "register_gui_caller", "load_flow_workspace", "load_skill_inventory", "load_skill_audit", "run_skill_audit", "open_flow", "save_flow",
     ]);
     expect(calls[0][1]).toBeUndefined();
     expect(calls[1][1]).toEqual({ request: { projectHandle: fence.projectHandle, operationId: fence.operationId } });
     expect(calls[4][1]).toEqual({ request: fence });
     expect(calls[5][1]).toEqual({ request: fence });
     expect(calls[6][1]).toEqual({ request: fence });
-    expect(calls[7][1]).toEqual({ request: { ...fence, flowHandle: "55555555-5555-4555-8555-555555555555" } });
-    expect(calls[8][1]).toEqual({ request: { ...fence, documentHandle: "66666666-6666-4666-8666-666666666666", source: "schema_version = 2" } });
+    expect(calls[7][1]).toEqual({ request: fence });
+    expect(calls[8][1]).toEqual({ request: fence });
+    expect(calls[9][1]).toEqual({ request: { ...fence, flowHandle: "55555555-5555-4555-8555-555555555555" } });
+    expect(calls[10][1]).toEqual({ request: { ...fence, documentHandle: "66666666-6666-4666-8666-666666666666", source: "schema_version = 2" } });
   });
 
   it("compares all three fence fields", () => {

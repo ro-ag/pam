@@ -23,6 +23,7 @@ import { StatusDot } from "../components/Shell";
 import type { CommandFence, PamBridge } from "../domain";
 import type { AgentBriefView, ControlCenterView, TimelineItemView } from "../selectors";
 import { SkillInventoryPanel } from "./SkillInventoryPanel";
+import { SkillAuditReportPanel } from "./SkillAuditReportPanel";
 
 function formatClock(iso: string): string {
   const date = new Date(iso);
@@ -265,6 +266,7 @@ export function AccessView({ data, bridge, fence }: AccessViewProps) {
         </div>
       </section>
       <SkillInventoryPanel bridge={bridge} fence={fence} />
+      <SkillAuditReportPanel bridge={bridge} fence={fence} />
     </main>
   );
 }

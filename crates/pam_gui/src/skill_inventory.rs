@@ -129,7 +129,7 @@ impl SkillInventoryEnvironment {
         })
     }
 
-    fn roots(&self) -> LocalInventoryRoots<'_> {
+    pub(crate) fn roots(&self) -> LocalInventoryRoots<'_> {
         LocalInventoryRoots {
             user_home: self.user_home.as_deref(),
             claude_plugin_registry_root: self.claude_plugin_registry_root.as_deref(),
@@ -139,6 +139,18 @@ impl SkillInventoryEnvironment {
             current_working_directory: &self.current_working_directory,
             cursor_global_rule: None,
         }
+    }
+
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    pub(crate) fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    pub(crate) const fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
     }
 
     #[cfg(test)]

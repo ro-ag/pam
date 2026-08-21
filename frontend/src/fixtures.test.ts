@@ -100,4 +100,78 @@ describe("visual QA fixture scenarios", () => {
       "bounded evidence preview",
     );
   });
+
+  it("provides evaluated, deterministic-only, failed, and empty skill-audit fixtures", async () => {
+    const evaluatedBridge = fixtureBridge("solved");
+    const evaluatedSnapshot = await evaluatedBridge.bootstrap();
+    const evaluated = await evaluatedBridge.loadSkillAudit(evaluatedSnapshot.fence);
+    const deterministicBridge = fixtureBridge("skill-audit-no-evaluator");
+    const deterministicSnapshot = await deterministicBridge.bootstrap();
+    const deterministic = await deterministicBridge.loadSkillAudit(deterministicSnapshot.fence);
+    const failedBridge = fixtureBridge("skill-audit-failed");
+    const failedSnapshot = await failedBridge.bootstrap();
+    const failed = await failedBridge.loadSkillAudit(failedSnapshot.fence);
+    const emptyBridge = fixtureBridge("skill-audit-empty");
+    const emptySnapshot = await emptyBridge.bootstrap();
+    const empty = await emptyBridge.loadSkillAudit(emptySnapshot.fence);
+
+    expect(evaluated.data?.footprint.rankedArtifacts[0]).toMatchObject({
+      rank: 1,
+      name: "Project instructions",
+      logicalPath: "AGENTS.md",
+      estimatedTokens: 2_048,
+    });
+    expect(evaluated.data?.footprint.estimator).toBe("raw_bytes_div_4_ceil_v1");
+    const ranked = evaluated.data?.footprint.rankedArtifacts ?? [];
+    const rankedIds = new Set(ranked.map((artifact) => artifact.id));
+    expect(ranked.every((artifact) => artifact.loadSemantics === "always")).toBe(true);
+    expect(evaluated.data?.footprint.alwaysLoadedArtifactCount).toBe(ranked.length);
+    expect(evaluated.data?.footprint.rankedArtifactsTotal).toBe(ranked.length);
+    expect(evaluated.data?.footprint.rankedArtifactsTruncated).toBe(false);
+    expect(evaluated.data?.footprint.allSessionRawBytes).toBe(
+      ranked.reduce((total, artifact) => total + artifact.rawBytes, 0),
+    );
+    expect(evaluated.data?.footprint.allSessionEstimatedTokens).toBe(
+      ranked.reduce((total, artifact) => total + artifact.estimatedTokens, 0),
+    );
+    expect(evaluated.data?.footprint.originSessions.reduce((total, origin) => total + origin.artifactCount, 0)).toBe(ranked.length);
+    expect(evaluated.data?.footprint.scopeTotals.reduce((total, scope) => total + scope.artifactCount, 0)).toBe(ranked.length);
+    for (const origin of evaluated.data?.footprint.originSessions ?? []) {
+      const artifacts = ranked.filter((artifact) => artifact.origin === origin.origin);
+      expect(origin).toMatchObject({
+        artifactCount: artifacts.length,
+        rawBytes: artifacts.reduce((total, artifact) => total + artifact.rawBytes, 0),
+        estimatedTokens: artifacts.reduce((total, artifact) => total + artifact.estimatedTokens, 0),
+      });
+    }
+    for (const scope of evaluated.data?.footprint.scopeTotals ?? []) {
+      const artifacts = ranked.filter((artifact) => artifact.scope === scope.scope);
+      expect(scope).toMatchObject({
+        artifactCount: artifacts.length,
+        rawBytes: artifacts.reduce((total, artifact) => total + artifact.rawBytes, 0),
+        estimatedTokens: artifacts.reduce((total, artifact) => total + artifact.estimatedTokens, 0),
+      });
+    }
+    expect(evaluated.data?.evaluation).toMatchObject({
+      status: "evaluated",
+      evaluator: "codex",
+      verdict: {
+        saturationGrade: "elevated",
+        overlaps: [{ summary: expect.any(String) }],
+        conflicts: [{ summary: expect.any(String) }],
+        staleCandidates: [{ reason: expect.any(String) }],
+      },
+    });
+    if (evaluated.data?.evaluation.status === "evaluated") {
+      const referencedIds = [
+        ...evaluated.data.evaluation.verdict.overlaps.flatMap((finding) => finding.artifactIds),
+        ...evaluated.data.evaluation.verdict.conflicts.flatMap((finding) => finding.artifactIds),
+        ...evaluated.data.evaluation.verdict.staleCandidates.map((finding) => finding.artifactId),
+      ];
+      expect(referencedIds.every((artifactId) => rankedIds.has(artifactId))).toBe(true);
+    }
+    expect(deterministic.data?.evaluation).toEqual({ status: "no_evaluator" });
+    expect(failed.data?.evaluation).toEqual({ status: "failed", evaluator: "cursor_agent", failure: "invalid_verdict" });
+    expect(empty.data).toBeNull();
+  });
 });

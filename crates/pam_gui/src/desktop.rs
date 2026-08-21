@@ -31,6 +31,7 @@ use crate::{
         ActionAuthority, DaemonAuthority, DryRunCondition, FlowDryRunPlan, FlowEditorDocument,
         FlowEditorError, FlowEditorModel, FlowIdentity, FlowVersionDiff, FlowVersionDiffLineKind,
     },
+    skill_audit::{SkillAuditDto, load_persisted_skill_audit, run_skill_audit_report},
     skill_inventory::{SkillInventoryDto, SkillInventoryEnvironment, load_skill_inventory},
 };
 
@@ -1091,6 +1092,41 @@ impl DesktopCore {
         let state = self.inner.lock().await;
         ensure_active_matches(&state, &active, &fence)?;
         Ok(SkillInventoryDto { fence, data })
+    }
+
+    /// Loads the latest durable audit for the active project without running an evaluator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for stale authority or invalid/unavailable durable state.
+    pub async fn load_skill_audit(&self, fence: CommandFence) -> DesktopResult<SkillAuditDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let environment = SkillInventoryEnvironment::discover(active.catalog.root.clone())?;
+        let data =
+            load_persisted_skill_audit(active.project_id.clone(), environment.state_path()).await?;
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        Ok(SkillAuditDto { fence, data })
+    }
+
+    /// Runs and persists one fresh bounded audit for the active project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for stale authority, incomplete scans, evaluator setup failures,
+    /// or invalid/unavailable durable state.
+    pub async fn run_skill_audit(&self, fence: CommandFence) -> DesktopResult<SkillAuditDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let environment = SkillInventoryEnvironment::discover(active.catalog.root.clone())?;
+        let data = run_skill_audit_report(active.project_id.clone(), environment).await?;
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        Ok(SkillAuditDto {
+            fence,
+            data: Some(data),
+        })
     }
 
     /// Opens one flow selected only by an opaque catalog handle.

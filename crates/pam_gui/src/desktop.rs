@@ -33,6 +33,10 @@ use crate::{
     },
     skill_audit::{SkillAuditDto, load_persisted_skill_audit, run_skill_audit_report},
     skill_inventory::{SkillInventoryDto, SkillInventoryEnvironment, load_skill_inventory},
+    skill_library::{
+        SkillLibraryAction, SkillLibraryDataDto, SkillLibraryDto, SkillLibraryEnvironment,
+        SkillLibraryRequest, execute_skill_library, project_key,
+    },
 };
 
 const MAX_OPERATIONS: usize = 256;
@@ -47,9 +51,21 @@ const GUI_REGISTRATION_RECOVERY: &str = "Use Register GUI caller in PAM.";
 
 macro_rules! uuid_handle {
     ($name:ident) => {
-        #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(|_| {
+                    serde::de::Error::custom("desktop handles must be canonical UUID strings")
+                })
+            }
+        }
 
         impl $name {
             #[must_use]
@@ -169,7 +185,7 @@ impl DesktopErrorDto {
         }
     }
 
-    fn invalid_input(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
         Self::new(DesktopErrorKind::InvalidInput, message, None)
     }
 
@@ -1092,6 +1108,54 @@ impl DesktopCore {
         let state = self.inner.lock().await;
         ensure_active_matches(&state, &active, &fence)?;
         Ok(SkillInventoryDto { fence, data })
+    }
+
+    /// Executes one exact metadata-only canonical skill-library action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the fence is stale or reused, the global p-track home or
+    /// derived agent root is unsafe, or the exact library action cannot be completed.
+    pub async fn manage_skill_library(
+        &self,
+        request: SkillLibraryRequest,
+    ) -> DesktopResult<SkillLibraryDto> {
+        self.manage_skill_library_with(request, |active, action| async move {
+            let root = active.catalog.root.clone();
+            let project = project_key(&active.project_id)?;
+            tokio::task::spawn_blocking(move || {
+                let environment = SkillLibraryEnvironment::discover(&root)?;
+                execute_skill_library(&environment, project, action)
+            })
+            .await
+            .map_err(|_| {
+                DesktopErrorDto::unavailable(
+                    "PAM could not join the bounded skill library action.",
+                    Some("Retry the exact skill library action.".to_owned()),
+                )
+            })?
+        })
+        .await
+    }
+
+    async fn manage_skill_library_with<F, Fut>(
+        &self,
+        request: SkillLibraryRequest,
+        work: F,
+    ) -> DesktopResult<SkillLibraryDto>
+    where
+        F: FnOnce(ActiveProject, SkillLibraryAction) -> Fut,
+        Fut: Future<Output = DesktopResult<SkillLibraryDataDto>>,
+    {
+        let _command = self.command_gate.lock().await;
+        let fence = request.fence();
+        let action = request.into_action();
+        let active = self.begin(&fence).await?;
+        let result = work(active.clone(), action).await;
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        let data = result?;
+        Ok(SkillLibraryDto { fence, data })
     }
 
     /// Loads the latest durable audit for the active project without running an evaluator.
@@ -2109,11 +2173,19 @@ pub(crate) fn active_core_for_test(
     project: &ProjectHandle,
     generation: GenerationId,
 ) -> DesktopCore {
-    let root = PathBuf::from("/bounded/test/project");
+    active_core_at_for_test(project, generation, Path::new("/bounded/test/project"))
+}
+
+#[cfg(test)]
+pub(crate) fn active_core_at_for_test(
+    project: &ProjectHandle,
+    generation: GenerationId,
+    root: &Path,
+) -> DesktopCore {
     let catalog = CatalogProject {
         handle: project.clone(),
         name: "project".to_owned(),
-        root: root.clone(),
+        root: root.to_path_buf(),
     };
     let mut state = test_state();
     state.catalog.insert(project.clone(), catalog.clone());
@@ -2126,6 +2198,33 @@ pub(crate) fn active_core_for_test(
         inner: Arc::new(Mutex::new(state)),
         command_gate: Arc::new(Mutex::new(())),
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn manage_skill_library_without_io_for_test(
+    core: &DesktopCore,
+    request: SkillLibraryRequest,
+    switch_after_work: Option<(ProjectHandle, GenerationId)>,
+) -> DesktopResult<SkillLibraryDto> {
+    let inner = Arc::clone(&core.inner);
+    core.manage_skill_library_with(request, move |_, _| async move {
+        if let Some((project, generation)) = switch_after_work {
+            let mut state = inner.lock().await;
+            let catalog = CatalogProject {
+                handle: project,
+                name: "other".to_owned(),
+                root: PathBuf::from("/bounded/test/other"),
+            };
+            state.active = Some(ActiveProject {
+                catalog,
+                project_id: ProjectId::new("other-internal-authority"),
+                generation,
+            });
+            state.used_operations.clear();
+        }
+        Ok(crate::skill_library::empty_load_for_test())
+    })
+    .await
 }
 
 #[cfg(test)]

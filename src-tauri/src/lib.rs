@@ -35,6 +35,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             commands::load_evidence,
             commands::load_flow_workspace,
             commands::load_skill_inventory,
+            commands::manage_skill_library,
             commands::load_skill_audit,
             commands::run_skill_audit,
             commands::open_flow,

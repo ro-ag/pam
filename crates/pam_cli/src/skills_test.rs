@@ -8,17 +8,20 @@ use std::{
 use pam_core::{ContentDigest, ProjectId};
 use pam_platform::discover_project;
 use pam_skills::{
-    AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, CursorGlobalRulesStatus,
-    EvaluatorRunConfig, LoadSemantics, LocalInventoryRoots, OriginAgent,
-    SkillsAuditEvaluationStatus,
+    AgentArtifact, AgentArtifactId, ArtifactKind, ArtifactScope, CanonicalEntryId,
+    CanonicalLibrary, CursorGlobalRulesStatus, EvaluatorRunConfig, LibraryManagedRootId,
+    LoadSemantics, LocalInventoryRoots, MaterializationError, OriginAgent, ScanLimits,
+    SkillsAuditEvaluationStatus, scan_local_inventory,
 };
 use pam_store::{SkillInventoryDrift, Store, StoreError, StoredAgentArtifact};
 use serde_json::json;
 
 use super::skills::{
     AuditRequest, InventoryOutput, InventoryRecords, InventoryRequest, InventorySelection,
-    SkillsEnvironment, SkillsError, render_audit, render_inventory, run_audit, run_inventory,
+    LibraryOperation, SkillsEnvironment, SkillsError, render_audit, render_inventory,
+    render_library_operation, resolve_ptrack_home, run_audit, run_inventory, run_library_operation,
 };
+use crate::command::{SkillsAgentArg, SkillsInstallSourceArg};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +61,20 @@ fn toml_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+#[test]
+fn empty_ptrack_home_override_falls_back_to_the_user_home() {
+    let home = TestDirectory::new("empty-ptrack-home");
+    assert_eq!(
+        resolve_ptrack_home(home.path(), Some(OsStr::new("").to_os_string())),
+        home.path().join(".ptrack")
+    );
+    let explicit = home.path().join("custom-ptrack");
+    assert_eq!(
+        resolve_ptrack_home(home.path(), Some(explicit.clone().into_os_string())),
+        explicit
+    );
 }
 
 fn stored(path: &str, byte: u8) -> StoredAgentArtifact {
@@ -381,6 +398,440 @@ async fn cli_environment_uses_exact_user_codex_trust() {
         record.artifact.origin() == OriginAgent::Codex
             && record.artifact.logical_path() == ".codex/config.toml"
     }));
+}
+
+#[test]
+fn claude_and_cursor_default_materialization_roots_are_project_scoped() {
+    let project = TestDirectory::new("project-scoped-materialization-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"77777777-7777-4777-8777-777777777777\"\n",
+    );
+    fs::create_dir(project.path().join(".claude")).unwrap();
+    fs::create_dir(project.path().join(".cursor")).unwrap();
+    let home = TestDirectory::new("project-scoped-materialization-home");
+    for root in [".ptrack", ".claude", ".cursor"] {
+        fs::create_dir(home.path().join(root)).unwrap();
+    }
+    let state = TestDirectory::new("project-scoped-materialization-state");
+    let environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state.path().join("state.sqlite3"),
+    )
+    .unwrap();
+    let library = CanonicalLibrary::open(&home.path().join(".ptrack")).unwrap();
+    let entry_id = CanonicalEntryId::parse("review").unwrap();
+    let inserted = library
+        .insert(entry_id.clone(), b"project-scoped bytes\n")
+        .unwrap();
+    drop(library);
+
+    for (agent, relative_destination) in [
+        (SkillsAgentArg::Claude, ".claude/skills/review/SKILL.md"),
+        (SkillsAgentArg::Cursor, ".cursor/rules/review.mdc"),
+    ] {
+        run_library_operation(
+            &environment,
+            LibraryOperation::Enable {
+                entry_id: entry_id.clone(),
+                version: inserted.version().clone(),
+                agent,
+            },
+        )
+        .unwrap();
+        run_library_operation(
+            &environment,
+            LibraryOperation::Materialize {
+                entry_id: entry_id.clone(),
+                version: inserted.version().clone(),
+                agent,
+                root: None,
+                apply: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(project.path().join(relative_destination)).unwrap(),
+            b"project-scoped bytes\n"
+        );
+        assert!(!home.path().join(relative_destination).exists());
+    }
+}
+
+#[test]
+fn library_list_and_no_op_preview_respect_the_current_managed_root() {
+    let project = TestDirectory::new("root-bound-list-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"99999999-9999-4999-8999-999999999999\"\n",
+    );
+    let home = TestDirectory::new("root-bound-list-home");
+    fs::create_dir(home.path().join(".ptrack")).unwrap();
+    fs::create_dir(home.path().join(".codex")).unwrap();
+    let explicit_root = TestDirectory::new("root-bound-list-explicit");
+    let state = TestDirectory::new("root-bound-list-state");
+    let environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state.path().join("state.sqlite3"),
+    )
+    .unwrap();
+    let library = CanonicalLibrary::open(&home.path().join(".ptrack")).unwrap();
+    let entry_id = CanonicalEntryId::parse("root-bound").unwrap();
+    let bytes = b"root-bound canonical bytes\n";
+    let version = library
+        .insert(entry_id.clone(), bytes)
+        .unwrap()
+        .version()
+        .clone();
+    drop(library);
+
+    run_library_operation(
+        &environment,
+        LibraryOperation::Enable {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+        },
+    )
+    .unwrap();
+    run_library_operation(
+        &environment,
+        LibraryOperation::Materialize {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: Some(explicit_root.path().to_path_buf()),
+            apply: true,
+        },
+    )
+    .unwrap();
+
+    let default_root = home.path().join(".codex");
+    fs::create_dir_all(default_root.join("prompts")).unwrap();
+    fs::write(default_root.join("prompts/root-bound.md"), bytes).unwrap();
+    assert!(matches!(
+        run_library_operation(
+            &environment,
+            LibraryOperation::Materialize {
+                entry_id,
+                version,
+                agent: SkillsAgentArg::Codex,
+                root: None,
+                apply: false,
+            },
+        )
+        .unwrap_err(),
+        SkillsError::Materialize(MaterializationError::Library(
+            pam_skills::LibraryError::ManagedCopyRootMismatch
+        ))
+    ));
+
+    let listed = run_library_operation(&environment, LibraryOperation::List).unwrap();
+    let json = render_library_operation(&listed, true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["result"]["entries"][0]["versions"][0]["managedAgents"],
+        json!([])
+    );
+    let canonical_explicit = fs::canonicalize(explicit_root.path()).unwrap();
+    let root_id = LibraryManagedRootId::from_canonical_path(&canonical_explicit).unwrap();
+    assert!(!json.contains(explicit_root.path().to_string_lossy().as_ref()));
+    assert!(!json.contains(default_root.to_string_lossy().as_ref()));
+    assert!(!json.contains(root_id.digest().as_str()));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn library_management_is_versioned_private_and_dry_run_by_default() {
+    let project = TestDirectory::new("library-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"33333333-3333-4333-8333-333333333333\"\n",
+    );
+    let private_body = b"private canonical source body\r\n";
+    project.write("AGENTS.md", private_body);
+    let home = TestDirectory::new("library-home");
+    fs::create_dir(home.path().join(".ptrack")).unwrap();
+    fs::create_dir(home.path().join(".codex")).unwrap();
+    let state = TestDirectory::new("library-state");
+    let environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state.path().join("state.sqlite3"),
+    )
+    .unwrap();
+
+    let empty = run_library_operation(&environment, LibraryOperation::List).unwrap();
+    assert!(
+        render_library_operation(&empty, false)
+            .unwrap()
+            .contains("Canonical library is empty.")
+    );
+
+    let scan = scan_local_inventory(environment.roots(), ScanLimits::default()).unwrap();
+    let artifact_id = scan
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.logical_path() == "AGENTS.md")
+        .unwrap()
+        .id();
+    let entry_id = CanonicalEntryId::parse("review").unwrap();
+    let adopted = run_library_operation(
+        &environment,
+        LibraryOperation::Adopt {
+            entry_id: entry_id.clone(),
+            artifact_id,
+        },
+    )
+    .unwrap();
+    let adopted_json = render_library_operation(&adopted, true).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&adopted_json).unwrap()["schemaVersion"],
+        1
+    );
+
+    let local_source = TestDirectory::new("library-local-source");
+    let local_private_body = b"private local install body\n";
+    local_source.write("local.md", local_private_body);
+    let installed = run_library_operation(
+        &environment,
+        LibraryOperation::Install {
+            entry_id: CanonicalEntryId::parse("local-review").unwrap(),
+            source: SkillsInstallSourceArg::Local(local_source.path().join("local.md")),
+        },
+    )
+    .unwrap();
+    let installed_json = render_library_operation(&installed, true).unwrap();
+
+    let library = CanonicalLibrary::open(&home.path().join(".ptrack")).unwrap();
+    let version = library
+        .entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.id() == &entry_id)
+        .unwrap()
+        .versions()[0]
+        .clone();
+    run_library_operation(
+        &environment,
+        LibraryOperation::Enable {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+        },
+    )
+    .unwrap();
+
+    let dry_run = run_library_operation(
+        &environment,
+        LibraryOperation::Materialize {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+            apply: false,
+        },
+    )
+    .unwrap();
+    let destination = home.path().join(".codex/prompts/review.md");
+    assert!(!destination.exists());
+    let dry_run_json = render_library_operation(&dry_run, true).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&dry_run_json).unwrap()["result"]["applied"],
+        false
+    );
+
+    let applied = run_library_operation(
+        &environment,
+        LibraryOperation::Materialize {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+            apply: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), private_body);
+
+    let clean = run_library_operation(
+        &environment,
+        LibraryOperation::Drift {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        render_library_operation(&clean, false)
+            .unwrap()
+            .contains(": clean.")
+    );
+    fs::write(&destination, b"user drift\n").unwrap();
+    let drift = run_library_operation(
+        &environment,
+        LibraryOperation::Drift {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        render_library_operation(&drift, false)
+            .unwrap()
+            .contains(": modified")
+    );
+
+    run_library_operation(
+        &environment,
+        LibraryOperation::Resync {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+            apply: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"user drift\n");
+    let resynced = run_library_operation(
+        &environment,
+        LibraryOperation::Resync {
+            entry_id: entry_id.clone(),
+            version: version.clone(),
+            agent: SkillsAgentArg::Codex,
+            root: None,
+            apply: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), private_body);
+
+    let disabled = run_library_operation(
+        &environment,
+        LibraryOperation::Disable {
+            entry_id,
+            version,
+            agent: SkillsAgentArg::Codex,
+            root: None,
+        },
+    )
+    .unwrap();
+    assert!(!destination.exists());
+
+    let listed = run_library_operation(&environment, LibraryOperation::List).unwrap();
+    let rendered = [
+        adopted_json,
+        installed_json,
+        dry_run_json,
+        render_library_operation(&applied, true).unwrap(),
+        render_library_operation(&drift, true).unwrap(),
+        render_library_operation(&resynced, true).unwrap(),
+        render_library_operation(&disabled, true).unwrap(),
+        render_library_operation(&listed, true).unwrap(),
+        format!("{listed:?}"),
+    ]
+    .join("\n");
+    for secret in [
+        std::str::from_utf8(private_body).unwrap(),
+        std::str::from_utf8(local_private_body).unwrap(),
+        project.path().to_str().unwrap(),
+        home.path().to_str().unwrap(),
+        local_source.path().to_str().unwrap(),
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_install_output_omits_repository_url_path_and_source_body() {
+    let project = TestDirectory::new("library-git-project");
+    project.write(
+        ".pam/project.toml",
+        b"version = 1\nproject_id = \"44444444-4444-4444-8444-444444444444\"\n",
+    );
+    let home = TestDirectory::new("library-git-home");
+    fs::create_dir(home.path().join(".ptrack")).unwrap();
+    let state = TestDirectory::new("library-git-state");
+    let environment = SkillsEnvironment::for_test(
+        project.path(),
+        home.path().to_path_buf(),
+        state.path().join("state.sqlite3"),
+    )
+    .unwrap();
+    let repository = TestDirectory::new("library-git-source");
+    let private_body = "private git install body";
+    repository.write("skill.md", private_body);
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "skill.md"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=PAM Test",
+                "-c",
+                "user.email=pam@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let url = format!(
+        "file://{}",
+        fs::canonicalize(repository.path()).unwrap().display()
+    );
+
+    let output = run_library_operation(
+        &environment,
+        LibraryOperation::Install {
+            entry_id: CanonicalEntryId::parse("git-review").unwrap(),
+            source: SkillsInstallSourceArg::Git {
+                url: url.clone(),
+                artifact_path: "skill.md".to_owned(),
+            },
+        },
+    )
+    .unwrap();
+    let rendered = render_library_operation(&output, true).unwrap();
+    assert!(rendered.contains("\"source\": \"git\""));
+    assert!(rendered.contains("gitCommit"));
+    assert!(!rendered.contains(&url));
+    assert!(!rendered.contains(repository.path().to_str().unwrap()));
+    assert!(!rendered.contains(private_body));
+}
+
+#[test]
+fn materialization_errors_never_render_raw_local_paths() {
+    let secret = "/private/root/token/prompts/review.md";
+    let error = SkillsError::Materialize(MaterializationError::UnsafePath(PathBuf::from(secret)));
+    assert!(!error.to_string().contains(secret));
+    assert!(error.to_string().contains("no local path details"));
 }
 
 fn request<'a>(

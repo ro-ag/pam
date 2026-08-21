@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use pam_gui::SkillLibraryRequest;
+
 use crate::commands::{ActivateProjectRequest, ApprovalRequest, BootstrapRequest, FencedRequest};
 
 const PROJECT_HANDLE: &str = "88d408ec-796b-4f56-b34c-f2a8d25f9128";
@@ -109,4 +111,25 @@ fn audit_requests_accept_only_the_canonical_fence_contract() {
 
     assert!(serde_json::from_value::<FencedRequest>(valid).is_ok());
     assert!(serde_json::from_value::<FencedRequest>(ambient_evaluator).is_err());
+}
+
+#[test]
+fn skill_library_request_is_one_strict_action_without_caller_roots_or_project_identity() {
+    let valid = json!({
+        "action": "load",
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID
+    });
+    let ambient = json!({
+        "action": "load",
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID,
+        "projectId": "guessed-project",
+        "root": "/tmp/untrusted"
+    });
+
+    assert!(serde_json::from_value::<SkillLibraryRequest>(valid).is_ok());
+    assert!(serde_json::from_value::<SkillLibraryRequest>(ambient).is_err());
 }

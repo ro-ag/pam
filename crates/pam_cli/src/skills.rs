@@ -7,7 +7,7 @@ use std::{
 };
 
 use directories::BaseDirs;
-use pam_core::ProjectId;
+use pam_core::{ContentDigest, ProjectId};
 use pam_platform::{IdentityError, ProjectIdentity, discover_project, user_data_dir};
 use pam_skills::{
     AgentArtifactId, CursorGlobalRulesStatus, EvaluatorKind, EvaluatorRunConfig,
@@ -18,12 +18,30 @@ use pam_skills::{
 use pam_store::{SkillInventoryDrift, Store, StoreError, StoredAgentArtifact};
 use serde::Serialize;
 
-use crate::render::{EXIT_OPERATION_FAILED, escape_text};
+use crate::{
+    command::{SkillsAgentArg, SkillsInstallSourceArg},
+    render::{EXIT_OPERATION_FAILED, escape_text},
+};
+
+use pam_skills::{
+    ArtifactInstallError, ArtifactInstallProvenance, ArtifactInstallSource, CanonicalEntryId,
+    CanonicalLibrary, CanonicalLibrarySnapshot, InvalidLibraryProjectKey, LibraryEnablementKey,
+    LibraryError, LibraryInsertDisposition, LibraryManagedRootId, LibraryProjectKey,
+    ManagedCopyCleanupDisposition, MaterializationAction, MaterializationDriftConflict,
+    MaterializationDriftState, MaterializationError, MaterializationPlan,
+    apply_managed_materialization, apply_materialization_resync, disable_materialization,
+    inspect_materialization_drift, install_artifact, plan_managed_materialization,
+    plan_materialization_resync,
+};
 
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) async fn list(json: bool) -> i32 {
     execute(InventorySelection::List, json).await
+}
+
+pub(crate) fn library_list(json: bool) -> i32 {
+    execute_library(LibraryOperation::List, json)
 }
 
 pub(crate) async fn show(artifact_id: AgentArtifactId, json: bool) -> i32 {
@@ -54,6 +72,133 @@ pub(crate) async fn audit(json: bool) -> i32 {
         Err(error) => return report_error(&error),
     };
     let rendered = render_audit(&output, json);
+    println!("{rendered}");
+    0
+}
+
+pub(crate) fn adopt(entry_id: CanonicalEntryId, artifact_id: AgentArtifactId, json: bool) -> i32 {
+    execute_library(
+        LibraryOperation::Adopt {
+            entry_id,
+            artifact_id,
+        },
+        json,
+    )
+}
+
+pub(crate) fn install(
+    entry_id: CanonicalEntryId,
+    source: SkillsInstallSourceArg,
+    json: bool,
+) -> i32 {
+    execute_library(LibraryOperation::Install { entry_id, source }, json)
+}
+
+pub(crate) fn enable(
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    json: bool,
+) -> i32 {
+    execute_library(
+        LibraryOperation::Enable {
+            entry_id,
+            version,
+            agent,
+        },
+        json,
+    )
+}
+
+pub(crate) fn disable(
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    json: bool,
+) -> i32 {
+    execute_library(
+        LibraryOperation::Disable {
+            entry_id,
+            version,
+            agent,
+            root,
+        },
+        json,
+    )
+}
+
+pub(crate) fn materialize(
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    apply: bool,
+    json: bool,
+) -> i32 {
+    execute_library(
+        LibraryOperation::Materialize {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+        },
+        json,
+    )
+}
+
+pub(crate) fn drift(
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    json: bool,
+) -> i32 {
+    execute_library(
+        LibraryOperation::Drift {
+            entry_id,
+            version,
+            agent,
+            root,
+        },
+        json,
+    )
+}
+
+pub(crate) fn resync(
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    apply: bool,
+    json: bool,
+) -> i32 {
+    execute_library(
+        LibraryOperation::Resync {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+        },
+        json,
+    )
+}
+
+fn execute_library(operation: LibraryOperation, json: bool) -> i32 {
+    let environment = match SkillsEnvironment::discover() {
+        Ok(environment) => environment,
+        Err(error) => return report_error(&error),
+    };
+    let output = match run_library_operation(&environment, operation) {
+        Ok(output) => output,
+        Err(error) => return report_error(&error),
+    };
+    let rendered = match render_library_operation(&output, json) {
+        Ok(rendered) => rendered,
+        Err(error) => return report_error(&error),
+    };
     println!("{rendered}");
     0
 }
@@ -92,6 +237,7 @@ pub(crate) struct SkillsEnvironment {
     codex_system_config_root: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     state_path: PathBuf,
+    ptrack_home: PathBuf,
 }
 
 impl SkillsEnvironment {
@@ -119,6 +265,7 @@ impl SkillsEnvironment {
         let state_path = user_data_dir()
             .map_err(SkillsError::Identity)?
             .join("state.sqlite3");
+        let ptrack_home = resolve_ptrack_home(&user_home, env::var_os("PTRACK_HOME"));
         Ok(Self {
             project,
             user_home,
@@ -126,6 +273,7 @@ impl SkillsEnvironment {
             codex_system_config_root,
             codex_home,
             state_path,
+            ptrack_home,
         })
     }
 
@@ -149,6 +297,7 @@ impl SkillsEnvironment {
     ) -> Result<Self, SkillsError> {
         let default_codex_home = user_home.join(".codex");
         let codex_home = default_codex_home.is_dir().then_some(default_codex_home);
+        let ptrack_home = user_home.join(".ptrack");
         Ok(Self {
             project: discover_project(current_working_directory).map_err(SkillsError::Identity)?,
             user_home,
@@ -156,8 +305,59 @@ impl SkillsEnvironment {
             codex_system_config_root: None,
             codex_home,
             state_path,
+            ptrack_home,
         })
     }
+
+    fn project_key(&self) -> Result<LibraryProjectKey, SkillsError> {
+        LibraryProjectKey::parse(self.project.id().as_str().to_ascii_lowercase())
+            .map_err(SkillsError::ProjectKey)
+    }
+
+    fn ptrack_home(&self) -> Result<&Path, SkillsError> {
+        bounded_absolute_path(&self.ptrack_home)
+            .then_some(self.ptrack_home.as_path())
+            .ok_or(SkillsError::PTrackHomeUnavailable)
+    }
+
+    fn agent_root(
+        &self,
+        agent: SkillsAgentArg,
+        explicit: Option<PathBuf>,
+    ) -> Result<PathBuf, SkillsError> {
+        let root = explicit.unwrap_or_else(|| match agent {
+            SkillsAgentArg::Claude => self.project.root().join(".claude"),
+            SkillsAgentArg::Codex => self
+                .codex_home
+                .clone()
+                .unwrap_or_else(|| self.user_home.join(".codex")),
+            SkillsAgentArg::Cursor => self.project.root().join(".cursor"),
+        });
+        let safe_directory = fs::symlink_metadata(&root)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
+        if !bounded_absolute_path(&root) || !safe_directory {
+            return Err(SkillsError::AgentRootUnavailable(agent));
+        }
+        Ok(root)
+    }
+}
+
+pub(crate) fn resolve_ptrack_home(
+    user_home: &Path,
+    override_path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_path
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| user_home.join(".ptrack"), PathBuf::from)
+}
+
+fn bounded_absolute_path(path: &Path) -> bool {
+    const MAX_CLI_PATH_BYTES: usize = 4_096;
+    path.is_absolute()
+        && path.as_os_str().as_encoded_bytes().len() <= MAX_CLI_PATH_BYTES
+        && path
+            .to_str()
+            .is_some_and(|value| !value.chars().any(char::is_control))
 }
 
 pub(crate) struct InventoryRequest<'a> {
@@ -201,6 +401,580 @@ pub(crate) struct AuditOutput {
     pub(crate) observed_at_ms: u64,
     pub(crate) report: SkillsAuditReport,
     pub(crate) report_json: String,
+}
+
+pub(crate) enum LibraryOperation {
+    List,
+    Adopt {
+        entry_id: CanonicalEntryId,
+        artifact_id: AgentArtifactId,
+    },
+    Install {
+        entry_id: CanonicalEntryId,
+        source: SkillsInstallSourceArg,
+    },
+    Enable {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+    },
+    Disable {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+    },
+    Materialize {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        apply: bool,
+    },
+    Drift {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+    },
+    Resync {
+        entry_id: CanonicalEntryId,
+        version: ContentDigest,
+        agent: SkillsAgentArg,
+        root: Option<PathBuf>,
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryVersionOutput {
+    version: String,
+    enabled_agents: Vec<String>,
+    managed_agents: Vec<String>,
+    install_source: Option<String>,
+    git_commit: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryEntryOutput {
+    entry_id: String,
+    versions: Vec<LibraryVersionOutput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryPlanStepOutput {
+    entry_id: String,
+    version: String,
+    agent: String,
+    action: String,
+    backup: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+enum LibraryOperationResult {
+    List {
+        entries: Vec<LibraryEntryOutput>,
+    },
+    Adopt {
+        entry_id: String,
+        version: String,
+        artifact_id: String,
+        disposition: String,
+    },
+    Install {
+        entry_id: String,
+        version: String,
+        source: String,
+        git_commit: Option<String>,
+        disposition: String,
+    },
+    Enable {
+        entry_id: String,
+        version: String,
+        agent: String,
+        changed: bool,
+    },
+    Disable {
+        entry_id: String,
+        version: String,
+        agent: String,
+        changed: bool,
+        cleanup: String,
+    },
+    Materialize {
+        applied: bool,
+        steps: Vec<LibraryPlanStepOutput>,
+    },
+    Drift {
+        entry_id: String,
+        version: String,
+        agent: String,
+        state: String,
+        actual_digest: Option<String>,
+        conflict: Option<String>,
+    },
+    Resync {
+        applied: bool,
+        steps: Vec<LibraryPlanStepOutput>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct LibraryCommandOutput {
+    project_key: LibraryProjectKey,
+    result: LibraryOperationResult,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonLibraryCommand<'a> {
+    schema_version: u32,
+    project_key: &'a str,
+    result: &'a LibraryOperationResult,
+}
+
+pub(crate) fn run_library_operation(
+    environment: &SkillsEnvironment,
+    operation: LibraryOperation,
+) -> Result<LibraryCommandOutput, SkillsError> {
+    let project_key = environment.project_key()?;
+    let library =
+        CanonicalLibrary::open(environment.ptrack_home()?).map_err(SkillsError::Library)?;
+    let result = match operation {
+        LibraryOperation::List => list_library(environment, &library, &project_key)?,
+        LibraryOperation::Adopt {
+            entry_id,
+            artifact_id,
+        } => adopt_artifact(environment, &library, entry_id, artifact_id)?,
+        LibraryOperation::Install { entry_id, source } => {
+            install_source(&library, entry_id, source)?
+        }
+        LibraryOperation::Enable {
+            entry_id,
+            version,
+            agent,
+        } => enable_version(&library, &project_key, &entry_id, &version, agent)?,
+        LibraryOperation::Disable {
+            entry_id,
+            version,
+            agent,
+            root,
+        } => disable_version(
+            environment,
+            &library,
+            &project_key,
+            &entry_id,
+            &version,
+            agent,
+            root,
+        )?,
+        LibraryOperation::Materialize {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+        } => materialize_version(
+            environment,
+            &library,
+            &project_key,
+            &entry_id,
+            &version,
+            agent,
+            root,
+            apply,
+        )?,
+        LibraryOperation::Drift {
+            entry_id,
+            version,
+            agent,
+            root,
+        } => inspect_drift(
+            environment,
+            &library,
+            &project_key,
+            &entry_id,
+            &version,
+            agent,
+            root,
+        )?,
+        LibraryOperation::Resync {
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+        } => resync_version(
+            environment,
+            &library,
+            &project_key,
+            entry_id,
+            version,
+            agent,
+            root,
+            apply,
+        )?,
+    };
+    Ok(LibraryCommandOutput {
+        project_key,
+        result,
+    })
+}
+
+fn list_library(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let snapshot = library.snapshot().map_err(SkillsError::Library)?;
+    let enablements = snapshot.enablements();
+    let mut entries = Vec::new();
+    for entry in snapshot.entries() {
+        let mut versions = Vec::new();
+        for version in entry.versions() {
+            let mut enabled_agents =
+                agents_for_version(enablements, project_key, entry.id(), version);
+            let mut managed_agents = managed_agents_for_version(
+                environment,
+                &snapshot,
+                project_key,
+                entry.id(),
+                version,
+            );
+            enabled_agents.sort_unstable();
+            managed_agents.sort_unstable();
+            let provenance = snapshot.installations().iter().find(|installation| {
+                installation.entry_id() == entry.id() && installation.version() == version
+            });
+            let (install_source, git_commit) = provenance_labels(
+                provenance.map(pam_skills::CanonicalLibraryInstallation::provenance),
+            );
+            versions.push(LibraryVersionOutput {
+                version: version.to_string(),
+                enabled_agents,
+                managed_agents,
+                install_source,
+                git_commit,
+            });
+        }
+        entries.push(LibraryEntryOutput {
+            entry_id: entry.id().to_string(),
+            versions,
+        });
+    }
+    Ok(LibraryOperationResult::List { entries })
+}
+
+fn managed_agents_for_version(
+    environment: &SkillsEnvironment,
+    snapshot: &CanonicalLibrarySnapshot,
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+) -> Vec<String> {
+    [
+        SkillsAgentArg::Claude,
+        SkillsAgentArg::Codex,
+        SkillsAgentArg::Cursor,
+    ]
+    .into_iter()
+    .filter(|agent| {
+        let key = enablement_key(project_key, entry_id.clone(), version.clone(), *agent);
+        current_managed_root(environment, *agent)
+            .is_some_and(|root| snapshot.is_managed_at(&key, &root))
+    })
+    .map(|agent| agent.materialization_agent().as_str().to_owned())
+    .collect()
+}
+
+fn current_managed_root(
+    environment: &SkillsEnvironment,
+    agent: SkillsAgentArg,
+) -> Option<LibraryManagedRootId> {
+    let root = environment.agent_root(agent, None).ok()?;
+    let canonical = fs::canonicalize(root).ok()?;
+    LibraryManagedRootId::from_canonical_path(&canonical).ok()
+}
+
+fn agents_for_version(
+    keys: &[LibraryEnablementKey],
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+) -> Vec<String> {
+    keys.iter()
+        .filter(|key| {
+            key.project() == project_key && key.entry_id() == entry_id && key.version() == version
+        })
+        .map(|key| key.agent().as_str().to_owned())
+        .collect()
+}
+
+fn provenance_labels(
+    provenance: Option<&ArtifactInstallProvenance>,
+) -> (Option<String>, Option<String>) {
+    match provenance {
+        None => (None, None),
+        Some(ArtifactInstallProvenance::Local) => (Some("local".to_owned()), None),
+        Some(ArtifactInstallProvenance::Git(git)) => {
+            (Some("git".to_owned()), Some(git.commit().to_owned()))
+        }
+    }
+}
+
+fn adopt_artifact(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    entry_id: CanonicalEntryId,
+    artifact_id: AgentArtifactId,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let report = scan_local_inventory(environment.roots(), ScanLimits::default())
+        .map_err(SkillsError::LocalInventory)?;
+    let adopted = library
+        .adopt(entry_id, artifact_id, &report.into_scan_report())
+        .map_err(SkillsError::Library)?;
+    Ok(LibraryOperationResult::Adopt {
+        entry_id: adopted.entry_id().to_string(),
+        version: adopted.version().to_string(),
+        artifact_id: adopted.artifact_id().to_string(),
+        disposition: disposition_label(adopted.disposition()).to_owned(),
+    })
+}
+
+fn install_source(
+    library: &CanonicalLibrary,
+    entry_id: CanonicalEntryId,
+    source: SkillsInstallSourceArg,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let source = match source {
+        SkillsInstallSourceArg::Local(path) => ArtifactInstallSource::local_file(path),
+        SkillsInstallSourceArg::Git { url, artifact_path } => {
+            ArtifactInstallSource::git(url, artifact_path).map_err(SkillsError::Install)?
+        }
+    };
+    let installed = install_artifact(library, entry_id, &source).map_err(SkillsError::Install)?;
+    let (source, git_commit) = provenance_labels(Some(installed.provenance()));
+    Ok(LibraryOperationResult::Install {
+        entry_id: installed.entry_id().to_string(),
+        version: installed.version().to_string(),
+        source: source.expect("an installation always has provenance"),
+        git_commit,
+        disposition: disposition_label(installed.disposition()).to_owned(),
+    })
+}
+
+fn enable_version(
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+    agent: SkillsAgentArg,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let change = library
+        .enable(enablement_key(
+            project_key,
+            entry_id.clone(),
+            version.clone(),
+            agent,
+        ))
+        .map_err(SkillsError::Library)?;
+    Ok(LibraryOperationResult::Enable {
+        entry_id: entry_id.to_string(),
+        version: version.to_string(),
+        agent: agent.materialization_agent().as_str().to_owned(),
+        changed: change.changed(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn disable_version(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let root = environment.agent_root(agent, root)?;
+    let outcome = disable_materialization(
+        library,
+        &enablement_key(project_key, entry_id.clone(), version.clone(), agent),
+        &root,
+    )
+    .map_err(SkillsError::Materialize)?;
+    Ok(LibraryOperationResult::Disable {
+        entry_id: entry_id.to_string(),
+        version: version.to_string(),
+        agent: agent.materialization_agent().as_str().to_owned(),
+        changed: outcome.state_changed(),
+        cleanup: cleanup_label(outcome.cleanup()).to_owned(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_version(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    apply: bool,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let key = enablement_key(project_key, entry_id.clone(), version.clone(), agent);
+    if !library.is_enabled(&key).map_err(SkillsError::Library)? {
+        return Err(SkillsError::NotEnabled);
+    }
+    let root = environment.agent_root(agent, root)?;
+    let plan =
+        plan_managed_materialization(library, &key, &root).map_err(SkillsError::Materialize)?;
+    let steps = plan_steps(&plan);
+    if apply {
+        apply_managed_materialization(library, &key, &plan).map_err(SkillsError::Materialize)?;
+    }
+    Ok(LibraryOperationResult::Materialize {
+        applied: apply,
+        steps,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_drift(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+    entry_id: &CanonicalEntryId,
+    version: &ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let root = environment.agent_root(agent, root)?;
+    let inspection = inspect_materialization_drift(
+        library,
+        &enablement_key(project_key, entry_id.clone(), version.clone(), agent),
+        &root,
+    )
+    .map_err(SkillsError::Materialize)?;
+    let (state, actual_digest, conflict) = drift_labels(inspection.state());
+    Ok(LibraryOperationResult::Drift {
+        entry_id: entry_id.to_string(),
+        version: version.to_string(),
+        agent: agent.materialization_agent().as_str().to_owned(),
+        state: state.to_owned(),
+        actual_digest,
+        conflict,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resync_version(
+    environment: &SkillsEnvironment,
+    library: &CanonicalLibrary,
+    project_key: &LibraryProjectKey,
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+    root: Option<PathBuf>,
+    apply: bool,
+) -> Result<LibraryOperationResult, SkillsError> {
+    let root = environment.agent_root(agent, root)?;
+    let key = enablement_key(project_key, entry_id, version, agent);
+    let plan =
+        plan_materialization_resync(library, &key, &root).map_err(SkillsError::Materialize)?;
+    let steps = plan_steps(&plan);
+    if apply {
+        apply_materialization_resync(library, &key, &plan).map_err(SkillsError::Materialize)?;
+    }
+    Ok(LibraryOperationResult::Resync {
+        applied: apply,
+        steps,
+    })
+}
+
+fn enablement_key(
+    project_key: &LibraryProjectKey,
+    entry_id: CanonicalEntryId,
+    version: ContentDigest,
+    agent: SkillsAgentArg,
+) -> LibraryEnablementKey {
+    LibraryEnablementKey::new(entry_id, version, agent.origin(), project_key.clone())
+}
+
+fn plan_steps(plan: &MaterializationPlan) -> Vec<LibraryPlanStepOutput> {
+    plan.items()
+        .iter()
+        .map(|item| LibraryPlanStepOutput {
+            entry_id: item.entry_id().to_string(),
+            version: item.version().to_string(),
+            agent: item.agent().as_str().to_owned(),
+            action: materialization_action_label(item.action()).to_owned(),
+            backup: item.backup_destination().is_some(),
+        })
+        .collect()
+}
+
+fn drift_labels(
+    state: &MaterializationDriftState,
+) -> (&'static str, Option<String>, Option<String>) {
+    match state {
+        MaterializationDriftState::Clean => ("clean", None, None),
+        MaterializationDriftState::Missing => ("missing", None, None),
+        MaterializationDriftState::Modified(actual) => ("modified", Some(actual.to_string()), None),
+        MaterializationDriftState::Conflict(conflict) => (
+            "conflict",
+            None,
+            Some(drift_conflict_label(*conflict).to_owned()),
+        ),
+    }
+}
+
+const fn drift_conflict_label(conflict: MaterializationDriftConflict) -> &'static str {
+    match conflict {
+        MaterializationDriftConflict::Disabled => "disabled",
+        MaterializationDriftConflict::Unowned => "unowned",
+        MaterializationDriftConflict::UnsafeRoot => "unsafe_root",
+        MaterializationDriftConflict::UnsafePath => "unsafe_path",
+        MaterializationDriftConflict::Symlink => "symlink",
+        MaterializationDriftConflict::NonRegular => "non_regular",
+        MaterializationDriftConflict::Unreadable => "unreadable",
+        MaterializationDriftConflict::TooLarge => "too_large",
+        MaterializationDriftConflict::PlanMismatch => "plan_mismatch",
+    }
+}
+
+const fn materialization_action_label(action: MaterializationAction) -> &'static str {
+    match action {
+        MaterializationAction::NoOp => "no_op",
+        MaterializationAction::Create => "create",
+        MaterializationAction::Replace => "replace",
+    }
+}
+
+const fn cleanup_label(cleanup: ManagedCopyCleanupDisposition) -> &'static str {
+    match cleanup {
+        ManagedCopyCleanupDisposition::Removed => "removed",
+        ManagedCopyCleanupDisposition::Missing => "missing",
+        ManagedCopyCleanupDisposition::PreservedModified => "preserved_modified",
+        ManagedCopyCleanupDisposition::PreservedSymlink => "preserved_symlink",
+        ManagedCopyCleanupDisposition::PreservedUnowned => "preserved_unowned",
+    }
+}
+
+const fn disposition_label(disposition: LibraryInsertDisposition) -> &'static str {
+    match disposition {
+        LibraryInsertDisposition::Inserted => "inserted",
+        LibraryInsertDisposition::AlreadyPresent => "already_present",
+    }
 }
 
 pub(crate) async fn run_inventory(
@@ -356,6 +1130,145 @@ struct JsonShow {
     cursor_global_rules_status: CursorGlobalRulesStatus,
     drift: JsonDrift,
     artifact: JsonArtifact,
+}
+
+pub(crate) fn render_library_operation(
+    output: &LibraryCommandOutput,
+    json: bool,
+) -> Result<String, SkillsError> {
+    if json {
+        return serde_json::to_string_pretty(&JsonLibraryCommand {
+            schema_version: JSON_SCHEMA_VERSION,
+            project_key: output.project_key.as_str(),
+            result: &output.result,
+        })
+        .map_err(SkillsError::Json);
+    }
+    Ok(render_human_library_operation(output))
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_human_library_operation(output: &LibraryCommandOutput) -> String {
+    let mut lines = vec![format!("Project: {}", output.project_key)];
+    match &output.result {
+        LibraryOperationResult::List { entries } => {
+            if entries.is_empty() {
+                lines.push("Canonical library is empty.".to_owned());
+            } else {
+                lines.push(format!("Canonical entries: {}", entries.len()));
+                for entry in entries {
+                    for version in &entry.versions {
+                        lines.push(format!(
+                            "{}@{}  enabled={}  managed={}  source={}",
+                            entry.entry_id,
+                            version.version,
+                            joined_or_none(&version.enabled_agents),
+                            joined_or_none(&version.managed_agents),
+                            version.install_source.as_deref().unwrap_or("adopted")
+                        ));
+                    }
+                }
+            }
+        }
+        LibraryOperationResult::Adopt {
+            entry_id,
+            version,
+            artifact_id,
+            disposition,
+        } => lines.push(format!(
+            "Adopted {artifact_id} as {entry_id}@{version} ({disposition})."
+        )),
+        LibraryOperationResult::Install {
+            entry_id,
+            version,
+            source,
+            disposition,
+            ..
+        } => lines.push(format!(
+            "Installed {entry_id}@{version} from {source} ({disposition})."
+        )),
+        LibraryOperationResult::Enable {
+            entry_id,
+            version,
+            agent,
+            changed,
+        } => lines.push(format!(
+            "{} {entry_id}@{version} for {agent}.",
+            if *changed {
+                "Enabled"
+            } else {
+                "Already enabled"
+            }
+        )),
+        LibraryOperationResult::Disable {
+            entry_id,
+            version,
+            agent,
+            changed,
+            cleanup,
+        } => lines.push(format!(
+            "{} {entry_id}@{version} for {agent}; cleanup={cleanup}.",
+            if *changed {
+                "Disabled"
+            } else {
+                "Already disabled"
+            }
+        )),
+        LibraryOperationResult::Materialize { applied, steps } => {
+            render_plan_lines(&mut lines, "Materialization", *applied, steps);
+        }
+        LibraryOperationResult::Drift {
+            entry_id,
+            version,
+            agent,
+            state,
+            actual_digest,
+            conflict,
+        } => {
+            let detail = actual_digest
+                .as_deref()
+                .or(conflict.as_deref())
+                .map_or(String::new(), |detail| format!(" ({detail})"));
+            lines.push(format!(
+                "Drift {entry_id}@{version} for {agent}: {state}{detail}."
+            ));
+        }
+        LibraryOperationResult::Resync { applied, steps } => {
+            render_plan_lines(&mut lines, "Resync", *applied, steps);
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_plan_lines(
+    lines: &mut Vec<String>,
+    label: &str,
+    applied: bool,
+    steps: &[LibraryPlanStepOutput],
+) {
+    lines.push(format!(
+        "{label} {}: {} action(s).",
+        if applied { "applied" } else { "dry run" },
+        steps.len()
+    ));
+    for step in steps {
+        lines.push(format!(
+            "  {} {}@{} for {}{}",
+            step.action,
+            step.entry_id,
+            step.version,
+            step.agent,
+            if step.backup { " (backup)" } else { "" }
+        ));
+    }
+}
+
+fn joined_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(",")
+    }
 }
 
 pub(crate) fn render_inventory(
@@ -641,6 +1554,13 @@ pub(crate) enum SkillsError {
     IncompleteScan(Vec<ScanDiagnostic>),
     Audit(SkillsAuditError),
     Store(StoreError),
+    PTrackHomeUnavailable,
+    ProjectKey(InvalidLibraryProjectKey),
+    AgentRootUnavailable(SkillsAgentArg),
+    NotEnabled,
+    Library(LibraryError),
+    Install(ArtifactInstallError),
+    Materialize(MaterializationError),
     Json(serde_json::Error),
 }
 
@@ -650,7 +1570,9 @@ impl std::fmt::Display for SkillsError {
             Self::CurrentDirectory(_) => {
                 formatter.write_str("PAM could not locate the current working directory.")
             }
-            Self::Identity(error) => error.fmt(formatter),
+            Self::Identity(_) => {
+                formatter.write_str("PAM could not resolve the current project identity.")
+            }
             Self::HomeUnavailable => {
                 formatter.write_str("PAM could not locate the current user's home directory.")
             }
@@ -663,6 +1585,22 @@ impl std::fmt::Display for SkillsError {
             ),
             Self::Audit(error) => write!(formatter, "Skills audit failed: {error}."),
             Self::Store(error) => write!(formatter, "Skills store failed: {error}."),
+            Self::PTrackHomeUnavailable => {
+                formatter.write_str("PAM could not resolve a safe p-track home directory.")
+            }
+            Self::ProjectKey(error) => error.fmt(formatter),
+            Self::AgentRootUnavailable(agent) => write!(
+                formatter,
+                "PAM could not resolve a safe {} agent root.",
+                agent.materialization_agent().as_str()
+            ),
+            Self::NotEnabled => {
+                formatter.write_str("The exact library version is not enabled for this project.")
+            }
+            Self::Library(error) => write!(formatter, "Skill library failed: {error}."),
+            Self::Install(error) => write!(formatter, "Skill install failed: {error}."),
+            Self::Materialize(_) => formatter
+                .write_str("Skill materialization failed; no local path details were emitted."),
             Self::Json(_) => formatter.write_str("PAM could not encode skills JSON."),
         }
     }
@@ -676,8 +1614,17 @@ impl std::error::Error for SkillsError {
             Self::LocalInventory(error) => Some(error),
             Self::Audit(error) => Some(error),
             Self::Store(error) => Some(error),
+            Self::ProjectKey(error) => Some(error),
+            Self::Library(error) => Some(error),
+            Self::Install(error) => Some(error),
+            Self::Materialize(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::HomeUnavailable | Self::Clock | Self::IncompleteScan(_) => None,
+            Self::HomeUnavailable
+            | Self::Clock
+            | Self::IncompleteScan(_)
+            | Self::PTrackHomeUnavailable
+            | Self::AgentRootUnavailable(_)
+            | Self::NotEnabled => None,
         }
     }
 }

@@ -202,7 +202,7 @@ fn scan_settings(session: &mut ScanSession, root: &RootedPath, path: &Path, scop
             session,
             ScannedFile {
                 logical_path: file.logical_path.clone(),
-                bytes: Vec::new(),
+                bytes: file.bytes.clone(),
                 content_hash: file.content_hash.clone(),
             },
             Some("hooks"),

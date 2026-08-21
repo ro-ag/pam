@@ -16,6 +16,7 @@
     "allow-load-evidence",
     "allow-load-flow-workspace",
     "allow-load-skill-inventory",
+    "allow-manage-skill-library",
     "allow-load-skill-audit",
     "allow-run-skill-audit",
     "allow-open-flow",

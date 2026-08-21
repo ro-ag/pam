@@ -13,8 +13,8 @@ use pam_core::ContentDigest;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::AgentArtifactId;
 use crate::{AgentArtifact, ArtifactKind, ArtifactScope, OriginAgent};
-use crate::{AgentArtifactId, LoadSemantics};
 
 pub const DEFAULT_MAX_FILE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACTS: usize = 4096;
@@ -96,7 +96,7 @@ pub struct ScanReport {
     diagnostics: Vec<ScanDiagnostic>,
     complete: bool,
     #[serde(skip)]
-    always_loaded_sources: AlwaysLoadedSources,
+    retained_sources: RetainedSources,
 }
 
 impl std::fmt::Debug for ScanReport {
@@ -106,15 +106,15 @@ impl std::fmt::Debug for ScanReport {
             .field("artifacts", &self.artifacts)
             .field("diagnostics", &self.diagnostics)
             .field("complete", &self.complete)
-            .field("always_loaded_sources", &self.always_loaded_sources)
+            .field("retained_sources", &self.retained_sources)
             .finish()
     }
 }
 
 #[derive(Clone, Default, Eq, PartialEq)]
-struct AlwaysLoadedSources(BTreeMap<AgentArtifactId, Vec<u8>>);
+struct RetainedSources(BTreeMap<AgentArtifactId, Vec<u8>>);
 
-impl std::fmt::Debug for AlwaysLoadedSources {
+impl std::fmt::Debug for RetainedSources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "<redacted:{} sources>", self.0.len())
     }
@@ -124,7 +124,8 @@ impl ScanReport {
     /// Builds a deterministic complete report from already-normalized artifacts.
     ///
     /// Duplicate conflicting identities and the global artifact limit are converted
-    /// into diagnostics, making the returned report incomplete.
+    /// into diagnostics, making the returned report incomplete. This metadata-only
+    /// constructor has no exact source bytes and therefore cannot support adoption.
     #[must_use]
     pub fn from_artifacts(artifacts: impl IntoIterator<Item = AgentArtifact>) -> Self {
         let mut session = ScanSession::new(ScanLimits::default());
@@ -134,7 +135,8 @@ impl ScanReport {
         session.finish()
     }
 
-    /// Merges ecosystem reports into one atomic snapshot for persistence.
+    /// Merges ecosystem reports into one atomic snapshot for persistence, retaining
+    /// and charging every available artifact source against the aggregate byte limit.
     #[must_use]
     pub fn merge(reports: impl IntoIterator<Item = Self>) -> Self {
         merge_scan_reports(reports, ScanLimits::default())
@@ -161,7 +163,11 @@ impl ScanReport {
     }
 
     pub(crate) fn always_loaded_source(&self, id: &AgentArtifactId) -> Option<&[u8]> {
-        self.always_loaded_sources.0.get(id).map(Vec::as_slice)
+        self.artifact_source(id)
+    }
+
+    pub(crate) fn artifact_source(&self, id: &AgentArtifactId) -> Option<&[u8]> {
+        self.retained_sources.0.get(id).map(Vec::as_slice)
     }
 }
 
@@ -209,7 +215,7 @@ pub(crate) struct ScanSession {
     visited_directory_entries: usize,
     directory_entry_limit_exhausted: bool,
     artifacts: BTreeMap<ArtifactKey, AgentArtifact>,
-    always_loaded_sources: AlwaysLoadedSources,
+    retained_sources: RetainedSources,
     diagnostics: Vec<ScanDiagnostic>,
 }
 
@@ -223,7 +229,7 @@ impl ScanSession {
             visited_directory_entries: 0,
             directory_entry_limit_exhausted: false,
             artifacts: BTreeMap::new(),
-            always_loaded_sources: AlwaysLoadedSources::default(),
+            retained_sources: RetainedSources::default(),
             diagnostics: Vec::new(),
         }
     }
@@ -504,7 +510,7 @@ impl ScanSession {
     fn push_artifact_inner(
         &mut self,
         artifact: AgentArtifact,
-        content: Option<Vec<u8>>,
+        mut content: Option<Vec<u8>>,
         charge_retained_source: bool,
     ) {
         let key = ArtifactKey {
@@ -519,12 +525,16 @@ impl ScanSession {
                     artifact.logical_path(),
                     ScanDiagnosticKind::DuplicateArtifactIdentity,
                 );
+            } else if !self.retained_sources.0.contains_key(&artifact.id())
+                && let Some(source) = content.take()
+                && (!charge_retained_source
+                    || self.charge_retained_source(artifact.logical_path(), source.len()))
+            {
+                self.retained_sources.0.insert(artifact.id(), source);
             }
             return;
         }
-        let mut source = (artifact.load_semantics() == LoadSemantics::Always)
-            .then_some(content)
-            .flatten();
+        let mut source = content;
         let artifact_id = artifact.id();
         if self.artifacts.len() >= self.limits.max_artifacts {
             if !self.artifact_limit_reported {
@@ -543,7 +553,7 @@ impl ScanSession {
         }
         self.artifacts.insert(key, artifact);
         if let Some(source) = source {
-            self.always_loaded_sources.0.insert(artifact_id, source);
+            self.retained_sources.0.insert(artifact_id, source);
         }
     }
 
@@ -579,7 +589,7 @@ impl ScanSession {
             artifacts: self.artifacts.into_values().collect(),
             complete: self.diagnostics.is_empty(),
             diagnostics: self.diagnostics,
-            always_loaded_sources: self.always_loaded_sources,
+            retained_sources: self.retained_sources,
         }
     }
 
@@ -728,12 +738,12 @@ pub(crate) fn merge_scan_reports(
         let ScanReport {
             artifacts,
             diagnostics,
-            mut always_loaded_sources,
+            mut retained_sources,
             ..
         } = report;
         session.diagnostics.extend(diagnostics);
         for artifact in artifacts {
-            let source = always_loaded_sources.0.remove(&artifact.id());
+            let source = retained_sources.0.remove(&artifact.id());
             if let Some(source) = source {
                 session.push_merged_artifact_with_content(artifact, source);
             } else {

@@ -227,6 +227,100 @@ export interface SkillInventoryDataDto {
 
 export type SkillInventoryDto = FencedResponse<SkillInventoryDataDto>;
 
+export type SkillLibraryAgentDto = "claude" | "codex" | "cursor";
+export type SkillLibraryDispositionDto = "inserted" | "already_present";
+export type SkillLibraryMaterializationActionDto = "no_op" | "create" | "replace";
+export type SkillLibraryCleanupDto =
+  | "removed"
+  | "missing"
+  | "preserved_modified"
+  | "preserved_symlink"
+  | "preserved_unowned";
+
+export type SkillLibraryInstallationDto =
+  | { kind: "local" }
+  | { kind: "git"; commit: string };
+
+export type SkillLibraryDriftStateDto =
+  | { state: "clean" }
+  | { state: "missing" }
+  | { state: "modified"; actualDigest: string }
+  | {
+      state: "conflict";
+      reason:
+        | "disabled"
+        | "unowned"
+        | "unsafe_root"
+        | "unsafe_path"
+        | "symlink"
+        | "non_regular"
+        | "unreadable"
+        | "too_large"
+        | "plan_mismatch";
+    };
+
+export interface SkillLibraryVersionDto {
+  version: string;
+  installation: SkillLibraryInstallationDto | null;
+  enabledAgents: SkillLibraryAgentDto[];
+  managedAgents: SkillLibraryAgentDto[];
+}
+
+export interface SkillLibraryEntryDto {
+  entryId: string;
+  versions: SkillLibraryVersionDto[];
+}
+
+export interface SkillLibraryKeyDto {
+  entryId: string;
+  version: string;
+  agent: SkillLibraryAgentDto;
+}
+
+export interface SkillLibraryFileMetadataDto {
+  byteLen: number;
+  digest: string;
+}
+
+export interface SkillLibraryPlanItemDto {
+  key: SkillLibraryKeyDto;
+  action: SkillLibraryMaterializationActionDto;
+  existing: SkillLibraryFileMetadataDto | null;
+  backupPlanned: boolean;
+}
+
+export interface SkillLibraryOutcomeDto {
+  key: SkillLibraryKeyDto;
+  action: SkillLibraryMaterializationActionDto;
+  backup: SkillLibraryFileMetadataDto | null;
+  ownershipRecorded: boolean;
+}
+
+export interface SkillLibraryDriftDto {
+  key: SkillLibraryKeyDto;
+  expectedDigest: string;
+  state: SkillLibraryDriftStateDto;
+}
+
+export type SkillLibraryActionRequest =
+  | { action: "load" }
+  | { action: "adopt"; entryId: string; artifactId: string }
+  | { action: "install_local"; entryId: string; sourcePath: string }
+  | { action: "install_git"; entryId: string; url: string; artifactPath: string }
+  | ({ action: "enable" | "disable" | "preview_materialization" | "apply_materialization" | "inspect_drift" | "preview_resync" | "apply_resync" } & SkillLibraryKeyDto);
+
+export type SkillLibraryActionResultDto =
+  | { schemaVersion: 1; action: "load"; entries: SkillLibraryEntryDto[] }
+  | { schemaVersion: 1; action: "adopt"; entryId: string; version: string; artifactId: string; disposition: SkillLibraryDispositionDto }
+  | { schemaVersion: 1; action: "install_local" | "install_git"; entryId: string; version: string; disposition: SkillLibraryDispositionDto }
+  | { schemaVersion: 1; action: "enable"; key: SkillLibraryKeyDto; enabled: boolean; changed: boolean }
+  | { schemaVersion: 1; action: "disable"; key: SkillLibraryKeyDto; stateChanged: boolean; cleanup: SkillLibraryCleanupDto }
+  | { schemaVersion: 1; action: "preview_materialization" | "preview_resync"; items: SkillLibraryPlanItemDto[] }
+  | { schemaVersion: 1; action: "apply_materialization" | "apply_resync"; outcomes: SkillLibraryOutcomeDto[] }
+  | { schemaVersion: 1; action: "inspect_drift"; inspection: SkillLibraryDriftDto };
+
+export type SkillLibraryDto = FencedResponse<SkillLibraryActionResultDto>;
+
 export interface SkillAuditOriginSessionDto {
   origin: string;
   artifactCount: number;
@@ -314,6 +408,7 @@ export interface PamBridge {
   loadEvidence(fence: CommandFence, evidenceHandle: string): Promise<EvidenceDto>;
   loadFlowWorkspace(fence: CommandFence): Promise<FlowWorkspaceDto>;
   loadSkillInventory(fence: CommandFence): Promise<SkillInventoryDto>;
+  manageSkillLibrary(fence: CommandFence, action: SkillLibraryActionRequest): Promise<SkillLibraryDto>;
   loadSkillAudit(fence: CommandFence): Promise<SkillAuditDto>;
   runSkillAudit(fence: CommandFence): Promise<SkillAuditDto>;
   openFlow(fence: CommandFence, flowHandle: string): Promise<FlowDocumentDto>;

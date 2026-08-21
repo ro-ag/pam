@@ -174,4 +174,66 @@ describe("visual QA fixture scenarios", () => {
     expect(failed.data?.evaluation).toEqual({ status: "failed", evaluator: "cursor_agent", failure: "invalid_verdict" });
     expect(empty.data).toBeNull();
   });
+
+  it("provides exact metadata-only skill-library actions without echoing source authority", async () => {
+    const bridge = fixtureBridge();
+    const snapshot = await bridge.bootstrap();
+    const fence = snapshot.fence;
+    const loaded = await bridge.manageSkillLibrary(fence, { action: "load" });
+
+    expect(loaded.data).toMatchObject({
+      schemaVersion: 1,
+      action: "load",
+      entries: expect.arrayContaining([{
+        entryId: "release-confidence",
+        versions: [{
+          version: expect.any(String),
+          installation: { kind: "local" },
+          enabledAgents: ["codex"],
+          managedAgents: ["codex"],
+        }],
+      }]),
+    });
+
+    const installed = await bridge.manageSkillLibrary(fence, {
+      action: "install_git",
+      entryId: "team-review",
+      url: "https://example.com/team/skills.git",
+      artifactPath: "private/review/SKILL.md",
+    });
+    expect(installed.data).toMatchObject({ action: "install_git", entryId: "team-review", disposition: "inserted" });
+    expect(JSON.stringify(installed)).not.toContain("example.com/team/skills.git");
+    expect(JSON.stringify(installed)).not.toContain("private/review/SKILL.md");
+
+    const key = {
+      entryId: "release-confidence",
+      version: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      agent: "claude" as const,
+    };
+    expect((await bridge.manageSkillLibrary(fence, { action: "enable", ...key })).data)
+      .toMatchObject({ action: "enable", key, enabled: true, changed: true });
+    expect((await bridge.manageSkillLibrary(fence, { action: "preview_materialization", ...key })).data)
+      .toMatchObject({ action: "preview_materialization", items: [{ key, backupPlanned: false }] });
+    expect((await bridge.manageSkillLibrary(fence, { action: "apply_materialization", ...key })).data)
+      .toMatchObject({ action: "apply_materialization", outcomes: [{ key, ownershipRecorded: true }] });
+    expect((await bridge.manageSkillLibrary(fence, { action: "inspect_drift", ...key })).data)
+      .toMatchObject({ action: "inspect_drift", inspection: { key, state: { state: "clean" } } });
+    expect((await bridge.manageSkillLibrary(fence, { action: "preview_resync", ...key })).data)
+      .toMatchObject({ action: "preview_resync", items: [{ key, action: "no_op" }] });
+    expect((await bridge.manageSkillLibrary(fence, { action: "apply_resync", ...key })).data)
+      .toMatchObject({ action: "apply_resync", outcomes: [{ key, ownershipRecorded: true }] });
+
+    const noOpKey = {
+      entryId: "review-changes",
+      version: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      agent: "claude" as const,
+    };
+    expect((await bridge.manageSkillLibrary(fence, { action: "apply_materialization", ...noOpKey })).data)
+      .toMatchObject({
+        action: "apply_materialization",
+        outcomes: [{ key: noOpKey, action: "no_op", ownershipRecorded: true }],
+      });
+    expect((await bridge.manageSkillLibrary(fence, { action: "disable", ...key })).data)
+      .toMatchObject({ action: "disable", key, stateChanged: true, cleanup: "removed" });
+  });
 });

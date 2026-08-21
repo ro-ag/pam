@@ -1,8 +1,9 @@
 use std::{fs, path::Path};
 
 use super::{
-    AgentArtifact, ArtifactKind, ArtifactScope, ClaudePluginRoot, ClaudeScanRoots, LoadSemantics,
-    ScanDiagnosticKind, ScanLimits, scan_claude_code, scan_test::TestDirectory,
+    AgentArtifact, ArtifactKind, ArtifactScope, CanonicalEntryId, CanonicalLibrary,
+    ClaudePluginRoot, ClaudeScanRoots, LibraryInsertDisposition, LoadSemantics, ScanDiagnosticKind,
+    ScanLimits, scan_claude_code, scan_test::TestDirectory,
 };
 
 fn artifact<'a>(
@@ -120,6 +121,84 @@ fn discovers_user_and_project_artifacts_with_safe_semantics() {
 
     let repeated = scan_claude_code(roots, ScanLimits::default());
     assert_eq!(report, repeated);
+}
+
+#[test]
+fn settings_hook_and_config_adopt_the_same_exact_private_source() {
+    let project = TestDirectory::new("claude-settings-adoption-project");
+    let home = TestDirectory::new("claude-settings-adoption-home");
+    let relative = ".claude/settings.json";
+    let settings = br#"{
+  "hooks": {"PreToolUse": [{"command": "private-settings-source"}]},
+  "permissions": {"allow": ["Read"]}
+}
+"#;
+    project.write(relative, settings);
+    let source_path = project.path().join(relative);
+    let canonical_source_path = fs::canonicalize(&source_path).unwrap();
+
+    let report = scan_claude_code(
+        ClaudeScanRoots::new(None, Some(project.path()), &[]),
+        ScanLimits {
+            max_aggregate_bytes: settings.len(),
+            ..ScanLimits::default()
+        },
+    );
+    assert!(report.complete(), "{:?}", report.diagnostics());
+    let hook = artifact(
+        report.artifacts(),
+        relative,
+        ArtifactKind::Hook,
+        ArtifactScope::Project,
+    );
+    let config = artifact(
+        report.artifacts(),
+        relative,
+        ArtifactKind::Config,
+        ArtifactScope::Project,
+    );
+    let library = CanonicalLibrary::open(home.path()).unwrap();
+    let hook_entry = CanonicalEntryId::parse("claude-settings-hook").unwrap();
+    let config_entry = CanonicalEntryId::parse("claude-settings-config").unwrap();
+
+    let hook_outcome = library
+        .adopt(hook_entry.clone(), hook.id(), &report)
+        .unwrap();
+    let config_outcome = library
+        .adopt(config_entry.clone(), config.id(), &report)
+        .unwrap();
+
+    assert_eq!(
+        hook_outcome.disposition(),
+        LibraryInsertDisposition::Inserted
+    );
+    assert_eq!(
+        config_outcome.disposition(),
+        LibraryInsertDisposition::Inserted
+    );
+    assert_eq!(
+        library.read(&hook_entry, hook_outcome.version()).unwrap(),
+        settings
+    );
+    assert_eq!(
+        library
+            .read(&config_entry, config_outcome.version())
+            .unwrap(),
+        settings
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), settings);
+    assert_eq!(
+        fs::canonicalize(&source_path).unwrap(),
+        canonical_source_path
+    );
+    for rendered in [
+        serde_json::to_string(&report).unwrap(),
+        format!("{report:?}"),
+        format!("{hook_outcome:?}"),
+        format!("{config_outcome:?}"),
+    ] {
+        assert!(!rendered.contains("private-settings-source"));
+    }
 }
 
 #[test]

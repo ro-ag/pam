@@ -7,6 +7,7 @@ mod desktop;
 mod flow_editor;
 mod skill_audit;
 mod skill_inventory;
+mod skill_library;
 
 #[cfg(test)]
 mod access_config_test;
@@ -22,6 +23,8 @@ mod flow_editor_test;
 mod skill_audit_test;
 #[cfg(test)]
 mod skill_inventory_test;
+#[cfg(test)]
+mod skill_library_test;
 
 pub use desktop::{
     AccessConfigDto, ApprovalDecisionDispositionDto, ApprovalDecisionDto,
@@ -39,6 +42,15 @@ pub use desktop::{
 pub use skill_inventory::{
     CursorGlobalRulesStatusDto, SkillArtifactDto, SkillInventoryDataDto, SkillInventoryDriftDto,
     SkillInventoryDto,
+};
+
+pub use skill_library::{
+    SKILL_LIBRARY_DTO_SCHEMA_VERSION, SkillLibraryAgentDto, SkillLibraryCleanupDto,
+    SkillLibraryDataDto, SkillLibraryDispositionDto, SkillLibraryDriftConflictDto,
+    SkillLibraryDriftDto, SkillLibraryDriftStateDto, SkillLibraryDto, SkillLibraryEntryDto,
+    SkillLibraryFileMetadataDto, SkillLibraryInstallationDto, SkillLibraryKeyDto,
+    SkillLibraryMaterializationActionDto, SkillLibraryOutcomeDto, SkillLibraryPlanItemDto,
+    SkillLibraryRequest, SkillLibraryVersionDto,
 };
 
 pub use skill_audit::{

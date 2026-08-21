@@ -6,7 +6,10 @@ mod codex;
 mod codex_trust;
 mod cursor;
 mod evaluator;
+mod install;
+mod library;
 mod local;
+mod materialize;
 mod model;
 mod report;
 mod scan;
@@ -27,7 +30,13 @@ mod evaluator_test;
 #[cfg(test)]
 mod fixture_test;
 #[cfg(test)]
+mod install_test;
+#[cfg(test)]
+mod library_test;
+#[cfg(test)]
 mod local_test;
+#[cfg(test)]
+mod materialize_test;
 #[cfg(test)]
 mod model_test;
 #[cfg(test)]
@@ -52,8 +61,36 @@ pub use evaluator::{
     DetectedEvaluator, EvaluatorDetectionError, EvaluatorKind, EvaluatorRunConfig,
     EvaluatorRunError, detect_evaluator, run_evaluator,
 };
+pub use install::{
+    ArtifactInstallError, ArtifactInstallOutcome, ArtifactInstallProvenance, ArtifactInstallSource,
+    GitArtifactSource, GitInstallProvenance, MAX_GIT_ARTIFACT_PATH_BYTES,
+    MAX_GIT_ARTIFACT_PATH_DEPTH, MAX_GIT_PRIVATE_WORKSPACE_BYTES, MAX_GIT_SOURCE_URL_BYTES,
+    install_artifact,
+};
+pub use library::{
+    CanonicalEntryId, CanonicalLibrary, CanonicalLibraryEntry, CanonicalLibraryInstallation,
+    CanonicalLibrarySnapshot, InvalidCanonicalEntryId, InvalidLibraryManagedRoot,
+    InvalidLibraryProjectKey, LIBRARY_MANIFEST_SCHEMA_VERSION, LibraryAdoptionOutcome,
+    LibraryEnablementChange, LibraryEnablementKey, LibraryError, LibraryInsertDisposition,
+    LibraryInsertOutcome, LibraryIoOperation, LibraryManagedCopyChange, LibraryManagedRootId,
+    LibraryProjectKey, MAX_CANONICAL_ENTRY_ID_BYTES, MAX_LIBRARY_ARTIFACT_BYTES,
+    MAX_LIBRARY_ENABLEMENTS, MAX_LIBRARY_ENTRIES, MAX_LIBRARY_INSTALLATIONS,
+    MAX_LIBRARY_MANAGED_COPIES, MAX_LIBRARY_MANAGED_ROOT_BYTES, MAX_LIBRARY_MANIFEST_BYTES,
+    MAX_LIBRARY_PROJECT_KEY_BYTES, MAX_LIBRARY_VERSIONS_PER_ENTRY,
+};
 pub use local::{
     LocalInventoryError, LocalInventoryReport, LocalInventoryRoots, scan_local_inventory,
+};
+pub use materialize::{
+    DisableMaterializationOutcome, MAX_MATERIALIZATION_BATCH_BYTES,
+    MAX_MATERIALIZATION_BATCH_ENTRIES, ManagedCopyCleanupDisposition, MaterializationAction,
+    MaterializationAgent, MaterializationBackup, MaterializationBatchOutcome,
+    MaterializationDestinationMetadata, MaterializationDriftConflict,
+    MaterializationDriftInspection, MaterializationDriftState, MaterializationError,
+    MaterializationIoOperation, MaterializationOutcome, MaterializationPlan,
+    MaterializationPlanItem, MaterializationRequest, apply_managed_materialization,
+    apply_materialization_resync, disable_materialization, inspect_materialization_drift,
+    plan_managed_materialization, plan_materialization, plan_materialization_resync,
 };
 pub use model::{
     AgentArtifact, AgentArtifactId, AgentArtifactIdentity, ArtifactKind, ArtifactScope,

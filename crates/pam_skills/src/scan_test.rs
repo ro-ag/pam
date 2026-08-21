@@ -249,6 +249,38 @@ fn report_merge_accepts_exact_multi_report_retained_source_boundary() {
 }
 
 #[test]
+fn report_merge_retains_non_always_sources_without_serializing_or_debugging_bytes() {
+    let private_source = b"private model-selected source body";
+    let artifact = AgentArtifact::new(
+        "selected",
+        "selected.mdc",
+        ArtifactKind::Rule,
+        ArtifactScope::Project,
+        OriginAgent::Cursor,
+        LoadSemantics::ModelSelected,
+        ContentDigest::from_sha256([9; 32]),
+    )
+    .unwrap();
+    let artifact_id = artifact.id();
+    let mut session = ScanSession::new(ScanLimits::default());
+    session.push_artifact_with_content(artifact, private_source.to_vec());
+
+    let merged = merge_scan_reports([session.finish()], ScanLimits::default());
+
+    assert_eq!(
+        merged.artifact_source(&artifact_id),
+        Some(private_source.as_slice())
+    );
+    for rendered in [
+        serde_json::to_string(&merged).unwrap(),
+        format!("{merged:?}"),
+    ] {
+        assert!(!rendered.contains("private model-selected source body"));
+    }
+    assert!(format!("{merged:?}").contains("<redacted:1 sources>"));
+}
+
+#[test]
 fn report_merge_rejects_one_over_global_retained_source_budget_atomically() {
     let limits = ScanLimits {
         max_aggregate_bytes: 5,

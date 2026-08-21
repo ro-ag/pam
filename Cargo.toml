@@ -9,6 +9,7 @@ members = [
     "crates/pam_gui",
     "crates/pam_store",
     "crates/pam_compact",
+    "crates/pam_connectors",
     "crates/pam_model",
     "crates/pam_flow",
     "src-tauri",
@@ -38,7 +39,7 @@ tauri-build = { version = "=2.6.3", default-features = false, features = ["confi
 tokio = { version = "=1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
 rmp-serde = "=1.3.1"
-reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "system-proxy"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream", "system-proxy"] }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 sha2 = "=0.10.9"
 uuid = { version = "=1.24.1", features = ["v4"] }
@@ -54,6 +55,7 @@ pam_daemon = { path = "crates/pam_daemon" }
 pam_gui = { path = "crates/pam_gui" }
 pam_store = { path = "crates/pam_store" }
 pam_compact = { path = "crates/pam_compact" }
+pam_connectors = { path = "crates/pam_connectors" }
 pam_model = { path = "crates/pam_model" }
 pam_flow = { path = "crates/pam_flow" }
 

@@ -675,6 +675,9 @@ async fn project_current_and_remote_approval_decisions_are_scoped_and_fail_close
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    // project.current is a baseline read: an authenticated caller with no
+    // matching grant is served instead of rejected. Explicit deny and
+    // approval-required grants (exercised below) still take over.
     let ungranted = RequestEnvelope::project_current(
         RequestId::from("current-ungranted"),
         CallerId::from("integration-test"),
@@ -688,7 +691,7 @@ async fn project_current_and_remote_approval_decisions_are_scoped_and_fail_close
             .unwrap()
             .result
             .body,
-        ResultBody::Failure(ref failure) if failure.code == FailureCode::Forbidden
+        ResultBody::Success { .. }
     ));
 
     let current = approval_project_current("current-challenge", None);

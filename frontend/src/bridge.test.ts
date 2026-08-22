@@ -102,6 +102,25 @@ describe("Tauri bridge ABI", () => {
     expect(calls[11][1]).toEqual({ request: { ...fence, documentHandle: "66666666-6666-4666-8666-666666666666", source: "schema_version = 2" } });
   });
 
+  it("keeps the daemon observatory reads narrow with an optional bounded limit", async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+    const invoke = async <T,>(command: string, args?: Record<string, unknown>) => {
+      calls.push([command, args]);
+      return { status: "ok" } as T;
+    };
+    const bridge = createTauriBridge(invoke);
+
+    await bridge.daemonActivity(fence, 25);
+    await bridge.daemonActivity(fence);
+    await bridge.callerRegistry(fence);
+
+    expect(calls).toEqual([
+      ["daemon_activity", { request: { ...fence, limit: 25 } }],
+      ["daemon_activity", { request: { ...fence, limit: null } }],
+      ["caller_registry", { request: fence }],
+    ]);
+  });
+
   it("compares all three fence fields", () => {
     expect(sameFence(fence, { ...fence })).toBe(true);
     expect(sameFence(fence, { ...fence, generation: "33333333-3333-4333-8333-333333333333" })).toBe(false);

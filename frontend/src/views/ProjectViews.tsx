@@ -166,7 +166,7 @@ export function CurrentView({
   const canStartDaemon = data.current.recoveryAction === "start-daemon";
   const outcomeLabel = outcome?.state === "succeeded" ? "Ready" : outcome ? "Needs follow-up" : "Waiting";
   return (
-    <main className="canvas" id="main-content">
+    <section className="project-detail-view">
       <header className="project-header project-hero">
         <div>
           <span className="eyebrow">Project control center</span>
@@ -272,7 +272,7 @@ export function CurrentView({
           </div>
         </section>
       )}
-    </main>
+    </section>
   );
 }
 
@@ -293,7 +293,7 @@ export function AccessView({ data, bridge, fence }: AccessViewProps) {
           ? GitBranch
           : WarningCircle;
   return (
-    <main className="canvas" id="main-content">
+    <section className="project-detail-view">
       <header className="project-header compact"><div><h1>Access</h1><p>Narrow capabilities, visible to the developer.</p></div></header>
       <section className="panel access-panel" aria-labelledby="access-heading">
         <div className="panel-title"><div><span className="eyebrow">Project boundary</span><h2 id="access-heading">Authorized capabilities</h2></div><LockSimple size={22} /></div>
@@ -311,6 +311,6 @@ export function AccessView({ data, bridge, fence }: AccessViewProps) {
       <SkillInventoryPanel bridge={bridge} fence={fence} />
       <SkillLibraryPanel bridge={bridge} fence={fence} />
       <SkillAuditReportPanel bridge={bridge} fence={fence} />
-    </main>
+    </section>
   );
 }

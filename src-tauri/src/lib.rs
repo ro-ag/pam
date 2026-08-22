@@ -49,6 +49,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             commands::decide_approval,
             commands::load_evidence,
             commands::load_flow_workspace,
+            commands::daemon_activity,
+            commands::caller_registry,
             commands::load_skill_inventory,
             commands::manage_skill_library,
             commands::load_skill_audit,

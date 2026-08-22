@@ -11,10 +11,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use pam_core::{EvidenceHandle as ProtocolEvidenceHandle, ProjectId};
+use pam_core::{CallerCredential, CallerId, EvidenceHandle as ProtocolEvidenceHandle, ProjectId};
 use pam_daemon::registered_projects;
 use pam_platform::{CallerKind, caller_id, discover_project};
-use pam_protocol::{ApprovalDecision, FailureCode, ProjectRequestState, ProjectRequestSummary};
+use pam_protocol::{
+    ActivityEventSummary, ActivityResult, ApprovalDecision, CallerListResult, CallerSummary,
+    FailureCode, ProjectRequestState, ProjectRequestSummary,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -34,6 +37,7 @@ use crate::{
         ActionAuthority, DaemonAuthority, DryRunCondition, FlowDryRunPlan, FlowEditorDocument,
         FlowEditorError, FlowEditorModel, FlowIdentity, FlowVersionDiff, FlowVersionDiffLineKind,
     },
+    observatory::{ObservatoryState, load_caller_registry, load_daemon_activity},
     skill_audit::{SkillAuditDto, load_persisted_skill_audit, run_skill_audit_report},
     skill_inventory::{SkillInventoryDto, SkillInventoryEnvironment, load_skill_inventory},
     skill_library::{
@@ -562,6 +566,57 @@ pub struct FlowSaveDataDto {
     pub created: bool,
     pub durability_confirmed: bool,
     pub cleanup_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ActivityDto {
+    Ok {
+        events: Vec<ActivityEventDto>,
+        truncated: bool,
+    },
+    Blocked {
+        failure: FailureDto,
+    },
+    Unavailable {
+        failure: FailureDto,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivityEventDto {
+    pub sequence: u64,
+    pub project_id: String,
+    pub caller_id: String,
+    pub action: String,
+    pub decision: String,
+    pub outcome: String,
+    pub occurred_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum CallersDto {
+    Ok { callers: Vec<CallerDto> },
+    Blocked { failure: FailureDto },
+    Unavailable { failure: FailureDto },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallerDto {
+    pub caller_id: String,
+    pub registered_at_ms: u64,
+    pub revoked_at_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1111,6 +1166,63 @@ impl DesktopCore {
         })
     }
 
+    /// Loads the bounded newest-first daemon activity feed.
+    ///
+    /// A `None` limit requests the daemon default; the daemon clamps any limit
+    /// to its bounded maximum. Daemon failures are classified in the returned
+    /// DTO: an explicit policy deny is blocked, everything else unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the fence is invalid, stale, or reused.
+    pub async fn daemon_activity(
+        &self,
+        fence: CommandFence,
+        limit: Option<u32>,
+    ) -> DesktopResult<ActivityDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let observed = match observatory_credential().await {
+            Ok((caller, credential)) => {
+                load_daemon_activity(
+                    caller,
+                    credential,
+                    active.project_id.clone(),
+                    limit.unwrap_or(0),
+                )
+                .await
+            }
+            Err(state) => state,
+        };
+        let data = activity_dto(observed);
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        Ok(data)
+    }
+
+    /// Loads the complete caller registry, including revoked callers.
+    ///
+    /// Daemon failures are classified in the returned DTO: an explicit policy
+    /// deny is blocked, everything else unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the fence is invalid, stale, or reused.
+    pub async fn caller_registry(&self, fence: CommandFence) -> DesktopResult<CallersDto> {
+        let _command = self.command_gate.lock().await;
+        let active = self.begin(&fence).await?;
+        let observed = match observatory_credential().await {
+            Ok((caller, credential)) => {
+                load_caller_registry(caller, credential, active.project_id.clone()).await
+            }
+            Err(state) => state,
+        };
+        let data = callers_dto(observed);
+        let state = self.inner.lock().await;
+        ensure_active_matches(&state, &active, &fence)?;
+        Ok(data)
+    }
+
     /// Scans and persists the active project's bounded local agent artifact inventory.
     ///
     /// # Errors
@@ -1435,8 +1547,8 @@ async fn load_surfaces(project_id: ProjectId) -> SurfaceBundle {
 }
 
 async fn load_surfaces_with_credential(
-    caller: pam_core::CallerId,
-    credential: pam_core::CallerCredential,
+    caller: CallerId,
+    credential: CallerCredential,
     project_id: ProjectId,
 ) -> SurfaceBundle {
     let (health, current, access) = load_project_surfaces(caller, credential, project_id).await;
@@ -1795,6 +1907,92 @@ fn available_access_dto(view: &AccessConfigView) -> AccessConfigDto {
     }
 }
 
+async fn observatory_credential<T>() -> Result<(CallerId, CallerCredential), ObservatoryState<T>> {
+    let caller = caller_id(CallerKind::Gui).map_err(|error| ObservatoryState::Unavailable {
+        code: None,
+        detail: error.to_string(),
+        recovery: None,
+    })?;
+    let credential =
+        load_credential(caller.clone())
+            .await
+            .map_err(|detail| ObservatoryState::Unavailable {
+                code: Some(
+                    CurrentUnavailableCode::GuiRegistrationRequired
+                        .as_str()
+                        .to_owned(),
+                ),
+                detail,
+                recovery: Some(GUI_REGISTRATION_RECOVERY.to_owned()),
+            })?;
+    Ok((caller, credential))
+}
+
+fn activity_dto(state: ObservatoryState<ActivityResult>) -> ActivityDto {
+    match state {
+        ObservatoryState::Available(result) => ActivityDto::Ok {
+            events: result.events.into_iter().map(activity_event_dto).collect(),
+            truncated: result.truncated,
+        },
+        ObservatoryState::Blocked {
+            code,
+            detail,
+            recovery,
+        } => ActivityDto::Blocked {
+            failure: failure_dto(&code, detail, recovery),
+        },
+        ObservatoryState::Unavailable {
+            code,
+            detail,
+            recovery,
+        } => ActivityDto::Unavailable {
+            failure: unavailable_failure(code, detail, recovery),
+        },
+    }
+}
+
+fn activity_event_dto(event: ActivityEventSummary) -> ActivityEventDto {
+    ActivityEventDto {
+        sequence: event.sequence,
+        project_id: bounded_detail(event.project_id.as_str().to_owned()),
+        caller_id: bounded_detail(event.caller_id.as_str().to_owned()),
+        action: bounded_detail(event.action),
+        decision: bounded_detail(event.decision),
+        outcome: bounded_detail(event.outcome),
+        occurred_at_ms: event.occurred_at_ms,
+    }
+}
+
+fn callers_dto(state: ObservatoryState<CallerListResult>) -> CallersDto {
+    match state {
+        ObservatoryState::Available(result) => CallersDto::Ok {
+            callers: result.callers.iter().map(caller_dto).collect(),
+        },
+        ObservatoryState::Blocked {
+            code,
+            detail,
+            recovery,
+        } => CallersDto::Blocked {
+            failure: failure_dto(&code, detail, recovery),
+        },
+        ObservatoryState::Unavailable {
+            code,
+            detail,
+            recovery,
+        } => CallersDto::Unavailable {
+            failure: unavailable_failure(code, detail, recovery),
+        },
+    }
+}
+
+fn caller_dto(caller: &CallerSummary) -> CallerDto {
+    CallerDto {
+        caller_id: bounded_detail(caller.caller_id.as_str().to_owned()),
+        registered_at_ms: caller.registered_at_ms,
+        revoked_at_ms: caller.revoked_at_ms,
+    }
+}
+
 fn failure_dto(code: &FailureCode, detail: String, recovery: Option<String>) -> FailureDto {
     FailureDto {
         kind: failure_kind(code),
@@ -2090,6 +2288,16 @@ pub(crate) fn current_dto_for_test(current: CurrentState) -> CurrentDto {
 #[cfg(test)]
 pub(crate) fn access_dto_for_test(access: AccessConfigState) -> AccessConfigDto {
     access_dto(access)
+}
+
+#[cfg(test)]
+pub(crate) fn activity_dto_for_test(state: ObservatoryState<ActivityResult>) -> ActivityDto {
+    activity_dto(state)
+}
+
+#[cfg(test)]
+pub(crate) fn callers_dto_for_test(state: ObservatoryState<CallerListResult>) -> CallersDto {
+    callers_dto(state)
 }
 
 #[cfg(test)]

@@ -24,17 +24,18 @@ use pam_protocol::{
     ResultBody, ResultPayload, ServerMessage, SourceAvailability, decode_server_message, encode,
 };
 use pam_store::{
-    AcceptRequest, ApprovalDecision, CancelOutcome, EvidenceRedaction as StoreEvidenceRedaction,
-    EvidenceRetention as StoreEvidenceRetention, ProjectCurrent as StoreProjectCurrent,
-    ProjectRequestSummary as StoreProjectRequestSummary, PutEvidence, PutGrant, RequestState,
-    Store, StoreError,
+    AcceptRequest, ApprovalDecision, AuditEventRecord, CallerRegistration, CancelOutcome,
+    EvidenceRedaction as StoreEvidenceRedaction, EvidenceRetention as StoreEvidenceRetention,
+    ProjectCurrent as StoreProjectCurrent, ProjectRequestSummary as StoreProjectRequestSummary,
+    PutEvidence, PutGrant, RequestState, Store, StoreError,
 };
 use tokio::sync::oneshot;
 
 use super::lifecycle::{
     BriefProvider, DaemonConfig, Ownership, approval_recovery, cancellation_presentation,
-    grant_recovery, model_runtime_result, policy_resource, prepare_endpoint,
-    protocol_project_current, request_audit_event_id, request_preflight, serve_until_with_delay,
+    clamp_activity_limit, grant_recovery, model_runtime_result, policy_resource, prepare_endpoint,
+    protocol_activity_event, protocol_caller_summary, protocol_project_current,
+    request_audit_event_id, request_preflight, serve_until_with_delay,
 };
 use crate::{
     DaemonError, ExchangeError, request_exchange, request_exchange_streaming, request_status,
@@ -2726,4 +2727,54 @@ async fn long_running_work_renews_its_lease_without_duplicate_execution() {
     shutdown.send(()).unwrap();
     daemon.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(runtime);
+}
+
+#[test]
+fn activity_limits_are_clamped_with_a_default_for_zero() {
+    assert_eq!(clamp_activity_limit(0), 50);
+    assert_eq!(clamp_activity_limit(1), 1);
+    assert_eq!(clamp_activity_limit(100), 100);
+    assert_eq!(clamp_activity_limit(101), 100);
+    assert_eq!(clamp_activity_limit(u32::MAX), 100);
+}
+
+#[test]
+fn activity_event_summaries_drop_redacted_detail_and_retention() {
+    let summary = protocol_activity_event(AuditEventRecord {
+        sequence: 7,
+        event_id: "event-7".to_owned(),
+        project_id: ProjectId::from("project-a"),
+        caller_id: CallerId::from("caller-a"),
+        action: "request.preflight".to_owned(),
+        decision: "allow".to_owned(),
+        outcome: "completed".to_owned(),
+        redacted_detail: "detail-must-not-cross".to_owned(),
+        occurred_at_ms: 11,
+        retain_until_ms: 99,
+    });
+    assert_eq!(summary.sequence, 7);
+    assert_eq!(summary.project_id, ProjectId::from("project-a"));
+    assert_eq!(summary.caller_id, CallerId::from("caller-a"));
+    assert_eq!(summary.action, "request.preflight");
+    assert_eq!(summary.decision, "allow");
+    assert_eq!(summary.outcome, "completed");
+    assert_eq!(summary.occurred_at_ms, 11);
+    let encoded = encode(&summary).unwrap();
+    assert!(
+        !encoded
+            .windows(b"detail-must-not-cross".len())
+            .any(|window| window == b"detail-must-not-cross")
+    );
+}
+
+#[test]
+fn caller_summaries_preserve_registration_and_revocation() {
+    let summary = protocol_caller_summary(CallerRegistration {
+        caller_id: CallerId::from("caller-a"),
+        registered_at_ms: 5,
+        revoked_at_ms: Some(9),
+    });
+    assert_eq!(summary.caller_id, CallerId::from("caller-a"));
+    assert_eq!(summary.registered_at_ms, 5);
+    assert_eq!(summary.revoked_at_ms, Some(9));
 }

@@ -99,6 +99,13 @@ pub struct AuditPruneOutcome {
     pub has_more: bool,
 }
 
+/// Bounded newest-first slice of the durable audit ledger across all projects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentAuditEvents {
+    pub events: Vec<AuditEventRecord>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallerRegistration {
     pub caller_id: CallerId,

@@ -39,13 +39,14 @@ use pam_platform::{
 };
 use pam_policy::{CapabilityName, InvalidResourceName, ResourceName, redact_audit_detail};
 use pam_protocol::{
-    ApprovalChallenge, ApprovalDecision as ProtocolApprovalDecision, ApprovalDecisionDisposition,
-    ApprovalDecisionResult, BriefProvenance, BriefResult, CancellationDisposition,
-    CancellationResult, Capability, CodecError, ConfigurationPresence, DaemonLifecycleResult,
-    Event, EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction, EvidenceRetention,
-    ExpectedTargetKind, Failure, FailureCode, ModelFinishReason, ModelGenerationResult,
-    ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult, OperationTruth,
-    PROTOCOL_VERSION, PacState, ProjectCurrentResult,
+    ActivityEventSummary, ActivityResult, ApprovalChallenge,
+    ApprovalDecision as ProtocolApprovalDecision, ApprovalDecisionDisposition,
+    ApprovalDecisionResult, BriefProvenance, BriefResult, CallerListResult, CallerSummary,
+    CancellationDisposition, CancellationResult, Capability, CodecError, ConfigurationPresence,
+    DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk, EvidenceMetadata,
+    EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure, FailureCode,
+    ModelFinishReason, ModelGenerationResult, ModelMessage, ModelRole, ModelUsage,
+    NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState, ProjectCurrentResult,
     ProjectRequestState as ProtocolProjectRequestState,
     ProjectRequestSummary as ProtocolProjectRequestSummary, ReplayResult, RequestEnvelope,
     RequestPayload, ResultBody, ResultEnvelope, ResultPayload, ServerMessage, SourceAvailability,
@@ -53,11 +54,12 @@ use pam_protocol::{
 };
 use pam_store::{
     AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision as StoreApprovalDecision,
-    ApprovalDecisionOutcome, AuthorizationAudit, AuthorizationOutcome, AuthorizationRequest,
-    AuthorizeFlowRun, CallerAuthentication, CancelOutcome, EventRecord, ExpectedOperationKind,
-    FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome, LeasedRequest,
-    ProjectCurrent as StoreProjectCurrent, ProjectRequestSummary as StoreProjectRequestSummary,
-    Replay, RequestSnapshot, RequestState, Store, StoreError, TerminalState,
+    ApprovalDecisionOutcome, AuditEventRecord, AuthorizationAudit, AuthorizationOutcome,
+    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CallerRegistration,
+    CancelOutcome, EventRecord, ExpectedOperationKind, FlowAuthorizationOutcome,
+    FlowAuthorizationRecoveryOutcome, LeasedRequest, ProjectCurrent as StoreProjectCurrent,
+    ProjectRequestSummary as StoreProjectRequestSummary, Replay, RequestSnapshot, RequestState,
+    Store, StoreError, TerminalState,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -869,6 +871,12 @@ async fn handle_incoming(
         (Capability::ProjectCurrent, RequestPayload::ProjectCurrent) => {
             handle_project_current(&request, incoming, &store, &outbound).await
         }
+        (Capability::DaemonActivity, RequestPayload::DaemonActivity { limit }) => {
+            handle_daemon_activity(&request, *limit, incoming, &store, &outbound).await
+        }
+        (Capability::CallerList, RequestPayload::CallerList) => {
+            handle_caller_list(&request, incoming, &store, &outbound).await
+        }
         (Capability::FlowRun, RequestPayload::FlowRun { .. }) => {
             handle_flow_run(
                 request,
@@ -1077,6 +1085,11 @@ fn request_shape_is_valid(request: &RequestEnvelope) -> bool {
         (&request.capability, &request.payload),
         (Capability::DaemonStatus, RequestPayload::Status)
             | (Capability::DaemonStop, RequestPayload::Stop)
+            | (
+                Capability::DaemonActivity,
+                RequestPayload::DaemonActivity { .. }
+            )
+            | (Capability::CallerList, RequestPayload::CallerList)
             | (Capability::ProjectCurrent, RequestPayload::ProjectCurrent)
             | (
                 Capability::ApprovalDecide,
@@ -1240,7 +1253,10 @@ pub(super) fn policy_resource(
     request: &RequestEnvelope,
 ) -> Result<ResourceName, InvalidResourceName> {
     let resource = match &request.payload {
-        RequestPayload::Status | RequestPayload::Stop => "daemon".to_owned(),
+        RequestPayload::Status
+        | RequestPayload::Stop
+        | RequestPayload::DaemonActivity { .. }
+        | RequestPayload::CallerList => "daemon".to_owned(),
         RequestPayload::ProjectCurrent => "project".to_owned(),
         RequestPayload::ApprovalDecide { .. } => "approval".to_owned(),
         RequestPayload::Brief => format!("project:{}", request.project_id),
@@ -1449,6 +1465,8 @@ pub(super) fn approval_recovery(request: &RequestEnvelope, approval_id: &Approva
         ),
         Capability::ApprovalDecide
         | Capability::DaemonStop
+        | Capability::DaemonActivity
+        | Capability::CallerList
         | Capability::CancelRequest
         | Capability::ReplayEvents => format!(
             "pam approval approve {approval_id}; PAM has no CLI retry surface for this capability, so a protocol client must attach this one-request receipt to the exact challenged request"
@@ -2086,6 +2104,106 @@ const fn protocol_project_request_state(state: RequestState) -> ProtocolProjectR
         RequestState::Succeeded => ProtocolProjectRequestState::Succeeded,
         RequestState::Failed => ProtocolProjectRequestState::Failed,
         RequestState::Cancelled => ProtocolProjectRequestState::Cancelled,
+    }
+}
+
+const DEFAULT_ACTIVITY_LIMIT: u32 = 50;
+const MAX_ACTIVITY_LIMIT: u32 = 100;
+
+/// Clamps a requested activity feed limit to 1..=100; zero selects the default.
+pub(super) const fn clamp_activity_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        DEFAULT_ACTIVITY_LIMIT
+    } else if limit > MAX_ACTIVITY_LIMIT {
+        MAX_ACTIVITY_LIMIT
+    } else {
+        limit
+    }
+}
+
+async fn handle_daemon_activity(
+    request: &RequestEnvelope,
+    limit: u32,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let recent = match store.recent_audit_events(clamp_activity_limit(limit)).await {
+        Ok(recent) => recent,
+        Err(error) => {
+            send_store_failure(outbound, incoming, request, &error).await;
+            return Ok(());
+        }
+    };
+    let result = ActivityResult {
+        events: recent
+            .events
+            .into_iter()
+            .map(protocol_activity_event)
+            .collect(),
+        truncated: recent.truncated,
+    };
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            OperationTruth::Observed,
+            ResultPayload::DaemonActivity(result),
+        ))],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+pub(super) fn protocol_activity_event(record: AuditEventRecord) -> ActivityEventSummary {
+    ActivityEventSummary {
+        sequence: record.sequence,
+        project_id: record.project_id,
+        caller_id: record.caller_id,
+        action: record.action,
+        decision: record.decision,
+        outcome: record.outcome,
+        occurred_at_ms: record.occurred_at_ms,
+    }
+}
+
+async fn handle_caller_list(
+    request: &RequestEnvelope,
+    incoming: IncomingRequest,
+    store: &Store,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), DaemonError> {
+    let callers = match store.list_callers().await {
+        Ok(callers) => callers,
+        Err(error) => {
+            send_store_failure(outbound, incoming, request, &error).await;
+            return Ok(());
+        }
+    };
+    let result = CallerListResult {
+        callers: callers.into_iter().map(protocol_caller_summary).collect(),
+    };
+    send_routed(
+        outbound,
+        incoming,
+        vec![ServerMessage::Result(success_result(
+            request,
+            OperationTruth::Observed,
+            ResultPayload::CallerList(result),
+        ))],
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+pub(super) fn protocol_caller_summary(registration: CallerRegistration) -> CallerSummary {
+    CallerSummary {
+        caller_id: registration.caller_id,
+        registered_at_ms: registration.registered_at_ms,
+        revoked_at_ms: registration.revoked_at_ms,
     }
 }
 
@@ -3083,6 +3201,8 @@ fn target_request_id(request: &RequestEnvelope) -> Option<&RequestId> {
         } => Some(target_request_id),
         RequestPayload::Status
         | RequestPayload::Stop
+        | RequestPayload::DaemonActivity { .. }
+        | RequestPayload::CallerList
         | RequestPayload::ProjectCurrent
         | RequestPayload::ApprovalDecide { .. }
         | RequestPayload::Brief

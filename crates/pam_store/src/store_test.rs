@@ -23,14 +23,14 @@ use sha2::{Digest as _, Sha256};
 use super::{
     AUDIT_EXPORT_VERSION, AcceptOutcome, AcceptRequest, AppendAuditEvent, ApprovalDecision,
     ApprovalDecisionOutcome, AuditPruneOutcome, AuthorizationAudit, AuthorizationOutcome,
-    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CallerRevocation, CancelOutcome,
-    ExpectedOperationKind, FlowAuthorizationOutcome, FlowAuthorizationRecoveryOutcome,
-    FlowCheckpointDisposition, FlowEffectAuthorization, FlowTerminalResult, GrantRevocation,
-    MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE, MAX_AUDIT_CALLER_ID_BYTES,
-    MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES, MAX_AUDIT_OUTCOME_BYTES,
-    MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_PROJECT_CURRENT_QUEUED,
-    MAX_SKILLS_AUDIT_REPORT_BYTES, ProjectWorkload, PutGrant, RequestState, SaveFlowCheckpoint,
-    Store, StoreError, TerminalState,
+    AuthorizationRequest, AuthorizeFlowRun, CallerAuthentication, CallerRegistration,
+    CallerRevocation, CancelOutcome, ExpectedOperationKind, FlowAuthorizationOutcome,
+    FlowAuthorizationRecoveryOutcome, FlowCheckpointDisposition, FlowEffectAuthorization,
+    FlowTerminalResult, GrantRevocation, MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_BATCH_SIZE,
+    MAX_AUDIT_CALLER_ID_BYTES, MAX_AUDIT_DECISION_BYTES, MAX_AUDIT_EVENT_ID_BYTES,
+    MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_TERMINAL_RESULT_BYTES,
+    MAX_PROJECT_CURRENT_QUEUED, MAX_SKILLS_AUDIT_REPORT_BYTES, ProjectWorkload, PutGrant,
+    RequestState, SaveFlowCheckpoint, Store, StoreError, TerminalState,
 };
 use crate::store::database_path;
 
@@ -4583,6 +4583,111 @@ async fn audit_sequence_event_identity_and_records_survive_restart() {
     assert_eq!(export.events[1], third);
 
     close(reopened, &directory).await;
+}
+
+#[tokio::test]
+async fn recent_audit_events_are_empty_on_a_fresh_store() {
+    let (directory, path) = database_path("audit-recent-empty");
+    let store = Store::open(&path).unwrap();
+    let recent = store.recent_audit_events(10).await.unwrap();
+    assert!(recent.events.is_empty());
+    assert!(!recent.truncated);
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn recent_audit_events_are_newest_first_bounded_and_flag_truncation() {
+    let (directory, path) = database_path("audit-recent");
+    let store = Store::open(&path).unwrap();
+    for (event_id, project_id, now_ms) in [
+        ("r-1", "project-a", 10),
+        ("r-2", "project-b", 11),
+        ("r-3", "project-a", 12),
+    ] {
+        store
+            .append_audit_event(audit_event(event_id, project_id, "caller", now_ms, 100))
+            .await
+            .unwrap();
+    }
+
+    let all = store.recent_audit_events(10).await.unwrap();
+    assert!(!all.truncated);
+    assert_eq!(
+        all.events
+            .iter()
+            .map(|event| (event.sequence, event.event_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(3, "r-3"), (2, "r-2"), (1, "r-1")]
+    );
+
+    let bounded = store.recent_audit_events(2).await.unwrap();
+    assert!(bounded.truncated);
+    assert_eq!(
+        bounded
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [3, 2]
+    );
+
+    let exact = store.recent_audit_events(3).await.unwrap();
+    assert!(!exact.truncated);
+    assert_eq!(exact.events.len(), 3);
+
+    assert!(matches!(
+        store.recent_audit_events(0).await,
+        Err(StoreError::InvalidAuditBatchLimit { .. })
+    ));
+    close(store, &directory).await;
+}
+
+#[tokio::test]
+async fn list_callers_is_newest_first_and_includes_revocations() {
+    let (directory, path) = database_path("caller-list");
+    let store = Store::open(&path).unwrap();
+    assert!(store.list_callers().await.unwrap().is_empty());
+
+    store
+        .register_caller(
+            CallerId::from("caller-old"),
+            CallerCredential::new("old credential"),
+            10,
+        )
+        .await
+        .unwrap();
+    store
+        .register_caller(
+            CallerId::from("caller-new"),
+            CallerCredential::new("new credential"),
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_caller(CallerId::from("caller-old"), 30)
+            .await
+            .unwrap(),
+        CallerRevocation::Revoked
+    );
+
+    assert_eq!(
+        store.list_callers().await.unwrap(),
+        [
+            CallerRegistration {
+                caller_id: CallerId::from("caller-new"),
+                registered_at_ms: 20,
+                revoked_at_ms: None,
+            },
+            CallerRegistration {
+                caller_id: CallerId::from("caller-old"),
+                registered_at_ms: 10,
+                revoked_at_ms: Some(30),
+            },
+        ]
+    );
+    close(store, &directory).await;
 }
 
 #[tokio::test]

@@ -6,16 +6,16 @@ use pam_flow::{MAX_FLOW_DOCUMENT_BYTES, MAX_RUN_ID_BYTES};
 
 use super::{
     ApprovalDecision, ApprovalDecisionDisposition, ApprovalDecisionResult, BriefItem,
-    BriefProvenance, BriefResult, CancellationDisposition, CancellationResult, Capability,
-    ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
-    EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, FailureCode,
-    MAX_EVIDENCE_CHUNK_SIZE, MAX_FLOW_PROJECT_ROOT_BYTES, MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES,
-    MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS, MAX_PROJECT_CURRENT_QUEUED,
-    MAX_PROJECT_OPERATION_KIND_BYTES, ModelFinishReason, ModelGenerationResult, ModelMessage,
-    ModelRole, ModelUsage, NetworkDiagnosticsResult, OperationTruth, PROTOCOL_VERSION, PacState,
-    ProjectCurrentResult, ProjectRequestState, ProjectRequestSummary, ProtocolContractError,
-    ReplayResult, RequestEnvelope, RequestPayload, ResultBody, ResultEnvelope, ResultPayload,
-    SourceAvailability, StatusResult,
+    BriefProvenance, BriefResult, CallerListResult, CallerSummary, CancellationDisposition,
+    CancellationResult, Capability, ConfigurationPresence, DaemonLifecycleResult, Event,
+    EventEnvelope, EvidenceChunk, EvidenceMetadata, EvidenceRedaction, EvidenceRetention,
+    ExpectedTargetKind, FailureCode, MAX_EVIDENCE_CHUNK_SIZE, MAX_FLOW_PROJECT_ROOT_BYTES,
+    MAX_FRAME_SIZE, MAX_MODEL_MESSAGE_BYTES, MAX_MODEL_OUTPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS,
+    MAX_PROJECT_CURRENT_QUEUED, MAX_PROJECT_OPERATION_KIND_BYTES, ModelFinishReason,
+    ModelGenerationResult, ModelMessage, ModelRole, ModelUsage, NetworkDiagnosticsResult,
+    OperationTruth, PROTOCOL_VERSION, PacState, ProjectCurrentResult, ProjectRequestState,
+    ProjectRequestSummary, ProtocolContractError, ReplayResult, RequestEnvelope, RequestPayload,
+    ResultBody, ResultEnvelope, ResultPayload, SourceAvailability, StatusResult,
 };
 
 const PROJECT_ROOT: &str = "/canonical/project";
@@ -103,6 +103,54 @@ fn project_current_is_authenticated_policy_gated_and_bound_by_the_envelope() {
     assert_eq!(request.capability, Capability::ProjectCurrent);
     assert_eq!(request.capability.policy_name(), "project.current");
     assert_eq!(request.payload, RequestPayload::ProjectCurrent);
+}
+
+#[test]
+fn daemon_activity_is_an_authenticated_bounded_read_and_policy_named() {
+    let request = RequestEnvelope::daemon_activity(
+        RequestId::from("activity-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("activity-key-1"),
+        25,
+    )
+    .authenticated(CallerCredential::new("activity-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::DaemonActivity);
+    assert_eq!(request.capability.policy_name(), "daemon.activity");
+    assert_eq!(
+        request.payload,
+        RequestPayload::DaemonActivity { limit: 25 }
+    );
+}
+
+#[test]
+fn caller_list_is_authenticated_policy_named_and_free_of_credential_fields() {
+    let request = RequestEnvelope::caller_list(
+        RequestId::from("callers-1"),
+        CallerId::from("control-center-1"),
+        ProjectId::from("project-1"),
+        IdempotencyKey::from("callers-key-1"),
+    )
+    .authenticated(CallerCredential::new("callers-credential"));
+
+    assert!(request.authentication.is_some());
+    assert_eq!(request.capability, Capability::CallerList);
+    assert_eq!(request.capability.policy_name(), "caller.list");
+    assert_eq!(request.payload, RequestPayload::CallerList);
+
+    let result = ResultPayload::CallerList(CallerListResult {
+        callers: vec![CallerSummary {
+            caller_id: CallerId::from("caller-1"),
+            registered_at_ms: 1,
+            revoked_at_ms: None,
+        }],
+    });
+    let encoded = rmp_serde::to_vec_named(&result).unwrap();
+    let rendered = String::from_utf8_lossy(&encoded).into_owned();
+    assert!(!rendered.contains("credential"));
+    assert!(!rendered.contains("digest"));
 }
 
 #[test]

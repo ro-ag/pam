@@ -11,7 +11,9 @@ const explicitFixtureMode = import.meta.env.DEV && import.meta.env.MODE === "fix
 const query = explicitFixtureMode ? new URLSearchParams(window.location.search) : null;
 const bridge = explicitFixtureMode ? createFixtureBridge(fixtureScenario(query?.get("scenario"))) : createTauriBridge();
 const requestedView = query?.get("view");
-const initialView: ViewId = requestedView === "flows" || requestedView === "access" ? requestedView : "current";
+const initialView: ViewId = requestedView === "callers" || requestedView === "flows" || requestedView === "options"
+  ? requestedView
+  : "activity";
 const themeStorage = (() => {
   try { return window.localStorage; } catch { return null; }
 })();

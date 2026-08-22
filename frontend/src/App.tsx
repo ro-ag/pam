@@ -38,8 +38,10 @@ import {
   QueueDrawer,
   RecoveryScreen,
 } from "./components/Surfaces";
+import { ActivityView } from "./views/ActivityView";
+import { CallersView } from "./views/CallersView";
 import { FlowsView } from "./views/FlowsView";
-import { AccessView, CurrentView } from "./views/ProjectViews";
+import { OptionsView } from "./views/OptionsView";
 import { appReducer, initialState, presentError } from "./state";
 import {
   applyPamTheme,
@@ -119,7 +121,7 @@ function sameAuthority(left: CommandFence, right: CommandFence): boolean {
   return left.projectHandle === right.projectHandle && left.generation === right.generation;
 }
 
-export function App({ bridge, initialView = "current", initialTheme, initialThemeMode }: AppProps) {
+export function App({ bridge, initialView = "activity", initialTheme, initialThemeMode }: AppProps) {
   const [initialLayout] = useState(readInitialLayout);
   const [theme, setTheme] = useState<PamTheme>(() => initialTheme ?? readPersistedPamTheme(initialLayout.storage));
   const [themeMode, setThemeMode] = useState<PamThemeMode>(() => initialThemeMode ?? readPersistedPamThemeMode(initialLayout.storage));
@@ -334,7 +336,7 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
           return;
         }
         if (activeOverlay(effectiveOverlays)) return;
-        const view = event.key === "1" ? "current" : event.key === "2" ? "flows" : event.key === "3" ? "access" : null;
+        const view = event.key === "1" ? "activity" : event.key === "2" ? "callers" : event.key === "3" ? "flows" : event.key === "4" ? "options" : null;
         if (view) { event.preventDefault(); dispatch({ type: "navigate", view }); }
         if (event.key.toLowerCase() === "r") { event.preventDefault(); refresh(); }
       }
@@ -465,14 +467,15 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
     }
   };
   const commands: CommandPaletteCommand[] = [
-    { id: "view-current", label: "Open Current", description: "Show the selected project's durable activity.", shortcut: "⌘1" },
-    { id: "view-flows", label: "Open Flows", description: "Show bounded project flow definitions.", shortcut: "⌘2" },
-    { id: "view-access", label: "Open Access", description: "Show reported project capabilities.", shortcut: "⌘3" },
+    { id: "view-activity", label: "Open Activity", description: "Show daemon health and the recent activity feed.", shortcut: "⌘1" },
+    { id: "view-callers", label: "Open Callers", description: "Show registered callers and watched projects.", shortcut: "⌘2" },
+    { id: "view-flows", label: "Open Flows", description: "Show bounded project flow definitions.", shortcut: "⌘3" },
+    { id: "view-options", label: "Open Options", description: "Choose appearance and daemon lifecycle options.", shortcut: "⌘4" },
     { id: "open-queue", label: "Open project queue", description: "Inspect the bounded retained request window." },
     { id: "refresh", label: "Refresh project", description: "Request current state from PAM.", shortcut: "⌘R" },
   ];
   const runCommand = (id: string) => {
-    const view = id === "view-current" ? "current" : id === "view-flows" ? "flows" : id === "view-access" ? "access" : null;
+    const view = id === "view-activity" ? "activity" : id === "view-callers" ? "callers" : id === "view-flows" ? "flows" : id === "view-options" ? "options" : null;
     if (view) {
       dispatch({ type: "navigate", view });
       closeActiveOverlay();
@@ -500,11 +503,8 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
           activeView={state.activeView}
           collapsed={state.sidebarCollapsed}
           pending={pending}
-          projectMenuOpen={effectiveOverlays.stack.some(({ kind }) => kind === "project")}
           trapFocus={mobileSidebarOpen}
           onNavigate={(view) => { dispatch({ type: "navigate", view }); if (mobileSidebarOpen) toggleSidebar(); }}
-          onProjectMenuOpenChange={setProjectMenuOpen}
-          onSelectProject={selectProject}
           onToggleDaemon={toggleDaemon}
           onRestartDaemon={restartDaemon}
           onDismiss={toggleSidebar}
@@ -512,7 +512,7 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
         {mobileSidebarOpen && <button type="button" className="sidebar-scrim" aria-label="Close project sidebar" tabIndex={-1} onClick={toggleSidebar} />}
         <ResizeSeparator collapsed={state.sidebarCollapsed || compactViewport} width={state.sidebarWidth} viewportWidth={viewportWidth} onResizePreview={previewSidebarWidth} onResizeCommit={commitSidebarWidth} onToggle={toggleSidebar} />
         <section className="workspace" inert={mobileSidebarOpen || undefined} aria-hidden={mobileSidebarOpen || undefined}>
-          <Toolbar toggleButtonRef={sidebarToggleRef} commandButtonRef={commandButtonRef} queueButtonRef={queueButtonRef} data={data} theme={theme} themeMode={themeMode} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onOpenCommand={openCommandPalette} onRefresh={refresh} onOpenQueue={openQueue} onThemeChange={selectTheme} onThemeModeChange={selectThemeMode} />
+          <Toolbar toggleButtonRef={sidebarToggleRef} commandButtonRef={commandButtonRef} queueButtonRef={queueButtonRef} data={data} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onOpenCommand={openCommandPalette} onRefresh={refresh} onOpenQueue={openQueue} />
           {state.loadState === "recovering" && state.error && <div className="inline-recovery" role="alert"><WarningCircle size={18} /><span>{state.error}</span><button type="button" onClick={refresh}>Retry</button></div>}
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
@@ -523,14 +523,45 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
               exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.24, ease: [0.33, 1, 0.68, 1] }}
             >
-              {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} onOpenQueue={openQueue} onOpenApproval={() => { if (approvalKey && overlayAuthority) openOverlay({ id: `approval:${approvalKey}`, kind: "approval", authority: overlayAuthority, approvalKey }, false, true); }} onRecoverDaemon={toggleDaemon} onRefresh={refresh} onRegisterCaller={registerGuiCaller} registrationBusy={pending} />}
-              {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
-              {state.activeView === "access" && (
-                <AccessView
-                  key={`${state.activeFence.projectHandle}:${state.activeFence.generation}`}
+              {state.activeView === "activity" && (
+                <ActivityView
                   data={data}
                   bridge={bridge}
                   fence={state.activeFence}
+                  pending={pending}
+                  onStartDaemon={toggleDaemon}
+                />
+              )}
+              {state.activeView === "callers" && (
+                <CallersView
+                  data={data}
+                  bridge={bridge}
+                  fence={state.activeFence}
+                  projectMenuOpen={effectiveOverlays.stack.some(({ kind }) => kind === "project")}
+                  onProjectMenuOpenChange={setProjectMenuOpen}
+                  onSelectProject={selectProject}
+                  onCopy={(brief) => void copyBrief(brief)}
+                  onEvidence={(handle) => void loadEvidence(handle)}
+                  onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }}
+                  onOpenQueue={openQueue}
+                  onOpenApproval={() => { if (approvalKey && overlayAuthority) openOverlay({ id: `approval:${approvalKey}`, kind: "approval", authority: overlayAuthority, approvalKey }, false, true); }}
+                  onRecoverDaemon={toggleDaemon}
+                  onRefresh={refresh}
+                  onRegisterCaller={registerGuiCaller}
+                  registrationBusy={pending}
+                />
+              )}
+              {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
+              {state.activeView === "options" && (
+                <OptionsView
+                  theme={theme}
+                  themeMode={themeMode}
+                  onThemeChange={selectTheme}
+                  onThemeModeChange={selectThemeMode}
+                  daemon={data.daemon}
+                  pending={pending}
+                  onToggleDaemon={toggleDaemon}
+                  onRestartDaemon={restartDaemon}
                 />
               )}
             </motion.div>

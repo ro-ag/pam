@@ -13,6 +13,8 @@ const COMMANDS: &[&str] = &[
     "decide_approval",
     "load_evidence",
     "load_flow_workspace",
+    "daemon_activity",
+    "caller_registry",
     "load_skill_inventory",
     "manage_skill_library",
     "load_skill_audit",

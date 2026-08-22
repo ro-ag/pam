@@ -5,6 +5,7 @@ mod control_center;
 mod current;
 mod desktop;
 mod flow_editor;
+mod observatory;
 mod skill_audit;
 mod skill_inventory;
 mod skill_library;
@@ -20,6 +21,8 @@ mod desktop_test;
 #[cfg(test)]
 mod flow_editor_test;
 #[cfg(test)]
+mod observatory_test;
+#[cfg(test)]
 mod skill_audit_test;
 #[cfg(test)]
 mod skill_inventory_test;
@@ -27,16 +30,16 @@ mod skill_inventory_test;
 mod skill_library_test;
 
 pub use desktop::{
-    AccessConfigDto, ApprovalDecisionDispositionDto, ApprovalDecisionDto,
-    ApprovalDecisionResponseDto, ApprovalHandle, CatalogDto, CommandFence, CurrentDto, DesktopCore,
-    DesktopErrorDto, DesktopErrorKind, DesktopResult, EvidenceDataDto, EvidenceDto,
-    EvidenceHandleDto, FailureDto, FailureKindDto, FlowDefinitionDto, FlowDefinitionHandle,
-    FlowDocumentDataDto, FlowDocumentDto, FlowDocumentHandle, FlowDryRunDto, FlowDryRunStepDto,
-    FlowIdentityDto, FlowReviewDataDto, FlowReviewDto, FlowSaveDataDto, FlowSaveDto,
-    FlowVersionDiffDto, FlowVersionDiffLineDto, FlowWorkspaceDataDto, FlowWorkspaceDto,
-    GenerationId, HealthDto, OperationId, OutcomeDto, OutcomeSectionDto, ProjectHandle,
-    ProjectSummaryDto, RequestSummaryDto, RunDto, SnapshotDataDto, SnapshotDto, SnapshotFence,
-    TimelineFactDto, TimelineKindDto,
+    AccessConfigDto, ActivityDto, ActivityEventDto, ApprovalDecisionDispositionDto,
+    ApprovalDecisionDto, ApprovalDecisionResponseDto, ApprovalHandle, CallerDto, CallersDto,
+    CatalogDto, CommandFence, CurrentDto, DesktopCore, DesktopErrorDto, DesktopErrorKind,
+    DesktopResult, EvidenceDataDto, EvidenceDto, EvidenceHandleDto, FailureDto, FailureKindDto,
+    FlowDefinitionDto, FlowDefinitionHandle, FlowDocumentDataDto, FlowDocumentDto,
+    FlowDocumentHandle, FlowDryRunDto, FlowDryRunStepDto, FlowIdentityDto, FlowReviewDataDto,
+    FlowReviewDto, FlowSaveDataDto, FlowSaveDto, FlowVersionDiffDto, FlowVersionDiffLineDto,
+    FlowWorkspaceDataDto, FlowWorkspaceDto, GenerationId, HealthDto, OperationId, OutcomeDto,
+    OutcomeSectionDto, ProjectHandle, ProjectSummaryDto, RequestSummaryDto, RunDto,
+    SnapshotDataDto, SnapshotDto, SnapshotFence, TimelineFactDto, TimelineKindDto,
 };
 
 pub use skill_inventory::{

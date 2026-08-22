@@ -2,7 +2,9 @@ use serde_json::json;
 
 use pam_gui::SkillLibraryRequest;
 
-use crate::commands::{ActivateProjectRequest, ApprovalRequest, BootstrapRequest, FencedRequest};
+use crate::commands::{
+    ActivateProjectRequest, ActivityRequest, ApprovalRequest, BootstrapRequest, FencedRequest,
+};
 
 const PROJECT_HANDLE: &str = "88d408ec-796b-4f56-b34c-f2a8d25f9128";
 const GENERATION: &str = "c608f63b-cd23-45af-87ed-5a13bf559154";
@@ -132,4 +134,29 @@ fn skill_library_request_is_one_strict_action_without_caller_roots_or_project_id
 
     assert!(serde_json::from_value::<SkillLibraryRequest>(valid).is_ok());
     assert!(serde_json::from_value::<SkillLibraryRequest>(ambient).is_err());
+}
+
+#[test]
+fn activity_request_accepts_an_optional_limit_and_rejects_unknown_fields() {
+    let without_limit = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID
+    });
+    let with_limit = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID,
+        "limit": 25
+    });
+    let unknown = json!({
+        "projectHandle": PROJECT_HANDLE,
+        "generation": GENERATION,
+        "operationId": OPERATION_ID,
+        "callerId": "ambient authority"
+    });
+
+    assert!(serde_json::from_value::<ActivityRequest>(without_limit).is_ok());
+    assert!(serde_json::from_value::<ActivityRequest>(with_limit).is_ok());
+    assert!(serde_json::from_value::<ActivityRequest>(unknown).is_err());
 }

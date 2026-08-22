@@ -2,8 +2,9 @@ use pam_core::{
     ApprovalId, CallerCredential, CallerId, EvidenceHandle, IdempotencyKey, ProjectId, RequestId,
 };
 use pam_protocol::{
-    ApprovalChallenge, ConfigurationPresence, FailureCode, NetworkDiagnosticsResult,
-    OperationTruth, PacState, RequestEnvelope,
+    ActivityEventSummary, ActivityResult, ApprovalChallenge, CallerListResult, CallerSummary,
+    ConfigurationPresence, FailureCode, NetworkDiagnosticsResult, OperationTruth, PacState,
+    RequestEnvelope,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -14,12 +15,13 @@ use super::{
         AccessConfigDto, ApprovalDecisionDispositionDto, CommandFence, CurrentDto,
         EvidenceHandleDto, FailureDto, FailureKindDto, GenerationId, HealthDto, OperationId,
         ProjectHandle, TimelineKindDto, access_dto_for_test, active_core_for_test,
-        approval_current_for_test, approval_failure_retains_handle_for_test,
-        bounded_detail_for_test, current_dto_for_test, evidence_dto_for_test,
+        activity_dto_for_test, approval_current_for_test, approval_failure_retains_handle_for_test,
+        bounded_detail_for_test, callers_dto_for_test, current_dto_for_test, evidence_dto_for_test,
         failure_kind_for_test, gui_registration_current_for_test, post_save_reload_error_for_test,
         registration_contract_for_test, reserve_for_test, switch_authority_for_test,
     },
     flow_editor::FlowEditorError,
+    observatory::ObservatoryState,
 };
 
 #[test]
@@ -393,4 +395,105 @@ fn current_access_and_evidence_conversions_remain_bounded_and_truthful() {
     assert!(dto.body.as_ref().unwrap().len() <= 4 * 1024);
     assert!(dto.truncated);
     assert_eq!(dto.truth, "observed");
+}
+
+#[test]
+fn activity_dto_serializes_the_exact_frontend_ok_contract() {
+    let dto = activity_dto_for_test(ObservatoryState::Available(ActivityResult {
+        events: vec![ActivityEventSummary {
+            sequence: 7,
+            project_id: ProjectId::from("project-7"),
+            caller_id: CallerId::from("gui"),
+            action: "daemon.activity".to_owned(),
+            decision: "allow".to_owned(),
+            outcome: "success".to_owned(),
+            occurred_at_ms: 123,
+        }],
+        truncated: false,
+    }));
+
+    assert_eq!(
+        serde_json::to_value(dto).unwrap(),
+        serde_json::json!({
+            "status": "ok",
+            "events": [{
+                "sequence": 7,
+                "projectId": "project-7",
+                "callerId": "gui",
+                "action": "daemon.activity",
+                "decision": "allow",
+                "outcome": "success",
+                "occurredAtMs": 123
+            }],
+            "truncated": false
+        })
+    );
+}
+
+#[test]
+fn callers_dto_serializes_the_exact_frontend_ok_contract() {
+    let dto = callers_dto_for_test(ObservatoryState::Available(CallerListResult {
+        callers: vec![
+            CallerSummary {
+                caller_id: CallerId::from("gui"),
+                registered_at_ms: 123,
+                revoked_at_ms: None,
+            },
+            CallerSummary {
+                caller_id: CallerId::from("cli"),
+                registered_at_ms: 100,
+                revoked_at_ms: Some(200),
+            },
+        ],
+    }));
+
+    assert_eq!(
+        serde_json::to_value(dto).unwrap(),
+        serde_json::json!({
+            "status": "ok",
+            "callers": [
+                { "callerId": "gui", "registeredAtMs": 123, "revokedAtMs": null },
+                { "callerId": "cli", "registeredAtMs": 100, "revokedAtMs": 200 }
+            ]
+        })
+    );
+}
+
+#[test]
+fn observatory_denials_are_blocked_and_offline_reads_are_unavailable() {
+    let blocked = activity_dto_for_test(ObservatoryState::Blocked {
+        code: FailureCode::Forbidden,
+        detail: "Policy denies daemon.activity.".to_owned(),
+        recovery: None,
+    });
+    assert_eq!(
+        serde_json::to_value(blocked).unwrap(),
+        serde_json::json!({
+            "status": "blocked",
+            "failure": {
+                "kind": "blocked",
+                "code": "forbidden",
+                "detail": "Policy denies daemon.activity.",
+                "recovery": null
+            }
+        })
+    );
+
+    let unavailable = callers_dto_for_test(ObservatoryState::Unavailable {
+        code: None,
+        detail: "The PAM daemon is not running.".to_owned(),
+        recovery: Some("Start the PAM daemon.".to_owned()),
+    });
+    assert_eq!(
+        serde_json::to_value(unavailable).unwrap(),
+        serde_json::json!({
+            "status": "unavailable",
+            "failure": {
+                "kind": "unavailable",
+                "code": null,
+                "detail": "The PAM daemon is not running.",
+                "recovery": "Start the PAM daemon."
+            }
+        })
+    );
 }

@@ -808,11 +808,11 @@ pub(crate) fn failure_state_for_test(failure: Failure) -> CurrentState {
     failure_state(failure)
 }
 
-fn unique_request_id(prefix: &str) -> RequestId {
+pub(crate) fn unique_request_id(prefix: &str) -> RequestId {
     RequestId::new(format!("{prefix}-{}", Uuid::new_v4()))
 }
 
-fn unique_idempotency(prefix: &str) -> IdempotencyKey {
+pub(crate) fn unique_idempotency(prefix: &str) -> IdempotencyKey {
     IdempotencyKey::new(format!("{prefix}-{}", Uuid::new_v4()))
 }
 

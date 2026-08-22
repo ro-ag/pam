@@ -358,6 +358,19 @@ fn baseline_capabilities_allow_without_grants() {
     assert_eq!(baseline_decision(&[], "daemon.status"), Decision::Allowed);
     assert_eq!(baseline_decision(&[], "project.current"), Decision::Allowed);
     assert_eq!(baseline_decision(&[], "daemon.stop"), Decision::Allowed);
+    assert_eq!(baseline_decision(&[], "daemon.activity"), Decision::Allowed);
+    assert_eq!(baseline_decision(&[], "caller.list"), Decision::Allowed);
+}
+
+#[test]
+fn baseline_observatory_reads_respect_explicit_deny() {
+    for name in ["daemon.activity", "caller.list"] {
+        let deny = Grant {
+            capability: capability(name),
+            ..grant(Effect::Deny, ResourceScope::Any, ApprovalRequirement::None)
+        };
+        assert_eq!(baseline_decision(&[deny], name), Decision::Denied);
+    }
 }
 
 #[test]

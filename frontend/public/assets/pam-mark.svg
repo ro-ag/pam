@@ -1,32 +1,30 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- Full-bleed coral semicircle with an original LA-style lifeguard tower
-       knocked out: slanted roof, flag, deck rail, X-brace, solid stairs.
-       Fine details (rail posts, brace) degrade to texture at small sizes. -->
+  <!-- Full-bleed coral semicircle with an original lifeguard tower knocked
+       out: steep high-left roof, flag, deck rail, plain legs, two-step
+       stairs with a simple handrail. -->
   <mask id="tower">
     <rect width="1024" height="1024" fill="#fff"/>
-    <!-- slanted roof with overhang -->
-    <polygon points="302,436 642,398 642,462 302,500" fill="#000"/>
+    <!-- roof: steep slant, high side left, wide overhang -->
+    <polygon points="296,382 648,458 648,516 296,440" fill="#000"/>
     <!-- flag pole + flag -->
-    <rect x="524" y="330" width="14" height="84" fill="#000"/>
-    <polygon points="538,330 538,378 614,354" fill="#000"/>
+    <rect x="446" y="322" width="14" height="88" fill="#000"/>
+    <polygon points="460,322 460,370 536,346" fill="#000"/>
     <!-- cabin -->
-    <rect x="344" y="468" width="242" height="196" fill="#000"/>
+    <rect x="344" y="478" width="242" height="186" fill="#000"/>
     <!-- vertical window slit -->
-    <rect x="470" y="505" width="64" height="122" fill="#fff"/>
+    <rect x="470" y="512" width="64" height="118" fill="#fff"/>
     <!-- deck bar extending right to the stairs -->
     <rect x="336" y="660" width="424" height="26" fill="#000"/>
     <!-- deck railing over the right extension -->
     <rect x="600" y="612" width="160" height="16" fill="#000"/>
     <rect x="612" y="628" width="14" height="32" fill="#000"/>
-    <rect x="664" y="628" width="14" height="32" fill="#000"/>
-    <rect x="716" y="628" width="14" height="32" fill="#000"/>
-    <!-- legs -->
+    <rect x="700" y="628" width="14" height="32" fill="#000"/>
+    <!-- plain legs, no brace -->
     <rect x="368" y="686" width="58" height="94" fill="#000"/>
     <rect x="522" y="686" width="58" height="94" fill="#000"/>
-    <!-- X cross-brace -->
-    <path d="M 400 700 L 548 772 M 548 700 L 400 772" stroke="#000" stroke-width="30" stroke-linecap="round" fill="none"/>
-    <!-- solid stairs down to the right -->
-    <polygon points="712,686 762,686 762,718 810,718 810,750 858,750 858,780 712,780" fill="#000"/>
+    <!-- stairs: two steps, simple handrail -->
+    <polygon points="712,686 782,686 782,734 852,734 852,780 712,780" fill="#000"/>
+    <path d="M 752 636 L 880 722" stroke="#000" stroke-width="18" stroke-linecap="round" fill="none"/>
   </mask>
   <path fill="#FC6349" mask="url(#tower)" d="M 42 780 A 470 470 0 0 1 982 780 Z"/>
 </svg>

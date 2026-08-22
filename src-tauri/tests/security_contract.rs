@@ -136,7 +136,8 @@ fn bundle_contract_covers_only_the_requested_desktop_targets() {
     let linux = read_json(manifest_dir().join("tauri.linux.conf.json"));
     let windows = read_json(manifest_dir().join("tauri.windows.conf.json"));
 
-    assert_eq!(config["bundle"]["externalBin"], json!(["binaries/pam"]));
+    // Single-binary product: the bundle ships no sidecar executables.
+    assert_eq!(config["bundle"]["externalBin"], json!(null));
     assert_eq!(config["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(config["bundle"]["category"], "DeveloperTool");
     assert_eq!(

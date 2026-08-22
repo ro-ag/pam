@@ -10,13 +10,14 @@ name = "pam_desktop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pam-gui"
+name = "pam"
 path = "src/main.rs"
 
 [build-dependencies]
 tauri-build.workspace = true
 
 [dependencies]
+pam_cli.workspace = true
 pam_gui.workspace = true
 serde.workspace = true
 tauri.workspace = true

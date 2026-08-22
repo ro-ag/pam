@@ -18,7 +18,9 @@ mod secrets_test;
 #[cfg(test)]
 mod transport_test;
 
-pub use endpoint::LocalEndpoint;
+pub use endpoint::{
+    LAUNCH_GRANT_ENV, LAUNCH_GRANT_FILE, LocalEndpoint, consume_launch_grant, issue_launch_grant,
+};
 pub use error::{TransportError, TransportErrorKind};
 pub use identity::{
     CallerKind, IdentityError, IdentityErrorKind, ProjectIdentity, caller_id, discover_project,

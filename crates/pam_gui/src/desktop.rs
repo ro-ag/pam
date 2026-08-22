@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use pam_core::{EvidenceHandle as ProtocolEvidenceHandle, ProjectId};
 use pam_daemon::registered_projects;
 use pam_platform::{CallerKind, caller_id, discover_project};
@@ -869,19 +872,33 @@ impl DesktopCore {
         let _command = self.command_gate.lock().await;
         let active = self.begin(&fence).await?;
         let executable = self.inner.lock().await.daemon_executable.clone();
-        let mut child = Command::new(executable)
-            .arg("daemon")
+        // The daemon starts only with a control-center launch grant, and runs
+        // detached in its own process group: closing the UI never stops it.
+        let endpoint = pam_platform::LocalEndpoint::default_for_user();
+        let grant = pam_platform::issue_launch_grant(endpoint.runtime_dir()).map_err(|error| {
+            DesktopErrorDto::unavailable(
+                "PAM could not authorize a daemon launch.",
+                Some(error.to_string()),
+            )
+        })?;
+        let mut command = Command::new(executable);
+        command
+            // --recover is idempotent: it only clears a stale socket, and a
+            // live daemon still holds the ownership lock.
+            .args(["daemon", "--recover"])
+            .env(pam_platform::LAUNCH_GRANT_ENV, grant)
             .current_dir(&active.catalog.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                DesktopErrorDto::unavailable(
-                    "PAM could not start the local daemon.",
-                    Some(error.to_string()),
-                )
-            })?;
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|error| {
+            DesktopErrorDto::unavailable(
+                "PAM could not start the local daemon.",
+                Some(error.to_string()),
+            )
+        })?;
         tokio::time::sleep(STARTUP_DELAY).await;
         if let Some(status) = child.try_wait().map_err(|error| {
             DesktopErrorDto::unavailable(
@@ -1347,10 +1364,9 @@ impl DesktopCore {
 }
 
 fn default_daemon_executable() -> PathBuf {
-    std::env::current_exe().map_or_else(
-        |_| PathBuf::from(executable_name("pam")),
-        |current| current.with_file_name(executable_name("pam")),
-    )
+    // Single-binary product: the daemon is this same executable in
+    // `pam daemon` mode.
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from(executable_name("pam")))
 }
 
 fn gui_registration_command(executable: &Path, root: &Path) -> tokio::process::Command {

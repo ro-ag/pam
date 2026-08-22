@@ -70,3 +70,12 @@ unused_qualifications = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Size-optimized release: one ~30MB binary would otherwise carry unused
+# generics, symbols, and unwinding tables across the whole stack.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -375,7 +375,7 @@ fn stale_socket_reports_recovery_command() {
     })
     .unwrap_err();
     assert!(matches!(error, DaemonError::StaleState(_)));
-    assert_eq!(error.recovery_action(), Some("pam daemon --recover"));
+    assert_eq!(error.recovery_action(), Some("pam gui"));
 
     let _ = fs::remove_dir_all(runtime);
 }

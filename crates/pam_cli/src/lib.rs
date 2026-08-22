@@ -32,10 +32,23 @@ mod skills_test;
 use clap::Parser;
 use command::{Cli, Mode};
 
-#[tokio::main]
+/// Runs the PAM client CLI to completion and returns its exit code.
+///
+/// # Panics
+///
+/// Panics only if the Tokio runtime cannot be constructed.
+#[must_use]
+pub fn run() -> i32 {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("PAM could not start its async runtime")
+        .block_on(run_async())
+}
+
 #[allow(clippy::too_many_lines)]
-async fn main() {
-    let exit_code = match Cli::parse().mode() {
+async fn run_async() -> i32 {
+    match Cli::parse().mode() {
         Mode::Client => {
             println!("PAM client ready. Run `pam status` to inspect the daemon.");
             0
@@ -217,7 +230,5 @@ async fn main() {
             }
         },
         Mode::Gui => gui::run(),
-    };
-
-    std::process::exit(exit_code);
+    }
 }

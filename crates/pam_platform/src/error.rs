@@ -40,7 +40,7 @@ impl TransportError {
         match self.kind {
             TransportErrorKind::Unavailable => Some("pam daemon"),
             TransportErrorKind::EndpointInUse => Some("pam status"),
-            TransportErrorKind::StaleEndpoint => Some("pam daemon --recover"),
+            TransportErrorKind::StaleEndpoint => Some("pam gui"),
             TransportErrorKind::ClientDisconnected
             | TransportErrorKind::FrameTooLarge
             | TransportErrorKind::InvalidMessage
@@ -63,8 +63,9 @@ impl fmt::Display for TransportError {
             TransportErrorKind::FrameTooLarge => {
                 formatter.write_str("PAM rejected an oversized local protocol message.")
             }
-            TransportErrorKind::StaleEndpoint => formatter
-                .write_str("PAM daemon endpoint is stale. Recover it with `pam daemon --recover`."),
+            TransportErrorKind::StaleEndpoint => formatter.write_str(
+                "PAM daemon endpoint is stale. Restart PAM from the control center (`pam gui`).",
+            ),
             TransportErrorKind::InvalidMessage => {
                 formatter.write_str("PAM received an invalid local protocol message.")
             }

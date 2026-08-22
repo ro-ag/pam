@@ -46,7 +46,6 @@
     "copyright": "Copyright © 2026 PAM contributors",
     "shortDescription": "A trusted local project companion",
     "longDescription": "PAM keeps project continuity, evidence, access diagnostics, and verified flows close at hand.",
-    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
-    "externalBin": ["binaries/pam"]
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
   }
 }

@@ -3001,6 +3001,7 @@ dependencies = [
 name = "pam-desktop"
 version = "0.1.0"
 dependencies = [
+ "pam_cli",
  "pam_gui",
  "serde",
  "serde_json",

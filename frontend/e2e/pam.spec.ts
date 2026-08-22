@@ -273,9 +273,9 @@ test.describe("production-shaped interactions", () => {
 test.describe("selectable theme families and variants", () => {
   const appearances = [
     { theme: "ventisquero", mode: "light", page: "rgb(246, 243, 236)", surface: "rgb(253, 252, 249)", accent: "#1d7893", font: "Archivo", asset: "ventisquero-yelcho.png" },
-    { theme: "ventisquero", mode: "dark", page: "rgb(6, 9, 13)", surface: "rgb(12, 17, 23)", accent: "#1d7893", font: "Archivo", asset: "ventisquero-yelcho.png" },
+    { theme: "ventisquero", mode: "dark", page: "rgb(12, 17, 23)", surface: "rgb(12, 17, 23)", accent: "#1d7893", font: "Archivo", asset: "ventisquero-yelcho.png" },
     { theme: "vina", mode: "light", page: "rgb(245, 243, 235)", surface: "rgb(253, 252, 249)", accent: "#a84595", font: "Space Grotesk", asset: "vina-sunset.png" },
-    { theme: "vina", mode: "dark", page: "rgb(10, 5, 20)", surface: "rgb(26, 11, 46)", accent: "#a84595", font: "Space Grotesk", asset: "vina-sunset.png" },
+    { theme: "vina", mode: "dark", page: "rgb(26, 11, 46)", surface: "rgb(26, 11, 46)", accent: "#a84595", font: "Space Grotesk", asset: "vina-sunset.png" },
   ] as const;
 
   for (const appearance of appearances) {

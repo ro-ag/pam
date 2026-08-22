@@ -361,6 +361,13 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
     const stopping = data.daemon.state === "running";
     void executeDataCommand(fence, () => stopping ? bridge.stopDaemon(fence) : bridge.startDaemon(fence), stopping ? "PAM is paused" : "PAM is back on watch");
   };
+  const restartDaemon = () => {
+    const fence = withOperation(state.activeFence!);
+    void executeDataCommand(fence, async () => {
+      const stopped = await bridge.stopDaemon(fence);
+      return bridge.startDaemon({ ...fence, generation: stopped.fence.generation });
+    }, "PAM restarted");
+  };
   const registerGuiCaller = () => {
     const fence = withOperation(state.activeFence!);
     void executeDataCommand(
@@ -499,6 +506,7 @@ export function App({ bridge, initialView = "current", initialTheme, initialThem
           onProjectMenuOpenChange={setProjectMenuOpen}
           onSelectProject={selectProject}
           onToggleDaemon={toggleDaemon}
+          onRestartDaemon={restartDaemon}
           onDismiss={toggleSidebar}
         />
         {mobileSidebarOpen && <button type="button" className="sidebar-scrim" aria-label="Close project sidebar" tabIndex={-1} onClick={toggleSidebar} />}

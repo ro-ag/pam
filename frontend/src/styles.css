@@ -1058,6 +1058,10 @@ body { color: var(--pam-text); background: var(--pam-chrome); }
 .nav-item.is-active > svg { color: var(--pam-chrome-accent); }
 .nav-item > span:nth-child(2) { font-size: 13px; font-weight: 650; }
 .nav-count { min-width: 22px; padding: 2px 7px; color: var(--pam-on-accent); background: var(--pam-chrome-accent); }
+.daemon-row { display: flex; gap: 2px; align-items: center; }
+.daemon-row .daemon-control { min-width: 0; flex: 1 1 auto; }
+.daemon-restart { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; padding: 0; border: 0; border-radius: 8px; color: var(--pam-chrome-muted); background: transparent; cursor: pointer; }
+.daemon-restart:hover { color: var(--pam-chrome-text); background: var(--pam-chrome-raised); }
 .daemon-control { min-height: 38px; padding: 0 12px; border-radius: 10px; color: var(--pam-chrome-muted); }
 .daemon-control:hover { color: var(--pam-chrome-text); background: var(--pam-chrome-raised); }
 .utility-nav button { width: 34px; height: 34px; color: var(--pam-chrome-muted); }

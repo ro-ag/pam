@@ -911,4 +911,29 @@ describe("control center", () => {
     expect(screen.getByText("daemon socket unavailable")).toBeInTheDocument();
     expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
   });
+
+  it("restarts the running daemon as one stop-then-start command", async () => {
+    const user = userEvent.setup();
+    const bridge = fixtureBridge();
+    const calls: string[] = [];
+    const originalStop = bridge.stopDaemon.bind(bridge);
+    const originalStart = bridge.startDaemon.bind(bridge);
+    bridge.stopDaemon = vi.fn(async (fence) => { calls.push("stop"); return originalStop(fence); });
+    bridge.startDaemon = vi.fn(async (fence) => { calls.push("start"); return originalStart(fence); });
+    render(<App bridge={bridge} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    await user.click(screen.getByRole("button", { name: "Restart PAM" }));
+
+    expect(calls).toEqual(["stop", "start"]);
+    expect(await screen.findByText("PAM restarted")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /PAM is on watch|PAM is active/ })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("hides the restart control while the daemon is stopped", async () => {
+    render(<App bridge={fixtureBridge("offline")} />);
+    await screen.findByRole("heading", { name: "Authenticated project state is unavailable" });
+
+    expect(screen.queryByRole("button", { name: "Restart PAM" })).not.toBeInTheDocument();
+  });
 });

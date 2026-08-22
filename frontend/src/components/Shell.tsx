@@ -144,6 +144,7 @@ export function Sidebar({
   onProjectMenuOpenChange,
   onSelectProject,
   onToggleDaemon,
+  onRestartDaemon,
   onDismiss,
   containerRef,
 }: {
@@ -157,6 +158,7 @@ export function Sidebar({
   onProjectMenuOpenChange: (open: boolean) => void;
   onSelectProject: (project: ProjectView) => void;
   onToggleDaemon: () => void;
+  onRestartDaemon: () => void;
   onDismiss: () => void;
   containerRef: RefObject<HTMLElement | null>;
 }) {
@@ -226,18 +228,32 @@ export function Sidebar({
         ))}
       </nav>
       <div className="sidebar-footer">
-        <button
-          type="button"
-          className="daemon-control"
-          aria-pressed={data.daemon.state === "running"}
-          aria-label={collapsed ? data.daemon.detail : undefined}
-          title={collapsed ? data.daemon.detail : undefined}
-          disabled={pending || ["starting", "stopping", "unavailable"].includes(data.daemon.state)}
-          onClick={onToggleDaemon}
-        >
-          {data.daemon.state === "running" ? <StatusDot /> : <Power size={18} weight="bold" aria-hidden="true" />}
-          {!collapsed && <span>{data.daemon.detail}</span>}
-        </button>
+        <div className="daemon-row">
+          <button
+            type="button"
+            className="daemon-control"
+            aria-pressed={data.daemon.state === "running"}
+            aria-label={collapsed ? data.daemon.detail : undefined}
+            title={collapsed ? data.daemon.detail : undefined}
+            disabled={pending || ["starting", "stopping", "unavailable"].includes(data.daemon.state)}
+            onClick={onToggleDaemon}
+          >
+            {data.daemon.state === "running" ? <StatusDot /> : <Power size={18} weight="bold" aria-hidden="true" />}
+            {!collapsed && <span>{data.daemon.detail}</span>}
+          </button>
+          {!collapsed && data.daemon.state === "running" && (
+            <button
+              type="button"
+              className="daemon-restart"
+              aria-label="Restart PAM"
+              title="Restart PAM"
+              disabled={pending}
+              onClick={onRestartDaemon}
+            >
+              <ArrowClockwise size={16} weight="bold" aria-hidden="true" />
+            </button>
+          )}
+        </div>
         <div className="utility-nav">
           <button type="button" aria-label="Settings unavailable in this preview" title="Settings unavailable in this preview" disabled><Gear size={19} /></button>
           <button type="button" aria-label="Documentation unavailable in this preview" title="Documentation unavailable in this preview" disabled><BookOpen size={19} /></button>

@@ -1,13 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- LA lifeguard tower knocked out of the sun: flat overhang roof, cabin, stilts, side ramp -->
+  <!-- LA lifeguard tower knocked out of the sun. Asymmetric on purpose:
+       tower sits left of center, ramp dominates to the right, no horizontal
+       window band — avoids torii-gate reading. -->
   <mask id="tower">
     <rect width="1024" height="1024" fill="#fff"/>
-    <rect x="376" y="296" width="272" height="44" rx="10" fill="#000"/>
-    <rect x="420" y="340" width="184" height="132" fill="#000"/>
-    <rect x="440" y="472" width="46" height="128" fill="#000"/>
-    <rect x="538" y="472" width="46" height="128" fill="#000"/>
-    <path d="M 604 478 L 758 600" stroke="#000" stroke-width="50" stroke-linecap="round" fill="none"/>
-    <rect x="444" y="368" width="136" height="44" fill="#fff"/>
+    <!-- roof: slight overhang only -->
+    <rect x="368" y="292" width="200" height="42" rx="10" fill="#000"/>
+    <!-- cabin -->
+    <rect x="392" y="334" width="152" height="138" fill="#000"/>
+    <!-- vertical window slit, off-center -->
+    <rect x="472" y="360" width="44" height="86" fill="#fff"/>
+    <!-- legs -->
+    <rect x="404" y="472" width="42" height="128" fill="#000"/>
+    <rect x="490" y="472" width="42" height="128" fill="#000"/>
+    <!-- ramp: long, dominant, down to the shore -->
+    <path d="M 556 470 L 780 596" stroke="#000" stroke-width="56" stroke-linecap="round" fill="none"/>
   </mask>
   <path fill="#FC6349" mask="url(#tower)" d="M 92 600 A 420 420 0 0 1 932 600 Z"/>
   <!-- waves -->

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- LA lifeguard tower knocked out of the sun: flat overhang roof, cabin, stilts, side ramp -->
+  <mask id="tower">
+    <rect width="1024" height="1024" fill="#fff"/>
+    <rect x="376" y="296" width="272" height="44" rx="10" fill="#000"/>
+    <rect x="420" y="340" width="184" height="132" fill="#000"/>
+    <rect x="440" y="472" width="46" height="128" fill="#000"/>
+    <rect x="538" y="472" width="46" height="128" fill="#000"/>
+    <path d="M 604 478 L 758 600" stroke="#000" stroke-width="50" stroke-linecap="round" fill="none"/>
+    <rect x="444" y="368" width="136" height="44" fill="#fff"/>
+  </mask>
+  <path fill="#FC6349" mask="url(#tower)" d="M 92 600 A 420 420 0 0 1 932 600 Z"/>
+  <!-- waves -->
+  <g stroke="#FC6349" stroke-width="72" stroke-linecap="round" fill="none">
+    <path d="M 148 712 C 420 712 560 710 680 696 C 780 684 850 668 912 648" />
+    <path d="M 268 804 C 470 804 590 800 690 786 C 760 776 810 764 852 750" />
+    <path d="M 438 890 C 560 890 640 882 724 862" />
+  </g>
+</svg>

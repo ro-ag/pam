@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { nextOperationId, sameFence, withOperation } from "./bridge";
+import { answersFence, nextOperationId, sameFence, withOperation } from "./bridge";
 import type {
   ApprovalDecision,
   CommandFence,
@@ -109,13 +109,7 @@ function briefText(brief: AgentBriefView): string {
   ].join("\n");
 }
 
-function acceptsResponseFence(requestFence: CommandFence, responseFence: CommandFence): boolean {
-  return sameFence(requestFence, responseFence) || (
-    requestFence.generation === "" &&
-    requestFence.projectHandle === responseFence.projectHandle &&
-    requestFence.operationId === responseFence.operationId
-  );
-}
+const acceptsResponseFence = answersFence;
 
 function sameAuthority(left: CommandFence, right: CommandFence): boolean {
   return left.projectHandle === right.projectHandle && left.generation === right.generation;
@@ -513,6 +507,7 @@ export function App({ bridge, initialView = "activity", initialTheme, initialThe
         <ResizeSeparator collapsed={state.sidebarCollapsed || compactViewport} width={state.sidebarWidth} viewportWidth={viewportWidth} onResizePreview={previewSidebarWidth} onResizeCommit={commitSidebarWidth} onToggle={toggleSidebar} />
         <section className="workspace" inert={mobileSidebarOpen || undefined} aria-hidden={mobileSidebarOpen || undefined}>
           <Toolbar toggleButtonRef={sidebarToggleRef} commandButtonRef={commandButtonRef} queueButtonRef={queueButtonRef} data={data} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onOpenCommand={openCommandPalette} onRefresh={refresh} onOpenQueue={openQueue} />
+          <div className="workspace-body">
           {state.loadState === "recovering" && state.error && <div className="inline-recovery" role="alert"><WarningCircle size={18} /><span>{state.error}</span><button type="button" onClick={refresh}>Retry</button></div>}
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
@@ -566,6 +561,7 @@ export function App({ bridge, initialView = "activity", initialTheme, initialThe
               )}
             </motion.div>
           </AnimatePresence>
+          </div>
         </section>
       </div>
       {effectiveOverlays.stack.map((entry) => {

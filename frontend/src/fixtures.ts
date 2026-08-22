@@ -467,6 +467,13 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
   const driftKey = (key: SkillLibraryKeyDto) => `${key.entryId}:${key.version}:${key.agent}`;
   const fenceResponse = <T,>(fence: CommandFence, data: T) => ({ fence: clone(fence), data: clone(data) });
   const currentFence = (operationId: string): CommandFence => ({ projectHandle: active.handle, generation, operationId });
+  // Snapshot commands rotate the generation, exactly like the desktop core.
+  let generationCounter = 0;
+  const rotatedFence = (operationId: string): CommandFence => {
+    generationCounter += 1;
+    generation = `99999999-9999-4999-8999-${String(generationCounter).padStart(12, "0")}`;
+    return currentFence(operationId);
+  };
   const identity = { fileName: "after-merge-checks.toml", id: "after-merge-checks", revision: 4, digest: "sha256:fixture-after-merge" };
   const workspace = (): FlowWorkspaceDataDto => ({
     definitions: [
@@ -525,10 +532,10 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
           : "99999999-9999-4999-8999-999999999999";
       return fenceResponse(currentFence(operationId), snapshot(active, daemonRunning, scenario));
     },
-    async refreshProject(fence) { return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
-    async startDaemon(fence) { daemonRunning = true; return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
-    async stopDaemon(fence) { daemonRunning = false; return fenceResponse(fence, snapshot(active, daemonRunning, scenario)); },
-    async registerGuiCaller(fence) { return fenceResponse(fence, solvedSnapshot(active, daemonRunning)); },
+    async refreshProject(fence) { return fenceResponse(rotatedFence(fence.operationId), snapshot(active, daemonRunning, scenario)); },
+    async startDaemon(fence) { daemonRunning = true; return fenceResponse(rotatedFence(fence.operationId), snapshot(active, daemonRunning, scenario)); },
+    async stopDaemon(fence) { daemonRunning = false; return fenceResponse(rotatedFence(fence.operationId), snapshot(active, daemonRunning, scenario)); },
+    async registerGuiCaller(fence) { return fenceResponse(rotatedFence(fence.operationId), solvedSnapshot(active, daemonRunning)); },
     async decideApproval(fence, _approvalHandle: string, decision: ApprovalDecision) {
       const data = solvedSnapshot(active, daemonRunning);
       if (decision === "deny") {
@@ -542,7 +549,7 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
           },
         };
       }
-      return { disposition: decision === "approve" ? "approved" : "denied", snapshot: fenceResponse(fence, data) };
+      return { disposition: decision === "approve" ? "approved" : "denied", snapshot: fenceResponse(rotatedFence(fence.operationId), data) };
     },
     async loadEvidence(fence, evidenceHandle) {
       if (scenario === "evidence-loading") return new Promise(() => {});

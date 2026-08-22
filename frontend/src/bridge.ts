@@ -52,6 +52,16 @@ export function sameFence(left: CommandFence | null | undefined, right: CommandF
   );
 }
 
+// Snapshot commands rotate the generation server-side and return the successor
+// fence; a response answers a request when it echoes its handle and operation.
+export function answersFence(requestFence: CommandFence | null | undefined, responseFence: CommandFence): boolean {
+  return Boolean(
+    requestFence &&
+      requestFence.projectHandle === responseFence.projectHandle &&
+      requestFence.operationId === responseFence.operationId,
+  );
+}
+
 export function withOperation(fence: CommandFence): CommandFence {
   return { ...fence, operationId: nextOperationId() };
 }

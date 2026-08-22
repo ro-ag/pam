@@ -1,4 +1,4 @@
-export type ViewId = "current" | "flows" | "access";
+export type ViewId = "activity" | "callers" | "flows" | "options";
 export type ApprovalDecision = "approve" | "deny";
 export type BridgeMode = "native" | "fixture";
 
@@ -395,10 +395,42 @@ export interface SkillAuditDataDto {
 
 export type SkillAuditDto = FencedResponse<SkillAuditDataDto | null>;
 
+export interface BridgeFailureDto {
+  code: string;
+  detail: string;
+  recovery: string | null;
+}
+
+export interface ActivityEventDto {
+  sequence: number;
+  projectId: string | null;
+  callerId: string;
+  action: string;
+  decision: string;
+  outcome: string | null;
+  occurredAtMs: number;
+}
+
+export type ActivityDto =
+  | { status: "ok"; events: ActivityEventDto[]; truncated: boolean }
+  | { status: "blocked" | "unavailable"; failure: BridgeFailureDto };
+
+export interface CallerDto {
+  callerId: string;
+  registeredAtMs: number;
+  revokedAtMs: number | null;
+}
+
+export type CallersDto =
+  | { status: "ok"; callers: CallerDto[] }
+  | { status: "blocked" | "unavailable"; failure: BridgeFailureDto };
+
 export interface PamBridge {
   readonly mode: BridgeMode;
   bootstrap(): Promise<SnapshotDto>;
   catalog(): Promise<CatalogDto>;
+  daemonActivity(fence: CommandFence, limit?: number): Promise<ActivityDto>;
+  callerRegistry(fence: CommandFence): Promise<CallersDto>;
   activateProject(projectHandle: string, operationId: string): Promise<SnapshotDto>;
   refreshProject(fence: CommandFence): Promise<SnapshotDto>;
   startDaemon(fence: CommandFence): Promise<SnapshotDto>;

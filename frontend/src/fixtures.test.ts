@@ -50,6 +50,37 @@ describe("visual QA fixture scenarios", () => {
     expect(approval.data.current).toMatchObject({ expiresAtMs: 2_000_000_000_000 });
   });
 
+  it("serves daemon activity and the caller registry while running, and calm failures while paused", async () => {
+    const bridge = fixtureBridge();
+    const snapshot = await bridge.bootstrap();
+
+    const activity = await bridge.daemonActivity(snapshot.fence, 2);
+    expect(activity).toMatchObject({ status: "ok", truncated: true });
+    if (activity.status === "ok") {
+      expect(activity.events).toHaveLength(2);
+      expect(activity.events[0]).toMatchObject({ callerId: "gui:pam-desktop", decision: "allowed" });
+    }
+
+    const callers = await bridge.callerRegistry(snapshot.fence);
+    expect(callers.status).toBe("ok");
+    if (callers.status === "ok") {
+      expect(callers.callers.some((caller) => caller.revokedAtMs !== null)).toBe(true);
+      expect(callers.callers.some((caller) => caller.revokedAtMs === null)).toBe(true);
+    }
+
+    const offline = fixtureBridge("offline");
+    const offlineSnapshot = await offline.bootstrap();
+    expect(offlineSnapshot.data.health.status).toBe("offline");
+    expect(await offline.daemonActivity(offlineSnapshot.fence)).toMatchObject({
+      status: "unavailable",
+      failure: { code: "daemon_offline" },
+    });
+    expect(await offline.callerRegistry(offlineSnapshot.fence)).toMatchObject({
+      status: "unavailable",
+      failure: { code: "daemon_offline" },
+    });
+  });
+
   it("keeps startup transport failure separate from protocol snapshots", async () => {
     await expect(fixtureBridge("startup-error").bootstrap()).rejects.toThrow(
       "The PAM daemon fixture is unavailable.",

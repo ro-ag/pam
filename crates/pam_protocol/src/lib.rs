@@ -13,9 +13,10 @@ pub use codec::{
     decode_server_message_envelope, encode,
 };
 pub use contract::{
-    ApprovalChallenge, ApprovalDecision, ApprovalDecisionDisposition, ApprovalDecisionResult,
-    BriefItem, BriefProvenance, BriefResult, CancellationDisposition, CancellationResult,
-    Capability, ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
+    ActivityEventSummary, ActivityResult, ApprovalChallenge, ApprovalDecision,
+    ApprovalDecisionDisposition, ApprovalDecisionResult, BriefItem, BriefProvenance, BriefResult,
+    CallerListResult, CallerSummary, CancellationDisposition, CancellationResult, Capability,
+    ConfigurationPresence, DaemonLifecycleResult, Event, EventEnvelope, EvidenceChunk,
     EvidenceMetadata, EvidenceRedaction, EvidenceRetention, ExpectedTargetKind, Failure,
     FailureCode, FlowDefinitionDocument, FlowProjectRoot, MAX_FLOW_PROJECT_ROOT_BYTES,
     MAX_PROJECT_CURRENT_QUEUED, MAX_PROJECT_OPERATION_KIND_BYTES, ModelFinishReason,

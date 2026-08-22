@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ActivityDto,
   BootstrapResponse,
   ApprovalDecisionResponseDto,
+  CallersDto,
   CatalogDto,
   CommandFence,
   EvidenceDto,
@@ -59,6 +61,13 @@ export function createTauriBridge(invokeCommand: Invoke = invoke): PamBridge {
     mode: "native",
     bootstrap: () => invokeCommand<BootstrapResponse>("bootstrap", request({ operationId: nextOperationId() })),
     catalog: () => invokeCommand<CatalogDto>("catalog"),
+    daemonActivity: (fence, limit) =>
+      invokeCommand<ActivityDto>("daemon_activity", request({
+        ...flatFence(fence),
+        limit: limit ?? null,
+      })),
+    callerRegistry: (fence) =>
+      invokeCommand<CallersDto>("caller_registry", request(flatFence(fence))),
     activateProject: (projectHandle, operationId) =>
       invokeCommand<SnapshotDto>(
         "activate_project",

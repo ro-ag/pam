@@ -450,6 +450,17 @@ fn render_success(payload: &ResultPayload, truth: &OperationTruth) -> String {
             result.stopping,
             truth_label(truth)
         ),
+        ResultPayload::DaemonActivity(activity) => format!(
+            "events={} truncated={} truth={}\n",
+            activity.events.len(),
+            activity.truncated,
+            truth_label(truth)
+        ),
+        ResultPayload::CallerList(list) => format!(
+            "callers={} truth={}\n",
+            list.callers.len(),
+            truth_label(truth)
+        ),
         ResultPayload::ProjectCurrent(current) => format!(
             "queued={} active={} latest={} truncated={} truth={}\n",
             current.queued().len(),

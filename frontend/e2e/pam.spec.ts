@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
 
-type ViewName = "current" | "flows" | "access";
+type ViewName = "activity" | "callers" | "flows" | "options";
 
 const responsiveWidths = [1_180, 960, 780, 600, 320] as const;
 const runtimeErrors = new WeakMap<Page, string[]>();
@@ -21,7 +21,7 @@ test.afterEach(async ({ page }) => {
 async function openFixture(
   page: Page,
   scenario = "solved",
-  view: ViewName = "current",
+  view: ViewName = "callers",
 ): Promise<void> {
   await page.goto(`/?scenario=${scenario}&view=${view}`);
   await page.locator(".app-shell").waitFor();
@@ -38,6 +38,11 @@ async function openFixture(
       )),
     );
   });
+}
+
+async function openAccess(page: Page, scenario = "solved"): Promise<void> {
+  await openFixture(page, scenario, "callers");
+  await page.getByRole("tab", { name: "Access" }).click();
 }
 
 async function horizontalMetrics(page: Page) {
@@ -387,7 +392,7 @@ test.describe("selectable theme families and variants", () => {
 
   test("switches family and variant with Radix controls and restores both on reload", async ({ page }) => {
     await page.setViewportSize({ width: 1_180, height: 800 });
-    await openFixture(page);
+    await openFixture(page, "solved", "options");
     const trigger = page.getByRole("button", { name: "Theme: Ventisquero · light" });
 
     await trigger.click();
@@ -410,13 +415,13 @@ test.describe("selectable theme families and variants", () => {
 test.describe("Access skill audit", () => {
   test("preserves the shell and renders the evaluated audit truth at 1180px", async ({ page }) => {
     await page.setViewportSize({ width: 1_180, height: 1_000 });
-    await openFixture(page, "solved", "access");
+    await openAccess(page, "solved");
     await expect(page.getByRole("heading", { name: "Evaluator verdict" })).toBeVisible();
 
     const navigationLabels = await page.getByRole("navigation", { name: "Primary" })
       .getByRole("button")
       .evaluateAll((buttons) => buttons.map((button) => button.getAttribute("aria-label")));
-    expect(navigationLabels).toEqual(["Current", "Flows", "Access"]);
+    expect(navigationLabels).toEqual(["Activity", "Callers", "Flows", "Options"]);
     const geometry = await page.evaluate(() => {
       const width = (selector: string) => document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().width ?? -1;
       const workspace = document.querySelector<HTMLElement>(".workspace")?.getBoundingClientRect();
@@ -445,7 +450,7 @@ test.describe("Access skill audit", () => {
 
   test("keeps Run and Retry audit actions reachable at effective 320px", async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 800 });
-    await openFixture(page, "skill-audit-empty", "access");
+    await openAccess(page, "skill-audit-empty");
     const run = page.getByRole("button", { name: "Run audit" });
     await run.scrollIntoViewIfNeeded();
     await expect(run).toBeVisible();
@@ -458,7 +463,7 @@ test.describe("Access skill audit", () => {
     expect(horizontal.bodyScroll).toBe(horizontal.bodyClient);
     expect(horizontal.shellScroll).toBe(horizontal.shellClient);
 
-    await openFixture(page, "skill-audit-load-error", "access");
+    await openAccess(page, "skill-audit-load-error");
     const retry = page.getByRole("button", { name: "Retry audit" });
     await retry.scrollIntoViewIfNeeded();
     await expect(retry).toBeVisible();
@@ -474,7 +479,7 @@ test.describe("Access skill audit", () => {
 
   test("shows deterministic footprint fallback without a qualitative verdict", async ({ page }) => {
     await page.setViewportSize({ width: 1_180, height: 800 });
-    await openFixture(page, "skill-audit-no-evaluator", "access");
+    await openAccess(page, "skill-audit-no-evaluator");
 
     await expect(page.getByText(
       "Deterministic footprint only — no supported evaluator was available, so PAM did not produce a qualitative verdict.",
@@ -487,7 +492,7 @@ test.describe("Access skill audit", () => {
 test.describe("Access skill library", () => {
   test("keeps exact target identity through drift, resync, and refreshed mutation truth", async ({ page }) => {
     await page.setViewportSize({ width: 1_180, height: 1_000 });
-    await openFixture(page, "solved", "access");
+    await openAccess(page, "solved");
     const panel = page.getByRole("region", { name: "Skill library" });
     await expect(panel).toBeVisible();
     await expect(panel.getByText("Git install · commit")).toBeVisible();
@@ -532,7 +537,7 @@ test.describe("Access skill library", () => {
 
   test("keeps every library form and preview/apply action reachable at effective 320px", async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 800 });
-    await openFixture(page, "solved", "access");
+    await openAccess(page, "solved");
     const panel = page.getByRole("region", { name: "Skill library" });
     await panel.scrollIntoViewIfNeeded();
 

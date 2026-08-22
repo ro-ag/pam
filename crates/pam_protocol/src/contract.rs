@@ -118,6 +118,59 @@ impl RequestEnvelope {
         }
     }
 
+    /// Creates an authenticated daemon-wide activity feed request.
+    ///
+    /// Attach the caller credential with [`Self::authenticated`] before sending
+    /// the request. The daemon clamps `limit` to its bounded maximum; zero
+    /// requests the daemon default. The result contains bounded audit metadata
+    /// only; redacted event detail never crosses this contract.
+    #[must_use]
+    pub fn daemon_activity(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+        limit: u32,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::DaemonActivity,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::DaemonActivity { limit },
+        }
+    }
+
+    /// Creates an authenticated caller registry listing request.
+    ///
+    /// Attach the caller credential with [`Self::authenticated`] before sending
+    /// the request. The result never contains credential verifiers.
+    #[must_use]
+    pub fn caller_list(
+        request_id: RequestId,
+        caller_id: CallerId,
+        project_id: ProjectId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            caller_id,
+            authentication: None,
+            approval_id: None,
+            project_id,
+            capability: Capability::CallerList,
+            idempotency_key,
+            deadline_unix_ms: None,
+            payload: RequestPayload::CallerList,
+        }
+    }
+
     /// Creates an authenticated decision for one pending approval challenge.
     ///
     /// The daemon must authenticate this envelope and verify that the approval
@@ -647,6 +700,8 @@ impl RequestEnvelope {
 pub enum Capability {
     DaemonStatus,
     DaemonStop,
+    DaemonActivity,
+    CallerList,
     ProjectCurrent,
     ApprovalDecide,
     CancelRequest,
@@ -667,6 +722,8 @@ impl Capability {
         match self {
             Self::DaemonStatus => "daemon.status",
             Self::DaemonStop => "daemon.stop",
+            Self::DaemonActivity => "daemon.activity",
+            Self::CallerList => "caller.list",
             Self::ProjectCurrent => "project.current",
             Self::ApprovalDecide => "approval.decide",
             Self::CancelRequest => "request.cancel",
@@ -818,6 +875,10 @@ impl FlowProjectRoot {
 pub enum RequestPayload {
     Status,
     Stop,
+    DaemonActivity {
+        limit: u32,
+    },
+    CallerList,
     ProjectCurrent,
     ApprovalDecide {
         approval_id: ApprovalId,
@@ -920,6 +981,8 @@ pub enum OperationTruth {
 pub enum ResultPayload {
     Status(StatusResult),
     DaemonLifecycle(DaemonLifecycleResult),
+    DaemonActivity(ActivityResult),
+    CallerList(CallerListResult),
     ProjectCurrent(ProjectCurrentResult),
     ApprovalDecision(ApprovalDecisionResult),
     Cancellation(CancellationResult),
@@ -1507,6 +1570,44 @@ pub struct StatusResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DaemonLifecycleResult {
     pub stopping: bool,
+}
+
+/// Bounded newest-first slice of the daemon audit ledger.
+///
+/// `truncated` is true when older events beyond the served limit remain.
+/// Redacted event detail and retention metadata never cross this contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivityResult {
+    pub events: Vec<ActivityEventSummary>,
+    pub truncated: bool,
+}
+
+/// One bounded audit ledger entry safe to expose in an activity feed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivityEventSummary {
+    pub sequence: u64,
+    pub project_id: ProjectId,
+    pub caller_id: CallerId,
+    pub action: String,
+    pub decision: String,
+    pub outcome: String,
+    pub occurred_at_ms: u64,
+}
+
+/// The complete caller registry, including revoked callers.
+///
+/// Credential verifiers never cross this contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CallerListResult {
+    pub callers: Vec<CallerSummary>,
+}
+
+/// One registered caller without any credential material.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CallerSummary {
+    pub caller_id: CallerId,
+    pub registered_at_ms: u64,
+    pub revoked_at_ms: Option<u64>,
 }
 
 /// One bounded, payload-free request summary for the native control center.

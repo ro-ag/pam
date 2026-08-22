@@ -13,6 +13,7 @@ describe("native DTO selectors", () => {
     expect(view.project.name).toBe("payments-api");
     expect(view.project.rootLabel).toBe("/work/payments-api");
     expect(view.daemon.state).toBe("running");
+    expect(view.daemon.queueDepth).toBe(2);
     expect(view.current.queue).toHaveLength(2);
     expect(view.current.latestOutcome?.brief?.sections.find(({ label }) => label === "VERIFIED")?.summary)
       .toContain("integration checks");

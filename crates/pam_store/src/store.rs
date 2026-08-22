@@ -44,9 +44,10 @@ use crate::{
     MAX_AUDIT_OUTCOME_BYTES, MAX_AUDIT_PROJECT_ID_BYTES, MAX_FLOW_CHECKPOINT_BYTES,
     MAX_FLOW_TERMINAL_RESULT_BYTES, MAX_FLOW_TRANSITION_BYTES, MAX_PROJECT_CURRENT_QUEUED,
     MAX_SKILL_INVENTORY_TOMBSTONES_PER_PROJECT, MAX_SKILLS_AUDIT_REPORT_BYTES, ProjectCurrent,
-    ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant, Replay,
-    RequestSnapshot, RequestState, SaveFlowCheckpoint, SkillInventoryDrift, StoreError,
-    StoredAgentArtifact, StoredResult, StoredSkillsAuditReport, TerminalState,
+    ProjectPolicy, ProjectRequestSummary, ProjectWorkload, PutEvidence, PutGrant,
+    RecentAuditEvents, Replay, RequestSnapshot, RequestState, SaveFlowCheckpoint,
+    SkillInventoryDrift, StoreError, StoredAgentArtifact, StoredResult, StoredSkillsAuditReport,
+    TerminalState,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -223,6 +224,23 @@ impl Store {
         self.send(Command::Caller(CallerCommand::Revoke {
             caller_id,
             now_ms,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Lists every registered caller, most recently registered first.
+    ///
+    /// Revoked callers are included with their revocation timestamp; credential
+    /// verifiers are never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable state is unavailable.
+    pub async fn list_callers(&self) -> Result<Vec<CallerRegistration>, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Caller(CallerCommand::List {
             response: response_tx,
         }))
         .await?;
@@ -535,6 +553,26 @@ impl Store {
             project_id,
             after_sequence,
             through_sequence,
+            limit,
+            response: response_tx,
+        }))
+        .await?;
+        receive(response_rx).await
+    }
+
+    /// Reads the most recent audit events across all projects, newest first.
+    ///
+    /// `truncated` is true when older events beyond `limit` remain in the
+    /// ledger. Use [`Self::export_audit_events`] for deterministic
+    /// project-scoped pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid batch limit, corrupt stored state, or
+    /// unavailable durable state.
+    pub async fn recent_audit_events(&self, limit: u32) -> Result<RecentAuditEvents, StoreError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(Command::Audit(AuditCommand::Recent {
             limit,
             response: response_tx,
         }))
@@ -1641,6 +1679,9 @@ enum CallerCommand {
         now_ms: u64,
         response: Response<CallerRevocation>,
     },
+    List {
+        response: Response<Vec<CallerRegistration>>,
+    },
 }
 
 enum PolicyCommand {
@@ -1716,6 +1757,10 @@ enum AuditCommand {
         now_ms: u64,
         limit: u32,
         response: Response<AuditPruneOutcome>,
+    },
+    Recent {
+        limit: u32,
+        response: Response<RecentAuditEvents>,
     },
 }
 
@@ -1929,6 +1974,7 @@ fn run_caller_command(connection: &mut Connection, command: CallerCommand) {
             now_ms,
             response,
         } => respond(response, revoke_caller(connection, &caller_id, now_ms)),
+        CallerCommand::List { response } => respond(response, list_callers(connection)),
     }
 }
 
@@ -2047,6 +2093,9 @@ fn run_audit_command(connection: &mut Connection, command: AuditCommand) {
             response,
             prune_audit_events(connection, &project_id, now_ms, limit),
         ),
+        AuditCommand::Recent { limit, response } => {
+            respond(response, recent_audit_events(connection, limit));
+        }
     }
 }
 
@@ -3239,6 +3288,31 @@ fn export_audit_events(
         has_more,
         events,
     })
+}
+
+fn recent_audit_events(
+    connection: &Connection,
+    limit: u32,
+) -> Result<RecentAuditEvents, StoreError> {
+    validate_audit_limit(limit)?;
+    let fetch_limit = i64::from(limit) + 1;
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_id, project_id, caller_id, action, decision, outcome,
+                redacted_detail, occurred_at_ms, retain_until_ms
+         FROM audit_events
+         ORDER BY sequence DESC
+         LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![fetch_limit], stored_audit_event)?;
+    let mut events = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(StoredAuditEvent::into_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let page_length = usize::try_from(limit).expect("u32 fits usize on supported platforms");
+    let truncated = events.len() > page_length;
+    events.truncate(page_length);
+    Ok(RecentAuditEvents { events, truncated })
 }
 
 struct StoredAuditEvent {
@@ -4817,6 +4891,31 @@ fn revoke_caller(
         params![caller_id.as_str(), revoked_at],
     )?;
     Ok(CallerRevocation::Revoked)
+}
+
+fn list_callers(connection: &Connection) -> Result<Vec<CallerRegistration>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT caller_id, registered_at_ms, revoked_at_ms
+         FROM callers
+         ORDER BY registered_at_ms DESC, caller_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(caller_id, registered_at, revoked_at)| {
+            Ok(CallerRegistration {
+                caller_id: CallerId::from(caller_id),
+                registered_at_ms: unsigned_integer(registered_at)?,
+                revoked_at_ms: revoked_at.map(unsigned_integer).transpose()?,
+            })
+        })
+        .collect()
 }
 
 fn credential_digest(credential: &CallerCredential) -> [u8; 32] {

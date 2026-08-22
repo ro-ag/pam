@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use pam_gui::{
-    ApprovalDecisionDto, ApprovalDecisionResponseDto, ApprovalHandle, CatalogDto, CommandFence,
-    DesktopCore, DesktopErrorDto, EvidenceDto, EvidenceHandleDto, FlowDefinitionHandle,
-    FlowDocumentDto, FlowDocumentHandle, FlowReviewDto, FlowSaveDto, FlowWorkspaceDto,
-    GenerationId, OperationId, ProjectHandle, SkillAuditDto, SkillInventoryDto, SkillLibraryDto,
-    SkillLibraryRequest, SnapshotDto,
+    ActivityDto, ApprovalDecisionDto, ApprovalDecisionResponseDto, ApprovalHandle, CallersDto,
+    CatalogDto, CommandFence, DesktopCore, DesktopErrorDto, EvidenceDto, EvidenceHandleDto,
+    FlowDefinitionHandle, FlowDocumentDto, FlowDocumentHandle, FlowReviewDto, FlowSaveDto,
+    FlowWorkspaceDto, GenerationId, OperationId, ProjectHandle, SkillAuditDto, SkillInventoryDto,
+    SkillLibraryDto, SkillLibraryRequest, SnapshotDto,
 };
 use serde::{Deserialize, Deserializer, de::Error as _};
 use tauri::State;
@@ -143,6 +143,19 @@ pub(crate) struct ReviewFlowRequest {
     source: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ActivityRequest {
+    #[serde(deserialize_with = "canonical_uuid")]
+    project_handle: ProjectHandle,
+    #[serde(deserialize_with = "canonical_uuid")]
+    generation: GenerationId,
+    #[serde(deserialize_with = "canonical_uuid")]
+    operation_id: OperationId,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
 fn fence(
     project_handle: ProjectHandle,
     generation: GenerationId,
@@ -250,6 +263,32 @@ pub(crate) async fn load_flow_workspace(
     request: FencedRequest,
 ) -> Result<FlowWorkspaceDto, DesktopErrorDto> {
     state.core.flow_workspace(request.into_fence()).await
+}
+
+#[tauri::command]
+pub(crate) async fn daemon_activity(
+    state: State<'_, DesktopState>,
+    request: ActivityRequest,
+) -> Result<ActivityDto, DesktopErrorDto> {
+    state
+        .core
+        .daemon_activity(
+            fence(
+                request.project_handle,
+                request.generation,
+                request.operation_id,
+            ),
+            request.limit,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn caller_registry(
+    state: State<'_, DesktopState>,
+    request: FencedRequest,
+) -> Result<CallersDto, DesktopErrorDto> {
+    state.core.caller_registry(request.into_fence()).await
 }
 
 #[tauri::command]

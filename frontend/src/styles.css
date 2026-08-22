@@ -353,6 +353,17 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .state-pill--high, .state-pill--critical { border-color: rgba(255, 103, 79, 0.45); color: var(--coral-soft); }
 .state-pill--not-reported { border-color: rgba(184, 158, 137, 0.3); color: var(--sand-400); }
 .panel-empty { padding: 24px; color: var(--sand-400); text-align: center; }
+.canvas > * + .panel { margin-top: 12px; }
+.project-picker { display: grid; gap: 6px; padding: 14px 16px; }
+.project-picker-location { margin: 0; color: var(--sand-400); font-size: 12px; }
+.project-detail { margin-top: 12px; }
+.project-detail-panel { padding: 14px 16px; }
+.project-detail-view { display: block; min-width: 0; }
+.options-row { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; padding: 14px 16px; }
+.options-row > div:first-child { display: grid; min-width: 0; gap: 4px; }
+.options-row p { margin: 0; color: var(--sand-400); font-size: 13px; }
+.options-daemon-detail { display: inline-flex; gap: 8px; align-items: center; }
+.options-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 9px; }
 .skill-inventory-panel { margin-top: 12px; }
 .skill-inventory-state { display: flex; min-height: 118px; gap: 10px; align-items: center; justify-content: center; padding: 18px; color: var(--sand-400); text-align: center; }
 .skill-inventory-state.is-error { flex-wrap: wrap; border-color: rgba(255, 103, 79, 0.48); }

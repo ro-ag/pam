@@ -35,7 +35,7 @@ export const initialState: AppState = {
   catalog: null,
   activeFence: null,
   pendingFence: null,
-  activeView: "current",
+  activeView: "activity",
   sidebarWidth: 248,
   sidebarCollapsed: false,
   error: null,

@@ -1,5 +1,9 @@
 import type {
+  ActivityDto,
+  ActivityEventDto,
   ApprovalDecision,
+  CallerDto,
+  CallersDto,
   CatalogDto,
   CommandFence,
   EvidenceDataDto,
@@ -25,6 +29,19 @@ const projects: ProjectSummaryDto[] = [
   { handle: "11111111-1111-4111-8111-111111111111", name: "payments-api", location: "/work/payments-api" },
   { handle: "22222222-2222-4222-8222-222222222222", name: "ledger-web", location: "/work/ledger-web" },
   { handle: "33333333-3333-4333-8333-333333333333", name: "docs", location: "/work/docs" },
+];
+
+const activityEvents: ActivityEventDto[] = [
+  { sequence: 4, projectId: "11111111-1111-4111-8111-111111111111", callerId: "gui:pam-desktop", action: "project.current", decision: "allowed", outcome: "served", occurredAtMs: 1_777_001_520_000 },
+  { sequence: 3, projectId: "11111111-1111-4111-8111-111111111111", callerId: "cli:release-agent", action: "flow.save", decision: "approval_required", outcome: null, occurredAtMs: 1_777_001_460_000 },
+  { sequence: 2, projectId: "22222222-2222-4222-8222-222222222222", callerId: "cli:release-agent", action: "project.refresh", decision: "allowed", outcome: "served", occurredAtMs: 1_777_001_400_000 },
+  { sequence: 1, projectId: null, callerId: "gui:pam-desktop", action: "daemon.status", decision: "allowed", outcome: "served", occurredAtMs: 1_777_001_340_000 },
+];
+
+const registeredCallers: CallerDto[] = [
+  { callerId: "gui:pam-desktop", registeredAtMs: 1_776_900_000_000, revokedAtMs: null },
+  { callerId: "cli:release-agent", registeredAtMs: 1_776_500_000_000, revokedAtMs: null },
+  { callerId: "cli:retired-agent", registeredAtMs: 1_775_000_000_000, revokedAtMs: 1_776_800_000_000 },
 ];
 
 const evidenceHandles = [
@@ -436,7 +453,7 @@ function clone<T>(value: T): T {
 export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
   let active = projects[0];
   let generation = "99999999-9999-4999-8999-999999999999";
-  let daemonRunning = true;
+  let daemonRunning = scenario !== "offline";
   let savedSource = flowSource;
   const libraryEntries = skillLibraryFixture();
   const libraryDrift = new Map<string, SkillLibraryDriftStateDto>([
@@ -468,6 +485,34 @@ export function fixtureBridge(scenario: FixtureScenario = "solved"): PamBridge {
     },
     async catalog(): Promise<CatalogDto> {
       return { projects: clone(projects), warning: null };
+    },
+    async daemonActivity(_fence, limit): Promise<ActivityDto> {
+      if (!daemonRunning) {
+        return {
+          status: "unavailable",
+          failure: {
+            code: "daemon_offline",
+            detail: "PAM is paused, so no daemon activity is being recorded.",
+            recovery: "Start PAM to resume the activity feed.",
+          },
+        };
+      }
+      if (scenario === "empty") return { status: "ok", events: [], truncated: false };
+      const bounded = activityEvents.slice(0, limit ?? activityEvents.length);
+      return clone({ status: "ok" as const, events: bounded, truncated: bounded.length < activityEvents.length });
+    },
+    async callerRegistry(_fence): Promise<CallersDto> {
+      if (!daemonRunning) {
+        return {
+          status: "unavailable",
+          failure: {
+            code: "daemon_offline",
+            detail: "PAM is paused, so the caller registry is not being served.",
+            recovery: "Start PAM to read the registered callers.",
+          },
+        };
+      }
+      return clone({ status: "ok" as const, callers: registeredCallers });
     },
     async activateProject(projectHandle, operationId) {
       const selected = projects.find((project) => project.handle === projectHandle);

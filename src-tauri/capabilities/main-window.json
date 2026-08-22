@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Allow the local PAM main window to invoke only PAM-owned typed commands.",
+  "description": "Allow the local PAM main window to invoke bounded PAM commands and synchronize native appearance.",
   "local": true,
   "windows": ["main"],
   "permissions": [
@@ -21,6 +21,7 @@
     "allow-run-skill-audit",
     "allow-open-flow",
     "allow-validate-flow",
-    "allow-save-flow"
+    "allow-save-flow",
+    "core:app:allow-set-app-theme"
   ]
 }

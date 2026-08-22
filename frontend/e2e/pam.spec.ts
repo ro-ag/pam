@@ -85,23 +85,23 @@ test.describe("responsive visual contract", () => {
         expect(geometry.sidebar?.width).toBe(248);
         expect(geometry.separator?.width).toBe(5);
         expect(geometry.workspace?.x).toBe(253);
-        expect(geometry.workspace?.y).toBe(8);
-        expect(geometry.workspace?.right).toBe(width - 8);
-        expect(geometry.toolbar?.height).toBe(44);
+        expect(geometry.workspace?.y).toBe(10);
+        expect(geometry.workspace?.right).toBe(width - 10);
+        expect(geometry.toolbar?.height).toBe(52);
       } else if (width > 600) {
         expect(geometry.sidebar?.width).toBe(68);
         expect(geometry.separator?.width).toBe(5);
         expect(geometry.workspace?.x).toBe(73);
         expect(geometry.workspace?.y).toBe(8);
         expect(geometry.workspace?.right).toBe(width - 8);
-        expect(geometry.toolbar?.height).toBe(44);
+        expect(geometry.toolbar?.height).toBe(52);
       } else {
         expect(geometry.sidebar?.height).toBe(68);
         expect(geometry.separatorDisplay).toBe("none");
         expect(geometry.workspace?.x).toBe(4);
         expect(geometry.workspace?.y).toBe(72);
         expect(geometry.workspace?.right).toBe(width - 4);
-        expect(geometry.toolbar?.height).toBeGreaterThanOrEqual(44);
+        expect(geometry.toolbar?.height).toBeGreaterThanOrEqual(50);
       }
 
       await expect(page).toHaveScreenshot(`current-solved-${width}x800.png`);
@@ -127,6 +127,23 @@ test.describe("responsive visual contract", () => {
     expect(horizontal.htmlScroll).toBe(horizontal.htmlClient);
     expect(horizontal.bodyScroll).toBe(horizontal.bodyClient);
     await expect(page).toHaveScreenshot("current-actions-320x800.png");
+  });
+
+  test("lets an active timeline use the full canvas when no outcome exists", async ({ page }) => {
+    await page.setViewportSize({ width: 1_180, height: 800 });
+    await openFixture(page, "active");
+    await expect(page.locator(".outcome-card")).toHaveCount(0);
+
+    const geometry = await page.evaluate(() => {
+      const layout = document.querySelector<HTMLElement>(".timeline-layout")!.getBoundingClientRect();
+      const timeline = document.querySelector<HTMLElement>(".timeline-column")!.getBoundingClientRect();
+      return {
+        layout: { left: layout.left, right: layout.right, width: layout.width },
+        timeline: { left: timeline.left, right: timeline.right, width: timeline.width },
+      };
+    });
+    expect(geometry.timeline).toEqual(geometry.layout);
+    await expect(page).toHaveScreenshot("current-active-1180x800.png");
   });
 });
 
@@ -253,6 +270,143 @@ test.describe("production-shaped interactions", () => {
   });
 });
 
+test.describe("selectable theme families and variants", () => {
+  const appearances = [
+    { theme: "ventisquero", mode: "light", page: "rgb(246, 243, 236)", surface: "rgb(253, 252, 249)", accent: "#1d7893", font: "Archivo", asset: "ventisquero-yelcho.png" },
+    { theme: "ventisquero", mode: "dark", page: "rgb(6, 9, 13)", surface: "rgb(12, 17, 23)", accent: "#1d7893", font: "Archivo", asset: "ventisquero-yelcho.png" },
+    { theme: "vina", mode: "light", page: "rgb(245, 243, 235)", surface: "rgb(253, 252, 249)", accent: "#a84595", font: "Space Grotesk", asset: "vina-sunset.png" },
+    { theme: "vina", mode: "dark", page: "rgb(10, 5, 20)", surface: "rgb(26, 11, 46)", accent: "#a84595", font: "Space Grotesk", asset: "vina-sunset.png" },
+  ] as const;
+
+  for (const appearance of appearances) {
+    test(`renders ${appearance.theme} ${appearance.mode} as an independent full-canvas theme`, async ({ page }) => {
+      await page.addInitScript(({ theme, mode }) => {
+        localStorage.setItem("pam-theme", theme);
+        localStorage.setItem("pam-theme-mode", mode);
+      }, appearance);
+      await page.setViewportSize({ width: 1_180, height: 800 });
+      await openFixture(page);
+
+      const computed = await page.evaluate(() => {
+        const workspace = document.querySelector<HTMLElement>(".workspace")!;
+        const sidebar = document.querySelector<HTMLElement>(".sidebar")!;
+        const separator = document.querySelector<HTMLElement>(".resize-separator")!;
+        const surface = document.querySelector<HTMLElement>(".project-overview")!;
+        const title = document.querySelector<HTMLElement>(".project-header h1")!;
+        const art = document.querySelector<HTMLElement>(".project-header-art")!;
+        const root = getComputedStyle(document.documentElement);
+        type Rgba = [number, number, number, number];
+        const parseColor = (value: string): Rgba => {
+          const channels = value.match(/[\d.]+/g)?.map(Number) ?? [];
+          return [channels[0] ?? 0, channels[1] ?? 0, channels[2] ?? 0, channels[3] ?? 1];
+        };
+        const composite = (foreground: Rgba, background: Rgba): Rgba => {
+          const alpha = foreground[3] + background[3] * (1 - foreground[3]);
+          if (alpha === 0) return [0, 0, 0, 0];
+          return [
+            (foreground[0] * foreground[3] + background[0] * background[3] * (1 - foreground[3])) / alpha,
+            (foreground[1] * foreground[3] + background[1] * background[3] * (1 - foreground[3])) / alpha,
+            (foreground[2] * foreground[3] + background[2] * background[3] * (1 - foreground[3])) / alpha,
+            alpha,
+          ];
+        };
+        const effectiveBackground = (element: HTMLElement): Rgba => {
+          const layers: Rgba[] = [];
+          let current: HTMLElement | null = element;
+          while (current) {
+            layers.push(parseColor(getComputedStyle(current).backgroundColor));
+            current = current.parentElement;
+          }
+          return layers.reverse().reduce(
+            (background, foreground) => composite(foreground, background),
+            [255, 255, 255, 1] as Rgba,
+          );
+        };
+        const luminance = (channels: Rgba) => {
+          const linear = channels.slice(0, 3).map((channel) => {
+            const normalized = channel / 255;
+            return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+          });
+          return 0.2126 * linear[0]! + 0.7152 * linear[1]! + 0.0722 * linear[2]!;
+        };
+        const contrast = (foreground: Rgba, background: Rgba) => {
+          const light = Math.max(luminance(foreground), luminance(background));
+          const dark = Math.min(luminance(foreground), luminance(background));
+          return (light + 0.05) / (dark + 0.05);
+        };
+        const semanticPills = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            ".state-pill--healthy, .state-pill--succeeded, .state-pill--attention, .state-pill--failed",
+          ),
+        );
+        const dangerProbe = document.createElement("span");
+        dangerProbe.className = "state-pill state-pill--failed";
+        dangerProbe.textContent = "failed";
+        dangerProbe.style.position = "absolute";
+        dangerProbe.style.left = "-10000px";
+        document.querySelector<HTMLElement>(".project-stat")!.append(dangerProbe);
+        semanticPills.push(dangerProbe);
+        const semanticPillContrasts = semanticPills.map(
+          (pill) => {
+            const style = getComputedStyle(pill);
+            return contrast(parseColor(style.color), effectiveBackground(pill));
+          },
+        );
+        dangerProbe.remove();
+        return {
+          theme: document.documentElement.dataset.theme,
+          mode: document.documentElement.dataset.mode,
+          scheme: document.documentElement.style.colorScheme,
+          page: getComputedStyle(workspace).backgroundColor,
+          chrome: getComputedStyle(sidebar).backgroundColor,
+          separator: getComputedStyle(separator).backgroundColor,
+          surface: getComputedStyle(surface).backgroundColor,
+          accent: root.getPropertyValue("--pam-ice").trim(),
+          font: getComputedStyle(title).fontFamily,
+          art: getComputedStyle(art).backgroundImage,
+          semanticPillContrasts,
+        };
+      });
+
+      expect(computed).toMatchObject({
+        theme: appearance.theme,
+        mode: appearance.mode,
+        scheme: appearance.mode,
+        page: appearance.page,
+        surface: appearance.surface,
+        accent: appearance.accent,
+      });
+      expect(computed.font).toContain(appearance.font);
+      expect(computed.art).toContain(appearance.asset);
+      expect(computed.separator).toBe(computed.chrome);
+      expect(computed.semanticPillContrasts.length).toBeGreaterThan(0);
+      expect(Math.min(...computed.semanticPillContrasts)).toBeGreaterThanOrEqual(4.5);
+      await expect(page).toHaveScreenshot(`theme-${appearance.theme}-${appearance.mode}-1180x800.png`);
+    });
+  }
+
+  test("switches family and variant with Radix controls and restores both on reload", async ({ page }) => {
+    await page.setViewportSize({ width: 1_180, height: 800 });
+    await openFixture(page);
+    const trigger = page.getByRole("button", { name: "Theme: Ventisquero · light" });
+
+    await trigger.click();
+    await page.getByRole("menuitemradio", { name: /^Viña del Mar/ }).click();
+    await page.getByRole("button", { name: "Theme: Viña del Mar · light" }).click();
+    await page.getByRole("menuitemradio", { name: /^Dark/ }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "vina");
+    await expect(page.locator("html")).toHaveAttribute("data-mode", "dark");
+
+    await page.reload();
+    await page.locator(".app-shell").waitFor();
+    await expect(page.getByRole("button", { name: "Theme: Viña del Mar · dark" })).toBeVisible();
+    await page.getByRole("button", { name: "Theme: Viña del Mar · dark" }).click();
+    await expect(page.getByRole("menuitemradio", { name: /^Viña del Mar/ })).toBeChecked();
+    await expect(page.getByRole("menuitemradio", { name: /^Dark/ })).toBeChecked();
+    await expect(page).toHaveScreenshot("theme-menu-vina-dark-1180x800.png");
+  });
+});
+
 test.describe("Access skill audit", () => {
   test("preserves the shell and renders the evaluated audit truth at 1180px", async ({ page }) => {
     await page.setViewportSize({ width: 1_180, height: 1_000 });
@@ -274,7 +428,7 @@ test.describe("Access skill audit", () => {
         workspaceRight: workspace?.right ?? -1,
       };
     });
-    expect(geometry).toEqual({ sidebar: 248, separator: 5, toolbar: 44, workspaceRight: 1_172 });
+    expect(geometry).toEqual({ sidebar: 248, separator: 5, toolbar: 52, workspaceRight: 1_170 });
 
     const ranked = page.getByRole("region", { name: "Ranked artifacts" });
     const verdict = page.getByRole("region", { name: "Evaluator verdict" });

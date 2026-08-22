@@ -9,26 +9,22 @@ import {
   GitBranch,
   LockSimple,
   MagnifyingGlass,
+  MoonStars,
   Power,
   Pulse,
   Queue,
   SidebarSimple,
+  SunHorizon,
 } from "@phosphor-icons/react";
+import { DropdownMenu, Tooltip, VisuallyHidden } from "radix-ui";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   type RefObject,
   useEffect,
   useRef,
 } from "react";
-import {
-  Button,
-  Menu,
-  MenuItem,
-  MenuTrigger,
-  Popover,
-  VisuallyHidden,
-} from "react-aria-components";
 import type { ViewId } from "../domain";
 import {
   clampSidebarWidth,
@@ -37,6 +33,7 @@ import {
   sidebarWidthFromKey,
 } from "../layout";
 import type { ControlCenterView, ProjectView } from "../selectors";
+import type { PamTheme, PamThemeMode } from "../theme";
 
 export const navItems: ReadonlyArray<{ id: ViewId; label: string; icon: typeof Pulse }> = [
   { id: "current", label: "Current", icon: Pulse },
@@ -46,6 +43,20 @@ export const navItems: ReadonlyArray<{ id: ViewId; label: string; icon: typeof P
 
 export function StatusDot({ state = "coral" }: { state?: "coral" | "aqua" | "muted" }) {
   return <Circle className={`status-dot status-dot--${state}`} size={12} weight="fill" aria-hidden="true" />;
+}
+
+function IconTooltip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip.Root>
+      <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
+      <Tooltip.Portal>
+        <Tooltip.Content className="tooltip-content" sideOffset={8}>
+          {label}
+          <Tooltip.Arrow className="tooltip-arrow" />
+        </Tooltip.Content>
+      </Tooltip.Portal>
+    </Tooltip.Root>
+  );
 }
 
 export function ProjectMenu({
@@ -62,55 +73,62 @@ export function ProjectMenu({
   onSelect: (project: ProjectView) => void;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const wasOpen = useRef(open);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (wasOpen.current && !open) triggerRef.current?.focus();
-    wasOpen.current = open;
+    if (open) {
+      window.requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>('[data-state="checked"]')?.focus());
+    }
   }, [open]);
 
   return (
     <div className="project-menu-wrap">
-      <MenuTrigger
-        isOpen={open}
-        onOpenChange={onOpenChange}
-      >
-        <Button
+      <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
+        <DropdownMenu.Trigger asChild>
+          <button
           ref={triggerRef}
           type="button"
           className="project-switcher"
-        >
-          <GitBranch size={19} aria-hidden="true" />
-          <span>{active.name}</span>
-          <CaretDown size={16} weight="bold" aria-hidden="true" />
-        </Button>
-        <Popover className="project-menu-popover" placement="bottom start">
-          <Menu
-            className="project-menu"
-            aria-label="Registered projects"
-            selectionMode="single"
-            selectedKeys={new Set([active.handle])}
           >
+            <GitBranch size={19} aria-hidden="true" />
+            <span>{active.name}</span>
+            <CaretDown size={16} weight="bold" aria-hidden="true" />
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            ref={menuRef}
+            className="project-menu-popover project-menu"
+            aria-label="Registered projects"
+            align="start"
+            sideOffset={8}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              triggerRef.current?.focus();
+            }}
+          >
+            <DropdownMenu.RadioGroup value={active.handle}>
             {projects.map((project) => (
-              <MenuItem
+              <DropdownMenu.RadioItem
                 className="project-menu-item"
-                id={project.handle}
                 key={project.handle}
                 textValue={project.name}
-                onAction={() => onSelect(project)}
+                value={project.handle}
+                onSelect={() => onSelect(project)}
               >
                 <span className={`health-dot health-dot--${project.health}`} aria-hidden="true" />
                 <span>
                   <strong>{project.name}</strong>
                   <small>{project.branch ?? project.rootLabel}</small>
-                  <VisuallyHidden>Health: {project.health}</VisuallyHidden>
+                  <VisuallyHidden.Root>Health: {project.health}</VisuallyHidden.Root>
                 </span>
-                {project.handle === active.handle && <Check size={15} weight="bold" aria-hidden="true" />}
-              </MenuItem>
+                <DropdownMenu.ItemIndicator><Check size={15} weight="bold" aria-hidden="true" /></DropdownMenu.ItemIndicator>
+              </DropdownMenu.RadioItem>
             ))}
-          </Menu>
-        </Popover>
-      </MenuTrigger>
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
     </div>
   );
 }
@@ -169,7 +187,7 @@ export function Sidebar({
   };
   return (
     <aside ref={containerRef} className={`sidebar ${collapsed ? "is-collapsed" : ""}`} aria-label="Project navigation" onKeyDownCapture={trapTabFocus}>
-      <div className="brand" aria-label="PAM">
+      <div className="brand" aria-label="PAM" data-tauri-drag-region>
         <img src="/assets/pam-mark.png" alt="" />
         {!collapsed && <span>PAM</span>}
       </div>
@@ -306,23 +324,31 @@ export function ResizeSeparator({
 
 export function Toolbar({
   data,
+  theme,
+  themeMode,
   collapsed,
   pending,
   onToggleSidebar,
   onRefresh,
   onOpenCommand,
   onOpenQueue,
+  onThemeChange,
+  onThemeModeChange,
   toggleButtonRef,
   commandButtonRef,
   queueButtonRef,
 }: {
   data: ControlCenterView;
+  theme: PamTheme;
+  themeMode: PamThemeMode;
   collapsed: boolean;
   pending: boolean;
   onToggleSidebar: () => void;
   onRefresh: () => void;
   onOpenCommand: (returnFocusTarget?: HTMLElement) => void;
   onOpenQueue: (returnFocusTarget?: HTMLElement) => void;
+  onThemeChange: (theme: PamTheme) => void;
+  onThemeModeChange: (mode: PamThemeMode) => void;
   toggleButtonRef: RefObject<HTMLButtonElement | null>;
   commandButtonRef: RefObject<HTMLButtonElement | null>;
   queueButtonRef: RefObject<HTMLButtonElement | null>;
@@ -332,23 +358,74 @@ export function Toolbar({
       <button ref={toggleButtonRef} type="button" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={onToggleSidebar}>
         <SidebarSimple size={19} weight="bold" />
       </button>
-      <div className="breadcrumb">
+      <div className="breadcrumb" data-tauri-drag-region>
         <span>{data.project.name}</span>
         <CaretRight size={12} aria-hidden="true" />
         <strong>Control center</strong>
       </div>
       {import.meta.env.DEV && data.fixture && <span className="fixture-badge">Design fixture</span>}
       <div className="toolbar-actions">
-        <button ref={commandButtonRef} type="button" aria-label="Open command palette (⌘K)" title="Open command palette (⌘K)" onClick={(event) => onOpenCommand(event.currentTarget)}>
-          <MagnifyingGlass size={18} />
-        </button>
-        <button ref={queueButtonRef} type="button" aria-label="Open queue" title="Open queue" onClick={(event) => onOpenQueue(event.currentTarget)}>
-          <Queue size={19} />
-          {data.current.queue.length > 0 && <span>{data.current.queue.length}</span>}
-        </button>
-        <button type="button" aria-label="Refresh project" title="Refresh project (⌘R)" disabled={pending} onClick={onRefresh}>
-          <ArrowClockwise className={pending ? "is-spinning" : ""} size={18} weight="bold" />
-        </button>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button
+              type="button"
+              className="theme-trigger"
+              aria-label={`Theme: ${theme === "ventisquero" ? "Ventisquero" : "Viña del Mar"} · ${themeMode}`}
+              title="Choose appearance theme"
+            >
+              {themeMode === "light"
+                ? <SunHorizon size={19} weight="bold" aria-hidden="true" />
+                : <MoonStars size={19} weight="bold" aria-hidden="true" />}
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="theme-menu-popover" align="end" sideOffset={8}>
+              <DropdownMenu.Label className="theme-menu-label">Theme</DropdownMenu.Label>
+              <DropdownMenu.RadioGroup value={theme} onValueChange={(value) => onThemeChange(value as PamTheme)}>
+                <DropdownMenu.RadioItem className="theme-menu-item" value="ventisquero" textValue="Ventisquero">
+                  <span className="theme-swatch theme-swatch--ventisquero" aria-hidden="true" />
+                  <span><strong>Ventisquero</strong><small>Rock · Ice · Copper · Mist</small></span>
+                  <DropdownMenu.ItemIndicator><Check size={15} weight="bold" aria-hidden="true" /></DropdownMenu.ItemIndicator>
+                </DropdownMenu.RadioItem>
+                <DropdownMenu.RadioItem className="theme-menu-item" value="vina" textValue="Viña del Mar">
+                  <span className="theme-swatch theme-swatch--vina" aria-hidden="true" />
+                  <span><strong>Viña del Mar</strong><small>Night · Violet · Coral · Surf</small></span>
+                  <DropdownMenu.ItemIndicator><Check size={15} weight="bold" aria-hidden="true" /></DropdownMenu.ItemIndicator>
+                </DropdownMenu.RadioItem>
+              </DropdownMenu.RadioGroup>
+              <DropdownMenu.Separator className="theme-menu-separator" />
+              <DropdownMenu.Label className="theme-menu-label">Variant</DropdownMenu.Label>
+              <DropdownMenu.RadioGroup value={themeMode} onValueChange={(value) => onThemeModeChange(value as PamThemeMode)}>
+                <DropdownMenu.RadioItem className="theme-menu-item theme-menu-item--compact" value="light" textValue="Light variant">
+                  <SunHorizon size={19} aria-hidden="true" />
+                  <span><strong>Light</strong><small>{theme === "ventisquero" ? "Mist" : "Dawn"}</small></span>
+                  <DropdownMenu.ItemIndicator><Check size={15} weight="bold" aria-hidden="true" /></DropdownMenu.ItemIndicator>
+                </DropdownMenu.RadioItem>
+                <DropdownMenu.RadioItem className="theme-menu-item theme-menu-item--compact" value="dark" textValue="Dark variant">
+                  <MoonStars size={19} aria-hidden="true" />
+                  <span><strong>Dark</strong><small>{theme === "ventisquero" ? "Bedrock" : "Night"}</small></span>
+                  <DropdownMenu.ItemIndicator><Check size={15} weight="bold" aria-hidden="true" /></DropdownMenu.ItemIndicator>
+                </DropdownMenu.RadioItem>
+              </DropdownMenu.RadioGroup>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+        <IconTooltip label="Search commands · ⌘K">
+          <button ref={commandButtonRef} type="button" aria-label="Open command palette (⌘K)" onClick={(event) => onOpenCommand(event.currentTarget)}>
+            <MagnifyingGlass size={18} />
+          </button>
+        </IconTooltip>
+        <IconTooltip label="Open project queue">
+          <button ref={queueButtonRef} type="button" aria-label="Open queue" onClick={(event) => onOpenQueue(event.currentTarget)}>
+            <Queue size={19} />
+            {data.current.queue.length > 0 && <span>{data.current.queue.length}</span>}
+          </button>
+        </IconTooltip>
+        <IconTooltip label="Refresh project · ⌘R">
+          <button type="button" aria-label="Refresh project" disabled={pending} onClick={onRefresh}>
+            <ArrowClockwise className={pending ? "is-spinning" : ""} size={18} weight="bold" />
+          </button>
+        </IconTooltip>
       </div>
     </header>
   );

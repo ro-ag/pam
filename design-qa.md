@@ -1,146 +1,171 @@
-# Plan 13 desktop UI design QA
+# PAM two-layer shell and theme implementation QA
 
-## Evidence and normalization
+Date: 2026-08-21
 
-- PAM identity and content source: `prototype/reference/pam-project-current-approved.png`
-  (1487 x 1058 px).
-- p-track spatial sources:
-  `/Users/rodox/dev/rs/ptrack/docs/help/assets/screenshots/board-dark.png`,
-  `task-drawer-dark.png`, and `project-search-dark.png` (1552 x 1012 px;
-  the app frame is the exact 1440 x 900 crop at `+56+39`).
-- Browser-rendered implementation:
-  `prototype/qa/plan13/production-current-1487x1058.png` at a 1487 x 1058
-  CSS-pixel Chromium viewport, device scale factor 1, dark color scheme,
-  `en-US`, UTC, and reduced motion.
-- Exact PAM full-view comparison:
-  `prototype/qa/plan13/pam-approved-vs-production.png` (source left,
-  production right; both 1487 x 1058, no crop or stretch).
-- Exact p-track shell comparison:
-  `prototype/qa/plan13/ptrack-shell-vs-pam-production.png` (p-track left,
-  PAM right; both 1440 x 900).
-- Focused comparisons:
-  `prototype/qa/plan13/handoff-approved-vs-production.png`,
-  `prototype/qa/plan13/ptrack-drawer-vs-pam-queue.png`, and
-  `prototype/qa/plan13/ptrack-command-vs-pam-command.png`.
-  Handoff regions were independently scaled to 900 px wide without changing
-  aspect ratio. Drawer crops retain 200 px of dimmed underlay plus the exact
-  430 px drawer. Command crops retain the 520 px dialog and backdrop context.
-- Responsive evidence:
-  `prototype/qa/plan13/responsive-contact-sheet.png` plus the individual
-  Playwright baselines under
-  `frontend/e2e/__screenshots__/pam.spec.ts/` at 1180, 960, 780, 600, and
-  320 CSS px, all 800 px tall. The direct 320 px viewport is the effective
-  reflow target for 400% zoom, not a separate breakpoint.
-- Interaction evidence:
-  `prototype/qa/plan13/interaction-contact-sheet.png` covers the project menu,
-  command palette, queue drawer, evidence drawer, and validated Flows view.
-- State: deterministic `payments-api` solved fixture; Current active; daemon
-  running; terminal result expanded; no live timestamps, model identity, or
-  other invented protocol facts.
+## Result
 
-The approved PAM image owns palette, imagery, editorial hierarchy, timeline,
-and handoff identity. p-track owns shell density, the 5 px separator, 8 px
-workspace inset, 44 px toolbar, bounded canvas, 430 px drawer, and 520 px
-search-dialog execution. p-track's mint/purple palette, Kanban content,
-terminal, and copy are deliberately not copied.
+PAM now uses the shared composition visible in ZCode and p-track: the sidebar
+belongs to the application background and the main working area is one inset,
+floating canvas. PAM's identity remains its own. Ventisquero Mist/Bedrock and
+Viña del Mar Dawn/Night retain their existing palette, typography, imagery,
+copy, and interaction language.
 
-## Findings
+No P0, P1, or P2 visual or interaction findings remain.
 
-No actionable P0, P1, or P2 visual or interaction differences remain in the
-current comparisons.
+## Source truth and capture conditions
 
-- Fonts and typography: bundled Cormorant, Manrope, and JetBrains Mono preserve
-  PAM's editorial/UI/code hierarchy without platform-font drift. The production
-  typography is intentionally denser than the approved presentation mock so it
-  matches p-track's working desktop scale; headings, small labels, identifiers,
-  wrapping, and truncation remain legible at every captured width.
-- Spacing and layout rhythm: the live shell matches p-track's 248 px desktop
-  sidebar, 68 px compact rail, 5 px separator, 8 px/4 px workspace insets, and
-  growable 44 px toolbar. Timeline, terminal result, provenance, and actions
-  retain the approved PAM order. Flows becomes one column at 960 px. At 320 px,
-  the document reflows without horizontal overflow and all three handoff actions
-  remain reachable.
-- Colors and tokens: midnight navy, sunset coral, Pacific aqua, and warm sand
-  remain the only product palette. Coral continues to denote action/attention,
-  aqua denotes verified/focus state, and sand carries body copy. p-track's
-  colors were used only as spatial reference.
-- Image quality and asset fidelity: the transparent PAM mark and Pacific sunset
-  are real project-local raster assets with correct transparency, crop, and
-  sharpness. No logo, background, or non-standard visible asset is replaced by
-  CSS art, emoji, a text glyph, or handcrafted SVG. Interface icons use the
-  existing Phosphor family consistently.
-- Copy and content: the UI keeps PAM's approved narrative anatomy while using
-  only production-shaped protocol truth. `Sequence 1` through `Sequence 4`
-  replace invented clock times, and the terminal report does not claim a model
-  name or memory size that the daemon does not supply.
-- Interaction and accessibility: React Aria owns menu, tabs, modal, drawer,
-  listbox, search, focus containment, outside dismissal, and Escape behavior.
-  The project menu supports Arrow keys, Home, End, Enter/Space, and exact focus
-  return. Drawers and the command palette keep one active layer, make older
-  layers inert, and restore the exact opener. Visible focus, forced colors,
-  reduced-motion `always`/system/`never`, and compact-sidebar focus containment
-  are covered by automated assertions.
+- Repository-owned reference board:
+  `qa/ui-modernization/reference-board-1280x800.png`.
+- Reproducible ZCode/PAM composition comparison:
+  `qa/ui-modernization/zcode-reference-vs-pam-canvas-2360x800.png`.
+- Canonical Ventisquero and Viña del Mar assets:
+  `frontend/public/assets/ventisquero-yelcho.png` and
+  `frontend/public/assets/vina-sunset.png`; their semantic token maps live in
+  `frontend/src/styles.css`.
+- Browser implementation capture:
+  `qa/ui-modernization/after-canvas-composition-1180x800.png` at exactly
+  1180×800 CSS pixels and 1× scale.
+- Light-shell implementation capture:
+  `frontend/e2e/__screenshots__/pam.spec.ts/access-audit-evaluated-1180x1000-darwin.png`
+  at exactly 1180×1000 CSS pixels and 1× scale.
+- Native implementation capture:
+  `qa/ui-modernization/native-tauri-canvas-composition.jpeg` from the running
+  macOS Tauri application.
+- Responsive evidence: current Playwright snapshots at 1180, 960, 780, 600,
+  and 320 CSS pixels.
 
-## Comparison history
+The 1152×768 ZCode capture was padded, not scaled, to 1180×800 before the
+side-by-side shell comparison. The comparison tests the shared spatial rule,
+not a pixel clone. PAM content, tokens, and identity remain intentionally
+different. The theme board compares all four PAM appearances at the same
+1180×800 viewport.
 
-### Interaction pre-pass — blocked
+## Combined visual evidence
 
-- [P1] Replacing the command palette with the queue drawer allowed the browser's
-  modal cleanup to overwrite focus restoration, leaving focus on the document.
-  `Drawer` now restores the explicit opener immediately and once more on the
-  next animation frame, after React Aria finishes its cleanup. Vitest and real
-  Chromium both prove toolbar-opener restoration.
-- [P1] The compact sidebar's original document-level Tab trap could intercept
-  an active modal. Focus containment now lives on the sidebar itself, so
-  portalled menus and dialogs retain their own authority. A regression test
-  opens an approval while the compact sidebar is expanded and proves focus
-  remains inside the active dialog.
+- ZCode composition beside PAM:
+  `qa/ui-modernization/zcode-reference-vs-pam-canvas-2360x800.png`.
+- PAM baseline beside the final composition:
+  `qa/ui-modernization/canvas-composition-before-after-2360x800.png`.
+- All four final appearances:
+  `qa/ui-modernization/four-theme-canvas-composition-1180x800.jpg`.
+- User-reported light shell beside the corrected implementation crop:
+  `qa/ui-modernization/light-shell-seam-reference-vs-fix.png`. Both halves are
+  452×1000 crops at 1× scale, aligned on the sidebar/workspace boundary.
+- Original-size full views were inspected in addition to the combined boards;
+  no focused crop was needed because type, icons, boundaries, and imagery were
+  legible in the originals.
 
-### Current visual pass — passed
+## Fidelity review
 
-- `pam-approved-vs-production.png` confirms that PAM's brand, timeline,
-  terminal-result hierarchy, provenance, and three actions remain intact while
-  using the denser p-track shell.
-- `ptrack-shell-vs-pam-production.png` confirms sidebar density, workspace
-  boundary, toolbar height, and scroll ownership at the same 1440 x 900 frame.
-- Focused handoff, drawer, and command comparisons confirm action order,
-  independent drawer scrolling, fixed headers, dimmed underlay, and bounded
-  dialog geometry. No visual fix was required after this current-run pass.
-- The Playwright suite runs 12 production-shaped Chromium checks and rejects
-  console errors or page exceptions. It also asserts zero document overflow,
-  exact shell measurements, reachable actions, keyboard navigation, focus
-  return, forced-color focus, and reduced motion.
-- Fresh production-mode native evidence now covers macOS arm64 WKWebView and
-  Parallels Ubuntu arm64 WebKitGTK. Both render packaged assets/fonts and the
-  truthful credential-recovery state; command search, queue drawer geometry,
-  Escape dismissal, and opener focus recovery pass on both. Ubuntu additionally
-  passes real 780x800 and 320x800 window captures without visible horizontal
-  overflow. See [the native evidence manifest](prototype/qa/plan13/native/README.md).
+### Composition, spacing, and elevation
 
-## Open questions and residual scope
+- The application root and sidebar share the theme chrome. There is no detached
+  sidebar card or separate sidebar background layer.
+- The 5px desktop resize gutter is painted with that same chrome token. This
+  masks the workspace's left shadow inside the gutter while preserving the
+  workspace border, its elevation on the other three sides, and the resize
+  hit target.
+- The workspace is the only large floating surface: 10px desktop inset, 18px
+  radius, 1px theme boundary, clipped content, and the only large shell shadow.
+- Its toolbar is 52px high; controls are 34px. Content begins directly below
+  the toolbar inside the same canvas.
+- The hero is a flat section with a divider rather than a nested 24px card.
+  Its existing image is retained in a compact 104px slot.
+- The three status summaries read as one 10px-radius strip with internal
+  dividers. Individual summary cards have no shadow, lift, or competing radius.
+- Timeline, outcome, panel, and state surfaces use radii no larger than 12px
+  and no large elevation. Hierarchy comes from grouping and whitespace.
+- At 600px and below the same two-layer concept reflows vertically: compact
+  navigation remains part of the root and the workspace remains the single
+  inset canvas. There is no horizontal document overflow at 320px.
 
-- The checked-in baselines in this pass are Darwin-specific by filename.
-  Plan 13 task 84 records separate current-run evidence on the macOS host and
-  the available Parallels Ubuntu guest; raster output is never compared across
-  operating systems with a permissive shared baseline.
-- Browser fixture evidence owns the deterministic full state matrix but does
-  not substitute for task 84's bounded production-mode native WebView smoke on
-  macOS and Linux.
+### Typography
 
-## Implementation checklist
+- Existing theme type roles are unchanged. Ventisquero uses Archivo/Inter with
+  IBM Plex Mono for data; Viña uses Space Grotesk/Inter with JetBrains Mono for
+  data.
+- Display size is capped at 38px in the compact hero. Monospace remains limited
+  to code and metadata; general UI copy does not regress to terminal styling.
 
-- Preserve the approved PAM identity/content authority and p-track spatial
-  authority as separate constraints.
-- Keep platform-specific screenshot baselines locked to the bundled Chromium
-  revision.
-- Keep the current macOS and Parallels Ubuntu native-smoke evidence manifest
-  synchronized when Plan 13 UI sources change. Windows and duplicate CPU
-  architecture variants remain package-distribution scope, not this UI gate.
+### Colors and variants
 
-## Follow-up polish
+- The implementation does not introduce a new palette. Root/sidebar chrome,
+  workspace page, borders, states, and accents all use the existing semantic
+  tokens.
+- Ventisquero Mist and Bedrock remain independent light/dark variants of one
+  family. Viña del Mar Dawn and Night remain independent light/dark variants
+  of the other family.
+- Family and variant apply at the document root, so Radix menus, dialogs,
+  drawers, tooltips, and toasts inherit the active appearance.
 
-- [P3] A future native-only capture can document the separator's aqua hover
-  rail beside its default transparent state; the keyboard focus state is already
-  asserted and does not block this pass.
+### Imagery, icons, and copy
+
+- The exact supplied glacier and Pacific assets are retained; no generated,
+  approximate, SVG, or CSS-drawn replacement was introduced.
+- Phosphor remains the single icon family. Radix remains the primitive layer
+  for menus, dialogs, drawers, tooltips, and selection behavior.
+- Product copy and truthful typed fixture content are unchanged.
+
+### Motion, interaction, and accessibility
+
+- Existing Motion route/overlay transitions remain, with the reduced-motion
+  path preserving immediate state changes.
+- Browser verification covered the command palette, sidebar collapse/restore,
+  and the family/variant theme menu. Focus returned correctly and browser error
+  logs were empty.
+- Native verification launched the actual macOS Tauri app. The overlay titlebar
+  contract is configured and also enforced at runtime; dedicated drag regions
+  avoid turning interactive controls into window drag targets.
+- Forced-colors, focus-visible, keyboard navigation, responsive containment,
+  and reduced-motion assertions remain in the automated suite.
+
+## Iteration history
+
+1. Baseline: nested 24px hero, individually elevated 74px status cards,
+   24px timeline/outcome cards, and 60px toolbar produced a P1 hierarchy
+   mismatch. Fixed by making the workspace the only major floating canvas and
+   flattening the inner content.
+2. First responsive pass: at 960px the redundant status phrase truncated to
+   `PAM is a…`, a P2 responsive defect. Fixed by hiding redundant state pills
+   from 601–1100px and restoring them in the mobile reflow.
+3. Theme regression check: the former test expected the hero to have its own
+   opaque card color. The intentional transparent hero invalidated that old
+   assertion, so the contract now checks the unified overview surface. All four
+   theme snapshots then passed.
+4. Native pass: configuration and runtime titlebar styles were aligned, native
+   drag regions were added, and the running Tauri window was captured after the
+   final rebuild.
+5. Light-shell regression: the transparent desktop resize gutter exposed the
+   workspace's left shadow as a gray strip, a P2 composition defect that made
+   the sidebar appear detached. The base gutter background now resolves to
+   `--pam-chrome`; the focused post-fix comparison shows one uninterrupted
+   shell. At y=400, pixels x=247 through x=252 are all `rgb(253,252,249)` in
+   Viña del Mar Dawn, with the workspace boundary beginning at x=253.
+   The four-appearance visual contract now also asserts that the computed
+   separator background exactly equals the computed sidebar chrome, so the
+   narrow defect cannot slip under screenshot-diff tolerance again.
+6. Pre-merge audit: semantic success and danger text used decorative accent
+   colors below the 4.5:1 small-text threshold, an active run without an
+   outcome occupied only the first desktop grid track, and native chrome was
+   fixed to dark. State pill text now uses the high-contrast content token,
+   the only timeline child spans both tracks, and document theme changes call
+   Tauri's bounded app-theme command. Automated contrast, geometry, capability,
+   and default-light configuration checks cover all three corrections.
+
+## Automated evidence
+
+- TypeScript typecheck: passed.
+- Vitest: 13 files, 124 tests passed.
+- Vite production build: passed; only the existing chunk-size advisory remains.
+- Playwright visual/interaction suite: 23 tests passed, including four theme
+  appearances, an outcome-free active timeline, and the 1180/960/780/600/320
+  responsive set.
+- Rust formatting: passed.
+- Rust workspace check: passed.
+- Clippy with warnings denied: passed.
+- Rust workspace tests: passed; two live connector tests remain intentionally
+  ignored.
+- Tauri security contract: passed, including the native window configuration
+  and narrowly scoped app-theme permission.
 
 final result: passed

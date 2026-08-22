@@ -40,12 +40,13 @@ fn read_json(path: impl AsRef<Path>) -> Value {
 }
 
 #[test]
-fn main_window_is_local_and_has_only_typed_command_permissions() {
+fn main_window_is_local_and_has_only_bounded_permissions() {
     let capability = read_json(manifest_dir().join("capabilities/main-window.json"));
-    let expected = COMMANDS
+    let mut expected = COMMANDS
         .iter()
         .map(|command| Value::String(format!("allow-{}", command.replace('_', "-"))))
         .collect::<Vec<_>>();
+    expected.push(Value::String("core:app:allow-set-app-theme".to_owned()));
 
     assert_eq!(capability["local"], true);
     assert_eq!(capability["windows"], json!(["main"]));
@@ -106,6 +107,11 @@ fn production_window_and_csp_are_exact_and_remote_free() {
     assert_eq!(windows[0]["height"], 900);
     assert_eq!(windows[0]["minWidth"], 320);
     assert_eq!(windows[0]["minHeight"], 600);
+    assert_eq!(windows[0]["backgroundColor"], "#f6f3ec");
+    assert_eq!(windows[0]["theme"], "Light");
+    assert_eq!(windows[0]["decorations"], true);
+    assert_eq!(windows[0]["hiddenTitle"], true);
+    assert_eq!(windows[0]["titleBarStyle"], "Overlay");
     assert_eq!(
         config["app"]["security"]["capabilities"],
         json!(["main-window"])

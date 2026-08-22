@@ -1,4 +1,6 @@
 import { WarningCircle } from "@phosphor-icons/react";
+import { AnimatePresence, MotionConfig, motion } from "motion/react";
+import { Tooltip } from "radix-ui";
 import {
   type CSSProperties,
   useCallback,
@@ -40,6 +42,15 @@ import { FlowsView } from "./views/FlowsView";
 import { AccessView, CurrentView } from "./views/ProjectViews";
 import { appReducer, initialState, presentError } from "./state";
 import {
+  applyPamTheme,
+  readPersistedPamTheme,
+  readPersistedPamThemeMode,
+  writePersistedPamTheme,
+  writePersistedPamThemeMode,
+  type PamTheme,
+  type PamThemeMode,
+} from "./theme";
+import {
   activeOverlay,
   createOverlayState,
   loadingEvidenceEntry,
@@ -53,6 +64,8 @@ import {
 interface AppProps {
   bridge: PamBridge;
   initialView?: ViewId;
+  initialTheme?: PamTheme;
+  initialThemeMode?: PamThemeMode;
 }
 
 interface InitialLayout {
@@ -106,8 +119,10 @@ function sameAuthority(left: CommandFence, right: CommandFence): boolean {
   return left.projectHandle === right.projectHandle && left.generation === right.generation;
 }
 
-export function App({ bridge, initialView = "current" }: AppProps) {
+export function App({ bridge, initialView = "current", initialTheme, initialThemeMode }: AppProps) {
   const [initialLayout] = useState(readInitialLayout);
+  const [theme, setTheme] = useState<PamTheme>(() => initialTheme ?? readPersistedPamTheme(initialLayout.storage));
+  const [themeMode, setThemeMode] = useState<PamThemeMode>(() => initialThemeMode ?? readPersistedPamThemeMode(initialLayout.storage));
   const [viewportWidth, setViewportWidth] = useState(initialLayout.viewportWidth);
   const [compactViewport, setCompactViewport] = useState(initialLayout.compactViewport);
   const [state, dispatch] = useReducer(appReducer, {
@@ -169,6 +184,8 @@ export function App({ bridge, initialView = "current" }: AppProps) {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
   }, []);
 
+  useEffect(() => applyPamTheme(theme, themeMode), [theme, themeMode]);
+
   useEffect(() => {
     const query = window.matchMedia("(max-width: 780px)");
     const update = () => {
@@ -204,6 +221,18 @@ export function App({ bridge, initialView = "current" }: AppProps) {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(""), 2600);
   }, []);
+
+  const selectTheme = useCallback((nextTheme: PamTheme) => {
+    applyPamTheme(nextTheme, themeMode);
+    setTheme(nextTheme);
+    writePersistedPamTheme(storageRef.current, nextTheme);
+  }, [themeMode]);
+
+  const selectThemeMode = useCallback((nextMode: PamThemeMode) => {
+    applyPamTheme(theme, nextMode);
+    setThemeMode(nextMode);
+    writePersistedPamThemeMode(storageRef.current, nextMode);
+  }, [theme]);
 
   const bootstrap = useCallback(async () => {
     const sequence = ++bootstrapRequestSequence.current;
@@ -452,7 +481,9 @@ export function App({ bridge, initialView = "current" }: AppProps) {
   const shellWidth = state.sidebarCollapsed ? 68 : state.sidebarWidth;
   const shellStyle: ShellStyle = { "--sidebar-size": `${shellWidth}px` };
   return (
-    <div className="app-root">
+    <MotionConfig reducedMotion="user">
+      <Tooltip.Provider delayDuration={350} skipDelayDuration={150}>
+      <div className="app-root" data-theme={theme} data-mode={themeMode}>
       <div className="app-shell" style={shellStyle} inert={applicationOverlayOpen || undefined} aria-hidden={applicationOverlayOpen || undefined}>
         <div className="atmosphere" aria-hidden="true" />
         <a className="skip-link" href="#main-content" tabIndex={mobileSidebarOpen ? -1 : undefined}>Skip to content</a>
@@ -473,18 +504,29 @@ export function App({ bridge, initialView = "current" }: AppProps) {
         {mobileSidebarOpen && <button type="button" className="sidebar-scrim" aria-label="Close project sidebar" tabIndex={-1} onClick={toggleSidebar} />}
         <ResizeSeparator collapsed={state.sidebarCollapsed || compactViewport} width={state.sidebarWidth} viewportWidth={viewportWidth} onResizePreview={previewSidebarWidth} onResizeCommit={commitSidebarWidth} onToggle={toggleSidebar} />
         <section className="workspace" inert={mobileSidebarOpen || undefined} aria-hidden={mobileSidebarOpen || undefined}>
-          <Toolbar toggleButtonRef={sidebarToggleRef} commandButtonRef={commandButtonRef} queueButtonRef={queueButtonRef} data={data} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onOpenCommand={openCommandPalette} onRefresh={refresh} onOpenQueue={openQueue} />
+          <Toolbar toggleButtonRef={sidebarToggleRef} commandButtonRef={commandButtonRef} queueButtonRef={queueButtonRef} data={data} theme={theme} themeMode={themeMode} collapsed={state.sidebarCollapsed} pending={pending} onToggleSidebar={toggleSidebar} onOpenCommand={openCommandPalette} onRefresh={refresh} onOpenQueue={openQueue} onThemeChange={selectTheme} onThemeModeChange={selectThemeMode} />
           {state.loadState === "recovering" && state.error && <div className="inline-recovery" role="alert"><WarningCircle size={18} /><span>{state.error}</span><button type="button" onClick={refresh}>Retry</button></div>}
-          {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} onOpenQueue={openQueue} onOpenApproval={() => { if (approvalKey && overlayAuthority) openOverlay({ id: `approval:${approvalKey}`, kind: "approval", authority: overlayAuthority, approvalKey }, false, true); }} onRecoverDaemon={toggleDaemon} onRefresh={refresh} onRegisterCaller={registerGuiCaller} registrationBusy={pending} />}
-          {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
-          {state.activeView === "access" && (
-            <AccessView
-              key={`${state.activeFence.projectHandle}:${state.activeFence.generation}`}
-              data={data}
-              bridge={bridge}
-              fence={state.activeFence}
-            />
-          )}
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              className="view-transition"
+              key={state.activeView}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.24, ease: [0.33, 1, 0.68, 1] }}
+            >
+              {state.activeView === "current" && <CurrentView data={data} onCopy={(brief) => void copyBrief(brief)} onEvidence={(handle) => void loadEvidence(handle)} onContinue={() => { dispatch({ type: "navigate", view: "flows" }); showToast("Flow workspace opened"); }} onOpenQueue={openQueue} onOpenApproval={() => { if (approvalKey && overlayAuthority) openOverlay({ id: `approval:${approvalKey}`, kind: "approval", authority: overlayAuthority, approvalKey }, false, true); }} onRecoverDaemon={toggleDaemon} onRefresh={refresh} onRegisterCaller={registerGuiCaller} registrationBusy={pending} />}
+              {state.activeView === "flows" && <FlowsView bridge={bridge} fence={state.activeFence} onError={showToast} onToast={showToast} />}
+              {state.activeView === "access" && (
+                <AccessView
+                  key={`${state.activeFence.projectHandle}:${state.activeFence.generation}`}
+                  data={data}
+                  bridge={bridge}
+                  fence={state.activeFence}
+                />
+              )}
+            </motion.div>
+          </AnimatePresence>
         </section>
       </div>
       {effectiveOverlays.stack.map((entry) => {
@@ -498,9 +540,11 @@ export function App({ bridge, initialView = "current" }: AppProps) {
         if (entry.kind === "evidence") {
           return <EvidenceDrawer active={active} document={entry.document} loading={entry.loading} error={entry.error} key={entry.id} onRetry={entry.retryable ? () => { void loadEvidence(entry.handle); } : undefined} onClose={closeActiveOverlay} />;
         }
-        return <CommandPalette active={active} commands={commands} key={entry.id} onAction={runCommand} onClose={closeActiveOverlay} />;
+        return <CommandPalette active={active} commands={commands} key={entry.id} returnFocusTarget={commandReturnFocusRef.current} onAction={runCommand} onClose={closeActiveOverlay} />;
       })}
       {toast && <div className="toast" role="status">{toast}</div>}
-    </div>
+      </div>
+      </Tooltip.Provider>
+    </MotionConfig>
   );
 }

@@ -1,23 +1,14 @@
 import { ArrowClockwise, WarningCircle, X } from "@phosphor-icons/react";
+import { Dialog, ScrollArea, VisuallyHidden } from "radix-ui";
 import {
   type CSSProperties,
   type ReactNode,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
 } from "react";
-import {
-  Button,
-  Dialog,
-  Heading,
-  Input,
-  ListBox,
-  ListBoxItem,
-  Modal,
-  ModalOverlay,
-  SearchField,
-} from "react-aria-components";
 import type { ApprovalDecision, EvidenceDataDto } from "../domain";
 import { MAX_EVIDENCE_TEXT } from "../domain";
 import type { ControlCenterView } from "../selectors";
@@ -32,6 +23,7 @@ export interface DrawerProps {
 }
 
 export function Drawer({ title, eyebrow, onClose, children, active = true, returnFocusTarget }: DrawerProps) {
+  const titleId = useId();
   const returnFocus = useRef<HTMLElement | null>(returnFocusTarget ?? (active && document.activeElement instanceof HTMLElement ? document.activeElement : null));
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -50,31 +42,49 @@ export function Drawer({ title, eyebrow, onClose, children, active = true, retur
       }
     };
   }, []);
+  const content = (
+    <div className="drawer">
+      <VisuallyHidden.Root><Dialog.Description>{eyebrow}</Dialog.Description></VisuallyHidden.Root>
+      <header>
+        <div><span className="eyebrow">{eyebrow}</span><Dialog.Title id={titleId}>{title}</Dialog.Title></div>
+        <Dialog.Close asChild>
+          <button className="drawer-close" type="button" aria-label={`Close ${title}`}><X size={21} weight="bold" /></button>
+        </Dialog.Close>
+      </header>
+      <ScrollArea.Root className="drawer-body">
+        <ScrollArea.Viewport className="drawer-scroll-viewport">{children}</ScrollArea.Viewport>
+        <ScrollArea.Scrollbar className="scrollbar" orientation="vertical"><ScrollArea.Thumb className="scrollbar-thumb" /></ScrollArea.Scrollbar>
+      </ScrollArea.Root>
+    </div>
+  );
+
+  if (!active) {
+    return (
+      <Dialog.Root open={false}>
+        <div className="application-overlay application-overlay--drawer" data-application-overlay-layer="underlay" aria-hidden inert>
+          <div className="drawer-modal" role="dialog" aria-labelledby={titleId}>{content}</div>
+        </div>
+      </Dialog.Root>
+    );
+  }
+
   return (
-    <ModalOverlay
-      className="application-overlay application-overlay--drawer"
-      data-application-overlay-layer={active ? "active" : "underlay"}
-      isOpen
-      isDismissable={active}
-      isKeyboardDismissDisabled={!active}
-      aria-hidden={active ? undefined : true}
-      inert={active ? undefined : true}
-      onOpenChange={(isOpen) => { if (!isOpen && active) onClose(); }}
-    >
-      <Modal className="drawer-modal">
-        <Dialog className="drawer">
-          {({ close }) => (
-            <>
-              <header>
-                <div><span className="eyebrow">{eyebrow}</span><Heading slot="title" level={2}>{title}</Heading></div>
-                <Button className="drawer-close" autoFocus={active} aria-label={`Close ${title}`} onPress={() => { if (active) close(); }}><X size={21} weight="bold" /></Button>
-              </header>
-              <div className="drawer-body">{children}</div>
-            </>
-          )}
-        </Dialog>
-      </Modal>
-    </ModalOverlay>
+    <Dialog.Root open onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="application-overlay application-overlay--drawer" />
+        <Dialog.Content
+          className="drawer-modal"
+          data-application-overlay-layer="active"
+          aria-labelledby={titleId}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (returnFocus.current?.isConnected) returnFocus.current.focus();
+          }}
+        >
+          {content}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -146,13 +156,22 @@ export interface CommandPaletteCommand {
 export interface CommandPaletteProps {
   commands: CommandPaletteCommand[];
   active: boolean;
+  returnFocusTarget?: HTMLElement | null;
   onAction: (id: string) => void;
   onClose: () => void;
 }
 
-export function CommandPalette({ commands, active, onAction, onClose }: CommandPaletteProps) {
+export function CommandPalette({ commands, active, returnFocusTarget, onAction, onClose }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const commandListRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const returnFocus = useRef<HTMLElement | null>(returnFocusTarget ?? (active && document.activeElement instanceof HTMLElement ? document.activeElement : null));
+  useEffect(() => () => {
+    const target = returnFocus.current;
+    if (!target?.isConnected) return;
+    target.focus();
+    requestAnimationFrame(() => { if (target.isConnected) target.focus(); });
+  }, []);
   const filteredCommands = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return commands;
@@ -165,56 +184,78 @@ export function CommandPalette({ commands, active, onAction, onClose }: CommandP
     onAction(command.id);
   };
 
-  return (
-    <ModalOverlay
-      className="application-overlay application-overlay--command"
-      data-application-overlay-layer={active ? "active" : "underlay"}
-      isOpen
-      isDismissable={active}
-      isKeyboardDismissDisabled={!active}
-      aria-hidden={active ? undefined : true}
-      inert={active ? undefined : true}
-      onOpenChange={(isOpen) => { if (!isOpen && active) onClose(); }}
+  const moveOptionFocus = (current: HTMLElement | null, direction: 1 | -1) => {
+    const options = Array.from(commandListRef.current?.querySelectorAll<HTMLElement>('[role="option"]') ?? []);
+    if (options.length === 0) return;
+    const index = current ? options.indexOf(current) : direction > 0 ? -1 : 0;
+    options[(index + direction + options.length) % options.length]?.focus();
+  };
+
+  const dialog = (
+    <Dialog.Content
+      className="command-modal"
+      aria-label="Command palette"
+      onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        searchRef.current?.focus();
+      }}
     >
-      <Modal className="command-modal">
-        <Dialog className="command-dialog" aria-label="Command palette">
-          <SearchField
-            className="command-search"
-            value={query}
-            onChange={setQuery}
-            aria-label="Search commands"
-            autoFocus={active}
-            onKeyDown={(event) => {
-              if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-              const options = commandListRef.current?.querySelectorAll<HTMLElement>('[role="option"]:not([aria-disabled="true"])');
-              const target = event.key === "ArrowDown" ? options?.[0] : options?.[options.length - 1];
-              if (!target) return;
-              event.preventDefault();
-              target.focus();
-            }}
-          >
-            <Input className="command-input" placeholder="Search commands…" />
-          </SearchField>
-          <ListBox
-            ref={commandListRef}
-            className="command-options"
-            aria-label="Commands"
-            items={filteredCommands}
-            renderEmptyState={() => <p className="command-empty">No matching commands.</p>}
-          >
-            {(command) => (
-              <ListBoxItem className="command-option" id={command.id} textValue={command.label} onAction={() => run(command)}>
-                <span className="command-option-copy">
-                  <strong>{command.label}</strong>
-                  <small>{command.description}</small>
-                </span>
-                {command.shortcut && <kbd>{command.shortcut}</kbd>}
-              </ListBoxItem>
-            )}
-          </ListBox>
-        </Dialog>
-      </Modal>
-    </ModalOverlay>
+      <VisuallyHidden.Root><Dialog.Title>Command palette</Dialog.Title></VisuallyHidden.Root>
+      <VisuallyHidden.Root><Dialog.Description>Search and run a PAM command.</Dialog.Description></VisuallyHidden.Root>
+      <div className="command-dialog">
+        <input
+          ref={searchRef}
+          className="command-input"
+          type="search"
+          value={query}
+          placeholder="Search commands…"
+          aria-label="Search commands"
+          onChange={(event) => setQuery(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+            event.preventDefault();
+            moveOptionFocus(null, event.key === "ArrowDown" ? 1 : -1);
+          }}
+        />
+        <div ref={commandListRef} className="command-options" role="listbox" aria-label="Commands">
+          {filteredCommands.length === 0 ? <p className="command-empty">No matching commands.</p> : filteredCommands.map((command) => (
+            <button
+              className="command-option"
+              type="button"
+              role="option"
+              aria-selected="false"
+              key={command.id}
+              onClick={() => run(command)}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  moveOptionFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+                } else if (event.key === "Home" || event.key === "End") {
+                  event.preventDefault();
+                  const options = commandListRef.current?.querySelectorAll<HTMLElement>('[role="option"]');
+                  (event.key === "Home" ? options?.[0] : options?.[options.length - 1])?.focus();
+                }
+              }}
+            >
+              <span className="command-option-copy">
+                <strong>{command.label}</strong>
+                <small>{command.description}</small>
+              </span>
+              {command.shortcut && <kbd>{command.shortcut}</kbd>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </Dialog.Content>
+  );
+
+  return (
+    <Dialog.Root open={active} onOpenChange={(isOpen) => { if (!isOpen && active) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="application-overlay application-overlay--command" data-application-overlay-layer={active ? "active" : "underlay"} />
+        {dialog}
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 

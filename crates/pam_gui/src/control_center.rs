@@ -111,7 +111,10 @@ pub(crate) async fn request_daemon_stop_authenticated(
             return Err(failure
                 .recovery
                 .map_or(failure.message.clone(), |recovery| {
-                    format!("{} Recovery: {recovery}", failure.message)
+                    format!(
+                        "{}. Recovery: {recovery}",
+                        failure.message.trim_end_matches('.')
+                    )
                 }));
         }
         ResultBody::Success { .. } => {

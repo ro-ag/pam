@@ -134,6 +134,22 @@ describe("daemon observatory", () => {
     expect(screen.queryByRole("heading", { name: "Ready for the next agent" })).not.toBeInTheDocument();
   });
 
+  it("adopts the server-rotated fence generation from lifecycle responses", async () => {
+    const bridge = fixtureBridge();
+    const rotated = "12121212-1212-4121-8121-121212121212";
+    const originalStop = bridge.stopDaemon.bind(bridge);
+    bridge.stopDaemon = async (fence) => {
+      const response = await originalStop(fence);
+      return { ...response, fence: { ...response.fence, generation: rotated } };
+    };
+    render(<App bridge={bridge} initialView="options" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Pause PAM" }));
+
+    expect(await screen.findByRole("button", { name: "Start PAM" })).toBeEnabled();
+    expect(screen.queryByText(/did not match the latest project operation/)).not.toBeInTheDocument();
+  });
+
   it("keeps a calm paused Activity view while the daemon is offline", async () => {
     render(<App bridge={fixtureBridge("offline")} />);
 

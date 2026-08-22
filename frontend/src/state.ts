@@ -1,5 +1,5 @@
 import type { CatalogDto, CommandFence, SnapshotDataDto, SnapshotDto, ViewId } from "./domain";
-import { sameFence } from "./bridge";
+import { answersFence, sameFence } from "./bridge";
 import { clampSidebarWidth } from "./layout";
 
 export { clampSidebarWidth };
@@ -56,14 +56,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "commandStarted":
       return { ...state, pendingFence: action.fence, error: null };
     case "commandSucceeded":
-      if (
-        !sameFence(state.pendingFence, action.response.fence) &&
-        !(
-          state.pendingFence?.generation === "" &&
-          state.pendingFence.projectHandle === action.response.fence.projectHandle &&
-          state.pendingFence.operationId === action.response.fence.operationId
-        )
-      ) return state;
+      if (!answersFence(state.pendingFence, action.response.fence)) return state;
       return {
         ...state,
         loadState: "ready",

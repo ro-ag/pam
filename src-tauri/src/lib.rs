@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use commands::DesktopState;
 use pam_gui::DesktopCore;
 
+#[cfg(target_os = "macos")]
+use tauri::{Manager, TitleBarStyle};
+
 /// Runs the local PAM Tauri application.
 ///
 /// # Errors
@@ -23,6 +26,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     tauri::Builder::default()
         .manage(DesktopState::new(core))
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_title_bar_style(TitleBarStyle::Overlay)?;
+                window.set_title("")?;
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::catalog,

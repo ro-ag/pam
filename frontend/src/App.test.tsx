@@ -33,7 +33,12 @@ function deferred() {
 }
 
 describe("control center", () => {
-  beforeEach(() => window.localStorage.clear());
+  beforeEach(() => {
+    window.localStorage.clear();
+    delete document.documentElement.dataset.theme;
+    delete document.documentElement.dataset.mode;
+    document.documentElement.style.colorScheme = "";
+  });
 
   it("renders the p-track spatial grammar and provenance-backed current outcome", async () => {
     render(<App bridge={fixtureBridge()} />);
@@ -50,6 +55,32 @@ describe("control center", () => {
     expect(screen.getByText("UNRESOLVED")).toBeInTheDocument();
     expect(screen.getByText("BLOCKED")).toBeInTheDocument();
     expect(screen.getByText("Design fixture")).toBeInTheDocument();
+  });
+
+  it("switches and persists both variants of both named themes", async () => {
+    const user = userEvent.setup();
+    const first = render(<App bridge={fixtureBridge()} />);
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    expect(document.documentElement).toHaveAttribute("data-theme", "ventisquero");
+    expect(document.documentElement).toHaveAttribute("data-mode", "light");
+
+    await user.click(screen.getByRole("button", { name: "Theme: Ventisquero · light" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /^Viña del Mar/ }));
+    expect(document.documentElement).toHaveAttribute("data-theme", "vina");
+    expect(document.documentElement).toHaveAttribute("data-mode", "light");
+
+    await user.click(screen.getByRole("button", { name: "Theme: Viña del Mar · light" }));
+    await user.click(screen.getByRole("menuitemradio", { name: /^Dark/ }));
+    expect(document.documentElement).toHaveAttribute("data-theme", "vina");
+    expect(document.documentElement).toHaveAttribute("data-mode", "dark");
+    expect(document.documentElement.style.colorScheme).toBe("dark");
+    expect(window.localStorage.getItem("pam-theme")).toBe("vina");
+    expect(window.localStorage.getItem("pam-theme-mode")).toBe("dark");
+
+    first.unmount();
+    render(<App bridge={fixtureBridge()} />);
+    expect(await screen.findByRole("button", { name: "Theme: Viña del Mar · dark" })).toBeInTheDocument();
   });
 
   it("renders an active request even before replay facts arrive", async () => {

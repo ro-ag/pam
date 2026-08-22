@@ -18,6 +18,8 @@ import {
   WarningCircle,
   Wrench,
 } from "@phosphor-icons/react";
+import { Collapsible } from "radix-ui";
+import { AnimatePresence, motion } from "motion/react";
 import { useState } from "react";
 import { StatusDot } from "../components/Shell";
 import type { CommandFence, PamBridge } from "../domain";
@@ -41,10 +43,15 @@ const timelineIcons = {
   failure: WarningCircle,
 };
 
-function TimelineEventRow({ item, last }: { item: TimelineItemView; last: boolean }) {
+function TimelineEventRow({ item, last, index }: { item: TimelineItemView; last: boolean; index: number }) {
   const Icon = timelineIcons[item.kind];
   return (
-    <li className={`timeline-row timeline-row--${item.kind}`}>
+    <motion.li
+      className={`timeline-row timeline-row--${item.kind}`}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.045, duration: 0.24, ease: [0.33, 1, 0.68, 1] }}
+    >
       <div className="timeline-marker" aria-hidden="true">
         <span><Icon size={21} weight={item.kind === "verification" ? "bold" : "regular"} /></span>
         {!last && <i />}
@@ -59,7 +66,7 @@ function TimelineEventRow({ item, last }: { item: TimelineItemView; last: boolea
           <span>{formatClock(item.occurredAt)}</span>
         </time>
       ) : <span className="timeline-sequence">{item.relativeLabel}</span>}
-    </li>
+    </motion.li>
   );
 }
 
@@ -157,10 +164,12 @@ export function CurrentView({
   const timeline = data.current.activeRun?.timeline ?? outcome?.timeline ?? [];
   const missingCredential = data.current.recoveryAction === "register-caller";
   const canStartDaemon = data.current.recoveryAction === "start-daemon";
+  const outcomeLabel = outcome?.state === "succeeded" ? "Ready" : outcome ? "Needs follow-up" : "Waiting";
   return (
     <main className="canvas" id="main-content">
-      <header className="project-header">
+      <header className="project-header project-hero">
         <div>
+          <span className="eyebrow">Project control center</span>
           <h1>{data.project.name}</h1>
           <p>
             <StatusDot state={data.daemon.state === "running" ? "coral" : "muted"} />
@@ -169,7 +178,25 @@ export function CurrentView({
             {data.daemon.modelMemory && <><span>·</span>{data.daemon.modelMemory}</>}
           </p>
         </div>
+        <div className="project-header-art" aria-hidden="true" />
       </header>
+      <section className="project-overview" aria-label="Project overview">
+        <article className="project-stat group flex items-center gap-3">
+          <span className="project-stat-icon"><Pulse size={21} weight="bold" /></span>
+          <div><small>Watch status</small><strong>{data.daemon.state === "running" ? "PAM is active" : "PAM is paused"}</strong></div>
+          <span className={`state-pill state-pill--${data.daemon.state === "running" ? "healthy" : "attention"}`}>{data.daemon.state}</span>
+        </article>
+        <article className="project-stat group flex items-center gap-3">
+          <span className="project-stat-icon"><Queue size={21} weight="bold" /></span>
+          <div><small>Project queue</small><strong>{data.current.queue.length} request{data.current.queue.length === 1 ? "" : "s"}</strong></div>
+          <span className="project-stat-value">{data.current.queue.length}</span>
+        </article>
+        <article className="project-stat group flex items-center gap-3">
+          <span className="project-stat-icon"><CheckCircle size={21} weight="bold" /></span>
+          <div><small>Latest handoff</small><strong>{outcomeLabel}</strong></div>
+          <span className={`state-pill state-pill--${outcome?.state === "succeeded" ? "succeeded" : outcome ? "attention" : "not-reported"}`}>{outcome?.state ?? "none"}</span>
+        </article>
+      </section>
       {data.catalogWarning && <div className="surface-notice" role="status"><WarningCircle size={18} /><span>{data.catalogWarning}</span></div>}
       {data.current.failure && <div className="surface-notice is-error" role="alert"><WarningCircle size={18} /><span>{data.current.failure}</span></div>}
       {data.current.approval ? (
@@ -213,21 +240,36 @@ export function CurrentView({
       ) : (
         <section className="timeline-surface" aria-label={`${data.project.name} activity timeline`}>
           {data.current.activeRun && <div className="active-run-strip" role="status"><Pulse size={18} aria-hidden="true" /><strong>{data.current.activeRun.state === "cancelling" ? "Cancelling durable request" : "Active durable request"}</strong><span>{data.current.activeRun.operationKind}</span><span className={`state-pill state-pill--${data.current.activeRun.state}`}>{data.current.activeRun.state}</span></div>}
-          <ol className="timeline-list">
-            {timeline.map((item, index) => <TimelineEventRow item={item} last={index === timeline.length - 1} key={item.id} />)}
-          </ol>
-          {outcome?.brief && (
-            <article className={`outcome-card ${outcome.state === "succeeded" ? "is-solved" : "is-attention"}`}>
-              <button type="button" className="outcome-summary" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-                <span>{outcome.state === "succeeded"
-                  ? <CheckCircle size={24} weight="regular" aria-hidden="true" />
-                  : <WarningCircle size={24} weight="regular" aria-hidden="true" />}</span>
-                <span><strong>{outcome.title}</strong><small>{outcome.state === "succeeded" ? "Terminal result · solved" : "Terminal result · follow-up required"}</small></span>
-                {expanded ? <CaretUp size={18} weight="bold" /> : <CaretDown size={18} weight="bold" />}
-              </button>
-              {expanded && <HandoffPanel brief={outcome.brief} onCopy={() => onCopy(outcome.brief!)} onEvidence={onEvidence} onContinue={onContinue} />}
-            </article>
-          )}
+          <div className="timeline-layout">
+            <div className="timeline-column">
+              <div className="section-heading"><span className="eyebrow">Durable activity</span><strong>What happened</strong></div>
+              <ol className="timeline-list">
+                {timeline.map((item, index) => <TimelineEventRow item={item} index={index} last={index === timeline.length - 1} key={item.id} />)}
+              </ol>
+            </div>
+            {outcome?.brief && (
+              <Collapsible.Root className={`outcome-card ${outcome.state === "succeeded" ? "is-solved" : "is-attention"}`} open={expanded} onOpenChange={setExpanded}>
+                <Collapsible.Trigger asChild>
+                  <button type="button" className="outcome-summary">
+                    <span>{outcome.state === "succeeded"
+                      ? <CheckCircle size={24} weight="regular" aria-hidden="true" />
+                      : <WarningCircle size={24} weight="regular" aria-hidden="true" />}</span>
+                    <span><strong>{outcome.title}</strong><small>{outcome.state === "succeeded" ? "Terminal result · solved" : "Terminal result · follow-up required"}</small></span>
+                    {expanded ? <CaretUp size={18} weight="bold" /> : <CaretDown size={18} weight="bold" />}
+                  </button>
+                </Collapsible.Trigger>
+                <AnimatePresence initial={false}>
+                  {expanded && (
+                    <Collapsible.Content forceMount asChild>
+                      <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.24, ease: [0.33, 1, 0.68, 1] }}>
+                        <HandoffPanel brief={outcome.brief} onCopy={() => onCopy(outcome.brief!)} onEvidence={onEvidence} onContinue={onContinue} />
+                      </motion.div>
+                    </Collapsible.Content>
+                  )}
+                </AnimatePresence>
+              </Collapsible.Root>
+            )}
+          </div>
         </section>
       )}
     </main>

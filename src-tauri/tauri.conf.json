@@ -24,7 +24,11 @@
         "height": 900,
         "minWidth": 320,
         "minHeight": 600,
-        "backgroundColor": "#101520",
+        "backgroundColor": "#f6f3ec",
+        "theme": "Light",
+        "decorations": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay",
         "resizable": true,
         "fullscreen": false
       }

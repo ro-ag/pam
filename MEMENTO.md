@@ -46,3 +46,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - hits: 2026-08-19
 - cost: 0
 - status: watching
+
+## reuse-existing-pam-design-system
+- kind: habit
+- scope: project
+- rule: When the PAM theme palettes and identity tokens already exist, reuse them exactly; do not propose or recreate palette work.
+- fix: Inspect and apply the existing Ventisquero and Viña token maps while changing only shell composition and spatial hierarchy.
+- hits: 2026-08-21
+- cost: 0
+- status: watching

@@ -130,7 +130,9 @@ describe("ProjectMenu", () => {
 
     const switcher = screen.getByRole("button", { name: "payments-api" });
     switcher.focus();
-    await user.keyboard("{ArrowDown}{ArrowDown}{Enter}");
+    await user.keyboard("{ArrowDown}");
+    await waitFor(() => expect(screen.getByRole("menuitemradio", { name: /payments-api/ })).toHaveFocus());
+    await user.keyboard("{ArrowDown}{Enter}");
 
     await waitFor(() => expect(onSelect).toHaveBeenCalledWith(projects[1]));
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());

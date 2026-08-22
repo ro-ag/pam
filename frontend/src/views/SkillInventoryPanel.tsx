@@ -1,12 +1,9 @@
 import { ArrowClockwise, PuzzlePiece, WarningCircle } from "@phosphor-icons/react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { sameFence, withOperation } from "../bridge";
 import type { CommandFence, PamBridge, SkillInventoryDataDto } from "../domain";
 import { presentError } from "../state";
-
-function sameAuthority(left: CommandFence, right: CommandFence): boolean {
-  return left.projectHandle === right.projectHandle && left.generation === right.generation;
-}
 
 function label(value: string): string {
   return value.replaceAll("_", " ");
@@ -26,42 +23,31 @@ export interface SkillInventoryPanelProps {
 }
 
 export function SkillInventoryPanel({ bridge, fence }: SkillInventoryPanelProps) {
-  const [inventory, setInventory] = useState<SkillInventoryDataDto | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const fenceRef = useRef(fence);
-  const requestSequence = useRef(0);
-  fenceRef.current = fence;
+  const [queryClient] = useState(() => new QueryClient({
+    defaultOptions: { queries: { gcTime: 0, retry: false, staleTime: 0 } },
+  }));
+  return (
+    <QueryClientProvider client={queryClient}>
+      <SkillInventoryContent bridge={bridge} fence={fence} />
+    </QueryClientProvider>
+  );
+}
 
-  const isCurrentRequest = useCallback((sequence: number, requestFence: CommandFence) => (
-    sequence === requestSequence.current && sameAuthority(requestFence, fenceRef.current)
-  ), []);
-
-  const load = useCallback(async () => {
-    const sequence = ++requestSequence.current;
-    const requestFence = withOperation(fenceRef.current);
-    setLoading(true);
-    setInventory(null);
-    setError(null);
-    try {
+function SkillInventoryContent({ bridge, fence }: SkillInventoryPanelProps) {
+  const inventoryQuery = useQuery({
+    queryKey: ["skill-inventory", fence.projectHandle, fence.generation],
+    queryFn: async (): Promise<SkillInventoryDataDto> => {
+      const requestFence = withOperation(fence);
       const response = await bridge.loadSkillInventory(requestFence);
-      if (!isCurrentRequest(sequence, requestFence)) return;
       if (!sameFence(requestFence, response.fence)) {
-        setError("The skill inventory response did not match the active project request. Retry inventory.");
-        return;
+        throw new Error("The skill inventory response did not match the active project request. Retry inventory.");
       }
-      setInventory(response.data);
-    } catch (loadError) {
-      if (isCurrentRequest(sequence, requestFence)) setError(presentError(loadError));
-    } finally {
-      if (isCurrentRequest(sequence, requestFence)) setLoading(false);
-    }
-  }, [bridge, isCurrentRequest]);
-
-  useEffect(() => {
-    void load();
-    return () => { requestSequence.current += 1; };
-  }, [load, fence.projectHandle, fence.generation]);
+      return response.data;
+    },
+  });
+  const inventory = inventoryQuery.data ?? null;
+  const error = inventoryQuery.error ? presentError(inventoryQuery.error) : null;
+  const loading = inventoryQuery.isPending;
 
   return (
     <section className="panel skill-inventory-panel" aria-labelledby="skill-inventory-heading">
@@ -75,7 +61,7 @@ export function SkillInventoryPanel({ bridge, fence }: SkillInventoryPanelProps)
         <div className="skill-inventory-state is-error" role="alert">
           <WarningCircle size={24} />
           <div><strong>Skill inventory unavailable</strong><p>{error}</p></div>
-          <button type="button" className="button button--secondary" onClick={() => void load()}><ArrowClockwise size={18} /> Retry inventory</button>
+          <button type="button" className="button button--secondary" onClick={() => { void inventoryQuery.refetch(); }}><ArrowClockwise size={18} /> Retry inventory</button>
         </div>
       ) : inventory ? (
         <>

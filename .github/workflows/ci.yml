@@ -134,14 +134,6 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
-      - name: Stage development PAM helper
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build -p pam_cli --bin pam --locked
-          mkdir -p src-tauri/binaries
-          cp target/debug/pam src-tauri/binaries/pam-x86_64-unknown-linux-gnu
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -252,9 +244,6 @@ jobs:
         working-directory: frontend
         run: npm ci --prefer-offline --no-audit --no-fund
 
-      - name: Stage PAM helper
-        run: node tools/stage-desktop-sidecar.mjs ${{ matrix.target }}
-
       - name: Build desktop packages
         run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
@@ -266,8 +255,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle="target/$TARGET/release/bundle"
-          helper="target/$TARGET/release/pam"
-          desktop="target/$TARGET/release/pam-gui"
+          binary="target/$TARGET/release/pam"
           mapfile -t appimages < <(find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
           mapfile -t debs < <(find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
           (( ${#appimages[@]} == 1 ))
@@ -286,8 +274,8 @@ jobs:
               exit 2
               ;;
           esac
-          for binary in "$helper" "$desktop" "${appimages[0]}"; do
-            machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+          for candidate in "$binary" "${appimages[0]}"; do
+            machine="$(readelf -h "$candidate" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
             [[ "$machine" == "$expected_machine" ]]
           done
           [[ "$(dpkg-deb --field "${debs[0]}" Architecture)" == "$expected_deb_arch" ]]
@@ -307,7 +295,7 @@ jobs:
             grep -Fxq "Local project continuity companion" "$RUNNER_TEMP/pam-help.txt"
             grep -Eq '^Usage: pam( |$)' "$RUNNER_TEMP/pam-help.txt"
           }
-          verify_helper_contract "$helper"
+          verify_helper_contract "$binary"
 
           deb_root="$RUNNER_TEMP/pam-deb-payload"
           appimage_root="$RUNNER_TEMP/pam-appimage-payload"
@@ -319,12 +307,11 @@ jobs:
           )
           verify_payload() {
             local root="$1"
+            # Single-binary product: the payload ships exactly one executable.
             mapfile -t binaries < <(find "$root/usr/bin" -maxdepth 1 -type f -printf '%f\n' | sort)
-            [[ "${binaries[*]}" == "pam pam-gui" ]]
-            for binary in "$root/usr/bin/pam" "$root/usr/bin/pam-gui"; do
-              machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
-              [[ "$machine" == "$expected_machine" ]]
-            done
+            [[ "${binaries[*]}" == "pam" ]]
+            machine="$(readelf -h "$root/usr/bin/pam" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+            [[ "$machine" == "$expected_machine" ]]
             verify_helper_contract "$root/usr/bin/pam"
           }
           verify_payload "$deb_root"
@@ -338,8 +325,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $bundle = "target/$env:TARGET/release/bundle"
-          $helper = (Resolve-Path "target/$env:TARGET/release/pam.exe").Path
-          $desktop = (Resolve-Path "target/$env:TARGET/release/pam-gui.exe").Path
+          $binary = (Resolve-Path "target/$env:TARGET/release/pam.exe").Path
           $installers = @(Get-ChildItem "$bundle/nsis" -File -Filter '*.exe')
           if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
 
@@ -358,28 +344,6 @@ jobs:
             $actual = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
             if ($actual -ne $Expected) {
               throw ("{0} PE machine 0x{1:x4} != 0x{2:x4}" -f $Path, $actual, $Expected)
-            }
-          }
-
-          function Assert-HelperContract([string] $Path, [string] $ExpectedVersion) {
-            $version = (& $Path --version | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or $version -ne "pam $ExpectedVersion") {
-              throw "unexpected PAM helper version: $version"
-            }
-            $helpPath = Join-Path $env:RUNNER_TEMP ("pam-help-{0}.txt" -f [Guid]::NewGuid())
-            try {
-              & $Path --help *> $helpPath
-              $helpExit = $LASTEXITCODE
-              $help = Get-Content -LiteralPath $helpPath -Raw
-              $help = [Regex]::Replace($help, '\x1B\[[0-?]*[ -/]*[@-~]', '')
-              $hasAbout = $help.Contains('Local project continuity companion')
-              $hasUsage = $help.Contains('Usage: pam')
-              if ($helpExit -ne 0 -or -not $hasAbout -or -not $hasUsage) {
-                $helpBytes = (Get-Item -LiteralPath $helpPath).Length
-                throw "PAM helper help contract failed (exit=$helpExit, about=$hasAbout, usage=$hasUsage, bytes=$helpBytes)"
-              }
-            } finally {
-              Remove-Item -LiteralPath $helpPath -Force -ErrorAction SilentlyContinue
             }
           }
 
@@ -414,13 +378,10 @@ jobs:
             'aarch64-pc-windows-msvc' { [UInt16] 0xaa64 }
             default { throw "unsupported Windows verification target: $env:TARGET" }
           }
-          Assert-PeMachine $helper $expectedMachine
-          Assert-PeMachine $desktop $expectedMachine
-
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
-          $expectedVersion = ($metadata.packages | Where-Object name -eq 'pam_cli').version
-          Assert-HelperContract $helper $expectedVersion
+          # The single release binary uses the windowed subsystem, so CLI
+          # output capture is unreliable here; the execution contract is
+          # covered by the Linux and macOS package checks.
+          Assert-PeMachine $binary $expectedMachine
 
           $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
           if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles/7-Zip/7z.exe" }
@@ -432,21 +393,11 @@ jobs:
 
           $pamExecutables = @(Get-ChildItem $extract -Recurse -File -Filter 'pam*.exe')
           $names = @($pamExecutables.Name | Sort-Object)
-          if (($names -join ' ') -ne 'pam-gui.exe pam.exe') {
+          if (($names -join ' ') -ne 'pam.exe') {
             throw "unexpected NSIS PAM executable inventory: $($names -join ' ')"
           }
-          $packagedHelper = @($pamExecutables | Where-Object Name -eq 'pam.exe')
-          $packagedDesktop = @($pamExecutables | Where-Object Name -eq 'pam-gui.exe')
-          if ($packagedHelper.Count -ne 1 -or $packagedDesktop.Count -ne 1) {
-            throw "NSIS payload must contain one helper and one desktop executable"
-          }
-          Assert-PeMachine $packagedHelper[0].FullName $expectedMachine
-          Assert-PeMachine $packagedDesktop[0].FullName $expectedMachine
-          Assert-HelperContract $packagedHelper[0].FullName $expectedVersion
-          if ((Get-FileHash $helper).Hash -ne (Get-FileHash $packagedHelper[0].FullName).Hash) {
-            throw "packaged PAM helper differs from the verified target binary"
-          }
-          Assert-NsisDesktopContract $desktop $packagedDesktop[0].FullName
+          Assert-PeMachine $pamExecutables[0].FullName $expectedMachine
+          Assert-NsisDesktopContract $binary $pamExecutables[0].FullName
 
       - name: Record package output
         id: package
@@ -534,9 +485,6 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
           echo "APPLE_API_KEY_PATH=$private_key" >> "$GITHUB_ENV"
 
-      - name: Stage PAM helper
-        run: node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
-
       - name: Build signed and notarized application
         env:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -577,10 +525,11 @@ jobs:
           xcrun stapler validate "$app"
           xcrun stapler validate "$dmg"
           spctl --assess --type execute "$app"
-          for binary in "$app/Contents/MacOS/pam" "$app/Contents/MacOS/pam-gui"; do
-            [[ "$(lipo -archs "$binary")" == arm64 ]]
-            [[ "$(otool -l "$binary" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
-          done
+          # Single-binary product: the app bundle ships exactly one executable.
+          mapfile -t bundle_binaries < <(find "$app/Contents/MacOS" -maxdepth 1 -type f -exec basename {} \; | sort)
+          [[ "${bundle_binaries[*]}" == "pam" ]]
+          [[ "$(lipo -archs "$app/Contents/MacOS/pam")" == arm64 ]]
+          [[ "$(otool -l "$app/Contents/MacOS/pam" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
           archive="target/aarch64-apple-darwin/release/PAM-macos-arm64-bundle.tar.gz"
           tar -C "$bundle" -czf "$PWD/$archive" "macos/PAM.app" "dmg/$(basename "$dmg")"
           echo "path=$archive" >> "$GITHUB_OUTPUT"

@@ -1,26 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- LA lifeguard tower knocked out of the sun. Asymmetric on purpose:
-       tower sits left of center, ramp dominates to the right, no horizontal
-       window band — avoids torii-gate reading. -->
+  <!-- Whole icon = one coral semicircle; big lifeguard tower knocked out.
+       Asymmetric (tower left, ramp right, vertical slit) to avoid torii reading. -->
   <mask id="tower">
     <rect width="1024" height="1024" fill="#fff"/>
-    <!-- roof: slight overhang only -->
-    <rect x="368" y="292" width="200" height="42" rx="10" fill="#000"/>
+    <!-- roof -->
+    <rect x="304" y="384" width="332" height="66" rx="16" fill="#000"/>
     <!-- cabin -->
-    <rect x="392" y="334" width="152" height="138" fill="#000"/>
+    <rect x="344" y="450" width="252" height="212" fill="#000"/>
     <!-- vertical window slit, off-center -->
-    <rect x="472" y="360" width="44" height="86" fill="#fff"/>
+    <rect x="474" y="492" width="72" height="132" fill="#fff"/>
     <!-- legs -->
-    <rect x="404" y="472" width="42" height="128" fill="#000"/>
-    <rect x="490" y="472" width="42" height="128" fill="#000"/>
-    <!-- ramp: long, dominant, down to the shore -->
-    <path d="M 556 470 L 780 596" stroke="#000" stroke-width="56" stroke-linecap="round" fill="none"/>
+    <rect x="366" y="662" width="64" height="118" fill="#000"/>
+    <rect x="508" y="662" width="64" height="118" fill="#000"/>
+    <!-- ramp -->
+    <path d="M 618 654 L 872 728" stroke="#000" stroke-width="80" stroke-linecap="round" fill="none"/>
   </mask>
-  <path fill="#FC6349" mask="url(#tower)" d="M 92 600 A 420 420 0 0 1 932 600 Z"/>
-  <!-- waves -->
-  <g stroke="#FC6349" stroke-width="72" stroke-linecap="round" fill="none">
-    <path d="M 148 712 C 420 712 560 710 680 696 C 780 684 850 668 912 648" />
-    <path d="M 268 804 C 470 804 590 800 690 786 C 760 776 810 764 852 750" />
-    <path d="M 438 890 C 560 890 640 882 724 862" />
-  </g>
+  <path fill="#FC6349" mask="url(#tower)" d="M 42 780 A 470 470 0 0 1 982 780 Z"/>
 </svg>

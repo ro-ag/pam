@@ -176,7 +176,17 @@ pub enum Decision {
     ApprovalRequired,
 }
 
+/// Read-only capabilities every registered caller may use without an explicit
+/// grant. The daemon is a generic executor: clients call it and it answers
+/// status and current-project reads by default. An explicit deny still
+/// overrides, and an explicit approval-required allow still tightens.
+pub const BASELINE_READ_CAPABILITIES: [&str; 2] = ["daemon.status", "project.current"];
+
 /// Evaluates active grants using deny-overrides semantics.
+///
+/// Capabilities in [`BASELINE_READ_CAPABILITIES`] are allowed when no grant
+/// matches at all; any matching grant (deny or approval-required allow) takes
+/// over the decision as usual.
 #[must_use]
 pub fn evaluate(
     grants: &[Grant],
@@ -188,11 +198,13 @@ pub fn evaluate(
 ) -> Decision {
     let mut found_allow = false;
     let mut found_unconditional_allow = false;
+    let mut found_match = false;
 
     for grant in grants
         .iter()
         .filter(|grant| grant.matches(caller, project, capability, resource, now_ms))
     {
+        found_match = true;
         match grant.effect {
             Effect::Deny => return Decision::Denied,
             Effect::Allow => {
@@ -206,6 +218,8 @@ pub fn evaluate(
         Decision::Allowed
     } else if found_allow {
         Decision::ApprovalRequired
+    } else if !found_match && BASELINE_READ_CAPABILITIES.contains(&capability.as_str()) {
+        Decision::Allowed
     } else {
         Decision::Denied
     }

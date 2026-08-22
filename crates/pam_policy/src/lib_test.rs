@@ -341,3 +341,50 @@ fn validation_errors_never_echo_rejected_input() {
         "resource name must be 1 to 1024 UTF-8 bytes with no control characters"
     );
 }
+
+fn baseline_decision(grants: &[Grant], name: &str) -> Decision {
+    evaluate(
+        grants,
+        &CallerId::from("caller-1"),
+        &ProjectId::from("project-1"),
+        &capability(name),
+        &resource("daemon"),
+        100,
+    )
+}
+
+#[test]
+fn baseline_read_capabilities_allow_without_grants() {
+    assert_eq!(baseline_decision(&[], "daemon.status"), Decision::Allowed);
+    assert_eq!(baseline_decision(&[], "project.current"), Decision::Allowed);
+}
+
+#[test]
+fn baseline_read_capabilities_respect_explicit_deny() {
+    let deny = Grant {
+        capability: capability("daemon.status"),
+        ..grant(Effect::Deny, ResourceScope::Any, ApprovalRequirement::None)
+    };
+    assert_eq!(
+        baseline_decision(&[deny], "daemon.status"),
+        Decision::Denied
+    );
+}
+
+#[test]
+fn baseline_read_capabilities_keep_explicit_approval_requirement() {
+    let approval_only = Grant {
+        capability: capability("project.current"),
+        ..grant(Effect::Allow, ResourceScope::Any, ApprovalRequirement::Once)
+    };
+    assert_eq!(
+        baseline_decision(&[approval_only], "project.current"),
+        Decision::ApprovalRequired
+    );
+}
+
+#[test]
+fn non_baseline_capabilities_still_deny_by_default() {
+    assert_eq!(baseline_decision(&[], "shell.execute"), Decision::Denied);
+    assert_eq!(baseline_decision(&[], "evidence.read"), Decision::Denied);
+}

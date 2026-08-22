@@ -235,11 +235,20 @@ impl BriefProvider for UnavailableBriefProvider {
 
 /// Runs the foreground daemon until an operating-system shutdown signal arrives.
 ///
+/// The daemon never runs itself: launching requires the single-use grant the
+/// control center issues before spawning (`pam gui` → Start PAM).
+///
 /// # Errors
 ///
-/// Returns [`DaemonError`] when ownership, durable state, endpoint preparation,
-/// transport, or protocol handling fails.
+/// Returns [`DaemonError::LaunchNotGranted`] without a valid launch grant, and
+/// otherwise when ownership, durable state, endpoint preparation, transport,
+/// or protocol handling fails.
 pub async fn run(recover: bool, model: Option<ModelKey>) -> Result<(), DaemonError> {
+    let endpoint = LocalEndpoint::default_for_user();
+    let presented = std::env::var(pam_platform::LAUNCH_GRANT_ENV).ok();
+    if !pam_platform::consume_launch_grant(endpoint.runtime_dir(), presented.as_deref()) {
+        return Err(DaemonError::LaunchNotGranted);
+    }
     let brief_provider = std::env::current_dir()
         .ok()
         .and_then(|directory| {
@@ -254,6 +263,7 @@ pub async fn run(recover: bool, model: Option<ModelKey>) -> Result<(), DaemonErr
         })
         .map(|provider| provider as Arc<dyn BriefProvider>);
     let config = DaemonConfig {
+        endpoint,
         recover,
         model,
         brief_provider,

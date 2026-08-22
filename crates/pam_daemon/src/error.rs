@@ -8,6 +8,7 @@ use pam_store::StoreError;
 #[derive(Debug)]
 pub enum DaemonError {
     AlreadyRunning,
+    LaunchNotGranted,
     Handler(tokio::task::JoinError),
     Identity(IdentityError),
     StaleState(String),
@@ -23,7 +24,7 @@ impl DaemonError {
     pub const fn recovery_action(&self) -> Option<&'static str> {
         match self {
             Self::AlreadyRunning => Some("pam status"),
-            Self::StaleState(_) => Some("pam daemon --recover"),
+            Self::LaunchNotGranted | Self::StaleState(_) => Some("pam gui"),
             Self::Transport(error) => error.recovery_action(),
             Self::Handler(_)
             | Self::Identity(_)
@@ -40,10 +41,14 @@ impl fmt::Display for DaemonError {
         match self {
             Self::AlreadyRunning => formatter
                 .write_str("PAM daemon ownership is already claimed. Check it with `pam status`."),
+            Self::LaunchNotGranted => formatter.write_str(
+                "The PAM daemon starts only from the control center. Open it with `pam gui`.",
+            ),
             Self::Handler(_) => formatter.write_str("PAM daemon request handling failed."),
             Self::Identity(error) => error.fmt(formatter),
-            Self::StaleState(_) => formatter
-                .write_str("PAM daemon endpoint is stale. Recover it with `pam daemon --recover`."),
+            Self::StaleState(_) => formatter.write_str(
+                "PAM daemon endpoint is stale. Restart PAM from the control center (`pam gui`).",
+            ),
             Self::Io(_) => formatter.write_str("PAM could not prepare its local runtime state."),
             Self::Model(_) => {
                 formatter.write_str("PAM could not start the embedded model runtime.")
@@ -65,7 +70,7 @@ impl Error for DaemonError {
             Self::Protocol(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Transport(error) => Some(error),
-            Self::AlreadyRunning | Self::StaleState(_) => None,
+            Self::AlreadyRunning | Self::LaunchNotGranted | Self::StaleState(_) => None,
         }
     }
 }

@@ -85,3 +85,48 @@ pub(super) fn private_runtime_dir() -> Option<PathBuf> {
     ProjectDirs::from("dev", "PAM", "PAM")
         .map(|project_dirs| project_dirs.data_local_dir().join("runtime"))
 }
+
+/// Single-use file carrying the nonce that authorizes one daemon launch.
+pub const LAUNCH_GRANT_FILE: &str = "launch-grant";
+
+/// Environment variable through which the launcher presents the nonce.
+pub const LAUNCH_GRANT_ENV: &str = "PAM_LAUNCH_GRANT";
+
+/// Issues a single-use daemon launch grant under the runtime directory and
+/// returns the nonce the launcher must present via [`LAUNCH_GRANT_ENV`].
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the runtime directory or grant file
+/// cannot be created.
+pub fn issue_launch_grant(runtime_dir: &std::path::Path) -> std::io::Result<String> {
+    std::fs::create_dir_all(runtime_dir)?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let path = runtime_dir.join(LAUNCH_GRANT_FILE);
+    std::fs::write(&path, &nonce)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(nonce)
+}
+
+/// Consumes the pending launch grant when the presented nonce matches.
+///
+/// A match deletes the grant file so every grant is single-use; a mismatch
+/// leaves the pending grant untouched for the legitimate launcher.
+#[must_use]
+pub fn consume_launch_grant(runtime_dir: &std::path::Path, presented: Option<&str>) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let path = runtime_dir.join(LAUNCH_GRANT_FILE);
+    let Ok(expected) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if expected.trim() != presented {
+        return false;
+    }
+    std::fs::remove_file(&path).is_ok()
+}

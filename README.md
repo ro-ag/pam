@@ -59,10 +59,10 @@ PAM should help an agent answer:
 
 The product foundation, walking skeleton, durable project-continuity, local
 trust-and-policy, and desktop-control-center slices are implemented. The pinned
-Rust workspace builds the `pam` command and a dedicated Tauri `pam-gui` app
-entry point with client, daemon, status, brief, wait, result, evidence, caller,
-access, approval, network-diagnostics, audit-export, retention, and native GUI
-modes. The daemon durably schedules per-project work in SQLite,
+Rust workspace builds one `pam` binary with three modes — client (default,
+covering status, brief, wait, result, evidence, caller, access, approval,
+network-diagnostics, audit-export, and retention), `pam gui` for the embedded
+Tauri control center, and `pam daemon` for the IPC daemon. The daemon durably schedules per-project work in SQLite,
 recovers leases after restart, replays ordered events, retains exact
 content-addressed evidence, and obtains project context from `ptrack` only
 through its supported JSON CLI. The workspace also contains a tested,
@@ -234,7 +234,6 @@ For an unsigned local Apple Silicon build:
 
 ```sh
 npm --prefix frontend ci
-node tools/stage-desktop-sidecar.mjs aarch64-apple-darwin
 MACOSX_DEPLOYMENT_TARGET=12.0 \
   npm --prefix frontend run tauri -- build \
   --target aarch64-apple-darwin --bundles app

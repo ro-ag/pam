@@ -21,5 +21,5 @@ fn unavailable_transport_has_exact_recovery_action() {
 fn stale_endpoint_has_explicit_recovery_action() {
     let error = TransportError::new(TransportErrorKind::StaleEndpoint, "address in use");
 
-    assert_eq!(error.recovery_action(), Some("pam daemon --recover"));
+    assert_eq!(error.recovery_action(), Some("pam gui"));
 }

@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "pam"
-path = "src/main.rs"
-
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true

@@ -425,6 +425,7 @@ async fn status_crosses_transport_and_returns_an_immediate_result() {
     let _ = fs::remove_dir_all(runtime);
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_denies_unauthorized_callers_acknowledges_before_teardown_and_allows_restart() {
     let runtime = test_runtime("stop-round-trip");
@@ -445,6 +446,25 @@ async fn stop_denies_unauthorized_callers_acknowledges_before_teardown_and_allow
             CallerCredential::new("stop-denied-credential"),
             2,
         )
+        .await
+        .unwrap();
+    // daemon.stop is a baseline capability, so denial coverage needs an
+    // explicit deny grant.
+    store
+        .put_grant(PutGrant {
+            grant: Grant {
+                id: GrantId::from("stop-denied-grant"),
+                caller: CallerId::from("stop-denied-caller"),
+                project: ProjectId::from("project-round-trip"),
+                capability: CapabilityName::parse("daemon.stop").unwrap(),
+                resource: ResourceScope::Any,
+                effect: Effect::Deny,
+                approval: ApprovalRequirement::None,
+                expires_at_ms: None,
+                revoked_at_ms: None,
+            },
+            created_at_ms: 3,
+        })
         .await
         .unwrap();
     store.shutdown().await.unwrap();

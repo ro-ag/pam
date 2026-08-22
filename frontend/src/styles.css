@@ -1111,6 +1111,15 @@ body { color: var(--pam-text); background: var(--pam-chrome); }
 .fixture-badge { border-color: color-mix(in srgb, var(--pam-violet) 28%, transparent); color: var(--pam-violet); background: var(--pam-violet-soft); }
 .toolbar-actions { gap: 4px; }
 .toolbar-actions button span { top: -2px; right: -2px; min-width: 16px; color: var(--pam-on-accent); background: var(--pam-violet); }
+.inline-recovery {
+  border: 1px solid color-mix(in srgb, var(--pam-danger) 45%, transparent);
+  border-radius: 10px;
+  color: var(--pam-text);
+  background: var(--pam-danger-soft);
+  box-shadow: var(--pam-shadow-soft);
+}
+.inline-recovery svg { color: var(--pam-danger); }
+.inline-recovery button { color: var(--pam-ice); }
 .view-transition { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 .canvas { padding: 18px 22px 22px; scrollbar-color: color-mix(in srgb, var(--pam-ice) 30%, transparent) transparent; }
 .inline-recovery { top: calc(52px + var(--space-100)); }

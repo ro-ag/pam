@@ -354,9 +354,10 @@ fn baseline_decision(grants: &[Grant], name: &str) -> Decision {
 }
 
 #[test]
-fn baseline_read_capabilities_allow_without_grants() {
+fn baseline_capabilities_allow_without_grants() {
     assert_eq!(baseline_decision(&[], "daemon.status"), Decision::Allowed);
     assert_eq!(baseline_decision(&[], "project.current"), Decision::Allowed);
+    assert_eq!(baseline_decision(&[], "daemon.stop"), Decision::Allowed);
 }
 
 #[test]

@@ -1,0 +1,4 @@
+# Sign macOS dev binaries with a stable identity before running, so keychain
+# ACLs for the caller credential survive rebuilds (see tools/macos-dev-sign.sh).
+[target.aarch64-apple-darwin]
+runner = "tools/macos-dev-run.sh"

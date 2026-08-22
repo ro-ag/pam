@@ -1,10 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- Owner-supplied lifeguard tower silhouette (cropped ground line),
-       knocked out of the full-bleed coral semicircle. -->
-  <mask id="tower">
-    <rect width="1024" height="1024" fill="#fff"/>
-    <g transform="translate(6,354) scale(0.75)">
-      <path fill="#000" fill-rule="evenodd" d="
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 568" width="1320" height="568" role="img" aria-labelledby="title desc">
+  <title id="title">Lifeguard tower silhouette</title>
+  <desc id="desc">Black vector silhouette of a raised lifeguard tower with flag, railings, cross braces, stairs, and a low ground line. The surrounding background is transparent.</desc>
+  <path fill="#000000" fill-rule="evenodd" d="
       M10 524 L76 523 L117 525 L149 521 L240 522 L383 510 L433 509 L487 500 L486 487 H484 V464 L487 461 V364 L473 355 L472 343 L452 338 V323 L446 320 V315 H453 V277 L449 274 V266 L453 265 V218 L445 214 V209 L488 207 V144 L473 130 H471 L464 122 H462 L455 114 H453 L447 107 H445 L439 100 H437 L435 96 V79 L466 76 V0 H472 L473 8 L491 25 L497 37 L499 38 L500 55 L504 61 L503 64 H497 L488 59 H482 L473 62 V75 L782 46 L790 111 L807 112 L803 145 L802 147 L796 148 L729 153 L717 206 L784 205 V247 L836 246 L844 232 V229 L847 226 H857 L859 228 L930 391 V395 H925 L926 497 L929 499 L930 507 L952 509 L956 507 L968 506 L998 513 H1047 L1085 518 H1161 L1244 524 L1320 527 V568 H10 Z
       M562 474 V496 L570 498 L590 497 L609 493 L637 498 L686 500 H719 L753 497 L752 477 L649 441 Z
       M563 365 L564 385 L594 394 L622 405 L632 407 L637 410 H641 L646 413 H652 L656 410 L673 405 L680 401 L697 396 L752 374 L751 362 Z
@@ -46,9 +44,4 @@
       M481 276 L483 279 L488 280 V275 Z
       M860 327 V330 H862 V327 Z
   "/>
-      <rect x="-300" y="490" width="732" height="140" fill="#fff"/>
-      <rect x="940" y="490" width="700" height="140" fill="#fff"/>
-    </g>
-  </mask>
-  <path fill="#FC6349" mask="url(#tower)" d="M 42 780 A 470 470 0 0 1 982 780 Z"/>
 </svg>

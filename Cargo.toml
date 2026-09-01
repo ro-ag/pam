@@ -26,6 +26,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "ipc-transport"] }
 thiserror = "2"
 tempfile = "3"
+# CLI surface: derive-style argument parsing. Pure Rust (clap_builder,
+# anstyle, proc-macro derive) — no C compile step.
+clap = { version = "4", features = ["derive"] }
+# Request ids (`req_<ulid>`). Pure Rust; randomness via getrandom (syscall
+# bindings, no C compile step).
+ulid = "1"
 # process inspection for advisory caller identity; default features off keeps
 # the optional `multithread` (rayon) machinery out — only the `system`
 # component (processes) is needed. Pure Rust over libc/windows-sys FFI, no C

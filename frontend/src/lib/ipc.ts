@@ -126,25 +126,33 @@ export interface PendingApproval {
   requested_ts: string;
 }
 
+/** `pam_store::RequestState`, exactly — the store knows no other states. */
 export type RequestStateName =
-  "queued" | "running" | "done" | "refused" | "failed" | "cancelled";
+  "queued" | "running" | "waiting_approval" | "done" | "refused" | "failed";
 
+/** The five truth verdicts a finished request can report. */
+export type OutcomeName = "solved" | "changed" | "verified" | "unresolved" | "blocked";
+
+/** One `admin.activity.list` row; timestamps are unix seconds. */
 export interface ActivityRow {
   id: string;
   capability: string;
   repo: string;
   agent: string;
+  /** The request's args, parsed back to JSON by the daemon. */
+  args: unknown;
   state: RequestStateName;
   outcome: string | null;
-  created_ts: string;
-  updated_ts: string;
+  created_ts: number;
+  updated_ts: number;
 }
 
+/** One observed agent+repo pair; timestamps are unix seconds. */
 export interface CallerRow {
   agent: string;
   repo: string;
-  first_seen: string;
-  last_seen: string;
+  first_seen: number;
+  last_seen: number;
 }
 
 export function profileGet(): Promise<{ profile: Profile }> {

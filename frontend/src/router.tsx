@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { Shell } from "./components/shell/Shell";
 import { ActivityScreen } from "./screens/Activity";
+import { parseActivitySearch } from "./screens/activitySearch";
 import { ApprovalsScreen } from "./screens/Approvals";
 import { SettingsScreen } from "./screens/Settings";
 
@@ -31,6 +32,9 @@ const activityRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/activity",
   component: ActivityScreen,
+  // Filters live in the URL so a filtered view is shareable/restorable;
+  // junk params are dropped rather than refused.
+  validateSearch: parseActivitySearch,
 });
 
 const approvalsRoute = createRoute({

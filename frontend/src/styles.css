@@ -1,7 +1,81 @@
+/* PAM GUI stylesheet — the single CSS entry.
+ *
+ * Order matters: self-hosted fonts (CSP forbids remote), Tailwind, then the
+ * design system: primitive theme palettes (themes.css) and the semantic
+ * token layer (tokens.css). Components never add CSS files of their own —
+ * they compose semantic utilities via cn()/cva.
+ */
+
+/* Three voices + furniture, self-hosted via fontsource. */
+@import "@fontsource-variable/archivo";
+@import "@fontsource-variable/newsreader";
+@import "@fontsource-variable/newsreader/wght-italic.css";
+@import "@fontsource-variable/inter";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
 @import "tailwindcss";
 
-/* Placeholder theme block — the real design tokens (chrome/surface split,
-   type scale, palette) land with the design-tokens task. */
-@theme {
-  --font-sans: ui-sans-serif, system-ui, sans-serif;
+@import "./styles/themes.css" layer(base);
+@import "./styles/tokens.css";
+
+@layer base {
+  :root {
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-chrome);
+  }
+
+  ::selection {
+    color: var(--color-on-accent);
+    background: var(--color-accent-strong);
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  a:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* The chrome atmosphere: a barely-there radial wash so the dark water has
+     depth without competing with the lit panel. Gradients (not images) keep
+     the strict CSP happy. The one place raw color math is allowed. */
+  .atmosphere {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        120% 90% at 18% -10%,
+        color-mix(in oklab, var(--color-accent-strong) 16%, transparent),
+        transparent 60%
+      ),
+      radial-gradient(
+        90% 70% at 100% 110%,
+        color-mix(in oklab, var(--color-copper) 10%, transparent),
+        transparent 55%
+      );
+  }
 }

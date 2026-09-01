@@ -1,0 +1,130 @@
+/**
+ * PAM design tokens — the ONE layer that controls everything.
+ *
+ * Tailwind v4, CSS-first. This file maps the primitive `--pam-*` variables
+ * (defined per theme in `themes.css`) into Tailwind's semantic namespaces so
+ * real utilities exist for every role: `bg-chrome`, `text-ink-muted`,
+ * `shadow-float`, `font-voice`, `rounded-panel`, …
+ *
+ * Rules of the system (enforced by ESLint, not discipline):
+ *  - Components consume SEMANTIC utilities only. No hex, no arbitrary values
+ *    (`w-[347px]` is a lint error), no inline styles.
+ *  - Tailwind's stock palette, shadows, and radii are wiped below (`initial`)
+ *    — `bg-neutral-950` does not exist here. If a role is missing, it is
+ *    added HERE, once, for every theme.
+ *  - `@theme inline` keeps the var() reference live in the emitted utility,
+ *    so switching `data-theme` restyles the whole app with zero re-render.
+ */
+
+@theme inline {
+  /* ---------------------------------------------------------------- *
+   * Color — wipe the stock palette, then the PAM roles.
+   * ---------------------------------------------------------------- */
+  --color-*: initial;
+
+  /* three grounds */
+  --color-chrome: var(--pam-chrome);
+  --color-surface: var(--pam-surface);
+  --color-surface-raised: var(--pam-surface-raised);
+
+  /* ink (text) */
+  --color-ink: var(--pam-ink);
+  --color-ink-muted: var(--pam-ink-muted);
+  --color-ink-faint: var(--pam-ink-faint);
+
+  /* hairlines: line = borders on the surface, edge = rim of raised panels,
+     separator = the theme-independent warm copper signature */
+  --color-line: var(--pam-line);
+  --color-edge: var(--pam-edge);
+  --color-separator: var(--pam-separator);
+
+  /* accent ramp */
+  --color-accent: var(--pam-accent);
+  --color-accent-strong: var(--pam-accent-strong);
+  --color-accent-hover: var(--pam-accent-hover);
+  --color-accent-pressed: var(--pam-accent-pressed);
+  --color-accent-soft: var(--pam-accent-soft);
+  --color-on-accent: var(--pam-on-accent);
+
+  /* status */
+  --color-success: var(--pam-success);
+  --color-success-soft: var(--pam-success-soft);
+  --color-warning: var(--pam-warning);
+  --color-warning-soft: var(--pam-warning-soft);
+  --color-danger: var(--pam-danger);
+  --color-danger-soft: var(--pam-danger-soft);
+  --color-copper: var(--pam-copper);
+
+  /* the beacon — daemon state readable from the corner of the eye */
+  --color-beacon-green: var(--pam-success);
+  --color-beacon-amber: var(--pam-warning);
+  --color-beacon-red: var(--pam-danger);
+
+  /* refusals are beautiful — they get their own role, not a reused danger */
+  --color-refusal: var(--pam-danger);
+  --color-refusal-soft: var(--pam-danger-soft);
+
+  --color-focus: var(--pam-focus);
+  --color-overlay: var(--pam-overlay);
+
+  /* ---------------------------------------------------------------- *
+   * Spacing — Tailwind's numeric scale, density-aware (v1 multiplier).
+   * ---------------------------------------------------------------- */
+  --spacing: calc(0.25rem * var(--pam-density));
+
+  /* ---------------------------------------------------------------- *
+   * Elevation — exactly two shadows + a wiped stock scale.
+   * raise: cards standing on the panel. float: the panel over chrome.
+   * ---------------------------------------------------------------- */
+  --shadow-*: initial;
+  --shadow-raise: var(--pam-shadow-raise);
+  --shadow-float: var(--pam-shadow-float);
+}
+
+@theme {
+  /* ---------------------------------------------------------------- *
+   * Radius — four intentional stops, no stock scale.
+   * ---------------------------------------------------------------- */
+  --radius-*: initial;
+  --radius-control: 0.625rem; /* buttons, inputs, chips */
+  --radius-card: 0.875rem; /* raised cards */
+  --radius-panel: 1.25rem; /* the floating work panel */
+  --radius-pill: 9999px; /* badges, beacon dot */
+
+  /* ---------------------------------------------------------------- *
+   * Typography — three voices + furniture.
+   *   display: Archivo    — the tower's signage (numbers, heroes)
+   *   voice:   Newsreader — Pam speaks in serif, data never does
+   *   data:    Plex Mono  — evidence, hashes, paths, audit rows
+   *   sans:    Inter      — controls and labels; furniture, not personality
+   * ---------------------------------------------------------------- */
+  --font-*: initial;
+  --font-display: "Archivo Variable", "Inter Variable", sans-serif;
+  --font-voice: "Newsreader Variable", Georgia, serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-sans: "Inter Variable", system-ui, sans-serif;
+
+  /* fluid display steps on top of the stock text scale */
+  --text-hero: clamp(2.75rem, 1.9rem + 3.4vw, 4.5rem);
+  --text-hero--line-height: 1.02;
+  --text-hero--letter-spacing: -0.02em;
+  --text-title: clamp(1.375rem, 1.15rem + 0.9vw, 1.875rem);
+  --text-title--line-height: 1.15;
+
+  /* ---------------------------------------------------------------- *
+   * Motion — the beacon breathes; everything else earns its animation.
+   * ---------------------------------------------------------------- */
+  --animate-breathe: breathe 3.2s ease-in-out infinite;
+
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 0.55;
+      transform: scale(0.92);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+}

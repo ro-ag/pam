@@ -3,23 +3,41 @@
  *
  * THE CONTRACT
  * ------------
- * A theme is a token set, nothing more. Each `[data-theme="…"]` block below
- * redefines the SAME primitive `--pam-*` custom properties; `tokens.css` maps
- * them once into Tailwind's semantic namespace (`bg-surface`, `text-ink`,
- * `shadow-float`, …). Components consume semantic utilities ONLY — they never
- * read a `--pam-*` primitive and never know which theme is active. Adding a
- * theme = adding one block here, zero component edits.
+ * A theme is a token set, nothing more. Theming has TWO AXES, exactly like
+ * v1: `data-theme` picks the family (ventisquero | vina) and `data-mode`
+ * picks the variant (light | dark) — four palettes total. Each block below
+ * redefines the SAME primitive `--pam-*` custom properties; `tokens.css`
+ * maps them once into Tailwind's semantic namespace (`bg-surface`,
+ * `text-ink`, `shadow-float`, …). Components consume semantic utilities
+ * ONLY — they never read a `--pam-*` primitive and never know which
+ * theme or mode is active. Adding a theme = adding two blocks here,
+ * zero component edits.
  *
- * Both palettes are ported verbatim from pam-old `frontend/src/styles.css`
- * (`@layer tokens`, the block the owner kept because "they are pretty"):
+ * All four palettes are ported verbatim from pam-old
+ * `frontend/src/styles.css` (`@layer tokens` — the blocks the owner kept
+ * because "they are pretty"):
  *
- *   Ventisquero Mist  ← ventisquero/dark  (rock · ice · copper · mist)
- *   Viña del Mar Dawn ← vina/light        (dawn · violet · coral · surf)
+ *   Ventisquero light ("Mist")     ← :root[data-theme="ventisquero"][data-mode="light"]
+ *   Ventisquero dark  ("Bedrock")  ← [data-theme="ventisquero"][data-mode="dark"]
+ *   Viña del Mar light ("Dawn")    ← [data-theme="vina"][data-mode="light"]
+ *   Viña del Mar dark  ("Night")   ← [data-theme="vina"][data-mode="dark"]
+ *
+ * Three v2 adjustments, applied consistently to all four (documented per
+ * block): grounds reordered monotonically chrome → surface → raised (v1's
+ * raised sometimes sat below its surface), `--pam-ink-faint` derived as ink
+ * at ~50% alpha (v1 had no third ink step), and `--pam-warning-soft`
+ * synthesized to match each palette's soft-alpha pattern (v1 had none).
  *
  * The three grounds (lifeguard tower at night):
- *   --pam-chrome          the dark water — window + sidebar ground
+ *   --pam-chrome          the water — window + sidebar ground
  *   --pam-surface         the lit tower deck — the floating work panel
  *   --pam-surface-raised  cards standing on the deck
+ *
+ * DEFAULT: `initTheme()` stamps both attributes before first render, so the
+ * bare-`:root` fallback below only covers the pre-JS frame and tests: it is
+ * Ventisquero in the system's preferred mode (light block on `:root`, dark
+ * block repeated under `prefers-color-scheme: dark` — kept verbatim in sync
+ * with the attributed dark block).
  */
 
 /* The one deliberately theme-independent token: v1's warm copper hairline
@@ -30,11 +48,59 @@
 }
 
 /* ---------------------------------------------------------------- *
- * Ventisquero Mist — default. Glacial night: near-black blue chrome,
- * ice-cyan accent, copper warmth. (pam-old ventisquero, dark mode.)
+ * Ventisquero · light ("Mist") — icy pale water, warm paper deck,
+ * deep-teal ice accent. (pam-old ventisquero, light mode.)
  * ---------------------------------------------------------------- */
 :root,
-[data-theme="ventisquero-mist"] {
+[data-theme="ventisquero"][data-mode="light"] {
+  color-scheme: light;
+
+  /* grounds — v1's cool ice tint #eef3f5 becomes the receding water,
+     its bright paper #fdfcf9 floats as the panel; pure white is the one
+     added stop (v1 had no third ground) so raised cards still lift */
+  --pam-chrome: #eef3f5;
+  --pam-surface: #fdfcf9;
+  --pam-surface-raised: #ffffff;
+
+  /* ink */
+  --pam-ink: #0c1117;
+  --pam-ink-muted: #5c6b7a;
+  --pam-ink-faint: rgba(12, 17, 23, 0.52);
+
+  /* hairlines */
+  --pam-line: #d4dcdf;
+  --pam-edge: rgba(12, 17, 23, 0.08);
+
+  /* accent — the ice ramp reads dark-on-light, so text and fill share it */
+  --pam-accent: #1d7893;
+  --pam-accent-strong: #1d7893;
+  --pam-accent-hover: #2f9db8;
+  --pam-accent-pressed: #14586d;
+  --pam-accent-soft: #e3f9fd;
+  --pam-on-accent: #e3f9fd;
+
+  /* status + warmth */
+  --pam-copper: #b0612f;
+  --pam-success: #6fbf8e;
+  --pam-success-soft: #edf8f1;
+  --pam-warning: #cd7f45;
+  --pam-warning-soft: rgba(205, 127, 69, 0.12);
+  --pam-danger: #bf5238;
+  --pam-danger-soft: #fff1f1;
+
+  --pam-focus: #1d7893;
+  --pam-overlay: rgba(12, 17, 23, 0.36);
+
+  /* elevation — exactly two shadows in the whole system */
+  --pam-shadow-raise: 0 16px 48px rgba(42, 53, 66, 0.1), 0 2px 8px rgba(42, 53, 66, 0.06);
+  --pam-shadow-float: 0 24px 72px rgba(10, 5, 20, 0.18), 0 4px 14px rgba(10, 5, 20, 0.1);
+}
+
+/* ---------------------------------------------------------------- *
+ * Ventisquero · dark ("Bedrock") — glacial night: near-black blue
+ * chrome, ice-cyan accent, copper warmth. (pam-old ventisquero, dark.)
+ * ---------------------------------------------------------------- */
+[data-theme="ventisquero"][data-mode="dark"] {
   color-scheme: dark;
 
   /* grounds — #06090d / #0c1117 / #131a22 are the ventisquero night ramp;
@@ -72,16 +138,15 @@
   --pam-focus: #5cc4dc;
   --pam-overlay: rgba(6, 9, 13, 0.68);
 
-  /* elevation — exactly two shadows in the whole system */
   --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.24);
   --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.5), 0 4px 14px rgba(0, 0, 0, 0.32);
 }
 
 /* ---------------------------------------------------------------- *
- * Viña del Mar Dawn — light. Cream paper, magenta-violet accent,
+ * Viña del Mar · light ("Dawn") — cream paper, magenta-violet accent,
  * coral warmth. (pam-old vina, light mode.)
  * ---------------------------------------------------------------- */
-[data-theme="vina-del-mar-dawn"] {
+[data-theme="vina"][data-mode="light"] {
   color-scheme: light;
 
   /* grounds — cream page recedes, the panel floats brighter; pure white is
@@ -121,4 +186,93 @@
 
   --pam-shadow-raise: 0 16px 48px rgba(10, 5, 20, 0.1), 0 2px 8px rgba(10, 5, 20, 0.06);
   --pam-shadow-float: 0 24px 72px rgba(10, 5, 20, 0.18), 0 4px 14px rgba(10, 5, 20, 0.1);
+}
+
+/* ---------------------------------------------------------------- *
+ * Viña del Mar · dark ("Night") — deep violet night, electric fuchsia
+ * accent, coral warmth. (pam-old vina, dark mode.)
+ * ---------------------------------------------------------------- */
+[data-theme="vina"][data-mode="dark"] {
+  color-scheme: dark;
+
+  /* grounds — #0a0514 / #1a0b2e / #2d1b4e are the vina night ramp; v2
+     orders them chrome → surface → raised (one step lighter per ground) */
+  --pam-chrome: #0a0514;
+  --pam-surface: #1a0b2e;
+  --pam-surface-raised: #2d1b4e;
+
+  /* ink */
+  --pam-ink: #ffffff;
+  --pam-ink-muted: #e8e0f0;
+  --pam-ink-faint: rgba(255, 255, 255, 0.45);
+
+  /* hairlines */
+  --pam-line: #4a306d;
+  --pam-edge: rgba(255, 255, 255, 0.08);
+
+  /* accent — fuchsia #e879f9 for text/rings, magenta #a84595 fills */
+  --pam-accent: #e879f9;
+  --pam-accent-strong: #a84595;
+  --pam-accent-hover: #c456b0;
+  --pam-accent-pressed: #7c2d6b;
+  --pam-accent-soft: #3d2569;
+  --pam-on-accent: #fdefff;
+
+  /* status + warmth */
+  --pam-copper: #ff784b;
+  --pam-success: #0d9488;
+  --pam-success-soft: rgba(13, 148, 136, 0.18);
+  --pam-warning: #ff784b;
+  --pam-warning-soft: rgba(255, 120, 75, 0.16);
+  --pam-danger: #e25555;
+  --pam-danger-soft: rgba(226, 85, 85, 0.16);
+
+  --pam-focus: #e879f9;
+  --pam-overlay: rgba(10, 5, 20, 0.64);
+
+  --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.22);
+  --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.48), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+/* ---------------------------------------------------------------- *
+ * Bare-:root fallback, dark half: before initTheme() stamps the
+ * attributes, a system that prefers dark gets Ventisquero dark.
+ * KEEP VERBATIM IN SYNC with [data-theme="ventisquero"][data-mode="dark"].
+ * ---------------------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-mode]) {
+    color-scheme: dark;
+
+    --pam-chrome: #06090d;
+    --pam-surface: #0c1117;
+    --pam-surface-raised: #131a22;
+
+    --pam-ink: #eef3f5;
+    --pam-ink-muted: #b9c6cd;
+    --pam-ink-faint: rgba(238, 243, 245, 0.45);
+
+    --pam-line: #2a3542;
+    --pam-edge: rgba(238, 243, 245, 0.08);
+
+    --pam-accent: #5cc4dc;
+    --pam-accent-strong: #1d7893;
+    --pam-accent-hover: #2f9db8;
+    --pam-accent-pressed: #14586d;
+    --pam-accent-soft: #122a33;
+    --pam-on-accent: #e3f9fd;
+
+    --pam-copper: #cd7f45;
+    --pam-success: #6fbf8e;
+    --pam-success-soft: rgba(111, 191, 142, 0.16);
+    --pam-warning: #cd7f45;
+    --pam-warning-soft: rgba(205, 127, 69, 0.16);
+    --pam-danger: #d4634f;
+    --pam-danger-soft: rgba(212, 99, 79, 0.16);
+
+    --pam-focus: #5cc4dc;
+    --pam-overlay: rgba(6, 9, 13, 0.68);
+
+    --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.24);
+    --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.5), 0 4px 14px rgba(0, 0, 0, 0.32);
+  }
 }

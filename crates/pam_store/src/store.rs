@@ -415,6 +415,24 @@ impl Store {
         Ok(())
     }
 
+    /// Counts the in-flight requests (state `queued`, `running`, or
+    /// `waiting_approval`). Feeds the `status` capability's
+    /// `active_requests` figure.
+    pub async fn count_inflight(&self) -> Result<i64, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM request
+                 WHERE state IN ('queued','running','waiting_approval')",
+                (),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(0),
+        }
+    }
+
     /// Appends one audit row. Audit rows are never updated or deleted by
     /// normal operations.
     pub async fn append_audit(

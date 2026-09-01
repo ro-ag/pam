@@ -1,0 +1,921 @@
+//! Pipeline assembly: the request path from `pam.sock` to a response.
+//!
+//! # Request path
+//!
+//! ```text
+//! transport → classify → admit (dedupe + row insert) → policy gate
+//!           → lane placement → executor → audit → response
+//! ```
+//!
+//! [`run_daemon`] wires the existing services (transport, policy gate,
+//! queue manager, store) into long-lived tokio tasks:
+//!
+//! - a **dispatcher** that spawns one pipeline task per incoming
+//!   request ([`Pipeline::handle`]);
+//! - an **executor loop** that leases queued work from the lanes and
+//!   runs it through [`BuiltinCapability`] dispatch;
+//! - the queue's **lease reaper**.
+//!
+//! # Ordering constraints
+//!
+//! The gate needs the `request` row to exist (audit foreign key) but
+//! must run before anything is placed in a lane, and dedupe must run
+//! before the row insert. [`QueueManager::admit`] therefore does
+//! dedupe + insert atomically, the gate runs next, and only an allowed
+//! request reaches [`QueueManager::place_in_lane`]. A crash between
+//! admit and placement can resurrect a not-yet-gated `queued` row on
+//! restart; crash recovery (task #12) owns that window.
+//!
+//! # Replies and attachment
+//!
+//! For `wait: true` the pipeline task parks on the [`CompletionRouter`]
+//! until the executor finishes the request — duplicate callers attached
+//! to the same request register with the same router entry and every
+//! waiter receives the terminal [`Response`] (fan-out). The router keeps
+//! each terminal response for a short grace period so an attacher that
+//! registers just after completion still gets its answer instead of
+//! hanging to its deadline. For `wait: false` the pipeline answers with
+//! a [`Response::Ticket`] immediately; results reach the store and the
+//! event stream only.
+//!
+//! # Deadlines
+//!
+//! The envelope's `deadline_ms` is enforced at the pipeline level for
+//! waiting callers: past it, the request is cancelled through the queue
+//! (the executor observes the signal and records the terminal state on
+//! its own path), a [`ACTION_DEADLINE_REFUSAL`] audit row is written,
+//! and the caller gets a [`CAUSE_DEADLINE_EXCEEDED`] refusal. Executor-side
+//! runaways are reaped by the queue's lease reaper independently.
+//!
+//! # Audit rows
+//!
+//! Every terminal path introduced here writes exactly one audit row for
+//! its terminal state:
+//!
+//! - gate refusal (unknown capability, ungranted capability) and the
+//!   approval-required stub → [`ACTION_GATE_REFUSAL`], decision
+//!   `refuse`, actor `policy`;
+//! - execution success → [`ACTION_EXECUTE`], decision `allow`, actor
+//!   `system`;
+//! - execution failure → [`ACTION_EXECUTE`], decision `refuse`, actor
+//!   `system`;
+//! - cancelled execution → the queue's `cancel` action, decision `deny`,
+//!   actor `system` (queued-side cancellation is audited by the queue
+//!   itself);
+//! - deadline refusal → [`ACTION_DEADLINE_REFUSAL`], decision `timeout`,
+//!   actor `system`, *in addition to* the cancellation row of whichever
+//!   path tears the request down — the deadline row records the refusal
+//!   sent to the caller, the cancellation row records the terminal
+//!   state.
+//!
+//! Store failures on these bookkeeping writes are swallowed (`let _`)
+//! for now: without the tracing setup (a later task) there is nowhere
+//! legible to report them, and the caller still gets its response.
+//!
+//! # Approval stub
+//!
+//! [`GateDecision::RequireApproval`] currently refuses with cause
+//! [`CAUSE_APPROVAL_REQUIRED`] and a GUI recovery line. The approval
+//! service (task #10) replaces that arm with a real
+//! `waiting_approval` pause; nothing else in the pipeline changes.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use pam_proto::{Envelope, Event, Response};
+use pam_store::{Actor, Decision, RequestState, Store, StoreError};
+use thiserror::Error;
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
+use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
+use crate::queue::{
+    AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
+};
+use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
+use crate::transport::{EventPublisher, IncomingRequest, Transport, TransportError};
+
+/// Refusal cause when a waiting caller's `deadline_ms` elapsed.
+pub const CAUSE_DEADLINE_EXCEEDED: &str = "deadline_exceeded";
+
+/// Refusal cause for the approval-required stub (see the module docs).
+pub const CAUSE_APPROVAL_REQUIRED: &str = "approval_required";
+
+/// Refusal cause (and `request.outcome`) when a capability ran and
+/// failed.
+pub const CAUSE_EXECUTION_FAILED: &str = "execution_failed";
+
+/// Refusal cause when the daemon's own bookkeeping failed mid-pipeline.
+pub const CAUSE_INTERNAL_ERROR: &str = "internal_error";
+
+/// `audit.action` for a refusal decided at the policy gate.
+pub const ACTION_GATE_REFUSAL: &str = "gate_refusal";
+
+/// `audit.action` for an execution outcome (success or failure).
+pub const ACTION_EXECUTE: &str = "execute";
+
+/// `audit.action` for a deadline refusal sent to a waiting caller.
+pub const ACTION_DEADLINE_REFUSAL: &str = "deadline_refusal";
+
+/// GUI recovery line for [`CAUSE_APPROVAL_REQUIRED`] refusals.
+const RECOVERY_APPROVAL: &str = "Approve this operation in the PAM GUI.";
+
+/// Recovery line for [`CAUSE_DEADLINE_EXCEEDED`] refusals.
+const RECOVERY_DEADLINE: &str =
+    "Retry with a larger deadline, or without wait to poll the ticket instead.";
+
+/// Recovery line for [`CAUSE_EXECUTION_FAILED`] refusals.
+const RECOVERY_FAILED: &str = "Inspect the failure in the PAM GUI activity view, then retry.";
+
+/// Recovery line for [`CAUSE_INTERNAL_ERROR`] refusals.
+const RECOVERY_INTERNAL: &str = "Retry; if it persists, restart the daemon from the PAM GUI.";
+
+/// How long the completion router remembers a terminal response, to
+/// close the attach-after-finish race.
+const FINISHED_TTL: Duration = Duration::from_mins(1);
+
+/// How often the lease reaper sweeps.
+const REAP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Fallback poll interval of the executor loop; the loop is normally
+/// woken by placement/completion notifications, the tick backstops
+/// reaper-freed lanes.
+const EXECUTOR_TICK: Duration = Duration::from_millis(100);
+
+/// Capacity of the transport → dispatcher channel.
+const INCOMING_CAPACITY: usize = 256;
+
+/// Why the daemon could not be assembled.
+#[derive(Debug, Error)]
+pub enum DaemonError {
+    /// The runtime directory could not be prepared.
+    #[error(transparent)]
+    RuntimeDir(#[from] RuntimeDirError),
+    /// The transport sockets could not be bound.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// The store could not be opened or queried.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The policy gate could not be constructed.
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    /// The queue could not be rebuilt.
+    #[error(transparent)]
+    Queue(#[from] QueueError),
+}
+
+/// Routes each request's single terminal [`Response`] to every pipeline
+/// task waiting for it (the requester plus any attached duplicates).
+#[derive(Debug, Clone, Default)]
+pub struct CompletionRouter {
+    inner: Arc<Mutex<RouterInner>>,
+}
+
+#[derive(Debug, Default)]
+struct RouterInner {
+    /// request id → the waiters to answer on completion.
+    waiting: HashMap<String, Vec<oneshot::Sender<Response>>>,
+    /// Recently finished requests, kept for [`FINISHED_TTL`] so a waiter
+    /// registering just after the finish still gets its answer.
+    finished: HashMap<String, (Instant, Response)>,
+}
+
+/// What [`CompletionRouter::register`] handed back.
+#[derive(Debug)]
+pub enum Registration {
+    /// The request already finished; here is its response.
+    Ready(Box<Response>),
+    /// The request is still in flight; the receiver resolves with its
+    /// terminal response.
+    Pending(oneshot::Receiver<Response>),
+}
+
+impl CompletionRouter {
+    /// An empty router.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers interest in `request_id`'s terminal response.
+    pub async fn register(&self, request_id: &str) -> Registration {
+        let mut inner = self.inner.lock().await;
+        if let Some((_, response)) = inner.finished.get(request_id) {
+            return Registration::Ready(Box::new(response.clone()));
+        }
+        let (tx, rx) = oneshot::channel();
+        inner
+            .waiting
+            .entry(request_id.to_owned())
+            .or_default()
+            .push(tx);
+        Registration::Pending(rx)
+    }
+
+    /// Delivers `response` to every waiter registered for `request_id`
+    /// and remembers it for late registrants (see [`FINISHED_TTL`]).
+    pub async fn finish(&self, request_id: &str, response: Response) {
+        let mut inner = self.inner.lock().await;
+        if let Some(waiters) = inner.waiting.remove(request_id) {
+            for waiter in waiters {
+                // A dropped receiver (deadline elapsed) is fine.
+                let _ = waiter.send(response.clone());
+            }
+        }
+        let now = Instant::now();
+        inner
+            .finished
+            .insert(request_id.to_owned(), (now, response));
+        inner
+            .finished
+            .retain(|_, (finished_at, _)| now.duration_since(*finished_at) < FINISHED_TTL);
+    }
+}
+
+/// A running daemon: sockets bound, pipeline tasks pumping.
+#[derive(Debug)]
+pub struct DaemonHandle {
+    dirs: RuntimeDir,
+    store: Arc<Store>,
+    transport: Transport,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl DaemonHandle {
+    /// The runtime directory (socket paths) this daemon serves on.
+    #[must_use]
+    pub fn runtime_dir(&self) -> &RuntimeDir {
+        &self.dirs
+    }
+
+    /// A handle to the daemon's store, for inspection.
+    #[must_use]
+    pub fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
+    }
+
+    /// Stops the transport and joins every daemon task.
+    ///
+    /// Flip the shutdown watch handed to [`run_daemon`] first — the
+    /// executor loop and reaper exit on it; the dispatcher also exits
+    /// when the transport closes the incoming channel.
+    pub async fn shutdown(self) {
+        self.transport.shutdown().await;
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Assembles and starts the daemon.
+///
+/// Binds the transport under `<base>/run`, opens the store at
+/// `<base>/state.sqlite3` (constructing the policy gate from the profile
+/// persisted there), rebuilds the queue lanes, and spawns the
+/// dispatcher, executor loop, and lease reaper. `base_dir` defaults to
+/// `~/.pam`. Flip `shutdown` to stop the background tasks, then await
+/// [`DaemonHandle::shutdown`].
+pub async fn run_daemon(
+    base_dir: Option<PathBuf>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<DaemonHandle, DaemonError> {
+    let base = match base_dir {
+        Some(base) => base,
+        None => std::env::home_dir()
+            .ok_or(RuntimeDirError::HomeNotFound)?
+            .join(".pam"),
+    };
+    let dirs = RuntimeDir::at_base(&base)?;
+    let store = Arc::new(Store::open(&base.join("state.sqlite3")).await?);
+    let gate = PolicyGate::new(Arc::clone(&store)).await?;
+    let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
+    queue.rebuild_from_store().await?;
+
+    let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CAPACITY);
+    let transport = Transport::bind(&dirs, incoming_tx).await?;
+
+    let pipeline = Arc::new(Pipeline {
+        store: Arc::clone(&store),
+        gate,
+        queue: Arc::clone(&queue),
+        events: transport.event_publisher(),
+        router: CompletionRouter::new(),
+        work: Notify::new(),
+        started_at: Instant::now(),
+    });
+
+    let tasks = vec![
+        Arc::clone(&queue).run_reaper(REAP_INTERVAL, shutdown.clone()),
+        tokio::spawn(dispatch_loop(
+            Arc::clone(&pipeline),
+            incoming_rx,
+            shutdown.clone(),
+        )),
+        tokio::spawn(executor_loop(pipeline, shutdown)),
+    ];
+
+    Ok(DaemonHandle {
+        dirs,
+        store,
+        transport,
+        tasks,
+    })
+}
+
+/// The services one request flows through, shared by every pipeline
+/// task.
+struct Pipeline {
+    store: Arc<Store>,
+    gate: PolicyGate,
+    queue: Arc<QueueManager>,
+    events: EventPublisher,
+    router: CompletionRouter,
+    /// Kicked on lane placement and execution completion; wakes the
+    /// executor loop.
+    work: Notify,
+    started_at: Instant,
+}
+
+/// Resolves when the shutdown flag flips to `true` (a dropped sender
+/// counts as shutdown).
+async fn signalled(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+/// Receives transport requests and spawns one pipeline task each.
+async fn dispatch_loop(
+    pipeline: Arc<Pipeline>,
+    mut incoming: mpsc::Receiver<IncomingRequest>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let request = tokio::select! {
+            () = signalled(&mut shutdown) => break,
+            request = incoming.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let pipeline = Arc::clone(&pipeline);
+        tokio::spawn(async move {
+            pipeline.handle(request.envelope, request.reply).await;
+        });
+    }
+}
+
+/// Leases ready work off the lanes and spawns an execution task per
+/// lease. Woken by [`Pipeline::work`]; the tick backstops lanes freed by
+/// the reaper.
+async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(EXECUTOR_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        for repo in pipeline.queue.ready_repos().await {
+            if let Ok(Some(work)) = pipeline.queue.take_next(&repo).await {
+                let pipeline = Arc::clone(&pipeline);
+                tokio::spawn(async move {
+                    pipeline.execute_leased(work).await;
+                });
+            }
+        }
+        tokio::select! {
+            () = signalled(&mut shutdown) => break,
+            () = pipeline.work.notified() => {}
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
+impl Pipeline {
+    /// Runs one request through classify → admit → gate → queue/execute
+    /// and answers `reply` with its single [`Response`].
+    async fn handle(&self, envelope: Envelope, reply: oneshot::Sender<Response>) {
+        let id = envelope.id.clone();
+
+        // Unknown capability: no class, no dedupe — record the request,
+        // let the gate produce the refusal.
+        let Some(class) = classify(&envelope.capability) else {
+            let response = self.refuse_unadmitted(&envelope).await;
+            let _ = reply.send(response);
+            return;
+        };
+
+        let Ok(admitted) = self.queue.admit(&envelope, class).await else {
+            let _ = reply.send(internal_refusal(&id));
+            return;
+        };
+
+        match admitted {
+            AdmitOutcome::Attached {
+                existing_request_id,
+            } => {
+                if envelope.wait {
+                    let registration = self.router.register(&existing_request_id).await;
+                    let response = await_registration(registration, envelope.deadline_ms)
+                        .await
+                        .unwrap_or_else(|timed_out| attach_refusal(&id, timed_out));
+                    let _ = reply.send(response);
+                } else {
+                    let _ = reply.send(Response::Ticket {
+                        id,
+                        ticket: existing_request_id,
+                        position: 0,
+                    });
+                }
+            }
+            AdmitOutcome::Bypass => {
+                if envelope.wait {
+                    let response = self.execute_bypass(&envelope).await;
+                    let _ = reply.send(response);
+                } else {
+                    let _ = reply.send(Response::Ticket {
+                        id: id.clone(),
+                        ticket: id,
+                        position: 0,
+                    });
+                    // Result reaches the store and event stream only.
+                    let _ = self.execute_bypass(&envelope).await;
+                }
+            }
+            AdmitOutcome::Admitted => {
+                let response = self.gate_and_place(&envelope).await;
+                let _ = reply.send(response);
+            }
+        }
+    }
+
+    /// The laned path after admission: gate, place, and (for waiting
+    /// callers) park on the completion router under the deadline.
+    async fn gate_and_place(&self, envelope: &Envelope) -> Response {
+        let id = &envelope.id;
+        let Ok(decision) = self.gate.evaluate(id, &envelope.capability).await else {
+            // Keep the not-yet-placed row out of the lanes forever.
+            let _ = self
+                .store
+                .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
+                .await;
+            return internal_refusal(id);
+        };
+        match decision {
+            GateDecision::Refuse {
+                cause,
+                detail,
+                recovery,
+            } => self.refuse(id, cause, detail, recovery).await,
+            GateDecision::RequireApproval { reason } => {
+                // Approval service is task #10; until it lands the gate's
+                // pause signal is answered with a legible refusal.
+                self.refuse(
+                    id,
+                    CAUSE_APPROVAL_REQUIRED.to_owned(),
+                    reason,
+                    RECOVERY_APPROVAL.to_owned(),
+                )
+                .await
+            }
+            GateDecision::Allow { .. } => {
+                // Register before placement so the completion cannot slip
+                // between the two.
+                let registration = self.router.register(id).await;
+                let position = self
+                    .queue
+                    .place_in_lane(id, &envelope.caller.repo, envelope.deadline_ms)
+                    .await;
+                let _ = self.events.publish(id, Event::Queued).await;
+                self.work.notify_one();
+                if envelope.wait {
+                    match await_registration(registration, envelope.deadline_ms).await {
+                        Ok(response) => response,
+                        Err(true) => self.deadline_refusal(envelope).await,
+                        Err(false) => internal_refusal(id),
+                    }
+                } else {
+                    Response::Ticket {
+                        id: id.clone(),
+                        ticket: id.clone(),
+                        position: u64::try_from(position).unwrap_or(u64::MAX),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Executes a read-only bypass request inline, under the envelope's
+    /// deadline, and records its terminal state.
+    async fn execute_bypass(&self, envelope: &Envelope) -> Response {
+        let id = &envelope.id;
+        let _ = self.events.publish(id, Event::Started).await;
+        // No lease exists for a bypass; the sender is held so the cancel
+        // signal simply never fires. The deadline timeout below dropping
+        // the future is the cancellation mechanism on this path.
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let Some(capability) = BuiltinCapability::from_name(&envelope.capability) else {
+            return self
+                .fail_bypass(id, "capability classified but not dispatchable")
+                .await;
+        };
+        let ctx = self.exec_context(id.clone(), envelope.args.clone(), cancel);
+        match timeout(
+            Duration::from_millis(envelope.deadline_ms),
+            capability.execute(ctx),
+        )
+        .await
+        {
+            Ok(Ok(output)) => {
+                let _ = self
+                    .store
+                    .update_request_state(id, RequestState::Done, Some(outcome_str(output.outcome)))
+                    .await;
+                self.audit_execute_success(id, &envelope.capability, output.outcome)
+                    .await;
+                let _ = self.events.publish(id, Event::Done).await;
+                Response::Result {
+                    id: id.clone(),
+                    outcome: output.outcome,
+                    body: output.body,
+                    evidence: output.evidence,
+                }
+            }
+            Ok(Err(CapabilityFailure::Cancelled)) => {
+                // Unreachable without a lease, but handled legibly.
+                let _ = self
+                    .store
+                    .update_request_state(id, RequestState::Failed, Some(CAUSE_CANCELLED))
+                    .await;
+                self.audit_cancelled(id).await;
+                let _ = self.events.publish(id, Event::Refused).await;
+                cancelled_refusal(id)
+            }
+            Ok(Err(CapabilityFailure::Failed { detail })) => self.fail_bypass(id, &detail).await,
+            Err(_elapsed) => {
+                let _ = self
+                    .store
+                    .update_request_state(id, RequestState::Failed, Some(CAUSE_DEADLINE_EXCEEDED))
+                    .await;
+                self.audit_deadline(id, envelope.deadline_ms).await;
+                let _ = self.events.publish(id, Event::Refused).await;
+                deadline_refusal_response(id, envelope.deadline_ms)
+            }
+        }
+    }
+
+    /// Executes one leased (laned) request and records its terminal
+    /// state, audit row, events, and router completion.
+    async fn execute_leased(&self, work: LeasedWork) {
+        let LeasedWork {
+            request_id: id,
+            cancel,
+            ..
+        } = work;
+        let Ok(Some(row)) = self.store.get_request(&id).await else {
+            // A vanished row is unanswerable; free the lane and move on.
+            let _ = self
+                .queue
+                .complete(&id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
+                .await;
+            self.work.notify_one();
+            return;
+        };
+        let _ = self.events.publish(&id, Event::Started).await;
+
+        let result = match BuiltinCapability::from_name(&row.capability) {
+            Some(capability) => {
+                let args = serde_json::from_str(&row.args_json).unwrap_or(serde_json::Value::Null);
+                let ctx = self.exec_context(id.clone(), args, cancel);
+                capability.execute(ctx).await
+            }
+            // The gate classified it, so this only fires on registry
+            // drift between classify() and from_name().
+            None => Err(CapabilityFailure::Failed {
+                detail: "capability classified but not dispatchable".to_owned(),
+            }),
+        };
+
+        match result {
+            Ok(output) => {
+                let terminal = self
+                    .queue
+                    .complete(&id, RequestState::Done, Some(outcome_str(output.outcome)))
+                    .await;
+                if matches!(terminal, Ok(true)) {
+                    self.audit_execute_success(&id, &row.capability, output.outcome)
+                        .await;
+                    let _ = self.events.publish(&id, Event::Done).await;
+                    self.router
+                        .finish(
+                            &id,
+                            Response::Result {
+                                id: id.clone(),
+                                outcome: output.outcome,
+                                body: output.body,
+                                evidence: output.evidence,
+                            },
+                        )
+                        .await;
+                } else {
+                    // The lease was reaped first: the reaper wrote the
+                    // terminal row and audit; release any waiters.
+                    self.finish_reaped(&id).await;
+                }
+            }
+            Err(CapabilityFailure::Cancelled) => {
+                let terminal = self
+                    .queue
+                    .complete(&id, RequestState::Failed, Some(CAUSE_CANCELLED))
+                    .await;
+                if matches!(terminal, Ok(true)) {
+                    self.audit_cancelled(&id).await;
+                    let _ = self.events.publish(&id, Event::Refused).await;
+                    self.router.finish(&id, cancelled_refusal(&id)).await;
+                } else {
+                    self.finish_reaped(&id).await;
+                }
+            }
+            Err(CapabilityFailure::Failed { detail }) => {
+                let terminal = self
+                    .queue
+                    .complete(&id, RequestState::Failed, Some(CAUSE_EXECUTION_FAILED))
+                    .await;
+                if matches!(terminal, Ok(true)) {
+                    self.audit_execute_failure(&id, &row.capability, &detail)
+                        .await;
+                    let _ = self.events.publish(&id, Event::Refused).await;
+                    self.router.finish(&id, failure_refusal(&id, detail)).await;
+                } else {
+                    self.finish_reaped(&id).await;
+                }
+            }
+        }
+        // The lane is free again.
+        self.work.notify_one();
+    }
+
+    /// Builds the execution context for one request.
+    fn exec_context(
+        &self,
+        request_id: String,
+        args: serde_json::Value,
+        cancel: watch::Receiver<bool>,
+    ) -> ExecContext {
+        ExecContext {
+            request_id,
+            args,
+            cancel,
+            events: self.events.clone(),
+            store: Arc::clone(&self.store),
+            queue: Arc::clone(&self.queue),
+            router: self.router.clone(),
+            started_at: self.started_at,
+        }
+    }
+
+    /// Inserts the row for a request that never passed admission (an
+    /// unknown capability) and refuses it through the gate.
+    async fn refuse_unadmitted(&self, envelope: &Envelope) -> Response {
+        let inserted = self
+            .store
+            .insert_request(
+                &envelope.id,
+                &envelope.capability,
+                &envelope.caller.repo,
+                &envelope.caller.agent,
+                &envelope.args.to_string(),
+                envelope.idempotency_key.as_deref(),
+            )
+            .await;
+        if inserted.is_err() {
+            return internal_refusal(&envelope.id);
+        }
+        match self.gate.evaluate(&envelope.id, &envelope.capability).await {
+            Ok(GateDecision::Refuse {
+                cause,
+                detail,
+                recovery,
+            }) => self.refuse(&envelope.id, cause, detail, recovery).await,
+            // classify() said None, so the gate must refuse; anything
+            // else is an internal inconsistency.
+            _ => internal_refusal(&envelope.id),
+        }
+    }
+
+    /// Marks a request refused, writes the gate-refusal audit row,
+    /// publishes the `refused` event, and builds the refusal response.
+    async fn refuse(&self, id: &str, cause: String, detail: String, recovery: String) -> Response {
+        let _ = self
+            .store
+            .update_request_state(id, RequestState::Refused, Some(&cause))
+            .await;
+        let audit_detail = serde_json::json!({
+            "cause": cause,
+            "detail": detail,
+            "profile": self.gate.profile().as_str(),
+        })
+        .to_string();
+        let _ = self
+            .store
+            .append_audit(
+                id,
+                ACTION_GATE_REFUSAL,
+                Decision::Refuse,
+                Actor::Policy,
+                Some(&audit_detail),
+            )
+            .await;
+        let _ = self.events.publish(id, Event::Refused).await;
+        Response::Refusal {
+            id: id.to_owned(),
+            cause,
+            detail,
+            recovery,
+        }
+    }
+
+    /// Terminal handling for a bypass execution failure.
+    async fn fail_bypass(&self, id: &str, detail: &str) -> Response {
+        let _ = self
+            .store
+            .update_request_state(id, RequestState::Failed, Some(CAUSE_EXECUTION_FAILED))
+            .await;
+        self.audit_execute_failure(id, "", detail).await;
+        let _ = self.events.publish(id, Event::Refused).await;
+        failure_refusal(id, detail.to_owned())
+    }
+
+    /// Tears a deadline-expired waiting request down: cancel through the
+    /// queue (whichever side holds it records the terminal state), audit
+    /// the refusal, tell subscribers, answer the caller.
+    async fn deadline_refusal(&self, envelope: &Envelope) -> Response {
+        let id = &envelope.id;
+        let _ = self.queue.cancel(id, Actor::System).await;
+        self.audit_deadline(id, envelope.deadline_ms).await;
+        let _ = self.events.publish(id, Event::Refused).await;
+        deadline_refusal_response(id, envelope.deadline_ms)
+    }
+
+    /// Releases waiters of a request whose lease was reaped mid-flight
+    /// (the reaper already wrote the terminal row and audit).
+    async fn finish_reaped(&self, id: &str) {
+        let _ = self.events.publish(id, Event::Refused).await;
+        self.router
+            .finish(
+                id,
+                Response::Refusal {
+                    id: id.to_owned(),
+                    cause: CAUSE_LEASE_EXPIRED.to_owned(),
+                    detail: format!("request {id} outlived its lease and was reaped"),
+                    recovery: RECOVERY_DEADLINE.to_owned(),
+                },
+            )
+            .await;
+    }
+
+    /// Audit row for a successful execution.
+    async fn audit_execute_success(&self, id: &str, capability: &str, outcome: pam_proto::Outcome) {
+        let detail = serde_json::json!({
+            "capability": capability,
+            "outcome": outcome_str(outcome),
+        })
+        .to_string();
+        let _ = self
+            .store
+            .append_audit(
+                id,
+                ACTION_EXECUTE,
+                Decision::Allow,
+                Actor::System,
+                Some(&detail),
+            )
+            .await;
+    }
+
+    /// Audit row for a failed execution.
+    async fn audit_execute_failure(&self, id: &str, capability: &str, detail: &str) {
+        let audit_detail = serde_json::json!({
+            "capability": capability,
+            "detail": detail,
+        })
+        .to_string();
+        let _ = self
+            .store
+            .append_audit(
+                id,
+                ACTION_EXECUTE,
+                Decision::Refuse,
+                Actor::System,
+                Some(&audit_detail),
+            )
+            .await;
+    }
+
+    /// Audit row for an execution the cancel signal stopped (mirrors the
+    /// queue's queued-side cancellation row).
+    async fn audit_cancelled(&self, id: &str) {
+        let detail = serde_json::json!({ "actor": Actor::System.as_str() }).to_string();
+        let _ = self
+            .store
+            .append_audit(
+                id,
+                crate::queue::ACTION_CANCEL,
+                Decision::Deny,
+                Actor::System,
+                Some(&detail),
+            )
+            .await;
+    }
+
+    /// Audit row for a deadline refusal sent to a waiting caller.
+    async fn audit_deadline(&self, id: &str, deadline_ms: u64) {
+        let detail = serde_json::json!({ "deadline_ms": deadline_ms }).to_string();
+        let _ = self
+            .store
+            .append_audit(
+                id,
+                ACTION_DEADLINE_REFUSAL,
+                Decision::Timeout,
+                Actor::System,
+                Some(&detail),
+            )
+            .await;
+    }
+}
+
+/// Awaits a router registration under `deadline_ms`. `Err(true)` means
+/// the deadline elapsed; `Err(false)` means the router dropped the
+/// waiter without answering (internal failure).
+async fn await_registration(
+    registration: Registration,
+    deadline_ms: u64,
+) -> Result<Response, bool> {
+    match registration {
+        Registration::Ready(response) => Ok(*response),
+        Registration::Pending(rx) => match timeout(Duration::from_millis(deadline_ms), rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(false),
+            Err(_elapsed) => Err(true),
+        },
+    }
+}
+
+/// The refusal an *attached* caller gets when its own deadline elapses
+/// (`timed_out`) or the router fails. The attached caller has no request
+/// row of its own, so nothing is audited and the in-flight original is
+/// left alone — other callers may still be waiting on it.
+fn attach_refusal(id: &str, timed_out: bool) -> Response {
+    if timed_out {
+        Response::Refusal {
+            id: id.to_owned(),
+            cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
+            detail: "the in-flight request this call attached to did not finish \
+                     within the deadline"
+                .to_owned(),
+            recovery: RECOVERY_DEADLINE.to_owned(),
+        }
+    } else {
+        internal_refusal(id)
+    }
+}
+
+/// Refusal for a daemon-side bookkeeping failure.
+fn internal_refusal(id: &str) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_INTERNAL_ERROR.to_owned(),
+        detail: "the daemon could not record the request".to_owned(),
+        recovery: RECOVERY_INTERNAL.to_owned(),
+    }
+}
+
+/// Refusal for a request that was cancelled.
+fn cancelled_refusal(id: &str) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_CANCELLED.to_owned(),
+        detail: format!("request {id} was cancelled"),
+        recovery: "Re-run the pam command to start a fresh request.".to_owned(),
+    }
+}
+
+/// Refusal for a capability that ran and failed.
+fn failure_refusal(id: &str, detail: String) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_EXECUTION_FAILED.to_owned(),
+        detail,
+        recovery: RECOVERY_FAILED.to_owned(),
+    }
+}
+
+/// Refusal for an elapsed deadline.
+fn deadline_refusal_response(id: &str, deadline_ms: u64) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
+        detail: format!("request exceeded its {deadline_ms} ms deadline"),
+        recovery: RECOVERY_DEADLINE.to_owned(),
+    }
+}

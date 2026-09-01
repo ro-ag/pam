@@ -91,6 +91,14 @@ pub struct EventPublisher {
 }
 
 impl EventPublisher {
+    /// A publisher over a bare channel, for in-crate unit tests that
+    /// need to observe published events without binding real sockets.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> (Self, mpsc::Receiver<(String, Event)>) {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        (Self { tx }, rx)
+    }
+
     /// Publishes `event` under the topic `request_id`, so subscribers to
     /// that request id receive it.
     pub async fn publish(&self, request_id: &str, event: Event) -> Result<(), PublishError> {

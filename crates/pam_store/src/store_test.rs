@@ -332,3 +332,32 @@ async fn grant_table_insert_works_despite_keyword_name() {
     assert_eq!(row.get::<String>(1).unwrap(), "global");
     assert_eq!(row.get::<Option<i64>>(2).unwrap(), None);
 }
+
+#[tokio::test]
+async fn count_inflight_counts_only_non_terminal_states() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert_eq!(store.count_inflight().await.unwrap(), 0);
+
+    for id in ["req_q", "req_r", "req_w", "req_d", "req_f"] {
+        insert_demo_request(&store, id).await;
+    }
+    store
+        .update_request_state("req_r", RequestState::Running, None)
+        .await
+        .unwrap();
+    store
+        .update_request_state("req_w", RequestState::WaitingApproval, None)
+        .await
+        .unwrap();
+    store
+        .update_request_state("req_d", RequestState::Done, Some("ok"))
+        .await
+        .unwrap();
+    store
+        .update_request_state("req_f", RequestState::Failed, Some("boom"))
+        .await
+        .unwrap();
+
+    // queued + running + waiting_approval; done and failed are terminal.
+    assert_eq!(store.count_inflight().await.unwrap(), 3);
+}

@@ -1,0 +1,12 @@
+[package]
+name = "pam_store"
+description = "SQLite-backed durable state for the pam daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

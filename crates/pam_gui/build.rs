@@ -29,6 +29,7 @@ fn main() {
         "request_capability",
         "daemon_stop",
         "events_subscribe",
+        "read_daemon_log",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run the tauri build script for pam_gui");

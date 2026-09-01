@@ -26,6 +26,22 @@ export function relativeTime(unixSeconds: number, nowMs: number = Date.now()): s
   return `${elapsed}s ago`;
 }
 
+/**
+ * Compact duration for machine facts (daemon uptime): "42s", "3m 05s",
+ * "5h 09m", "2d 11h". Two units at most — a status card, not a
+ * stopwatch. Negative input reads as zero.
+ */
+export function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (total < 60) return `${total}s`;
+  if (total < 3_600) return `${Math.floor(total / 60)}m ${pad(total % 60)}s`;
+  if (total < 86_400) {
+    return `${Math.floor(total / 3_600)}h ${pad(Math.floor((total % 3_600) / 60))}m`;
+  }
+  return `${Math.floor(total / 86_400)}d ${pad(Math.floor((total % 86_400) / 3_600))}h`;
+}
+
 /** Full precise stamp for detail views: "2026-09-01 14:03:27" (local). */
 export function exactTime(unixSeconds: number): string {
   const date = new Date(unixSeconds * 1000);

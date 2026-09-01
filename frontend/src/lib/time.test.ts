@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { exactTime, relativeTime } from "./time";
+import { exactTime, formatDuration, relativeTime } from "./time";
 
 const NOW_MS = 1_756_000_000_000; // fixed "now" so ages are deterministic
 const NOW_S = NOW_MS / 1000;
@@ -26,6 +26,28 @@ describe("relativeTime", () => {
 
   it("treats a future timestamp (clock skew) as now", () => {
     expect(relativeTime(NOW_S + 120, NOW_MS)).toBe("now");
+  });
+});
+
+describe("formatDuration", () => {
+  it.each([
+    [0, "0s"],
+    [42, "42s"],
+    [59, "59s"],
+    [60, "1m 00s"],
+    [185, "3m 05s"],
+    [3_599, "59m 59s"],
+    [3_600, "1h 00m"],
+    [3_723, "1h 02m"],
+    [86_399, "23h 59m"],
+    [86_400, "1d 00h"],
+    [2 * 86_400 + 11 * 3_600, "2d 11h"],
+  ] as const)("%ds reads %s", (seconds, expected) => {
+    expect(formatDuration(seconds)).toBe(expected);
+  });
+
+  it("treats a negative duration as zero", () => {
+    expect(formatDuration(-5)).toBe("0s");
   });
 });
 

@@ -57,6 +57,49 @@ export function nextMode(current: ModeId): ModeId {
   return current === "light" ? "dark" : "light";
 }
 
+// --- shared live state -----------------------------------------------------
+//
+// Two views change themes (the chrome strip and Settings > Appearance), so
+// the applied combination is a tiny external store: `applyTheme` is the one
+// writer, `themeSnapshot`/`subscribeTheme` feed `useSyncExternalStore` in
+// whichever components render controls. No context, no prop drilling — the
+// DOM attributes stay the source of truth and this cache only exists so
+// React gets a referentially stable snapshot.
+
+/** The applied combination, as one immutable snapshot object. */
+export interface ThemeState {
+  theme: ThemeId;
+  mode: ModeId;
+}
+
+let snapshot: ThemeState | null = null;
+const listeners = new Set<() => void>();
+
+/** Subscribe to theme/mode changes; returns the unsubscribe function. */
+export function subscribeTheme(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * The currently applied combination — stable between `applyTheme` calls
+ * (required by `useSyncExternalStore`). First read falls back to the DOM
+ * attributes `initTheme()` stamped, then to the defaults.
+ */
+export function themeSnapshot(): ThemeState {
+  if (snapshot === null) {
+    const theme = document.documentElement.dataset.theme;
+    const mode = document.documentElement.dataset.mode;
+    snapshot = {
+      theme: isThemeId(theme) ? theme : defaultTheme,
+      mode: isModeId(mode) ? mode : systemMode(),
+    };
+  }
+  return snapshot;
+}
+
 function persist(key: string, value: string): void {
   try {
     window.localStorage.setItem(key, value);
@@ -86,6 +129,8 @@ export function applyTheme(
     persist(modeStorageKey, mode);
   }
   syncNativeWindow(mode);
+  snapshot = { theme, mode };
+  for (const listener of listeners) listener();
 }
 
 function stored<T>(key: string, guard: (value: unknown) => value is T): T | null {

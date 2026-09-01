@@ -15,6 +15,14 @@ pam_store = { path = "crates/pam_store" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# default features off: `mimalloc` bundles C, and the point of turso is a
+# pure-Rust engine. pure-rust-crypto keeps aegis pure Rust on every platform.
+# Known residue: turso_core links simsimd (small C SIMD kernel for vector
+# functions) unconditionally; no feature removes it as of 0.7.
+turso = { version = "0.7", default-features = false, features = ["pure-rust-crypto"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+thiserror = "2"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

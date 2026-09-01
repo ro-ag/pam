@@ -2958,6 +2958,7 @@ dependencies = [
  "pam_client",
  "pam_daemon",
  "pam_proto",
+ "pam_testkit",
  "serde",
  "serde_json",
  "tauri",

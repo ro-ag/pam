@@ -116,9 +116,10 @@ pub enum CapabilityClass {
 
 /// Static capability registry: what each known capability may do.
 ///
-/// Known capabilities so far: `status` (read-only), `echo` (the first
-/// executor capability, non-destructive), and `cancel` (the built-in
-/// behind `pam cancel <ticket>`). Connectors and flows register their
+/// Known capabilities so far: `status` (read-only), `query` (read-only
+/// ticket-state lookup backing `pam wait` / `pam subscribe`), `echo`
+/// (the first executor capability, non-destructive), and `cancel` (the
+/// built-in behind `pam cancel <ticket>`). Connectors and flows register their
 /// capabilities later, when the connector host lands; until then the
 /// table is static. An unknown capability classifies as `None` and the
 /// gate refuses it with cause [`CAUSE_UNKNOWN_CAPABILITY`].
@@ -131,7 +132,7 @@ pub enum CapabilityClass {
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {
-        "status" | "cancel" => Some(CapabilityClass::ReadOnly),
+        "status" | "cancel" | "query" => Some(CapabilityClass::ReadOnly),
         "echo" => Some(CapabilityClass::NonDestructive),
         _ => None,
     }

@@ -120,9 +120,19 @@ fn main() -> ExitCode {
     }
 }
 
-/// The base directory every mode works under: `~/.pam`.
+/// The base directory every mode works under: `$PAM_BASE_DIR` when set
+/// and non-empty, otherwise `~/.pam`.
+///
+/// The environment override is a testing/dev knob (deliberately not a
+/// CLI flag): it lets a test or a scratch session point a real spawned
+/// `pam daemon` process *and* the client subcommands at an isolated
+/// base dir. The auto-spawned daemon inherits the client's environment,
+/// so both sides always resolve the same base.
 fn base_dir() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".pam"))
+    match std::env::var_os("PAM_BASE_DIR") {
+        Some(base) if !base.is_empty() => Some(PathBuf::from(base)),
+        _ => Some(std::env::home_dir()?.join(".pam")),
+    }
 }
 
 /// Runs one client subcommand on a fresh runtime against `~/.pam`.

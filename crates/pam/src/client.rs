@@ -29,7 +29,10 @@
 //!
 //! [`follow_ticket`] is the event side: subscribe to `events.sock` on
 //! the ticket's topic and stream events until a terminal `done` /
-//! `refused` (bounded by a caller-chosen timeout). `pam wait` follows
+//! `refused` (bounded by a caller-chosen timeout), reconciling against
+//! the daemon's store (read-only `query` capability) so a terminal
+//! event that predates the subscription still terminates the follow —
+//! zmq `PUB` has no replay (see the function docs). `pam wait` follows
 //! quietly; `pam subscribe` prints each event — one code path, the
 //! callback decides.
 
@@ -322,15 +325,57 @@ async fn exchange(dirs: &RuntimeDir, envelope: &Envelope) -> Result<Response, Re
     serde_json::from_slice(&payload).map_err(|source| RequestError::Parse { source })
 }
 
+/// Deadline for each store reconciliation `query` request a follow
+/// makes (see [`follow_ticket`]); small because the answer is a single
+/// indexed row read.
+const QUERY_DEADLINE_MS: u64 = 5_000;
+
+/// First pause before a follow re-reconciles against the store; each
+/// subsequent reconcile doubles it up to [`RECONCILE_MAX`], so a long
+/// quiet follow stays cheap while a lost terminal event is still
+/// noticed within seconds.
+const RECONCILE_MIN: Duration = Duration::from_secs(1);
+
+/// Cap on the reconcile back-off interval.
+const RECONCILE_MAX: Duration = Duration::from_secs(30);
+
 /// Follows a ticket's event stream on `events.sock` until its terminal
 /// `done` / `refused` event, calling `on_event` for every event seen
 /// (the terminal one included). Returns the terminal event; gives up
 /// with [`RequestError::FollowTimeout`] past `timeout`.
 ///
-/// Events published before the subscription registered are gone (zmq
-/// `PUB` has no replay); a request that finished before `pam wait`
-/// started therefore times out rather than terminating — the bound is
-/// what keeps that legible.
+/// # Why events alone are not enough (issue #1)
+///
+/// zmq `PUB` has no replay: an event published before the daemon's
+/// `PUB` socket registered this subscription is gone for good. Live
+/// verification hit exactly that: `pam echo --no-wait` then a separate
+/// `pam subscribe` seconds later — by the time the subscriber joined,
+/// the request's `done` event (and everything before it) had already
+/// been published to nobody, so the follow sat blind until its
+/// timeout. Cross-process delivery itself is sound (the same pure-Rust
+/// zmq `SUB` over ipc receives reliably once the subscription is
+/// registered before the publish); the in-process testkit never sees
+/// the failure because its tests subscribe before sending requests. A
+/// second, narrower hole has the same shape: `SubSocket::subscribe`
+/// only queues the subscription frame to the publisher, so an event
+/// published in the instant before the `PUB` side processes it is
+/// silently filtered out — fatal when that event is the terminal one.
+///
+/// # The reconcile loop
+///
+/// The store is the authority on request state, so the follow never
+/// trusts the event stream with the *termination* decision alone:
+/// subscribe first, then reconcile by asking the daemon (read-only
+/// `query` capability) whether the ticket is already terminal —
+/// immediately after subscribing (catches a follower that joined after
+/// the finish), and again on a backing-off interval while events are
+/// quiet (catches a terminal event lost to the subscription race). A
+/// reconciled terminal state is surfaced as the synthesized terminal
+/// event. Intermediate events still stream with `PUB` latency; only
+/// missed ones fall back to the reconcile cadence. Earlier events
+/// published before the subscription (`queued`, `started`) remain
+/// unreplayable — the documented `--no-wait` join race — but the
+/// terminal event is now guaranteed to arrive.
 pub async fn follow_ticket(
     base_dir: &Path,
     ticket: &str,
@@ -349,21 +394,37 @@ pub async fn follow_ticket(
         .map_err(|source| RequestError::Transport { source })?;
 
     let deadline = Instant::now() + timeout;
+    let timed_out = || RequestError::FollowTimeout {
+        ticket: ticket.to_owned(),
+        waited: timeout,
+    };
+    let mut reconcile_pause = RECONCILE_MIN;
+    let mut next_reconcile = Instant::now();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RequestError::FollowTimeout {
-                ticket: ticket.to_owned(),
-                waited: timeout,
-            });
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(timed_out());
         }
-        let message = tokio::time::timeout(remaining, sub.recv())
-            .await
-            .map_err(|_elapsed| RequestError::FollowTimeout {
-                ticket: ticket.to_owned(),
-                waited: timeout,
-            })?
-            .map_err(|source| RequestError::Transport { source })?;
+        if now >= next_reconcile {
+            let remaining = deadline.saturating_duration_since(now);
+            let queried = tokio::time::timeout(remaining, query_terminal(base_dir, ticket))
+                .await
+                .map_err(|_elapsed| timed_out())??;
+            if let Some(event) = queried {
+                on_event(&event);
+                return Ok(event);
+            }
+            next_reconcile = Instant::now() + reconcile_pause;
+            reconcile_pause = (reconcile_pause * 2).min(RECONCILE_MAX);
+        }
+        let wait = deadline
+            .min(next_reconcile)
+            .saturating_duration_since(Instant::now());
+        let Ok(received) = tokio::time::timeout(wait, sub.recv()).await else {
+            // Reconcile due or deadline reached; the loop head decides.
+            continue;
+        };
+        let message = received.map_err(|source| RequestError::Transport { source })?;
         let frames = message.into_vec();
         // PUB frames are [topic, payload]; anything shorter is noise.
         let Some(payload) = frames.get(1) else {
@@ -376,6 +437,29 @@ pub async fn follow_ticket(
             return Ok(event);
         }
     }
+}
+
+/// One reconcile step of [`follow_ticket`]: asks the daemon (`query`
+/// capability, request/reply — reliable, unlike `PUB`) for the ticket's
+/// stored state. `Some(event)` maps a terminal state to the terminal
+/// event a subscriber would have seen (`done` → [`Event::Done`],
+/// `refused`/`failed` → [`Event::Refused`], matching what the daemon
+/// publishes); `None` means not terminal yet — or not answerable (a
+/// refusal, e.g. an unknown ticket), in which case the follow keeps
+/// waiting on events and times out as before rather than guessing.
+async fn query_terminal(base_dir: &Path, ticket: &str) -> Result<Option<Event>, RequestError> {
+    let args = serde_json::json!({ "ticket": ticket });
+    let response = send_request(base_dir, "query", args, true, QUERY_DEADLINE_MS, None).await?;
+    let Response::Result { body, .. } = response else {
+        return Ok(None);
+    };
+    Ok(
+        match body.get("state").and_then(serde_json::Value::as_str) {
+            Some("done") => Some(Event::Done),
+            Some("refused" | "failed") => Some(Event::Refused),
+            _ => None,
+        },
+    )
 }
 
 /// What the daemon-lock probe found, for `pam daemon stop`.

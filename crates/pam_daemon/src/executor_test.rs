@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
-use pam_store::{Actor, Decision, RequestState, Store};
+use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
@@ -82,7 +82,7 @@ fn envelope(id: &str, args: serde_json::Value) -> Envelope {
 
 #[test]
 fn registry_names_round_trip_and_cover_classify() {
-    for name in ["status", "echo", "cancel"] {
+    for name in ["status", "query", "echo", "cancel"] {
         let capability = BuiltinCapability::from_name(name).unwrap();
         assert_eq!(capability.name(), name);
         assert!(
@@ -121,6 +121,76 @@ async fn status_reports_versions_uptime_and_inflight_count() {
         assert_eq!(output.body["active_requests"], 1);
         assert!(output.body["uptime_s"].is_u64());
         assert!(output.evidence.is_empty());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn query_reports_a_request_row_state_and_outcome() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        fx.store
+            .insert_request("req_target", "echo", "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+
+        // Non-terminal: state comes back as-is, no outcome yet.
+        let ctx = fx.ctx_uncancelled("req_query", serde_json::json!({ "ticket": "req_target" }));
+        let output = BuiltinCapability::Query.execute(ctx).await.unwrap();
+        assert_eq!(output.outcome, Outcome::Verified);
+        assert_eq!(
+            output.body,
+            serde_json::json!({
+                "ticket": "req_target",
+                "state": "queued",
+                "outcome": null,
+            })
+        );
+
+        // Terminal: `pam wait` / `pam subscribe` reconcile against this.
+        fx.store
+            .finish_request(
+                "req_target",
+                RequestState::Done,
+                Some("solved"),
+                AuditEntry {
+                    action: "execute",
+                    decision: Decision::Allow,
+                    actor: Actor::System,
+                    detail: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = fx.ctx_uncancelled("req_query2", serde_json::json!({ "ticket": "req_target" }));
+        let output = BuiltinCapability::Query.execute(ctx).await.unwrap();
+        assert_eq!(output.body["state"], "done");
+        assert_eq!(output.body["outcome"], "solved");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn query_fails_legibly_without_a_ticket_or_row() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+
+        let ctx = fx.ctx_uncancelled("req_query", serde_json::json!({}));
+        let result = BuiltinCapability::Query.execute(ctx).await;
+        assert!(
+            matches!(result, Err(CapabilityFailure::Failed { ref detail }) if detail.contains("args.ticket")),
+            "got {result:?}"
+        );
+
+        let ctx =
+            fx.ctx_uncancelled("req_query", serde_json::json!({ "ticket": "req_ghost" }));
+        let result = BuiltinCapability::Query.execute(ctx).await;
+        assert!(
+            matches!(result, Err(CapabilityFailure::Failed { ref detail }) if detail.contains("req_ghost")),
+            "got {result:?}"
+        );
     })
     .await
     .expect("test within deadline");

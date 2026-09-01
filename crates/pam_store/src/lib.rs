@@ -34,7 +34,10 @@ mod migrations;
 mod store;
 
 pub use error::StoreError;
-pub use store::{Actor, AuditRow, Decision, RequestRow, RequestState, Store};
+pub use store::{
+    Actor, ApprovalResolution, ApprovalRow, AuditRow, Decision, PendingApproval, RequestRow,
+    RequestState, Store,
+};
 
 #[cfg(test)]
 mod migrations_test;

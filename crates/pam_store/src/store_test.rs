@@ -1,6 +1,6 @@
 use turso::params;
 
-use crate::{Actor, Decision, RequestState, Store, StoreError};
+use crate::{Actor, ApprovalResolution, Decision, RequestState, Store, StoreError};
 
 async fn insert_demo_request(store: &Store, id: &str) {
     store
@@ -360,4 +360,87 @@ async fn count_inflight_counts_only_non_terminal_states() {
 
     // queued + running + waiting_approval; done and failed are terminal.
     assert_eq!(store.count_inflight().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn approval_insert_resolve_round_trip() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+    store.insert_approval("req_1", "release").await.unwrap();
+
+    let row = store.approval_for_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.request_id, "req_1");
+    assert_eq!(row.capability, "release");
+    assert!(row.requested_ts > 0);
+    assert_eq!(row.resolved_ts, None);
+    assert_eq!(row.resolution, None);
+    assert_eq!(row.note, None);
+
+    store
+        .resolve_approval("req_1", ApprovalResolution::Approved, Some("go"))
+        .await
+        .unwrap();
+    let row = store.approval_for_request("req_1").await.unwrap().unwrap();
+    assert!(row.resolved_ts.is_some());
+    assert_eq!(row.resolution, Some(ApprovalResolution::Approved));
+    assert_eq!(row.note.as_deref(), Some("go"));
+
+    assert!(store.approval_for_request("req_2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn resolve_approval_guards_against_double_resolution() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    // No pending approval at all.
+    assert!(matches!(
+        store
+            .resolve_approval("req_1", ApprovalResolution::Denied, None)
+            .await,
+        Err(StoreError::NotFound {
+            table: "approval",
+            ..
+        })
+    ));
+
+    store.insert_approval("req_1", "release").await.unwrap();
+    store
+        .resolve_approval("req_1", ApprovalResolution::Denied, None)
+        .await
+        .unwrap();
+
+    // A second resolution loses the race guard.
+    assert!(matches!(
+        store
+            .resolve_approval("req_1", ApprovalResolution::Timeout, None)
+            .await,
+        Err(StoreError::NotFound {
+            table: "approval",
+            ..
+        })
+    ));
+    let row = store.approval_for_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.resolution, Some(ApprovalResolution::Denied));
+}
+
+#[tokio::test]
+async fn list_pending_approvals_joins_request_and_skips_resolved() {
+    let store = Store::open_in_memory().await.unwrap();
+    for id in ["req_1", "req_2"] {
+        insert_demo_request(&store, id).await;
+        store.insert_approval(id, "release").await.unwrap();
+    }
+    store
+        .resolve_approval("req_1", ApprovalResolution::Approved, None)
+        .await
+        .unwrap();
+
+    let pending = store.list_pending_approvals().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request_id, "req_2");
+    assert_eq!(pending[0].capability, "release");
+    assert_eq!(pending[0].repo, "ro-ag/pam");
+    assert_eq!(pending[0].caller_agent, "claude");
+    assert!(pending[0].requested_ts > 0);
 }

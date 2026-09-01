@@ -115,6 +115,85 @@ async fn audit_requires_existing_request() {
 }
 
 #[tokio::test]
+async fn audit_for_request_returns_typed_rows_oldest_first() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+    insert_demo_request(&store, "req_2").await;
+
+    store
+        .append_audit("req_1", "enqueue", Decision::Allow, Actor::Policy, None)
+        .await
+        .unwrap();
+    store
+        .append_audit(
+            "req_1",
+            "approve",
+            Decision::Approve,
+            Actor::Human,
+            Some("looks fine"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_audit("req_2", "enqueue", Decision::Refuse, Actor::Policy, None)
+        .await
+        .unwrap();
+
+    let rows = store.audit_for_request("req_1").await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].request_id, "req_1");
+    assert_eq!(rows[0].action, "enqueue");
+    assert_eq!(rows[0].decision, Decision::Allow);
+    assert_eq!(rows[0].actor, Actor::Policy);
+    assert_eq!(rows[0].detail, None);
+    assert!(rows[0].ts > 0);
+    assert_eq!(rows[1].action, "approve");
+    assert_eq!(rows[1].decision, Decision::Approve);
+    assert_eq!(rows[1].actor, Actor::Human);
+    assert_eq!(rows[1].detail.as_deref(), Some("looks fine"));
+    assert!(rows[0].id < rows[1].id);
+
+    assert!(store.audit_for_request("ghost").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn active_grant_tracks_insert_and_revocation() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert!(!store.active_grant("release").await.unwrap());
+
+    store.insert_grant("release").await.unwrap();
+    assert!(store.active_grant("release").await.unwrap());
+    // Grants are per capability.
+    assert!(!store.active_grant("echo").await.unwrap());
+
+    // A revoked row (GUI-side administration, no helper yet) stops
+    // counting; history stays in the table.
+    store
+        .conn
+        .execute(
+            "UPDATE \"grant\" SET revoked_ts = granted_ts WHERE capability = ?1",
+            params!["release"],
+        )
+        .await
+        .unwrap();
+    assert!(!store.active_grant("release").await.unwrap());
+
+    // Re-grant is a new row, and the old one is preserved.
+    store.insert_grant("release").await.unwrap();
+    assert!(store.active_grant("release").await.unwrap());
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT count(*) FROM \"grant\" WHERE capability = ?1",
+            params!["release"],
+        )
+        .await
+        .unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn setting_round_trip() {
     let store = Store::open_in_memory().await.unwrap();
     assert!(store.get_setting("policy").await.unwrap().is_none());

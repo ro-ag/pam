@@ -86,6 +86,20 @@ impl Decision {
             Self::Timeout => "timeout",
         }
     }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "refuse" => Ok(Self::Refuse),
+            "approve" => Ok(Self::Approve),
+            "deny" => Ok(Self::Deny),
+            "timeout" => Ok(Self::Timeout),
+            other => Err(StoreError::UnexpectedValue {
+                column: "audit.decision",
+                value: other.to_owned(),
+            }),
+        }
+    }
 }
 
 /// Who made an audited decision.
@@ -107,6 +121,18 @@ impl Actor {
             Self::Policy => "policy",
             Self::Human => "human",
             Self::System => "system",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "policy" => Ok(Self::Policy),
+            "human" => Ok(Self::Human),
+            "system" => Ok(Self::System),
+            other => Err(StoreError::UnexpectedValue {
+                column: "audit.actor",
+                value: other.to_owned(),
+            }),
         }
     }
 }
@@ -132,6 +158,25 @@ pub struct RequestRow {
     pub created_ts: i64,
     /// Unix seconds of the last state change.
     pub updated_ts: i64,
+}
+
+/// One row of the `audit` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRow {
+    /// Audit row id.
+    pub id: i64,
+    /// Request this row belongs to.
+    pub request_id: String,
+    /// What was decided about (e.g. `enqueue`, `auto_grant`).
+    pub action: String,
+    /// Outcome recorded on the row.
+    pub decision: Decision,
+    /// Who made the decision.
+    pub actor: Actor,
+    /// Free-form context (JSON by convention).
+    pub detail: Option<String>,
+    /// Unix seconds when the row was written.
+    pub ts: i64,
 }
 
 /// Handle to the durable state database.
@@ -293,6 +338,65 @@ impl Store {
                     detail,
                     now_ts()
                 ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads every audit row for one request, oldest first.
+    pub async fn audit_for_request(&self, request_id: &str) -> Result<Vec<AuditRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, request_id, action, decision, actor, detail, ts
+                 FROM audit WHERE request_id = ?1 ORDER BY id",
+                params![request_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let decision: String = row.get(3)?;
+            let actor: String = row.get(4)?;
+            out.push(AuditRow {
+                id: row.get(0)?,
+                request_id: row.get(1)?,
+                action: row.get(2)?,
+                decision: Decision::parse(&decision)?,
+                actor: Actor::parse(&actor)?,
+                detail: row.get(5)?,
+                ts: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// True when `capability` currently has an active global grant
+    /// (a `grant` row whose `revoked_ts` is NULL).
+    pub async fn active_grant(&self, capability: &str) -> Result<bool, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM \"grant\"
+                 WHERE capability = ?1 AND revoked_ts IS NULL LIMIT 1",
+                params![capability],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    /// Records a new machine-wide grant for `capability` (scope `global`,
+    /// granted now).
+    ///
+    /// History is preserved by design: revocation sets `revoked_ts` on the
+    /// old row and a re-grant is a new row. There is deliberately no revoke
+    /// helper yet — revocation is GUI-only administration and arrives with
+    /// that surface.
+    pub async fn insert_grant(&self, capability: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO \"grant\" (capability, scope, granted_ts)
+                 VALUES (?1, 'global', ?2)",
+                params![capability, now_ts()],
             )
             .await?;
         Ok(())

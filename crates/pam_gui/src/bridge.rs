@@ -150,7 +150,15 @@ pub fn is_disconnect(err: &RequestError) -> bool {
 
 /// Unwraps a [`Response`], passing a daemon refusal through verbatim and
 /// rejecting the shapes the caller did not ask for.
-pub(crate) fn expect_result(response: Response) -> Result<serde_json::Value, BridgeError> {
+///
+/// Public so the bridge integration tests (`tests/bridge.rs`) can drive
+/// the exact unwrap the commands use against a real daemon's answers.
+///
+/// # Errors
+///
+/// A refusal maps onto [`BridgeError`] verbatim; a ticket answers with
+/// cause `unexpected_ticket` (synchronous ops never queue).
+pub fn expect_result(response: Response) -> Result<serde_json::Value, BridgeError> {
     match response {
         Response::Result { body, .. } => Ok(body),
         Response::Refusal {

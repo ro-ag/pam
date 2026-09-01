@@ -23,6 +23,7 @@ tokio.workspace = true
 zeromq.workspace = true
 
 [dev-dependencies]
+pam_testkit.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]

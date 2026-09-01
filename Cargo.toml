@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/pam",
     "crates/pam_daemon",
+    "crates/pam_gui",
     "crates/pam_proto",
     "crates/pam_store",
     "crates/pam_testkit",
@@ -16,6 +17,7 @@ repository = "https://github.com/ro-ag/pam"
 
 [workspace.dependencies]
 pam_daemon = { path = "crates/pam_daemon" }
+pam_gui = { path = "crates/pam_gui" }
 pam_proto = { path = "crates/pam_proto" }
 pam_store = { path = "crates/pam_store" }
 # test-only harness; never published (dev-dependency cycles are fine —
@@ -52,6 +54,13 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
+# desktop shell for `pam gui`. Default features off: `compression` (brotli
+# for embedded assets) and `dbus`/tray extras are not needed for the
+# scaffold; `wry` is the webview runtime, `x11` keeps Linux building.
+# The tauri stack is pure Rust on macOS (objc2/block2 are Rust bindings to
+# system frameworks, no C compile step); see the workspace C-residue notes.
+tauri = { version = "2", default-features = false, features = ["wry", "x11"] }
+tauri-build = { version = "2", default-features = false, features = ["config-json"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

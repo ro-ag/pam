@@ -1,0 +1,25 @@
+[package]
+name = "pam_gui"
+description = "Desktop control center for pam: the Tauri shell behind `pam gui`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Embed the built frontend (frontend/dist) into the binary instead of the
+# dev-server context. Off by default so a plain `cargo build` never needs
+# the frontend built first; production GUI builds enable it (see lib.rs).
+embed = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

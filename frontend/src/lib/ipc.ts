@@ -118,12 +118,13 @@ export interface GrantRow {
   revoked_ts: string | null;
 }
 
+/** One unresolved raised hand; `requested_ts` is unix seconds. */
 export interface PendingApproval {
   request_id: string;
   capability: string;
   repo: string;
   agent: string;
-  requested_ts: string;
+  requested_ts: number;
 }
 
 /** `pam_store::RequestState`, exactly — the store knows no other states. */

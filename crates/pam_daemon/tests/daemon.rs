@@ -5,14 +5,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pam_daemon::approval::{ACTION_APPROVAL, Resolution};
 use pam_daemon::daemon::{
-    ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, ACTION_GATE_REFUSAL, CAUSE_DEADLINE_EXCEEDED,
-    DaemonHandle, run_daemon,
+    ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, ACTION_GATE_REFUSAL, CAUSE_APPROVAL_DENIED,
+    CAUSE_APPROVAL_TIMEOUT, CAUSE_DEADLINE_EXCEEDED, DaemonConfig, DaemonHandle, run_daemon,
+    run_daemon_with,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::queue::{ACTION_CANCEL, CAUSE_CANCELLED};
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
-use pam_store::{Actor, Decision, RequestRow, RequestState, Store};
+use pam_store::{Actor, ApprovalResolution, Decision, RequestRow, RequestState, Store};
 use tokio::sync::watch;
 use tokio::time::timeout;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
@@ -58,6 +60,23 @@ impl TestDaemon {
     async fn start_at(tmp: tempfile::TempDir) -> Self {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
+            .await
+            .expect("daemon starts");
+        Self {
+            _tmp: tmp,
+            handle,
+            shutdown,
+        }
+    }
+
+    /// [`Self::start_at`] with a custom approval timeout.
+    async fn start_at_with_approval_timeout(tmp: tempfile::TempDir, timeout: Duration) -> Self {
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let config = DaemonConfig {
+            base_dir: Some(base_of(&tmp)),
+            approval_timeout: timeout,
+        };
+        let handle = run_daemon_with(config, shutdown_rx)
             .await
             .expect("daemon starts");
         Self {
@@ -129,6 +148,26 @@ async fn recv_response(dealer: &mut DealerSocket) -> Response {
     let answer = dealer.recv().await.expect("recv ok");
     let frames = answer.into_vec();
     serde_json::from_slice(&frames[0]).expect("parse response")
+}
+
+/// Receives one event off the subscription.
+async fn recv_event(sub: &mut SubSocket) -> Event {
+    let message = sub.recv().await.expect("event recv ok");
+    let frames = message.into_vec();
+    serde_json::from_slice(&frames[1]).expect("parse event")
+}
+
+/// Seeds `tmp`'s store with the strict profile and an active `echo`
+/// grant, so every echo request hits the per-operation approval pause.
+async fn seed_strict_with_echo_grant(tmp: &tempfile::TempDir) {
+    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
+        .await
+        .expect("store opens");
+    store
+        .set_setting(PROFILE_SETTING_KEY, "\"strict\"")
+        .await
+        .expect("profile set");
+    store.insert_grant("echo").await.expect("grant inserted");
 }
 
 /// Collects this topic's events until a terminal one (`done`/`refused`).
@@ -488,6 +527,195 @@ async fn cancel_builtin_stops_a_running_request() {
 
         let events = events_until_terminal(&mut sub).await;
         assert_eq!(events.last(), Some(&Event::Refused));
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn approval_approve_resumes_execution_and_audits_the_resolution() {
+    timeout(DEADLINE, async {
+        let tmp = short_tempdir();
+        seed_strict_with_echo_grant(&tmp).await;
+        let daemon = TestDaemon::start_at(tmp).await;
+        let mut sub = daemon.subscriber("req_appr").await;
+        let mut dealer = daemon.dealer().await;
+
+        let args = serde_json::json!({ "msg": "hi" });
+        send(
+            &mut dealer,
+            &envelope("req_appr", "echo", args.clone(), true),
+        )
+        .await;
+
+        // The request parks: approval_pending on PUB, waiting_approval
+        // in the store, and one entry on the GUI's pending list.
+        assert_eq!(recv_event(&mut sub).await, Event::ApprovalPending);
+        let store = daemon.handle.store();
+        let row = store.get_request("req_appr").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::WaitingApproval);
+        let pending = daemon.handle.approvals().pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, "req_appr");
+        assert_eq!(pending[0].capability, "echo");
+        assert_eq!(pending[0].repo, REPO);
+
+        // The human approves; the pipeline resumes into execution.
+        daemon
+            .handle
+            .approvals()
+            .resolve("req_appr", Resolution::Approve { remember: false })
+            .await
+            .expect("resolvable");
+
+        let response = recv_response(&mut dealer).await;
+        let Response::Result {
+            id, outcome, body, ..
+        } = response
+        else {
+            panic!("expected a result, got {response:?}");
+        };
+        assert_eq!(id, "req_appr");
+        assert_eq!(outcome, Outcome::Solved);
+        assert_eq!(body, serde_json::json!({ "echo": args }));
+
+        // Terminal row, resolved approval row, and both audit rows.
+        let row = store.get_request("req_appr").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Done);
+        let approval = store
+            .approval_for_request("req_appr")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Approved));
+        let audit = store.audit_for_request("req_appr").await.unwrap();
+        assert!(audit.iter().any(|row| row.action == ACTION_APPROVAL
+            && row.decision == Decision::Approve
+            && row.actor == Actor::Human));
+        assert!(
+            audit
+                .iter()
+                .any(|row| row.action == ACTION_EXECUTE && row.decision == Decision::Allow)
+        );
+        assert!(
+            daemon
+                .handle
+                .approvals()
+                .pending()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The rest of the lifecycle follows the approval.
+        let events = events_until_terminal(&mut sub).await;
+        assert_eq!(events, [Event::Queued, Event::Started, Event::Done]);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn approval_deny_refuses_with_approval_denied() {
+    timeout(DEADLINE, async {
+        let tmp = short_tempdir();
+        seed_strict_with_echo_grant(&tmp).await;
+        let daemon = TestDaemon::start_at(tmp).await;
+        let mut sub = daemon.subscriber("req_deny").await;
+        let mut dealer = daemon.dealer().await;
+
+        send(
+            &mut dealer,
+            &envelope("req_deny", "echo", serde_json::json!({ "msg": "no" }), true),
+        )
+        .await;
+        assert_eq!(recv_event(&mut sub).await, Event::ApprovalPending);
+
+        daemon
+            .handle
+            .approvals()
+            .resolve("req_deny", Resolution::Deny)
+            .await
+            .expect("resolvable");
+
+        let response = recv_response(&mut dealer).await;
+        let Response::Refusal {
+            cause, recovery, ..
+        } = response
+        else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, CAUSE_APPROVAL_DENIED);
+        assert!(recovery.contains("GUI"), "recovery: {recovery}");
+
+        let store = daemon.handle.store();
+        let row = store.get_request("req_deny").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Refused);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_APPROVAL_DENIED));
+        let approval = store
+            .approval_for_request("req_deny")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Denied));
+        let audit = store.audit_for_request("req_deny").await.unwrap();
+        assert!(audit.iter().any(|row| row.action == ACTION_APPROVAL
+            && row.decision == Decision::Deny
+            && row.actor == Actor::Human));
+        assert!(
+            audit
+                .iter()
+                .any(|row| row.action == ACTION_GATE_REFUSAL && row.decision == Decision::Refuse)
+        );
+
+        assert_eq!(recv_event(&mut sub).await, Event::Refused);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn unanswered_approval_times_out_into_a_refusal() {
+    timeout(DEADLINE, async {
+        let tmp = short_tempdir();
+        seed_strict_with_echo_grant(&tmp).await;
+        let daemon =
+            TestDaemon::start_at_with_approval_timeout(tmp, Duration::from_millis(300)).await;
+        let mut dealer = daemon.dealer().await;
+
+        send(
+            &mut dealer,
+            &envelope("req_slow", "echo", serde_json::json!({ "msg": "??" }), true),
+        )
+        .await;
+
+        // Nobody answers within the daemon's (short) approval timeout.
+        let response = recv_response(&mut dealer).await;
+        let Response::Refusal { cause, .. } = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, CAUSE_APPROVAL_TIMEOUT);
+
+        let store = daemon.handle.store();
+        let row = store.get_request("req_slow").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Refused);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_APPROVAL_TIMEOUT));
+        let approval = store
+            .approval_for_request("req_slow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Timeout));
+        let audit = store.audit_for_request("req_slow").await.unwrap();
+        assert!(audit.iter().any(|row| row.action == ACTION_APPROVAL
+            && row.decision == Decision::Timeout
+            && row.actor == Actor::System));
 
         daemon.stop().await;
     })

@@ -52,9 +52,9 @@
 //! Every terminal path introduced here writes exactly one audit row for
 //! its terminal state:
 //!
-//! - gate refusal (unknown capability, ungranted capability) and the
-//!   approval-required stub → [`ACTION_GATE_REFUSAL`], decision
-//!   `refuse`, actor `policy`;
+//! - gate refusal (unknown capability, ungranted capability) and every
+//!   approval-path refusal (denied, timed out, cancelled while waiting)
+//!   → [`ACTION_GATE_REFUSAL`], decision `refuse`, actor `policy`;
 //! - execution success → [`ACTION_EXECUTE`], decision `allow`, actor
 //!   `system`;
 //! - execution failure → [`ACTION_EXECUTE`], decision `refuse`, actor
@@ -72,12 +72,23 @@
 //! for now: without the tracing setup (a later task) there is nowhere
 //! legible to report them, and the caller still gets its response.
 //!
-//! # Approval stub
+//! # Approval pause
 //!
-//! [`GateDecision::RequireApproval`] currently refuses with cause
-//! [`CAUSE_APPROVAL_REQUIRED`] and a GUI recovery line. The approval
-//! service (task #10) replaces that arm with a real
-//! `waiting_approval` pause; nothing else in the pipeline changes.
+//! [`GateDecision::RequireApproval`] parks the admitted request in the
+//! approval service ([`crate::approval`]) before lane placement: the
+//! request row moves to `waiting_approval`, `approval_pending` goes out
+//! on PUB, and the GUI resolves it through
+//! [`DaemonHandle::approvals`]. On approval the pipeline moves the row
+//! back to `queued` and continues into lane placement exactly as an
+//! allow; a denial, timeout, or cancellation refuses with its own cause
+//! ([`CAUSE_APPROVAL_DENIED`], [`CAUSE_APPROVAL_TIMEOUT`], the queue's
+//! `cancelled`) and a GUI recovery line. A waiting caller whose
+//! `deadline_ms` elapses mid-approval cancels the wait (the service
+//! resolves the row `denied` with note `cancelled`); a `wait: false`
+//! caller gets its ticket immediately and the approval wait runs in a
+//! background task, bounded by the approval timeout alone. The
+//! request-state transitions around the wait belong to the pipeline —
+//! see the approval module docs for the writer split.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -91,6 +102,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
 use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
 use crate::queue::{
@@ -102,8 +114,11 @@ use crate::transport::{EventPublisher, IncomingRequest, Transport, TransportErro
 /// Refusal cause when a waiting caller's `deadline_ms` elapsed.
 pub const CAUSE_DEADLINE_EXCEEDED: &str = "deadline_exceeded";
 
-/// Refusal cause for the approval-required stub (see the module docs).
-pub const CAUSE_APPROVAL_REQUIRED: &str = "approval_required";
+/// Refusal cause when a human denied the required approval.
+pub const CAUSE_APPROVAL_DENIED: &str = "approval_denied";
+
+/// Refusal cause when the required approval expired unanswered.
+pub const CAUSE_APPROVAL_TIMEOUT: &str = "approval_timeout";
 
 /// Refusal cause (and `request.outcome`) when a capability ran and
 /// failed.
@@ -121,8 +136,17 @@ pub const ACTION_EXECUTE: &str = "execute";
 /// `audit.action` for a deadline refusal sent to a waiting caller.
 pub const ACTION_DEADLINE_REFUSAL: &str = "deadline_refusal";
 
-/// GUI recovery line for [`CAUSE_APPROVAL_REQUIRED`] refusals.
-const RECOVERY_APPROVAL: &str = "Approve this operation in the PAM GUI.";
+/// GUI recovery line for [`CAUSE_APPROVAL_DENIED`] refusals.
+const RECOVERY_APPROVAL_DENIED: &str =
+    "The operation was denied in the PAM GUI; ask the human to approve a retry.";
+
+/// GUI recovery line for [`CAUSE_APPROVAL_TIMEOUT`] refusals.
+const RECOVERY_APPROVAL_TIMEOUT: &str =
+    "Nobody answered the approval in the PAM GUI in time; retry when a human is available.";
+
+/// Recovery line for a request cancelled while waiting for approval.
+const RECOVERY_APPROVAL_CANCELLED: &str =
+    "The wait for approval was cancelled; re-run the pam command to ask again.";
 
 /// Recovery line for [`CAUSE_DEADLINE_EXCEEDED`] refusals.
 const RECOVERY_DEADLINE: &str =
@@ -242,6 +266,7 @@ impl CompletionRouter {
 pub struct DaemonHandle {
     dirs: RuntimeDir,
     store: Arc<Store>,
+    approvals: Arc<ApprovalService>,
     transport: Transport,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -259,6 +284,14 @@ impl DaemonHandle {
         Arc::clone(&self.store)
     }
 
+    /// The approval service — the daemon-internal resolution surface the
+    /// GUI plumbing (and integration tests) approve or deny through. No
+    /// agent-facing capability reaches it; see [`crate::approval`].
+    #[must_use]
+    pub fn approvals(&self) -> Arc<ApprovalService> {
+        Arc::clone(&self.approvals)
+    }
+
     /// Stops the transport and joins every daemon task.
     ///
     /// Flip the shutdown watch handed to [`run_daemon`] first — the
@@ -272,19 +305,56 @@ impl DaemonHandle {
     }
 }
 
-/// Assembles and starts the daemon.
-///
-/// Binds the transport under `<base>/run`, opens the store at
-/// `<base>/state.sqlite3` (constructing the policy gate from the profile
-/// persisted there), rebuilds the queue lanes, and spawns the
-/// dispatcher, executor loop, and lease reaper. `base_dir` defaults to
-/// `~/.pam`. Flip `shutdown` to stop the background tasks, then await
-/// [`DaemonHandle::shutdown`].
+/// Configuration for [`run_daemon_with`]. [`run_daemon`] uses the
+/// defaults.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// Base directory for the runtime dir and store; `None` means
+    /// `~/.pam`.
+    pub base_dir: Option<PathBuf>,
+    /// How long a pending approval waits before it times out
+    /// (default [`DEFAULT_APPROVAL_TIMEOUT`]; tests inject a short one).
+    pub approval_timeout: Duration,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            base_dir: None,
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+        }
+    }
+}
+
+/// Assembles and starts the daemon with the default configuration
+/// (see [`run_daemon_with`]).
 pub async fn run_daemon(
     base_dir: Option<PathBuf>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<DaemonHandle, DaemonError> {
-    let base = match base_dir {
+    run_daemon_with(
+        DaemonConfig {
+            base_dir,
+            ..DaemonConfig::default()
+        },
+        shutdown,
+    )
+    .await
+}
+
+/// Assembles and starts the daemon.
+///
+/// Binds the transport under `<base>/run`, opens the store at
+/// `<base>/state.sqlite3` (constructing the policy gate from the profile
+/// persisted there), rebuilds the queue lanes, builds the approval
+/// service, and spawns the dispatcher, executor loop, and lease reaper.
+/// `config.base_dir` defaults to `~/.pam`. Flip `shutdown` to stop the
+/// background tasks, then await [`DaemonHandle::shutdown`].
+pub async fn run_daemon_with(
+    config: DaemonConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<DaemonHandle, DaemonError> {
+    let base = match config.base_dir {
         Some(base) => base,
         None => std::env::home_dir()
             .ok_or(RuntimeDirError::HomeNotFound)?
@@ -299,10 +369,16 @@ pub async fn run_daemon(
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CAPACITY);
     let transport = Transport::bind(&dirs, incoming_tx).await?;
 
+    let approvals = Arc::new(ApprovalService::new(
+        Arc::clone(&store),
+        transport.event_publisher(),
+        config.approval_timeout,
+    ));
     let pipeline = Arc::new(Pipeline {
         store: Arc::clone(&store),
         gate,
         queue: Arc::clone(&queue),
+        approvals: Arc::clone(&approvals),
         events: transport.event_publisher(),
         router: CompletionRouter::new(),
         work: Notify::new(),
@@ -322,6 +398,7 @@ pub async fn run_daemon(
     Ok(DaemonHandle {
         dirs,
         store,
+        approvals,
         transport,
         tasks,
     })
@@ -333,6 +410,7 @@ struct Pipeline {
     store: Arc<Store>,
     gate: PolicyGate,
     queue: Arc<QueueManager>,
+    approvals: Arc<ApprovalService>,
     events: EventPublisher,
     router: CompletionRouter,
     /// Kicked on lane placement and execution completion; wakes the
@@ -393,8 +471,10 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
 
 impl Pipeline {
     /// Runs one request through classify → admit → gate → queue/execute
-    /// and answers `reply` with its single [`Response`].
-    async fn handle(&self, envelope: Envelope, reply: oneshot::Sender<Response>) {
+    /// and answers `reply` with its single [`Response`]. Takes the
+    /// pipeline by `Arc` so the approval path can spawn a background
+    /// wait for `wait: false` callers.
+    async fn handle(self: Arc<Self>, envelope: Envelope, reply: oneshot::Sender<Response>) {
         let id = envelope.id.clone();
 
         // Unknown capability: no class, no dedupe — record the request,
@@ -449,9 +529,10 @@ impl Pipeline {
         }
     }
 
-    /// The laned path after admission: gate, place, and (for waiting
-    /// callers) park on the completion router under the deadline.
-    async fn gate_and_place(&self, envelope: &Envelope) -> Response {
+    /// The laned path after admission: gate, then place (pausing for an
+    /// approval when the gate requires one) and, for waiting callers,
+    /// park on the completion router under the deadline.
+    async fn gate_and_place(self: Arc<Self>, envelope: &Envelope) -> Response {
         let id = &envelope.id;
         let Ok(decision) = self.gate.evaluate(id, &envelope.capability).await else {
             // Keep the not-yet-placed row out of the lanes forever.
@@ -467,42 +548,187 @@ impl Pipeline {
                 detail,
                 recovery,
             } => self.refuse(id, cause, detail, recovery).await,
-            GateDecision::RequireApproval { reason } => {
-                // Approval service is task #10; until it lands the gate's
-                // pause signal is answered with a legible refusal.
-                self.refuse(
+            GateDecision::RequireApproval { reason } => self.approval_pause(envelope, reason).await,
+            GateDecision::Allow { .. } => self.place_and_wait(envelope, envelope.deadline_ms).await,
+        }
+    }
+
+    /// Places an allowed (or approved) request on its lane and, for a
+    /// waiting caller, parks on the completion router with `deadline_ms`
+    /// of budget left.
+    async fn place_and_wait(&self, envelope: &Envelope, deadline_ms: u64) -> Response {
+        let id = &envelope.id;
+        // Register before placement so the completion cannot slip
+        // between the two.
+        let registration = self.router.register(id).await;
+        let position = self
+            .queue
+            .place_in_lane(id, &envelope.caller.repo, envelope.deadline_ms)
+            .await;
+        let _ = self.events.publish(id, Event::Queued).await;
+        self.work.notify_one();
+        if envelope.wait {
+            match await_registration(registration, deadline_ms).await {
+                Ok(response) => response,
+                Err(true) => self.deadline_refusal(envelope).await,
+                Err(false) => internal_refusal(id),
+            }
+        } else {
+            Response::Ticket {
+                id: id.clone(),
+                ticket: id.clone(),
+                position: u64::try_from(position).unwrap_or(u64::MAX),
+            }
+        }
+    }
+
+    /// The approval pause (see the module docs): parks the request in
+    /// the approval service, then continues into placement (approved) or
+    /// refuses (denied, timed out, cancelled). A `wait: false` caller
+    /// gets its ticket immediately while the wait runs in a background
+    /// task bounded by the approval timeout.
+    async fn approval_pause(self: Arc<Self>, envelope: &Envelope, reason: String) -> Response {
+        if envelope.wait {
+            return self.approval_wait_inline(envelope, &reason).await;
+        }
+        let ticket = Response::Ticket {
+            id: envelope.id.clone(),
+            ticket: envelope.id.clone(),
+            position: 0,
+        };
+        let envelope = envelope.clone();
+        tokio::spawn(async move {
+            // The cancel signal never fires here — the sender is held
+            // until the wait ends; the approval timeout is the bound.
+            let (_cancel_tx, mut cancel) = watch::channel(false);
+            let outcome = self
+                .approvals
+                .request_approval(&envelope.id, &envelope.capability, &mut cancel)
+                .await;
+            // The response reaches the store, events, and any attached
+            // waiters; the ticket holder polls those.
+            let _ = self
+                .conclude_approval(&envelope, &reason, outcome, envelope.deadline_ms)
+                .await;
+        });
+        ticket
+    }
+
+    /// The waiting caller's approval pause: the wait is additionally
+    /// bounded by the envelope's `deadline_ms` — past it the wait is
+    /// cancelled (the service resolves the approval row as denied with
+    /// note `cancelled`) and the caller gets a refusal.
+    async fn approval_wait_inline(&self, envelope: &Envelope, reason: &str) -> Response {
+        let id = &envelope.id;
+        let waited_from = Instant::now();
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        let fut = self
+            .approvals
+            .request_approval(id, &envelope.capability, &mut cancel);
+        tokio::pin!(fut);
+        let outcome = tokio::select! {
+            outcome = &mut fut => outcome,
+            () = tokio::time::sleep(Duration::from_millis(envelope.deadline_ms)) => {
+                let _ = cancel_tx.send(true);
+                // Resolves promptly: the service observes the signal,
+                // records the cancellation, and returns.
+                fut.await
+            }
+        };
+        let elapsed_ms = u64::try_from(waited_from.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let remaining_ms = envelope.deadline_ms.saturating_sub(elapsed_ms);
+        self.conclude_approval(envelope, reason, outcome, remaining_ms)
+            .await
+    }
+
+    /// Acts on an approval wait's outcome: approved requests move back
+    /// to `queued` and continue into placement with `deadline_ms` of
+    /// budget left; everything else becomes a terminal refusal (audited
+    /// via [`Self::refuse`], released to attached waiters through the
+    /// router).
+    async fn conclude_approval(
+        &self,
+        envelope: &Envelope,
+        reason: &str,
+        outcome: Result<ApprovalOutcome, StoreError>,
+        deadline_ms: u64,
+    ) -> Response {
+        let id = &envelope.id;
+        let capability = &envelope.capability;
+        match outcome {
+            Ok(ApprovalOutcome::Approved { .. }) => {
+                // The pipeline owns the transition out of
+                // waiting_approval (see the approval module docs):
+                // back to queued, then placement as any allow.
+                if self
+                    .store
+                    .update_request_state(id, RequestState::Queued, None)
+                    .await
+                    .is_err()
+                {
+                    let _ = self
+                        .store
+                        .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
+                        .await;
+                    return internal_refusal(id);
+                }
+                self.place_and_wait(envelope, deadline_ms).await
+            }
+            Ok(ApprovalOutcome::Denied) => {
+                self.refuse_approval(
                     id,
-                    CAUSE_APPROVAL_REQUIRED.to_owned(),
-                    reason,
-                    RECOVERY_APPROVAL.to_owned(),
+                    CAUSE_APPROVAL_DENIED,
+                    format!("approval for capability {capability:?} was denied ({reason})"),
+                    RECOVERY_APPROVAL_DENIED,
                 )
                 .await
             }
-            GateDecision::Allow { .. } => {
-                // Register before placement so the completion cannot slip
-                // between the two.
-                let registration = self.router.register(id).await;
-                let position = self
-                    .queue
-                    .place_in_lane(id, &envelope.caller.repo, envelope.deadline_ms)
+            Ok(ApprovalOutcome::TimedOut) => {
+                self.refuse_approval(
+                    id,
+                    CAUSE_APPROVAL_TIMEOUT,
+                    format!("approval for capability {capability:?} expired unanswered ({reason})"),
+                    RECOVERY_APPROVAL_TIMEOUT,
+                )
+                .await
+            }
+            Ok(ApprovalOutcome::Cancelled) => {
+                self.refuse_approval(
+                    id,
+                    CAUSE_CANCELLED,
+                    format!(
+                        "request was cancelled while waiting for approval \
+                         of capability {capability:?}"
+                    ),
+                    RECOVERY_APPROVAL_CANCELLED,
+                )
+                .await
+            }
+            Err(_) => {
+                let _ = self
+                    .store
+                    .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
                     .await;
-                let _ = self.events.publish(id, Event::Queued).await;
-                self.work.notify_one();
-                if envelope.wait {
-                    match await_registration(registration, envelope.deadline_ms).await {
-                        Ok(response) => response,
-                        Err(true) => self.deadline_refusal(envelope).await,
-                        Err(false) => internal_refusal(id),
-                    }
-                } else {
-                    Response::Ticket {
-                        id: id.clone(),
-                        ticket: id.clone(),
-                        position: u64::try_from(position).unwrap_or(u64::MAX),
-                    }
-                }
+                internal_refusal(id)
             }
         }
+    }
+
+    /// Refuses a request whose approval wait did not end in an approval,
+    /// and releases any attached duplicate callers with the same refusal
+    /// (they may have attached during the long `waiting_approval` window).
+    async fn refuse_approval(
+        &self,
+        id: &str,
+        cause: &str,
+        detail: String,
+        recovery: &str,
+    ) -> Response {
+        let response = self
+            .refuse(id, cause.to_owned(), detail, recovery.to_owned())
+            .await;
+        self.router.finish(id, response.clone()).await;
+        response
     }
 
     /// Executes a read-only bypass request inline, under the envelope's

@@ -162,6 +162,76 @@ pub struct RequestRow {
     pub updated_ts: i64,
 }
 
+/// How a pending approval was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResolution {
+    /// A human approved the operation.
+    Approved,
+    /// A human denied the operation.
+    Denied,
+    /// The approval expired unanswered.
+    Timeout,
+}
+
+impl ApprovalResolution {
+    /// The value stored in the `approval.resolution` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "approved" => Ok(Self::Approved),
+            "denied" => Ok(Self::Denied),
+            "timeout" => Ok(Self::Timeout),
+            other => Err(StoreError::UnexpectedValue {
+                column: "approval.resolution",
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+/// One row of the `approval` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    /// Approval row id.
+    pub id: i64,
+    /// Request this approval gates.
+    pub request_id: String,
+    /// Capability awaiting approval.
+    pub capability: String,
+    /// Unix seconds when the approval was requested.
+    pub requested_ts: i64,
+    /// Unix seconds when it was resolved, once it was.
+    pub resolved_ts: Option<i64>,
+    /// How it was resolved, once it was.
+    pub resolution: Option<ApprovalResolution>,
+    /// Free-form context recorded at resolution.
+    pub note: Option<String>,
+}
+
+/// One unresolved approval, joined with its request for the GUI's
+/// pending list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// Request waiting on this approval.
+    pub request_id: String,
+    /// Capability awaiting approval.
+    pub capability: String,
+    /// Repository the request acts on.
+    pub repo: String,
+    /// Agent that issued the request.
+    pub caller_agent: String,
+    /// Unix seconds when the approval was requested.
+    pub requested_ts: i64,
+}
+
 /// One row of the `audit` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
@@ -517,6 +587,115 @@ impl Store {
             )
             .await?;
         Ok(())
+    }
+
+    /// Inserts an unresolved approval row for `request_id`, requested
+    /// now. The approval service writes exactly one per gated request.
+    pub async fn insert_approval(
+        &self,
+        request_id: &str,
+        capability: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO approval (request_id, capability, requested_ts)
+                 VALUES (?1, ?2, ?3)",
+                params![request_id, capability, now_ts()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Resolves `request_id`'s pending approval: sets `resolved_ts`,
+    /// `resolution`, and `note`.
+    ///
+    /// Race guard: only a row whose `resolved_ts` is still NULL is
+    /// updated; a request without one (never requested, or already
+    /// resolved) errors with [`StoreError::NotFound`], so two concurrent
+    /// resolutions cannot both claim the approval.
+    pub async fn resolve_approval(
+        &self,
+        request_id: &str,
+        resolution: ApprovalResolution,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE approval SET resolved_ts = ?2, resolution = ?3, note = ?4
+                 WHERE request_id = ?1 AND resolved_ts IS NULL",
+                params![request_id, now_ts(), resolution.as_str(), note],
+            )
+            .await?;
+        if changed == 0 {
+            return Err(StoreError::NotFound {
+                table: "approval",
+                id: request_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads `request_id`'s newest approval row, or `None` if it never
+    /// needed one.
+    pub async fn approval_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ApprovalRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, request_id, capability, requested_ts, resolved_ts,
+                        resolution, note
+                 FROM approval WHERE request_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![request_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => {
+                let resolution: Option<String> = row.get(5)?;
+                Ok(Some(ApprovalRow {
+                    id: row.get(0)?,
+                    request_id: row.get(1)?,
+                    capability: row.get(2)?,
+                    requested_ts: row.get(3)?,
+                    resolved_ts: row.get(4)?,
+                    resolution: resolution
+                        .as_deref()
+                        .map(ApprovalResolution::parse)
+                        .transpose()?,
+                    note: row.get(6)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Every unresolved approval joined with its request, oldest first —
+    /// the GUI's pending list.
+    pub async fn list_pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT a.request_id, a.capability, r.repo, r.caller_agent,
+                        a.requested_ts
+                 FROM approval a JOIN request r ON r.id = a.request_id
+                 WHERE a.resolved_ts IS NULL
+                 ORDER BY a.requested_ts, a.id",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(PendingApproval {
+                request_id: row.get(0)?,
+                capability: row.get(1)?,
+                repo: row.get(2)?,
+                caller_agent: row.get(3)?,
+                requested_ts: row.get(4)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Reads a setting value (JSON text), or `None` if unset.

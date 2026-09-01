@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 pam_daemon.workspace = true
 pam_proto.workspace = true
+sysinfo.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

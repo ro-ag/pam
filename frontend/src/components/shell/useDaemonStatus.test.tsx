@@ -20,7 +20,7 @@ const approval: PendingApproval = {
   capability: "fs.write",
   repo: "/tmp/repo",
   agent: "claude",
-  requested_ts: "2026-09-01T00:00:00Z",
+  requested_ts: 1_756_684_800,
 };
 
 beforeEach(() => {

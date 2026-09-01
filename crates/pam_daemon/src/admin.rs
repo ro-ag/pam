@@ -512,6 +512,10 @@ impl AdminService {
                     "capability": row.capability,
                     "repo": row.repo,
                     "agent": row.caller_agent,
+                    // Parsed back to JSON so the GUI's detail view renders
+                    // structured args, not a doubly-encoded string.
+                    "args": serde_json::from_str::<serde_json::Value>(&row.args_json)
+                        .unwrap_or(serde_json::Value::Null),
                     "state": row.state.as_str(),
                     "outcome": row.outcome,
                     "created_ts": row.created_ts,

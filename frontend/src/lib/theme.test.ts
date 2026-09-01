@@ -8,8 +8,10 @@ import {
   modeStorageKey,
   nextMode,
   nextTheme,
+  subscribeTheme,
   themeDefinition,
   themes,
+  themeSnapshot,
   themeStorageKey,
 } from "./theme";
 
@@ -40,6 +42,28 @@ describe("theme registry", () => {
     expect(nextTheme("vina")).toBe("ventisquero");
     expect(nextMode("light")).toBe("dark");
     expect(nextMode("dark")).toBe("light");
+  });
+});
+
+describe("the shared theme store", () => {
+  it("keeps the snapshot referentially stable between applies", () => {
+    applyTheme("vina", "dark", { persist: false });
+    expect(themeSnapshot()).toBe(themeSnapshot());
+    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "dark" });
+  });
+
+  it("notifies subscribers on every apply, until they unsubscribe", () => {
+    let seen = 0;
+    const unsubscribe = subscribeTheme(() => {
+      seen += 1;
+    });
+    applyTheme("ventisquero", "light", { persist: false });
+    applyTheme("vina", "light", { persist: false });
+    expect(seen).toBe(2);
+    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light" });
+    unsubscribe();
+    applyTheme("vina", "dark", { persist: false });
+    expect(seen).toBe(2);
   });
 });
 

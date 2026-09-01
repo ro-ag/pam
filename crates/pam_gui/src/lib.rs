@@ -40,6 +40,7 @@
 
 pub mod bridge;
 pub mod events;
+pub mod logs;
 
 #[cfg(test)]
 mod bridge_test;
@@ -47,6 +48,8 @@ mod bridge_test;
 mod events_test;
 #[cfg(test)]
 mod lib_test;
+#[cfg(test)]
+mod logs_test;
 
 /// Opens the pam desktop window and runs the Tauri event loop until the
 /// window closes.
@@ -64,7 +67,8 @@ pub fn run() -> tauri::Result<()> {
             bridge::admin_call,
             bridge::request_capability,
             bridge::daemon_stop,
-            events::events_subscribe
+            events::events_subscribe,
+            logs::read_daemon_log
         ])
         .run(tauri::generate_context!())
 }

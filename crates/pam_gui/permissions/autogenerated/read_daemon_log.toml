@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-daemon-log"
+description = "Enables the read_daemon_log command without any pre-configured scope."
+commands.allow = ["read_daemon_log"]
+
+[[permission]]
+identifier = "deny-read-daemon-log"
+description = "Denies the read_daemon_log command without any pre-configured scope."
+commands.deny = ["read_daemon_log"]

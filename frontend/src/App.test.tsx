@@ -56,13 +56,14 @@ describe("shell routing", () => {
     expect(screen.getAllByText("soon")).toHaveLength(2);
   });
 
-  it("hosts the migrated style proof on the Settings screen", async () => {
+  it("hosts the real Settings sections (the style proof is retired)", async () => {
     renderShell("/settings");
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    for (const verdict of ["verified", "changed", "queued", "refused"]) {
-      expect(screen.getByText(verdict)).toBeInTheDocument();
+    for (const section of ["Appearance", "Security", "Daemon", "Retention", "Logs"]) {
+      expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
     }
-    expect(screen.getByText(/tokens avoided this week/)).toBeInTheDocument();
+    // The design system's living proof moved out with task #30.
+    expect(screen.queryByText(/tokens avoided this week/)).not.toBeInTheDocument();
   });
 });
 

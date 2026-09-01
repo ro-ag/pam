@@ -110,12 +110,13 @@ export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): P
 
 export type Profile = "relaxed" | "standard" | "strict";
 
+/** One grant row; timestamps are unix seconds (`pam_store` integers). */
 export interface GrantRow {
   id: number;
   capability: string;
   scope: string;
-  granted_ts: string;
-  revoked_ts: string | null;
+  granted_ts: number;
+  revoked_ts: number | null;
 }
 
 /** One unresolved raised hand; `requested_ts` is unix seconds. */
@@ -204,6 +205,25 @@ export function activityList(
 
 export function callersList(): Promise<{ callers: CallerRow[] }> {
   return adminCall("admin.callers.list");
+}
+
+// --- daemon log ------------------------------------------------------------
+
+/** What `read_daemon_log` answers: the file read, and its tail. */
+export interface DaemonLogTail {
+  /** Full path of the newest daemon log file. */
+  file: string;
+  /** The last lines of that file, oldest first. */
+  lines: string[];
+}
+
+/**
+ * Tail of the newest daemon log file, read from disk by the GUI process
+ * itself (never a daemon op — the log's whole point is diagnosing a
+ * daemon that is down). `lines` is clamped to 50..=1000 Rust-side.
+ */
+export function readDaemonLog(lines: number): Promise<DaemonLogTail> {
+  return bridged<DaemonLogTail>("read_daemon_log", { lines });
 }
 
 // --- ordinary capabilities -------------------------------------------------

@@ -11,6 +11,7 @@
     "allow-request-capability",
     "allow-daemon-stop",
     "allow-events-subscribe",
+    "allow-read-daemon-log",
     "core:window:allow-start-dragging"
   ]
 }

@@ -1,16 +1,13 @@
 import { Moon, Sun } from "lucide-react";
-import { useState } from "react";
+import { useSyncExternalStore } from "react";
 import { cn } from "../../lib/cn";
 import {
   applyTheme,
-  defaultTheme,
-  isModeId,
-  isThemeId,
   nextMode,
   nextTheme,
+  subscribeTheme,
   themeDefinition,
-  type ModeId,
-  type ThemeId,
+  themeSnapshot,
 } from "../../lib/theme";
 import { Button } from "../ui/Button";
 import { Beacon } from "./Beacon";
@@ -34,26 +31,12 @@ function hasTrafficLights(): boolean {
 
 export function TopStrip() {
   const daemon = useDaemonStatus();
-  const [theme, setTheme] = useState<ThemeId>(() => {
-    const applied = document.documentElement.dataset.theme;
-    return isThemeId(applied) ? applied : defaultTheme;
-  });
-  const [mode, setMode] = useState<ModeId>(() => {
-    const applied = document.documentElement.dataset.mode;
-    return isModeId(applied) ? applied : "dark";
-  });
+  // The shared theme store keeps this strip and Settings > Appearance in
+  // agreement: whichever changes the combination, both re-render.
+  const { theme, mode } = useSyncExternalStore(subscribeTheme, themeSnapshot);
 
-  const cycleTheme = () => {
-    const upcoming = nextTheme(theme);
-    applyTheme(upcoming, mode);
-    setTheme(upcoming);
-  };
-
-  const toggleMode = () => {
-    const upcoming = nextMode(mode);
-    applyTheme(theme, upcoming);
-    setMode(upcoming);
-  };
+  const cycleTheme = () => applyTheme(nextTheme(theme), mode);
+  const toggleMode = () => applyTheme(theme, nextMode(mode));
 
   return (
     <header

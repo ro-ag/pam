@@ -87,7 +87,7 @@ pub struct BridgeError {
 
 impl BridgeError {
     /// Builds an error from its three parts.
-    fn new(
+    pub(crate) fn new(
         cause: impl Into<String>,
         detail: impl Into<String>,
         recovery: impl Into<String>,

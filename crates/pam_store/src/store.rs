@@ -150,6 +150,8 @@ pub struct RequestRow {
     pub caller_agent: String,
     /// Capability arguments as a JSON document.
     pub args_json: String,
+    /// Caller-chosen key for in-flight deduplication, when one was sent.
+    pub idempotency_key: Option<String>,
     /// Current lifecycle state.
     pub state: RequestState,
     /// Final outcome, once there is one.
@@ -235,6 +237,9 @@ impl Store {
     }
 
     /// Inserts a new request in the `queued` state.
+    ///
+    /// `idempotency_key` is the caller-chosen dedupe key from the request
+    /// envelope, when one was sent.
     pub async fn insert_request(
         &self,
         id: &str,
@@ -242,20 +247,22 @@ impl Store {
         repo: &str,
         caller_agent: &str,
         args_json: &str,
+        idempotency_key: Option<&str>,
     ) -> Result<(), StoreError> {
         let now = now_ts();
         self.conn
             .execute(
                 "INSERT INTO request
-                     (id, capability, repo, caller_agent, args_json, state,
-                      outcome, created_ts, updated_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)",
+                     (id, capability, repo, caller_agent, args_json,
+                      idempotency_key, state, outcome, created_ts, updated_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8)",
                 params![
                     id,
                     capability,
                     repo,
                     caller_agent,
                     args_json,
+                    idempotency_key,
                     RequestState::Queued.as_str(),
                     now
                 ],
@@ -264,32 +271,124 @@ impl Store {
         Ok(())
     }
 
-    /// Reads one request by id, or `None` if it does not exist.
-    pub async fn get_request(&self, id: &str) -> Result<Option<RequestRow>, StoreError> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id, capability, repo, caller_agent, args_json,
-                        state, outcome, created_ts, updated_ts
-                 FROM request WHERE id = ?1",
-                params![id],
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let state: String = row.get(5)?;
-        Ok(Some(RequestRow {
+    /// The `request` column list every row query selects, in the order
+    /// [`Self::parse_request_row`] expects.
+    const REQUEST_COLUMNS: &'static str = "id, capability, repo, caller_agent, args_json,
+         idempotency_key, state, outcome, created_ts, updated_ts";
+
+    /// Builds a [`RequestRow`] from a row selected with
+    /// [`Self::REQUEST_COLUMNS`].
+    fn parse_request_row(row: &turso::Row) -> Result<RequestRow, StoreError> {
+        let state: String = row.get(6)?;
+        Ok(RequestRow {
             id: row.get(0)?,
             capability: row.get(1)?,
             repo: row.get(2)?,
             caller_agent: row.get(3)?,
             args_json: row.get(4)?,
+            idempotency_key: row.get(5)?,
             state: RequestState::parse(&state)?,
-            outcome: row.get(6)?,
-            created_ts: row.get(7)?,
-            updated_ts: row.get(8)?,
-        }))
+            outcome: row.get(7)?,
+            created_ts: row.get(8)?,
+            updated_ts: row.get(9)?,
+        })
+    }
+
+    /// Reads one request by id, or `None` if it does not exist.
+    pub async fn get_request(&self, id: &str) -> Result<Option<RequestRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request WHERE id = ?1",
+                    Self::REQUEST_COLUMNS
+                ),
+                params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(Self::parse_request_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Finds the oldest in-flight request carrying `idempotency_key`.
+    ///
+    /// In-flight means state `queued`, `running`, or `waiting_approval`;
+    /// terminal requests never match, so a retried key after completion
+    /// starts a fresh execution. Used by the queue manager's dedupe check.
+    pub async fn find_inflight_by_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<RequestRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request
+                     WHERE idempotency_key = ?1
+                       AND state IN ('queued','running','waiting_approval')
+                     ORDER BY created_ts, id LIMIT 1",
+                    Self::REQUEST_COLUMNS
+                ),
+                params![idempotency_key],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(Self::parse_request_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Finds the oldest in-flight request with the same shape: equal
+    /// `capability`, `repo`, and `args_json` (byte equality of the JSON
+    /// text). Fallback dedupe for envelopes without an idempotency key;
+    /// matches regardless of whether the in-flight request carries one.
+    pub async fn find_inflight_by_shape(
+        &self,
+        capability: &str,
+        repo: &str,
+        args_json: &str,
+    ) -> Result<Option<RequestRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request
+                     WHERE capability = ?1 AND repo = ?2 AND args_json = ?3
+                       AND state IN ('queued','running','waiting_approval')
+                     ORDER BY created_ts, id LIMIT 1",
+                    Self::REQUEST_COLUMNS
+                ),
+                params![capability, repo, args_json],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(Self::parse_request_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads every `queued` request, oldest first (ties broken by id, and
+    /// request ids are ULID-ordered). The queue manager rebuilds its lanes
+    /// from this on boot.
+    pub async fn list_queued_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request
+                     WHERE state = 'queued' ORDER BY created_ts, id",
+                    Self::REQUEST_COLUMNS
+                ),
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::parse_request_row(&row)?);
+        }
+        Ok(out)
     }
 
     /// Moves a request to `state`, recording `outcome` and bumping

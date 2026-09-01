@@ -17,6 +17,8 @@ zeromq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `start_paused` tests for lease/reaper timing need the paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

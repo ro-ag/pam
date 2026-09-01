@@ -28,6 +28,29 @@
 //! a fresh gate pass — an accepted, narrow window (the capability was
 //! at worst one auto-grant away from allowed).
 //!
+//! # Admin surface (GUI-only)
+//!
+//! Envelopes whose capability starts with the reserved
+//! [`crate::admin::ADMIN_PREFIX`] are intercepted right after the
+//! lifecycle/version gates and handed to [`crate::admin::AdminService`]
+//! — **before** classify, admit, and the policy gate. Admin operations
+//! are not capabilities: they have no `classify()` entry and can never
+//! be granted, approved, or queued. The service records its own request
+//! row, enforces the envelope deadline, audits every outcome
+//! ([`ACTION_ADMIN`] / [`ACTION_ADMIN_DENIED`] are terminal actions),
+//! and answers synchronously — no events, except what an approval
+//! resolution already publishes through the approval service. The full
+//! security model (why GUI-only is structural for CLI users but
+//! advisory at the socket) lives in the [`crate::admin`] module docs.
+//!
+//! # Caller registry
+//!
+//! Every **admitted** request (bypass, laned, or attached duplicate)
+//! upserts its observed agent+repo pair into the `caller` table — an
+//! advisory registry feeding the GUI sidebar and activity filters,
+//! never authorization. Admin envelopes are deliberately excluded: the
+//! GUI is not an observed workload.
+//!
 //! # Boot order and lifecycle
 //!
 //! [`run_daemon_with`] boots in a fixed order: **instance lock** →
@@ -157,6 +180,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
 use crate::lifecycle::{
@@ -214,6 +238,8 @@ pub const TERMINAL_ACTIONS: &[&str] = &[
     ACTION_EXECUTE,
     ACTION_DEADLINE_REFUSAL,
     ACTION_INTERNAL_FAILURE,
+    ACTION_ADMIN,
+    ACTION_ADMIN_DENIED,
     crate::queue::ACTION_CANCEL,
     crate::queue::ACTION_LEASE_REAPED,
     crate::lifecycle::ACTION_DAEMON_RESTART,
@@ -525,6 +551,7 @@ pub async fn run_daemon_with(
         gate,
         queue: Arc::clone(&queue),
         approvals: Arc::clone(&approvals),
+        admin: AdminService::new(Arc::clone(&store), Arc::clone(&approvals)),
         events: transport.event_publisher(),
         router: CompletionRouter::new(),
         work: Notify::new(),
@@ -622,6 +649,10 @@ struct Pipeline {
     gate: PolicyGate,
     queue: Arc<QueueManager>,
     approvals: Arc<ApprovalService>,
+    /// GUI-only admin surface; envelopes under the reserved `admin.`
+    /// prefix are handed here **before** classify/admit and never touch
+    /// the gate, grants, or lanes (see [`crate::admin`]).
+    admin: AdminService,
     events: EventPublisher,
     router: CompletionRouter,
     /// Kicked on lane placement and execution completion; wakes the
@@ -721,6 +752,17 @@ impl Pipeline {
             return;
         }
 
+        // Admin surface: the reserved `admin.` prefix is intercepted
+        // BEFORE classify/admit — admin operations are not capabilities
+        // and never touch the gate, grants, dedupe, or lanes. The
+        // service records, audits, and answers on its own (deadline
+        // included); see `crate::admin` for the full security model.
+        if envelope.capability.starts_with(ADMIN_PREFIX) {
+            let response = self.admin.handle(&envelope).await;
+            let _ = reply.send(response);
+            return;
+        }
+
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
         let Some(class) = classify(&envelope.capability) else {
@@ -733,6 +775,13 @@ impl Pipeline {
             let _ = reply.send(internal_refusal(&id));
             return;
         };
+        // Advisory caller registry: every admitted request records its
+        // observed agent+repo pair (attribution and GUI filters, never
+        // authorization). Failures are non-fatal bookkeeping.
+        let _ = self
+            .store
+            .upsert_caller(&envelope.caller.agent, &envelope.caller.repo)
+            .await;
 
         match admitted {
             AdmitOutcome::Attached {

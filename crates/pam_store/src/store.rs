@@ -12,6 +12,14 @@ use turso::{Builder, Connection, Database, params};
 use crate::error::StoreError;
 use crate::migrations;
 
+/// Default `limit` for [`Store::list_requests_filtered`] when the caller
+/// passes `None`.
+pub const DEFAULT_REQUEST_LIST_LIMIT: u64 = 100;
+
+/// Hard upper bound on [`Store::list_requests_filtered`]'s `limit`; a
+/// larger request is clamped, keeping the activity query bounded.
+pub const MAX_REQUEST_LIST_LIMIT: u64 = 500;
+
 /// Lifecycle state of a capability request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestState {
@@ -50,7 +58,8 @@ impl RequestState {
         matches!(self, Self::Done | Self::Refused | Self::Failed)
     }
 
-    fn parse(value: &str) -> Result<Self, StoreError> {
+    /// Parses a `request.state` column value back into the enum.
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
@@ -237,6 +246,36 @@ pub struct PendingApproval {
     pub caller_agent: String,
     /// Unix seconds when the approval was requested.
     pub requested_ts: i64,
+}
+
+/// One row of the `grant` table — history included: a revoked grant
+/// keeps its row with `revoked_ts` set, and a re-grant is a new row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRow {
+    /// Grant row id.
+    pub id: i64,
+    /// Capability the grant covers.
+    pub capability: String,
+    /// Grant scope; only `global` exists today.
+    pub scope: String,
+    /// Unix seconds when the grant was recorded.
+    pub granted_ts: i64,
+    /// Unix seconds when the grant was revoked, once it was.
+    pub revoked_ts: Option<i64>,
+}
+
+/// One row of the `caller` table — an observed agent+repo pair. An
+/// advisory registry (attribution and GUI filters), never authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerRow {
+    /// Agent name the caller self-reported.
+    pub agent: String,
+    /// Repository path the caller worked in.
+    pub repo: String,
+    /// Unix seconds when this pair was first observed.
+    pub first_seen: i64,
+    /// Unix seconds when this pair was last observed.
+    pub last_seen: i64,
 }
 
 /// The audit row [`Store::finish_request`] appends alongside a terminal
@@ -776,9 +815,10 @@ impl Store {
     /// granted now).
     ///
     /// History is preserved by design: revocation sets `revoked_ts` on the
-    /// old row and a re-grant is a new row. There is deliberately no revoke
-    /// helper yet — revocation is GUI-only administration and arrives with
-    /// that surface.
+    /// old row ([`Self::revoke_grant`]) and a re-grant is a new row.
+    /// Granting and revoking are GUI-only administration (the daemon's
+    /// admin surface); the policy gate only ever *adds* grants, on the
+    /// relaxed profile's auto-grant path.
     pub async fn insert_grant(&self, capability: &str) -> Result<(), StoreError> {
         self.conn
             .execute(
@@ -788,6 +828,136 @@ impl Store {
             )
             .await?;
         Ok(())
+    }
+
+    /// Revokes `capability`'s active grant by setting `revoked_ts` — the
+    /// row stays, as history. Errors with [`StoreError::NotFound`] when
+    /// no active grant exists (never granted, or already revoked).
+    pub async fn revoke_grant(&self, capability: &str) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE \"grant\" SET revoked_ts = ?2
+                 WHERE capability = ?1 AND revoked_ts IS NULL",
+                params![capability, now_ts()],
+            )
+            .await?;
+        if changed == 0 {
+            return Err(StoreError::NotFound {
+                table: "grant",
+                id: capability.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Every grant row, revoked history included, newest first — the
+    /// GUI's capability view.
+    pub async fn list_grants(&self) -> Result<Vec<GrantRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, capability, scope, granted_ts, revoked_ts
+                 FROM \"grant\" ORDER BY granted_ts DESC, id DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(GrantRow {
+                id: row.get(0)?,
+                capability: row.get(1)?,
+                scope: row.get(2)?,
+                granted_ts: row.get(3)?,
+                revoked_ts: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Recent request rows, newest first, optionally filtered by exact
+    /// `repo`, `caller_agent`, and/or `state` — the GUI's activity feed.
+    ///
+    /// `limit` defaults to [`DEFAULT_REQUEST_LIST_LIMIT`] and is clamped
+    /// into `1..=`[`MAX_REQUEST_LIST_LIMIT`], so the query stays bounded
+    /// no matter what the caller asks for.
+    pub async fn list_requests_filtered(
+        &self,
+        limit: Option<u64>,
+        repo: Option<&str>,
+        agent: Option<&str>,
+        state: Option<RequestState>,
+    ) -> Result<Vec<RequestRow>, StoreError> {
+        let limit = limit
+            .unwrap_or(DEFAULT_REQUEST_LIST_LIMIT)
+            .clamp(1, MAX_REQUEST_LIST_LIMIT);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<String> = Vec::new();
+        for (column, value) in [
+            ("repo", repo),
+            ("caller_agent", agent),
+            ("state", state.map(RequestState::as_str)),
+        ] {
+            if let Some(value) = value {
+                args.push(value.to_owned());
+                clauses.push(format!("{column} = ?{}", args.len()));
+            }
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {} ", clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT {} FROM request {where_sql}\
+             ORDER BY created_ts DESC, id DESC LIMIT {limit}",
+            Self::REQUEST_COLUMNS
+        );
+        let mut rows = self.conn.query(&sql, args).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::parse_request_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Records that the agent+repo pair was observed now: inserts the
+    /// `caller` row on first sight, bumps `last_seen` afterwards. The
+    /// registry is advisory (see [`CallerRow`]); the pipeline calls this
+    /// on every admitted request.
+    pub async fn upsert_caller(&self, agent: &str, repo: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO caller (agent, repo, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT (agent, repo) DO UPDATE SET last_seen = excluded.last_seen",
+                params![agent, repo, now_ts()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every observed agent+repo pair, most recently seen first — feeds
+    /// the GUI sidebar and activity filters.
+    pub async fn list_callers(&self) -> Result<Vec<CallerRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT agent, repo, first_seen, last_seen
+                 FROM caller ORDER BY last_seen DESC, agent, repo",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(CallerRow {
+                agent: row.get(0)?,
+                repo: row.get(1)?,
+                first_seen: row.get(2)?,
+                last_seen: row.get(3)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Inserts an unresolved approval row for `request_id`, requested

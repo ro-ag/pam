@@ -167,3 +167,46 @@ fn probe_reports_the_lock_holder_and_its_release() {
         "lock released after drop"
     );
 }
+
+#[tokio::test]
+async fn send_request_refuses_admin_capabilities_before_the_socket() {
+    // No daemon exists under this base; the guard must fire before
+    // ensure_daemon would try to spawn one.
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let err = crate::client::send_request(
+        tmp.path(),
+        "admin.grants.add",
+        serde_json::json!({ "capability": "deploy" }),
+        true,
+        1_000,
+        None,
+    )
+    .await
+    .expect_err("admin capabilities are refused");
+
+    assert!(matches!(
+        err,
+        crate::client::RequestError::AdminOnly { ref capability }
+            if capability == "admin.grants.add"
+    ));
+    let dirs = RuntimeDir::at_base(tmp.path()).expect("runtime dir");
+    assert!(
+        !dirs.router_socket().exists(),
+        "the guard fired before anything touched the runtime dir"
+    );
+}
+
+#[tokio::test]
+async fn send_admin_rejects_non_admin_operations() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let err = crate::client::send_admin(tmp.path(), "echo", serde_json::json!({}), 1_000)
+        .await
+        .expect_err("non-admin capabilities are refused");
+
+    assert!(matches!(
+        err,
+        crate::client::RequestError::NotAdmin { ref capability } if capability == "echo"
+    ));
+}

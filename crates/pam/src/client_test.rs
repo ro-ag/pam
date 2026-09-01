@@ -2,10 +2,15 @@ use std::fs::File;
 use std::io;
 use std::time::Duration;
 
+use pam_daemon::daemon::CAUSE_DAEMON_OUTDATED;
 use pam_daemon::lifecycle::{InstanceLock, acquire_instance_lock};
 use pam_daemon::runtime_dir::RuntimeDir;
+use pam_proto::{Outcome, Response};
 
-use crate::client::{ClientError, EnsureOutcome, ensure_daemon_with};
+use crate::client::{
+    ClientError, DaemonStatus, EnsureOutcome, ensure_daemon_with, probe_daemon, should_retry,
+    wait_for_daemon_exit,
+};
 
 /// Short bounds so the not-ready path stays fast.
 const WAIT: Duration = Duration::from_millis(120);
@@ -104,4 +109,61 @@ fn a_failing_spawn_is_reported_as_a_spawn_error() {
     .expect_err("spawn failure surfaces");
 
     assert!(matches!(err, ClientError::Spawn { .. }), "got {err:?}");
+}
+
+#[test]
+fn only_the_outdated_refusal_triggers_the_retry() {
+    let outdated = Response::Refusal {
+        id: "req_x".to_owned(),
+        cause: CAUSE_DAEMON_OUTDATED.to_owned(),
+        detail: "d".to_owned(),
+        recovery: "r".to_owned(),
+    };
+    assert!(should_retry(&outdated));
+
+    let other_refusal = Response::Refusal {
+        id: "req_x".to_owned(),
+        cause: "not_granted".to_owned(),
+        detail: "d".to_owned(),
+        recovery: "r".to_owned(),
+    };
+    assert!(!should_retry(&other_refusal));
+
+    let result = Response::Result {
+        id: "req_x".to_owned(),
+        outcome: Outcome::Solved,
+        body: serde_json::json!({}),
+        evidence: Vec::new(),
+    };
+    assert!(!should_retry(&result));
+}
+
+#[test]
+fn probe_reports_the_lock_holder_and_its_release() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    assert_eq!(
+        probe_daemon(tmp.path()).expect("probe ok"),
+        DaemonStatus::NotRunning
+    );
+
+    let daemon = start_fake_daemon(tmp.path());
+    assert_eq!(
+        probe_daemon(tmp.path()).expect("probe ok"),
+        DaemonStatus::Running {
+            pid: Some(std::process::id()),
+        }
+    );
+
+    // Held lock: the bounded wait times out without release.
+    assert!(
+        !wait_for_daemon_exit(tmp.path(), WAIT).expect("wait ok"),
+        "lock is still held"
+    );
+
+    drop(daemon);
+    assert!(
+        wait_for_daemon_exit(tmp.path(), WAIT).expect("wait ok"),
+        "lock released after drop"
+    );
 }

@@ -18,11 +18,20 @@
 //! cannot be fooled by a leftover socket file, needs no timeout, and
 //! costs one syscall.
 //!
-//! # What this module does not do
+//! # Request flow
 //!
-//! Sending the actual request (and retrying it once after an
-//! auto-start or a `daemon_outdated` refusal) is the full CLI request
-//! flow, built on top of this in the client work (task #13).
+//! [`send_request`] is the full path every client subcommand takes:
+//! ensure the daemon exists, build the envelope ([`crate::request`]),
+//! exchange it over a zmq `DEALER` against `pam.sock` with a client-side
+//! timeout of `deadline_ms` plus a margin, and retry exactly once after
+//! a [`CAUSE_DAEMON_OUTDATED`] refusal (the daemon drains and re-spawns
+//! the newer binary; the spec says the client retries).
+//!
+//! [`follow_ticket`] is the event side: subscribe to `events.sock` on
+//! the ticket's topic and stream events until a terminal `done` /
+//! `refused` (bounded by a caller-chosen timeout). `pam wait` follows
+//! quietly; `pam subscribe` prints each event — one code path, the
+//! callback decides.
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io;
@@ -30,9 +39,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pam_daemon::daemon::CAUSE_DAEMON_OUTDATED;
 use pam_daemon::lifecycle::LOCK_FILE;
 use pam_daemon::runtime_dir::{RuntimeDir, RuntimeDirError};
+use pam_proto::{Envelope, Event, Response};
 use thiserror::Error;
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+
+use crate::request::build_envelope;
 
 /// How long [`ensure_daemon`] waits for a spawned daemon to become
 /// ready, per spawn attempt.
@@ -178,4 +192,231 @@ fn spawn_detached_daemon() -> io::Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .map(|_child| ())
+}
+
+/// Default bound on `pam wait` / `pam subscribe` (10 minutes).
+pub const DEFAULT_FOLLOW_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Extra client-side budget on top of the envelope's `deadline_ms`
+/// before [`send_request`] gives up on a reply: the daemon enforces the
+/// deadline itself (it refuses, not hangs), so the margin only covers
+/// transport latency around that refusal.
+const REPLY_MARGIN: Duration = Duration::from_secs(5);
+
+/// Pause before the single retry after a `daemon_outdated` refusal —
+/// long enough for the old daemon to finish its drain and the new
+/// binary to take the lock in the common case.
+const OUTDATED_RETRY_PAUSE: Duration = Duration::from_millis(750);
+
+/// Why the request flow failed client-side (a daemon-side "no" is a
+/// [`Response::Refusal`], not an error).
+#[derive(Debug, Error)]
+pub enum RequestError {
+    /// The daemon could not be ensured.
+    #[error(transparent)]
+    Ensure(#[from] ClientError),
+    /// The runtime directory is unusable.
+    #[error(transparent)]
+    RuntimeDir(#[from] RuntimeDirError),
+    /// Connecting a socket failed.
+    #[error("cannot connect to {endpoint}: {source}")]
+    Connect {
+        /// The `ipc://` endpoint that failed.
+        endpoint: String,
+        /// The underlying zmq error.
+        #[source]
+        source: zeromq::ZmqError,
+    },
+    /// The zmq exchange itself failed.
+    #[error("transport failure talking to the daemon: {source}")]
+    Transport {
+        /// The underlying zmq error.
+        #[source]
+        source: zeromq::ZmqError,
+    },
+    /// The daemon's bytes did not parse as a [`Response`] / [`Event`].
+    #[error("cannot parse the daemon's reply: {source}")]
+    Parse {
+        /// The underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// No reply within the client-side budget.
+    #[error("no reply from the daemon within {waited:?} (deadline plus margin)")]
+    ReplyTimeout {
+        /// How long the client waited.
+        waited: Duration,
+    },
+    /// No terminal event within the follow bound.
+    #[error("request {ticket} did not reach a terminal event within {waited:?}")]
+    FollowTimeout {
+        /// The ticket being followed.
+        ticket: String,
+        /// How long the client waited.
+        waited: Duration,
+    },
+}
+
+/// True when `response` is the version-handshake refusal after which
+/// the spec tells the client to retry once: the daemon found the binary
+/// on disk newer than itself and is restarting.
+#[must_use]
+pub fn should_retry(response: &Response) -> bool {
+    matches!(response, Response::Refusal { cause, .. } if cause == CAUSE_DAEMON_OUTDATED)
+}
+
+/// Sends one request through the full client flow (see the module docs):
+/// ensure the daemon, build the envelope, exchange over `pam.sock`, and
+/// retry exactly once after a `daemon_outdated` refusal.
+///
+/// The daemon's answer — result, refusal, or ticket — is returned as-is;
+/// rendering and exit codes are the caller's job ([`crate::render`]).
+pub async fn send_request(
+    base_dir: &Path,
+    capability: &str,
+    args: serde_json::Value,
+    wait: bool,
+    deadline_ms: u64,
+    idempotency_key: Option<String>,
+) -> Result<Response, RequestError> {
+    let envelope = build_envelope(capability, args, wait, deadline_ms, idempotency_key);
+    let mut retried = false;
+    loop {
+        ensure_daemon(base_dir)?;
+        let dirs = RuntimeDir::at_base(base_dir)?;
+        let response = exchange(&dirs, &envelope).await?;
+        if should_retry(&response) && !retried {
+            retried = true;
+            tokio::time::sleep(OUTDATED_RETRY_PAUSE).await;
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
+/// One `DEALER` exchange: connect, send the envelope, await its single
+/// reply under `deadline_ms` plus [`REPLY_MARGIN`].
+async fn exchange(dirs: &RuntimeDir, envelope: &Envelope) -> Result<Response, RequestError> {
+    let endpoint = dirs.router_endpoint();
+    let mut dealer = DealerSocket::new();
+    dealer
+        .connect(&endpoint)
+        .await
+        .map_err(|source| RequestError::Connect { endpoint, source })?;
+    let payload = serde_json::to_vec(envelope).map_err(|source| RequestError::Parse { source })?;
+    dealer
+        .send(ZmqMessage::from(payload))
+        .await
+        .map_err(|source| RequestError::Transport { source })?;
+
+    let budget = Duration::from_millis(envelope.deadline_ms) + REPLY_MARGIN;
+    let reply = tokio::time::timeout(budget, dealer.recv())
+        .await
+        .map_err(|_elapsed| RequestError::ReplyTimeout { waited: budget })?
+        .map_err(|source| RequestError::Transport { source })?;
+    let frames = reply.into_vec();
+    let payload = frames
+        .first()
+        .map(|frame| frame.to_vec())
+        .unwrap_or_default();
+    serde_json::from_slice(&payload).map_err(|source| RequestError::Parse { source })
+}
+
+/// Follows a ticket's event stream on `events.sock` until its terminal
+/// `done` / `refused` event, calling `on_event` for every event seen
+/// (the terminal one included). Returns the terminal event; gives up
+/// with [`RequestError::FollowTimeout`] past `timeout`.
+///
+/// Events published before the subscription registered are gone (zmq
+/// `PUB` has no replay); a request that finished before `pam wait`
+/// started therefore times out rather than terminating — the bound is
+/// what keeps that legible.
+pub async fn follow_ticket(
+    base_dir: &Path,
+    ticket: &str,
+    timeout: Duration,
+    mut on_event: impl FnMut(&Event),
+) -> Result<Event, RequestError> {
+    ensure_daemon(base_dir)?;
+    let dirs = RuntimeDir::at_base(base_dir)?;
+    let endpoint = dirs.events_endpoint();
+    let mut sub = SubSocket::new();
+    sub.connect(&endpoint)
+        .await
+        .map_err(|source| RequestError::Connect { endpoint, source })?;
+    sub.subscribe(ticket)
+        .await
+        .map_err(|source| RequestError::Transport { source })?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RequestError::FollowTimeout {
+                ticket: ticket.to_owned(),
+                waited: timeout,
+            });
+        }
+        let message = tokio::time::timeout(remaining, sub.recv())
+            .await
+            .map_err(|_elapsed| RequestError::FollowTimeout {
+                ticket: ticket.to_owned(),
+                waited: timeout,
+            })?
+            .map_err(|source| RequestError::Transport { source })?;
+        let frames = message.into_vec();
+        // PUB frames are [topic, payload]; anything shorter is noise.
+        let Some(payload) = frames.get(1) else {
+            continue;
+        };
+        let event: Event =
+            serde_json::from_slice(payload).map_err(|source| RequestError::Parse { source })?;
+        on_event(&event);
+        if matches!(event, Event::Done | Event::Refused) {
+            return Ok(event);
+        }
+    }
+}
+
+/// What the daemon-lock probe found, for `pam daemon stop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// Nobody holds the instance lock.
+    NotRunning,
+    /// A daemon holds the lock; `pid` when the lock file was readable.
+    Running {
+        /// The holder's pid.
+        pid: Option<u32>,
+    },
+}
+
+/// Probes whether a daemon holds the instance lock under `base_dir`,
+/// reporting its pid (from the lock file) when it does.
+pub fn probe_daemon(base_dir: &Path) -> Result<DaemonStatus, ClientError> {
+    let dirs = RuntimeDir::at_base(base_dir)?;
+    let path = dirs.run_dir().join(LOCK_FILE);
+    if !lock_is_held(&path)? {
+        return Ok(DaemonStatus::NotRunning);
+    }
+    let pid = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok());
+    Ok(DaemonStatus::Running { pid })
+}
+
+/// Waits (bounded) for the daemon lock under `base_dir` to be released:
+/// `true` when it was released within `timeout`.
+pub fn wait_for_daemon_exit(base_dir: &Path, timeout: Duration) -> Result<bool, ClientError> {
+    let dirs = RuntimeDir::at_base(base_dir)?;
+    let path = dirs.run_dir().join(LOCK_FILE);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !lock_is_held(&path)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(READINESS_POLL);
+    }
 }

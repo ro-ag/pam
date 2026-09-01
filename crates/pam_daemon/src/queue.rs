@@ -8,7 +8,7 @@
 //! in-memory index over the `request` table: the table is the durable
 //! truth (state `queued`), so [`QueueManager::rebuild_from_store`]
 //! reconstructs every lane on boot. Read-only capabilities never enter a
-//! lane at all ([`EnqueueOutcome::Bypass`]).
+//! lane at all ([`AdmitOutcome::Bypass`]).
 //!
 //! # Bypass row semantics
 //!
@@ -18,6 +18,25 @@
 //! pushed into a lane. The caller executes it straight away and records
 //! the terminal state itself.
 //!
+//! # Admission vs placement
+//!
+//! Admission is split in two so the policy gate can run in between with
+//! every contract intact ([`PolicyGate::evaluate`] needs the `request`
+//! row to exist; the spec wants the gate before enqueue):
+//!
+//! 1. [`QueueManager::admit`] — dedupe check + `request` row insert
+//!    (state `queued`), atomically under the internal mutex.
+//! 2. [`QueueManager::place_in_lane`] — pushes the admitted request onto
+//!    its repo's lane, once the gate has allowed it.
+//!
+//! A gate refusal between the two moves the row straight to `refused`;
+//! the id never reaches a lane. A concurrent duplicate arriving in that
+//! window attaches to the admitted request and is forwarded whatever
+//! terminal response it gets — refusals included — which is exactly what
+//! running the duplicate itself would have produced.
+//!
+//! [`PolicyGate::evaluate`]: crate::policy::PolicyGate::evaluate
+//!
 //! # Deduplication
 //!
 //! Before inserting a laned request, the manager looks for an *in-flight*
@@ -25,11 +44,12 @@
 //! `idempotency_key` when the envelope carries one, otherwise by shape —
 //! byte equality of capability + repo + serialized args (deterministic:
 //! `serde_json` serializes maps with sorted keys). A hit returns
-//! [`EnqueueOutcome::Attached`] naming the existing request; the caller
+//! [`AdmitOutcome::Attached`] naming the existing request; the caller
 //! subscribes to that request's events and result instead of starting a
 //! second execution. Terminal requests never match, so retries after
 //! completion run fresh. The internal mutex is held across the
-//! check-then-insert, so concurrent enqueues cannot both miss the check.
+//! check-then-insert, so concurrent admissions cannot both miss the
+//! check.
 //!
 //! # Leases
 //!
@@ -107,15 +127,12 @@ pub const ACTION_CANCEL: &str = "cancel";
 /// `audit.action` for a lease the reaper collected.
 pub const ACTION_LEASE_REAPED: &str = "lease_reaped";
 
-/// What [`QueueManager::enqueue`] did with a request.
+/// What [`QueueManager::admit`] did with a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnqueueOutcome {
-    /// A new request row was inserted and queued on its repo's lane.
-    New {
-        /// Requests already waiting ahead of it in the lane (0 = lane
-        /// head). A currently leased request is not counted.
-        position: usize,
-    },
+pub enum AdmitOutcome {
+    /// A new request row was inserted in state `queued`. The caller gates
+    /// it and, on allow, calls [`QueueManager::place_in_lane`].
+    Admitted,
     /// An in-flight duplicate exists; no row was inserted. The caller
     /// attaches to the existing request's events and result.
     Attached {
@@ -217,17 +234,19 @@ impl QueueManager {
         }
     }
 
-    /// Admits `envelope` (already past the policy gate, classified as
-    /// `class`) into the queue.
+    /// Admits `envelope` (classified as `class`) into the queue: dedupe
+    /// check plus `request` row insert, but **no** lane placement — the
+    /// caller gates the admitted request first, then calls
+    /// [`Self::place_in_lane`] (see the module docs on admission vs
+    /// placement).
     ///
-    /// Read-only capabilities bypass lanes (see the module docs for the
-    /// bypass row semantics). Everything else is deduplicated against
-    /// in-flight requests, then inserted `queued` on its repo's lane.
-    pub async fn enqueue(
+    /// Read-only capabilities bypass lanes and dedupe entirely (see the
+    /// module docs for the bypass row semantics).
+    pub async fn admit(
         &self,
         envelope: &Envelope,
         class: crate::policy::CapabilityClass,
-    ) -> Result<EnqueueOutcome, QueueError> {
+    ) -> Result<AdmitOutcome, QueueError> {
         let args_json = envelope.args.to_string();
         if class == crate::policy::CapabilityClass::ReadOnly {
             // Bypass: on record for the audit trail, never in a lane.
@@ -235,12 +254,12 @@ impl QueueManager {
             self.store
                 .update_request_state(&envelope.id, RequestState::Running, None)
                 .await?;
-            return Ok(EnqueueOutcome::Bypass);
+            return Ok(AdmitOutcome::Bypass);
         }
 
         // The lock spans dedupe-check + insert so two concurrent
         // duplicates cannot both miss the check and both insert.
-        let mut inner = self.inner.lock().await;
+        let _inner = self.inner.lock().await;
         let existing = match &envelope.idempotency_key {
             Some(key) => self.store.find_inflight_by_key(key).await?,
             None => {
@@ -250,19 +269,42 @@ impl QueueManager {
             }
         };
         if let Some(row) = existing {
-            return Ok(EnqueueOutcome::Attached {
+            return Ok(AdmitOutcome::Attached {
                 existing_request_id: row.id,
             });
         }
 
         self.insert_row(envelope, &args_json).await?;
-        let lane = inner.lanes.entry(envelope.caller.repo.clone()).or_default();
+        Ok(AdmitOutcome::Admitted)
+    }
+
+    /// Places an admitted (and gate-allowed) request onto `repo`'s lane,
+    /// with a lease budget derived from `deadline_ms` (clamped to
+    /// [`MAX_LEASE`]). Returns the number of requests already waiting
+    /// ahead of it (0 = lane head; a currently leased request is not
+    /// counted).
+    pub async fn place_in_lane(&self, request_id: &str, repo: &str, deadline_ms: u64) -> usize {
+        let mut inner = self.inner.lock().await;
+        let lane = inner.lanes.entry(repo.to_owned()).or_default();
         let position = lane.len();
         lane.push_back(QueuedEntry {
-            id: envelope.id.clone(),
-            lease_budget: clamp_lease(envelope.deadline_ms),
+            id: request_id.to_owned(),
+            lease_budget: clamp_lease(deadline_ms),
         });
-        Ok(EnqueueOutcome::New { position })
+        position
+    }
+
+    /// Repos whose lane has waiting work and no outstanding lease — the
+    /// lanes a [`Self::take_next`] call would currently serve. The
+    /// executor loop polls this to know where to look.
+    pub async fn ready_repos(&self) -> Vec<String> {
+        let inner = self.inner.lock().await;
+        inner
+            .lanes
+            .keys()
+            .filter(|repo| !inner.busy.contains_key(*repo))
+            .cloned()
+            .collect()
     }
 
     /// Takes the next request from `repo`'s lane under a fresh lease, or

@@ -8,8 +8,8 @@ use tokio::time::{Instant, advance, timeout};
 
 use crate::policy::CapabilityClass;
 use crate::queue::{
-    ACTION_CANCEL, ACTION_LEASE_REAPED, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, CancelOutcome,
-    EnqueueOutcome, QueueError, QueueManager,
+    ACTION_CANCEL, ACTION_LEASE_REAPED, AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED,
+    CancelOutcome, QueueError, QueueManager,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -40,12 +40,21 @@ async fn manager() -> (Arc<Store>, Arc<QueueManager>) {
     (store, queue)
 }
 
-/// Enqueues as non-destructive (the ordinary laned class) and unwraps.
-async fn enqueue(queue: &QueueManager, envelope: &Envelope) -> EnqueueOutcome {
+/// Admits as non-destructive (the ordinary laned class) and unwraps.
+async fn admit(queue: &QueueManager, envelope: &Envelope) -> AdmitOutcome {
     queue
-        .enqueue(envelope, CapabilityClass::NonDestructive)
+        .admit(envelope, CapabilityClass::NonDestructive)
         .await
         .unwrap()
+}
+
+/// Admits and places on the lane (the full pre-gate + post-gate pair),
+/// panicking on attach or bypass; returns the lane position.
+async fn enqueue(queue: &QueueManager, envelope: &Envelope) -> usize {
+    assert_eq!(admit(queue, envelope).await, AdmitOutcome::Admitted);
+    queue
+        .place_in_lane(&envelope.id, &envelope.caller.repo, envelope.deadline_ms)
+        .await
 }
 
 #[tokio::test]
@@ -61,16 +70,10 @@ async fn enqueue_new_inserts_queued_row_with_lane_position() {
                 serde_json::json!({ "n": i }),
                 None,
             );
-            assert_eq!(
-                enqueue(&queue, &env).await,
-                EnqueueOutcome::New { position: expected }
-            );
+            assert_eq!(enqueue(&queue, &env).await, expected);
         }
         let env = envelope("req_b1", REPO_B, serde_json::json!({ "n": 1 }), None);
-        assert_eq!(
-            enqueue(&queue, &env).await,
-            EnqueueOutcome::New { position: 0 }
-        );
+        assert_eq!(enqueue(&queue, &env).await, 0);
 
         let row = store.get_request("req_a1").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Queued);
@@ -150,11 +153,8 @@ async fn read_only_bypasses_lanes_but_leaves_a_running_row() {
     timeout(DEADLINE, async {
         let (store, queue) = manager().await;
         let env = envelope("req_ro", REPO_A, serde_json::json!({}), None);
-        let outcome = queue
-            .enqueue(&env, CapabilityClass::ReadOnly)
-            .await
-            .unwrap();
-        assert_eq!(outcome, EnqueueOutcome::Bypass);
+        let outcome = queue.admit(&env, CapabilityClass::ReadOnly).await.unwrap();
+        assert_eq!(outcome, AdmitOutcome::Bypass);
 
         // The row exists for the audit trail, already running.
         let row = store.get_request("req_ro").await.unwrap().unwrap();
@@ -176,10 +176,7 @@ async fn dedupe_by_idempotency_key_attaches() {
             serde_json::json!({ "n": 1 }),
             Some("key-1"),
         );
-        assert_eq!(
-            enqueue(&queue, &first).await,
-            EnqueueOutcome::New { position: 0 }
-        );
+        assert_eq!(enqueue(&queue, &first).await, 0);
 
         // Same key attaches even though the args differ.
         let dup = envelope(
@@ -189,8 +186,8 @@ async fn dedupe_by_idempotency_key_attaches() {
             Some("key-1"),
         );
         assert_eq!(
-            enqueue(&queue, &dup).await,
-            EnqueueOutcome::Attached {
+            admit(&queue, &dup).await,
+            AdmitOutcome::Attached {
                 existing_request_id: "req_1".to_owned()
             }
         );
@@ -204,10 +201,7 @@ async fn dedupe_by_idempotency_key_attaches() {
             serde_json::json!({ "n": 1 }),
             Some("key-2"),
         );
-        assert_eq!(
-            enqueue(&queue, &other).await,
-            EnqueueOutcome::New { position: 1 }
-        );
+        assert_eq!(enqueue(&queue, &other).await, 1);
     })
     .await
     .expect("test within deadline");
@@ -223,8 +217,8 @@ async fn dedupe_by_shape_attaches_and_different_args_do_not() {
         // Same capability + repo + args, no key: attach.
         let dup = envelope("req_2", REPO_A, serde_json::json!({ "n": 1 }), None);
         assert_eq!(
-            enqueue(&queue, &dup).await,
-            EnqueueOutcome::Attached {
+            admit(&queue, &dup).await,
+            AdmitOutcome::Attached {
                 existing_request_id: "req_1".to_owned()
             }
         );
@@ -232,15 +226,9 @@ async fn dedupe_by_shape_attaches_and_different_args_do_not() {
 
         // Different args or different repo: new work.
         let other_args = envelope("req_3", REPO_A, serde_json::json!({ "n": 2 }), None);
-        assert_eq!(
-            enqueue(&queue, &other_args).await,
-            EnqueueOutcome::New { position: 1 }
-        );
+        assert_eq!(enqueue(&queue, &other_args).await, 1);
         let other_repo = envelope("req_4", REPO_B, serde_json::json!({ "n": 1 }), None);
-        assert_eq!(
-            enqueue(&queue, &other_repo).await,
-            EnqueueOutcome::New { position: 0 }
-        );
+        assert_eq!(enqueue(&queue, &other_repo).await, 0);
     })
     .await
     .expect("test within deadline");
@@ -261,8 +249,8 @@ async fn dedupe_also_attaches_to_running_requests() {
         // Running is still in-flight: the retry attaches.
         let dup = envelope("req_2", REPO_A, serde_json::json!({}), Some("k"));
         assert_eq!(
-            enqueue(&queue, &dup).await,
-            EnqueueOutcome::Attached {
+            admit(&queue, &dup).await,
+            AdmitOutcome::Attached {
                 existing_request_id: "req_1".to_owned()
             }
         );
@@ -288,10 +276,7 @@ async fn terminal_request_does_not_attach() {
 
         // The same key after completion runs fresh work.
         let retry = envelope("req_2", REPO_A, serde_json::json!({}), Some("k"));
-        assert_eq!(
-            enqueue(&queue, &retry).await,
-            EnqueueOutcome::New { position: 0 }
-        );
+        assert_eq!(enqueue(&queue, &retry).await, 0);
     })
     .await
     .expect("test within deadline");

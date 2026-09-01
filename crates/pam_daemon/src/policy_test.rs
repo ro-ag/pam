@@ -58,6 +58,7 @@ fn profile_round_trips_through_json() {
 #[test]
 fn known_capabilities_classify() {
     assert_eq!(classify("status"), Some(CapabilityClass::ReadOnly));
+    assert_eq!(classify("cancel"), Some(CapabilityClass::ReadOnly));
     assert_eq!(classify("echo"), Some(CapabilityClass::NonDestructive));
     assert_eq!(classify("frobnicate"), None);
 }

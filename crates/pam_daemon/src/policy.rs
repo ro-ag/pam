@@ -116,15 +116,22 @@ pub enum CapabilityClass {
 
 /// Static capability registry: what each known capability may do.
 ///
-/// Known capabilities so far: `status` (read-only) and `echo` (the first
-/// executor capability, non-destructive). Connectors and flows register
-/// their capabilities later, when the connector host lands; until then
-/// the table is static. An unknown capability classifies as `None` and
-/// the gate refuses it with cause [`CAUSE_UNKNOWN_CAPABILITY`].
+/// Known capabilities so far: `status` (read-only), `echo` (the first
+/// executor capability, non-destructive), and `cancel` (the built-in
+/// behind `pam cancel <ticket>`). Connectors and flows register their
+/// capabilities later, when the connector host lands; until then the
+/// table is static. An unknown capability classifies as `None` and the
+/// gate refuses it with cause [`CAUSE_UNKNOWN_CAPABILITY`].
+///
+/// `cancel` does mutate state (it fails the target request), but it is
+/// deliberately classed `ReadOnly`: a cancellation must never queue
+/// behind the very work it cancels, and the read-only class is what
+/// gives it the grant bypass and the lane bypass. Its effect is bounded
+/// to pam's own bookkeeping — nothing outside the daemon changes.
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {
-        "status" => Some(CapabilityClass::ReadOnly),
+        "status" | "cancel" => Some(CapabilityClass::ReadOnly),
         "echo" => Some(CapabilityClass::NonDestructive),
         _ => None,
     }

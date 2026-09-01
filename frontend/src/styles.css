@@ -1,0 +1,7 @@
+@import "tailwindcss";
+
+/* Placeholder theme block — the real design tokens (chrome/surface split,
+   type scale, palette) land with the design-tokens task. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, sans-serif;
+}

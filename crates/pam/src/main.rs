@@ -19,7 +19,7 @@ use pam_daemon::daemon::{DaemonError, run_daemon};
 use pam_daemon::lifecycle::{LifecycleError, LifecyclePhase, init_daemon_logging};
 use pam_proto::{Event, Response};
 
-/// Exit code for usage errors and stubbed subcommands.
+/// Exit code for usage errors.
 const EXIT_USAGE: u8 = 2;
 
 /// How long `pam daemon stop` waits for the daemon's drain to finish.
@@ -96,7 +96,7 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<DaemonCmd>,
     },
-    /// Desktop control center (not yet available).
+    /// Open the desktop control center.
     Gui,
 }
 
@@ -112,11 +112,24 @@ fn main() -> ExitCode {
         Cmd::Daemon {
             action: Some(DaemonCmd::Stop),
         } => daemon_stop(),
-        Cmd::Gui => {
-            eprintln!("pam gui: GUI not yet available");
-            ExitCode::from(EXIT_USAGE)
-        }
+        Cmd::Gui => gui_mode(),
         command => client_mode(command),
+    }
+}
+
+/// `pam gui`: hands the process to the Tauri event loop (must run on the
+/// main thread, before any async runtime exists) until the window closes.
+///
+/// Which frontend the window loads is a compile-time property of the
+/// binary — plain builds load the Vite dev server, `--features gui-embed`
+/// builds carry the built frontend. See the [`pam_gui`] crate docs.
+fn gui_mode() -> ExitCode {
+    match pam_gui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("pam gui: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 

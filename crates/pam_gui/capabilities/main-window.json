@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Allow the local pam main window its core webview surface, the ping liveness command, and titlebar dragging (needed by the custom titlebar arriving with the frameless-window task).",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["core:default", "allow-ping", "core:window:allow-start-dragging"]
+}

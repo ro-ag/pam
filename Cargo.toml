@@ -31,6 +31,12 @@ tempfile = "3"
 # component (processes) is needed. Pure Rust over libc/windows-sys FFI, no C
 # compile step.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# daemon self-logging (~/.pam/log/daemon.log): all three are pure Rust.
+# tracing-subscriber kept minimal — fmt for the file format, env-filter so
+# PAM_LOG can raise verbosity (regex engine is regex-automata, pure Rust).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

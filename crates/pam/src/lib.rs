@@ -4,6 +4,9 @@
 //! lives here.
 
 pub mod caller;
+pub mod client;
 
 #[cfg(test)]
 mod caller_test;
+#[cfg(test)]
+mod client_test;

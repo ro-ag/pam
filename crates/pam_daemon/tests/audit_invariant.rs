@@ -73,6 +73,7 @@ impl TestDaemon {
         let config = DaemonConfig {
             base_dir: Some(base_of(&tmp)),
             approval_timeout: timeout,
+            ..DaemonConfig::default()
         };
         let handle = run_daemon_with(config, shutdown_rx)
             .await
@@ -109,7 +110,7 @@ fn envelope(id: &str, capability: &str, args: serde_json::Value, wait: bool) -> 
         v: PROTOCOL_VERSION,
         id: id.to_owned(),
         capability: capability.to_owned(),
-        client_version: "0.1.0-test".to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
         caller: Caller {
             agent: "claude".to_owned(),
             repo: REPO.to_owned(),

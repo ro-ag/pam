@@ -10,6 +10,9 @@ repository.workspace = true
 pam_daemon.workspace = true
 pam_proto.workspace = true
 sysinfo.workspace = true
+thiserror.workspace = true
+# `signal` on top of the workspace features: `pam daemon` blocks on ctrl_c.
+tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true

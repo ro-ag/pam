@@ -24,7 +24,44 @@
 //! dedupe + insert atomically, the gate runs next, and only an allowed
 //! request reaches [`QueueManager::place_in_lane`]. A crash between
 //! admit and placement can resurrect a not-yet-gated `queued` row on
-//! restart; crash recovery (task #12) owns that window.
+//! restart; such a row re-enters a lane on rebuild and executes without
+//! a fresh gate pass — an accepted, narrow window (the capability was
+//! at worst one auto-grant away from allowed).
+//!
+//! # Boot order and lifecycle
+//!
+//! [`run_daemon_with`] boots in a fixed order: **instance lock** →
+//! store open → **crash recovery** ([`crate::lifecycle::recover_stuck_rows`])
+//! → lane rebuild → transport bind (which removes stale socket files —
+//! safe, because the lock is already held; see the lifecycle module's
+//! lock-first ordering) → serve.
+//!
+//! Shutdown is a **graceful drain**, driven by an internal lifecycle
+//! task once the caller's shutdown watch flips (or the daemon requests
+//! its own restart): the phase leaves
+//! [`LifecyclePhase::Serving`] so the pipeline refuses new requests
+//! ([`CAUSE_DAEMON_SHUTTING_DOWN`]), the executor loop and reaper stop
+//! (no new leases; `queued` rows are the restart-safe checkpoint and
+//! stay put for the next boot), in-flight leases get a bounded drain
+//! ([`DaemonConfig::drain_timeout`]) and are cancelled cooperatively
+//! past it, then the dispatcher stops. The store needs no explicit
+//! flush — every write (audit included) is per-statement durable — so
+//! closing it is dropping it. A request parked in `waiting_approval`
+//! is not drained; the next boot's crash recovery fails it legibly.
+//!
+//! # Version handshake
+//!
+//! Every envelope carries the client binary's build version. The single
+//! `pam` binary ships client and daemon at the same workspace version,
+//! so a mismatch means the binary on disk was replaced while this
+//! daemon process kept running — the client is the **newer** build.
+//! The pipeline checks before anything else: a mismatched request is
+//! refused ([`CAUSE_DAEMON_OUTDATED`], with a retry hint — no request
+//! row is recorded; the retry lands on the new daemon) and the daemon
+//! moves to [`LifecyclePhase::Restarting`], which triggers the same
+//! graceful drain. The process shell (`pam daemon`) observes the phase
+//! through [`DaemonHandle::lifecycle`] and re-spawns the new binary
+//! after the drain; the client-side retry is the client module's job.
 //!
 //! # Replies and attachment
 //!
@@ -122,6 +159,9 @@ use tokio::time::timeout;
 
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
+use crate::lifecycle::{
+    InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
+};
 use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
 use crate::queue::{
     AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
@@ -144,6 +184,13 @@ pub const CAUSE_EXECUTION_FAILED: &str = "execution_failed";
 
 /// Refusal cause when the daemon's own bookkeeping failed mid-pipeline.
 pub const CAUSE_INTERNAL_ERROR: &str = "internal_error";
+
+/// Refusal cause when the envelope's client version does not match the
+/// daemon's — the binary on disk is newer; the daemon restarts itself.
+pub const CAUSE_DAEMON_OUTDATED: &str = "daemon_outdated";
+
+/// Refusal cause for a request arriving while the daemon drains.
+pub const CAUSE_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
 
 /// `audit.action` for a refusal decided at the policy gate.
 pub const ACTION_GATE_REFUSAL: &str = "gate_refusal";
@@ -169,7 +216,12 @@ pub const TERMINAL_ACTIONS: &[&str] = &[
     ACTION_INTERNAL_FAILURE,
     crate::queue::ACTION_CANCEL,
     crate::queue::ACTION_LEASE_REAPED,
+    crate::lifecycle::ACTION_DAEMON_RESTART,
 ];
+
+/// This daemon build's version, compared against every envelope's
+/// `client_version` (see the module docs on the version handshake).
+pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// GUI recovery line for [`CAUSE_APPROVAL_DENIED`] refusals.
 const RECOVERY_APPROVAL_DENIED: &str =
@@ -193,6 +245,13 @@ const RECOVERY_FAILED: &str = "Inspect the failure in the PAM GUI activity view,
 /// Recovery line for [`CAUSE_INTERNAL_ERROR`] refusals.
 const RECOVERY_INTERNAL: &str = "Retry; if it persists, restart the daemon from the PAM GUI.";
 
+/// Recovery line for [`CAUSE_DAEMON_OUTDATED`] refusals.
+const RECOVERY_OUTDATED: &str = "The daemon is restarting with the new binary; retry your command.";
+
+/// Recovery line for [`CAUSE_DAEMON_SHUTTING_DOWN`] refusals.
+const RECOVERY_SHUTTING_DOWN: &str =
+    "Retry shortly; the next pam command starts a fresh daemon automatically.";
+
 /// How long the completion router remembers a terminal response, to
 /// close the attach-after-finish race.
 const FINISHED_TTL: Duration = Duration::from_mins(1);
@@ -207,6 +266,17 @@ const EXECUTOR_TICK: Duration = Duration::from_millis(100);
 
 /// Capacity of the transport → dispatcher channel.
 const INCOMING_CAPACITY: usize = 256;
+
+/// Default bound on the graceful drain (see [`DaemonConfig::drain_timeout`]).
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the lifecycle task re-checks the outstanding leases while
+/// draining.
+const DRAIN_POLL: Duration = Duration::from_millis(25);
+
+/// Extra budget granted after the drain bound for cancelled executors
+/// to observe their cancel signal and record their terminal state.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Why the daemon could not be assembled.
 #[derive(Debug, Error)]
@@ -226,6 +296,10 @@ pub enum DaemonError {
     /// The queue could not be rebuilt.
     #[error(transparent)]
     Queue(#[from] QueueError),
+    /// The instance lock could not be taken (another daemon runs, or
+    /// the lock file is unusable).
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
 }
 
 /// Routes each request's single terminal [`Response`] to every pipeline
@@ -296,7 +370,8 @@ impl CompletionRouter {
     }
 }
 
-/// A running daemon: sockets bound, pipeline tasks pumping.
+/// A running daemon: instance lock held, sockets bound, pipeline tasks
+/// pumping.
 #[derive(Debug)]
 pub struct DaemonHandle {
     dirs: RuntimeDir,
@@ -304,6 +379,9 @@ pub struct DaemonHandle {
     approvals: Arc<ApprovalService>,
     transport: Transport,
     tasks: Vec<JoinHandle<()>>,
+    phase: watch::Sender<LifecyclePhase>,
+    /// Held for the daemon's lifetime; dropping the handle releases it.
+    _lock: InstanceLock,
 }
 
 impl DaemonHandle {
@@ -327,16 +405,28 @@ impl DaemonHandle {
         Arc::clone(&self.approvals)
     }
 
-    /// Stops the transport and joins every daemon task.
+    /// The daemon's lifecycle phase, as a watch: the process shell
+    /// observes [`LifecyclePhase::Restarting`] here to know it must
+    /// re-spawn the (newer) binary after [`Self::shutdown`] completes.
+    #[must_use]
+    pub fn lifecycle(&self) -> watch::Receiver<LifecyclePhase> {
+        self.phase.subscribe()
+    }
+
+    /// Waits for the graceful drain, then stops the transport and joins
+    /// every daemon task (see the module docs on the drain).
     ///
-    /// Flip the shutdown watch handed to [`run_daemon`] first — the
-    /// executor loop and reaper exit on it; the dispatcher also exits
-    /// when the transport closes the incoming channel.
+    /// The drain starts when the shutdown watch handed to [`run_daemon`]
+    /// flips (or its sender drops), or when the daemon requested its own
+    /// restart — trigger one of those first, or this call never returns.
     pub async fn shutdown(self) {
-        self.transport.shutdown().await;
+        // The lifecycle task is among these; joining it means the drain
+        // ran to completion (waiting callers got their answers through
+        // the still-live transport) before the sockets close.
         for task in self.tasks {
             let _ = task.await;
         }
+        self.transport.shutdown().await;
     }
 }
 
@@ -350,6 +440,9 @@ pub struct DaemonConfig {
     /// How long a pending approval waits before it times out
     /// (default [`DEFAULT_APPROVAL_TIMEOUT`]; tests inject a short one).
     pub approval_timeout: Duration,
+    /// How long a graceful shutdown waits for in-flight leases before
+    /// cancelling them (default [`DEFAULT_DRAIN_TIMEOUT`]).
+    pub drain_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -357,6 +450,7 @@ impl Default for DaemonConfig {
         Self {
             base_dir: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
     }
 }
@@ -379,12 +473,16 @@ pub async fn run_daemon(
 
 /// Assembles and starts the daemon.
 ///
-/// Binds the transport under `<base>/run`, opens the store at
-/// `<base>/state.sqlite3` (constructing the policy gate from the profile
-/// persisted there), rebuilds the queue lanes, builds the approval
-/// service, and spawns the dispatcher, executor loop, and lease reaper.
-/// `config.base_dir` defaults to `~/.pam`. Flip `shutdown` to stop the
-/// background tasks, then await [`DaemonHandle::shutdown`].
+/// Boot order (see the module docs): takes the instance lock under
+/// `<base>/run` (erroring [`LifecycleError::AlreadyRunning`] when
+/// another daemon holds it), opens the store at `<base>/state.sqlite3`
+/// (constructing the policy gate from the profile persisted there),
+/// fails the rows a dead daemon left mid-flight, rebuilds the queue
+/// lanes, binds the transport (stale socket cleanup inside — safe under
+/// the held lock), builds the approval service, and spawns the
+/// dispatcher, executor loop, lease reaper, and lifecycle task.
+/// `config.base_dir` defaults to `~/.pam`. Flip `shutdown` to start the
+/// graceful drain, then await [`DaemonHandle::shutdown`].
 pub async fn run_daemon_with(
     config: DaemonConfig,
     shutdown: watch::Receiver<bool>,
@@ -396,7 +494,15 @@ pub async fn run_daemon_with(
             .join(".pam"),
     };
     let dirs = RuntimeDir::at_base(&base)?;
+    let lock = acquire_instance_lock(dirs.run_dir())?;
     let store = Arc::new(Store::open(&base.join("state.sqlite3")).await?);
+    let recovered = recover_stuck_rows(&store).await?;
+    if !recovered.is_empty() {
+        tracing::info!(
+            count = recovered.len(),
+            "crash recovery failed stuck in-flight rows from a previous daemon"
+        );
+    }
     let gate = PolicyGate::new(Arc::clone(&store)).await?;
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     queue.rebuild_from_store().await?;
@@ -409,6 +515,11 @@ pub async fn run_daemon_with(
         transport.event_publisher(),
         config.approval_timeout,
     ));
+    let (phase, _) = watch::channel(LifecyclePhase::Serving);
+    // Drain stops the lease-granting side (executor loop, reaper);
+    // dispatch keeps answering (with refusals) until the drain is done.
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (dispatch_stop_tx, dispatch_stop_rx) = watch::channel(false);
     let pipeline = Arc::new(Pipeline {
         store: Arc::clone(&store),
         gate,
@@ -418,17 +529,27 @@ pub async fn run_daemon_with(
         router: CompletionRouter::new(),
         work: Notify::new(),
         started_at: Instant::now(),
+        phase: phase.clone(),
     });
 
     let tasks = vec![
-        Arc::clone(&queue).run_reaper(REAP_INTERVAL, shutdown.clone()),
+        Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
         tokio::spawn(dispatch_loop(
             Arc::clone(&pipeline),
             incoming_rx,
-            shutdown.clone(),
+            dispatch_stop_rx,
         )),
-        tokio::spawn(executor_loop(pipeline, shutdown)),
+        tokio::spawn(executor_loop(pipeline, drain_rx)),
+        tokio::spawn(lifecycle_task(
+            shutdown,
+            phase.clone(),
+            drain_tx,
+            dispatch_stop_tx,
+            Arc::clone(&queue),
+            config.drain_timeout,
+        )),
     ];
+    tracing::info!(version = DAEMON_VERSION, base = %base.display(), "daemon serving");
 
     Ok(DaemonHandle {
         dirs,
@@ -436,7 +557,62 @@ pub async fn run_daemon_with(
         approvals,
         transport,
         tasks,
+        phase,
+        _lock: lock,
     })
+}
+
+/// Drives the graceful drain (see the module docs): waits for the
+/// caller's shutdown flip or a self-restart request, refuses new work
+/// via the phase, stops the lease-granting tasks, waits (bounded) for
+/// in-flight leases, cancels leftovers cooperatively, then stops the
+/// dispatcher.
+async fn lifecycle_task(
+    mut shutdown: watch::Receiver<bool>,
+    phase: watch::Sender<LifecyclePhase>,
+    drain: watch::Sender<bool>,
+    dispatch_stop: watch::Sender<bool>,
+    queue: Arc<QueueManager>,
+    drain_timeout: Duration,
+) {
+    let mut phase_rx = phase.subscribe();
+    tokio::select! {
+        () = signalled(&mut shutdown) => {
+            let _ = phase.send_if_modified(|current| {
+                if *current == LifecyclePhase::Serving {
+                    *current = LifecyclePhase::Draining;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        // The pipeline moved the phase itself (version handshake).
+        _ = phase_rx.wait_for(|current| *current != LifecyclePhase::Serving) => {}
+    }
+    let _ = drain.send(true);
+    tracing::info!(phase = ?*phase.borrow(), "daemon draining");
+
+    let drain_deadline = Instant::now() + drain_timeout;
+    while !queue.leased_ids().await.is_empty() && Instant::now() < drain_deadline {
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+    let leftovers = queue.leased_ids().await;
+    if !leftovers.is_empty() {
+        tracing::warn!(
+            count = leftovers.len(),
+            "drain bound hit; cancelling in-flight leases"
+        );
+        for id in leftovers {
+            let _ = queue.cancel(&id, Actor::System).await;
+        }
+        let grace_deadline = Instant::now() + CANCEL_GRACE;
+        while !queue.leased_ids().await.is_empty() && Instant::now() < grace_deadline {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+    let _ = dispatch_stop.send(true);
+    tracing::info!("daemon drained");
 }
 
 /// The services one request flows through, shared by every pipeline
@@ -452,6 +628,9 @@ struct Pipeline {
     /// executor loop.
     work: Notify,
     started_at: Instant,
+    /// Read to refuse requests while draining; written to request the
+    /// self-restart the version handshake calls for.
+    phase: watch::Sender<LifecyclePhase>,
 }
 
 /// Resolves when the shutdown flag flips to `true` (a dropped sender
@@ -511,6 +690,36 @@ impl Pipeline {
     /// wait for `wait: false` callers.
     async fn handle(self: Arc<Self>, envelope: Envelope, reply: oneshot::Sender<Response>) {
         let id = envelope.id.clone();
+
+        // Lifecycle gates run before anything is recorded: neither a
+        // drain refusal nor a version-handshake refusal gets a request
+        // row — the retry lands on the next (or new) daemon and is
+        // recorded there.
+        if *self.phase.borrow() != LifecyclePhase::Serving {
+            let _ = reply.send(shutting_down_refusal(&id));
+            return;
+        }
+        if envelope.client_version != DAEMON_VERSION {
+            // The single binary ships client and daemon at the same
+            // version, so a mismatch means the binary on disk was
+            // replaced: the client is the newer build. Answer this
+            // request, then hand over to the new binary.
+            tracing::info!(
+                client_version = %envelope.client_version,
+                daemon_version = DAEMON_VERSION,
+                "client build differs; restarting with the binary on disk"
+            );
+            let _ = reply.send(outdated_refusal(&id, &envelope.client_version));
+            let _ = self.phase.send_if_modified(|current| {
+                if *current == LifecyclePhase::Serving {
+                    *current = LifecyclePhase::Restarting;
+                    true
+                } else {
+                    false
+                }
+            });
+            return;
+        }
 
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
@@ -1205,6 +1414,30 @@ fn attach_refusal(id: &str, timed_out: bool) -> Response {
         }
     } else {
         internal_refusal(id)
+    }
+}
+
+/// Refusal for a request that arrived while the daemon drains.
+fn shutting_down_refusal(id: &str) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_DAEMON_SHUTTING_DOWN.to_owned(),
+        detail: "the daemon is draining in-flight work before it exits".to_owned(),
+        recovery: RECOVERY_SHUTTING_DOWN.to_owned(),
+    }
+}
+
+/// Refusal for the version handshake: the client build is newer than
+/// this daemon, which restarts itself.
+fn outdated_refusal(id: &str, client_version: &str) -> Response {
+    Response::Refusal {
+        id: id.to_owned(),
+        cause: CAUSE_DAEMON_OUTDATED.to_owned(),
+        detail: format!(
+            "client version {client_version} does not match daemon version \
+             {DAEMON_VERSION}; the pam binary was replaced while this daemon ran"
+        ),
+        recovery: RECOVERY_OUTDATED.to_owned(),
     }
 }
 

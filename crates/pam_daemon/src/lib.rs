@@ -5,6 +5,7 @@
 pub mod approval;
 pub mod daemon;
 pub mod executor;
+pub mod lifecycle;
 pub mod policy;
 pub mod queue;
 pub mod runtime_dir;
@@ -16,6 +17,8 @@ mod approval_test;
 mod daemon_test;
 #[cfg(test)]
 mod executor_test;
+#[cfg(test)]
+mod lifecycle_test;
 #[cfg(test)]
 mod policy_test;
 #[cfg(test)]

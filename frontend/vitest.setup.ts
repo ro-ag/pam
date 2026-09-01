@@ -8,6 +8,12 @@ afterEach(() => {
   cleanup();
 });
 
+// jsdom leaves window.scrollTo unimplemented and logs an error each time the
+// router's scroll restoration calls it after navigation — stub it quiet.
+if (typeof window !== "undefined") {
+  window.scrollTo = () => {};
+}
+
 // This jsdom build ships no window.localStorage (Node's own experimental
 // localStorage shadows it); theme persistence tests need a real-enough one.
 if (typeof window !== "undefined" && !window.localStorage) {

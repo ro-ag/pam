@@ -3,7 +3,10 @@ import {
   applyTheme,
   defaultTheme,
   initTheme,
+  isModeId,
   isThemeId,
+  modeStorageKey,
+  nextMode,
   nextTheme,
   themeDefinition,
   themes,
@@ -13,59 +16,85 @@ import {
 afterEach(() => {
   window.localStorage.clear();
   delete document.documentElement.dataset.theme;
+  delete document.documentElement.dataset.mode;
   document.documentElement.style.colorScheme = "";
 });
 
 describe("theme registry", () => {
-  it("registers both kept v1 families with schemes", () => {
-    expect(themes.map((theme) => theme.id)).toEqual(["ventisquero-mist", "vina-del-mar-dawn"]);
-    expect(themeDefinition("ventisquero-mist").scheme).toBe("dark");
-    expect(themeDefinition("vina-del-mar-dawn").scheme).toBe("light");
+  it("registers both kept v1 families", () => {
+    expect(themes.map((theme) => theme.id)).toEqual(["ventisquero", "vina"]);
+    expect(themeDefinition("ventisquero").label).toBe("Ventisquero");
+    expect(themeDefinition("vina").label).toBe("Viña del Mar");
   });
 
-  it("validates ids", () => {
-    expect(isThemeId("vina-del-mar-dawn")).toBe(true);
-    expect(isThemeId("solarized")).toBe(false);
+  it("validates theme and mode ids", () => {
+    expect(isThemeId("vina")).toBe(true);
+    expect(isThemeId("vina-del-mar-dawn")).toBe(false);
     expect(isThemeId(null)).toBe(false);
+    expect(isModeId("dark")).toBe(true);
+    expect(isModeId("dim")).toBe(false);
   });
 
-  it("cycles through the registry", () => {
-    expect(nextTheme("ventisquero-mist")).toBe("vina-del-mar-dawn");
-    expect(nextTheme("vina-del-mar-dawn")).toBe("ventisquero-mist");
+  it("cycles families and toggles modes", () => {
+    expect(nextTheme("ventisquero")).toBe("vina");
+    expect(nextTheme("vina")).toBe("ventisquero");
+    expect(nextMode("light")).toBe("dark");
+    expect(nextMode("dark")).toBe("light");
   });
 });
 
 describe("applyTheme", () => {
-  it("sets data-theme, color-scheme, and persists", () => {
-    applyTheme("vina-del-mar-dawn");
-    expect(document.documentElement.dataset.theme).toBe("vina-del-mar-dawn");
-    expect(document.documentElement.style.colorScheme).toBe("light");
-    expect(window.localStorage.getItem(themeStorageKey)).toBe("vina-del-mar-dawn");
+  it("sets both attributes, color-scheme, and persists both keys", () => {
+    applyTheme("vina", "dark");
+    expect(document.documentElement.dataset.theme).toBe("vina");
+    expect(document.documentElement.dataset.mode).toBe("dark");
+    expect(document.documentElement.style.colorScheme).toBe("dark");
+    expect(window.localStorage.getItem(themeStorageKey)).toBe("vina");
+    expect(window.localStorage.getItem(modeStorageKey)).toBe("dark");
+  });
+
+  it("changes one axis without disturbing the other", () => {
+    applyTheme("ventisquero", "dark");
+    applyTheme("vina", "dark");
+    expect(document.documentElement.dataset.theme).toBe("vina");
+    expect(document.documentElement.dataset.mode).toBe("dark");
+    applyTheme("vina", "light");
+    expect(document.documentElement.dataset.theme).toBe("vina");
+    expect(document.documentElement.dataset.mode).toBe("light");
   });
 
   it("can apply without persisting", () => {
-    applyTheme("ventisquero-mist", { persist: false });
-    expect(document.documentElement.dataset.theme).toBe("ventisquero-mist");
+    applyTheme("ventisquero", "light", { persist: false });
+    expect(document.documentElement.dataset.theme).toBe("ventisquero");
     expect(window.localStorage.getItem(themeStorageKey)).toBeNull();
+    expect(window.localStorage.getItem(modeStorageKey)).toBeNull();
   });
 });
 
 describe("initTheme", () => {
-  it("prefers a valid stored theme", () => {
-    window.localStorage.setItem(themeStorageKey, "vina-del-mar-dawn");
-    expect(initTheme()).toBe("vina-del-mar-dawn");
-    expect(document.documentElement.dataset.theme).toBe("vina-del-mar-dawn");
+  it("prefers valid stored values on both axes", () => {
+    window.localStorage.setItem(themeStorageKey, "vina");
+    window.localStorage.setItem(modeStorageKey, "light");
+    expect(initTheme()).toEqual({ theme: "vina", mode: "light" });
+    expect(document.documentElement.dataset.theme).toBe("vina");
+    expect(document.documentElement.dataset.mode).toBe("light");
   });
 
-  it("falls back to the default on garbage storage", () => {
+  it("falls back per axis on garbage storage", () => {
     window.localStorage.setItem(themeStorageKey, "hotdog-stand");
-    expect(initTheme()).toBe(defaultTheme);
-    expect(document.documentElement.dataset.theme).toBe(defaultTheme);
+    window.localStorage.setItem(modeStorageKey, "light");
+    expect(initTheme()).toEqual({ theme: defaultTheme, mode: "light" });
   });
 
-  it("does not persist the fallback choice", () => {
+  it("resolves mode from the system when unstored (jsdom has none → dark-first)", () => {
+    window.localStorage.setItem(themeStorageKey, "ventisquero");
+    expect(initTheme().mode).toBe("dark");
+  });
+
+  it("does not persist fallback choices", () => {
     window.localStorage.clear();
     initTheme();
     expect(window.localStorage.getItem(themeStorageKey)).toBeNull();
+    expect(window.localStorage.getItem(modeStorageKey)).toBeNull();
   });
 });

@@ -1,0 +1,23 @@
+[package]
+name = "pam_client"
+description = "Client-side library for pam: daemon lifecycle, request envelopes, and the socket exchange shared by the CLI and the GUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pam_daemon.workspace = true
+pam_proto.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ulid.workspace = true
+zeromq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

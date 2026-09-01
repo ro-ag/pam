@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-admin-call"
+description = "Enables the admin_call command without any pre-configured scope."
+commands.allow = ["admin_call"]
+
+[[permission]]
+identifier = "deny-admin-call"
+description = "Denies the admin_call command without any pre-configured scope."
+commands.deny = ["admin_call"]

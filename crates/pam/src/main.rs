@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use pam::client::{self, DaemonStatus};
+use pam::client::{self, StopOutcome};
 use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
 use pam_daemon::daemon::{DaemonError, run_daemon};
@@ -134,18 +134,10 @@ fn gui_mode() -> ExitCode {
 }
 
 /// The base directory every mode works under: `$PAM_BASE_DIR` when set
-/// and non-empty, otherwise `~/.pam`.
-///
-/// The environment override is a testing/dev knob (deliberately not a
-/// CLI flag): it lets a test or a scratch session point a real spawned
-/// `pam daemon` process *and* the client subcommands at an isolated
-/// base dir. The auto-spawned daemon inherits the client's environment,
-/// so both sides always resolve the same base.
+/// and non-empty, otherwise `~/.pam` (see [`pam::default_base_dir`] —
+/// shared with the GUI bridge so both resolve the same base).
 fn base_dir() -> Option<PathBuf> {
-    match std::env::var_os("PAM_BASE_DIR") {
-        Some(base) if !base.is_empty() => Some(PathBuf::from(base)),
-        _ => Some(std::env::home_dir()?.join(".pam")),
-    }
+    pam::default_base_dir()
 }
 
 /// Runs one client subcommand on a fresh runtime against `~/.pam`.
@@ -272,56 +264,23 @@ async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool) -> Ex
 }
 
 /// `pam daemon stop`: name the lock holder, send it SIGTERM (unix), and
-/// wait — bounded — for the drain to release the lock.
+/// wait — bounded — for the drain to release the lock. The mechanics
+/// live in [`client::stop_daemon`], shared with the GUI bridge.
 fn daemon_stop() -> ExitCode {
     let Some(base) = base_dir() else {
         eprintln!("pam daemon stop: cannot resolve the home directory; set $HOME");
         return ExitCode::FAILURE;
     };
-    match client::probe_daemon(&base) {
-        Ok(DaemonStatus::NotRunning) => {
+    match client::stop_daemon(&base, STOP_WAIT) {
+        Ok(StopOutcome::NotRunning) => {
             println!("pam daemon stop: no daemon is running");
             ExitCode::SUCCESS
         }
-        Ok(DaemonStatus::Running { pid }) => stop_running(&base, pid),
-        Err(err) => {
-            eprintln!("pam daemon stop: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Signals the running daemon (by the pid in its lock file) and waits
-/// for the lock to be released.
-#[cfg(unix)]
-fn stop_running(base: &Path, pid: Option<u32>) -> ExitCode {
-    let Some(pid) = pid else {
-        eprintln!("pam daemon stop: the lock file names no pid; stop the daemon process manually");
-        return ExitCode::FAILURE;
-    };
-    // SIGTERM through /bin/kill: the workspace denies `unsafe`, which a
-    // direct libc::kill call would need.
-    let signalled = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
-    match signalled {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("pam daemon stop: kill -TERM {pid} exited with {status}");
-            return ExitCode::FAILURE;
-        }
-        Err(err) => {
-            eprintln!("pam daemon stop: cannot run kill: {err}");
-            return ExitCode::FAILURE;
-        }
-    }
-    match client::wait_for_daemon_exit(base, STOP_WAIT) {
-        Ok(true) => {
+        Ok(StopOutcome::Stopped { pid }) => {
             println!("pam daemon stopped (pid {pid})");
             ExitCode::SUCCESS
         }
-        Ok(false) => {
+        Ok(StopOutcome::StillDraining { pid }) => {
             eprintln!(
                 "pam daemon stop: the daemon (pid {pid}) is still draining after {STOP_WAIT:?}; \
                  it exits when the drain completes"
@@ -333,18 +292,6 @@ fn stop_running(base: &Path, pid: Option<u32>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// `pam daemon stop` needs a signal; without unix signals it is not
-/// supported yet — stop the daemon process from the task manager.
-#[cfg(not(unix))]
-fn stop_running(_base: &Path, pid: Option<u32>) -> ExitCode {
-    let holder = pid.map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"));
-    eprintln!(
-        "pam daemon stop: not supported on this platform yet; \
-         end the pam daemon process ({holder}) manually"
-    );
-    ExitCode::from(EXIT_USAGE)
 }
 
 /// `pam daemon`: logging, lock, serve, drain on ctrl-c / SIGTERM, and

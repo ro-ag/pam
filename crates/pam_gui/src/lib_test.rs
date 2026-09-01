@@ -2,19 +2,24 @@
 //! (dev-server port, window basics, capability grants) are asserted here so
 //! a drive-by edit to one side fails fast.
 
-use super::ping;
-
 const TAURI_CONF: &str = include_str!("../tauri.conf.json");
 const MAIN_WINDOW_CAPABILITY: &str = include_str!("../capabilities/main-window.json");
+const BUILD_SCRIPT: &str = include_str!("../build.rs");
 
 fn tauri_conf() -> serde_json::Value {
     serde_json::from_str(TAURI_CONF).expect("tauri.conf.json parses")
 }
 
-#[test]
-fn ping_returns_pong() {
-    assert_eq!(ping(), "pong");
-}
+/// The bridge commands the frontend may invoke; `build.rs` must list
+/// every one (that is what mints its `allow-<command>` permission) and
+/// the main-window capability must grant every one.
+const BRIDGE_COMMANDS: [&str; 5] = [
+    "daemon_status",
+    "admin_call",
+    "request_capability",
+    "daemon_stop",
+    "events_subscribe",
+];
 
 #[test]
 fn dev_url_matches_the_vite_port() {
@@ -50,21 +55,40 @@ fn binary_name_stays_pam() {
 }
 
 #[test]
-fn main_window_capability_grants_ping_and_dragging() {
+fn main_window_capability_grants_the_bridge_and_dragging() {
     let capability: serde_json::Value =
         serde_json::from_str(MAIN_WINDOW_CAPABILITY).expect("main-window.json parses");
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
     let permissions = capability["permissions"]
         .as_array()
         .expect("permissions is an array");
-    for needed in [
-        "core:default",
-        "allow-ping",
-        "core:window:allow-start-dragging",
-    ] {
+    let mut needed = vec![
+        // core:default includes core:event:default — the frontend's
+        // pam://event listener rides on it.
+        "core:default".to_owned(),
+        "core:window:allow-start-dragging".to_owned(),
+    ];
+    for command in BRIDGE_COMMANDS {
+        needed.push(format!("allow-{}", command.replace('_', "-")));
+    }
+    for permission in needed {
         assert!(
-            permissions.iter().any(|permission| permission == needed),
-            "capability must grant {needed}"
+            permissions.iter().any(|granted| *granted == permission),
+            "capability must grant {permission}"
         );
     }
+}
+
+#[test]
+fn build_script_mints_a_permission_for_every_bridge_command() {
+    for command in BRIDGE_COMMANDS {
+        assert!(
+            BUILD_SCRIPT.contains(&format!("\"{command}\"")),
+            "build.rs AppManifest must list {command}"
+        );
+    }
+    assert!(
+        !BUILD_SCRIPT.contains("\"ping\""),
+        "the ping scaffold command is gone"
+    );
 }

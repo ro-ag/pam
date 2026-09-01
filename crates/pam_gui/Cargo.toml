@@ -13,13 +13,17 @@ repository.workspace = true
 embed = ["tauri/custom-protocol"]
 
 [dependencies]
+pam_client.workspace = true
+pam_daemon.workspace = true
+pam_proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tauri.workspace = true
+tokio.workspace = true
+zeromq.workspace = true
 
 [build-dependencies]
 tauri-build.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

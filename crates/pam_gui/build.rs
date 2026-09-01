@@ -2,8 +2,8 @@
 //!
 //! `tauri_build` reads `tauri.conf.json` (next to this file), validates the
 //! capability files under `capabilities/`, and generates the ACL manifest
-//! that the `allow-ping` permission in `capabilities/main-window.json`
-//! refers to — `AppManifest::commands` below is the list of `#[tauri::command]`
+//! that the `allow-*` permissions in `capabilities/main-window.json`
+//! refer to — `AppManifest::commands` below is the list of `#[tauri::command]`
 //! functions that get an auto-generated `allow-<command>` permission.
 //!
 //! # Which frontend the binary carries (the "white window" law)
@@ -23,7 +23,13 @@
 //!   codegen aborts with a clear panic naming the missing path.
 
 fn main() {
-    let manifest = tauri_build::AppManifest::new().commands(&["ping"]);
+    let manifest = tauri_build::AppManifest::new().commands(&[
+        "daemon_status",
+        "admin_call",
+        "request_capability",
+        "daemon_stop",
+        "events_subscribe",
+    ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run the tauri build script for pam_gui");
 }

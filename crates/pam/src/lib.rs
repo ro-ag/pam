@@ -1,7 +1,11 @@
 //! Library side of the `pam` binary: testable modules behind the thin CLI.
 //!
 //! The binary in `main.rs` stays a thin shell; everything worth unit-testing
-//! lives here.
+//! lives in library crates. The client-side modules (`client`, `request`,
+//! `caller`, and the base-dir resolution) live in `pam_client` — shared
+//! with the GUI bridge, which cannot depend on this crate (this crate
+//! depends on `pam_gui` for `pam gui`) — and are re-exported here so
+//! callers keep using `pam::client` and friends.
 //!
 //! # CLI surface (v0)
 //!
@@ -37,16 +41,9 @@
 //! | 4 | result `unresolved` |
 //! | 5 | result `blocked` |
 
-pub mod caller;
-pub mod client;
+pub use pam_client::{base_dir_from, caller, client, default_base_dir, request};
+
 pub mod render;
-pub mod request;
 
 #[cfg(test)]
-mod caller_test;
-#[cfg(test)]
-mod client_test;
-#[cfg(test)]
 mod render_test;
-#[cfg(test)]
-mod request_test;

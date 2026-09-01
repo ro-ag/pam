@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::{Caller, Envelope, PROTOCOL_VERSION};
-use pam_store::{Actor, Decision, RequestState, Store};
+use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
 use tokio::sync::watch;
 use tokio::time::{Instant, advance, timeout};
 
@@ -31,6 +31,16 @@ fn envelope(id: &str, repo: &str, args: serde_json::Value, key: Option<&str>) ->
         idempotency_key: key.map(str::to_owned),
         deadline_ms: 60_000,
         wait: true,
+    }
+}
+
+/// The executor-style audit entry tests hand to `complete`.
+fn execute_entry() -> AuditEntry<'static> {
+    AuditEntry {
+        action: "execute",
+        decision: Decision::Allow,
+        actor: Actor::System,
+        detail: None,
     }
 }
 
@@ -109,7 +119,7 @@ async fn same_repo_serializes_through_the_lease() {
 
         assert!(
             queue
-                .complete("req_1", RequestState::Done, Some("ok"))
+                .complete("req_1", RequestState::Done, Some("ok"), execute_entry())
                 .await
                 .unwrap()
         );
@@ -270,7 +280,7 @@ async fn terminal_request_does_not_attach() {
         .await;
         queue.take_next(REPO_A).await.unwrap().unwrap();
         queue
-            .complete("req_1", RequestState::Done, Some("ok"))
+            .complete("req_1", RequestState::Done, Some("ok"), execute_entry())
             .await
             .unwrap();
 
@@ -343,7 +353,12 @@ async fn cancel_running_signals_the_lease_holder() {
         assert_eq!(row.state, RequestState::Running);
         assert!(
             queue
-                .complete("req_1", RequestState::Failed, Some(CAUSE_CANCELLED))
+                .complete(
+                    "req_1",
+                    RequestState::Failed,
+                    Some(CAUSE_CANCELLED),
+                    execute_entry(),
+                )
                 .await
                 .unwrap()
         );
@@ -371,7 +386,7 @@ async fn cancel_unknown_or_terminal_request_is_not_found() {
         .await;
         queue.take_next(REPO_A).await.unwrap().unwrap();
         queue
-            .complete("req_1", RequestState::Done, None)
+            .complete("req_1", RequestState::Done, None, execute_entry())
             .await
             .unwrap();
         assert_eq!(
@@ -423,7 +438,7 @@ async fn lease_reaping_fails_the_row_audits_and_frees_the_lane() {
         assert!(*work.cancel.borrow());
         assert!(
             !queue
-                .complete("req_1", RequestState::Done, Some("late"))
+                .complete("req_1", RequestState::Done, Some("late"), execute_entry())
                 .await
                 .unwrap()
         );
@@ -484,7 +499,10 @@ async fn complete_refuses_non_terminal_states() {
             RequestState::Running,
             RequestState::WaitingApproval,
         ] {
-            let err = queue.complete("req_1", state, None).await.unwrap_err();
+            let err = queue
+                .complete("req_1", state, None, execute_entry())
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, QueueError::NotTerminal { .. }),
                 "{state:?} must be refused, got {err:?}"
@@ -513,7 +531,7 @@ async fn rebuild_from_store_restores_lane_order() {
             .await
             .unwrap();
         store
-            .update_request_state("req_done", RequestState::Done, Some("ok"))
+            .finish_request("req_done", RequestState::Done, Some("ok"), execute_entry())
             .await
             .unwrap();
 
@@ -525,7 +543,7 @@ async fn rebuild_from_store_restores_lane_order() {
         assert_eq!(work.request_id, "req_b1");
         assert!(queue.take_next(REPO_A).await.unwrap().is_none());
         queue
-            .complete("req_a1", RequestState::Done, None)
+            .complete("req_a1", RequestState::Done, None, execute_entry())
             .await
             .unwrap();
         let work = queue.take_next(REPO_A).await.unwrap().unwrap();

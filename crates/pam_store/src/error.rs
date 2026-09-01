@@ -31,6 +31,16 @@ pub enum StoreError {
         supported: i64,
     },
 
+    /// A terminal-only operation was handed a non-terminal state.
+    #[error(
+        "request state {state:?} is not terminal; only done, refused or \
+         failed may be recorded as a final state"
+    )]
+    NotTerminal {
+        /// The offending state's column value.
+        state: &'static str,
+    },
+
     /// A row referenced by id does not exist.
     #[error("no {table} row with id {id}")]
     NotFound {

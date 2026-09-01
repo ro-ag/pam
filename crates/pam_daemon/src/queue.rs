@@ -75,13 +75,16 @@
 //! [`QueueManager::complete`]; its terminal write and audit happen on
 //! that path.
 //!
-//! # Audit split
+//! # Audit invariant
 //!
-//! The queue writes terminal audit rows only for the terminal states it
-//! *owns*: queued-cancellation and lease reaping. [`QueueManager::complete`]
-//! writes the request's terminal state but no audit row — the executor
-//! (task #9) audits its own outcomes, keeping exactly one audit writer
-//! per path (the every-terminal-state invariant is hardened in task #11).
+//! Every terminal transition the queue performs — queued-cancellation,
+//! lease reaping, and executor completion via [`QueueManager::complete`]
+//! (which takes the executor's audit fields) — goes through
+//! [`Store::finish_request`], the store-level choke point that writes
+//! the terminal state and its audit row in one transaction. The queue
+//! never calls `update_request_state` with a terminal state, and
+//! `finish_request`'s already-terminal guard makes double-finish races
+//! (reaper vs executor) a first-wins no-op with no duplicate audit row.
 //!
 //! # Concurrency
 //!
@@ -104,7 +107,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::Envelope;
-use pam_store::{Actor, Decision, RequestState, Store, StoreError};
+use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -358,24 +361,23 @@ impl QueueManager {
     }
 
     /// Releases `request_id`'s lease and records its terminal
-    /// `final_state` / `outcome`, freeing the lane for the next request.
+    /// `final_state` / `outcome` together with the executor's `audit`
+    /// row (one transaction, via [`Store::finish_request`]), freeing the
+    /// lane for the next request.
     ///
-    /// Returns `true` when the lease was still held and the state was
-    /// written; `false` when the lease was already gone (reaped or
-    /// cancelled after the executor finished) — the row is left alone,
-    /// since whoever released the lease already recorded a terminal
-    /// state. No audit row is written here: the executor audits its own
-    /// outcome (see the module docs for the audit split).
+    /// Returns `true` when the lease was still held and the terminal
+    /// state was written; `false` when the lease was already gone
+    /// (reaped or cancelled after the executor finished) or the row was
+    /// already terminal — the row and audit trail are left alone, since
+    /// whoever finished first already recorded the terminal state.
     pub async fn complete(
         &self,
         request_id: &str,
         final_state: RequestState,
         outcome: Option<&str>,
+        audit: AuditEntry<'_>,
     ) -> Result<bool, QueueError> {
-        if !matches!(
-            final_state,
-            RequestState::Done | RequestState::Refused | RequestState::Failed
-        ) {
+        if !final_state.is_terminal() {
             return Err(QueueError::NotTerminal { state: final_state });
         }
         let mut inner = self.inner.lock().await;
@@ -383,10 +385,11 @@ impl QueueManager {
             return Ok(false);
         };
         inner.busy.remove(&lease.repo);
-        self.store
-            .update_request_state(request_id, final_state, outcome)
+        let finished = self
+            .store
+            .finish_request(request_id, final_state, outcome, audit)
             .await?;
-        Ok(true)
+        Ok(finished)
     }
 
     /// Cancels `request_id` on behalf of `actor` (see the module docs
@@ -417,17 +420,18 @@ impl QueueManager {
             return Ok(CancelOutcome::NotFound);
         }
         inner.lanes.retain(|_, lane| !lane.is_empty());
-        self.store
-            .update_request_state(request_id, RequestState::Failed, Some(CAUSE_CANCELLED))
-            .await?;
         let detail = serde_json::json!({ "actor": actor.as_str() }).to_string();
         self.store
-            .append_audit(
+            .finish_request(
                 request_id,
-                ACTION_CANCEL,
-                Decision::Deny,
-                actor,
-                Some(&detail),
+                RequestState::Failed,
+                Some(CAUSE_CANCELLED),
+                AuditEntry {
+                    action: ACTION_CANCEL,
+                    decision: Decision::Deny,
+                    actor,
+                    detail: Some(&detail),
+                },
             )
             .await?;
         Ok(CancelOutcome::CancelledQueued)
@@ -454,20 +458,26 @@ impl QueueManager {
             inner.busy.remove(&lease.repo);
             // Tell a still-running holder to stop; best-effort.
             let _ = lease.cancel_tx.send(true);
-            self.store
-                .update_request_state(&id, RequestState::Failed, Some(CAUSE_LEASE_EXPIRED))
-                .await?;
             let detail = serde_json::json!({ "cause": "timeout" }).to_string();
-            self.store
-                .append_audit(
+            let finished = self
+                .store
+                .finish_request(
                     &id,
-                    ACTION_LEASE_REAPED,
-                    Decision::Timeout,
-                    Actor::System,
-                    Some(&detail),
+                    RequestState::Failed,
+                    Some(CAUSE_LEASE_EXPIRED),
+                    AuditEntry {
+                        action: ACTION_LEASE_REAPED,
+                        decision: Decision::Timeout,
+                        actor: Actor::System,
+                        detail: Some(&detail),
+                    },
                 )
                 .await?;
-            reaped.push(id);
+            // An already-terminal row means someone else finished first;
+            // the lane is freed either way but nothing was reaped.
+            if finished {
+                reaped.push(id);
+            }
         }
         Ok(reaped)
     }

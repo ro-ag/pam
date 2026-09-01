@@ -47,10 +47,24 @@
 //! and the caller gets a [`CAUSE_DEADLINE_EXCEEDED`] refusal. Executor-side
 //! runaways are reaped by the queue's lease reaper independently.
 //!
-//! # Audit rows
+//! # Audit invariant: every terminal state writes its own audit row
 //!
-//! Every terminal path introduced here writes exactly one audit row for
-//! its terminal state:
+//! Every transition into a terminal request state (`done`, `refused`,
+//! `failed`) goes through **one choke point**:
+//! [`pam_store::Store::finish_request`], which writes the state, the
+//! outcome, and the terminal audit row in a single `SQLite` transaction
+//! — crash-safe (no window where the state is terminal but the audit
+//! row missing) and race-safe (an already-terminal row is a first-wins
+//! no-op, so a reaper/executor double-finish never writes a duplicate
+//! audit row). No code path may call
+//! [`pam_store::Store::update_request_state`] with a terminal state; the
+//! store enforces that with a `debug_assert`, and the laned paths reach
+//! the choke point through [`QueueManager::complete`] (which takes the
+//! executor's audit fields). The v1 issue #49 lesson — silent terminal
+//! paths — is thereby structural, not conventional.
+//!
+//! The terminal audit row per path ([`TERMINAL_ACTIONS`] lists the
+//! action names):
 //!
 //! - gate refusal (unknown capability, ungranted capability) and every
 //!   approval-path refusal (denied, timed out, cancelled while waiting)
@@ -61,12 +75,16 @@
 //!   `system`;
 //! - cancelled execution → the queue's `cancel` action, decision `deny`,
 //!   actor `system` (queued-side cancellation is audited by the queue
-//!   itself);
-//! - deadline refusal → [`ACTION_DEADLINE_REFUSAL`], decision `timeout`,
-//!   actor `system`, *in addition to* the cancellation row of whichever
-//!   path tears the request down — the deadline row records the refusal
-//!   sent to the caller, the cancellation row records the terminal
-//!   state.
+//!   itself, lease reaping by the reaper);
+//! - bypass deadline expiry → [`ACTION_DEADLINE_REFUSAL`], decision
+//!   `timeout`, actor `system`;
+//! - daemon-side bookkeeping failure → [`ACTION_INTERNAL_FAILURE`],
+//!   decision `refuse`, actor `system`.
+//!
+//! On the laned deadline path the [`ACTION_DEADLINE_REFUSAL`] row is
+//! written *in addition to* the cancellation row of whichever side tears
+//! the request down — the deadline row records the refusal sent to the
+//! caller, the cancellation row is the terminal one.
 //!
 //! Store failures on these bookkeeping writes are swallowed (`let _`)
 //! for now: without the tracing setup (a later task) there is nowhere
@@ -96,7 +114,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pam_proto::{Envelope, Event, Response};
-use pam_store::{Actor, Decision, RequestState, Store, StoreError};
+use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -135,6 +153,23 @@ pub const ACTION_EXECUTE: &str = "execute";
 
 /// `audit.action` for a deadline refusal sent to a waiting caller.
 pub const ACTION_DEADLINE_REFUSAL: &str = "deadline_refusal";
+
+/// `audit.action` for a request the daemon failed on its own
+/// bookkeeping ([`CAUSE_INTERNAL_ERROR`]).
+pub const ACTION_INTERNAL_FAILURE: &str = "internal_failure";
+
+/// Every `audit.action` that records a terminal request state. A
+/// terminal request with no audit row among these actions is an audit
+/// invariant violation — feed this list to
+/// [`pam_store::Store::terminal_requests_missing_audit`].
+pub const TERMINAL_ACTIONS: &[&str] = &[
+    ACTION_GATE_REFUSAL,
+    ACTION_EXECUTE,
+    ACTION_DEADLINE_REFUSAL,
+    ACTION_INTERNAL_FAILURE,
+    crate::queue::ACTION_CANCEL,
+    crate::queue::ACTION_LEASE_REAPED,
+];
 
 /// GUI recovery line for [`CAUSE_APPROVAL_DENIED`] refusals.
 const RECOVERY_APPROVAL_DENIED: &str =
@@ -536,11 +571,7 @@ impl Pipeline {
         let id = &envelope.id;
         let Ok(decision) = self.gate.evaluate(id, &envelope.capability).await else {
             // Keep the not-yet-placed row out of the lanes forever.
-            let _ = self
-                .store
-                .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
-                .await;
-            return internal_refusal(id);
+            return self.fail_internal(id).await;
         };
         match decision {
             GateDecision::Refuse {
@@ -666,11 +697,7 @@ impl Pipeline {
                     .await
                     .is_err()
                 {
-                    let _ = self
-                        .store
-                        .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
-                        .await;
-                    return internal_refusal(id);
+                    return self.fail_internal(id).await;
                 }
                 self.place_and_wait(envelope, deadline_ms).await
             }
@@ -704,13 +731,7 @@ impl Pipeline {
                 )
                 .await
             }
-            Err(_) => {
-                let _ = self
-                    .store
-                    .update_request_state(id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
-                    .await;
-                internal_refusal(id)
-            }
+            Err(_) => self.fail_internal(id).await,
         }
     }
 
@@ -742,7 +763,11 @@ impl Pipeline {
         let (_cancel_tx, cancel) = watch::channel(false);
         let Some(capability) = BuiltinCapability::from_name(&envelope.capability) else {
             return self
-                .fail_bypass(id, "capability classified but not dispatchable")
+                .fail_bypass(
+                    id,
+                    &envelope.capability,
+                    "capability classified but not dispatchable",
+                )
                 .await;
         };
         let ctx = self.exec_context(id.clone(), envelope.args.clone(), cancel);
@@ -753,11 +778,15 @@ impl Pipeline {
         .await
         {
             Ok(Ok(output)) => {
+                let detail = execute_success_detail(&envelope.capability, output.outcome);
                 let _ = self
                     .store
-                    .update_request_state(id, RequestState::Done, Some(outcome_str(output.outcome)))
-                    .await;
-                self.audit_execute_success(id, &envelope.capability, output.outcome)
+                    .finish_request(
+                        id,
+                        RequestState::Done,
+                        Some(outcome_str(output.outcome)),
+                        execute_success_entry(&detail),
+                    )
                     .await;
                 let _ = self.events.publish(id, Event::Done).await;
                 Response::Result {
@@ -769,21 +798,38 @@ impl Pipeline {
             }
             Ok(Err(CapabilityFailure::Cancelled)) => {
                 // Unreachable without a lease, but handled legibly.
+                let detail = cancelled_detail();
                 let _ = self
                     .store
-                    .update_request_state(id, RequestState::Failed, Some(CAUSE_CANCELLED))
+                    .finish_request(
+                        id,
+                        RequestState::Failed,
+                        Some(CAUSE_CANCELLED),
+                        cancelled_entry(&detail),
+                    )
                     .await;
-                self.audit_cancelled(id).await;
                 let _ = self.events.publish(id, Event::Refused).await;
                 cancelled_refusal(id)
             }
-            Ok(Err(CapabilityFailure::Failed { detail })) => self.fail_bypass(id, &detail).await,
+            Ok(Err(CapabilityFailure::Failed { detail })) => {
+                self.fail_bypass(id, &envelope.capability, &detail).await
+            }
             Err(_elapsed) => {
+                let detail = serde_json::json!({ "deadline_ms": envelope.deadline_ms }).to_string();
                 let _ = self
                     .store
-                    .update_request_state(id, RequestState::Failed, Some(CAUSE_DEADLINE_EXCEEDED))
+                    .finish_request(
+                        id,
+                        RequestState::Failed,
+                        Some(CAUSE_DEADLINE_EXCEEDED),
+                        AuditEntry {
+                            action: ACTION_DEADLINE_REFUSAL,
+                            decision: Decision::Timeout,
+                            actor: Actor::System,
+                            detail: Some(&detail),
+                        },
+                    )
                     .await;
-                self.audit_deadline(id, envelope.deadline_ms).await;
                 let _ = self.events.publish(id, Event::Refused).await;
                 deadline_refusal_response(id, envelope.deadline_ms)
             }
@@ -800,9 +846,15 @@ impl Pipeline {
         } = work;
         let Ok(Some(row)) = self.store.get_request(&id).await else {
             // A vanished row is unanswerable; free the lane and move on.
+            let detail = serde_json::json!({ "cause": "request row missing" }).to_string();
             let _ = self
                 .queue
-                .complete(&id, RequestState::Failed, Some(CAUSE_INTERNAL_ERROR))
+                .complete(
+                    &id,
+                    RequestState::Failed,
+                    Some(CAUSE_INTERNAL_ERROR),
+                    internal_failure_entry(&detail),
+                )
                 .await;
             self.work.notify_one();
             return;
@@ -824,13 +876,17 @@ impl Pipeline {
 
         match result {
             Ok(output) => {
+                let audit_detail = execute_success_detail(&row.capability, output.outcome);
                 let terminal = self
                     .queue
-                    .complete(&id, RequestState::Done, Some(outcome_str(output.outcome)))
+                    .complete(
+                        &id,
+                        RequestState::Done,
+                        Some(outcome_str(output.outcome)),
+                        execute_success_entry(&audit_detail),
+                    )
                     .await;
                 if matches!(terminal, Ok(true)) {
-                    self.audit_execute_success(&id, &row.capability, output.outcome)
-                        .await;
                     let _ = self.events.publish(&id, Event::Done).await;
                     self.router
                         .finish(
@@ -850,12 +906,17 @@ impl Pipeline {
                 }
             }
             Err(CapabilityFailure::Cancelled) => {
+                let audit_detail = cancelled_detail();
                 let terminal = self
                     .queue
-                    .complete(&id, RequestState::Failed, Some(CAUSE_CANCELLED))
+                    .complete(
+                        &id,
+                        RequestState::Failed,
+                        Some(CAUSE_CANCELLED),
+                        cancelled_entry(&audit_detail),
+                    )
                     .await;
                 if matches!(terminal, Ok(true)) {
-                    self.audit_cancelled(&id).await;
                     let _ = self.events.publish(&id, Event::Refused).await;
                     self.router.finish(&id, cancelled_refusal(&id)).await;
                 } else {
@@ -863,13 +924,17 @@ impl Pipeline {
                 }
             }
             Err(CapabilityFailure::Failed { detail }) => {
+                let audit_detail = execute_failure_detail(&row.capability, &detail);
                 let terminal = self
                     .queue
-                    .complete(&id, RequestState::Failed, Some(CAUSE_EXECUTION_FAILED))
+                    .complete(
+                        &id,
+                        RequestState::Failed,
+                        Some(CAUSE_EXECUTION_FAILED),
+                        execute_failure_entry(&audit_detail),
+                    )
                     .await;
                 if matches!(terminal, Ok(true)) {
-                    self.audit_execute_failure(&id, &row.capability, &detail)
-                        .await;
                     let _ = self.events.publish(&id, Event::Refused).await;
                     self.router.finish(&id, failure_refusal(&id, detail)).await;
                 } else {
@@ -929,13 +994,10 @@ impl Pipeline {
         }
     }
 
-    /// Marks a request refused, writes the gate-refusal audit row,
-    /// publishes the `refused` event, and builds the refusal response.
+    /// Marks a request refused — terminal state and gate-refusal audit
+    /// row in one transaction — publishes the `refused` event, and
+    /// builds the refusal response.
     async fn refuse(&self, id: &str, cause: String, detail: String, recovery: String) -> Response {
-        let _ = self
-            .store
-            .update_request_state(id, RequestState::Refused, Some(&cause))
-            .await;
         let audit_detail = serde_json::json!({
             "cause": cause,
             "detail": detail,
@@ -944,12 +1006,16 @@ impl Pipeline {
         .to_string();
         let _ = self
             .store
-            .append_audit(
+            .finish_request(
                 id,
-                ACTION_GATE_REFUSAL,
-                Decision::Refuse,
-                Actor::Policy,
-                Some(&audit_detail),
+                RequestState::Refused,
+                Some(&cause),
+                AuditEntry {
+                    action: ACTION_GATE_REFUSAL,
+                    decision: Decision::Refuse,
+                    actor: Actor::Policy,
+                    detail: Some(&audit_detail),
+                },
             )
             .await;
         let _ = self.events.publish(id, Event::Refused).await;
@@ -961,13 +1027,35 @@ impl Pipeline {
         }
     }
 
-    /// Terminal handling for a bypass execution failure.
-    async fn fail_bypass(&self, id: &str, detail: &str) -> Response {
+    /// Terminal handling for a daemon-side bookkeeping failure: fail the
+    /// request with its [`ACTION_INTERNAL_FAILURE`] audit row and answer
+    /// with the internal refusal.
+    async fn fail_internal(&self, id: &str) -> Response {
+        let detail = serde_json::json!({ "cause": CAUSE_INTERNAL_ERROR }).to_string();
         let _ = self
             .store
-            .update_request_state(id, RequestState::Failed, Some(CAUSE_EXECUTION_FAILED))
+            .finish_request(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_INTERNAL_ERROR),
+                internal_failure_entry(&detail),
+            )
             .await;
-        self.audit_execute_failure(id, "", detail).await;
+        internal_refusal(id)
+    }
+
+    /// Terminal handling for a bypass execution failure.
+    async fn fail_bypass(&self, id: &str, capability: &str, detail: &str) -> Response {
+        let audit_detail = execute_failure_detail(capability, detail);
+        let _ = self
+            .store
+            .finish_request(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_EXECUTION_FAILED),
+                execute_failure_entry(&audit_detail),
+            )
+            .await;
         let _ = self.events.publish(id, Event::Refused).await;
         failure_refusal(id, detail.to_owned())
     }
@@ -1000,61 +1088,11 @@ impl Pipeline {
             .await;
     }
 
-    /// Audit row for a successful execution.
-    async fn audit_execute_success(&self, id: &str, capability: &str, outcome: pam_proto::Outcome) {
-        let detail = serde_json::json!({
-            "capability": capability,
-            "outcome": outcome_str(outcome),
-        })
-        .to_string();
-        let _ = self
-            .store
-            .append_audit(
-                id,
-                ACTION_EXECUTE,
-                Decision::Allow,
-                Actor::System,
-                Some(&detail),
-            )
-            .await;
-    }
-
-    /// Audit row for a failed execution.
-    async fn audit_execute_failure(&self, id: &str, capability: &str, detail: &str) {
-        let audit_detail = serde_json::json!({
-            "capability": capability,
-            "detail": detail,
-        })
-        .to_string();
-        let _ = self
-            .store
-            .append_audit(
-                id,
-                ACTION_EXECUTE,
-                Decision::Refuse,
-                Actor::System,
-                Some(&audit_detail),
-            )
-            .await;
-    }
-
-    /// Audit row for an execution the cancel signal stopped (mirrors the
-    /// queue's queued-side cancellation row).
-    async fn audit_cancelled(&self, id: &str) {
-        let detail = serde_json::json!({ "actor": Actor::System.as_str() }).to_string();
-        let _ = self
-            .store
-            .append_audit(
-                id,
-                crate::queue::ACTION_CANCEL,
-                Decision::Deny,
-                Actor::System,
-                Some(&detail),
-            )
-            .await;
-    }
-
     /// Audit row for a deadline refusal sent to a waiting caller.
+    ///
+    /// This is the one supplementary (non-terminal) audit append on the
+    /// laned deadline path: the terminal row is the cancellation row of
+    /// whichever side tears the request down (see the module docs).
     async fn audit_deadline(&self, id: &str, deadline_ms: u64) {
         let detail = serde_json::json!({ "deadline_ms": deadline_ms }).to_string();
         let _ = self
@@ -1067,6 +1105,70 @@ impl Pipeline {
                 Some(&detail),
             )
             .await;
+    }
+}
+
+/// Audit detail for a successful execution.
+fn execute_success_detail(capability: &str, outcome: pam_proto::Outcome) -> String {
+    serde_json::json!({
+        "capability": capability,
+        "outcome": outcome_str(outcome),
+    })
+    .to_string()
+}
+
+/// Terminal audit entry for a successful execution.
+fn execute_success_entry(detail: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action: ACTION_EXECUTE,
+        decision: Decision::Allow,
+        actor: Actor::System,
+        detail: Some(detail),
+    }
+}
+
+/// Audit detail for a failed execution.
+fn execute_failure_detail(capability: &str, detail: &str) -> String {
+    serde_json::json!({
+        "capability": capability,
+        "detail": detail,
+    })
+    .to_string()
+}
+
+/// Terminal audit entry for a failed execution.
+fn execute_failure_entry(detail: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action: ACTION_EXECUTE,
+        decision: Decision::Refuse,
+        actor: Actor::System,
+        detail: Some(detail),
+    }
+}
+
+/// Audit detail for an execution the cancel signal stopped.
+fn cancelled_detail() -> String {
+    serde_json::json!({ "actor": Actor::System.as_str() }).to_string()
+}
+
+/// Terminal audit entry for an execution the cancel signal stopped
+/// (mirrors the queue's queued-side cancellation row).
+fn cancelled_entry(detail: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action: crate::queue::ACTION_CANCEL,
+        decision: Decision::Deny,
+        actor: Actor::System,
+        detail: Some(detail),
+    }
+}
+
+/// Terminal audit entry for a daemon-side bookkeeping failure.
+fn internal_failure_entry(detail: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action: ACTION_INTERNAL_FAILURE,
+        decision: Decision::Refuse,
+        actor: Actor::System,
+        detail: Some(detail),
     }
 }
 

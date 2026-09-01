@@ -1,12 +1,22 @@
 use turso::params;
 
-use crate::{Actor, ApprovalResolution, Decision, RequestState, Store, StoreError};
+use crate::{Actor, ApprovalResolution, AuditEntry, Decision, RequestState, Store, StoreError};
 
 async fn insert_demo_request(store: &Store, id: &str) {
     store
         .insert_request(id, "release", "ro-ag/pam", "claude", "{}", None)
         .await
         .unwrap();
+}
+
+/// A minimal terminal audit entry for seeding finished requests.
+fn entry(action: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action,
+        decision: Decision::Allow,
+        actor: Actor::System,
+        detail: None,
+    }
 }
 
 #[tokio::test]
@@ -45,7 +55,14 @@ async fn request_insert_and_state_round_trip() {
     assert_eq!(row.created_ts, row.updated_ts);
 
     store
-        .update_request_state("req_1", RequestState::Done, Some("ok"))
+        .update_request_state("req_1", RequestState::Running, None)
+        .await
+        .unwrap();
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Running);
+
+    store
+        .finish_request("req_1", RequestState::Done, Some("ok"), entry("execute"))
         .await
         .unwrap();
     let row = store.get_request("req_1").await.unwrap().unwrap();
@@ -93,7 +110,7 @@ async fn find_inflight_by_key_matches_only_active_states() {
 
     // A terminal request stops matching: retries start fresh work.
     store
-        .update_request_state("req_1", RequestState::Done, Some("ok"))
+        .finish_request("req_1", RequestState::Done, Some("ok"), entry("execute"))
         .await
         .unwrap();
     assert!(store.find_inflight_by_key("k").await.unwrap().is_none());
@@ -152,7 +169,7 @@ async fn list_queued_ordered_returns_oldest_first_queued_only() {
 async fn updating_missing_request_is_an_error() {
     let store = Store::open_in_memory().await.unwrap();
     let err = store
-        .update_request_state("nope", RequestState::Failed, None)
+        .update_request_state("nope", RequestState::Running, None)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -350,11 +367,16 @@ async fn count_inflight_counts_only_non_terminal_states() {
         .await
         .unwrap();
     store
-        .update_request_state("req_d", RequestState::Done, Some("ok"))
+        .finish_request("req_d", RequestState::Done, Some("ok"), entry("execute"))
         .await
         .unwrap();
     store
-        .update_request_state("req_f", RequestState::Failed, Some("boom"))
+        .finish_request(
+            "req_f",
+            RequestState::Failed,
+            Some("boom"),
+            entry("execute"),
+        )
         .await
         .unwrap();
 
@@ -443,4 +465,173 @@ async fn list_pending_approvals_joins_request_and_skips_resolved() {
     assert_eq!(pending[0].repo, "ro-ag/pam");
     assert_eq!(pending[0].caller_agent, "claude");
     assert!(pending[0].requested_ts > 0);
+}
+
+#[tokio::test]
+async fn finish_request_writes_state_outcome_and_audit_together() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    let finished = store
+        .finish_request(
+            "req_1",
+            RequestState::Refused,
+            Some("not_granted"),
+            AuditEntry {
+                action: "gate_refusal",
+                decision: Decision::Refuse,
+                actor: Actor::Policy,
+                detail: Some(r#"{"cause":"not_granted"}"#),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(finished);
+
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Refused);
+    assert_eq!(row.outcome.as_deref(), Some("not_granted"));
+
+    let audit = store.audit_for_request("req_1").await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "gate_refusal");
+    assert_eq!(audit[0].decision, Decision::Refuse);
+    assert_eq!(audit[0].actor, Actor::Policy);
+    assert_eq!(
+        audit[0].detail.as_deref(),
+        Some(r#"{"cause":"not_granted"}"#)
+    );
+    assert!(audit[0].ts > 0);
+}
+
+#[tokio::test]
+async fn finish_request_rejects_non_terminal_states() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    for state in [
+        RequestState::Queued,
+        RequestState::Running,
+        RequestState::WaitingApproval,
+    ] {
+        let err = store
+            .finish_request("req_1", state, None, entry("execute"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotTerminal { .. }),
+            "{state:?} must be rejected, got {err:?}"
+        );
+    }
+    // The refused states left no trace.
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert!(store.audit_for_request("req_1").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn finish_request_double_finish_no_ops_with_a_single_audit_row() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    // First finisher wins (executor completing)...
+    assert!(
+        store
+            .finish_request(
+                "req_1",
+                RequestState::Done,
+                Some("solved"),
+                entry("execute")
+            )
+            .await
+            .unwrap()
+    );
+    // ...the second (a racing reaper) no-ops and leaves the row alone.
+    assert!(
+        !store
+            .finish_request(
+                "req_1",
+                RequestState::Failed,
+                Some("lease_expired"),
+                entry("lease_reaped"),
+            )
+            .await
+            .unwrap()
+    );
+
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Done);
+    assert_eq!(row.outcome.as_deref(), Some("solved"));
+    let audit = store.audit_for_request("req_1").await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "execute");
+}
+
+#[tokio::test]
+async fn finish_request_missing_request_is_not_found() {
+    let store = Store::open_in_memory().await.unwrap();
+    let err = store
+        .finish_request("nope", RequestState::Failed, None, entry("execute"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::NotFound {
+            table: "request",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn terminal_requests_missing_audit_flags_only_silent_terminals() {
+    let store = Store::open_in_memory().await.unwrap();
+    let terminal_actions = ["execute", "cancel"];
+
+    // Terminal with a terminal-action audit row: clean.
+    insert_demo_request(&store, "req_ok").await;
+    store
+        .finish_request(
+            "req_ok",
+            RequestState::Done,
+            Some("solved"),
+            entry("execute"),
+        )
+        .await
+        .unwrap();
+
+    // Terminal whose only audit row is a non-terminal action: flagged.
+    insert_demo_request(&store, "req_wrong_action").await;
+    store
+        .append_audit(
+            "req_wrong_action",
+            "auto_grant",
+            Decision::Allow,
+            Actor::Policy,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "req_wrong_action",
+            RequestState::Failed,
+            None,
+            entry("bookkeeping"),
+        )
+        .await
+        .unwrap();
+
+    // Non-terminal without audit: not flagged — it is still in flight.
+    insert_demo_request(&store, "req_inflight").await;
+
+    let missing = store
+        .terminal_requests_missing_audit(&terminal_actions)
+        .await
+        .unwrap();
+    assert_eq!(missing, ["req_wrong_action"]);
+
+    // An empty action list counts every terminal request as silent.
+    let missing = store.terminal_requests_missing_audit(&[]).await.unwrap();
+    assert_eq!(missing, ["req_ok", "req_wrong_action"]);
 }

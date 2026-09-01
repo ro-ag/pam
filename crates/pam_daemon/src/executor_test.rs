@@ -143,6 +143,26 @@ async fn echo_mirrors_its_args() {
 }
 
 #[tokio::test]
+async fn echo_fail_arg_fails_the_execution() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let ctx = fx.ctx_uncancelled("req_echo", serde_json::json!({ "fail": true }));
+
+        let result = BuiltinCapability::Echo.execute(ctx).await;
+        assert!(
+            matches!(result, Err(CapabilityFailure::Failed { ref detail }) if detail.contains("args.fail")),
+            "got {result:?}"
+        );
+
+        // Anything but the boolean true still echoes.
+        let ctx = fx.ctx_uncancelled("req_echo", serde_json::json!({ "fail": false }));
+        assert!(BuiltinCapability::Echo.execute(ctx).await.is_ok());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
 async fn echo_delay_stops_on_the_cancel_signal() {
     timeout(DEADLINE, async {
         let fx = fixture().await;

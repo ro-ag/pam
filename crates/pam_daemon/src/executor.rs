@@ -23,6 +23,9 @@
 //! - `echo` (non-destructive): mirrors its args back; an optional
 //!   `delay_ms` argument sleeps first, honoring the cancel signal — the
 //!   integration tests use it as a controllable long-running capability.
+//!   An optional `fail: true` argument makes it fail (after any delay)
+//!   with [`CapabilityFailure::Failed`] — a documented test/diagnostic
+//!   surface for driving the execution-failure path end to end.
 //!   Outcome `solved`.
 //! - `cancel` (read-only class, see [`crate::policy::classify`] for why):
 //!   the built-in behind `pam cancel <ticket>`. Cancels the queued or
@@ -182,7 +185,8 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
 }
 
 /// `echo`: mirror the args back; `args.delay_ms` sleeps first, honoring
-/// the cancel signal.
+/// the cancel signal, and `args.fail: true` fails after any delay (the
+/// test/diagnostic surface for the execution-failure path).
 async fn echo(mut ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     if let Some(delay_ms) = ctx.args.get("delay_ms").and_then(serde_json::Value::as_u64) {
         tokio::select! {
@@ -193,6 +197,11 @@ async fn echo(mut ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailur
                 return Err(CapabilityFailure::Cancelled);
             }
         }
+    }
+    if ctx.args.get("fail").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(CapabilityFailure::Failed {
+            detail: "echo was asked to fail (args.fail = true)".to_owned(),
+        });
     }
     Ok(CapabilityOutput {
         outcome: Outcome::Solved,

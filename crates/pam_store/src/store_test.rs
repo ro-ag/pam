@@ -4,7 +4,7 @@ use crate::{Actor, Decision, RequestState, Store, StoreError};
 
 async fn insert_demo_request(store: &Store, id: &str) {
     store
-        .insert_request(id, "release", "ro-ag/pam", "claude", "{}")
+        .insert_request(id, "release", "ro-ag/pam", "claude", "{}", None)
         .await
         .unwrap();
 }
@@ -20,7 +20,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 1);
+    assert_eq!(store.schema_version().await.unwrap(), 2);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -53,6 +53,99 @@ async fn request_insert_and_state_round_trip() {
     assert_eq!(row.outcome.as_deref(), Some("ok"));
 
     assert!(store.get_request("req_missing").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn idempotency_key_round_trips() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("req_k", "echo", "ro-ag/pam", "claude", "{}", Some("key-9"))
+        .await
+        .unwrap();
+    let row = store.get_request("req_k").await.unwrap().unwrap();
+    assert_eq!(row.idempotency_key.as_deref(), Some("key-9"));
+
+    insert_demo_request(&store, "req_none").await;
+    let row = store.get_request("req_none").await.unwrap().unwrap();
+    assert_eq!(row.idempotency_key, None);
+}
+
+#[tokio::test]
+async fn find_inflight_by_key_matches_only_active_states() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert!(store.find_inflight_by_key("k").await.unwrap().is_none());
+
+    store
+        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", Some("k"))
+        .await
+        .unwrap();
+    let row = store.find_inflight_by_key("k").await.unwrap().unwrap();
+    assert_eq!(row.id, "req_1");
+
+    // Running and waiting_approval still count as in-flight.
+    for state in [RequestState::Running, RequestState::WaitingApproval] {
+        store
+            .update_request_state("req_1", state, None)
+            .await
+            .unwrap();
+        assert!(store.find_inflight_by_key("k").await.unwrap().is_some());
+    }
+
+    // A terminal request stops matching: retries start fresh work.
+    store
+        .update_request_state("req_1", RequestState::Done, Some("ok"))
+        .await
+        .unwrap();
+    assert!(store.find_inflight_by_key("k").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn find_inflight_by_shape_requires_full_equality() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("req_1", "echo", "ro-ag/pam", "claude", r#"{"n":1}"#, None)
+        .await
+        .unwrap();
+
+    let row = store
+        .find_inflight_by_shape("echo", "ro-ag/pam", r#"{"n":1}"#)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id, "req_1");
+
+    // Any differing component misses.
+    for (capability, repo, args) in [
+        ("status", "ro-ag/pam", r#"{"n":1}"#),
+        ("echo", "other/repo", r#"{"n":1}"#),
+        ("echo", "ro-ag/pam", r#"{"n":2}"#),
+    ] {
+        assert!(
+            store
+                .find_inflight_by_shape(capability, repo, args)
+                .await
+                .unwrap()
+                .is_none(),
+            "unexpected match for {capability}/{repo}/{args}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_queued_ordered_returns_oldest_first_queued_only() {
+    let store = Store::open_in_memory().await.unwrap();
+    // Same-second inserts: the id tie-break keeps insertion order.
+    insert_demo_request(&store, "req_a").await;
+    insert_demo_request(&store, "req_b").await;
+    insert_demo_request(&store, "req_c").await;
+    store
+        .update_request_state("req_b", RequestState::Running, None)
+        .await
+        .unwrap();
+
+    let queued = store.list_queued_ordered().await.unwrap();
+    let ids: Vec<&str> = queued.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["req_a", "req_c"]);
 }
 
 #[tokio::test]

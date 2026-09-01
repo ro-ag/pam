@@ -16,10 +16,16 @@ pub(crate) struct Migration {
 }
 
 /// Every migration this binary knows, ordered by ascending version.
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+];
 
 /// Highest schema version this binary can produce.
 pub(crate) fn latest_version() -> i64 {
@@ -153,3 +159,11 @@ CREATE TABLE setting (
     value TEXT NOT NULL
 );
 "#;
+
+/// Migration 2: caller-chosen idempotency key on `request`, for in-flight
+/// request deduplication by the queue manager. Nullable — most requests
+/// never set one — and indexed for the dedupe lookup on enqueue.
+const SCHEMA_V2: &str = r"
+ALTER TABLE request ADD COLUMN idempotency_key TEXT;
+CREATE INDEX request_idempotency_idx ON request (idempotency_key);
+";

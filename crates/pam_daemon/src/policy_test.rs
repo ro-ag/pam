@@ -26,7 +26,7 @@ async fn gate_with(store: &Arc<Store>, profile: Profile) -> PolicyGate {
         .await
         .unwrap();
     store
-        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}")
+        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", None)
         .await
         .unwrap();
     PolicyGate::new(Arc::clone(store)).await.unwrap()

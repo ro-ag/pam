@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 turso.workspace = true
 thiserror.workspace = true
+# sync-only: finish_request serializes its BEGIN/COMMIT window behind an
+# async mutex. No runtime features — the daemon owns task placement.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tokio.workspace = true

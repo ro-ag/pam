@@ -26,8 +26,9 @@
 //!   Rust enums.
 //! - The API is async ([`Store::open`] and every helper await). Turso
 //!   drives its own I/O and does not require a specific runtime; this
-//!   crate depends on `tokio` only in tests. The daemon still owns
-//!   threading and task placement.
+//!   crate depends on `tokio` only for the `sync` mutex serializing
+//!   [`Store::finish_request`] transactions (and fully in tests). The
+//!   daemon still owns threading and task placement.
 
 mod error;
 mod migrations;
@@ -35,8 +36,8 @@ mod store;
 
 pub use error::StoreError;
 pub use store::{
-    Actor, ApprovalResolution, ApprovalRow, AuditRow, Decision, PendingApproval, RequestRow,
-    RequestState, Store,
+    Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, Decision, PendingApproval,
+    RequestRow, RequestState, Store,
 };
 
 #[cfg(test)]

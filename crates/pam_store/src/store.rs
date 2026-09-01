@@ -43,6 +43,13 @@ impl RequestState {
         }
     }
 
+    /// True for the states a request never leaves (`done`, `refused`,
+    /// `failed`).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Refused | Self::Failed)
+    }
+
     fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "queued" => Ok(Self::Queued),
@@ -232,6 +239,20 @@ pub struct PendingApproval {
     pub requested_ts: i64,
 }
 
+/// The audit row [`Store::finish_request`] appends alongside a terminal
+/// state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditEntry<'a> {
+    /// What was decided about (e.g. `execute`, `cancel`).
+    pub action: &'a str,
+    /// Outcome recorded on the row.
+    pub decision: Decision,
+    /// Who made the decision.
+    pub actor: Actor,
+    /// Free-form context (JSON by convention).
+    pub detail: Option<&'a str>,
+}
+
 /// One row of the `audit` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
@@ -259,6 +280,12 @@ pub struct Store {
     /// Keeps the database itself alive alongside the connection.
     _db: Database,
     pub(crate) conn: Connection,
+    /// Serializes [`Store::finish_request`] transactions: the connection
+    /// is shared across tasks, and a statement issued between another
+    /// task's `BEGIN` and `COMMIT` would join that transaction. Only
+    /// `finish_request` opens transactions at runtime, so only it takes
+    /// this lock.
+    txn_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -298,7 +325,11 @@ impl Store {
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
         migrations::run(&conn).await?;
-        Ok(Self { _db: db, conn })
+        Ok(Self {
+            _db: db,
+            conn,
+            txn_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// The schema version currently recorded in the database.
@@ -461,14 +492,28 @@ impl Store {
         Ok(out)
     }
 
-    /// Moves a request to `state`, recording `outcome` and bumping
-    /// `updated_ts`. Errors if the request does not exist.
+    /// Moves a request to a **non-terminal** `state`, recording `outcome`
+    /// and bumping `updated_ts`. Errors if the request does not exist.
+    ///
+    /// # Invariant: terminal transitions go through `finish_request`
+    ///
+    /// Every transition into a terminal state (`done`, `refused`,
+    /// `failed`) must go through [`Self::finish_request`], which writes
+    /// the state and its audit row in one transaction — every terminal
+    /// state gets its own audit row, with no crash window in between and
+    /// no silent paths. No code path may call this helper with a terminal
+    /// state; a `debug_assert` enforces it as far as the type system
+    /// cannot.
     pub async fn update_request_state(
         &self,
         id: &str,
         state: RequestState,
         outcome: Option<&str>,
     ) -> Result<(), StoreError> {
+        debug_assert!(
+            !state.is_terminal(),
+            "terminal transitions must go through finish_request"
+        );
         let changed = self
             .conn
             .execute(
@@ -483,6 +528,137 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    /// Moves a request into terminal `state`, recording `outcome` and
+    /// appending its `audit` row — both in **one transaction**, so no
+    /// crash or interleaving can leave a terminal request without an
+    /// audit row. This is the single choke point for terminal
+    /// transitions (see [`Self::update_request_state`]).
+    ///
+    /// Returns `true` when this call performed the transition. A request
+    /// that is **already terminal** is left untouched and returns
+    /// `false` — the idempotent guard against double-finish races
+    /// (reaper vs executor): the first finisher wins, the second no-ops
+    /// and writes no duplicate audit row. A missing request errors with
+    /// [`StoreError::NotFound`]; a non-terminal `state` errors with
+    /// [`StoreError::NotTerminal`].
+    pub async fn finish_request(
+        &self,
+        id: &str,
+        state: RequestState,
+        outcome: Option<&str>,
+        audit: AuditEntry<'_>,
+    ) -> Result<bool, StoreError> {
+        if !state.is_terminal() {
+            return Err(StoreError::NotTerminal {
+                state: state.as_str(),
+            });
+        }
+        let _guard = self.txn_lock.lock().await;
+        self.conn.execute("BEGIN", ()).await?;
+        let finished = self.finish_request_in_txn(id, state, outcome, audit).await;
+        match finished {
+            // COMMIT on both outcomes: the no-op path wrote nothing of
+            // its own, and a concurrent statement that joined the
+            // transaction window must not be rolled back with it.
+            Ok(finished) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(finished)
+            }
+            Err(err) => {
+                // Best effort: the returned error is the one that matters.
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// The statements inside [`Self::finish_request`]'s transaction.
+    async fn finish_request_in_txn(
+        &self,
+        id: &str,
+        state: RequestState,
+        outcome: Option<&str>,
+        audit: AuditEntry<'_>,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE request SET state = ?2, outcome = ?3, updated_ts = ?4
+                 WHERE id = ?1 AND state IN ('queued','running','waiting_approval')",
+                params![id, state.as_str(), outcome, now_ts()],
+            )
+            .await?;
+        if changed == 0 {
+            // Nothing matched: either the row is already terminal (the
+            // idempotent no-op) or it does not exist at all.
+            let mut rows = self
+                .conn
+                .query("SELECT 1 FROM request WHERE id = ?1", params![id])
+                .await?;
+            return match rows.next().await? {
+                Some(_) => Ok(false),
+                None => Err(StoreError::NotFound {
+                    table: "request",
+                    id: id.to_owned(),
+                }),
+            };
+        }
+        self.conn
+            .execute(
+                "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    audit.action,
+                    audit.decision.as_str(),
+                    audit.actor.as_str(),
+                    audit.detail,
+                    now_ts()
+                ],
+            )
+            .await?;
+        Ok(true)
+    }
+
+    /// Ids of terminal requests with **no** audit row whose action is in
+    /// `terminal_actions` — the every-terminal-state-is-audited
+    /// invariant's violation query, oldest first. Empty means the
+    /// invariant holds; exposed for the invariant tests and the GUI's
+    /// health view. The daemon supplies its terminal action names
+    /// (`pam_daemon`'s `TERMINAL_ACTIONS`).
+    pub async fn terminal_requests_missing_audit(
+        &self,
+        terminal_actions: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        let sql = if terminal_actions.is_empty() {
+            // No action can match, so every terminal request is missing.
+            "SELECT id FROM request
+             WHERE state IN ('done','refused','failed')
+             ORDER BY created_ts, id"
+                .to_owned()
+        } else {
+            let placeholders: Vec<String> = (1..=terminal_actions.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            format!(
+                "SELECT r.id FROM request r
+                 WHERE r.state IN ('done','refused','failed')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM audit a
+                       WHERE a.request_id = r.id AND a.action IN ({}))
+                 ORDER BY r.created_ts, r.id",
+                placeholders.join(", ")
+            )
+        };
+        let actions: Vec<String> = terminal_actions.iter().map(|a| (*a).to_owned()).collect();
+        let mut rows = self.conn.query(&sql, actions).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
     }
 
     /// Counts the in-flight requests (state `queued`, `running`, or

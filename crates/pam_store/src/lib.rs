@@ -36,7 +36,8 @@ mod store;
 
 pub use error::StoreError;
 pub use store::{
-    Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, Decision, PendingApproval,
+    Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow,
+    DEFAULT_REQUEST_LIST_LIMIT, Decision, GrantRow, MAX_REQUEST_LIST_LIMIT, PendingApproval,
     RequestRow, RequestState, Store,
 };
 

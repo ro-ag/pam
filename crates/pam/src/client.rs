@@ -27,6 +27,11 @@
 //! a [`CAUSE_DAEMON_OUTDATED`] refusal (the daemon drains and re-spawns
 //! the newer binary; the spec says the client retries).
 //!
+//! [`send_request`] refuses the reserved GUI-only `admin.*` namespace
+//! before touching the socket; the GUI administers the daemon through
+//! [`send_admin`] instead (see both functions' docs for the security
+//! reasoning).
+//!
 //! [`follow_ticket`] is the event side: subscribe to `events.sock` on
 //! the ticket's topic and stream events until a terminal `done` /
 //! `refused` (bounded by a caller-chosen timeout), reconciling against
@@ -42,14 +47,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pam_daemon::admin::{ADMIN_CALLER_AGENT, ADMIN_PREFIX, ADMIN_REPO};
 use pam_daemon::daemon::CAUSE_DAEMON_OUTDATED;
 use pam_daemon::lifecycle::LOCK_FILE;
 use pam_daemon::runtime_dir::{RuntimeDir, RuntimeDirError};
-use pam_proto::{Envelope, Event, Response};
+use pam_proto::{Caller, Envelope, Event, PROTOCOL_VERSION, Response};
 use thiserror::Error;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-use crate::request::build_envelope;
+use crate::request::{build_envelope, new_request_id};
 
 /// How long [`ensure_daemon`] waits for a spawned daemon to become
 /// ready, per spawn attempt.
@@ -258,6 +264,24 @@ pub enum RequestError {
         /// How long the client waited.
         waited: Duration,
     },
+    /// [`send_request`] was handed a GUI-only `admin.*` capability —
+    /// the structural guard keeping every CLI code path out of the
+    /// admin surface (see [`send_admin`]).
+    #[error(
+        "capability {capability:?} is a GUI-only admin operation; the pam CLI \
+         has no security commands — use the PAM GUI"
+    )]
+    AdminOnly {
+        /// The refused `admin.*` capability.
+        capability: String,
+    },
+    /// [`send_admin`] was handed a capability outside the `admin.*`
+    /// namespace; ordinary capabilities go through [`send_request`].
+    #[error("send_admin only sends admin.* operations, got {capability:?}")]
+    NotAdmin {
+        /// The refused capability.
+        capability: String,
+    },
 }
 
 /// True when `response` is the version-handshake refusal after which
@@ -274,6 +298,15 @@ pub fn should_retry(response: &Response) -> bool {
 ///
 /// The daemon's answer — result, refusal, or ticket — is returned as-is;
 /// rendering and exit codes are the caller's job ([`crate::render`]).
+///
+/// # Admin guard
+///
+/// A capability under the reserved `admin.` prefix errors with
+/// [`RequestError::AdminOnly`] **before anything touches the socket**:
+/// every CLI subcommand funnels through here, so no subcommand — present
+/// or future — can reach the daemon's GUI-only admin surface (the v1
+/// `pam access grant` self-grant lesson, closed structurally). The GUI
+/// uses [`send_admin`] instead.
 pub async fn send_request(
     base_dir: &Path,
     capability: &str,
@@ -282,12 +315,67 @@ pub async fn send_request(
     deadline_ms: u64,
     idempotency_key: Option<String>,
 ) -> Result<Response, RequestError> {
+    if capability.starts_with(ADMIN_PREFIX) {
+        return Err(RequestError::AdminOnly {
+            capability: capability.to_owned(),
+        });
+    }
     let envelope = build_envelope(capability, args, wait, deadline_ms, idempotency_key);
+    send_envelope(base_dir, &envelope).await
+}
+
+/// Sends one **GUI-only** admin operation (`admin.*`) to the daemon.
+///
+/// This is the path `pam gui` (the Tauri bridge) administers the daemon
+/// through — grants, approvals, profile, activity. It is deliberately
+/// separate from [`send_request`], which refuses `admin.*` outright so
+/// the CLI subcommand surface can never reach administration. The
+/// separation is structural for CLI users and advisory at the socket:
+/// the envelope carries the `pam-gui` caller tripwire the daemon
+/// requires, but filesystem permissions on the runtime dir remain the
+/// actual security wall (see `pam_daemon::admin` for the full model).
+///
+/// A capability outside `admin.*` errors with
+/// [`RequestError::NotAdmin`]. Admin ops always wait (they are
+/// synchronous request/reply).
+pub async fn send_admin(
+    base_dir: &Path,
+    op: &str,
+    args: serde_json::Value,
+    deadline_ms: u64,
+) -> Result<Response, RequestError> {
+    if !op.starts_with(ADMIN_PREFIX) {
+        return Err(RequestError::NotAdmin {
+            capability: op.to_owned(),
+        });
+    }
+    let envelope = Envelope {
+        v: PROTOCOL_VERSION,
+        id: new_request_id(),
+        capability: op.to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        caller: Caller {
+            agent: ADMIN_CALLER_AGENT.to_owned(),
+            repo: ADMIN_REPO.to_owned(),
+            pid: std::process::id(),
+        },
+        args,
+        idempotency_key: None,
+        deadline_ms,
+        wait: true,
+    };
+    send_envelope(base_dir, &envelope).await
+}
+
+/// The shared exchange loop behind [`send_request`] and [`send_admin`]:
+/// ensure the daemon, exchange over `pam.sock`, retry exactly once
+/// after a `daemon_outdated` refusal.
+async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response, RequestError> {
     let mut retried = false;
     loop {
         ensure_daemon(base_dir)?;
         let dirs = RuntimeDir::at_base(base_dir)?;
-        let response = exchange(&dirs, &envelope).await?;
+        let response = exchange(&dirs, envelope).await?;
         if should_retry(&response) && !retried {
             retried = true;
             tokio::time::sleep(OUTDATED_RETRY_PAUSE).await;

@@ -635,3 +635,147 @@ async fn terminal_requests_missing_audit_flags_only_silent_terminals() {
     let missing = store.terminal_requests_missing_audit(&[]).await.unwrap();
     assert_eq!(missing, ["req_ok", "req_wrong_action"]);
 }
+
+#[tokio::test]
+async fn list_grants_includes_revoked_history_newest_first() {
+    let store = Store::open_in_memory().await.unwrap();
+    store.insert_grant("deploy").await.unwrap();
+    store.insert_grant("release").await.unwrap();
+    store.revoke_grant("deploy").await.unwrap();
+
+    let grants = store.list_grants().await.unwrap();
+    assert_eq!(grants.len(), 2, "revoked rows stay listed");
+    // Same-second timestamps: id DESC is the newest-first tiebreaker.
+    assert_eq!(grants[0].capability, "release");
+    assert_eq!(grants[0].revoked_ts, None);
+    assert_eq!(grants[1].capability, "deploy");
+    assert!(grants[1].revoked_ts.is_some(), "revocation timestamped");
+    assert_eq!(grants[1].scope, "global");
+}
+
+#[tokio::test]
+async fn revoke_grant_errors_without_an_active_grant() {
+    let store = Store::open_in_memory().await.unwrap();
+
+    // Never granted.
+    assert!(matches!(
+        store.revoke_grant("deploy").await,
+        Err(StoreError::NotFound { table: "grant", .. })
+    ));
+
+    // Already revoked.
+    store.insert_grant("deploy").await.unwrap();
+    store.revoke_grant("deploy").await.unwrap();
+    assert!(matches!(
+        store.revoke_grant("deploy").await,
+        Err(StoreError::NotFound { table: "grant", .. })
+    ));
+}
+
+#[tokio::test]
+async fn list_requests_filtered_applies_filters_newest_first() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("req_1", "echo", "/repo/a", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_request("req_2", "echo", "/repo/b", "codex", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_request("req_3", "status", "/repo/a", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .finish_request(
+            "req_3",
+            RequestState::Done,
+            Some("verified"),
+            entry("execute"),
+        )
+        .await
+        .unwrap();
+
+    // Unfiltered: everything, newest first (id DESC breaks the
+    // same-second tie).
+    let all = store
+        .list_requests_filtered(None, None, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(ids, ["req_3", "req_2", "req_1"]);
+
+    // By repo.
+    let repo_a = store
+        .list_requests_filtered(None, Some("/repo/a"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(repo_a.len(), 2);
+
+    // By agent and state combined.
+    let done_claude = store
+        .list_requests_filtered(None, None, Some("claude"), Some(RequestState::Done))
+        .await
+        .unwrap();
+    assert_eq!(done_claude.len(), 1);
+    assert_eq!(done_claude[0].id, "req_3");
+
+    // No match.
+    let none = store
+        .list_requests_filtered(None, Some("/repo/none"), None, None)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn list_requests_filtered_bounds_the_limit() {
+    let store = Store::open_in_memory().await.unwrap();
+    for i in 0..5 {
+        store
+            .insert_request(&format!("req_{i}"), "echo", "/r", "claude", "{}", None)
+            .await
+            .unwrap();
+    }
+
+    // An explicit limit caps the rows.
+    let two = store
+        .list_requests_filtered(Some(2), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(two.len(), 2);
+
+    // Zero is clamped up to one instead of returning nothing.
+    let one = store
+        .list_requests_filtered(Some(0), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+
+    // An absurd limit is clamped to the maximum (observable only as
+    // "does not error"; the clamp constant bounds the SQL LIMIT).
+    let all = store
+        .list_requests_filtered(Some(u64::MAX), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+}
+
+#[tokio::test]
+async fn upsert_caller_inserts_once_and_bumps_last_seen() {
+    let store = Store::open_in_memory().await.unwrap();
+    store.upsert_caller("claude", "/repo/a").await.unwrap();
+    store.upsert_caller("claude", "/repo/a").await.unwrap();
+    store.upsert_caller("codex", "/repo/b").await.unwrap();
+
+    let callers = store.list_callers().await.unwrap();
+    assert_eq!(callers.len(), 2, "same pair upserts into one row");
+    let claude = callers
+        .iter()
+        .find(|caller| caller.agent == "claude")
+        .expect("claude row");
+    assert_eq!(claude.repo, "/repo/a");
+    assert!(claude.first_seen > 0);
+    assert!(claude.last_seen >= claude.first_seen);
+}

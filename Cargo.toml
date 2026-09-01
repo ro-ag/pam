@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/pam", "crates/pam_daemon", "crates/pam_proto", "crates/pam_store"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ro-ag/pam"
+
+[workspace.dependencies]
+pam_daemon = { path = "crates/pam_daemon" }
+pam_proto = { path = "crates/pam_proto" }
+pam_store = { path = "crates/pam_store" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

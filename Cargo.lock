@@ -1296,6 +1296,8 @@ dependencies = [
  "pam_proto",
  "sysinfo",
  "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1309,6 +1311,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "zeromq",
 ]
 

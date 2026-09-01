@@ -360,6 +360,13 @@ impl QueueManager {
         }))
     }
 
+    /// Ids of every outstanding lease — the in-flight work a graceful
+    /// drain waits for (and, past the drain bound, cancels).
+    pub async fn leased_ids(&self) -> Vec<String> {
+        let inner = self.inner.lock().await;
+        inner.leases.keys().cloned().collect()
+    }
+
     /// Releases `request_id`'s lease and records its terminal
     /// `final_state` / `outcome` together with the executor's `audit`
     /// row (one transaction, via [`Store::finish_request`]), freeing the

@@ -21,7 +21,7 @@ fn envelope(id: &str, repo: &str, args: serde_json::Value, key: Option<&str>) ->
         v: PROTOCOL_VERSION,
         id: id.to_owned(),
         capability: "echo".to_owned(),
-        client_version: "0.1.0-test".to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
         caller: Caller {
             agent: "claude".to_owned(),
             repo: repo.to_owned(),

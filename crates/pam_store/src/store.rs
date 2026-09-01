@@ -492,6 +492,31 @@ impl Store {
         Ok(out)
     }
 
+    /// Reads every `running` or `waiting_approval` row, oldest first —
+    /// the rows a dead daemon left mid-flight. Crash recovery on boot
+    /// fails each of them (cause `daemon_restart`) through
+    /// [`Self::finish_request`] before the lanes are rebuilt; a live
+    /// daemon never calls this.
+    pub async fn list_stuck_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request
+                     WHERE state IN ('running','waiting_approval')
+                     ORDER BY created_ts, id",
+                    Self::REQUEST_COLUMNS
+                ),
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::parse_request_row(&row)?);
+        }
+        Ok(out)
+    }
+
     /// Moves a request to a **non-terminal** `state`, recording `outcome`
     /// and bumping `updated_ts`. Errors if the request does not exist.
     ///

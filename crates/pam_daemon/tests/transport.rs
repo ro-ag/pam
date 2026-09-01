@@ -32,7 +32,7 @@ fn envelope(id: &str) -> Envelope {
         v: PROTOCOL_VERSION,
         id: id.to_owned(),
         capability: "log.summarize".to_owned(),
-        client_version: "0.1.0-test".to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
         caller: Caller {
             agent: "claude".to_owned(),
             repo: "/tmp/repo".to_owned(),

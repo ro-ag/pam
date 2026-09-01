@@ -8,8 +8,11 @@ use std::time::Duration;
 use pam_daemon::approval::{ACTION_APPROVAL, Resolution};
 use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, ACTION_GATE_REFUSAL, CAUSE_APPROVAL_DENIED,
-    CAUSE_APPROVAL_TIMEOUT, CAUSE_DEADLINE_EXCEEDED, DaemonConfig, DaemonHandle, run_daemon,
-    run_daemon_with,
+    CAUSE_APPROVAL_TIMEOUT, CAUSE_DAEMON_OUTDATED, CAUSE_DAEMON_SHUTTING_DOWN,
+    CAUSE_DEADLINE_EXCEEDED, DaemonConfig, DaemonError, DaemonHandle, run_daemon, run_daemon_with,
+};
+use pam_daemon::lifecycle::{
+    ACTION_DAEMON_RESTART, CAUSE_DAEMON_RESTART, LifecycleError, LifecyclePhase,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::queue::{ACTION_CANCEL, CAUSE_CANCELLED};
@@ -44,7 +47,7 @@ fn short_tempdir() -> tempfile::TempDir {
 }
 
 struct TestDaemon {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     handle: DaemonHandle,
     shutdown: watch::Sender<bool>,
 }
@@ -63,7 +66,7 @@ impl TestDaemon {
             .await
             .expect("daemon starts");
         Self {
-            _tmp: tmp,
+            tmp,
             handle,
             shutdown,
         }
@@ -75,12 +78,13 @@ impl TestDaemon {
         let config = DaemonConfig {
             base_dir: Some(base_of(&tmp)),
             approval_timeout: timeout,
+            ..DaemonConfig::default()
         };
         let handle = run_daemon_with(config, shutdown_rx)
             .await
             .expect("daemon starts");
         Self {
-            _tmp: tmp,
+            tmp,
             handle,
             shutdown,
         }
@@ -107,9 +111,17 @@ impl TestDaemon {
         sub
     }
 
-    async fn stop(self) {
+    async fn stop(self) -> tempfile::TempDir {
         let _ = self.shutdown.send(true);
         self.handle.shutdown().await;
+        self.tmp
+    }
+
+    /// Joins the daemon **without** signalling shutdown — for tests
+    /// where the daemon initiated its own drain (version handshake).
+    async fn join(self) -> tempfile::TempDir {
+        self.handle.shutdown().await;
+        self.tmp
     }
 }
 
@@ -123,7 +135,7 @@ fn envelope(id: &str, capability: &str, args: serde_json::Value, wait: bool) -> 
         v: PROTOCOL_VERSION,
         id: id.to_owned(),
         capability: capability.to_owned(),
-        client_version: "0.1.0-test".to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
         caller: Caller {
             agent: "claude".to_owned(),
             repo: REPO.to_owned(),
@@ -756,6 +768,217 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
         assert!(audit.iter().any(|row| row.action == ACTION_CANCEL));
 
         daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn second_daemon_on_the_same_base_is_refused_with_the_holder_pid() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let err = run_daemon(Some(base_of(&daemon.tmp)), shutdown_rx)
+            .await
+            .expect_err("second daemon must not start");
+        let DaemonError::Lifecycle(LifecycleError::AlreadyRunning { pid, .. }) = err else {
+            panic!("expected AlreadyRunning, got {err:?}");
+        };
+        assert_eq!(pid, Some(std::process::id()));
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
+    timeout(DEADLINE, async {
+        let tmp = short_tempdir();
+        {
+            let store = Store::open(&base_of(&tmp).join("state.sqlite3"))
+                .await
+                .expect("store opens");
+            // A dead daemon's leftovers: one running, one waiting for an
+            // approval nobody can grant any more, one queued (restart-safe).
+            for (id, state) in [
+                ("req_dead_run", RequestState::Running),
+                ("req_dead_wait", RequestState::WaitingApproval),
+            ] {
+                store
+                    .insert_request(id, "echo", REPO, "claude", "{}", None)
+                    .await
+                    .expect("insert");
+                store
+                    .update_request_state(id, state, None)
+                    .await
+                    .expect("state set");
+            }
+            store
+                .insert_approval("req_dead_wait", "echo")
+                .await
+                .expect("approval row");
+            store
+                .insert_request("req_survivor", "echo", REPO, "claude", "{}", None)
+                .await
+                .expect("insert queued");
+        }
+
+        let daemon = TestDaemon::start_at(tmp).await;
+        let store = daemon.handle.store();
+
+        for id in ["req_dead_run", "req_dead_wait"] {
+            let row = store.get_request(id).await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::Failed, "{id} recovered");
+            assert_eq!(row.outcome.as_deref(), Some(CAUSE_DAEMON_RESTART));
+            let audit = store.audit_for_request(id).await.unwrap();
+            assert!(audit.iter().any(|row| row.action == ACTION_DAEMON_RESTART
+                && row.decision == Decision::Timeout
+                && row.actor == Actor::System));
+        }
+        let approval = store
+            .approval_for_request("req_dead_wait")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Timeout));
+
+        // The queued row was rebuilt into its lane and executes.
+        let row = wait_for_row(&store, "req_survivor", |row| {
+            row.state == RequestState::Done
+        })
+        .await;
+        assert_eq!(row.outcome.as_deref(), Some("solved"));
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn version_mismatch_refuses_outdated_and_the_daemon_restarts_itself() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let mut lifecycle = daemon.handle.lifecycle();
+        let mut dealer = daemon.dealer().await;
+
+        let mut newer = envelope(
+            "req_newer",
+            "echo",
+            serde_json::json!({ "msg": "hi" }),
+            true,
+        );
+        newer.client_version = "999.0.0".to_owned();
+        send(&mut dealer, &newer).await;
+
+        let response = recv_response(&mut dealer).await;
+        let Response::Refusal {
+            id,
+            cause,
+            detail,
+            recovery,
+        } = response
+        else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(id, "req_newer");
+        assert_eq!(cause, CAUSE_DAEMON_OUTDATED);
+        assert!(detail.contains("999.0.0"), "detail: {detail}");
+        assert!(
+            detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {detail}"
+        );
+        assert!(recovery.contains("retry"), "recovery: {recovery}");
+
+        // No request row was recorded for the refused envelope.
+        let store = daemon.handle.store();
+        assert!(store.get_request("req_newer").await.unwrap().is_none());
+
+        // The daemon drains and stops on its own: the phase flips to
+        // Restarting and joining completes without any external signal.
+        lifecycle
+            .wait_for(|phase| *phase == LifecyclePhase::Restarting)
+            .await
+            .expect("phase reaches Restarting");
+        let tmp = daemon.join().await;
+
+        // A fresh daemon on the same base serves a matching client.
+        let daemon = TestDaemon::start_at(tmp).await;
+        let mut dealer = daemon.dealer().await;
+        send(
+            &mut dealer,
+            &envelope(
+                "req_fresh",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+                true,
+            ),
+        )
+        .await;
+        let response = recv_response(&mut dealer).await;
+        assert!(
+            matches!(response, Response::Result { .. }),
+            "expected a result, got {response:?}"
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn graceful_drain_finishes_inflight_work_and_refuses_newcomers() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let mut dealer = daemon.dealer().await;
+
+        send(
+            &mut dealer,
+            &envelope(
+                "req_drain",
+                "echo",
+                serde_json::json!({ "delay_ms": 800 }),
+                false,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            recv_response(&mut dealer).await,
+            Response::Ticket { .. }
+        ));
+        let store = daemon.handle.store();
+        wait_for_row(&store, "req_drain", |row| {
+            row.state == RequestState::Running
+        })
+        .await;
+
+        // Begin the drain and give the lifecycle task a beat to flip
+        // the phase before probing it with a new request.
+        let _ = daemon.shutdown.send(true);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut latecomer = daemon.dealer().await;
+        send(
+            &mut latecomer,
+            &envelope("req_late", "echo", serde_json::json!({}), true),
+        )
+        .await;
+        let response = recv_response(&mut latecomer).await;
+        let Response::Refusal { cause, .. } = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, CAUSE_DAEMON_SHUTTING_DOWN);
+        assert!(store.get_request("req_late").await.unwrap().is_none());
+
+        // The drain waits for the in-flight echo before the daemon exits.
+        daemon.stop().await;
+        let row = store.get_request("req_drain").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Done);
+        assert_eq!(row.outcome.as_deref(), Some("solved"));
     })
     .await
     .expect("test within deadline");

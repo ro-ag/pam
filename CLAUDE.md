@@ -101,6 +101,8 @@ Standing rules for any agent working in this project (from ~/dev/ai):
   portable unit tests on Linux only, Windows gated to PRs + `main`, macOS
   UI/AppKit tests gated to approved PRs / `main` / nightly / releases. Cancel
   superseded PR runs (`concurrency`), filter paths, cache dependencies, and
-  make expensive jobs `needs:` the cheap Linux checks first.
+  make expensive jobs `needs:` the cheap Linux checks first. CI exists since
+  plan #3: `ci.yml` runs the Linux gate on PRs to `main`, pushes to `main`, and
+  tags, with the other four targets gated behind it.
 - **No repo or no remote → stop and ask** before making changes.
 <!-- ptrack:end -->

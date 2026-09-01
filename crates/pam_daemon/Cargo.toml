@@ -19,6 +19,9 @@ tracing-subscriber.workspace = true
 zeromq.workspace = true
 
 [dev-dependencies]
+# dev-only cycle (pam_testkit depends on pam_daemon); path-only
+# dev-deps are stripped at publish time.
+pam_testkit.workspace = true
 tempfile.workspace = true
 # `start_paused` tests for lease/reaper timing need the paused clock.
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/pam", "crates/pam_daemon", "crates/pam_proto", "crates/pam_store"]
+members = [
+    "crates/pam",
+    "crates/pam_daemon",
+    "crates/pam_proto",
+    "crates/pam_store",
+    "crates/pam_testkit",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +18,9 @@ repository = "https://github.com/ro-ag/pam"
 pam_daemon = { path = "crates/pam_daemon" }
 pam_proto = { path = "crates/pam_proto" }
 pam_store = { path = "crates/pam_store" }
+# test-only harness; never published (dev-dependency cycles are fine —
+# path-only dev-deps are stripped at publish time).
+pam_testkit = { path = "crates/pam_testkit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

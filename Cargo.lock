@@ -1419,6 +1419,7 @@ version = "0.1.0"
 dependencies = [
  "pam_proto",
  "pam_store",
+ "pam_testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -1446,6 +1447,19 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "turso",
+]
+
+[[package]]
+name = "pam_testkit"
+version = "0.1.0"
+dependencies = [
+ "pam_daemon",
+ "pam_proto",
+ "pam_store",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeromq",
 ]
 
 [[package]]

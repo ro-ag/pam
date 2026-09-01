@@ -576,6 +576,97 @@ pub fn probe_daemon(base_dir: &Path) -> Result<DaemonStatus, ClientError> {
     Ok(DaemonStatus::Running { pid })
 }
 
+/// How `stop_daemon` went when it did not error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// Nobody held the instance lock; there was nothing to stop.
+    NotRunning,
+    /// The daemon was signalled and released the lock within the wait.
+    Stopped {
+        /// The stopped daemon's pid.
+        pid: u32,
+    },
+    /// The daemon was signalled but is still draining past the wait; it
+    /// exits when the drain completes.
+    StillDraining {
+        /// The draining daemon's pid.
+        pid: u32,
+    },
+}
+
+/// Why [`stop_daemon`] could not signal the daemon.
+#[derive(Debug, Error)]
+pub enum StopError {
+    /// Probing or waiting on the instance lock failed.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The lock is held but names no pid; the process must be stopped
+    /// manually.
+    #[error("the daemon lock file names no pid; stop the daemon process manually")]
+    NoPid,
+    /// Sending SIGTERM failed.
+    #[error("cannot signal the daemon (pid {pid}): {detail}")]
+    Signal {
+        /// The pid the signal was aimed at.
+        pid: u32,
+        /// What went wrong sending it.
+        detail: String,
+    },
+    /// This platform has no supported stop signal yet.
+    #[error(
+        "stopping the daemon is not supported on this platform yet; \
+         end the pam daemon process manually"
+    )]
+    Unsupported,
+}
+
+/// Stops the daemon under `base_dir`: names the lock holder, sends it
+/// SIGTERM (unix), and waits — bounded by `wait` — for the graceful
+/// drain to release the instance lock. Shared by `pam daemon stop` and
+/// the GUI bridge's stop command.
+pub fn stop_daemon(base_dir: &Path, wait: Duration) -> Result<StopOutcome, StopError> {
+    match probe_daemon(base_dir)? {
+        DaemonStatus::NotRunning => Ok(StopOutcome::NotRunning),
+        DaemonStatus::Running { pid } => {
+            let pid = pid.ok_or(StopError::NoPid)?;
+            signal_terminate(pid)?;
+            if wait_for_daemon_exit(base_dir, wait)? {
+                Ok(StopOutcome::Stopped { pid })
+            } else {
+                Ok(StopOutcome::StillDraining { pid })
+            }
+        }
+    }
+}
+
+/// SIGTERM through `/bin/kill`: the workspace denies `unsafe`, which a
+/// direct `libc::kill` call would need.
+#[cfg(unix)]
+fn signal_terminate(pid: u32) -> Result<(), StopError> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map_err(|err| StopError::Signal {
+            pid,
+            detail: format!("cannot run kill: {err}"),
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(StopError::Signal {
+            pid,
+            detail: format!("kill -TERM exited with {status}"),
+        })
+    }
+}
+
+/// No unix signals here; stopping is not supported yet.
+#[cfg(not(unix))]
+fn signal_terminate(_pid: u32) -> Result<(), StopError> {
+    Err(StopError::Unsupported)
+}
+
 /// Waits (bounded) for the daemon lock under `base_dir` to be released:
 /// `true` when it was released within `timeout`.
 pub fn wait_for_daemon_exit(base_dir: &Path, timeout: Duration) -> Result<bool, ClientError> {

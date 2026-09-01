@@ -38,16 +38,15 @@
 //! CLI-only builds pay the Tauri/wry compile cost too. Accepted trade-off —
 //! revisit only if workspace build times become a real problem.
 
+pub mod bridge;
+pub mod events;
+
+#[cfg(test)]
+mod bridge_test;
+#[cfg(test)]
+mod events_test;
 #[cfg(test)]
 mod lib_test;
-
-/// IPC liveness probe: proves the frontend can reach Rust over Tauri's
-/// invoke bridge. The placeholder UI calls it on mount and displays the
-/// reply; real daemon IPC arrives with a later task.
-#[tauri::command]
-fn ping() -> &'static str {
-    "pong"
-}
 
 /// Opens the pam desktop window and runs the Tauri event loop until the
 /// window closes.
@@ -60,6 +59,12 @@ fn ping() -> &'static str {
 /// Returns an error when the platform webview runtime cannot start.
 pub fn run() -> tauri::Result<()> {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ping])
+        .invoke_handler(tauri::generate_handler![
+            bridge::daemon_status,
+            bridge::admin_call,
+            bridge::request_capability,
+            bridge::daemon_stop,
+            events::events_subscribe
+        ])
         .run(tauri::generate_context!())
 }

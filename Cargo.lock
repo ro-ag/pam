@@ -2908,10 +2908,22 @@ name = "pam"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "pam_client",
  "pam_daemon",
  "pam_gui",
  "pam_proto",
  "pam_store",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "pam_client"
+version = "0.1.0"
+dependencies = [
+ "pam_daemon",
+ "pam_proto",
  "serde_json",
  "sysinfo",
  "tempfile",
@@ -2943,9 +2955,15 @@ dependencies = [
 name = "pam_gui"
 version = "0.1.0"
 dependencies = [
+ "pam_client",
+ "pam_daemon",
+ "pam_proto",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
+ "zeromq",
 ]
 
 [[package]]

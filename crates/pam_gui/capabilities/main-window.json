@@ -1,8 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Allow the local pam main window its core webview surface, the ping liveness command, and titlebar dragging (needed by the custom titlebar arriving with the frameless-window task).",
+  "description": "Allow the local pam main window its core webview surface (core:default includes core:event:default, which the pam://event listener needs), the IPC bridge commands, and titlebar dragging (needed by the custom titlebar).",
   "local": true,
   "windows": ["main"],
-  "permissions": ["core:default", "allow-ping", "core:window:allow-start-dragging"]
+  "permissions": [
+    "core:default",
+    "allow-daemon-status",
+    "allow-admin-call",
+    "allow-request-capability",
+    "allow-daemon-stop",
+    "allow-events-subscribe",
+    "core:window:allow-start-dragging"
+  ]
 }

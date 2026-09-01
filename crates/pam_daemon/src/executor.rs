@@ -20,6 +20,12 @@
 //!
 //! - `status` (read-only): daemon version, protocol version, uptime and
 //!   the in-flight request count. Outcome `verified`.
+//! - `query` (read-only): the lifecycle state of the request named by
+//!   `args.ticket`, straight from the store. This is the authoritative
+//!   answer `pam wait` / `pam subscribe` reconcile against: zmq `PUB`
+//!   has no replay, so a subscriber that joins after a ticket's
+//!   terminal event was published would otherwise wait forever on a
+//!   request that already finished. Outcome `verified`.
 //! - `echo` (non-destructive): mirrors its args back; an optional
 //!   `delay_ms` argument sleeps first, honoring the cancel signal — the
 //!   integration tests use it as a controllable long-running capability.
@@ -108,6 +114,8 @@ pub enum CapabilityFailure {
 pub enum BuiltinCapability {
     /// Daemon health snapshot (read-only).
     Status,
+    /// Lifecycle state of another request by ticket (read-only).
+    Query,
     /// Mirror the args back, optionally after a cancellable delay.
     Echo,
     /// Cancel another request by ticket.
@@ -122,6 +130,7 @@ impl BuiltinCapability {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "status" => Some(Self::Status),
+            "query" => Some(Self::Query),
             "echo" => Some(Self::Echo),
             "cancel" => Some(Self::Cancel),
             _ => None,
@@ -133,6 +142,7 @@ impl BuiltinCapability {
     pub fn name(self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::Query => "query",
             Self::Echo => "echo",
             Self::Cancel => "cancel",
         }
@@ -142,6 +152,7 @@ impl BuiltinCapability {
     pub async fn execute(self, ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
         match self {
             Self::Status => status(&ctx).await,
+            Self::Query => query(&ctx).await,
             Self::Echo => echo(ctx).await,
             Self::Cancel => cancel(&ctx).await,
         }
@@ -179,6 +190,43 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
             "protocol": PROTOCOL_VERSION,
             "uptime_s": ctx.started_at.elapsed().as_secs(),
             "active_requests": active_requests,
+        }),
+        evidence: Vec::new(),
+    })
+}
+
+/// `query`: the lifecycle state of the request named by `args.ticket`,
+/// as `{ ticket, state, outcome }` straight from the store.
+///
+/// This is the replay mechanism zmq `PUB` lacks: `pam wait` /
+/// `pam subscribe` reconcile their event subscription against this
+/// answer, so a follower that subscribed after the ticket's terminal
+/// event was published still terminates instead of waiting for an
+/// event that will never be re-sent.
+async fn query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
+    let Some(ticket) = ctx.args.get("ticket").and_then(serde_json::Value::as_str) else {
+        return Err(CapabilityFailure::Failed {
+            detail: "query needs args.ticket naming the request to look up".to_owned(),
+        });
+    };
+    let row = ctx
+        .store
+        .get_request(ticket)
+        .await
+        .map_err(|err| CapabilityFailure::Failed {
+            detail: format!("cannot read request {ticket}: {err}"),
+        })?;
+    let Some(row) = row else {
+        return Err(CapabilityFailure::Failed {
+            detail: format!("no request {ticket} exists"),
+        });
+    };
+    Ok(CapabilityOutput {
+        outcome: Outcome::Verified,
+        body: serde_json::json!({
+            "ticket": row.id,
+            "state": row.state.as_str(),
+            "outcome": row.outcome,
         }),
         evidence: Vec::new(),
     })

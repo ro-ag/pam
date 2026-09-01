@@ -179,6 +179,43 @@ async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
 }
 
 #[tokio::test]
+async fn a_follow_that_joins_after_the_terminal_event_still_terminates() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+
+        let response = client::send_request(
+            &daemon.base(),
+            "echo",
+            serde_json::json!({}),
+            false,
+            10_000,
+            None,
+        )
+        .await
+        .expect("request flows");
+        let Response::Ticket { ticket, .. } = response else {
+            panic!("expected a ticket, got a different response");
+        };
+
+        // Let the request finish before anybody subscribes: all its
+        // events — the terminal one included — are published to nobody,
+        // and zmq PUB has no replay (issue #1).
+        let store = daemon.handle.store();
+        wait_for_row(&store, &ticket, |row| row.state == RequestState::Done).await;
+
+        // The follow still terminates, through the store reconcile.
+        let terminal = client::follow_ticket(&daemon.base(), &ticket, FOLLOW_TIMEOUT, |_| {})
+            .await
+            .expect("follow reaches a terminal event");
+        assert_eq!(terminal, Event::Done);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
 async fn cancel_stops_a_delayed_echo() {
     timeout(DEADLINE, async {
         let daemon = TestDaemon::start().await;

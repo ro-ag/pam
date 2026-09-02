@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes `pam_model::testing` — the range-serving HTTP origin the download
+# suite drives real `curl` against. The daemon's admin-op tests run a
+# download end to end and need the same origin, so it ships behind a feature
+# instead of being copied. `tokio/net` is what the listener needs; nothing
+# else changes.
+testing = ["tokio/net"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

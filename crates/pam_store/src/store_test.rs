@@ -1,6 +1,19 @@
 use turso::params;
 
-use crate::{Actor, ApprovalResolution, AuditEntry, Decision, RequestState, Store, StoreError};
+use crate::{
+    Actor, ApprovalResolution, AuditEntry, Decision, ModelJobRow, RequestState, Store, StoreError,
+};
+
+/// The one model job row with `id`, read back through the bounded list.
+async fn one_model_job(store: &Store, id: &str) -> ModelJobRow {
+    store
+        .list_model_jobs(50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap_or_else(|| panic!("model job {id} exists"))
+}
 
 async fn insert_demo_request(store: &Store, id: &str) {
     store
@@ -30,7 +43,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 2);
+    assert_eq!(store.schema_version().await.unwrap(), 3);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -832,4 +845,136 @@ async fn concurrent_inserts_and_finishes_never_fail() {
             "round {round}: finish did not transition: {finish_outcome:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn model_jobs_list_newest_first() {
+    let store = Store::open_in_memory().await.unwrap();
+    for id in ["job_a", "job_b", "job_c"] {
+        store
+            .insert_model_job(
+                id,
+                "download",
+                "qwen/one",
+                Some("http://origin/one"),
+                Some(10),
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store.list_model_jobs(20).await.unwrap();
+    // Same second for all three, so the id tiebreaker decides: descending.
+    let ids: Vec<&str> = jobs.iter().map(|job| job.id.as_str()).collect();
+    assert_eq!(ids, ["job_c", "job_b", "job_a"]);
+    assert_eq!(jobs[0].kind, "download");
+    assert_eq!(jobs[0].model_id, "qwen/one");
+    assert_eq!(jobs[0].source.as_deref(), Some("http://origin/one"));
+    assert_eq!(jobs[0].state, "running");
+    assert_eq!(jobs[0].bytes_done, 0);
+    assert_eq!(jobs[0].bytes_total, Some(10));
+    assert_eq!(jobs[0].detail, None);
+}
+
+#[tokio::test]
+async fn model_job_list_limit_is_clamped_into_range() {
+    let store = Store::open_in_memory().await.unwrap();
+    for index in 0..3 {
+        store
+            .insert_model_job(&format!("job_{index}"), "verify", "qwen/one", None, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.list_model_jobs(0).await.unwrap().len(), 1);
+    assert_eq!(store.list_model_jobs(u64::MAX).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn model_job_progress_moves_the_byte_figures() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_model_job("job_p", "download", "qwen/one", None, None)
+        .await
+        .unwrap();
+    store
+        .update_model_job_progress("job_p", 512, Some(2048))
+        .await
+        .unwrap();
+    let job = one_model_job(&store, "job_p").await;
+    assert_eq!(job.bytes_done, 512);
+    assert_eq!(job.bytes_total, Some(2048));
+    assert_eq!(job.state, "running");
+}
+
+#[tokio::test]
+async fn finishing_a_model_job_records_the_verdict_once() {
+    let store = Store::open_in_memory().await.unwrap();
+    for (id, state) in [
+        ("job_done", "done"),
+        ("job_failed", "failed"),
+        ("job_cancelled", "cancelled"),
+    ] {
+        store
+            .insert_model_job(id, "download", "qwen/one", None, None)
+            .await
+            .unwrap();
+        store
+            .finish_model_job(id, state, Some(r#"{"cause":"x"}"#))
+            .await
+            .unwrap();
+        let job = one_model_job(&store, id).await;
+        assert_eq!(job.state, state);
+        assert_eq!(job.detail.as_deref(), Some(r#"{"cause":"x"}"#));
+    }
+
+    // A second verdict, and a late progress poll, both bounce off the
+    // terminal row.
+    store
+        .finish_model_job("job_done", "failed", Some("late"))
+        .await
+        .unwrap();
+    store
+        .update_model_job_progress("job_done", 999, Some(999))
+        .await
+        .unwrap();
+    let job = one_model_job(&store, "job_done").await;
+    assert_eq!(job.state, "done");
+    assert_eq!(job.bytes_done, 0);
+}
+
+#[tokio::test]
+async fn boot_recovery_fails_only_running_model_jobs() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_model_job("job_running", "download", "qwen/one", None, None)
+        .await
+        .unwrap();
+    store
+        .insert_model_job("job_settled", "verify", "qwen/two", None, None)
+        .await
+        .unwrap();
+    store
+        .finish_model_job("job_settled", "done", Some("sha"))
+        .await
+        .unwrap();
+
+    let failed = store
+        .fail_running_model_jobs("daemon_restart")
+        .await
+        .unwrap();
+    assert_eq!(failed, 1);
+    let running = one_model_job(&store, "job_running").await;
+    assert_eq!(running.state, "failed");
+    assert_eq!(running.detail.as_deref(), Some("daemon_restart"));
+    let settled = one_model_job(&store, "job_settled").await;
+    assert_eq!(settled.state, "done");
+    assert_eq!(settled.detail.as_deref(), Some("sha"));
+
+    // Idempotent: a second boot finds nothing left to fail.
+    assert_eq!(
+        store
+            .fail_running_model_jobs("daemon_restart")
+            .await
+            .unwrap(),
+        0
+    );
 }

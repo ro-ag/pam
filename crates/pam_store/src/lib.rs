@@ -1,5 +1,5 @@
 //! Durable state: requests, audit, evidence, grants, approvals, callers,
-//! settings. One database file in WAL mode with embedded migrations.
+//! settings, model jobs. One database file in WAL mode with embedded migrations.
 //! Secrets never live here; they belong to the OS credential store.
 //!
 //! The store is deliberately thin: it opens the database, applies
@@ -37,8 +37,8 @@ mod store;
 pub use error::StoreError;
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow,
-    DEFAULT_REQUEST_LIST_LIMIT, Decision, GrantRow, MAX_REQUEST_LIST_LIMIT, PendingApproval,
-    RequestRow, RequestState, Store,
+    DEFAULT_REQUEST_LIST_LIMIT, Decision, GrantRow, MAX_REQUEST_LIST_LIMIT, ModelJobRow,
+    PendingApproval, RequestRow, RequestState, Store,
 };
 
 #[cfg(test)]

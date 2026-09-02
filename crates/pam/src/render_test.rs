@@ -77,6 +77,66 @@ fn status_renders_the_daemon_summary() {
 }
 
 #[test]
+fn status_prints_one_model_line_per_runtime_state() {
+    let line = |model: serde_json::Value| {
+        let body = serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol": 1,
+            "uptime_s": 1,
+            "active_requests": 0,
+            "model": model,
+        });
+        render_status(&body)
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("model:")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+            .expect("a model line")
+    };
+
+    assert_eq!(
+        line(serde_json::json!({
+            "state": "idle",
+            "id": null,
+            "tokens_per_sec": null,
+            "defaults": { "light": null, "heavy": null },
+        })),
+        "idle"
+    );
+    assert_eq!(
+        line(serde_json::json!({
+            "state": "loading",
+            "id": "qwen/Qwen3-0.6B-Q8_0",
+            "tokens_per_sec": null,
+            "defaults": { "light": null, "heavy": null },
+        })),
+        "loading qwen/Qwen3-0.6B-Q8_0"
+    );
+    assert_eq!(
+        line(serde_json::json!({
+            "state": "loaded",
+            "id": "qwen/Qwen3-0.6B-Q8_0",
+            "tokens_per_sec": 42.25,
+            "defaults": { "light": null, "heavy": null },
+        })),
+        "qwen/Qwen3-0.6B-Q8_0 loaded (42.2 tok/s)"
+    );
+    // Loaded but never generated: no figure to report, and none invented.
+    assert_eq!(
+        line(serde_json::json!({
+            "state": "loaded",
+            "id": "qwen/Qwen3-0.6B-Q8_0",
+            "tokens_per_sec": null,
+            "defaults": { "light": null, "heavy": null },
+        })),
+        "qwen/Qwen3-0.6B-Q8_0 loaded"
+    );
+}
+
+#[test]
 fn status_degrades_to_question_marks_on_missing_fields() {
     let text = render_status(&serde_json::json!({}));
     assert!(text.contains('?'), "text: {text}");

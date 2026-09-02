@@ -3681,17 +3681,20 @@ dependencies = [
 name = "pam_daemon"
 version = "0.1.0"
 dependencies = [
+ "pam_model",
  "pam_proto",
  "pam_store",
  "pam_testkit",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ulid",
  "zeromq",
 ]
 

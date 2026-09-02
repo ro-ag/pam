@@ -25,6 +25,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: SCHEMA_V2,
     },
+    Migration {
+        version: 3,
+        sql: SCHEMA_V3,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -166,4 +170,29 @@ CREATE TABLE setting (
 const SCHEMA_V2: &str = r"
 ALTER TABLE request ADD COLUMN idempotency_key TEXT;
 CREATE INDEX request_idempotency_idx ON request (idempotency_key);
+";
+
+/// Migration 3: `model_job`, the history of the model layer's long-running
+/// work.
+///
+/// A download or a verification is not a request — admin ops answer
+/// synchronously and the transfer outlives them — so its progress and its
+/// verdict live here instead of on a `request` row. The GUI reads the
+/// table; a `running` row found at boot belonged to a daemon that is gone
+/// and is failed with cause `daemon_restart` (the part file still
+/// resumes).
+const SCHEMA_V3: &str = r"
+CREATE TABLE model_job (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('download','verify')),
+    model_id    TEXT NOT NULL,
+    source      TEXT,
+    state       TEXT NOT NULL CHECK (state IN ('running','done','failed','cancelled')),
+    bytes_done  INTEGER NOT NULL DEFAULT 0,
+    bytes_total INTEGER,
+    detail      TEXT,
+    created_ts  INTEGER NOT NULL,
+    updated_ts  INTEGER NOT NULL
+);
+CREATE INDEX model_job_state_idx ON model_job (state);
 ";

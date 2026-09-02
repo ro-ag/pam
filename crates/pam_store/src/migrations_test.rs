@@ -9,14 +9,21 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 2);
+    assert_eq!(store.schema_version().await.unwrap(), 3);
 }
 
 #[tokio::test]
-async fn all_seven_tables_exist() {
+async fn all_eight_tables_exist() {
     let store = Store::open_in_memory().await.unwrap();
     for table in [
-        "request", "audit", "evidence", "grant", "approval", "caller", "setting",
+        "request",
+        "audit",
+        "evidence",
+        "grant",
+        "approval",
+        "caller",
+        "setting",
+        "model_job",
     ] {
         let mut rows = store
             .conn
@@ -65,7 +72,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 2
+            supported: 3
         }
     ));
     let message = err.to_string();
@@ -91,10 +98,14 @@ async fn v1_database_upgrades_to_v2() {
     conn.execute("PRAGMA user_version = 1", ()).await.unwrap();
     drop((conn, db));
 
-    // Opening runs migration 2: the idempotency column exists and the
-    // version advances.
+    // Opening runs migrations 2 and 3: the idempotency column exists, the
+    // model job table exists, and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 2);
+    assert_eq!(store.schema_version().await.unwrap(), 3);
+    store
+        .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
+        .await
+        .unwrap();
     store
         .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", Some("key-1"))
         .await

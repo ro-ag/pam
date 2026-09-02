@@ -1,5 +1,6 @@
 //! Admin surface: GUI-only daemon administration (grants, approvals,
-//! profile, activity, callers) over the same socket as everything else.
+//! profile, activity, callers, models) over the same socket as everything
+//! else.
 //!
 //! # Security model — read this before touching the surface
 //!
@@ -91,7 +92,17 @@
 //!
 //! Op names are constants (`OP_*`), all under [`ADMIN_PREFIX`]. An
 //! unrecognized `admin.*` capability is refused with
-//! [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here, and only here.
+//! [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here, or in
+//! [`crate::admin_models`], and nowhere else.
+//!
+//! # The model ops live next door, under the same rules
+//!
+//! [`crate::admin_models`] holds the `admin.models.*` and
+//! `admin.curator.*` ops. They are dispatched from [`AdminService`] before
+//! this module's own `match` and are administration in every sense that
+//! matters here: same tripwire, same deadline, same request row, same
+//! single terminal audit row, no [`crate::policy::classify`] entry, no
+//! grant, no approval. The split is file size, not privilege.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +115,7 @@ use tokio::time::timeout;
 use crate::approval::{ApprovalService, Resolution};
 use crate::daemon::{ACTION_DEADLINE_REFUSAL, CAUSE_DEADLINE_EXCEEDED, CAUSE_INTERNAL_ERROR};
 use crate::executor::outcome_str;
+use crate::model_service::ModelService;
 use crate::policy::{PROFILE_SETTING_KEY, Profile};
 
 /// Reserved capability prefix the dispatcher intercepts before the
@@ -178,7 +190,7 @@ const RECOVERY_ADMIN_DENIED: &str =
     "Administration is GUI-only; open the PAM GUI — agents have no security commands.";
 
 /// Recovery line for argument/op-name refusals.
-const RECOVERY_FIX_ARGS: &str = "Fix the admin request and retry from the PAM GUI.";
+pub(crate) const RECOVERY_FIX_ARGS: &str = "Fix the admin request and retry from the PAM GUI.";
 
 /// Recovery line for grant-state refusals.
 const RECOVERY_GRANTS_VIEW: &str = "Check the capability's state in the PAM GUI grants view.";
@@ -188,25 +200,26 @@ const RECOVERY_APPROVALS_VIEW: &str =
     "Refresh the PAM GUI approvals view; the request may have resolved or timed out.";
 
 /// Recovery line for internal store failures.
-const RECOVERY_INTERNAL: &str = "Retry; if it persists, restart the daemon from the PAM GUI.";
+pub(crate) const RECOVERY_INTERNAL: &str =
+    "Retry; if it persists, restart the daemon from the PAM GUI.";
 
 /// Recovery line for an admin op that outlived its deadline.
 const RECOVERY_DEADLINE: &str = "Retry with a larger deadline.";
 
 /// What a successful admin op hands back: the response pieces plus a
 /// compact audit detail (never the full body — list bodies are large).
-struct AdminOk {
-    outcome: Outcome,
-    body: serde_json::Value,
-    audit: serde_json::Value,
+pub(crate) struct AdminOk {
+    pub(crate) outcome: Outcome,
+    pub(crate) body: serde_json::Value,
+    pub(crate) audit: serde_json::Value,
 }
 
 /// A refusal an admin op decided on; becomes the terminal `refused`
 /// row, its audit row, and the [`Response::Refusal`].
-struct AdminRefusal {
-    cause: &'static str,
-    detail: String,
-    recovery: &'static str,
+pub(crate) struct AdminRefusal {
+    pub(crate) cause: &'static str,
+    pub(crate) detail: String,
+    pub(crate) recovery: &'static str,
 }
 
 impl From<StoreError> for AdminRefusal {
@@ -224,15 +237,27 @@ impl From<StoreError> for AdminRefusal {
 /// security model).
 #[derive(Debug)]
 pub struct AdminService {
-    store: Arc<Store>,
+    pub(crate) store: Arc<Store>,
     approvals: Arc<ApprovalService>,
+    /// The model layer the `admin.models.*` / `admin.curator.*` ops act
+    /// through (see [`crate::admin_models`]).
+    pub(crate) models: Arc<ModelService>,
 }
 
 impl AdminService {
-    /// Builds the service over the daemon's store and approval service.
+    /// Builds the service over the daemon's store, approval service, and
+    /// model service.
     #[must_use]
-    pub fn new(store: Arc<Store>, approvals: Arc<ApprovalService>) -> Self {
-        Self { store, approvals }
+    pub fn new(
+        store: Arc<Store>,
+        approvals: Arc<ApprovalService>,
+        models: Arc<ModelService>,
+    ) -> Self {
+        Self {
+            store,
+            approvals,
+            models,
+        }
     }
 
     /// Handles one `admin.*` envelope end to end: records the request
@@ -279,8 +304,15 @@ impl AdminService {
     }
 
     /// Routes one (tripwire-cleared) envelope to its op.
+    ///
+    /// The model surface gets first refusal: [`Self::dispatch_models`]
+    /// answers `None` for anything that is not one of its ops, and the
+    /// match below takes over.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, AdminRefusal> {
         let args = &envelope.args;
+        if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
+            return answer;
+        }
         match envelope.capability.as_str() {
             OP_PROFILE_GET => self.profile_get().await,
             OP_PROFILE_SET => self.profile_set(args).await,
@@ -673,7 +705,7 @@ impl AdminService {
 }
 
 /// Reads a required non-empty string argument, refusing legibly.
-fn required_str<'a>(
+pub(crate) fn required_str<'a>(
     args: &'a serde_json::Value,
     key: &str,
     op: &str,

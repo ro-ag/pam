@@ -45,11 +45,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use pam_model::runtime::RuntimeState;
 use pam_proto::{Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::Store;
 use tokio::sync::watch;
 
 use crate::daemon::CompletionRouter;
+use crate::model_service::ModelService;
 use crate::queue::{CAUSE_CANCELLED, CancelOutcome, QueueManager};
 use crate::transport::EventPublisher;
 
@@ -76,6 +78,10 @@ pub struct ExecContext {
     pub store: Arc<Store>,
     /// The queue manager; the `cancel` built-in acts through it.
     pub queue: Arc<QueueManager>,
+    /// The model layer, for the read-only `model` block on `status`.
+    /// Read-only is the whole point: administration is GUI-only, so an
+    /// agent can see what is loaded and can change nothing about it.
+    pub models: Arc<ModelService>,
     /// Completion router; the `cancel` built-in releases the waiters of
     /// a queued-cancelled request through it.
     pub router: CompletionRouter,
@@ -171,10 +177,17 @@ pub fn outcome_str(outcome: Outcome) -> &'static str {
     }
 }
 
-/// `status`: daemon version, protocol version, uptime, in-flight count.
+/// `status`: daemon version, protocol version, uptime, in-flight count,
+/// and the model block.
 ///
 /// The in-flight count includes the `status` request itself — its bypass
 /// row is `running` while it executes.
+///
+/// The `model` block is read-only and degrades to `idle` with null
+/// figures on a machine with no weights: nothing in PAM breaks without a
+/// model, and the honest answer is that nothing is loaded. A settings
+/// read that fails leaves the defaults null rather than failing the
+/// whole status answer.
 async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let active_requests =
         ctx.store
@@ -190,8 +203,30 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
             "protocol": PROTOCOL_VERSION,
             "uptime_s": ctx.started_at.elapsed().as_secs(),
             "active_requests": active_requests,
+            "model": model_block(ctx).await,
         }),
         evidence: Vec::new(),
+    })
+}
+
+/// The `status` body's read-only `model` block.
+async fn model_block(ctx: &ExecContext) -> serde_json::Value {
+    let snapshot = ctx.models.runtime().snapshot();
+    let (state, id, tokens_per_sec) = match &snapshot.state {
+        RuntimeState::Idle => ("idle", None, None),
+        RuntimeState::Loading { id, .. } => ("loading", Some(id.clone()), None),
+        RuntimeState::Loaded(loaded) => (
+            "loaded",
+            Some(loaded.id.clone()),
+            loaded.last_tokens_per_sec,
+        ),
+    };
+    let (light, heavy) = ctx.models.defaults().await.unwrap_or((None, None));
+    serde_json::json!({
+        "state": state,
+        "id": id,
+        "tokens_per_sec": tokens_per_sec,
+        "defaults": { "light": light, "heavy": heavy },
     })
 }
 

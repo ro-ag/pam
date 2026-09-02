@@ -116,7 +116,11 @@ export type AdminOp =
   | "admin.models.try"
   | "admin.curator.list"
   | "admin.curator.set"
-  | "admin.curator.test";
+  | "admin.curator.test"
+  | "admin.log.compress"
+  | "admin.evidence.list"
+  | "admin.evidence.get"
+  | "admin.evidence.stats";
 
 /** One generic admin call; prefer the typed wrappers below. */
 export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): Promise<T> {
@@ -435,6 +439,125 @@ export function curatorSet(agent: AgentId | null): Promise<{ selected: AgentId |
 
 export function curatorTest(): Promise<{ reply: string; ms: number }> {
   return adminCall("admin.curator.test");
+}
+
+// --- log compression and evidence ------------------------------------------
+
+/**
+ * The log surface (`pam_daemon::admin_logs`). Compression is
+ * daemon-internal — flows and connector diagnoses call `LogService`
+ * directly — so these four ops exist for one reason: to give a human the
+ * observatory. Drive a log through the pipeline by hand, read every
+ * evidence row it left, and watch the odometer move. Every shape below is
+ * the daemon's own serialization (`pam_daemon::log_service`).
+ */
+
+/** A handle to one evidence row and how big its stored blob is. */
+export interface EvidenceRef {
+  id: string;
+  bytes: number;
+}
+
+/** What one compaction saved, in bytes, records and estimated tokens. */
+export interface CompressStats {
+  source_bytes: number;
+  compact_bytes: number;
+  source_records: number;
+  retained_records: number;
+  tokens_source_est: number;
+  tokens_compact_est: number;
+  tokens_avoided_est: number;
+}
+
+/** The model that wrote a summary, and what the generation cost. */
+export interface ModelUse {
+  id: string;
+  tier: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tokens_per_sec: number;
+}
+
+/** Everything one compression produced. */
+export interface CompressReport {
+  source: EvidenceRef;
+  compact: EvidenceRef;
+  /** Null when no model answered; `model_skipped` then says why. */
+  summary: EvidenceRef | null;
+  compact_text: string;
+  summary_text: string | null;
+  stats: CompressStats;
+  model: ModelUse | null;
+  /** Why there is no summary — never a failure, always an explanation. */
+  model_skipped: { cause: string; detail: string } | null;
+}
+
+/** One evidence row's identity and figures; the blob stays home. */
+export interface EvidenceMeta {
+  id: string;
+  request_id: string;
+  /** `log.source`, `log.compact`, `log.summary`, … */
+  kind: string;
+  /** Length of the stored blob, always — never the rendered text's. */
+  bytes: number;
+  sha256: string;
+  /** The row's `meta_json`, parsed by the daemon (null when it has none). */
+  meta: Record<string, unknown> | null;
+  ts: number;
+}
+
+/**
+ * One evidence row, readable. `text` is the first `max_bytes` of what a
+ * reader wants (for `log.compact` the rendered text, not the stored
+ * JSON), `text_bytes` is the full length of that same text, and
+ * `truncated` says the two differ.
+ */
+export interface EvidenceContent extends EvidenceMeta {
+  text: string;
+  text_bytes: number;
+  truncated: boolean;
+}
+
+/** The tokens-avoided odometer's figures over a window. */
+export interface EvidenceStats {
+  since_ts: number;
+  compressions: number;
+  source_bytes: number;
+  compact_bytes: number;
+  tokens_avoided_est: number;
+}
+
+/**
+ * Compresses one log the daemon can read. `path` must be absolute — the
+ * daemon's working directory is not a thing a human can reason about.
+ * The bridge gives this op a 120 s deadline.
+ */
+export function logCompress(args: {
+  path: string;
+  exit_status?: number;
+  model?: boolean;
+}): Promise<CompressReport> {
+  return adminCall("admin.log.compress", { ...args });
+}
+
+/** Every evidence row of one request; no rows is an empty list, not an error. */
+export function evidenceList(requestId: string): Promise<{ evidence: EvidenceMeta[] }> {
+  return adminCall("admin.evidence.list", { request_id: requestId });
+}
+
+/** One evidence row, bounded; the daemon defaults to 256 KB. */
+export function evidenceGet(id: string, maxBytes?: number): Promise<EvidenceContent> {
+  return adminCall("admin.evidence.get", {
+    id,
+    ...(maxBytes === undefined ? {} : { max_bytes: maxBytes }),
+  });
+}
+
+/** The odometer's figures; the daemon defaults to the last seven days. */
+export function evidenceStats(sinceTs?: number): Promise<EvidenceStats> {
+  return adminCall("admin.evidence.stats", {
+    ...(sinceTs === undefined ? {} : { since_ts: sinceTs }),
+  });
 }
 
 // --- daemon log ------------------------------------------------------------

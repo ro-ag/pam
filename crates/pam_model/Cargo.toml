@@ -12,10 +12,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 hex.workspace = true
-# `process` spawns system curl for downloads, `io-util` bounds its output and
-# `fs` moves the finished part file off the async threads; `sync` and `time`
-# carry the progress watch and its 500 ms poll, and `rt` is what `start`
-# needs to spawn the transfer task and hash on a blocking thread. No runtime
+# `process` spawns system curl for downloads and the curator's agent CLIs,
+# `io-util` bounds their output and `fs` moves the finished part file off the
+# async threads; `sync` and `time` carry the progress watch, its 500 ms poll
+# and the curator deadline; `rt` is what `start` needs to
+# spawn the transfer task and hash on a blocking thread. `macros` is only `join!`, which the curator needs
+# to drain a child's stdout and stderr while its stdin is still being
+# written — reading them in sequence deadlocks on a full pipe. No runtime
 # flavor — the daemon owns task placement.
 tokio = { version = "1", default-features = false, features = [
     "sync",
@@ -24,7 +27,11 @@ tokio = { version = "1", default-features = false, features = [
     "process",
     "io-util",
     "fs",
+    "macros",
 ] }
+# every curator invocation runs in a fresh empty directory that dies with
+# the call, so this is a runtime dependency and not only a test one.
+tempfile.workspace = true
 # byte-level BPE rebuilt from GGUF metadata, so a model stays one file.
 tokenizers.workspace = true
 # in-process inference. Declared here so the wave-2 runtime module only has
@@ -42,10 +49,10 @@ candle-nn = { version = "=0.9.2", default-features = false, features = ["metal"]
 candle-transformers = { version = "=0.9.2", default-features = false, features = ["metal"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 # the download suite drives the real curl against a local range-serving
-# origin: `net` for the listener, `macros`/`rt-multi-thread` for the tests
-# themselves. Test-only — the library still asks for no runtime flavor.
+# origin (`net` for the listener) and the curator tests drive async invokes;
+# `macros`/`rt-multi-thread` are for the tests themselves. Test-only — the
+# library still asks for no runtime flavor.
 tokio = { version = "1", default-features = false, features = [
     "net",
     "macros",

@@ -49,6 +49,9 @@ pub mod runtime;
 pub mod tokenizer;
 
 pub use catalog::{CATALOG, Preset, find_preset};
+pub use curator::{
+    AgentCli, AgentId, CuratorError, INVOKE_MAX_OUTPUT, detect, invoke, invoke_args,
+};
 pub use download::{
     DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState, curl_path,
     start,
@@ -61,6 +64,8 @@ pub use registry::{
 
 #[cfg(test)]
 mod catalog_test;
+#[cfg(test)]
+mod curator_test;
 #[cfg(test)]
 mod download_server_test;
 #[cfg(test)]

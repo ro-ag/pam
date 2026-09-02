@@ -55,6 +55,15 @@
 //!   for the failure detail when stderr is empty: the human needs to read
 //!   "OAuth session expired", not "exited with 1: ".
 //!
+//! # Windows
+//!
+//! These CLIs install as `claude.cmd` and friends, which Windows runs
+//! through `cmd.exe`. The shim is the process that starts, so a script
+//! that has been deleted or renamed comes back as
+//! [`CuratorError::Failed`] carrying `cmd.exe`'s own exit 1 — not the
+//! spawn error a Unix host would report. Both are legible; they are just
+//! not the same variant.
+//!
 //! # Blocking
 //!
 //! [`detect`] is synchronous — it stats directories and waits on

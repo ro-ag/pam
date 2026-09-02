@@ -44,8 +44,11 @@ fn script(fake: Fake) -> String {
             // copies stdin to stdout.
             Fake::EchoStdin => "@echo off\r\nfindstr /r \"^\"\r\n",
             Fake::EchoArgs => "@echo off\r\necho %*\r\n",
-            // `timeout` needs a console; `ping` does not.
-            Fake::Sleep => "@echo off\r\nping -n 31 127.0.0.1 > nul\r\n",
+            // `timeout` needs a console; `ping` does not. Kept short: a
+            // Windows child's pipe handles are read on a blocking thread,
+            // and dropping them after a deadline waits for the read in
+            // flight — which ends when the script does.
+            Fake::Sleep => "@echo off\r\nping -n 6 127.0.0.1 > nul\r\n",
             Fake::Fail => "@echo off\r\necho boom from the fake cli 1>&2\r\nexit /b 3\r\n",
         }
     } else {
@@ -53,7 +56,7 @@ fn script(fake: Fake) -> String {
             Fake::Version => "#!/bin/sh\necho '1.2.3'\necho 'trailing line'\n",
             Fake::EchoStdin => "#!/bin/sh\ncat\n",
             Fake::EchoArgs => "#!/bin/sh\necho \"$@\"\n",
-            Fake::Sleep => "#!/bin/sh\nsleep 30\n",
+            Fake::Sleep => "#!/bin/sh\nsleep 5\n",
             Fake::Fail => "#!/bin/sh\necho 'boom from the fake cli' >&2\nexit 3\n",
         }
     };
@@ -248,9 +251,12 @@ async fn invoke_reports_the_exit_code_and_the_complaint() {
 }
 
 #[tokio::test]
-async fn invoke_on_a_missing_binary_is_an_io_error() {
+async fn invoke_on_a_binary_that_cannot_be_spawned_is_an_io_error() {
     let dir = tempfile::tempdir().unwrap();
-    let cli = cli_at(AgentId::Claude, &dir.path().join(fake_name("claude")));
+    // Deliberately extension-less: Windows runs a `.cmd` through `cmd.exe`,
+    // which spawns fine and then reports the missing script as its own
+    // exit 1, so a `.cmd` path would prove nothing about the spawn error.
+    let cli = cli_at(AgentId::Claude, &dir.path().join("no-such-agent"));
 
     let failure = invoke(&cli, "anything", PROBE_DEADLINE).await.unwrap_err();
 

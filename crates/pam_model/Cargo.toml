@@ -1,0 +1,46 @@
+[package]
+name = "pam_model"
+description = "Local model layer for pam: GGUF inspection, catalog, on-disk registry, download, and the candle runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+# `process` spawns system curl for downloads, `io-util` bounds its output and
+# `fs` moves the finished part file off the async threads; `sync` and `time`
+# carry the progress watch and its 500 ms poll. No runtime flavor — the
+# daemon owns task placement.
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "time",
+    "process",
+    "io-util",
+    "fs",
+] }
+# byte-level BPE rebuilt from GGUF metadata, so a model stays one file.
+tokenizers.workspace = true
+# in-process inference. Declared here so the wave-2 runtime module only has
+# code to fill in; the portable CPU backend is the default everywhere.
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+
+# Metal on Apple Silicon. `objc2`/`metal` are Rust bindings to system
+# frameworks, so the C-free rule holds; CUDA would need `nvcc` and is not
+# shipped.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "=0.9.2", default-features = false, features = ["metal"] }
+candle-nn = { version = "=0.9.2", default-features = false, features = ["metal"] }
+candle-transformers = { version = "=0.9.2", default-features = false, features = ["metal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

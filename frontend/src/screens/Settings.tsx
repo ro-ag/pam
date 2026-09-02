@@ -1,9 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
-import { useState, useSyncExternalStore, type ReactNode } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { ConfirmButton } from "../components/ui/ConfirmButton";
+import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { Section } from "../components/ui/Section";
 import { cn } from "../lib/cn";
 import {
   daemonStatus,
@@ -28,6 +31,7 @@ import {
   type ModeId,
 } from "../lib/theme";
 import { exactTime, formatDuration, relativeTime } from "../lib/time";
+import { SettingsModelsSection } from "./SettingsModels";
 
 /**
  * Settings — every knob, one place (task #30). One calm scrollable column
@@ -40,95 +44,6 @@ import { exactTime, formatDuration, relativeTime } from "../lib/time";
  * real app is its own proof now. (The odometer concept returns with the
  * Ask Pam task.)
  */
-
-// --- section furniture -----------------------------------------------------
-
-/** One settings group: mono eyebrow, display title, serif blurb, panels. */
-function Section({
-  eyebrow,
-  eyebrowExtra,
-  title,
-  blurb,
-  children,
-}: {
-  eyebrow: string;
-  eyebrowExtra?: ReactNode;
-  title: string;
-  blurb: string;
-  children: ReactNode;
-}) {
-  return (
-    <section aria-label={title} className="max-w-2xl space-y-4">
-      <header className="space-y-1.5">
-        <div className="flex items-center gap-2">
-          <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-            {eyebrow}
-          </p>
-          {eyebrowExtra}
-        </div>
-        <h2 className="font-display text-lg font-semibold text-ink">{title}</h2>
-        <p className="font-voice text-base text-ink-muted italic">{blurb}</p>
-      </header>
-      {children}
-    </section>
-  );
-}
-
-/** The uniform failure shape, rendered the one PAM way. */
-function FailureNote({ failure, label }: { failure: BridgeFailure; label: string }) {
-  return (
-    <div className="space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
-      <p className="font-data text-xs tracking-widest text-danger uppercase">
-        {label} · {failure.cause}
-      </p>
-      <p className="font-voice text-sm text-ink italic">{failure.detail}.</p>
-      <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
-    </div>
-  );
-}
-
-/**
- * Two-tap destructive action (memento law: destructive actions confirm).
- * First tap arms — the button turns into its "sure?" wording; the second
- * tap fires. Leaving the button (blur) disarms.
- */
-function ConfirmButton({
-  label,
-  confirmLabel,
-  busy,
-  disabled,
-  onConfirm,
-  size = "sm",
-}: {
-  label: string;
-  confirmLabel: string;
-  busy?: boolean;
-  disabled?: boolean;
-  onConfirm: () => void;
-  size?: "sm" | "md";
-}) {
-  const [armed, setArmed] = useState(false);
-  return (
-    <Button
-      variant="danger"
-      size={size}
-      disabled={disabled || busy}
-      aria-label={armed ? confirmLabel : label}
-      onBlur={() => setArmed(false)}
-      onClick={() => {
-        if (!armed) {
-          setArmed(true);
-          return;
-        }
-        setArmed(false);
-        onConfirm();
-      }}
-    >
-      {busy && <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />}
-      {armed ? confirmLabel : label}
-    </Button>
-  );
-}
 
 // --- appearance ------------------------------------------------------------
 
@@ -804,6 +719,14 @@ export function SettingsScreen() {
             <ProfilePanel />
             <GrantsPanel />
           </div>
+        </Section>
+
+        <Section
+          eyebrow="models"
+          title="Models"
+          blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
+        >
+          <SettingsModelsSection />
         </Section>
 
         <Section

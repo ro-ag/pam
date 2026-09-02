@@ -101,7 +101,22 @@ export type AdminOp =
   | "admin.approvals.pending"
   | "admin.approvals.resolve"
   | "admin.activity.list"
-  | "admin.callers.list";
+  | "admin.callers.list"
+  | "admin.models.list"
+  | "admin.models.catalog"
+  | "admin.models.download"
+  | "admin.models.download.cancel"
+  | "admin.models.delete"
+  | "admin.models.verify"
+  | "admin.models.load"
+  | "admin.models.unload"
+  | "admin.models.status"
+  | "admin.models.defaults.set"
+  | "admin.models.settings.set"
+  | "admin.models.try"
+  | "admin.curator.list"
+  | "admin.curator.set"
+  | "admin.curator.test";
 
 /** One generic admin call; prefer the typed wrappers below. */
 export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): Promise<T> {
@@ -205,6 +220,221 @@ export function activityList(
 
 export function callersList(): Promise<{ callers: CallerRow[] }> {
   return adminCall("admin.callers.list");
+}
+
+// --- models ----------------------------------------------------------------
+
+/**
+ * The model surface (`pam_daemon::admin_models`). Every shape below is
+ * the daemon's own serialization — `pam_model::registry::ModelEntry`,
+ * `catalog::Preset` plus the two host flags the daemon adds,
+ * `runtime::RuntimeState` (internally tagged on `state`), and the
+ * `model_job` rows. Administration is GUI-only by design: no agent, CLI,
+ * or MCP call reaches any of these ops.
+ */
+
+/** Engine class, decided by size against the 18 GB floor. */
+export type ModelClass = "engine" | "test_only";
+
+/** What the bounded GGUF header parser could read out of a file. */
+export interface GgufInfo {
+  architecture: string;
+  name: string | null;
+  quant_label: string;
+  parameter_count: number;
+  context_length: number | null;
+  expert_count: number | null;
+  tensor_count: number;
+  version: number;
+}
+
+/** A digest run's verdict, kept in a sidecar next to the weights. */
+export interface VerifiedRecord {
+  sha256: string;
+  size_bytes: number;
+  verified_ts: number;
+  /** True/false against a catalog preset; null when no preset matches. */
+  matches_catalog: boolean | null;
+}
+
+/** One set of weights in the models directory. */
+export interface ModelEntry {
+  id: string;
+  vendor: string;
+  file_name: string;
+  path: string;
+  size_bytes: number;
+  info: GgufInfo | null;
+  /** Why the header would not parse, when `info` is null. */
+  info_error: string | null;
+  class: ModelClass;
+  verified: VerifiedRecord | null;
+  catalog_id: string | null;
+}
+
+/** A catalog entry, flagged for this host. */
+export interface CatalogPreset {
+  id: string;
+  label: string;
+  vendor: string;
+  file_name: string;
+  url: string;
+  size_bytes: number;
+  sha256: string;
+  license_id: string;
+  license_url: string;
+  quant: string;
+  params_label: string;
+  min_host_ram_bytes: number;
+  /** False when this machine has too little RAM; such cards are hidden. */
+  fits_host: boolean;
+  installed: boolean;
+}
+
+/** Where the runtime is; `state` is the discriminant the daemon tags on. */
+export type RuntimeState =
+  | { state: "idle" }
+  | { state: "loading"; phase: string; id: string }
+  | {
+      state: "loaded";
+      id: string;
+      quant: string;
+      architecture: string;
+      context_length: number;
+      weight_bytes: number;
+      device: string;
+      loaded_at: number;
+      last_used_at: number;
+      last_tokens_per_sec: number | null;
+    };
+
+/** One `model_job` row: a download or a digest run. */
+export interface ModelJob {
+  id: string;
+  kind: "download" | "verify";
+  model_id: string;
+  source: string | null;
+  state: "running" | "done" | "failed" | "cancelled";
+  bytes_done: number;
+  bytes_total: number | null;
+  detail: string | null;
+  created_ts: number;
+  updated_ts: number;
+}
+
+/** Everything the Models screen polls, in one read. */
+export interface ModelsStatus {
+  runtime: { state: RuntimeState; busy: boolean };
+  jobs: ModelJob[];
+  defaults: { light: string | null; heavy: string | null };
+  idle_unload_min: number;
+  models_dir: string;
+  host_ram_bytes: number;
+}
+
+/** What one generation produced, and what it cost. */
+export interface GenerateResult {
+  text: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  prompt_ms: number;
+  decode_ms: number;
+  tokens_per_sec: number;
+}
+
+/** The closed set of vendor agent CLIs PAM knows how to invoke. */
+export type AgentId = "claude" | "codex" | "copilot" | "gemini";
+
+/** One agent CLI found on the daemon's PATH. */
+export interface AgentCli {
+  id: AgentId;
+  path: string;
+  /** First line of `<cli> --version`, or null when it would not say. */
+  version: string | null;
+}
+
+export function modelsList(): Promise<{ models: ModelEntry[]; models_dir: string }> {
+  return adminCall("admin.models.list");
+}
+
+export function modelsCatalog(): Promise<{
+  presets: CatalogPreset[];
+  host_ram_bytes: number;
+  floor_bytes: number;
+}> {
+  return adminCall("admin.models.catalog");
+}
+
+/** From a catalog preset, or from a pasted URL (then it stays unverified). */
+export function modelsDownload(
+  source: { preset_id: string } | { url: string; vendor: string },
+): Promise<{ job_id: string }> {
+  return adminCall("admin.models.download", { ...source });
+}
+
+export function modelsDownloadCancel(
+  jobId: string,
+): Promise<{ job_id: string; cancelled: true }> {
+  return adminCall("admin.models.download.cancel", { job_id: jobId });
+}
+
+export function modelsDelete(modelId: string): Promise<{ deleted: true }> {
+  return adminCall("admin.models.delete", { model_id: modelId });
+}
+
+export function modelsVerify(modelId: string): Promise<{ job_id: string }> {
+  return adminCall("admin.models.verify", { model_id: modelId });
+}
+
+export function modelsLoad(modelId: string): Promise<{ state: RuntimeState }> {
+  return adminCall("admin.models.load", { model_id: modelId });
+}
+
+export function modelsUnload(): Promise<{ state: RuntimeState }> {
+  return adminCall("admin.models.unload");
+}
+
+export function modelsStatus(): Promise<ModelsStatus> {
+  return adminCall("admin.models.status");
+}
+
+/** `null` clears the tier back to the deterministic path. */
+export function modelsDefaultsSet(
+  tier: "light" | "heavy",
+  modelId: string | null,
+): Promise<{ tier: string; model_id: string | null }> {
+  return adminCall("admin.models.defaults.set", { tier, model_id: modelId });
+}
+
+export function modelsSettingsSet(patch: {
+  models_dir?: string;
+  idle_unload_min?: number;
+}): Promise<{ models_dir: string; idle_unload_min: number }> {
+  return adminCall("admin.models.settings.set", { ...patch });
+}
+
+/**
+ * One diagnostic generation on whatever is loaded — deliberately allowed
+ * on `test_only` weights, because proving the wiring is its purpose. The
+ * bridge gives this op a 120 s deadline; every other admin op gets 30 s.
+ */
+export function modelsTry(prompt: string, maxTokens?: number): Promise<GenerateResult> {
+  return adminCall("admin.models.try", {
+    prompt,
+    ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+  });
+}
+
+export function curatorList(): Promise<{ detected: AgentCli[]; selected: AgentId | null }> {
+  return adminCall("admin.curator.list");
+}
+
+export function curatorSet(agent: AgentId | null): Promise<{ selected: AgentId | null }> {
+  return adminCall("admin.curator.set", { agent });
+}
+
+export function curatorTest(): Promise<{ reply: string; ms: number }> {
+  return adminCall("admin.curator.test");
 }
 
 // --- daemon log ------------------------------------------------------------

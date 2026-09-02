@@ -9,14 +9,15 @@ import { Shell } from "./components/shell/Shell";
 import { ActivityScreen } from "./screens/Activity";
 import { parseActivitySearch } from "./screens/activitySearch";
 import { ApprovalsScreen } from "./screens/Approvals";
+import { ModelsScreen } from "./screens/Models";
 import { SettingsScreen } from "./screens/Settings";
 
 /**
  * Code-based route table — small app, no file-based magic. The root route is
  * the ZCode shell (chrome strip + sidebar + floating work panel); every child
  * renders inside the panel. `/` redirects to the Activity screen, the app's
- * default view. Flows and Models are sidebar placeholders only — they gain
- * routes when their screens land (tasks #28–#30 wire the real views).
+ * default view. Flows is the last sidebar placeholder — it gains a route
+ * when its screen lands.
  */
 const rootRoute = createRootRoute({ component: Shell });
 
@@ -43,6 +44,12 @@ const approvalsRoute = createRoute({
   component: ApprovalsScreen,
 });
 
+const modelsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/models",
+  component: ModelsScreen,
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
@@ -53,6 +60,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   activityRoute,
   approvalsRoute,
+  modelsRoute,
   settingsRoute,
 ]);
 

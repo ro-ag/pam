@@ -28,6 +28,12 @@ const mocks = vi.hoisted(() => ({
   grantsAdd: vi.fn(),
   grantsRevoke: vi.fn(),
   readDaemonLog: vi.fn(),
+  // The Models section mounts between Security and Daemon; its three
+  // reads are stubbed so this file keeps asserting Settings' own copy
+  // instead of three bridge-unavailable notes from a neighbour section.
+  modelsStatus: vi.fn(),
+  modelsList: vi.fn(),
+  curatorList: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -75,6 +81,16 @@ beforeEach(() => {
     file: "/Users/dev/.pam/log/daemon.log.2026-09-01",
     lines: ["INFO daemon listening", "WARN queue is deep", "ERROR store unreachable"],
   });
+  mocks.modelsStatus.mockResolvedValue({
+    runtime: { state: { state: "idle" }, busy: false },
+    jobs: [],
+    defaults: { light: null, heavy: null },
+    idle_unload_min: 10,
+    models_dir: "/Users/dev/llm",
+    host_ram_bytes: 64_000_000_000,
+  });
+  mocks.modelsList.mockResolvedValue({ models: [], models_dir: "/Users/dev/llm" });
+  mocks.curatorList.mockResolvedValue({ detected: [], selected: null });
 });
 
 afterEach(() => {

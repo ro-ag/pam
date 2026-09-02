@@ -201,6 +201,25 @@ async fn seed_relaxed(base: &Path) {
         .expect("relaxed profile persists");
 }
 
+/// Executes the freshly built binary once, outside any readiness clock.
+///
+/// macOS assesses a new executable the first time it runs (once per
+/// inode): a 100 MB debug `pam` sits in `_dyld_start` for 5 s on a quiet
+/// machine and past 30 s while other builds saturate the disk and CPU,
+/// then every later launch starts in well under a second. `cargo test`
+/// links a fresh inode every run, so without this the daemon's 15 s
+/// readiness budget was paying for the assessment, not for the daemon.
+/// A trivial `--version` exec absorbs the one-time cost before the test's
+/// own deadline starts, so the daemon spawn measures only the daemon.
+fn warm_binary() {
+    let _ = Command::new(env!("CARGO_BIN_EXE_pam"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Sends a no-wait `echo` and returns its ticket.
 async fn ticket_for_delayed_echo(base: &Path, delay_ms: u64) -> String {
     let args = serde_json::json!({ "delay_ms": delay_ms });
@@ -215,6 +234,9 @@ async fn ticket_for_delayed_echo(base: &Path, delay_ms: u64) -> String {
 
 #[tokio::test]
 async fn a_separate_daemon_process_streams_events_to_a_live_follow() {
+    // Outside the deadline on purpose: the one-time cost is the host's,
+    // not the daemon's (see `warm_binary`).
+    warm_binary();
     timeout(DEADLINE, async {
         let tmp = short_tempdir();
         let base = tmp.path().join("pam");

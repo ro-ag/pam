@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 3);
+    assert_eq!(store.schema_version().await.unwrap(), 4);
 }
 
 #[tokio::test]
@@ -72,7 +72,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 3
+            supported: 4
         }
     ));
     let message = err.to_string();
@@ -98,10 +98,10 @@ async fn v1_database_upgrades_to_v2() {
     conn.execute("PRAGMA user_version = 1", ()).await.unwrap();
     drop((conn, db));
 
-    // Opening runs migrations 2 and 3: the idempotency column exists, the
-    // model job table exists, and the version advances.
+    // Opening runs migrations 2, 3 and 4: the idempotency column exists,
+    // the model job table exists, and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 3);
+    assert_eq!(store.schema_version().await.unwrap(), 4);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -112,6 +112,60 @@ async fn v1_database_upgrades_to_v2() {
         .unwrap();
     let row = store.get_request("req_1").await.unwrap().unwrap();
     assert_eq!(row.idempotency_key.as_deref(), Some("key-1"));
+}
+
+#[tokio::test]
+async fn v3_database_gains_meta_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+
+    // Build a genuine v3 database by hand: apply migrations 1..=3 and
+    // stamp their version, so the evidence table has no `meta_json`.
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    for migration in &migrations::MIGRATIONS[..3] {
+        conn.execute_batch(migration.sql).await.unwrap();
+    }
+    conn.execute("PRAGMA user_version = 3", ()).await.unwrap();
+    drop((conn, db));
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert!(
+        evidence_columns(&store)
+            .await
+            .contains(&"meta_json".to_owned()),
+        "migration 4 did not add evidence.meta_json"
+    );
+
+    // The upgraded column is writable, and existing rows read back NULL.
+    store
+        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_1", "req_1", "log.source", b"hello", None)
+        .await
+        .unwrap();
+    let row = store.get_evidence("ev_1").await.unwrap().unwrap();
+    assert_eq!(row.meta_json, None);
+}
+
+/// Column names of the `evidence` table, via `PRAGMA table_info`.
+async fn evidence_columns(store: &Store) -> Vec<String> {
+    let mut rows = store
+        .conn
+        .query("PRAGMA table_info(evidence)", ())
+        .await
+        .unwrap();
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        names.push(row.get(1).unwrap());
+    }
+    names
 }
 
 #[test]

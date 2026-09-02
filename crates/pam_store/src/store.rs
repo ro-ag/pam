@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, params};
 
 use crate::error::StoreError;
@@ -341,6 +342,69 @@ pub struct ModelJobRow {
     pub created_ts: i64,
     /// Unix seconds of the last progress or the verdict.
     pub updated_ts: i64,
+}
+
+/// Evidence kind whose `meta_json` carries the compression figures the
+/// tokens-avoided odometer aggregates.
+pub const EVIDENCE_KIND_LOG_COMPACT: &str = "log.compact";
+
+/// One row of the `evidence` table, blob included.
+///
+/// `path` stays NULL for now: every row the daemon writes is blob-backed,
+/// and path-backed evidence arrives with the retention plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    /// Evidence id, `ev_<ulid>`, minted by the daemon.
+    pub id: String,
+    /// Request the evidence belongs to.
+    pub request_id: String,
+    /// What the row is (`log.source`, `log.compact`, `log.summary`, ...);
+    /// the vocabulary belongs to the services that write it.
+    pub kind: String,
+    /// The stored bytes, exactly as they were handed in.
+    pub content: Vec<u8>,
+    /// Lowercase hex sha256 of `content`.
+    pub content_hash: String,
+    /// Small kind-specific metadata as JSON text, when the writer left any.
+    pub meta_json: Option<String>,
+    /// Unix seconds when the row was written.
+    pub ts: i64,
+}
+
+/// One `evidence` row without its blob: what the GUI lists.
+///
+/// `bytes` is the blob's length read with SQL `LENGTH`, so a listing
+/// never pulls a 64 MiB log through the connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceMeta {
+    /// Evidence id, `ev_<ulid>`.
+    pub id: String,
+    /// Request the evidence belongs to.
+    pub request_id: String,
+    /// What the row is (`log.source`, `log.compact`, `log.summary`, ...).
+    pub kind: String,
+    /// Length of the stored blob in bytes.
+    pub bytes: u64,
+    /// Lowercase hex sha256 of the content.
+    pub content_hash: String,
+    /// Small kind-specific metadata as JSON text, when the writer left any.
+    pub meta_json: Option<String>,
+    /// Unix seconds when the row was written.
+    pub ts: i64,
+}
+
+/// Aggregate over the `log.compact` evidence rows in a time window: what
+/// the tokens-avoided odometer shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressionStats {
+    /// How many compactions happened in the window.
+    pub compressions: u64,
+    /// Total bytes of the sources that were compacted.
+    pub source_bytes: u64,
+    /// Total bytes the compact forms take.
+    pub compact_bytes: u64,
+    /// Estimated input tokens the compaction avoided.
+    pub tokens_avoided_est: u64,
 }
 
 /// Handle to the durable state database.
@@ -1276,6 +1340,175 @@ impl Store {
             .await?;
         Ok(changed)
     }
+
+    /// Writes one evidence row: the bytes, their sha256, and optional
+    /// kind-specific metadata.
+    ///
+    /// `content_hash` is computed here so every row is addressable by
+    /// digest whatever wrote it, and `path` stays NULL — evidence is
+    /// blob-backed today.
+    pub async fn insert_evidence(
+        &self,
+        id: &str,
+        request_id: &str,
+        kind: &str,
+        content: &[u8],
+        meta_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let content_hash = hex::encode(Sha256::digest(content));
+        self.conn
+            .execute(
+                "INSERT INTO evidence
+                     (id, request_id, kind, content, path, content_hash, meta_json, ts)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+                params![
+                    id,
+                    request_id,
+                    kind,
+                    content.to_vec(),
+                    content_hash,
+                    meta_json,
+                    now_ts()
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads one evidence row by id, blob included, or `None` if it does
+    /// not exist.
+    pub async fn get_evidence(&self, id: &str) -> Result<Option<EvidenceRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, request_id, kind, content, content_hash, meta_json, ts
+                 FROM evidence WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(EvidenceRow {
+                id: row.get(0)?,
+                request_id: row.get(1)?,
+                kind: row.get(2)?,
+                content: blob_column(&row, 3)?,
+                content_hash: row.get(4)?,
+                meta_json: row.get(5)?,
+                ts: row.get(6)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Every evidence row for one request, oldest first, without the
+    /// blobs — the GUI's evidence strip.
+    pub async fn list_evidence(&self, request_id: &str) -> Result<Vec<EvidenceMeta>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, request_id, kind, LENGTH(content), content_hash, meta_json, ts
+                 FROM evidence WHERE request_id = ?1 ORDER BY ts ASC, id ASC",
+                params![request_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(EvidenceMeta {
+                id: row.get(0)?,
+                request_id: row.get(1)?,
+                kind: row.get(2)?,
+                bytes: length_column(&row, 3)?,
+                content_hash: row.get(4)?,
+                meta_json: row.get(5)?,
+                ts: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Sums the compression figures over the [`EVIDENCE_KIND_LOG_COMPACT`]
+    /// rows written at or after `since_ts`.
+    ///
+    /// The figures are read out of `meta_json` in Rust rather than with
+    /// SQL JSON functions, so the aggregate does not depend on the
+    /// engine's JSON support. A row whose metadata cannot be read still
+    /// counts as a compression — it happened — but contributes no
+    /// figures, and says so in the log.
+    pub async fn compression_stats(&self, since_ts: i64) -> Result<CompressionStats, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, meta_json FROM evidence WHERE kind = ?1 AND ts >= ?2",
+                params![EVIDENCE_KIND_LOG_COMPACT, since_ts],
+            )
+            .await?;
+        let mut stats = CompressionStats::default();
+        while let Some(row) = rows.next().await? {
+            stats.compressions = stats.compressions.saturating_add(1);
+            let id: String = row.get(0)?;
+            let meta: Option<String> = row.get(1)?;
+            let Some(meta) = meta.as_deref() else {
+                tracing::warn!(evidence_id = %id, "compression meta is missing");
+                continue;
+            };
+            match serde_json::from_str::<serde_json::Value>(meta) {
+                Ok(value) => {
+                    stats.source_bytes = stats
+                        .source_bytes
+                        .saturating_add(meta_u64(&value, "source_bytes"));
+                    stats.compact_bytes = stats
+                        .compact_bytes
+                        .saturating_add(meta_u64(&value, "compact_bytes"));
+                    stats.tokens_avoided_est = stats
+                        .tokens_avoided_est
+                        .saturating_add(meta_u64(&value, "tokens_avoided_est"));
+                }
+                Err(error) => {
+                    tracing::warn!(evidence_id = %id, %error, "unreadable compression meta");
+                }
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// Reads a BLOB column as bytes; a NULL blob is an empty vector.
+fn blob_column(row: &turso::Row, idx: usize) -> Result<Vec<u8>, StoreError> {
+    match row.get_value(idx)? {
+        turso::Value::Blob(bytes) => Ok(bytes),
+        turso::Value::Null => Ok(Vec::new()),
+        turso::Value::Text(text) => Ok(text.into_bytes()),
+        other => Err(StoreError::UnexpectedValue {
+            column: "evidence.content",
+            value: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Reads a `LENGTH(...)` column as a byte count. `LENGTH` of a NULL blob
+/// is NULL, which means no content at all: zero bytes.
+fn length_column(row: &turso::Row, idx: usize) -> Result<u64, StoreError> {
+    match row.get_value(idx)? {
+        turso::Value::Integer(length) => Ok(u64::try_from(length).unwrap_or(0)),
+        turso::Value::Null => Ok(0),
+        other => Err(StoreError::UnexpectedValue {
+            column: "evidence.content length",
+            value: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Reads one non-negative integer field out of an evidence `meta_json`
+/// object. A missing, negative, or non-numeric field contributes nothing.
+fn meta_u64(value: &serde_json::Value, field: &str) -> u64 {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// Current time as unix seconds.

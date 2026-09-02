@@ -1,7 +1,9 @@
+use sha2::{Digest, Sha256};
 use turso::params;
 
 use crate::{
-    Actor, ApprovalResolution, AuditEntry, Decision, ModelJobRow, RequestState, Store, StoreError,
+    Actor, ApprovalResolution, AuditEntry, CompressionStats, Decision, EVIDENCE_KIND_LOG_COMPACT,
+    ModelJobRow, RequestState, Store, StoreError,
 };
 
 /// The one model job row with `id`, read back through the bounded list.
@@ -43,7 +45,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 3);
+    assert_eq!(store.schema_version().await.unwrap(), 4);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -977,4 +979,155 @@ async fn boot_recovery_fails_only_running_model_jobs() {
             .unwrap(),
         0
     );
+}
+
+// ---- evidence -------------------------------------------------------
+
+/// The lowercase hex sha256 of `bytes`, computed independently of the
+/// store so the round-trip test proves the column, not the helper.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// `meta_json` for a `log.compact` row carrying the compression figures.
+fn compact_meta(source_bytes: u64, compact_bytes: u64, tokens_avoided_est: u64) -> String {
+    format!(
+        r#"{{"source_bytes":{source_bytes},"compact_bytes":{compact_bytes},"tokens_avoided_est":{tokens_avoided_est}}}"#
+    )
+}
+
+#[tokio::test]
+async fn evidence_round_trips_bytes_hash_and_meta() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    let content: &[u8] = b"\x00\xffraw\nbytes";
+    store
+        .insert_evidence(
+            "ev_1",
+            "req_1",
+            "log.source",
+            content,
+            Some(r#"{"name":"build.log"}"#),
+        )
+        .await
+        .unwrap();
+
+    let row = store.get_evidence("ev_1").await.unwrap().unwrap();
+    assert_eq!(row.id, "ev_1");
+    assert_eq!(row.request_id, "req_1");
+    assert_eq!(row.kind, "log.source");
+    assert_eq!(row.content, content);
+    assert_eq!(row.content_hash, sha256_hex(content));
+    assert_eq!(row.meta_json.as_deref(), Some(r#"{"name":"build.log"}"#));
+    assert!(row.ts > 0);
+
+    assert_eq!(store.get_evidence("ev_missing").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn list_evidence_returns_metadata_without_blobs_in_insertion_order() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+    insert_demo_request(&store, "req_2").await;
+
+    for (id, kind, content) in [
+        ("ev_1", "log.source", b"aaaa".as_slice()),
+        ("ev_2", "log.compact", b"bb".as_slice()),
+        ("ev_3", "log.summary", b"c".as_slice()),
+    ] {
+        store
+            .insert_evidence(id, "req_1", kind, content, None)
+            .await
+            .unwrap();
+    }
+    store
+        .insert_evidence("ev_9", "req_2", "log.source", b"elsewhere", None)
+        .await
+        .unwrap();
+
+    let rows = store.list_evidence("req_1").await.unwrap();
+    assert_eq!(rows.len(), 3);
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["ev_1", "ev_2", "ev_3"]);
+    let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["log.source", "log.compact", "log.summary"]);
+    let sizes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
+    assert_eq!(sizes, [4, 2, 1]);
+    assert_eq!(rows[0].content_hash, sha256_hex(b"aaaa"));
+    assert!(rows.iter().all(|r| r.request_id == "req_1"));
+
+    assert!(store.list_evidence("req_none").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn compression_stats_sums_only_compact_rows_in_the_window() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "req_1").await;
+
+    for id in ["ev_c1", "ev_c2"] {
+        store
+            .insert_evidence(
+                id,
+                "req_1",
+                EVIDENCE_KIND_LOG_COMPACT,
+                b"report",
+                Some(&compact_meta(1000, 100, 225)),
+            )
+            .await
+            .unwrap();
+    }
+    // Another kind with the same meta must not be counted.
+    store
+        .insert_evidence(
+            "ev_s1",
+            "req_1",
+            "log.source",
+            b"raw",
+            Some(&compact_meta(1000, 100, 225)),
+        )
+        .await
+        .unwrap();
+    // An unreadable meta still counts as a compression, adding nothing.
+    store
+        .insert_evidence(
+            "ev_c3",
+            "req_1",
+            EVIDENCE_KIND_LOG_COMPACT,
+            b"report",
+            Some("not json"),
+        )
+        .await
+        .unwrap();
+
+    let stats = store.compression_stats(0).await.unwrap();
+    assert_eq!(stats.compressions, 3);
+    assert_eq!(stats.source_bytes, 2000);
+    assert_eq!(stats.compact_bytes, 200);
+    assert_eq!(stats.tokens_avoided_est, 450);
+
+    // A window that starts in the future sees nothing.
+    let future = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 600;
+    assert_eq!(
+        store.compression_stats(future).await.unwrap(),
+        CompressionStats::default()
+    );
+}
+
+#[tokio::test]
+async fn evidence_insert_refuses_an_unknown_request() {
+    let store = Store::open_in_memory().await.unwrap();
+    // foreign_keys is ON, so a dangling request_id must be rejected.
+    let err = store
+        .insert_evidence("ev_1", "ghost", "log.source", b"raw", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Database(_)));
 }

@@ -29,6 +29,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: SCHEMA_V3,
     },
+    Migration {
+        version: 4,
+        sql: SCHEMA_V4,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -196,3 +200,12 @@ CREATE TABLE model_job (
 );
 CREATE INDEX model_job_state_idx ON model_job (state);
 ";
+
+/// Migration 4: `evidence.meta_json` — small kind-specific metadata
+/// alongside the blob.
+///
+/// A compact carries its compression figures, a summary the model
+/// figures it was produced with. The GUI lists a request's evidence, and
+/// the tokens-avoided odometer aggregates over the compacts, without
+/// reading a single blob.
+const SCHEMA_V4: &str = "ALTER TABLE evidence ADD COLUMN meta_json TEXT;";

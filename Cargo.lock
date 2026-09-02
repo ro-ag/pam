@@ -3744,9 +3744,13 @@ dependencies = [
 name = "pam_store"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "turso",
 ]
 

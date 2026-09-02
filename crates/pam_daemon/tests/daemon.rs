@@ -55,6 +55,7 @@ struct TestDaemon {
 impl TestDaemon {
     async fn start() -> Self {
         let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
         Self::start_at(tmp).await
     }
 
@@ -167,6 +168,25 @@ async fn recv_event(sub: &mut SubSocket) -> Event {
     let message = sub.recv().await.expect("event recv ok");
     let frames = message.into_vec();
     serde_json::from_slice(&frames[1]).expect("parse event")
+}
+
+/// Persists the relaxed profile before the daemon (and thus the gate)
+/// opens the store.
+///
+/// [`pam_daemon::policy::Profile::platform_default`] is `Relaxed` only on
+/// macOS and `Standard` everywhere else, and only the relaxed profile
+/// auto-grants a non-destructive capability on first use. The tests that
+/// drive `echo` without granting it would otherwise pass on macOS and
+/// refuse with `not_granted` on Linux and Windows. Tests that want a
+/// different profile seed it themselves and use [`TestDaemon::start_at`].
+async fn seed_relaxed(tmp: &tempfile::TempDir) {
+    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
+        .await
+        .expect("store opens");
+    store
+        .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
+        .await
+        .expect("relaxed profile persists");
 }
 
 /// Seeds `tmp`'s store with the strict profile and an active `echo`
@@ -797,6 +817,7 @@ async fn second_daemon_on_the_same_base_is_refused_with_the_holder_pid() {
 async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
     timeout(DEADLINE, async {
         let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
         {
             let store = Store::open(&base_of(&tmp).join("state.sqlite3"))
                 .await

@@ -21,7 +21,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pam::client::{self, DaemonStatus};
+use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_proto::{Event, Response};
+use pam_store::Store;
 use tokio::time::timeout;
 
 /// Wall deadline for the whole test; generous for loaded runners.
@@ -150,6 +152,24 @@ fn signal_term(child: &Child) {
         .status();
 }
 
+/// Persists the relaxed profile on `base` before the daemon process
+/// opens it.
+///
+/// [`pam_daemon::policy::Profile::platform_default`] is `Relaxed` only on
+/// macOS and `Standard` everywhere else, and only the relaxed profile
+/// auto-grants a non-destructive capability on first use. This test
+/// drives `echo` without granting it, so without the seed it passes on
+/// macOS and refuses with `not_granted` on Linux and Windows.
+async fn seed_relaxed(base: &Path) {
+    let store = Store::open(&base.join("state.sqlite3"))
+        .await
+        .expect("store opens");
+    store
+        .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
+        .await
+        .expect("relaxed profile persists");
+}
+
 /// Sends a no-wait `echo` and returns its ticket.
 async fn ticket_for_delayed_echo(base: &Path, delay_ms: u64) -> String {
     let args = serde_json::json!({ "delay_ms": delay_ms });
@@ -167,6 +187,7 @@ async fn a_separate_daemon_process_streams_events_to_a_live_follow() {
     timeout(DEADLINE, async {
         let tmp = short_tempdir();
         let base = tmp.path().join("pam");
+        seed_relaxed(&base).await;
         let daemon = LiveDaemon::spawn(&base);
 
         // Scenario 1 — follow while the request runs: the terminal

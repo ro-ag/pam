@@ -29,6 +29,7 @@ use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, DAEMON_VERSION, DaemonConfig, DaemonHandle, TERMINAL_ACTIONS,
     run_daemon_with,
 };
+use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES;
 use pam_proto::{Caller, Envelope, Event, PROTOCOL_VERSION, Response};
 use pam_store::{AuditRow, RequestRow, RequestState, Store};
@@ -94,6 +95,26 @@ pub async fn open_store(tmp: &tempfile::TempDir) -> Store {
         .expect("store opens")
 }
 
+/// Persists the relaxed profile on a fresh base dir, before any daemon
+/// opens it.
+///
+/// [`pam_daemon::policy::Profile::platform_default`] is `Relaxed` only on
+/// macOS and `Standard` everywhere else, and only the relaxed profile
+/// auto-grants a non-destructive capability on first use. Harness daemons
+/// drive `echo` without granting it, so without this seed the very same
+/// test passes on macOS and refuses with `not_granted` on Linux and
+/// Windows. Tests that care about a different profile seed it themselves
+/// and spawn through [`TestDaemon::spawn_at`].
+pub async fn seed_relaxed(tmp: &tempfile::TempDir) {
+    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
+        .await
+        .expect("store opens");
+    store
+        .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
+        .await
+        .expect("relaxed profile persists");
+}
+
 /// Guards the 104-byte unix socket path limit before the daemon tries
 /// to bind — a failure here means the temp root is too deep, not a
 /// daemon bug.
@@ -157,15 +178,19 @@ pub struct TestDaemon {
 
 impl TestDaemon {
     /// Spawns a daemon on a fresh short-path temp dir with the default
-    /// [`DaemonConfig`].
+    /// [`DaemonConfig`] and the relaxed profile ([`seed_relaxed`]).
     pub async fn spawn() -> Self {
-        Self::spawn_at(short_tempdir()).await
+        let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
+        Self::spawn_at(tmp).await
     }
 
     /// [`Self::spawn`] with a config mutator (approval timeout, drain
     /// timeout, …). The base dir stays harness-owned.
     pub async fn spawn_with(mutate: impl FnOnce(&mut DaemonConfig)) -> Self {
-        Self::spawn_at_with(short_tempdir(), mutate).await
+        let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
+        Self::spawn_at_with(tmp, mutate).await
     }
 
     /// Spawns on an existing temp dir — for restart tests reusing the

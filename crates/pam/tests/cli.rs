@@ -10,6 +10,7 @@ use std::time::Duration;
 use pam::client;
 use pam::render;
 use pam_daemon::daemon::{DaemonHandle, run_daemon};
+use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_proto::{Event, Outcome, Response};
 use pam_store::{RequestRow, RequestState, Store};
 use tokio::sync::watch;
@@ -46,6 +47,7 @@ struct TestDaemon {
 impl TestDaemon {
     async fn start() -> Self {
         let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
             .await
@@ -70,6 +72,24 @@ impl TestDaemon {
 /// The daemon base directory inside a test's temp dir.
 fn base_of(tmp: &tempfile::TempDir) -> PathBuf {
     tmp.path().join("pam")
+}
+
+/// Persists the relaxed profile before the daemon (and thus the gate)
+/// opens the store.
+///
+/// [`pam_daemon::policy::Profile::platform_default`] is `Relaxed` only on
+/// macOS and `Standard` everywhere else, and only the relaxed profile
+/// auto-grants a non-destructive capability on first use. These tests
+/// drive `echo` without granting it, so without the seed they pass on
+/// macOS and refuse with `not_granted` on Linux and Windows.
+async fn seed_relaxed(tmp: &tempfile::TempDir) {
+    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
+        .await
+        .expect("store opens");
+    store
+        .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
+        .await
+        .expect("relaxed profile persists");
 }
 
 /// Polls the store until the request row satisfies `pred`.

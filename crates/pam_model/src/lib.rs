@@ -18,9 +18,11 @@
 //!   scan, classify, verify, delete.
 //! - [`download`] — resumable transfers through the system `curl`, with
 //!   the integrity check done here rather than trusted to the network.
-//! - [`tokenizer`], [`runtime`], [`curator`] — filled by the remaining
-//!   wave-2 tasks; declared here so the module list never has to change
-//!   under them.
+//! - [`tokenizer`] — a byte-level BPE rebuilt from the model file's own
+//!   metadata, so a model stays one file on disk.
+//! - [`runtime`] — the candle inference thread: load, unload, generate.
+//! - [`curator`] — the vendor agent CLIs installed on the machine: detect
+//!   them, ask one a single tool-free question.
 //! - [`error`] — one place to reach for the crate's error types.
 //!
 //! # The floor
@@ -61,6 +63,11 @@ pub use registry::{
     MODEL_FLOOR_BYTES, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord,
     VerifyOutcome, classify, default_models_dir,
 };
+pub use runtime::{
+    CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, Runtime, RuntimeError,
+    RuntimeSnapshot, RuntimeState,
+};
+pub use tokenizer::{GgufTokenizer, TokenizerError, chatml};
 
 #[cfg(test)]
 mod catalog_test;
@@ -74,3 +81,7 @@ mod download_test;
 mod gguf_test;
 #[cfg(test)]
 mod registry_test;
+#[cfg(test)]
+mod runtime_test;
+#[cfg(test)]
+mod tokenizer_test;

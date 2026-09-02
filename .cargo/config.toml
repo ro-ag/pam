@@ -1,0 +1,15 @@
+# Workspace build settings that every checkout needs.
+#
+# aarch64 off Apple: candle's matmul backend (`gemm-f16`) carries inline
+# AArch64 assembly (`fmul ... .8h`) that LLVM only accepts with the `fp16`
+# (FEAT_FP16, ARMv8.2-A) target feature. Apple targets enable it by default;
+# `aarch64-unknown-linux-gnu` and `aarch64-pc-windows-msvc` do not, and the
+# crate fails to compile there ("instruction requires: fullfp16"). Enabling
+# the feature for those triples fixes the build and commits the arm64
+# Linux/Windows binaries to ARMv8.2+ hardware — every machine that meets the
+# 32 GB model floor (Graviton2+, Ampere, Snapdragon X, Raspberry Pi 5) does.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+fp16"]

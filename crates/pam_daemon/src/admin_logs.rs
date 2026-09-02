@@ -250,18 +250,24 @@ impl AdminService {
                 recovery: RECOVERY_EVIDENCE_PICK,
             })?;
 
-        let (text, source_len, truncated) = readable_text(&row, max_bytes);
+        let (text, text_bytes, truncated) = readable_text(&row, max_bytes);
+        // `bytes` is the blob length, exactly as `admin.evidence.list`
+        // reports it, so one handle never shows two sizes across the two
+        // ops. `text_bytes` is the length of what `text` is a prefix of —
+        // for a `log.compact` row the rendered text, everywhere else the
+        // blob again — which is what makes `truncated` mean something.
         let mut body = meta_value(&EvidenceMeta {
             id: row.id.clone(),
             request_id: row.request_id.clone(),
             kind: row.kind.clone(),
-            bytes: source_len,
+            bytes: u64::try_from(row.content.len()).unwrap_or(u64::MAX),
             content_hash: row.content_hash.clone(),
             meta_json: row.meta_json.clone(),
             ts: row.ts,
         });
         if let Some(object) = body.as_object_mut() {
             object.insert("text".to_owned(), json!(text));
+            object.insert("text_bytes".to_owned(), json!(text_bytes));
             object.insert("truncated".to_owned(), json!(truncated));
         }
         Ok(AdminOk {
@@ -318,15 +324,16 @@ fn meta_value(row: &EvidenceMeta) -> Value {
     })
 }
 
-/// What a reader wants out of one evidence row, and whether they got all
-/// of it.
+/// What a reader wants out of one evidence row: the text, its **full**
+/// length in bytes, and whether the text is only a prefix of it.
 ///
 /// A `log.compact` row stores the JSON report — that is the provenance
 /// map, not something anyone reads — so what comes back is its
-/// `rendered_text`. Everything else is its own bytes. The cut is by byte
-/// count and the conversion is lossy, so a cut through a multi-byte
-/// character costs one replacement character, which is the honest thing
-/// for a bounded preview to do.
+/// `rendered_text`, and the length returned is that text's, not the
+/// blob's. Everything else is its own bytes, where the two agree. The cut
+/// is by byte count and the conversion is lossy, so a cut through a
+/// multi-byte character costs one replacement character, which is the
+/// honest thing for a bounded preview to do.
 fn readable_text(row: &EvidenceRow, max_bytes: u64) -> (String, u64, bool) {
     let rendered;
     let source: &[u8] = if row.kind == EVIDENCE_KIND_LOG_COMPACT {
@@ -343,14 +350,14 @@ fn readable_text(row: &EvidenceRow, max_bytes: u64) -> (String, u64, bool) {
     } else {
         &row.content
     };
-    let source_len = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let text_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
     let cut = usize::try_from(max_bytes)
         .unwrap_or(usize::MAX)
         .min(source.len());
     (
         String::from_utf8_lossy(&source[..cut]).into_owned(),
-        source_len,
-        source_len > max_bytes,
+        text_bytes,
+        text_bytes > max_bytes,
     )
 }
 

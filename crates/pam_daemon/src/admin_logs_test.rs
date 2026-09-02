@@ -331,19 +331,37 @@ async fn evidence_list_and_get_round_trip_through_the_ops() {
         );
         assert_eq!(listed[1]["meta"]["name"], "test.log");
 
-        // The compact row reads back as its rendered text, not its JSON.
+        // The compact row reads back as its rendered text, not its JSON —
+        // but `bytes` still reports the blob, the same figure the listing
+        // gave for the same handle, so one id never shows two sizes.
         let compact_id = report["compact"]["id"].as_str().unwrap();
+        let listed_compact_bytes = listed[1]["bytes"].clone();
         let (_, response) = fixture
             .run(OP_EVIDENCE_GET, json!({ "id": compact_id }))
             .await;
         let body = expect_result(response, Outcome::Verified);
         assert_eq!(body["kind"], EVIDENCE_KIND_LOG_COMPACT);
-        assert_eq!(body["text"], report["compact_text"]);
-        assert_eq!(body["truncated"], false);
         assert_eq!(body["id"], compact_id);
+        assert_eq!(body["text"], report["compact_text"]);
+        assert_eq!(
+            body["bytes"], listed_compact_bytes,
+            "get and list agree on the blob length"
+        );
+        assert_eq!(
+            body["text_bytes"].as_u64(),
+            Some(report["compact_text"].as_str().unwrap().len() as u64),
+            "text_bytes is the rendered text's length"
+        );
+        assert_ne!(
+            body["bytes"], body["text_bytes"],
+            "the JSON report really is bigger than the text it renders"
+        );
+        assert_eq!(body["truncated"], false);
 
-        // A budget smaller than the blob truncates and says so.
+        // A budget smaller than the text truncates and says so; for a
+        // source row the blob and the text are the same bytes.
         let source_id = report["source"]["id"].as_str().unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
         let (_, response) = fixture
             .run(OP_EVIDENCE_GET, json!({ "id": source_id, "max_bytes": 10 }))
             .await;
@@ -353,8 +371,9 @@ async fn evidence_list_and_get_round_trip_through_the_ops() {
             "{}",
             body["text"]
         );
+        assert_eq!(body["bytes"].as_u64(), Some(file_len));
+        assert_eq!(body["text_bytes"].as_u64(), Some(file_len));
         assert_eq!(body["truncated"], true);
-        assert_eq!(body["bytes"], report["stats"]["source_bytes"]);
 
         let (_, response) = fixture
             .run(OP_EVIDENCE_GET, json!({ "id": "ev_nope" }))

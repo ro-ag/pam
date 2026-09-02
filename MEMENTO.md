@@ -20,3 +20,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 60
 - status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
 
+## turso-connection-concurrent-use
+- kind: trick
+- scope: project
+- rule: A turso (Limbo) Connection must never run statements from two tasks at once: it fails with Misuse("concurrent use forbidden"), and a swallowed failure on a terminal write leaves rows stuck forever (looked like a PUB/SUB or follow-timeout flake). Serialize every statement behind one async mutex and hold it across explicit BEGIN..COMMIT
+- fix: pam_store::Store conn_lock (tokio Mutex) taken at the top of every method; regression test store_test::concurrent_inserts_and_finishes_never_fail; daemon logs failed terminal writes (log_terminal_failure). Diagnosis path: dump the daemon log on test failure and read the statement timeline (BEGIN with no COMMIT).
+- hits: 2026-09-01
+- cost: 120
+- status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
+

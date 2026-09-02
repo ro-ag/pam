@@ -324,7 +324,14 @@ pub struct Store {
     /// task's `BEGIN` and `COMMIT` would join that transaction. Only
     /// `finish_request` opens transactions at runtime, so only it takes
     /// this lock.
-    txn_lock: tokio::sync::Mutex<()>,
+    /// Serializes every statement on `conn`. turso refuses concurrent use
+    /// of one connection outright (`Misuse("concurrent use forbidden")`),
+    /// and the daemon drives this store from many tasks at once —
+    /// executor, dispatcher, reaper, admin. Each method holds the lock for
+    /// its statements; [`Self::finish_request`] holds it across its whole
+    /// `BEGIN`..`COMMIT` window so no other statement can join or break
+    /// the transaction.
+    conn_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -367,12 +374,13 @@ impl Store {
         Ok(Self {
             _db: db,
             conn,
-            txn_lock: tokio::sync::Mutex::new(()),
+            conn_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     /// The schema version currently recorded in the database.
     pub async fn schema_version(&self) -> Result<i64, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         migrations::current_version(&self.conn).await
     }
 
@@ -389,6 +397,7 @@ impl Store {
         args_json: &str,
         idempotency_key: Option<&str>,
     ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let now = now_ts();
         self.conn
             .execute(
@@ -436,6 +445,7 @@ impl Store {
 
     /// Reads one request by id, or `None` if it does not exist.
     pub async fn get_request(&self, id: &str) -> Result<Option<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -461,6 +471,7 @@ impl Store {
         &self,
         idempotency_key: &str,
     ) -> Result<Option<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -490,6 +501,7 @@ impl Store {
         repo: &str,
         args_json: &str,
     ) -> Result<Option<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -513,6 +525,7 @@ impl Store {
     /// request ids are ULID-ordered). The queue manager rebuilds its lanes
     /// from this on boot.
     pub async fn list_queued_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -537,6 +550,7 @@ impl Store {
     /// [`Self::finish_request`] before the lanes are rebuilt; a live
     /// daemon never calls this.
     pub async fn list_stuck_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -574,6 +588,7 @@ impl Store {
         state: RequestState,
         outcome: Option<&str>,
     ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         debug_assert!(
             !state.is_terminal(),
             "terminal transitions must go through finish_request"
@@ -619,7 +634,7 @@ impl Store {
                 state: state.as_str(),
             });
         }
-        let _guard = self.txn_lock.lock().await;
+        let _guard = self.conn_lock.lock().await;
         self.conn.execute("BEGIN", ()).await?;
         let finished = self.finish_request_in_txn(id, state, outcome, audit).await;
         match finished {
@@ -696,6 +711,7 @@ impl Store {
         &self,
         terminal_actions: &[&str],
     ) -> Result<Vec<String>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let sql = if terminal_actions.is_empty() {
             // No action can match, so every terminal request is missing.
             "SELECT id FROM request
@@ -729,6 +745,7 @@ impl Store {
     /// `waiting_approval`). Feeds the `status` capability's
     /// `active_requests` figure.
     pub async fn count_inflight(&self) -> Result<i64, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -753,6 +770,7 @@ impl Store {
         actor: Actor,
         detail: Option<&str>,
     ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
@@ -772,6 +790,7 @@ impl Store {
 
     /// Reads every audit row for one request, oldest first.
     pub async fn audit_for_request(&self, request_id: &str) -> Result<Vec<AuditRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -800,6 +819,7 @@ impl Store {
     /// True when `capability` currently has an active global grant
     /// (a `grant` row whose `revoked_ts` is NULL).
     pub async fn active_grant(&self, capability: &str) -> Result<bool, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -820,6 +840,7 @@ impl Store {
     /// admin surface); the policy gate only ever *adds* grants, on the
     /// relaxed profile's auto-grant path.
     pub async fn insert_grant(&self, capability: &str) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO \"grant\" (capability, scope, granted_ts)
@@ -834,6 +855,7 @@ impl Store {
     /// row stays, as history. Errors with [`StoreError::NotFound`] when
     /// no active grant exists (never granted, or already revoked).
     pub async fn revoke_grant(&self, capability: &str) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let changed = self
             .conn
             .execute(
@@ -854,6 +876,7 @@ impl Store {
     /// Every grant row, revoked history included, newest first — the
     /// GUI's capability view.
     pub async fn list_grants(&self) -> Result<Vec<GrantRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -888,6 +911,7 @@ impl Store {
         agent: Option<&str>,
         state: Option<RequestState>,
     ) -> Result<Vec<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let limit = limit
             .unwrap_or(DEFAULT_REQUEST_LIST_LIMIT)
             .clamp(1, MAX_REQUEST_LIST_LIMIT);
@@ -926,6 +950,7 @@ impl Store {
     /// registry is advisory (see [`CallerRow`]); the pipeline calls this
     /// on every admitted request.
     pub async fn upsert_caller(&self, agent: &str, repo: &str) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO caller (agent, repo, first_seen, last_seen)
@@ -940,6 +965,7 @@ impl Store {
     /// Every observed agent+repo pair, most recently seen first — feeds
     /// the GUI sidebar and activity filters.
     pub async fn list_callers(&self) -> Result<Vec<CallerRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -967,6 +993,7 @@ impl Store {
         request_id: &str,
         capability: &str,
     ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO approval (request_id, capability, requested_ts)
@@ -990,6 +1017,7 @@ impl Store {
         resolution: ApprovalResolution,
         note: Option<&str>,
     ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let changed = self
             .conn
             .execute(
@@ -1013,6 +1041,7 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Option<ApprovalRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -1045,6 +1074,7 @@ impl Store {
     /// Every unresolved approval joined with its request, oldest first —
     /// the GUI's pending list.
     pub async fn list_pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -1071,6 +1101,7 @@ impl Store {
 
     /// Reads a setting value (JSON text), or `None` if unset.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
         let mut rows = self
             .conn
             .query("SELECT value FROM setting WHERE key = ?1", params![key])
@@ -1083,6 +1114,7 @@ impl Store {
 
     /// Writes a setting value (JSON text), replacing any previous value.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
         self.conn
             .execute(
                 "INSERT INTO setting (key, value) VALUES (?1, ?2)

@@ -18,19 +18,27 @@ fn lock_is_exclusive_and_released_on_drop() {
 
     let first = acquire_instance_lock(tmp.path()).expect("first acquire succeeds");
     assert!(first.path().is_file());
-    let recorded: u32 = std::fs::read_to_string(first.path())
-        .expect("lock file readable")
-        .trim()
-        .parse()
-        .expect("lock file holds a pid");
-    assert_eq!(recorded, std::process::id());
+    // The pid is legible to another handle only where the lock is
+    // advisory. Unix `flock` is; a Windows byte-range lock is mandatory,
+    // so every read through another handle fails with
+    // `ERROR_LOCK_VIOLATION` — which is exactly why
+    // `LifecycleError::AlreadyRunning::pid` is an Option.
+    let holder = if cfg!(unix) {
+        Some(std::process::id())
+    } else {
+        None
+    };
+    let recorded = std::fs::read_to_string(first.path())
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok());
+    assert_eq!(recorded, holder, "the holder records its own pid");
 
     // A second acquire loses and names the holder.
     let err = acquire_instance_lock(tmp.path()).expect_err("second acquire fails");
     let LifecycleError::AlreadyRunning { pid, .. } = err else {
         panic!("expected AlreadyRunning, got {err:?}");
     };
-    assert_eq!(pid, Some(std::process::id()));
+    assert_eq!(pid, holder);
 
     // Dropping the lock releases it for the next daemon.
     drop(first);

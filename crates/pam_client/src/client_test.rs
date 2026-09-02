@@ -148,10 +148,20 @@ fn probe_reports_the_lock_holder_and_its_release() {
     );
 
     let daemon = start_fake_daemon(tmp.path());
+    // `DaemonStatus::Running.pid` is an Option by contract — the holder's
+    // pid "when the lock file was readable". Unix locks are advisory, so
+    // the probe reads it back; Windows byte-range locks are mandatory and
+    // any read through another handle fails with `ERROR_LOCK_VIOLATION`,
+    // which is precisely the None the Option exists for. The fact under
+    // test — the lock is seen as held — holds on both.
     assert_eq!(
         probe_daemon(tmp.path()).expect("probe ok"),
         DaemonStatus::Running {
-            pid: Some(std::process::id()),
+            pid: if cfg!(unix) {
+                Some(std::process::id())
+            } else {
+                None
+            },
         }
     );
 

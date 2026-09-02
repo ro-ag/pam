@@ -805,7 +805,19 @@ async fn second_daemon_on_the_same_base_is_refused_with_the_holder_pid() {
         let DaemonError::Lifecycle(LifecycleError::AlreadyRunning { pid, .. }) = err else {
             panic!("expected AlreadyRunning, got {err:?}");
         };
-        assert_eq!(pid, Some(std::process::id()));
+        // The holder's pid is legible to the loser only where the lock is
+        // advisory: unix `flock` is, a Windows byte-range lock is
+        // mandatory and hides the file from every other handle. Hence the
+        // Option on `AlreadyRunning::pid`; the refusal itself is the fact
+        // under test and holds on both.
+        assert_eq!(
+            pid,
+            if cfg!(unix) {
+                Some(std::process::id())
+            } else {
+                None
+            }
+        );
 
         daemon.stop().await;
     })

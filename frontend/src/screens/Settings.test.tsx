@@ -216,8 +216,8 @@ describe("retention", () => {
     renderSettings();
     expect(await screen.findByLabelText("evidence age")).toBeDisabled();
     expect(screen.getByLabelText("audit age")).toBeDisabled();
-    expect(screen.getByText("arrives with evidence storage")).toBeInTheDocument();
-    expect(screen.getByText(/Nothing prunes yet/)).toBeInTheDocument();
+    expect(screen.getByText("arrives with retention")).toBeInTheDocument();
+    expect(screen.getByText(/nothing prunes them yet/)).toBeInTheDocument();
   });
 });
 

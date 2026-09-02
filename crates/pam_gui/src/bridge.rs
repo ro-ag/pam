@@ -39,6 +39,7 @@ use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_CALLERS_LIST, OP_GRANTS_ADD,
     OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET, OP_PROFILE_SET,
 };
+use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
 use pam_proto::Response;
 use serde::Serialize;
@@ -49,10 +50,12 @@ const STATUS_DEADLINE_MS: u64 = 5_000;
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
 
-/// Deadline for `admin.models.try`, the one admin op that runs a real
-/// generation: a cold prompt on a large model decodes for minutes, not
-/// seconds, so the shared 30 s ceiling would time out a working model.
-const TRY_DEADLINE_MS: u64 = 120_000;
+/// Deadline for the two admin ops that do real work rather than a read:
+/// `admin.models.try` runs a generation, and `admin.log.compress` runs a
+/// 64 MiB compaction plus a generation. A cold prompt on a large model
+/// decodes for minutes, not seconds, so the shared 30 s ceiling would
+/// time out a working model.
+const LONG_DEADLINE_MS: u64 = 120_000;
 
 /// How long [`daemon_stop`] waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -72,10 +75,10 @@ const CORE_ADMIN_OPS: [&str; 9] = [
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model
-/// surface, counted from the daemon's own lists.
-const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len();
+/// and log surfaces, counted from the daemon's own lists.
+const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len() + LOG_ADMIN_OPS.len();
 
-/// Splices the two daemon-owned lists into one array at compile time —
+/// Splices the three daemon-owned lists into one array at compile time —
 /// no op name is retyped here, so the whitelist cannot drift from the
 /// daemon's dispatch.
 const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
@@ -90,13 +93,19 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
         ops[CORE_ADMIN_OPS.len() + model] = MODEL_ADMIN_OPS[model];
         model += 1;
     }
+    let mut log = 0;
+    while log < LOG_ADMIN_OPS.len() {
+        ops[CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len() + log] = LOG_ADMIN_OPS[log];
+        log += 1;
+    }
     ops
 }
 
 /// Every admin op the bridge forwards; anything else is refused before
-/// touching the socket. Composed from `pam_daemon::admin` and
-/// `pam_daemon::admin_models` — the daemon would refuse an unknown op
-/// too, this just fails faster and keeps the GUI surface explicit.
+/// touching the socket. Composed from `pam_daemon::admin`,
+/// `pam_daemon::admin_models` and `pam_daemon::admin_logs` — the daemon
+/// would refuse an unknown op too, this just fails faster and keeps the
+/// GUI surface explicit.
 pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();
 
 /// True when `op` is an admin operation the bridge forwards.
@@ -108,13 +117,14 @@ pub fn is_known_admin_op(op: &str) -> bool {
 /// How long the bridge waits for `op`'s answer.
 ///
 /// Every admin op is synchronous request/reply inside
-/// [`ADMIN_DEADLINE_MS`], except the one that generates tokens.
+/// [`ADMIN_DEADLINE_MS`], except the two that do real work: a generation
+/// (`admin.models.try`), or a 64 MiB compaction plus a generation
+/// (`admin.log.compress`).
 #[must_use]
 pub fn deadline_for(op: &str) -> u64 {
-    if op == OP_MODELS_TRY {
-        TRY_DEADLINE_MS
-    } else {
-        ADMIN_DEADLINE_MS
+    match op {
+        OP_MODELS_TRY | OP_LOG_COMPRESS => LONG_DEADLINE_MS,
+        _ => ADMIN_DEADLINE_MS,
     }
 }
 

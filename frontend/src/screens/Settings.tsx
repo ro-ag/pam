@@ -521,7 +521,7 @@ function RetentionPanel() {
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           storage pruning
         </p>
-        <Badge tone="neutral">arrives with evidence storage</Badge>
+        <Badge tone="neutral">arrives with retention</Badge>
       </div>
       <div className="grid grid-cols-1 gap-4 opacity-60 sm:grid-cols-2">
         <label className="space-y-1">
@@ -543,8 +543,8 @@ function RetentionPanel() {
         </label>
       </div>
       <p className="font-voice text-sm text-ink-muted italic">
-        Nothing prunes yet — the daemon stores no evidence to age out. These knobs wake up when
-        it does.
+        Evidence rows exist now — log sources, compacts, summaries — but nothing prunes them
+        yet. These knobs wake up with the retention plan.
       </p>
     </Panel>
   );

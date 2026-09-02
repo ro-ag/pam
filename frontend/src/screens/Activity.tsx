@@ -13,6 +13,8 @@ import {
   type ActivityRow,
 } from "../lib/ipc";
 import { exactTime, relativeTime } from "../lib/time";
+import { COMPRESS_CAPABILITY, EvidenceBand } from "./EvidenceBand";
+import { EvidenceStrip } from "./EvidenceStrip";
 import {
   STATE_FILTERS,
   matchesStateFilter,
@@ -263,6 +265,7 @@ function TideRow({
           ) : (
             <p className="font-data text-xs text-ink-faint">no args recorded</p>
           )}
+          <EvidenceStrip requestId={row.id} />
         </div>
       )}
     </li>
@@ -303,6 +306,10 @@ export function ActivityScreen() {
   const queryClient = useQueryClient();
   const now = useNow(CLOCK_TICK_MS);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // A compression answers with its report, not with the request id it
+  // was filed under. So the band raises this flag, and the next tide to
+  // land opens the newest compress row — which is where its evidence is.
+  const [pendingExpand, setPendingExpand] = useState(false);
 
   const stateFilter: StateFilter = search.state ?? "all";
   const serverState = serverStateFor(stateFilter);
@@ -350,6 +357,15 @@ export function ActivityScreen() {
     };
   }, [queryClient]);
 
+  const requests = activity.data?.requests;
+  useEffect(() => {
+    if (!pendingExpand || !requests) return;
+    const compressed = requests.find((row) => row.capability === COMPRESS_CAPABILITY);
+    if (!compressed) return;
+    setExpandedId(compressed.id);
+    setPendingExpand(false);
+  }, [pendingExpand, requests]);
+
   const repoOptions = useMemo(() => {
     const repos = new Set((callers.data?.callers ?? []).map((caller) => caller.repo));
     return [...repos].sort();
@@ -377,7 +393,7 @@ export function ActivityScreen() {
     });
   };
 
-  const rows = (activity.data?.requests ?? []).filter((row) =>
+  const rows = (requests ?? []).filter((row) =>
     matchesStateFilter(row.state, stateFilter),
   );
   const filtered =
@@ -410,6 +426,8 @@ export function ActivityScreen() {
         </div>
         <div className="border-b border-line" />
       </header>
+
+      <EvidenceBand onCompressed={() => setPendingExpand(true)} />
 
       {failure && (
         <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">

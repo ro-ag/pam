@@ -18,11 +18,22 @@ const mocks = vi.hoisted(() => ({
   subscribeEvents: vi.fn(),
   daemonStatus: vi.fn(),
   approvalsPending: vi.fn(),
+  evidenceStats: vi.fn(),
+  evidenceList: vi.fn(),
+  evidenceGet: vi.fn(),
+  logCompress: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return { ...actual, ...mocks };
+});
+
+// The band's odometer rolls with `motion`; pinned still here so the tide's
+// own assertions never race an animation frame.
+vi.mock("motion/react", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("motion/react")>();
+  return { ...actual, useReducedMotion: () => true };
 });
 
 /** Handlers captured from every subscribeEvents call (screen + beacon). */
@@ -71,6 +82,16 @@ beforeEach(() => {
   });
   mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
   mocks.approvalsPending.mockResolvedValue({ pending: [] });
+  mocks.evidenceStats.mockResolvedValue({
+    since_ts: 1_700_000_000,
+    compressions: 0,
+    source_bytes: 0,
+    compact_bytes: 0,
+    tokens_avoided_est: 0,
+  });
+  mocks.evidenceList.mockResolvedValue({ evidence: [] });
+  mocks.evidenceGet.mockResolvedValue(null);
+  mocks.logCompress.mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -120,6 +141,16 @@ describe("the tide", () => {
     expect(screen.getByText(/"hello": "water"/)).toBeInTheDocument();
     fireEvent.click(rowButton as HTMLElement);
     expect(screen.queryByText("req_run")).not.toBeInTheDocument();
+  });
+
+  it("asks for the expanded request's evidence", async () => {
+    renderActivity();
+    const rowButton = (await screen.findByText("compress.log")).closest("button");
+    expect(mocks.evidenceList).not.toHaveBeenCalled();
+    fireEvent.click(rowButton as HTMLElement);
+    await waitFor(() => expect(mocks.evidenceList).toHaveBeenCalledWith("req_run"));
+    // No evidence, no new furniture in the detail.
+    expect(screen.queryByRole("group", { name: "evidence" })).not.toBeInTheDocument();
   });
 });
 

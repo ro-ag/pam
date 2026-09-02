@@ -9,7 +9,11 @@ import {
   curatorTest,
   daemonStatus,
   daemonStop,
+  evidenceGet,
+  evidenceList,
+  evidenceStats,
   grantsList,
+  logCompress,
   modelsCatalog,
   modelsDefaultsSet,
   modelsDelete,
@@ -54,6 +58,7 @@ describe("ipc without the app shell", () => {
     ["approvalsPending", () => approvalsPending()],
     ["activityList", () => activityList()],
     ["grantsList", () => grantsList()],
+    ["evidenceStats", () => evidenceStats()],
     ["requestCapability", () => requestCapability("echo", { hello: "pam" })],
     ["subscribeEvents", () => subscribeEvents(() => {})],
   ] as const)("%s rejects with BridgeUnavailable", async (_name, call) => {
@@ -94,6 +99,72 @@ describe("toBridgeFailure", () => {
   it("wraps partially-shaped objects instead of trusting them", () => {
     const failure = toBridgeFailure({ cause: 42, detail: "x", recovery: "y" });
     expect(failure.cause).toBe("unknown_failure");
+  });
+});
+
+describe("log and evidence wrappers speak the daemon's op names and arg shapes", () => {
+  beforeEach(() => {
+    bridge.inShell = true;
+    bridge.invoke.mockResolvedValue({});
+  });
+
+  afterEach(() => {
+    bridge.inShell = false;
+  });
+
+  /** The op and args the wrapper handed the bridge on its one call. */
+  function sent(): { op: string; args: Record<string, unknown> } {
+    expect(bridge.invoke).toHaveBeenCalledTimes(1);
+    const [command, payload] = bridge.invoke.mock.calls[0] as [
+      string,
+      { op: string; args: Record<string, unknown> },
+    ];
+    expect(command).toBe("admin_call");
+    return payload;
+  }
+
+  it.each([
+    [
+      "logCompress",
+      () => logCompress({ path: "/tmp/build.log", exit_status: 1, model: true }),
+      "admin.log.compress",
+      { path: "/tmp/build.log", exit_status: 1, model: true },
+    ],
+    [
+      "logCompress (deterministic only)",
+      () => logCompress({ path: "/tmp/build.log", model: false }),
+      "admin.log.compress",
+      { path: "/tmp/build.log", model: false },
+    ],
+    [
+      "evidenceList",
+      () => evidenceList("req_7"),
+      "admin.evidence.list",
+      { request_id: "req_7" },
+    ],
+    [
+      "evidenceGet (bounded)",
+      () => evidenceGet("ev_1", 10),
+      "admin.evidence.get",
+      { id: "ev_1", max_bytes: 10 },
+    ],
+    [
+      "evidenceStats (window named)",
+      () => evidenceStats(1_700_000_000),
+      "admin.evidence.stats",
+      { since_ts: 1_700_000_000 },
+    ],
+  ] as const)("%s", async (_name, call, op, args) => {
+    await call();
+    expect(sent()).toEqual({ op, args });
+  });
+
+  it("lets the daemon own both defaults when the caller names neither", async () => {
+    await evidenceGet("ev_1");
+    expect(sent()).toEqual({ op: "admin.evidence.get", args: { id: "ev_1" } });
+    bridge.invoke.mockClear();
+    await evidenceStats();
+    expect(sent()).toEqual({ op: "admin.evidence.stats", args: {} });
   });
 });
 

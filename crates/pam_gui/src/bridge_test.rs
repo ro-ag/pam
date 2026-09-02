@@ -16,7 +16,8 @@ fn every_daemon_admin_op_is_whitelisted() {
     }
     assert_eq!(
         ADMIN_OPS.len(),
-        9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len(),
+        9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
+            + pam_daemon::admin_logs::LOG_ADMIN_OPS.len(),
         "new admin ops need explicit wiring"
     );
 }
@@ -31,16 +32,31 @@ fn every_model_admin_op_is_whitelisted() {
 }
 
 #[test]
-fn only_the_generating_op_gets_the_long_deadline() {
-    // A real generation runs for minutes; every other admin op is a
-    // synchronous read or write and keeps the 30 s ceiling.
-    assert_eq!(
-        deadline_for(pam_daemon::admin_models::OP_MODELS_TRY),
-        120_000,
-        "admin.models.try decodes tokens; 30 s would time out a working model"
-    );
+fn every_log_admin_op_is_whitelisted() {
+    // The log surface is spliced in from the daemon's own list too, so
+    // the compression observatory cannot go dark on a rename there.
+    for op in pam_daemon::admin_logs::LOG_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+}
+
+#[test]
+fn only_the_working_ops_get_the_long_deadline() {
+    // Real work runs for minutes; every other admin op is a synchronous
+    // read or write and keeps the 30 s ceiling.
+    let long = [
+        pam_daemon::admin_models::OP_MODELS_TRY,
+        pam_daemon::admin_logs::OP_LOG_COMPRESS,
+    ];
+    for op in long {
+        assert_eq!(
+            deadline_for(op),
+            120_000,
+            "{op} decodes tokens; 30 s would time out a working model"
+        );
+    }
     for op in ADMIN_OPS {
-        if op == pam_daemon::admin_models::OP_MODELS_TRY {
+        if long.contains(&op) {
             continue;
         }
         assert_eq!(deadline_for(op), 30_000, "{op} answers synchronously");

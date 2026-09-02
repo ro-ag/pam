@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/pam",
     "crates/pam_client",
+    "crates/pam_compact",
     "crates/pam_daemon",
     "crates/pam_gui",
     "crates/pam_model",
@@ -19,6 +20,7 @@ repository = "https://github.com/ro-ag/pam"
 
 [workspace.dependencies]
 pam_client = { path = "crates/pam_client" }
+pam_compact = { path = "crates/pam_compact" }
 pam_daemon = { path = "crates/pam_daemon" }
 pam_gui = { path = "crates/pam_gui" }
 pam_model = { path = "crates/pam_model" }

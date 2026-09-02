@@ -1,0 +1,20 @@
+[package]
+name = "pam_compact"
+description = "Deterministic, provenance-preserving log reduction."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# the report is stored as an evidence blob and read back through the admin
+# ops, so every public type round-trips through JSON.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# source digest recorded in the report; RustCrypto, pure Rust.
+sha2.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

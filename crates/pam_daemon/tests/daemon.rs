@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pam_daemon::admin::{ACTION_ADMIN_DENIED, CAUSE_ADMIN_DENIED};
+use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_LIST};
 use pam_daemon::approval::{ACTION_APPROVAL, Resolution};
 use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, ACTION_GATE_REFUSAL, CAUSE_APPROVAL_DENIED,
@@ -308,6 +310,13 @@ async fn status_bypasses_the_lanes_and_verifies() {
         assert_eq!(body["protocol"], PROTOCOL_VERSION);
         assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
         assert!(body["active_requests"].as_i64().unwrap() >= 1);
+        // The read-only model block: a fresh daemon has no weights, and
+        // says so rather than failing or inventing figures.
+        assert_eq!(body["model"]["state"], "idle");
+        assert_eq!(body["model"]["id"], serde_json::Value::Null);
+        assert_eq!(body["model"]["tokens_per_sec"], serde_json::Value::Null);
+        assert_eq!(body["model"]["defaults"]["light"], serde_json::Value::Null);
+        assert_eq!(body["model"]["defaults"]["heavy"], serde_json::Value::Null);
 
         let store = daemon.handle.store();
         let row = store.get_request("req_status").await.unwrap().unwrap();
@@ -1012,6 +1021,90 @@ async fn graceful_drain_finishes_inflight_work_and_refuses_newcomers() {
         let row = store.get_request("req_drain").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Done);
         assert_eq!(row.outcome.as_deref(), Some("solved"));
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_model_admin_op_from_an_agent_trips_the_wire() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let mut dealer = daemon.dealer().await;
+
+        // The default `envelope` helper speaks as `claude`, not as the
+        // GUI: the model ops sit behind the same tripwire as every other
+        // admin op, so this must never reach the registry.
+        send(
+            &mut dealer,
+            &envelope(
+                "req_models_denied",
+                OP_MODELS_LIST,
+                serde_json::json!({}),
+                true,
+            ),
+        )
+        .await;
+
+        let response = recv_response(&mut dealer).await;
+        let Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } = response
+        else {
+            panic!("a model admin op from an agent must be refused");
+        };
+        assert_eq!(cause, CAUSE_ADMIN_DENIED);
+        assert!(detail.contains("GUI-only"), "detail: {detail}");
+        assert!(!recovery.is_empty());
+
+        // Audited as the tripwire, not as an ordinary admin refusal, so
+        // the attempt stands out in the trail.
+        let store = daemon.handle.store();
+        let row = store
+            .get_request("req_models_denied")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RequestState::Refused);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_ADMIN_DENIED));
+        let audit = store.audit_for_request("req_models_denied").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_ADMIN_DENIED);
+        assert_eq!(audit[0].decision, Decision::Refuse);
+        assert_eq!(audit[0].actor, Actor::System);
+
+        // And the ops are not capabilities: none of them classifies, so
+        // none can ever be granted, approved, or queued.
+        for op in MODEL_ADMIN_OPS {
+            assert!(
+                pam_daemon::policy::classify(op).is_none(),
+                "{op} must not be a capability"
+            );
+        }
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn the_model_surface_is_reachable_from_the_daemon_handle() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let models = daemon.handle.models();
+
+        // Defaults start unset, so a tier resolves to nothing and the
+        // caller takes its deterministic path.
+        assert_eq!(models.defaults().await.unwrap(), (None, None));
+        let status = models.status().await.unwrap();
+        assert_eq!(status["runtime"]["state"]["state"], "idle");
+        assert!(status["host_ram_bytes"].as_u64().unwrap() > 0);
+
+        daemon.stop().await;
     })
     .await
     .expect("test within deadline");

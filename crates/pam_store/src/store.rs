@@ -311,6 +311,38 @@ pub struct AuditRow {
     pub ts: i64,
 }
 
+/// One row of the `model_job` table: a download or a verification, with
+/// where it got to.
+///
+/// `kind` is `download` or `verify`; `state` is `running`, `done`,
+/// `failed` or `cancelled` — both are CHECK-constrained in the schema and
+/// kept as strings here because the model layer, not the store, owns their
+/// vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelJobRow {
+    /// Job id, `job_<ulid>`.
+    pub id: String,
+    /// `download` or `verify`.
+    pub kind: String,
+    /// Registry id the job is about (`<vendor>/<file stem>`).
+    pub model_id: String,
+    /// Source URL, for a download.
+    pub source: Option<String>,
+    /// `running`, `done`, `failed` or `cancelled`.
+    pub state: String,
+    /// Bytes moved (a download) or hashed (a verification) so far.
+    pub bytes_done: i64,
+    /// Expected total, when it is known.
+    pub bytes_total: Option<i64>,
+    /// Verdict detail as JSON: the digest on success, cause and detail on
+    /// failure.
+    pub detail: Option<String>,
+    /// Unix seconds when the job started.
+    pub created_ts: i64,
+    /// Unix seconds of the last progress or the verdict.
+    pub updated_ts: i64,
+}
+
 /// Handle to the durable state database.
 ///
 /// Async by design (the Turso engine drives its own I/O); the daemon
@@ -1123,6 +1155,126 @@ impl Store {
             )
             .await?;
         Ok(())
+    }
+
+    /// Records a new `running` model job.
+    pub async fn insert_model_job(
+        &self,
+        id: &str,
+        kind: &str,
+        model_id: &str,
+        source: Option<&str>,
+        bytes_total: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        self.conn
+            .execute(
+                "INSERT INTO model_job
+                     (id, kind, model_id, source, state, bytes_done, bytes_total,
+                      created_ts, updated_ts)
+                 VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?6, ?6)",
+                params![id, kind, model_id, source, bytes_total, now_ts()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Moves a running job's progress figures forward.
+    ///
+    /// Silently does nothing for a job that already reached its verdict —
+    /// a poll that races the terminal write must not resurrect the row.
+    pub async fn update_model_job_progress(
+        &self,
+        id: &str,
+        bytes_done: i64,
+        bytes_total: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        self.conn
+            .execute(
+                "UPDATE model_job
+                    SET bytes_done = ?2, bytes_total = ?3, updated_ts = ?4
+                  WHERE id = ?1 AND state = 'running'",
+                params![id, bytes_done, bytes_total, now_ts()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Writes a job's verdict: `done`, `failed` or `cancelled`, with the
+    /// detail JSON the GUI shows.
+    ///
+    /// Only a `running` row is finished, so the first verdict wins.
+    pub async fn finish_model_job(
+        &self,
+        id: &str,
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        self.conn
+            .execute(
+                "UPDATE model_job
+                    SET state = ?2, detail = ?3, updated_ts = ?4
+                  WHERE id = ?1 AND state = 'running'",
+                params![id, state, detail, now_ts()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The most recent model jobs, newest first, bounded by `limit`
+    /// (clamped into `1..=`[`MAX_REQUEST_LIST_LIMIT`]).
+    pub async fn list_model_jobs(&self, limit: u64) -> Result<Vec<ModelJobRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let limit = limit.clamp(1, MAX_REQUEST_LIST_LIMIT);
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT id, kind, model_id, source, state, bytes_done, bytes_total,
+                            detail, created_ts, updated_ts
+                       FROM model_job
+                      ORDER BY created_ts DESC, id DESC LIMIT {limit}"
+                ),
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(ModelJobRow {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                model_id: row.get(2)?,
+                source: row.get(3)?,
+                state: row.get(4)?,
+                bytes_done: row.get(5)?,
+                bytes_total: row.get(6)?,
+                detail: row.get(7)?,
+                created_ts: row.get(8)?,
+                updated_ts: row.get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fails every `running` job, returning how many were closed — boot
+    /// recovery for the jobs a dead daemon left behind.
+    ///
+    /// Terminal rows are untouched: a job that already succeeded or was
+    /// cancelled keeps its verdict across the restart.
+    pub async fn fail_running_model_jobs(&self, detail: &str) -> Result<u64, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE model_job
+                    SET state = 'failed', detail = ?1, updated_ts = ?2
+                  WHERE state = 'running'",
+                params![detail, now_ts()],
+            )
+            .await?;
+        Ok(changed)
     }
 }
 

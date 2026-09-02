@@ -7,12 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pam_model.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# host RAM for the catalog fit check; the daemon answers it so the webview
+# never has to guess. Same pinned feature set the client already uses.
+sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# model job ids (`job_<ulid>`), the same shape as request ids.
+ulid.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
@@ -22,6 +28,9 @@ zeromq.workspace = true
 # dev-only cycle (pam_testkit depends on pam_daemon); path-only
 # dev-deps are stripped at publish time.
 pam_testkit.workspace = true
+# the admin download op is proved end to end against pam_model own
+# range-serving origin rather than a second copy of it.
+pam_model = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # `start_paused` tests for lease/reaper timing need the paused clock.
 tokio = { workspace = true, features = ["test-util"] }

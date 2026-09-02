@@ -7,8 +7,8 @@ use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
     curl_path, curl_recovery_line, sidecar_paths, start,
 };
-use crate::download_server_test as origin;
 use crate::registry::verified_sidecar_path;
+use crate::testing as origin;
 
 /// Every CI runner ships curl, so this never skips there; a machine without
 /// it should still get a green suite and a legible reason.

@@ -76,14 +76,41 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")
             .and_then(serde_json::Value::as_u64)
             .map_or_else(|| "?".to_owned(), render_uptime),
         field("active_requests"),
+        render_model(body.get("model")),
     )
+}
+
+/// The `model:` line: `idle`, `loading <id>`, or `<id> loaded (<n> tok/s)`.
+///
+/// A daemon that publishes no `model` block at all is an older build, and
+/// renders `?` like every other missing field. A loaded model that has not
+/// generated yet has no tokens/sec to report, so the figure is left off
+/// rather than invented.
+fn render_model(model: Option<&serde_json::Value>) -> String {
+    let Some(model) = model else {
+        return "?".to_owned();
+    };
+    let state = model.get("state").and_then(serde_json::Value::as_str);
+    let id = model.get("id").and_then(serde_json::Value::as_str);
+    match (state, id) {
+        (Some("loaded"), Some(id)) => match model
+            .get("tokens_per_sec")
+            .and_then(serde_json::Value::as_f64)
+        {
+            Some(tps) => format!("{id} loaded ({tps:.1} tok/s)"),
+            None => format!("{id} loaded"),
+        },
+        (Some("loading"), Some(id)) => format!("loading {id}"),
+        (Some(state), _) => state.to_owned(),
+        (None, _) => "?".to_owned(),
+    }
 }
 
 /// A generic result body as pretty JSON — the human fallback for

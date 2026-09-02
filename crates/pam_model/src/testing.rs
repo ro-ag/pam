@@ -44,11 +44,13 @@ pub struct TestServer {
 
 impl TestServer {
     /// URL for `name` on this origin.
+    #[must_use]
     pub fn url(&self, name: &str) -> String {
         format!("http://{}/{name}", self.addr)
     }
 
     /// Every header line every request sent, in order.
+    #[must_use]
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }

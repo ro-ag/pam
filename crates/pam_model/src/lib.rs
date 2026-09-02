@@ -54,6 +54,14 @@ pub mod registry;
 pub mod runtime;
 pub mod tokenizer;
 
+/// A range-serving HTTP origin for download tests.
+///
+/// Compiled for this crate's own tests, and for anyone who turns on the
+/// `testing` feature — the daemon's admin-op suite drives a real download
+/// end to end and needs the same origin rather than a second copy of it.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub use catalog::{CATALOG, Preset, find_preset};
 pub use curator::{
     AgentCli, AgentId, CuratorError, INVOKE_MAX_OUTPUT, detect, invoke, invoke_args,
@@ -77,8 +85,6 @@ pub use tokenizer::{GgufTokenizer, TokenizerError, chatml};
 mod catalog_test;
 #[cfg(test)]
 mod curator_test;
-#[cfg(test)]
-mod download_server_test;
 #[cfg(test)]
 mod download_test;
 #[cfg(test)]

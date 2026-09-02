@@ -189,6 +189,7 @@ use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
+use crate::model_service::ModelService;
 use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
 use crate::queue::{
     AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
@@ -406,6 +407,7 @@ pub struct DaemonHandle {
     dirs: RuntimeDir,
     store: Arc<Store>,
     approvals: Arc<ApprovalService>,
+    models: Arc<ModelService>,
     transport: Transport,
     tasks: Vec<JoinHandle<()>>,
     phase: watch::Sender<LifecyclePhase>,
@@ -432,6 +434,14 @@ impl DaemonHandle {
     #[must_use]
     pub fn approvals(&self) -> Arc<ApprovalService> {
         Arc::clone(&self.approvals)
+    }
+
+    /// The model layer: registry, runtime, downloads, tier defaults.
+    /// The GUI plumbing and the integration tests reach the model
+    /// surface through it; agents never do (see [`crate::admin_models`]).
+    #[must_use]
+    pub fn models(&self) -> Arc<ModelService> {
+        Arc::clone(&self.models)
     }
 
     /// The daemon's lifecycle phase, as a watch: the process shell
@@ -533,6 +543,7 @@ pub async fn run_daemon_with(
         );
     }
     let gate = PolicyGate::new(Arc::clone(&store)).await?;
+    let models = ModelService::new(Arc::clone(&store)).await?;
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     queue.rebuild_from_store().await?;
 
@@ -554,7 +565,12 @@ pub async fn run_daemon_with(
         gate,
         queue: Arc::clone(&queue),
         approvals: Arc::clone(&approvals),
-        admin: AdminService::new(Arc::clone(&store), Arc::clone(&approvals)),
+        admin: AdminService::new(
+            Arc::clone(&store),
+            Arc::clone(&approvals),
+            Arc::clone(&models),
+        ),
+        models: Arc::clone(&models),
         events: transport.event_publisher(),
         router: CompletionRouter::new(),
         work: Notify::new(),
@@ -585,6 +601,7 @@ pub async fn run_daemon_with(
         dirs,
         store,
         approvals,
+        models,
         transport,
         tasks,
         phase,
@@ -656,6 +673,9 @@ struct Pipeline {
     /// prefix are handed here **before** classify/admit and never touch
     /// the gate, grants, or lanes (see [`crate::admin`]).
     admin: AdminService,
+    /// The model layer, carried into every [`ExecContext`] so the
+    /// `status` capability can report it.
+    models: Arc<ModelService>,
     events: EventPublisher,
     router: CompletionRouter,
     /// Kicked on lane placement and execution completion; wakes the
@@ -1230,6 +1250,7 @@ impl Pipeline {
             events: self.events.clone(),
             store: Arc::clone(&self.store),
             queue: Arc::clone(&self.queue),
+            models: Arc::clone(&self.models),
             router: self.router.clone(),
             started_at: self.started_at,
         }

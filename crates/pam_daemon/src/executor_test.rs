@@ -8,6 +8,7 @@ use tokio::time::timeout;
 
 use crate::daemon::{CompletionRouter, Registration};
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
+use crate::model_service::ModelService;
 use crate::policy::{CapabilityClass, classify};
 use crate::queue::{ACTION_CANCEL, AdmitOutcome, CAUSE_CANCELLED, QueueManager};
 use crate::transport::EventPublisher;
@@ -17,6 +18,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 struct Fixture {
     store: Arc<Store>,
     queue: Arc<QueueManager>,
+    models: Arc<ModelService>,
     router: CompletionRouter,
     events: EventPublisher,
     events_rx: mpsc::Receiver<(String, Event)>,
@@ -25,10 +27,12 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
+    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     let (events, events_rx) = EventPublisher::for_tests();
     Fixture {
         store,
         queue,
+        models,
         router: CompletionRouter::new(),
         events,
         events_rx,
@@ -49,6 +53,7 @@ impl Fixture {
             events: self.events.clone(),
             store: Arc::clone(&self.store),
             queue: Arc::clone(&self.queue),
+            models: Arc::clone(&self.models),
             router: self.router.clone(),
             started_at: std::time::Instant::now(),
         }

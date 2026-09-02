@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, LoaderCircle } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -749,6 +749,19 @@ export function ModelsScreen() {
     refetchInterval: (query) => pollInterval(query.state.data),
   });
   const library = useQuery({ queryKey: ["models", "list"], queryFn: modelsList });
+  const queryClient = useQueryClient();
+
+  // A verify or download answers with a job id and finishes later; the
+  // library only changes when that job settles. Re-read it whenever the
+  // set of running jobs changes, so a fresh digest badge or a newly
+  // installed file appears without leaving the screen.
+  const runningJobs = (status.data?.jobs ?? [])
+    .filter((job) => job.state === "running")
+    .map((job) => job.id)
+    .join(",");
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["models", "list"] });
+  }, [runningJobs, queryClient]);
 
   const statusFailure = status.isError ? toBridgeFailure(status.error) : null;
   const libraryFailure = library.isError ? toBridgeFailure(library.error) : null;

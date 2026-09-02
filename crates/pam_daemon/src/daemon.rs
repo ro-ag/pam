@@ -189,6 +189,7 @@ use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
+use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
 use crate::queue::{
@@ -544,6 +545,7 @@ pub async fn run_daemon_with(
     }
     let gate = PolicyGate::new(Arc::clone(&store)).await?;
     let models = ModelService::new(Arc::clone(&store)).await?;
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     queue.rebuild_from_store().await?;
 
@@ -569,6 +571,7 @@ pub async fn run_daemon_with(
             Arc::clone(&store),
             Arc::clone(&approvals),
             Arc::clone(&models),
+            logs,
         ),
         models: Arc::clone(&models),
         events: transport.event_publisher(),

@@ -196,7 +196,7 @@ what a developer must fix. Never invent lines that are not in the log."
 | --- | --- | --- |
 | `admin.log.compress` | `{ path: absolute string, exit_status?: i32, model?: bool = true }` | `CompressReport`; outcome `solved` |
 | `admin.evidence.list` | `{ request_id }` | `{ evidence: [ { id, request_id, kind, bytes, sha256, meta, ts } ] }` |
-| `admin.evidence.get` | `{ id, max_bytes? = 262 144 (clamped to 4 MiB) }` | `{ id, request_id, kind, bytes, sha256, meta, ts, text, truncated }` — `text` is lossy UTF-8 of the first `max_bytes`; for `log.compact` it is the report's `rendered_text` (the JSON is the storage form, the text is what a reader wants) |
+| `admin.evidence.get` | `{ id, max_bytes? = 262 144 (clamped to 4 MiB) }` | `{ id, request_id, kind, bytes, sha256, meta, ts, text, text_bytes, truncated }` — `text` is lossy UTF-8 of the first `max_bytes`; for `log.compact` it is the report's `rendered_text` (the JSON is the storage form, the text is what a reader wants). `bytes` is always the blob length; `text_bytes` is the length of the text `text` is a prefix of (the rendered text for `log.compact`), and `truncated = text_bytes > max_bytes` |
 | `admin.evidence.stats` | `{ since_ts? = now − 7 days }` | `{ since_ts, compressions, source_bytes, compact_bytes, tokens_avoided_est }` |
 
 Refusals (`cause` / recovery): `bad_args` (missing or relative `path`,

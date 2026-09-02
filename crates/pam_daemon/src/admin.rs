@@ -93,14 +93,15 @@
 //! Op names are constants (`OP_*`), all under [`ADMIN_PREFIX`]. An
 //! unrecognized `admin.*` capability is refused with
 //! [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here, or in
-//! [`crate::admin_models`], and nowhere else.
+//! [`crate::admin_models`] / [`crate::admin_logs`], and nowhere else.
 //!
 //! # The model ops live next door, under the same rules
 //!
 //! [`crate::admin_models`] holds the `admin.models.*` and
-//! `admin.curator.*` ops. They are dispatched from [`AdminService`] before
-//! this module's own `match` and are administration in every sense that
-//! matters here: same tripwire, same deadline, same request row, same
+//! `admin.curator.*` ops, and [`crate::admin_logs`] the `admin.log.*` and
+//! `admin.evidence.*` ones. They are dispatched from [`AdminService`]
+//! before this module's own `match` and are administration in every sense
+//! that matters here: same tripwire, same deadline, same request row, same
 //! single terminal audit row, no [`crate::policy::classify`] entry, no
 //! grant, no approval. The split is file size, not privilege.
 
@@ -115,6 +116,7 @@ use tokio::time::timeout;
 use crate::approval::{ApprovalService, Resolution};
 use crate::daemon::{ACTION_DEADLINE_REFUSAL, CAUSE_DEADLINE_EXCEEDED, CAUSE_INTERNAL_ERROR};
 use crate::executor::outcome_str;
+use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{PROFILE_SETTING_KEY, Profile};
 
@@ -242,21 +244,26 @@ pub struct AdminService {
     /// The model layer the `admin.models.*` / `admin.curator.*` ops act
     /// through (see [`crate::admin_models`]).
     pub(crate) models: Arc<ModelService>,
+    /// The compression pipeline the `admin.log.*` / `admin.evidence.*` ops
+    /// act through (see [`crate::admin_logs`]).
+    pub(crate) logs: Arc<LogService>,
 }
 
 impl AdminService {
-    /// Builds the service over the daemon's store, approval service, and
-    /// model service.
+    /// Builds the service over the daemon's store, approval service,
+    /// model service, and log service.
     #[must_use]
     pub fn new(
         store: Arc<Store>,
         approvals: Arc<ApprovalService>,
         models: Arc<ModelService>,
+        logs: Arc<LogService>,
     ) -> Self {
         Self {
             store,
             approvals,
             models,
+            logs,
         }
     }
 
@@ -305,12 +312,20 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The model surface gets first refusal: [`Self::dispatch_models`]
-    /// answers `None` for anything that is not one of its ops, and the
-    /// match below takes over.
+    /// The model and log surfaces get first refusal:
+    /// [`Self::dispatch_models`] and [`Self::dispatch_logs`] answer `None`
+    /// for anything that is not one of their ops, and the match below
+    /// takes over. The log surface is handed the envelope's id because a
+    /// compress files its evidence under this very request row.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, AdminRefusal> {
         let args = &envelope.args;
         if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
+            return answer;
+        }
+        if let Some(answer) = self
+            .dispatch_logs(&envelope.id, &envelope.capability, args)
+            .await
+        {
             return answer;
         }
         match envelope.capability.as_str() {

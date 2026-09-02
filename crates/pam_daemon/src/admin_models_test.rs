@@ -20,6 +20,7 @@ use crate::admin_models::{
 };
 use crate::approval::ApprovalService;
 use crate::daemon::TERMINAL_ACTIONS;
+use crate::log_service::LogService;
 use crate::model_service::{ModelService, SETTING_CURATOR, Tier};
 use crate::transport::EventPublisher;
 
@@ -51,7 +52,8 @@ async fn fixture() -> Fixture {
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
-    let admin = AdminService::new(Arc::clone(&store), approvals, Arc::clone(&models));
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let admin = AdminService::new(Arc::clone(&store), approvals, Arc::clone(&models), logs);
     Fixture {
         store,
         models,

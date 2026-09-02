@@ -190,6 +190,25 @@ function renderModels() {
   return router;
 }
 
+describe("library refresh", () => {
+  it("re-reads the library when a running job settles", async () => {
+    mocks.modelsStatus
+      .mockResolvedValueOnce(
+        idleStatus({ jobs: [job({ id: "job_02", kind: "verify", state: "running" })] }),
+      )
+      .mockResolvedValue(
+        idleStatus({ jobs: [job({ id: "job_02", kind: "verify", state: "done" })] }),
+      );
+    renderModels();
+    await waitFor(() => expect(mocks.modelsList).toHaveBeenCalled());
+    const before = mocks.modelsList.mock.calls.length;
+    // The busy poll (2 s) delivers the settled job; the library must follow.
+    await waitFor(() => expect(mocks.modelsList.mock.calls.length).toBeGreaterThan(before), {
+      timeout: 5_000,
+    });
+  });
+});
+
 describe("polling cadence", () => {
   it("ticks fast while work is in flight and slow otherwise", () => {
     expect(pollInterval(undefined)).toBe(POLL_IDLE_MS);

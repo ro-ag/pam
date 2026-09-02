@@ -5,6 +5,7 @@ members = [
     "crates/pam_client",
     "crates/pam_daemon",
     "crates/pam_gui",
+    "crates/pam_model",
     "crates/pam_proto",
     "crates/pam_store",
     "crates/pam_testkit",
@@ -20,6 +21,7 @@ repository = "https://github.com/ro-ag/pam"
 pam_client = { path = "crates/pam_client" }
 pam_daemon = { path = "crates/pam_daemon" }
 pam_gui = { path = "crates/pam_gui" }
+pam_model = { path = "crates/pam_model" }
 pam_proto = { path = "crates/pam_proto" }
 pam_store = { path = "crates/pam_store" }
 # test-only harness; never published (dev-dependency cycles are fine —
@@ -63,6 +65,25 @@ tracing-appender = "0.2"
 # system frameworks, no C compile step); see the workspace C-residue notes.
 tauri = { version = "2", default-features = false, features = ["wry", "x11"] }
 tauri-build = { version = "2", default-features = false, features = ["config-json"] }
+
+# local inference (pam_model). candle is pinned `=0.9.2` on purpose: that
+# release carries `quantized_qwen3`/`quantized_qwen3_moe` and has no
+# `tokenizers` dependency. candle-core >= 0.10 pulls `tokenizers` with the
+# `onig` feature (Oniguruma — compiled C through `cc`), which the C-free
+# rule forbids. Default features off keeps CUDA/MKL/accelerate out; pure
+# Rust plus system-framework bindings.
+candle-core = { version = "=0.9.2", default-features = false }
+candle-nn = { version = "=0.9.2", default-features = false }
+candle-transformers = { version = "=0.9.2", default-features = false }
+# GGUF-embedded byte-level BPE. Default features off drops `onig` (C) and
+# `esaxx_fast` (C++); `fancy-regex` is the pure-Rust backtracking engine the
+# Qwen pre-tokenizer split pattern needs.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+# model integrity: SHA-256 over downloaded and installed weights. RustCrypto,
+# pure Rust (the optional `asm` C backend stays off).
+sha2 = "0.10"
+# hex digests for the sha256 above; pure Rust, no dependencies.
+hex = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

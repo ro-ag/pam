@@ -8,11 +8,18 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use thiserror::Error;
 
 /// Maximum unix socket path length in bytes (`sun_path` on macOS).
 pub const MAX_SOCKET_PATH_BYTES: usize = 104;
+
+/// Attempts before a persistent `PermissionDenied` is reported.
+pub const STALE_REMOVE_ATTEMPTS: u32 = 5;
+
+/// Pause between attempts.
+pub const STALE_REMOVE_BACKOFF: Duration = Duration::from_millis(25);
 
 /// Why the runtime directory could not be prepared.
 #[derive(Debug, Error)]
@@ -110,15 +117,61 @@ impl RuntimeDir {
 }
 
 /// Removes a stale socket file left behind by a previous daemon, so a fresh
-/// bind can succeed; a missing file is fine.
+/// bind can succeed. A missing file is fine, and `PermissionDenied` is
+/// retried briefly — on Windows, Defender or the search indexer can hold a
+/// transient handle on a file we are deleting (issue #3) — and is also fine
+/// when the file turns out to be gone after the error.
 ///
 /// This is blind cleanup only: single-instance liveness checking and lock
 /// arbitration are a separate concern (task #12) layered on top later.
 pub fn remove_stale(path: &Path) -> io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
+    // The closure pins the lifetime: `remove_file` is generic over
+    // `AsRef<Path>`, so passing it bare cannot satisfy the higher-ranked
+    // `FnMut(&Path)` bound.
+    remove_stale_with(
+        path,
+        |target: &Path| std::fs::remove_file(target),
+        STALE_REMOVE_ATTEMPTS,
+        STALE_REMOVE_BACKOFF,
+    )
+}
+
+/// The [`remove_stale`] retry policy over an injected remover, so tests can
+/// drive every branch without racing a real platform.
+///
+/// `attempts` is clamped to at least one; `backoff` is the pause between
+/// attempts. Only `PermissionDenied` is retried — every other error is
+/// reported on the first call.
+///
+/// # Errors
+///
+/// Returns the remover's error: a `PermissionDenied` that outlived all
+/// attempts while the file was still there, or any other error as it came.
+pub fn remove_stale_with(
+    path: &Path,
+    mut remove: impl FnMut(&Path) -> io::Result<()>,
+    attempts: u32,
+    backoff: Duration,
+) -> io::Result<()> {
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        match remove(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                // The holder may have let go as we asked: gone is gone.
+                if !path.exists() {
+                    return Ok(());
+                }
+                if attempt == attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(backoff);
+            }
+            Err(err) => return Err(err),
+        }
     }
+    Ok(())
 }
 
 fn validate_socket_path(path: &Path) -> Result<(), RuntimeDirError> {

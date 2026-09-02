@@ -50,13 +50,15 @@ candle-transformers = { version = "=0.9.2", default-features = false, features =
 
 [dev-dependencies]
 # the download suite drives the real curl against a local range-serving
-# origin (`net` for the listener) and the curator tests drive async invokes;
-# `macros`/`rt-multi-thread` are for the tests themselves. Test-only — the
-# library still asks for no runtime flavor.
+# origin (`net` for the listener), the curator and runtime tests drive async
+# calls; `macros`/`rt-multi-thread`/`sync`/`time` are for the tests
+# themselves. Test-only — the library still asks for no runtime flavor.
 tokio = { version = "1", default-features = false, features = [
     "net",
     "macros",
     "rt-multi-thread",
+    "sync",
+    "time",
 ] }
 
 [lints]

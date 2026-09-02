@@ -14,6 +14,12 @@
 //! — because the bench goes through [`Registry::scan`] rather than around it,
 //! which is the point: it exercises the same path the daemon takes.
 //!
+//! It also generates *twice* from the one loaded model and asserts the two
+//! answers are identical. At temperature 0 the only thing that can make a
+//! second answer differ from the first is a KV cache that still holds the
+//! first generation's keys — so this is the behavioural proof that
+//! `clear_kv_cache` works on whichever architecture the bench model is.
+//!
 //! With the variable unset the test prints how to enable it and passes.
 //! Skipping loudly beats failing on a machine that was never going to have
 //! the weights.
@@ -66,17 +72,15 @@ async fn generates_from_real_weights() {
     );
 
     let (_tx, cancel) = watch::channel(false);
+    let request = GenerateRequest {
+        system: None,
+        prompt: "Say hello in five words.".to_string(),
+        max_tokens: BENCH_MAX_TOKENS,
+        temperature: 0.0,
+        stop: Vec::new(),
+    };
     let result = runtime
-        .generate(
-            GenerateRequest {
-                system: None,
-                prompt: "Say hello in five words.".to_string(),
-                max_tokens: BENCH_MAX_TOKENS,
-                temperature: 0.0,
-                stop: Vec::new(),
-            },
-            cancel,
-        )
+        .generate(request.clone(), cancel.clone())
         .await
         .expect("the model generates");
 
@@ -96,6 +100,23 @@ async fn generates_from_real_weights() {
         result.tokens_per_sec > 0.0,
         "the decode rate is not positive"
     );
+
+    // Same prompt, same model, temperature 0: the answer can only change if
+    // the KV cache still holds the first generation's keys. This is the
+    // behavioural half of the `clear_kv_cache` proof.
+    let again = runtime
+        .generate(request, cancel)
+        .await
+        .expect("the model generates a second time");
+    println!(
+        "bench second pass: {} completion tokens in {} ms, {:.2} tok/s",
+        again.completion_tokens, again.decode_ms, again.tokens_per_sec
+    );
+    assert_eq!(
+        again.text, result.text,
+        "the second generation diverged, so the KV cache was not cleared"
+    );
+    assert_eq!(again.prompt_tokens, result.prompt_tokens);
 
     runtime.unload().await.expect("unload is clean");
 }

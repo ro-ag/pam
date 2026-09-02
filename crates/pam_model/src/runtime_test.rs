@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 
 use crate::gguf::GgufInfo;
+use crate::qwen3_moe::GGUFQWenMoE;
 use crate::registry::{ModelClass, ModelEntry};
 use crate::runtime::{GenerateRequest, Runtime, RuntimeError, RuntimeState};
 
@@ -203,4 +204,25 @@ fn the_snapshot_serializes_with_a_tagged_state() {
     let json = serde_json::to_value(runtime.snapshot()).expect("snapshots serialize");
     assert_eq!(json["state"]["state"], "idle");
     assert_eq!(json["busy"], false);
+}
+
+#[test]
+fn the_vendored_moe_model_can_clear_its_kv_cache() {
+    // `GGUFQWenMoE` cannot be built without real weights, so this is a
+    // compile-time proof rather than a behavioural one: the method has to
+    // exist, take `&mut self`, and return nothing, or this does not build.
+    // It is the whole reason `qwen3_moe.rs` is vendored — upstream 0.9.2 has
+    // no such method, and without it every generation would have to rebuild
+    // the model from its file. The behavioural half is `tests/bench.rs`,
+    // which generates twice from one loaded model.
+    let clear: fn(&mut GGUFQWenMoE) = GGUFQWenMoE::clear_kv_cache;
+    let dense: fn(&mut candle_transformers::models::quantized_qwen3::ModelWeights) =
+        candle_transformers::models::quantized_qwen3::ModelWeights::clear_kv_cache;
+    // Both architectures reset the same way, which is what lets
+    // `Loaded::reset_cache` be a two-line match with no rebuild in it.
+    assert_eq!(
+        std::mem::size_of_val(&clear),
+        std::mem::size_of_val(&dense),
+        "both clears are plain fn(&mut _) pointers"
+    );
 }

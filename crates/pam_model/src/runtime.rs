@@ -31,14 +31,13 @@
 //!
 //! # Mixture-of-experts and the KV cache
 //!
-//! The dense model exposes `clear_kv_cache`; `GGUFQWenMoE` in candle 0.9.2
-//! does not, and its layers are private, so there is no way to reset its
-//! caches in place. Rather than let a second generation concatenate onto the
-//! first one's keys and produce quiet nonsense, the `MoE` path **rebuilds the
-//! model from the file before every generation**. That is honest and it is
-//! expensive — re-mapping a quantized 30B `MoE` costs seconds — and it is what
-//! correctness costs until candle exposes a reset. The dense path pays
-//! nothing.
+//! Both models start every generation from an empty KV cache, and both do it
+//! the same cheap way: `clear_kv_cache`. The dense model has one upstream;
+//! candle 0.9.2's `GGUFQWenMoE` does not and keeps its layers private, so
+//! [`crate::qwen3_moe`] vendors that model with the three lines that walk its
+//! layers and reset each `ConcatKvCache`. Without it the only route to an
+//! empty cache is re-reading the file and re-mapping every tensor, which for
+//! an 18 GB engine-class `MoE` is tens of seconds before every prompt.
 //!
 //! # Crashes
 //!
@@ -67,9 +66,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::{quantized_qwen3, quantized_qwen3_moe};
+use candle_transformers::models::quantized_qwen3;
 use tokio::sync::{oneshot, watch};
 
+use crate::qwen3_moe::GGUFQWenMoE;
 use crate::registry::ModelEntry;
 use crate::tokenizer::{self, GgufTokenizer};
 
@@ -444,7 +444,7 @@ enum Model {
     /// `qwen3`.
     Dense(Box<quantized_qwen3::ModelWeights>),
     /// `qwen3moe`.
-    Moe(Box<quantized_qwen3_moe::GGUFQWenMoE>),
+    Moe(Box<GGUFQWenMoE>),
 }
 
 /// Everything the thread holds for one loaded model.
@@ -455,36 +455,19 @@ struct Loaded {
     tokenizer: GgufTokenizer,
     /// Metal or CPU.
     device: Device,
-    /// The file, kept so the `MoE` path can rebuild itself.
-    path: PathBuf,
     /// What the mirror and the caller are told about this model.
     meta: LoadedModel,
 }
 
 impl Loaded {
-    /// Puts the KV cache back to offset zero.
+    /// Puts the KV cache back to offset zero, on either architecture.
     ///
-    /// Dense clears in place. `MoE` has no reset in candle 0.9.2, so the model
-    /// is rebuilt from its file — seconds, not microseconds, and the reason
-    /// the `MoE` path is slower per call than the dense one.
-    fn reset_cache(&mut self) -> Result<(), RuntimeError> {
+    /// Both clears are in place and effectively free — the `MoE` one only
+    /// exists because [`crate::qwen3_moe`] vendors the model to add it.
+    fn reset_cache(&mut self) {
         match &mut self.model {
-            Model::Dense(model) => {
-                model.clear_kv_cache();
-                Ok(())
-            }
-            Model::Moe(_) => {
-                let (content, mut file) = read_header(&self.path).map_err(map_generation)?;
-                let rebuilt = quantized_qwen3_moe::GGUFQWenMoE::from_gguf(
-                    content,
-                    &mut file,
-                    &self.device,
-                    COMPUTE_DTYPE,
-                )
-                .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
-                self.model = Model::Moe(Box::new(rebuilt));
-                Ok(())
-            }
+            Model::Dense(model) => model.clear_kv_cache(),
+            Model::Moe(model) => model.clear_kv_cache(),
         }
     }
 
@@ -581,11 +564,6 @@ fn read_header(path: &PathBuf) -> Result<(gguf_file::Content, std::fs::File), St
     Ok((content, file))
 }
 
-/// Turns a header-reading failure into a generation failure.
-fn map_generation(detail: String) -> RuntimeError {
-    RuntimeError::GenerationFailed(detail)
-}
-
 /// Reads the header, refuses unsupported architectures, then maps the
 /// tensors, reporting each phase into the mirror as it goes.
 fn load_model(entry: &ModelEntry, mirror: &Mutex<RuntimeSnapshot>) -> Result<Loaded, RuntimeError> {
@@ -622,7 +600,6 @@ fn load_model(entry: &ModelEntry, mirror: &Mutex<RuntimeSnapshot>) -> Result<Loa
         model,
         tokenizer,
         device: device.clone(),
-        path: entry.path.clone(),
         meta: LoadedModel {
             id: entry.id.clone(),
             quant: entry
@@ -659,11 +636,9 @@ fn build_model<R: Read + Seek>(
         "qwen3" => quantized_qwen3::ModelWeights::from_gguf(content, reader, device)
             .map(|model| Model::Dense(Box::new(model)))
             .map_err(|err| RuntimeError::LoadFailed(err.to_string())),
-        "qwen3moe" => {
-            quantized_qwen3_moe::GGUFQWenMoE::from_gguf(content, reader, device, COMPUTE_DTYPE)
-                .map(|model| Model::Moe(Box::new(model)))
-                .map_err(|err| RuntimeError::LoadFailed(err.to_string()))
-        }
+        "qwen3moe" => GGUFQWenMoE::from_gguf(content, reader, device, COMPUTE_DTYPE)
+            .map(|model| Model::Moe(Box::new(model)))
+            .map_err(|err| RuntimeError::LoadFailed(err.to_string())),
         other => Err(RuntimeError::UnsupportedArchitecture(other.to_string())),
     }
 }
@@ -707,10 +682,9 @@ struct Decoded {
 /// halfway through a sentence — PAM would rather refuse up front than hand
 /// back a truncated answer that looks finished.
 ///
-/// `prompt_ms` covers everything before the first sampled token — framing,
-/// encoding, the cache reset and the prompt forward pass. On the `MoE` path
-/// the cache reset is a full model rebuild, so that figure carries it;
-/// reporting the rebuild anywhere else would hide it.
+/// `prompt_ms` is the prefill: framing, encoding and the one forward pass
+/// over the whole prompt. Clearing the cache costs nothing measurable on
+/// either architecture, so nothing else hides in that number.
 fn generate_on_thread(
     loaded: &mut Loaded,
     request: &GenerateRequest,
@@ -741,7 +715,7 @@ fn generate_on_thread(
         });
     }
 
-    loaded.reset_cache()?;
+    loaded.reset_cache();
     let input = Tensor::new(ids.as_slice(), &loaded.device)
         .and_then(|tensor| tensor.unsqueeze(0))
         .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;

@@ -23,6 +23,9 @@
 //! - [`runtime`] — the candle inference thread: load, unload, generate.
 //! - [`curator`] — the vendor agent CLIs installed on the machine: detect
 //!   them, ask one a single tool-free question.
+//! - [`qwen3_moe`] — candle's mixture-of-experts model, vendored so that its
+//!   KV cache can be cleared between generations instead of the whole model
+//!   being rebuilt.
 //! - [`error`] — one place to reach for the crate's error types.
 //!
 //! # The floor
@@ -46,6 +49,7 @@ pub mod curator;
 pub mod download;
 pub mod error;
 pub mod gguf;
+pub mod qwen3_moe;
 pub mod registry;
 pub mod runtime;
 pub mod tokenizer;

@@ -146,9 +146,12 @@
 //! the request down — the deadline row records the refusal sent to the
 //! caller, the cancellation row is the terminal one.
 //!
-//! Store failures on these bookkeeping writes are swallowed (`let _`)
-//! for now: without the tracing setup (a later task) there is nowhere
-//! legible to report them, and the caller still gets its response.
+//! A store failure on a terminal write cannot be answered to anyone
+//! (the caller already has its response or its ticket), so it is logged
+//! at error level in the daemon log and the row is left for the next
+//! boot's crash recovery. Concurrent statements on the store's single
+//! connection used to be the one way such a write failed (turso refuses
+//! concurrent use of a connection); the store now serializes them.
 //!
 //! # Approval pause
 //!
@@ -1103,18 +1106,7 @@ impl Pipeline {
             ..
         } = work;
         let Ok(Some(row)) = self.store.get_request(&id).await else {
-            // A vanished row is unanswerable; free the lane and move on.
-            let detail = serde_json::json!({ "cause": "request row missing" }).to_string();
-            let _ = self
-                .queue
-                .complete(
-                    &id,
-                    RequestState::Failed,
-                    Some(CAUSE_INTERNAL_ERROR),
-                    internal_failure_entry(&detail),
-                )
-                .await;
-            self.work.notify_one();
+            self.fail_vanished_row(&id).await;
             return;
         };
         let _ = self.events.publish(&id, Event::Started).await;
@@ -1144,6 +1136,7 @@ impl Pipeline {
                         execute_success_entry(&audit_detail),
                     )
                     .await;
+                log_terminal_failure(&id, &terminal);
                 if matches!(terminal, Ok(true)) {
                     let _ = self.events.publish(&id, Event::Done).await;
                     self.router
@@ -1174,6 +1167,7 @@ impl Pipeline {
                         cancelled_entry(&audit_detail),
                     )
                     .await;
+                log_terminal_failure(&id, &terminal);
                 if matches!(terminal, Ok(true)) {
                     let _ = self.events.publish(&id, Event::Refused).await;
                     self.router.finish(&id, cancelled_refusal(&id)).await;
@@ -1192,6 +1186,7 @@ impl Pipeline {
                         execute_failure_entry(&audit_detail),
                     )
                     .await;
+                log_terminal_failure(&id, &terminal);
                 if matches!(terminal, Ok(true)) {
                     let _ = self.events.publish(&id, Event::Refused).await;
                     self.router.finish(&id, failure_refusal(&id, detail)).await;
@@ -1201,6 +1196,23 @@ impl Pipeline {
             }
         }
         // The lane is free again.
+        self.work.notify_one();
+    }
+
+    /// A leased request whose row cannot be read is unanswerable: record
+    /// the internal failure (logged if even that fails) and free the lane.
+    async fn fail_vanished_row(&self, id: &str) {
+        let detail = serde_json::json!({ "cause": "request row missing" }).to_string();
+        let terminal = self
+            .queue
+            .complete(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_INTERNAL_ERROR),
+                internal_failure_entry(&detail),
+            )
+            .await;
+        log_terminal_failure(id, &terminal);
         self.work.notify_one();
     }
 
@@ -1367,6 +1379,16 @@ impl Pipeline {
 }
 
 /// Audit detail for a successful execution.
+/// Logs a terminal write that failed: nobody can be answered (the caller
+/// already holds its ticket or response), so the daemon log is the only
+/// place the failure can be seen; crash recovery fails the row on the
+/// next boot.
+fn log_terminal_failure(id: &str, terminal: &Result<bool, QueueError>) {
+    if let Err(err) = terminal {
+        tracing::error!(request = %id, %err, "could not record the terminal state");
+    }
+}
+
 fn execute_success_detail(capability: &str, outcome: pam_proto::Outcome) -> String {
     serde_json::json!({
         "capability": capability,

@@ -779,3 +779,57 @@ async fn upsert_caller_inserts_once_and_bumps_last_seen() {
     assert!(claude.first_seen > 0);
     assert!(claude.last_seen >= claude.first_seen);
 }
+
+/// The daemon drives one `Store` from many tokio tasks at once: the
+/// executor finishes requests while the dispatcher admits new ones and
+/// the reaper sweeps leases. Every statement runs on the same
+/// connection, so a `BEGIN` from `finish_request` must never land while
+/// another task's statement is mid-flight — that is the interleaving
+/// that left requests `running` forever (ptrack issue #2). Hammer the
+/// two paths concurrently and require every call to succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_inserts_and_finishes_never_fail() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(
+        Store::open(&tmp.path().join("state.sqlite3"))
+            .await
+            .expect("store opens"),
+    );
+    for round in 0..40 {
+        let id = format!("req_{round:04}");
+        insert_demo_request(&store, &id).await;
+        let finisher = {
+            let store = std::sync::Arc::clone(&store);
+            let id = id.clone();
+            tokio::spawn(async move {
+                store
+                    .finish_request(&id, RequestState::Done, Some("solved"), entry("execute"))
+                    .await
+            })
+        };
+        let inserter = {
+            let store = std::sync::Arc::clone(&store);
+            tokio::spawn(async move {
+                let other = format!("req_side_{round:04}");
+                store
+                    .insert_request(&other, "query", "/repo", "test", "{}", None)
+                    .await?;
+                store
+                    .update_request_state(&other, RequestState::Running, None)
+                    .await?;
+                store.upsert_caller("test", "/repo").await?;
+                store.get_request(&other).await
+            })
+        };
+        let finish_outcome = finisher.await.expect("finisher joins");
+        let side_outcome = inserter.await.expect("inserter joins");
+        assert!(
+            side_outcome.is_ok(),
+            "round {round}: side writes failed: {side_outcome:?}"
+        );
+        assert!(
+            matches!(finish_outcome, Ok(true)),
+            "round {round}: finish did not transition: {finish_outcome:?}"
+        );
+    }
+}

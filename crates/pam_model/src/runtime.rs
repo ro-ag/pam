@@ -496,17 +496,25 @@ fn thread_main(receiver: &Receiver<Command>, mirror: &Arc<Mutex<RuntimeSnapshot>
             // The reply channel went with the panic, so the caller already
             // sees `Crashed`; drop the weights and say so.
             loaded = None;
-            *lock(mirror) = RuntimeSnapshot {
-                state: RuntimeState::Idle,
-                busy: false,
-            };
-        } else {
-            lock(mirror).busy = false;
+            settle(mirror, RuntimeState::Idle);
         }
+        // Deliberately nothing in the success case. `handle` is the only
+        // thing that clears `busy`, and it does so before it answers. A
+        // trailing `busy = false` here would look like a safety net and
+        // would in fact be the opposite: it would paper over an arm that
+        // answered too early, turning a deterministic bug into a race that
+        // only some schedulers show. `busy` gates nothing — it is status —
+        // so an arm that forgot to settle wedges a flag, not the runtime,
+        // and the tests below catch it on the first iteration.
     }
 }
 
 /// Runs one command against the thread's state.
+///
+/// Every arm [`settle`]s the mirror before it answers. A caller holding a
+/// reply must never be able to read `busy: true` off the snapshot for a
+/// command that has already finished — that is precisely the stale status
+/// the mirror exists to prevent, and the GUI polls it two seconds apart.
 fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeSnapshot>) {
     match command {
         Command::Load { entry, reply } => {
@@ -516,19 +524,19 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             match load_model(&entry, mirror) {
                 Ok(model) => {
                     let meta = model.meta.clone();
-                    set_state(mirror, RuntimeState::Loaded(meta.clone()));
                     *loaded = Some(model);
+                    settle(mirror, RuntimeState::Loaded(meta.clone()));
                     drop(reply.send(Ok(meta)));
                 }
                 Err(err) => {
-                    set_state(mirror, RuntimeState::Idle);
+                    settle(mirror, RuntimeState::Idle);
                     drop(reply.send(Err(err)));
                 }
             }
         }
         Command::Unload { reply } => {
             *loaded = None;
-            set_state(mirror, RuntimeState::Idle);
+            settle(mirror, RuntimeState::Idle);
             let _ = reply.send(());
         }
         Command::Generate {
@@ -537,6 +545,7 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             reply,
         } => {
             let Some(model) = loaded.as_mut() else {
+                settle(mirror, RuntimeState::Idle);
                 drop(reply.send(Err(RuntimeError::NoModelLoaded)));
                 return;
             };
@@ -544,16 +553,27 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             if let Ok(generated) = &result {
                 model.meta.last_used_at = now();
                 model.meta.last_tokens_per_sec = Some(generated.tokens_per_sec);
-                set_state(mirror, RuntimeState::Loaded(model.meta.clone()));
             }
+            // A failed generation leaves the model loaded and usable; only the
+            // `busy` flag changes.
+            settle(mirror, RuntimeState::Loaded(model.meta.clone()));
             drop(reply.send(result));
         }
     }
 }
 
-/// Replaces the mirrored state, leaving `busy` to the thread loop.
+/// Replaces the mirrored state mid-command, leaving `busy` set.
+///
+/// Used for the load phases, which are progress reports on work still in
+/// flight. Anything that finishes a command uses [`settle`] instead.
 fn set_state(mirror: &Mutex<RuntimeSnapshot>, state: RuntimeState) {
     lock(mirror).state = state;
+}
+
+/// Finishes a command: the final state and `busy: false`, in one lock, before
+/// the caller is told anything.
+fn settle(mirror: &Mutex<RuntimeSnapshot>, state: RuntimeState) {
+    *lock(mirror) = RuntimeSnapshot { state, busy: false };
 }
 
 /// Opens a model file and reads its GGUF header, leaving the reader

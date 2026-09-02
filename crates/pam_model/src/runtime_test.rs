@@ -81,6 +81,7 @@ async fn unload_when_idle_is_ok() {
     let runtime = Runtime::new();
     runtime.unload().await.expect("unloading nothing is fine");
     assert_eq!(runtime.snapshot().state, RuntimeState::Idle);
+    assert!(!runtime.snapshot().busy);
 }
 
 #[tokio::test]
@@ -150,11 +151,13 @@ async fn the_thread_survives_a_failed_load_and_takes_the_next_command() {
         .await
         .expect_err("the load fails");
     runtime.unload().await.expect("the thread is still there");
+    assert!(!runtime.snapshot().busy);
     let err = runtime
         .generate(request(), live())
         .await
         .expect_err("and still answers");
     assert_eq!(err, RuntimeError::NoModelLoaded);
+    assert!(!runtime.snapshot().busy);
 }
 
 #[test]
@@ -225,4 +228,42 @@ fn the_vendored_moe_model_can_clear_its_kv_cache() {
         std::mem::size_of_val(&dense),
         "both clears are plain fn(&mut _) pointers"
     );
+}
+
+#[tokio::test]
+async fn a_reply_never_arrives_before_the_mirror_has_settled() {
+    // The thread must write the finished state and clear `busy` before it
+    // answers, not after. Answering first leaves a window in which a caller
+    // holding its result reads `busy: true` off the snapshot — exactly the
+    // stale status the mirror exists to prevent, and which the GUI would
+    // render for up to a full poll interval.
+    //
+    // This used to be a race that only some schedulers opened (CI on
+    // linux/arm64 found it; macOS never did). It is deterministic now
+    // because `handle` is the only thing that clears `busy` — the thread
+    // loop has no trailing reset to paper over an arm that answered too
+    // early — so a regression fails here on attempt 0, everywhere. The loop
+    // is there to check the thread stays healthy across cycles, not to
+    // catch a race.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("test.gguf");
+    std::fs::write(&path, b"not a gguf").expect("write the fixture");
+    let runtime = Runtime::new();
+    let entry = entry(path, Some("qwen3"));
+
+    for attempt in 0..8 {
+        runtime.load(&entry).await.expect_err("the load fails");
+        let snapshot = runtime.snapshot();
+        assert!(
+            !snapshot.busy,
+            "attempt {attempt}: the reply outran the mirror"
+        );
+        assert_eq!(snapshot.state, RuntimeState::Idle);
+
+        runtime.unload().await.expect("unload answers");
+        assert!(
+            !runtime.snapshot().busy,
+            "attempt {attempt}: unload replied before settling"
+        );
+    }
 }

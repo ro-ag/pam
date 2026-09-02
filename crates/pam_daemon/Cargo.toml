@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# deterministic log reduction behind `admin.log.compress`.
+pam_compact.workspace = true
 pam_model.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true

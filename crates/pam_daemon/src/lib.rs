@@ -3,17 +3,21 @@
 //! and communicating over typed channels.
 
 pub mod admin;
+pub mod admin_logs;
 pub mod admin_models;
 pub mod approval;
 pub mod daemon;
 pub mod executor;
 pub mod lifecycle;
+pub mod log_service;
 pub mod model_service;
 pub mod policy;
 pub mod queue;
 pub mod runtime_dir;
 pub mod transport;
 
+#[cfg(test)]
+mod admin_logs_test;
 #[cfg(test)]
 mod admin_models_test;
 #[cfg(test)]
@@ -26,6 +30,8 @@ mod daemon_test;
 mod executor_test;
 #[cfg(test)]
 mod lifecycle_test;
+#[cfg(test)]
+mod log_service_test;
 #[cfg(test)]
 mod model_service_test;
 #[cfg(test)]

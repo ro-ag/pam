@@ -15,6 +15,7 @@ use crate::admin::{
     OP_PROFILE_GET, OP_PROFILE_SET,
 };
 use crate::approval::{ApprovalOutcome, ApprovalService};
+use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{PROFILE_SETTING_KEY, Profile};
 use crate::transport::EventPublisher;
@@ -33,7 +34,8 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
         LONG_TIMEOUT,
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
-    let admin = AdminService::new(Arc::clone(&store), approvals, models);
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let admin = AdminService::new(Arc::clone(&store), approvals, models, logs);
     (store, admin, rx)
 }
 
@@ -53,7 +55,8 @@ async fn service_with_approvals() -> (
         LONG_TIMEOUT,
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
-    let admin = AdminService::new(Arc::clone(&store), Arc::clone(&approvals), models);
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let admin = AdminService::new(Arc::clone(&store), Arc::clone(&approvals), models, logs);
     (store, admin, approvals, rx)
 }
 

@@ -23,7 +23,7 @@ use pam_gui::bridge::{expect_result, is_disconnect, is_known_admin_op};
 use pam_gui::events::decode_event_frames;
 use pam_proto::{Event, Response};
 use pam_testkit::{TestDaemon, with_deadline};
-use serde_json::json;
+use serde_json::{Value, json};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 /// The deadlines the bridge commands use (`bridge.rs` constants are
@@ -82,6 +82,35 @@ async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
         body.get("profile").is_some(),
         "profile.get body must carry the active profile: {body}"
     );
+    daemon.stop().await;
+}
+
+/// The Models screen's own poll: `admin.models.status` through the
+/// bridge whitelist against a live daemon answers the block the runtime
+/// card reads, with an empty runtime on a fresh base dir.
+#[tokio::test]
+async fn admin_call_reads_the_model_status_block() {
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+
+    let op = pam_daemon::admin_models::OP_MODELS_STATUS;
+    assert!(is_known_admin_op(op), "the bridge whitelists {op}");
+    let response = with_deadline(client::send_admin(&base, op, json!({}), ADMIN_DEADLINE_MS))
+        .await
+        .expect("a live daemon answers model admin ops");
+    let body = expect_result(response).expect("models.status answers a result");
+
+    assert_eq!(
+        body.pointer("/runtime/state/state").and_then(Value::as_str),
+        Some("idle"),
+        "a daemon that never loaded weights reports an idle runtime: {body}"
+    );
+    for field in ["jobs", "defaults", "idle_unload_min", "models_dir"] {
+        assert!(
+            body.get(field).is_some(),
+            "models.status body must carry {field}: {body}"
+        );
+    }
     daemon.stop().await;
 }
 

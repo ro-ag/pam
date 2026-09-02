@@ -13,8 +13,8 @@
 //!
 //! # Command surface decisions
 //!
-//! - **One generic [`admin_call`]** instead of nine op-specific commands:
-//!   the op names and body shapes live in `pam_daemon::admin`, and the
+//! - **One generic [`admin_call`]** instead of one command per op: the
+//!   op names and body shapes live in `pam_daemon::admin`, and the
 //!   frontend gets typed wrappers per op (`frontend/src/lib/ipc.ts`).
 //!   The bridge whitelists the known `admin.*` op names before touching
 //!   the socket, so a typo (or an unexpected op smuggled through the
@@ -39,6 +39,7 @@ use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_CALLERS_LIST, OP_GRANTS_ADD,
     OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET, OP_PROFILE_SET,
 };
+use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
 use pam_proto::Response;
 use serde::Serialize;
 
@@ -48,14 +49,17 @@ const STATUS_DEADLINE_MS: u64 = 5_000;
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
 
+/// Deadline for `admin.models.try`, the one admin op that runs a real
+/// generation: a cold prompt on a large model decodes for minutes, not
+/// seconds, so the shared 30 s ceiling would time out a working model.
+const TRY_DEADLINE_MS: u64 = 120_000;
+
 /// How long [`daemon_stop`] waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
-/// Every admin op the bridge forwards; anything else is refused before
-/// touching the socket. Kept in lockstep with `pam_daemon::admin` — the
-/// daemon would refuse an unknown op too, this just fails faster and
-/// keeps the GUI surface explicit.
-pub const ADMIN_OPS: [&str; 9] = [
+/// The core admin surface (`pam_daemon::admin`): profile, grants,
+/// approvals, activity, callers.
+const CORE_ADMIN_OPS: [&str; 9] = [
     OP_PROFILE_GET,
     OP_PROFILE_SET,
     OP_GRANTS_LIST,
@@ -67,10 +71,51 @@ pub const ADMIN_OPS: [&str; 9] = [
     OP_CALLERS_LIST,
 ];
 
+/// How many ops the whitelist carries: the core surface plus the model
+/// surface, counted from the daemon's own lists.
+const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len();
+
+/// Splices the two daemon-owned lists into one array at compile time —
+/// no op name is retyped here, so the whitelist cannot drift from the
+/// daemon's dispatch.
+const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
+    let mut ops = [""; ADMIN_OPS_LEN];
+    let mut index = 0;
+    while index < CORE_ADMIN_OPS.len() {
+        ops[index] = CORE_ADMIN_OPS[index];
+        index += 1;
+    }
+    let mut model = 0;
+    while model < MODEL_ADMIN_OPS.len() {
+        ops[CORE_ADMIN_OPS.len() + model] = MODEL_ADMIN_OPS[model];
+        model += 1;
+    }
+    ops
+}
+
+/// Every admin op the bridge forwards; anything else is refused before
+/// touching the socket. Composed from `pam_daemon::admin` and
+/// `pam_daemon::admin_models` — the daemon would refuse an unknown op
+/// too, this just fails faster and keeps the GUI surface explicit.
+pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();
+
 /// True when `op` is an admin operation the bridge forwards.
 #[must_use]
 pub fn is_known_admin_op(op: &str) -> bool {
     ADMIN_OPS.contains(&op)
+}
+
+/// How long the bridge waits for `op`'s answer.
+///
+/// Every admin op is synchronous request/reply inside
+/// [`ADMIN_DEADLINE_MS`], except the one that generates tokens.
+#[must_use]
+pub fn deadline_for(op: &str) -> u64 {
+    if op == OP_MODELS_TRY {
+        TRY_DEADLINE_MS
+    } else {
+        ADMIN_DEADLINE_MS
+    }
 }
 
 /// The one failure shape every bridge command speaks: the daemon's
@@ -244,7 +289,7 @@ pub async fn admin_call(
         ));
     }
     let base = resolve_base_dir()?;
-    let response = client::send_admin(&base, &op, args, ADMIN_DEADLINE_MS)
+    let response = client::send_admin(&base, &op, args, deadline_for(&op))
         .await
         .map_err(BridgeError::from)?;
     expect_result(response)

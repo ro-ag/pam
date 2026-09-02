@@ -42,24 +42,30 @@ describe("shell routing", () => {
     expect(screen.getByRole("link", { name: "Activity" })).not.toHaveAttribute("aria-current");
   });
 
-  it("renders all five nav entries; Flows and Models are disabled non-links", async () => {
+  it("renders all five nav entries; only Flows is still a disabled non-link", async () => {
     renderShell("/");
     await screen.findByRole("heading", { name: "Activity" });
-    for (const entry of ["Activity", "Approvals", "Settings"]) {
+    for (const entry of ["Activity", "Approvals", "Models", "Settings"]) {
       expect(screen.getByRole("link", { name: entry })).toBeInTheDocument();
     }
-    for (const entry of ["Flows", "Models"]) {
-      const item = screen.getByText(entry);
-      expect(item.closest("a")).toBeNull();
-      expect(item.closest("[aria-disabled='true']")).not.toBeNull();
+    const flows = screen.getByText("Flows");
+    expect(flows.closest("a")).toBeNull();
+    expect(flows.closest("[aria-disabled='true']")).not.toBeNull();
+    expect(screen.getAllByText("soon")).toHaveLength(1);
+  });
+
+  it("routes /models to the Models screen", async () => {
+    renderShell("/models");
+    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    for (const section of ["Runtime", "Library", "Catalog", "Try box"]) {
+      expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
     }
-    expect(screen.getAllByText("soon")).toHaveLength(2);
   });
 
   it("hosts the real Settings sections (the style proof is retired)", async () => {
     renderShell("/settings");
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    for (const section of ["Appearance", "Security", "Daemon", "Retention", "Logs"]) {
+    for (const section of ["Appearance", "Security", "Models", "Daemon", "Retention", "Logs"]) {
       expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
     }
     // The design system's living proof moved out with task #30.

@@ -2,7 +2,7 @@ use pam_client::client::{ClientError, RequestError};
 use pam_proto::{Outcome, Response};
 use serde_json::json;
 
-use crate::bridge::{ADMIN_OPS, BridgeError, is_disconnect, is_known_admin_op};
+use crate::bridge::{ADMIN_OPS, BridgeError, deadline_for, is_disconnect, is_known_admin_op};
 
 #[test]
 fn every_daemon_admin_op_is_whitelisted() {
@@ -14,7 +14,37 @@ fn every_daemon_admin_op_is_whitelisted() {
             "{op} must live under the reserved admin prefix"
         );
     }
-    assert_eq!(ADMIN_OPS.len(), 9, "new admin ops need explicit wiring");
+    assert_eq!(
+        ADMIN_OPS.len(),
+        9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len(),
+        "new admin ops need explicit wiring"
+    );
+}
+
+#[test]
+fn every_model_admin_op_is_whitelisted() {
+    // The model surface is spliced in from the daemon's own list, so a
+    // new op there reaches the GUI without a second edit here.
+    for op in pam_daemon::admin_models::MODEL_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+}
+
+#[test]
+fn only_the_generating_op_gets_the_long_deadline() {
+    // A real generation runs for minutes; every other admin op is a
+    // synchronous read or write and keeps the 30 s ceiling.
+    assert_eq!(
+        deadline_for(pam_daemon::admin_models::OP_MODELS_TRY),
+        120_000,
+        "admin.models.try decodes tokens; 30 s would time out a working model"
+    );
+    for op in ADMIN_OPS {
+        if op == pam_daemon::admin_models::OP_MODELS_TRY {
+            continue;
+        }
+        assert_eq!(deadline_for(op), 30_000, "{op} answers synchronously");
+    }
 }
 
 #[test]

@@ -45,7 +45,7 @@ function NavLink({
   label,
   icon: Icon,
 }: {
-  to: "/activity" | "/approvals" | "/settings";
+  to: "/activity" | "/approvals" | "/models" | "/settings";
   label: string;
   icon: LucideIcon;
 }) {
@@ -92,7 +92,7 @@ export function Sidebar() {
         <NavSoon label="Flows" icon={Workflow} />
       </motion.div>
       <motion.div variants={staggerItem}>
-        <NavSoon label="Models" icon={Cpu} />
+        <NavLink to="/models" label="Models" icon={Cpu} />
       </motion.div>
       <motion.div variants={staggerItem} className="mt-auto">
         <NavLink to="/settings" label="Settings" icon={Settings} />

@@ -11,3 +11,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-tests-never-ran-off-macos
+- kind: project-way
+- scope: project
+- rule: PAM test harnesses must seed the relaxed policy profile explicitly and must not assert unix-only lock/signal details; Profile::platform_default is standard off macOS, Windows byte-range locks hide the holder pid, and Windows has no SIGTERM
+- fix: pam_testkit::TestDaemon and the crate-level harnesses call seed_relaxed(base) before the daemon opens the store; assert pid == if cfg!(unix) { Some(pid) } else { None }; stop via taskkill /T /F off unix
+- hits: 2026-09-01
+- cost: 60
+- status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
+

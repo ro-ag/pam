@@ -66,6 +66,9 @@ impl LiveDaemon {
         let child = Command::new(env!("CARGO_BIN_EXE_pam"))
             .arg("daemon")
             .env("PAM_BASE_DIR", base)
+            // Debug detail in the daemon's own log: it is only ever read
+            // by `dump_daemon_log`, on the failure path.
+            .env("PAM_LOG", "debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -139,6 +142,9 @@ impl LiveDaemon {
 
 impl Drop for LiveDaemon {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            dump_daemon_log(&self.base);
+        }
         // Already reaped (the `stop` happy path): nothing to signal —
         // the pid may belong to someone else by now.
         if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -218,6 +224,28 @@ fn warm_binary() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Prints the daemon's own log to the test output on the failure path.
+///
+/// The daemon is a separate process with its stdio closed, so a failing
+/// assertion in this file otherwise leaves no trace of what the daemon
+/// was doing — the CI flake recorded as ptrack issue #2 (a follow that
+/// times out although the daemon answered the ticket) has been unreadable
+/// for exactly that reason. Best effort: a missing log prints nothing.
+fn dump_daemon_log(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base.join("log")) else {
+        eprintln!("--- daemon log: no log directory under {}", base.display());
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    files.sort();
+    for file in files {
+        eprintln!("--- daemon log {} ---", file.display());
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            eprintln!("{text}");
+        }
+    }
 }
 
 /// Sends a no-wait `echo` and returns its ticket.

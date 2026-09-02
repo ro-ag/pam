@@ -106,3 +106,9 @@ Standing rules for any agent working in this project (from ~/dev/ai):
   tags, with the other four targets gated behind it.
 - **No repo or no remote → stop and ask** before making changes.
 <!-- ptrack:end -->
+
+## Memento-enforced
+
+Rules promoted from the memento ledger. Details/fix: `memento show <slug>`.
+- PAM test harnesses must seed the relaxed policy profile explicitly and must not assert unix-only lock/signal details; Profile::platform_default is standard off macOS, Windows byte-range locks hide the holder pid, and Windows has no SIGTERM (memento: pam-tests-never-ran-off-macos)
+

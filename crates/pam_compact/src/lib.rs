@@ -12,8 +12,8 @@
 //!    frames); an unterminated tail is a line.
 //! 2. **Display form** — terminal escape sequences stripped, lossy UTF-8,
 //!    control characters rendered as `\t`, `\xNN` or `\u{...}`.
-//! 3. **Omissions** — all but the last frame of a progress run, then
-//!    adjacent records with an identical display form.
+//! 3. **Omissions** — every progress frame that a following record
+//!    overwrites, then adjacent records with an identical display form.
 //! 4. **Retention** — the first and last `boundary_records` of what
 //!    survived, plus every record containing a failure keyword and its
 //!    neighbours.

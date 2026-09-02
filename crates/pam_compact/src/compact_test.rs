@@ -58,20 +58,19 @@ fn lf_crlf_and_bare_cr_frame_records() {
     let report = run(b"a\nb\r\nc\rd\re\n");
 
     assert_eq!(report.source_records, 5);
-    assert_eq!(report.retained_records, 4);
+    assert_eq!(report.retained_records, 3);
     assert_eq!(
         rendered(&report),
         [
             "a\n",
             "b\n",
-            "[... 1 progress frames superseded ...]\n",
-            "d\n",
+            "[... 2 progress frames superseded ...]\n",
             "e\n",
         ]
     );
     assert_eq!(
         omission(&report.fragments[2]),
-        (&OmissionReason::SupersededProgress, 1)
+        (&OmissionReason::SupersededProgress, 2)
     );
 }
 
@@ -105,21 +104,30 @@ fn adjacent_repeats_collapse_and_reset_after_an_omission() {
 }
 
 #[test]
-fn progress_runs_keep_only_the_last_frame() {
-    let report = run(b"10%\r20%\r30%\rdone\n");
-
-    assert_eq!(report.source_records, 4);
+fn progress_frames_are_superseded_by_what_overwrites_them() {
+    let overwritten_by_a_line = run(b"10%\r20%\r30%\rdone\n");
+    assert_eq!(overwritten_by_a_line.source_records, 4);
     assert_eq!(
-        rendered(&report),
-        [
-            "[... 2 progress frames superseded ...]\n",
-            "30%\n",
-            "done\n"
-        ]
+        rendered(&overwritten_by_a_line),
+        ["[... 3 progress frames superseded ...]\n", "done\n"]
     );
     assert_eq!(
-        omission(&report.fragments[0]),
-        (&OmissionReason::SupersededProgress, 2)
+        omission(&overwritten_by_a_line.fragments[0]),
+        (&OmissionReason::SupersededProgress, 3)
+    );
+
+    let overwritten_by_a_crlf_line = run(b"10%\r20%\r\n");
+    assert_eq!(overwritten_by_a_crlf_line.source_records, 2);
+    assert_eq!(
+        rendered(&overwritten_by_a_crlf_line),
+        ["[... 1 progress frames superseded ...]\n", "20%\n"]
+    );
+
+    let run_at_the_end_of_the_input = run(b"10%\r20%\r");
+    assert_eq!(run_at_the_end_of_the_input.source_records, 2);
+    assert_eq!(
+        rendered(&run_at_the_end_of_the_input),
+        ["[... 1 progress frames superseded ...]\n", "20%\n"]
     );
 }
 

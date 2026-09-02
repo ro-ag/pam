@@ -502,7 +502,10 @@ fn consume_osc(bytes: &[u8], mut cursor: usize) -> usize {
     cursor
 }
 
-/// Every frame of a progress run except the last one is superseded.
+/// A progress frame is superseded by whatever record follows it (a bare
+/// `\r` returns the cursor, so the next record overwrites the frame on a
+/// terminal, whatever kind that record is); only a trailing frame at the
+/// end of the input survives, because nothing overwrote it.
 fn progress_omissions(records: &[Record]) -> Vec<Option<OmissionReason>> {
     let mut omissions = vec![None; records.len()];
     let mut start = 0;
@@ -512,10 +515,10 @@ fn progress_omissions(records: &[Record]) -> Vec<Option<OmissionReason>> {
             continue;
         }
         let mut end = start + 1;
-        while end < records.len() && records[end].frame_kind == FrameKind::Progress {
+        while end < records.len() && records[end - 1].frame_kind == FrameKind::Progress {
             end += 1;
         }
-        for omission in &mut omissions[start..end - 1] {
+        for omission in &mut omissions[start..end.saturating_sub(1)] {
             *omission = Some(OmissionReason::SupersededProgress);
         }
         start = end;

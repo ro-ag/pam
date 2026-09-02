@@ -84,10 +84,12 @@ Algorithm (all byte-based, locale-independent, deterministic):
    `MAX_SOURCE_RECORDS` → `TooManyRecords`.
 2. **Display form.** Strip ANSI CSI/OSC escapes, lossy UTF-8, control
    characters rendered as `\t`, `\xNN`, `\u{...}`.
-3. **Omissions (pre-pass).** Progress frames: every frame in a run
-   except the last is `SupersededProgress`. Then adjacent records with an
-   identical display form collapse: the second and later are `Repeated`
-   (an omitted record resets the comparison).
+3. **Omissions (pre-pass).** Progress frames: a bare-`\r` frame is
+   `SupersededProgress` when any record follows it (the next record
+   overwrites it on a terminal); only a trailing frame at the end of the
+   input survives. Then adjacent records with an identical display form
+   collapse: the second and later are `Repeated` (an omitted record
+   resets the comparison).
 4. **Retention.** Over the surviving ("active") records: the first
    `boundary_records` get `FirstBoundary`, the last `boundary_records`
    `LastBoundary`; each active record whose display contains `error`,

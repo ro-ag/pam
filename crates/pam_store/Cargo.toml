@@ -9,6 +9,12 @@ repository.workspace = true
 [dependencies]
 turso.workspace = true
 thiserror.workspace = true
+# evidence content hashing (sha256 hex) and the compression figures the
+# odometer aggregates out of `evidence.meta_json`.
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 # sync-only: finish_request serializes its BEGIN/COMMIT window behind an
 # async mutex. No runtime features — the daemon owns task placement.
 tokio = { version = "1", default-features = false, features = ["sync"] }

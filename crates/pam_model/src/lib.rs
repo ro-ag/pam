@@ -16,7 +16,9 @@
 //!   with exact sizes and SHA-256 digests.
 //! - [`registry`] — what is actually on disk under the models directory:
 //!   scan, classify, verify, delete.
-//! - [`download`], [`tokenizer`], [`runtime`], [`curator`] — filled by the
+//! - [`download`] — resumable transfers through the system `curl`, with
+//!   the integrity check done here rather than trusted to the network.
+//! - [`tokenizer`], [`runtime`], [`curator`] — filled by the remaining
 //!   wave-2 tasks; declared here so the module list never has to change
 //!   under them.
 //! - [`error`] — one place to reach for the crate's error types.
@@ -47,6 +49,10 @@ pub mod runtime;
 pub mod tokenizer;
 
 pub use catalog::{CATALOG, Preset, find_preset};
+pub use download::{
+    DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState, curl_path,
+    start,
+};
 pub use gguf::{GgufError, GgufInfo, read_info};
 pub use registry::{
     MODEL_FLOOR_BYTES, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord,
@@ -55,6 +61,10 @@ pub use registry::{
 
 #[cfg(test)]
 mod catalog_test;
+#[cfg(test)]
+mod download_server_test;
+#[cfg(test)]
+mod download_test;
 #[cfg(test)]
 mod gguf_test;
 #[cfg(test)]

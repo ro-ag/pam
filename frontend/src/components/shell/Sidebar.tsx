@@ -18,8 +18,11 @@ import { cn, cva, type VariantProps } from "../../lib/cn";
  * the accent-soft pill. Every entry is a real screen now — the last
  * placeholder went when Flows landed.
  *
- * The mount stagger is one of exactly two orchestrated motions in the shell
- * (the other is the work panel's route transition) — nothing else animates.
+ * The column runs the full window height and carries the brand block at its
+ * head; there is no strip across the window any more. The mount stagger is
+ * one of exactly two orchestrated motions in the shell (the other is the
+ * work panel's route transition) — nothing else animates, and the head
+ * never does: it must be paintable the instant the window appears.
  */
 export const navItemVariants = cva(
   "flex h-9 w-full items-center gap-2.5 rounded-control px-3 font-sans text-sm font-medium transition-colors duration-150",
@@ -71,33 +74,69 @@ function NavLink({
   );
 }
 
+/** macOS overlay mode floats the traffic lights over our top-left; clear them. */
+function hasTrafficLights(): boolean {
+  return navigator.userAgent.includes("Mac");
+}
+
+/**
+ * The brand block at the head of the column. It is a drag region — and so
+ * are its non-interactive children, because Tauri honors the attribute on
+ * the exact element under the pointer. With `titleBarStyle: "Overlay"` the
+ * macOS traffic lights sit at x 16 / y 17, so the head drops below them.
+ */
+function SidebarHead() {
+  return (
+    <div
+      data-tauri-drag-region=""
+      className={cn(
+        "flex w-52 shrink-0 flex-col gap-0.5 px-3 pb-5",
+        hasTrafficLights() ? "pt-10" : "pt-4",
+      )}
+    >
+      <span
+        data-tauri-drag-region=""
+        className="font-display text-sm font-semibold tracking-widest text-ink"
+      >
+        PAM
+      </span>
+      <span data-tauri-drag-region="" className="font-data text-xs text-ink-faint">
+        personal agent machine
+      </span>
+    </div>
+  );
+}
+
 export function Sidebar() {
   return (
-    <motion.nav
-      aria-label="Primary"
-      variants={staggerList}
-      initial="hidden"
-      animate="show"
-      className="flex w-52 shrink-0 flex-col gap-1 pt-1"
-    >
-      <motion.div variants={staggerItem}>
-        <NavLink to="/" label="Home" icon={MessageCircleQuestion} />
-      </motion.div>
-      <motion.div variants={staggerItem}>
-        <NavLink to="/activity" label="Activity" icon={Activity} />
-      </motion.div>
-      <motion.div variants={staggerItem}>
-        <NavLink to="/approvals" label="Approvals" icon={Hand} />
-      </motion.div>
-      <motion.div variants={staggerItem}>
-        <NavLink to="/flows" label="Flows" icon={Workflow} />
-      </motion.div>
-      <motion.div variants={staggerItem}>
-        <NavLink to="/models" label="Models" icon={Cpu} />
-      </motion.div>
-      <motion.div variants={staggerItem} className="mt-auto">
-        <NavLink to="/settings" label="Settings" icon={Settings} />
-      </motion.div>
-    </motion.nav>
+    <div className="flex h-full shrink-0 flex-col pl-3">
+      <SidebarHead />
+      <motion.nav
+        aria-label="Primary"
+        variants={staggerList}
+        initial="hidden"
+        animate="show"
+        className="flex min-h-0 w-52 flex-1 flex-col gap-1 pb-3"
+      >
+        <motion.div variants={staggerItem}>
+          <NavLink to="/" label="Home" icon={MessageCircleQuestion} />
+        </motion.div>
+        <motion.div variants={staggerItem}>
+          <NavLink to="/activity" label="Activity" icon={Activity} />
+        </motion.div>
+        <motion.div variants={staggerItem}>
+          <NavLink to="/approvals" label="Approvals" icon={Hand} />
+        </motion.div>
+        <motion.div variants={staggerItem}>
+          <NavLink to="/flows" label="Flows" icon={Workflow} />
+        </motion.div>
+        <motion.div variants={staggerItem}>
+          <NavLink to="/models" label="Models" icon={Cpu} />
+        </motion.div>
+        <motion.div variants={staggerItem} className="mt-auto">
+          <NavLink to="/settings" label="Settings" icon={Settings} />
+        </motion.div>
+      </motion.nav>
+    </div>
   );
 }

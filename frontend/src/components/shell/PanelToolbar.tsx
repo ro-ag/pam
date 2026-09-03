@@ -1,0 +1,66 @@
+import { Moon, Sun } from "lucide-react";
+import { useSyncExternalStore } from "react";
+import {
+  applyTheme,
+  nextMode,
+  nextTheme,
+  subscribeTheme,
+  themeDefinition,
+  themeSnapshot,
+} from "../../lib/theme";
+import { Button } from "../ui/Button";
+import { Beacon } from "./Beacon";
+import { useDaemonStatus } from "./useDaemonStatus";
+
+/**
+ * The panel toolbar — the shell's chrome controls, living INSIDE the work
+ * panel's top edge rather than in a band across the window. There is no
+ * window-wide strip any more: the sidebar owns the full height on the left
+ * and the panel runs to the top on the right, so this row is the panel's
+ * first child.
+ *
+ * The row (and its non-interactive children: Tauri only honors the attribute
+ * on the exact element under the pointer) is a drag region, so the window
+ * still moves when the user grabs the empty space beside the controls; the
+ * theme and mode buttons never carry the attribute and stay clickable.
+ * The copper hairline underneath is the one theme-independent token, kept
+ * from v1 as the brand signature.
+ */
+export function PanelToolbar() {
+  const daemon = useDaemonStatus();
+  // The shared theme store keeps this toolbar and Settings > Appearance in
+  // agreement: whichever changes the combination, both re-render.
+  const { theme, mode } = useSyncExternalStore(subscribeTheme, themeSnapshot);
+
+  const cycleTheme = () => applyTheme(nextTheme(theme), mode);
+  const toggleMode = () => applyTheme(theme, nextMode(mode));
+
+  return (
+    <div
+      role="toolbar"
+      aria-label="panel controls"
+      data-tauri-drag-region=""
+      className="flex h-12 shrink-0 items-center justify-end gap-2 border-b border-separator px-3"
+    >
+      <span data-tauri-drag-region="" className="flex items-center pr-1">
+        <Beacon state={daemon} />
+      </span>
+      <Button variant="ghost" size="sm" onClick={cycleTheme}>
+        <span aria-hidden="true">◐</span>
+        {themeDefinition(theme).label}
+      </Button>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={toggleMode}
+        aria-label={mode === "dark" ? "switch to light mode" : "switch to dark mode"}
+      >
+        {mode === "dark" ? (
+          <Sun size={15} aria-hidden="true" />
+        ) : (
+          <Moon size={15} aria-hidden="true" />
+        )}
+      </Button>
+    </div>
+  );
+}

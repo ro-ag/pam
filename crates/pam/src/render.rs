@@ -22,8 +22,18 @@
 //!
 //! With `--json` the raw [`Response`] JSON goes to stdout instead; the
 //! exit code is mapped the same way either way.
+//!
+//! # Flows
+//!
+//! `pam flow` gets three bespoke renderers — [`render_flow_list`],
+//! [`render_flow_show`], [`render_flow_result`] — plus
+//! [`parse_flow_inputs`], which turns the subcommand's positional
+//! `key=value` arguments into the `flow.run` args object. Parsing lives
+//! here beside the rendering so the clap shell in `main.rs` stays thin
+//! and the CLI's whole text surface is unit-testable in one place.
 
 use pam_proto::{Event, Outcome, Response};
+use serde_json::Value;
 
 /// Exit code for a refusal.
 pub const EXIT_REFUSED: u8 = 3;
@@ -136,6 +146,226 @@ pub fn render_event(event: &Event) -> String {
         Event::Done => "[done]".to_owned(),
         Event::Refused => "[refused]".to_owned(),
     }
+}
+
+/// The `pam flow list` table — `id  source  steps  name`, one row per
+/// flow, every column padded to its widest value.
+///
+/// A flow whose file does not validate has no step count and no name to
+/// give, so its row carries `invalid: <message>` in their place: the
+/// library stays listable, and the row itself says what to fix.
+#[must_use]
+pub fn render_flow_list(body: &Value) -> String {
+    let Some(flows) = body.get("flows").and_then(Value::as_array) else {
+        return render_body(body);
+    };
+    if flows.is_empty() {
+        return "no flows are installed".to_owned();
+    }
+    let width = |key: &str| {
+        flows
+            .iter()
+            .map(|flow| field(flow, key).chars().count())
+            .max()
+            .unwrap_or_default()
+    };
+    let id_width = width("id");
+    let source_width = width("source");
+    let steps_width = flows
+        .iter()
+        .filter(|flow| is_valid(flow))
+        .map(|flow| step_count(flow).to_string().len())
+        .max()
+        .unwrap_or_default();
+
+    flows
+        .iter()
+        .map(|flow| {
+            let tail = if is_valid(flow) {
+                format!(
+                    "{:>steps_width$}  {}",
+                    step_count(flow),
+                    field(flow, "name")
+                )
+            } else {
+                format!("invalid: {}", field(flow, "error"))
+            };
+            format!(
+                "{:<id_width$}  {:<source_width$}  {tail}",
+                field(flow, "id"),
+                field(flow, "source")
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The `pam flow show` output: the flow's canonical YAML, verbatim.
+///
+/// A flow that does not validate has no canonical rendering — the daemon
+/// sends an empty `normalized_yaml` — so its source text is printed
+/// instead, which is exactly the text a human opened `show` to fix.
+#[must_use]
+pub fn render_flow_show(body: &Value) -> String {
+    let normalized = field(body, "normalized_yaml");
+    let yaml = if normalized.is_empty() {
+        field(body, "yaml")
+    } else {
+        normalized
+    };
+    yaml.trim_end().to_owned()
+}
+
+/// The `pam flow run` verdict: one line per step, the run's summary
+/// sentence, then any step summary text.
+///
+/// A step that ended well reports how long it took; one that did not
+/// reports why — its exit status, or the cause when there was no process
+/// to exit — followed by the evidence rows to read, and its recovery line
+/// indented underneath. A step whose `output: summarize` produced a
+/// paragraph gets that paragraph under its own rule at the bottom, where
+/// prose does not break the step table.
+///
+/// A body without a `steps` array (an older daemon) falls back to
+/// [`render_body`] rather than rendering nothing.
+#[must_use]
+pub fn render_flow_result(body: &Value) -> String {
+    let Some(steps) = body.get("steps").and_then(Value::as_array) else {
+        return render_body(body);
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for step in steps {
+        lines.push(render_step_line(step));
+        let recovery = step
+            .get("error")
+            .map(|error| field(error, "recovery"))
+            .unwrap_or_default();
+        if !recovery.is_empty() {
+            lines.push(format!("  \u{2192} {recovery}"));
+        }
+    }
+
+    let summary = field(body, "summary");
+    if !summary.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(summary.to_owned());
+    }
+
+    for step in steps {
+        let text = field(step, "summary").trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!(
+            "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+            field(step, "id")
+        ));
+        lines.extend(text.lines().map(|line| format!("  {line}")));
+    }
+    lines.join("\n")
+}
+
+/// Parses `pam flow run`'s positional `key=value` arguments into the
+/// `inputs` object the `flow.run` capability takes.
+///
+/// The first `=` separates the two, so a value may contain more of them.
+///
+/// # Errors
+///
+/// The usage message for the first argument that is not a `key=value`
+/// pair, ready to print after `pam flow run: `.
+pub fn parse_flow_inputs(raw: &[String]) -> Result<Value, String> {
+    let mut inputs = serde_json::Map::new();
+    for item in raw {
+        let (name, value) = item
+            .split_once('=')
+            .filter(|(name, _)| !name.is_empty())
+            .ok_or_else(|| format!("input {item:?} must be key=value"))?;
+        inputs.insert(name.to_owned(), Value::String(value.to_owned()));
+    }
+    Ok(Value::Object(inputs))
+}
+
+/// One step of a verdict as its table line (see [`render_flow_result`]).
+fn render_step_line(step: &Value) -> String {
+    let status = field(step, "status");
+    let mut parts = vec![status.to_owned()];
+    match status {
+        "succeeded" => {
+            let duration_ms = step
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if duration_ms > 0 {
+                parts.push(render_duration_ms(duration_ms));
+            }
+        }
+        "skipped" => {}
+        _ => {
+            if let Some(exit_status) = step.get("exit_status").and_then(Value::as_i64) {
+                parts.push(format!("exit {exit_status}"));
+            } else {
+                let cause = step
+                    .get("error")
+                    .map(|error| field(error, "cause"))
+                    .unwrap_or_default();
+                if !cause.is_empty() {
+                    parts.push(cause.to_owned());
+                }
+            }
+            if let Some(evidence) = step.get("evidence").and_then(Value::as_array) {
+                parts.extend(evidence.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+    }
+    format!(
+        "{} {}  {}",
+        step_glyph(status),
+        field(step, "id"),
+        parts.join("  ")
+    )
+}
+
+/// The status glyph a step line opens with.
+fn step_glyph(status: &str) -> char {
+    match status {
+        "succeeded" => '\u{2713}',
+        "failed" => '\u{2717}',
+        "skipped" => '\u{b7}',
+        "blocked" => '\u{2298}',
+        "cancelled" => '\u{2297}',
+        _ => '?',
+    }
+}
+
+/// A step's wall time as `120ms` under a second, `4.2s` above it.
+fn render_duration_ms(total_ms: u64) -> String {
+    if total_ms < 1_000 {
+        format!("{total_ms}ms")
+    } else {
+        format!("{}.{}s", total_ms / 1_000, (total_ms % 1_000) / 100)
+    }
+}
+
+/// A JSON object's string field, empty when it is missing or not a string.
+fn field<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Whether a flow list entry parsed. A daemon that omits the flag has
+/// nothing to complain about, so the entry counts as valid.
+fn is_valid(flow: &Value) -> bool {
+    flow.get("valid").and_then(Value::as_bool).unwrap_or(true)
+}
+
+/// A flow list entry's step count.
+fn step_count(flow: &Value) -> u64 {
+    flow.get("steps")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 /// A JSON scalar without quotes, everything else as compact JSON.

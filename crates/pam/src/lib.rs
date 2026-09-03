@@ -26,6 +26,16 @@
 //!   terminal event (quiet).
 //! - `pam subscribe <ticket> [--timeout-ms N]` — same wait, printing
 //!   every event as it arrives.
+//! - `pam flow list [--json]` — the flows this machine has, as
+//!   `id  source  steps  name` (an unparsable file says why instead).
+//! - `pam flow show <id>` — that flow's canonical YAML.
+//! - `pam flow run <id> [KEY=VALUE]... [--no-wait] [--deadline-ms N]
+//!   [--json]` — run a flow and print its verdict: one line per step,
+//!   the summary sentence, and any step summary text. The deadline
+//!   defaults to 30 minutes, because a flow that runs `cargo test` is
+//!   not a 60 s request. The whole run travels in **one** request, so
+//!   nothing prints until it ends; to watch it step by step, start it
+//!   with `--no-wait` and follow the ticket with `pam subscribe`.
 //! - `pam daemon` — run the daemon in the foreground;
 //!   `pam daemon stop` — signal the running daemon to drain and exit.
 //! - `pam gui` — open the desktop control center window.

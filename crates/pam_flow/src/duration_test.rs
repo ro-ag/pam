@@ -5,9 +5,9 @@ use super::duration::{DurationError, format_duration, parse_duration};
 #[test]
 fn parses_every_unit() {
     assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
-    assert_eq!(parse_duration("60s"), Ok(Duration::from_secs(60)));
-    assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
-    assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
+    assert_eq!(parse_duration("60s"), Ok(Duration::from_mins(1)));
+    assert_eq!(parse_duration("2m"), Ok(Duration::from_mins(2)));
+    assert_eq!(parse_duration("1h"), Ok(Duration::from_hours(1)));
     assert_eq!(parse_duration("0s"), Ok(Duration::ZERO));
 }
 
@@ -49,9 +49,9 @@ fn reports_overflow_instead_of_wrapping() {
 fn formats_the_shortest_exact_unit() {
     assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
     assert_eq!(format_duration(Duration::from_secs(45)), "45s");
-    assert_eq!(format_duration(Duration::from_secs(120)), "2m");
-    assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
-    assert_eq!(format_duration(Duration::from_secs(5400)), "90m");
+    assert_eq!(format_duration(Duration::from_mins(2)), "2m");
+    assert_eq!(format_duration(Duration::from_hours(1)), "1h");
+    assert_eq!(format_duration(Duration::from_mins(90)), "90m");
     assert_eq!(format_duration(Duration::ZERO), "0s");
     assert_eq!(format_duration(Duration::from_micros(1500)), "1ms");
 }

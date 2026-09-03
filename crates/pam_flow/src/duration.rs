@@ -33,7 +33,7 @@ const SECONDS_PER_HOUR: u64 = 3_600;
 ///
 /// ```
 /// use std::time::Duration;
-/// assert_eq!(pam_flow::parse_duration("2m"), Ok(Duration::from_secs(120)));
+/// assert_eq!(pam_flow::parse_duration("2m"), Ok(Duration::from_mins(2)));
 /// ```
 pub fn parse_duration(text: &str) -> Result<Duration, DurationError> {
     let trimmed = text.trim();
@@ -52,7 +52,9 @@ pub fn parse_duration(text: &str) -> Result<Duration, DurationError> {
         "h" => value.checked_mul(SECONDS_PER_HOUR * MILLIS_PER_SECOND),
         _ => return Err(DurationError::Malformed),
     };
-    millis.map(Duration::from_millis).ok_or(DurationError::Overflow)
+    millis
+        .map(Duration::from_millis)
+        .ok_or(DurationError::Overflow)
 }
 
 /// Renders a duration in the largest unit that keeps it exact.
@@ -63,7 +65,7 @@ pub fn parse_duration(text: &str) -> Result<Duration, DurationError> {
 ///
 /// ```
 /// use std::time::Duration;
-/// assert_eq!(pam_flow::format_duration(Duration::from_secs(120)), "2m");
+/// assert_eq!(pam_flow::format_duration(Duration::from_mins(2)), "2m");
 /// ```
 #[must_use]
 pub fn format_duration(duration: Duration) -> String {
@@ -71,14 +73,14 @@ pub fn format_duration(duration: Duration) -> String {
     if millis == 0 {
         return "0s".to_string();
     }
-    if millis % MILLIS_PER_SECOND != 0 {
+    if !millis.is_multiple_of(MILLIS_PER_SECOND) {
         return format!("{millis}ms");
     }
     let seconds = millis / MILLIS_PER_SECOND;
-    if seconds % SECONDS_PER_HOUR == 0 {
+    if seconds.is_multiple_of(SECONDS_PER_HOUR) {
         return format!("{}h", seconds / SECONDS_PER_HOUR);
     }
-    if seconds % SECONDS_PER_MINUTE == 0 {
+    if seconds.is_multiple_of(SECONDS_PER_MINUTE) {
         return format!("{}m", seconds / SECONDS_PER_MINUTE);
     }
     format!("{seconds}s")

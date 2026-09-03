@@ -27,13 +27,13 @@ pub enum ConnectorId {
     Github,
     /// Jenkins.
     Jenkins,
-    /// SonarQube.
+    /// `SonarQube`.
     Sonarqube,
     /// Jira Data Center.
     Jira,
     /// Confluence Cloud.
     Confluence,
-    /// SharePoint through Microsoft Graph.
+    /// `SharePoint` through Microsoft Graph.
     Sharepoint,
     /// Allowlisted read-only AWS CLI passthrough.
     Aws,
@@ -218,13 +218,10 @@ impl<'de> Deserialize<'de> for When {
             },
             Repr::Reference(map) => {
                 let mut entries = map.into_iter();
-                let (key, step) = match (entries.next(), entries.next()) {
-                    (Some(entry), None) => entry,
-                    _ => {
-                        return Err(serde::de::Error::custom(format!(
-                            "`when` takes exactly one condition; expected {WHEN_SHAPES}"
-                        )));
-                    }
+                let (Some((key, step)), None) = (entries.next(), entries.next()) else {
+                    return Err(serde::de::Error::custom(format!(
+                        "`when` takes exactly one condition; expected {WHEN_SHAPES}"
+                    )));
                 };
                 match key.as_str() {
                     "succeeded" => Ok(Self::Succeeded(step)),

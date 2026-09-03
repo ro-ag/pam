@@ -43,7 +43,10 @@ fn a_full_featured_flow_deserializes() {
     assert_eq!(flow.schema, 1);
     assert_eq!(flow.id, "full");
     assert_eq!(flow.name, "Full featured");
-    assert_eq!(flow.inputs["repo"].default.as_deref(), Some("${repo.origin}"));
+    assert_eq!(
+        flow.inputs["repo"].default.as_deref(),
+        Some("${repo.origin}")
+    );
     assert_eq!(flow.steps.len(), 2);
 
     let first = &flow.steps[0];
@@ -67,7 +70,10 @@ fn a_full_featured_flow_deserializes() {
     let retry = second.retry.as_ref().expect("retry");
     assert_eq!(retry.attempts, 2);
     assert_eq!(retry.backoff.as_deref(), Some("500ms"));
-    assert_eq!(second.env.as_ref().expect("env")["CARGO_TERM_COLOR"], "never");
+    assert_eq!(
+        second.env.as_ref().expect("env")["CARGO_TERM_COLOR"],
+        "never"
+    );
 }
 
 #[test]
@@ -79,8 +85,9 @@ fn an_unknown_flow_key_names_the_key() {
 
 #[test]
 fn an_unknown_step_key_names_the_key() {
-    let err = raw("schema: 1\nid: x\nname: X\nsteps:\n  - id: a\n    run: [git]\n    shell: true\n")
-        .expect_err("unknown key rejected");
+    let err =
+        raw("schema: 1\nid: x\nname: X\nsteps:\n  - id: a\n    run: [git]\n    shell: true\n")
+            .expect_err("unknown key rejected");
     assert!(err.to_string().contains("shell"), "{err}");
 }
 
@@ -189,7 +196,7 @@ fn step_defaults() -> Step {
     Step {
         id: String::new(),
         action: Action::Command { argv: Vec::new() },
-        timeout: Duration::from_secs(300),
+        timeout: Duration::from_mins(5),
         effect: Effect::ReadOnly,
         role: Role::Observe,
         output: OutputPolicy::Compact,

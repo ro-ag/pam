@@ -89,6 +89,37 @@ export function daemonStop(): Promise<DaemonStopReply> {
   return bridged<DaemonStopReply>("daemon_stop");
 }
 
+// --- login-start service ---------------------------------------------------
+
+/** Where the platform's login-start unit stands (`pam_client::service`). */
+export type ServiceState =
+  | { kind: "installed"; unit: string; loaded: boolean }
+  | { kind: "not_installed"; unit: string }
+  | { kind: "unsupported"; reason: string };
+
+/** What `pam service …` and the three service commands answer. */
+export interface ServiceReport {
+  platform: string;
+  exe: string;
+  state: ServiceState;
+  note: string | null;
+}
+
+/** Whether the login-start unit exists and is loaded. */
+export function serviceStatus(): Promise<ServiceReport> {
+  return bridged<ServiceReport>("service_status");
+}
+
+/** Registers the unit and starts the managed daemon (a loose one is stopped first). */
+export function serviceInstall(): Promise<ServiceReport> {
+  return bridged<ServiceReport>("service_install");
+}
+
+/** Unregisters and removes the unit; the daemon keeps running. */
+export function serviceUninstall(): Promise<ServiceReport> {
+  return bridged<ServiceReport>("service_uninstall");
+}
+
 // --- admin operations ------------------------------------------------------
 
 /** The admin ops the bridge whitelists (`pam_daemon::admin` op names). */

@@ -34,6 +34,9 @@ fn main() {
         "daemon_stop",
         "events_subscribe",
         "read_daemon_log",
+        "service_status",
+        "service_install",
+        "service_uninstall",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run the tauri build script for pam");

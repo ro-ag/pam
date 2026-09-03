@@ -18,6 +18,7 @@ pub mod log_service;
 pub mod model_service;
 pub mod policy;
 pub mod queue;
+pub mod retention;
 pub mod runtime_dir;
 pub mod secrets;
 pub mod transport;
@@ -54,6 +55,8 @@ mod model_service_test;
 mod policy_test;
 #[cfg(test)]
 mod queue_test;
+#[cfg(test)]
+mod retention_test;
 #[cfg(test)]
 mod runtime_dir_test;
 #[cfg(test)]

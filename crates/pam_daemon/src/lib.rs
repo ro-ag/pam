@@ -7,6 +7,7 @@ pub mod admin_connectors;
 pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;
+pub mod admin_retention;
 pub mod approval;
 pub mod connector_service;
 pub mod daemon;
@@ -18,6 +19,7 @@ pub mod log_service;
 pub mod model_service;
 pub mod policy;
 pub mod queue;
+pub mod retention;
 pub mod runtime_dir;
 pub mod secrets;
 pub mod transport;
@@ -30,6 +32,8 @@ mod admin_flows_test;
 mod admin_logs_test;
 #[cfg(test)]
 mod admin_models_test;
+#[cfg(test)]
+mod admin_retention_test;
 #[cfg(test)]
 mod admin_test;
 #[cfg(test)]
@@ -54,6 +58,8 @@ mod model_service_test;
 mod policy_test;
 #[cfg(test)]
 mod queue_test;
+#[cfg(test)]
+mod retention_test;
 #[cfg(test)]
 mod runtime_dir_test;
 #[cfg(test)]

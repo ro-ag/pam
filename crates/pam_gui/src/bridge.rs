@@ -43,6 +43,7 @@ use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
 use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
+use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
 use pam_proto::Response;
 use serde::Serialize;
 
@@ -82,14 +83,16 @@ const CORE_ADMIN_OPS: [&str; 9] = [
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model,
-/// log, flow and connector surfaces, counted from the daemon's own lists.
+/// log, flow, connector and retention surfaces, counted from the
+/// daemon's own lists.
 const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len()
     + MODEL_ADMIN_OPS.len()
     + LOG_ADMIN_OPS.len()
     + FLOW_ADMIN_OPS.len()
-    + CONNECTOR_ADMIN_OPS.len();
+    + CONNECTOR_ADMIN_OPS.len()
+    + RETENTION_ADMIN_OPS.len();
 
-/// Splices the five daemon-owned lists into one array at compile time —
+/// Splices the six daemon-owned lists into one array at compile time —
 /// no op name is retyped here, so the whitelist cannot drift from the
 /// daemon's dispatch.
 const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
@@ -122,15 +125,21 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
         ops[index + connector] = CONNECTOR_ADMIN_OPS[connector];
         connector += 1;
     }
+    index += CONNECTOR_ADMIN_OPS.len();
+    let mut retention = 0;
+    while retention < RETENTION_ADMIN_OPS.len() {
+        ops[index + retention] = RETENTION_ADMIN_OPS[retention];
+        retention += 1;
+    }
     ops
 }
 
 /// Every admin op the bridge forwards; anything else is refused before
 /// touching the socket. Composed from `pam_daemon::admin`,
 /// `pam_daemon::admin_models`, `pam_daemon::admin_logs`,
-/// `pam_daemon::admin_flows` and `pam_daemon::admin_connectors` — the
-/// daemon would refuse an unknown op too, this just fails faster and
-/// keeps the GUI surface explicit.
+/// `pam_daemon::admin_flows`, `pam_daemon::admin_connectors` and
+/// `pam_daemon::admin_retention` — the daemon would refuse an unknown op
+/// too, this just fails faster and keeps the GUI surface explicit.
 pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();
 
 /// True when `op` is an admin operation the bridge forwards.

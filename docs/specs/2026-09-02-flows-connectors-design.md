@@ -199,19 +199,19 @@ Read-only calls (arguments in parentheses, `*` required):
 
 | connector | auth | calls |
 | --- | --- | --- |
-| github | Bearer PAT; `GET /user` verifies | `runs(repo*, status=failure, limit=5)` → `GET /repos/{repo}/actions/runs`; `run(repo*, run_id*)` → run + `/attempts/{n}/jobs`; `job_log(repo*, job_id*)` → `/actions/jobs/{id}/logs` (Log; `exit_status` 1 when the job concluded `failure`, 0 on `success`, unknown otherwise) |
-| jenkins | Basic `user:token`; `GET /me/api/json` verifies | `jobs(limit=50)` → `/api/json?tree=jobs[...]`; `builds(job*, limit=20)` → `/{job}/api/json?tree=builds[...]`; `console(job*, build*)` → `/{job}/{build}/consoleText` (Log; `exit_status` from the build `result`) |
+| github | Bearer PAT; `GET /user` verifies | `runs(repo*, status=failure, limit=5)` → `GET /repos/{repo}/actions/runs`; `run(repo*, run_id*)` → run + `/attempts/{n}/jobs` (jobs ordered failed-first so `jobs[0]` is the one to read); `job_log(repo*, job_id*)` → `/actions/jobs/{id}/logs` (Log; `exit_status` 1 when the job concluded `failure`, 0 on `success`, unknown otherwise) |
+| jenkins | Basic `user:token`; `GET /me/api/json` verifies | `jobs(limit=50)` → `/api/json?tree=jobs[...]`; `builds(job*, limit=20)` → `/{job}/api/json?tree=builds[...]`; `console(job*, build*)` → `/{job}/{build}/consoleText` (Log; `build` is a number, `exit_status` from the build `result`) |
 | sonarqube | token as Basic user; `GET /api/authentication/validate` must answer `valid: true` | `quality_gate(project*)` → `/api/qualitygates/project_status`; `issues(project*, limit=50)` → `/api/issues/search?resolved=false` (result carries `partial: true` when more remain) |
 | jira (Data Center) | Bearer personal access token; `GET /rest/api/2/myself` must carry `name` or `key` | `search(jql*, limit=20)` → `/rest/api/2/search?jql&maxResults&fields=summary,status,issuetype,priority,assignee,updated` (`partial` when `total` exceeds the page); `issue(key*)` → `/rest/api/2/issue/{key}?fields=…` (description cut at 16 KiB, marked partial) |
 | confluence (Cloud) | Basic `email:api-token` (split at the first `:`); `GET /rest/api/user/current` must carry `accountId` or `displayName` | `search(cql*, limit=20)` → `/rest/api/content/search?cql&limit&expand=space,version` (`partial` from `totalSize` or `_links.next`); `page(id*)` → `/rest/api/content/{id}?expand=body.storage,space,version` (body cut at 64 KiB, partial) |
-| sharepoint (Microsoft Graph) | Bearer Graph token; base URL is the Graph root (sovereign clouds are just another base); `GET /sites/root` must carry `id` | `documents(site*, query*, limit=20)` → `/sites/{site}/drive/root/search(q='{query}')?$top` (query refuses `'`); `lists(site*, limit=20)` → `/sites/{site}/lists?$top` (`partial` from `@odata.nextLink` or a full page) |
-| aws | nothing stored; the local `aws` CLI resolves `~/.aws`; optional `profile` (`[A-Za-z0-9_.-]{1,64}`, no leading `-`) stored in the row's `username`; `sts get-caller-identity` must carry `Account` and `Arn` (non-zero exit = `Auth`) | `commands()` → the allowlist itself, no child; `cli(service*, command*, args=[])` → `aws <service> <command> <args…> [--profile P] --output json --no-cli-pager`, stdout ≤ 256 KiB (`partial` when cut), stderr ≤ 4 KiB, 30 s cap, missing binary → `NotFound` with the install line |
+| sharepoint (Microsoft Graph) | Bearer Graph token; base URL is the Graph root (sovereign clouds are just another base); `GET /sites/root` must carry `id` | `documents(site*, query*, limit=20)` → `/sites/{site}/drive/root/search(q='{query}')?$top` (query refuses `'`); `lists(site*, limit=20)` → `/sites/{site}/lists?$top` (`partial` from `@odata.nextLink` or a full page). `site` is `root` or the composite `host,siteId,webId` id |
+| aws | nothing stored; the local `aws` CLI resolves `~/.aws`; optional `profile` (`[A-Za-z0-9_.-]{1,64}`, no leading `-`) stored in the row's `username`; the row's base URL is the reserved `https://aws.invalid/` (`AWS_BASE_URL`); `sts get-caller-identity` must carry `Account` and `Arn` (non-zero exit = `Auth`) | `commands()` → the allowlist itself, no child; `cli(service*, command*, args="")` — `args` is one string split on ASCII whitespace, each token validated like a command arg → `aws <service> <command> <args…> [--profile P] --output json --no-cli-pager`, stdout ≤ 256 KiB (`partial` when cut), stderr ≤ 4 KiB, 30 s cap, missing binary → `CliMissing` with the install line |
 
 JSON responses are capped at 1 MiB (`TooLarge` beyond); every
 `partial` flag rides into the step's `connector.result` so a verdict
 never claims completeness it does not have.
 
-AWS allowlist, exact `(service, command)` pairs (pam-old's 25):
+AWS allowlist, exact `(service, command)` pairs (pam-old's 26):
 `sts get-caller-identity` · `ec2 describe-instances`,
 `describe-security-groups`, `describe-vpcs`, `describe-subnets` ·
 `s3api list-buckets`, `list-objects-v2`, `get-bucket-location` ·
@@ -266,8 +266,12 @@ a minimal PATH, so without this cargo never resolves.
 compile time (pam-old's `pam_platform::secrets`, trimmed): service
 `dev.pam.connector`, account `pam.connector.v1.<connector id>`;
 `get/set/delete` run under `spawn_blocking`; errors sanitized to
-`Unavailable | Denied | Missing` (platform text goes to the daemon log
-only). A `FakeSecretStore` (in-memory) is injected by tests through
+`Unavailable | Denied` (a missing entry is `None`; platform text goes
+to the daemon log only). The native store opens **lazily on first
+use, from the blocking pool** — the Linux Secret Service client spins
+up its own runtime when it opens, which panicked at boot on a tokio
+worker; boot never touches the keychain. `Secret` (zeroized, redacted
+`Debug`) is defined here and converted at the connector boundary. A `FakeSecretStore` (in-memory) is injected by tests through
 `DaemonConfig::secret_store: Option<Arc<dyn SecretBackend>>`. macOS
 warm-up at daemon start (one `get` on a background task, logged with
 elapsed ms); no probe on Linux (session-bus hang, memento).
@@ -370,8 +374,17 @@ normalized_yaml, digest, valid, error? }`.
 Capabilities: `flow.run` classifies `NonDestructive` (a flow is a
 recipe; its steps carry their own class), `flow.list` and `flow.show`
 `ReadOnly`. `BuiltinCapability` gains `FlowRun`, `FlowList`,
-`FlowShow`; `ExecContext` gains `flows: Arc<FlowService>` and
-`caller: Caller`.
+`FlowShow`; `ExecContext` gains `flows: Arc<FlowService>`,
+`approvals`, and `caller: Caller`. `flow_not_found`, `flow_invalid`,
+`input_missing`, `repo_missing` (and `library_unreadable` from
+`list`/`show`) answer as refusals through a new
+`CapabilityFailure::Refused`, audited as `execution_refused`. Because
+connector steps classify `External`, the first run of a connector step
+under the relaxed profile pauses for approval; remember keeps that
+flow/step. Connector failures a human fixes from Settings (disabled,
+credential, base URL, keychain, missing curl) block the step; a service
+that answered badly fails it. Kill reaches the direct child only;
+grandchildren are not chased in this plan.
 
 ### Admin ops (GUI-only, same intercept)
 

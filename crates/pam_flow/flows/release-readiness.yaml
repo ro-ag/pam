@@ -1,0 +1,22 @@
+schema: 1
+id: release-readiness
+name: Release readiness
+description: >-
+  Check a repository is ready to tag: nothing uncommitted, the last tag in
+  view, the test suite green, and the package contents as cargo would ship
+  them.
+steps:
+  - id: clean-tree
+    run: [git, status, --short]
+    role: verify
+  - id: last-tag
+    run: [git, describe, --tags, --abbrev=0]
+  - id: tests
+    run: [cargo, test, --workspace]
+    role: verify
+    output: summarize
+    timeout: 30m
+  - id: package-contents
+    run: [cargo, package, --list, --allow-dirty]
+    role: verify
+    timeout: 10m

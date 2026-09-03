@@ -1,0 +1,11 @@
+schema: 1
+id: summarize-build-log
+name: Summarize the build log
+description: >-
+  Build every target and hand back a summary of the log instead of the log:
+  the failures first, with the noise compressed away.
+steps:
+  - id: build
+    run: [cargo, build, --all-targets]
+    output: summarize
+    timeout: 30m

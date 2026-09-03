@@ -116,24 +116,37 @@ pub enum CapabilityClass {
 
 /// Static capability registry: what each known capability may do.
 ///
-/// Known capabilities so far: `status` (read-only), `query` (read-only
+/// Known capabilities: `status` (read-only), `query` (read-only
 /// ticket-state lookup backing `pam wait` / `pam subscribe`), `echo`
-/// (the first executor capability, non-destructive), and `cancel` (the
-/// built-in behind `pam cancel <ticket>`). Connectors and flows register their
-/// capabilities later, when the connector host lands; until then the
-/// table is static. An unknown capability classifies as `None` and the
-/// gate refuses it with cause [`CAUSE_UNKNOWN_CAPABILITY`].
+/// (the first executor capability, non-destructive), `cancel` (the
+/// built-in behind `pam cancel <ticket>`), and the three flow
+/// capabilities. The table is static by design — the registry is not
+/// something a request can extend. An unknown capability classifies as
+/// `None` and the gate refuses it with cause
+/// [`CAUSE_UNKNOWN_CAPABILITY`].
 ///
 /// `cancel` does mutate state (it fails the target request), but it is
 /// deliberately classed `ReadOnly`: a cancellation must never queue
 /// behind the very work it cancels, and the read-only class is what
 /// gives it the grant bypass and the lane bypass. Its effect is bounded
 /// to pam's own bookkeeping — nothing outside the daemon changes.
+///
+/// `flow.run` is `NonDestructive` for the same kind of reason turned
+/// around: a flow is a recipe, and running one changes nothing by
+/// itself. Every step that *could* change something is gated
+/// individually inside the run, under its own
+/// `flow.step:<flow>/<step>` capability name — so the class here
+/// governs admission and lanes, and the steps govern damage (see
+/// [`crate::flow_service`]).
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {
-        "status" | "cancel" | "query" => Some(CapabilityClass::ReadOnly),
-        "echo" => Some(CapabilityClass::NonDestructive),
+        "status"
+        | "cancel"
+        | "query"
+        | crate::flow_service::CAP_FLOW_LIST
+        | crate::flow_service::CAP_FLOW_SHOW => Some(CapabilityClass::ReadOnly),
+        "echo" | crate::flow_service::CAP_FLOW_RUN => Some(CapabilityClass::NonDestructive),
         _ => None,
     }
 }
@@ -235,9 +248,14 @@ impl PolicyGate {
             .await
     }
 
-    /// [`Self::evaluate`] after classification; also the seam the tests
-    /// use to exercise classes the static registry does not contain yet.
-    pub(crate) async fn evaluate_classified(
+    /// [`Self::evaluate`] after classification.
+    ///
+    /// Public because a flow's steps are gated one at a time under names
+    /// the static registry does not (and must not) carry: the engine
+    /// classifies each step itself and evaluates it here. It is also the
+    /// seam the tests use to exercise classes no registered capability
+    /// has yet.
+    pub async fn evaluate_classified(
         &self,
         request_id: &str,
         capability: &str,

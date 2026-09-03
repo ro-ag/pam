@@ -4037,6 +4037,7 @@ dependencies = [
  "keyring-core",
  "pam_compact",
  "pam_connectors",
+ "pam_flow",
  "pam_model",
  "pam_proto",
  "pam_store",

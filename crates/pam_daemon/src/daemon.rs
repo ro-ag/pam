@@ -187,7 +187,10 @@ use tokio::time::timeout;
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::connector_service::ConnectorService;
-use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
+use crate::executor::{
+    BuiltinCapability, CapabilityFailure, CapabilityOutput, ExecContext, outcome_str,
+};
+use crate::flow_service::FlowService;
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
@@ -230,6 +233,11 @@ pub const ACTION_GATE_REFUSAL: &str = "gate_refusal";
 /// `audit.action` for an execution outcome (success or failure).
 pub const ACTION_EXECUTE: &str = "execute";
 
+/// `audit.action` for a refusal an executing capability itself decided
+/// ([`CapabilityFailure::Refused`]) — the request named something that
+/// does not exist, or is not usable as asked.
+pub const ACTION_EXECUTION_REFUSAL: &str = "execution_refused";
+
 /// `audit.action` for a deadline refusal sent to a waiting caller.
 pub const ACTION_DEADLINE_REFUSAL: &str = "deadline_refusal";
 
@@ -244,6 +252,7 @@ pub const ACTION_INTERNAL_FAILURE: &str = "internal_failure";
 pub const TERMINAL_ACTIONS: &[&str] = &[
     ACTION_GATE_REFUSAL,
     ACTION_EXECUTE,
+    ACTION_EXECUTION_REFUSAL,
     ACTION_DEADLINE_REFUSAL,
     ACTION_INTERNAL_FAILURE,
     ACTION_ADMIN,
@@ -572,7 +581,7 @@ pub async fn run_daemon_with(
             "crash recovery failed stuck in-flight rows from a previous daemon"
         );
     }
-    let gate = PolicyGate::new(Arc::clone(&store)).await?;
+    let gate = Arc::new(PolicyGate::new(Arc::clone(&store)).await?);
     let models = ModelService::new(Arc::clone(&store)).await?;
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let secrets = open_secret_store(config.secret_backend);
@@ -589,12 +598,20 @@ pub async fn run_daemon_with(
     queue.rebuild_from_store().await?;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CAPACITY);
-    let transport = Transport::bind(&dirs, incoming_tx).await?;
+    let transport = Transport::bind(&dirs, incoming_tx.clone()).await?;
 
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
         transport.event_publisher(),
         config.approval_timeout,
+    ));
+    let flows = Arc::new(FlowService::new(
+        &base,
+        Arc::clone(&store),
+        Arc::clone(&approvals),
+        Arc::clone(&connectors),
+        Arc::clone(&logs),
+        Arc::clone(&gate),
     ));
     let (phase, _) = watch::channel(LifecyclePhase::Serving);
     // Drain stops the lease-granting side (executor loop, reaper);
@@ -612,7 +629,10 @@ pub async fn run_daemon_with(
             Arc::clone(&models),
             logs,
             connectors,
+            Arc::clone(&flows),
+            incoming_tx.clone(),
         ),
+        flows,
         models: Arc::clone(&models),
         events: transport.event_publisher(),
         router: CompletionRouter::new(),
@@ -747,13 +767,16 @@ async fn lifecycle_task(
 /// task.
 struct Pipeline {
     store: Arc<Store>,
-    gate: PolicyGate,
+    gate: Arc<PolicyGate>,
     queue: Arc<QueueManager>,
     approvals: Arc<ApprovalService>,
     /// GUI-only admin surface; envelopes under the reserved `admin.`
     /// prefix are handed here **before** classify/admit and never touch
     /// the gate, grants, or lanes (see [`crate::admin`]).
     admin: AdminService,
+    /// The flow engine, carried into every [`ExecContext`] so the three
+    /// `flow.*` capabilities can reach it.
+    flows: Arc<FlowService>,
     /// The model layer, carried into every [`ExecContext`] so the
     /// `status` capability can report it.
     models: Arc<ModelService>,
@@ -1132,7 +1155,13 @@ impl Pipeline {
                 )
                 .await;
         };
-        let ctx = self.exec_context(id.clone(), envelope.args.clone(), cancel);
+        let ctx = self.exec_context(
+            id.clone(),
+            envelope.capability.clone(),
+            envelope.caller.clone(),
+            envelope.args.clone(),
+            cancel,
+        );
         match timeout(
             Duration::from_millis(envelope.deadline_ms),
             capability.execute(ctx),
@@ -1176,6 +1205,14 @@ impl Pipeline {
             Ok(Err(CapabilityFailure::Failed { detail })) => {
                 self.fail_bypass(id, &envelope.capability, &detail).await
             }
+            Ok(Err(CapabilityFailure::Refused {
+                cause,
+                detail,
+                recovery,
+            })) => {
+                self.refuse_execution(id, &envelope.capability, cause, detail, recovery)
+                    .await
+            }
             Err(_elapsed) => {
                 let detail = serde_json::json!({ "deadline_ms": envelope.deadline_ms }).to_string();
                 let _ = self
@@ -1215,7 +1252,16 @@ impl Pipeline {
         let result = match BuiltinCapability::from_name(&row.capability) {
             Some(capability) => {
                 let args = serde_json::from_str(&row.args_json).unwrap_or(serde_json::Value::Null);
-                let ctx = self.exec_context(id.clone(), args, cancel);
+                // The row keeps the caller's agent and repo but not its
+                // pid — attribution needs the first two, and nothing a
+                // capability does is keyed on the third.
+                let caller = pam_proto::Caller {
+                    agent: row.caller_agent.clone(),
+                    repo: row.repo.clone(),
+                    pid: 0,
+                };
+                let ctx =
+                    self.exec_context(id.clone(), row.capability.clone(), caller, args, cancel);
                 capability.execute(ctx).await
             }
             // The gate classified it, so this only fires on registry
@@ -1225,79 +1271,128 @@ impl Pipeline {
             }),
         };
 
+        self.complete_leased(&id, &row.capability, result).await;
+        // The lane is free again.
+        self.work.notify_one();
+    }
+
+    /// Records one leased execution's terminal state: the row and its
+    /// single audit entry through the queue, the event, and the waiters'
+    /// response. Each arm is one of the four documented terminal paths
+    /// (see the module docs on the audit invariant).
+    async fn complete_leased(
+        &self,
+        id: &str,
+        capability: &str,
+        result: Result<CapabilityOutput, CapabilityFailure>,
+    ) {
         match result {
-            Ok(output) => {
-                let audit_detail = execute_success_detail(&row.capability, output.outcome);
-                let terminal = self
-                    .queue
-                    .complete(
-                        &id,
-                        RequestState::Done,
-                        Some(outcome_str(output.outcome)),
-                        execute_success_entry(&audit_detail),
-                    )
-                    .await;
-                log_terminal_failure(&id, &terminal);
-                if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(&id, Event::Done).await;
-                    self.router
-                        .finish(
-                            &id,
-                            Response::Result {
-                                id: id.clone(),
-                                outcome: output.outcome,
-                                body: output.body,
-                                evidence: output.evidence,
-                            },
-                        )
-                        .await;
-                } else {
-                    // The lease was reaped first: the reaper wrote the
-                    // terminal row and audit; release any waiters.
-                    self.finish_reaped(&id).await;
-                }
-            }
+            Ok(output) => self.complete_succeeded(id, capability, output).await,
             Err(CapabilityFailure::Cancelled) => {
                 let audit_detail = cancelled_detail();
                 let terminal = self
                     .queue
                     .complete(
-                        &id,
+                        id,
                         RequestState::Failed,
                         Some(CAUSE_CANCELLED),
                         cancelled_entry(&audit_detail),
                     )
                     .await;
-                log_terminal_failure(&id, &terminal);
+                log_terminal_failure(id, &terminal);
                 if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(&id, Event::Refused).await;
-                    self.router.finish(&id, cancelled_refusal(&id)).await;
+                    let _ = self.events.publish(id, Event::Refused).await;
+                    self.router.finish(id, cancelled_refusal(id)).await;
                 } else {
-                    self.finish_reaped(&id).await;
+                    self.finish_reaped(id).await;
                 }
             }
             Err(CapabilityFailure::Failed { detail }) => {
-                let audit_detail = execute_failure_detail(&row.capability, &detail);
+                let audit_detail = execute_failure_detail(capability, &detail);
                 let terminal = self
                     .queue
                     .complete(
-                        &id,
+                        id,
                         RequestState::Failed,
                         Some(CAUSE_EXECUTION_FAILED),
                         execute_failure_entry(&audit_detail),
                     )
                     .await;
-                log_terminal_failure(&id, &terminal);
+                log_terminal_failure(id, &terminal);
                 if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(&id, Event::Refused).await;
-                    self.router.finish(&id, failure_refusal(&id, detail)).await;
+                    let _ = self.events.publish(id, Event::Refused).await;
+                    self.router.finish(id, failure_refusal(id, detail)).await;
                 } else {
-                    self.finish_reaped(&id).await;
+                    self.finish_reaped(id).await;
+                }
+            }
+            Err(CapabilityFailure::Refused {
+                cause,
+                detail,
+                recovery,
+            }) => {
+                let audit_detail = execution_refusal_detail(capability, &cause, &detail);
+                let terminal = self
+                    .queue
+                    .complete(
+                        id,
+                        RequestState::Refused,
+                        Some(&cause),
+                        execution_refusal_entry(&audit_detail),
+                    )
+                    .await;
+                log_terminal_failure(id, &terminal);
+                if matches!(terminal, Ok(true)) {
+                    let _ = self.events.publish(id, Event::Refused).await;
+                    self.router
+                        .finish(
+                            id,
+                            Response::Refusal {
+                                id: id.to_owned(),
+                                cause,
+                                detail,
+                                recovery,
+                            },
+                        )
+                        .await;
+                } else {
+                    self.finish_reaped(id).await;
                 }
             }
         }
-        // The lane is free again.
-        self.work.notify_one();
+    }
+
+    /// The success arm of [`Self::complete_leased`].
+    async fn complete_succeeded(&self, id: &str, capability: &str, output: CapabilityOutput) {
+        let audit_detail = execute_success_detail(capability, output.outcome);
+        let terminal = self
+            .queue
+            .complete(
+                id,
+                RequestState::Done,
+                Some(outcome_str(output.outcome)),
+                execute_success_entry(&audit_detail),
+            )
+            .await;
+        log_terminal_failure(id, &terminal);
+        if matches!(terminal, Ok(true)) {
+            let _ = self.events.publish(id, Event::Done).await;
+            self.router
+                .finish(
+                    id,
+                    Response::Result {
+                        id: id.to_owned(),
+                        outcome: output.outcome,
+                        body: output.body,
+                        evidence: output.evidence,
+                    },
+                )
+                .await;
+        } else {
+            // The lease was reaped first: the reaper wrote the terminal
+            // row and audit; release any waiters.
+            self.finish_reaped(id).await;
+        }
     }
 
     /// A leased request whose row cannot be read is unanswerable: record
@@ -1321,6 +1416,8 @@ impl Pipeline {
     fn exec_context(
         &self,
         request_id: String,
+        capability: String,
+        caller: pam_proto::Caller,
         args: serde_json::Value,
         cancel: watch::Receiver<bool>,
     ) -> ExecContext {
@@ -1333,6 +1430,10 @@ impl Pipeline {
             queue: Arc::clone(&self.queue),
             models: Arc::clone(&self.models),
             router: self.router.clone(),
+            approvals: Arc::clone(&self.approvals),
+            flows: Arc::clone(&self.flows),
+            caller,
+            capability,
             started_at: self.started_at,
         }
     }
@@ -1432,6 +1533,38 @@ impl Pipeline {
         failure_refusal(id, detail.to_owned())
     }
 
+    /// Terminal handling for a capability that refused the request
+    /// itself (bypass path): state `refused`, the executor's own
+    /// [`ACTION_EXECUTION_REFUSAL`] row, decision `refuse`, actor
+    /// `policy` — the capability decided, on policy grounds, that there
+    /// was nothing to run.
+    async fn refuse_execution(
+        &self,
+        id: &str,
+        capability: &str,
+        cause: String,
+        detail: String,
+        recovery: String,
+    ) -> Response {
+        let audit_detail = execution_refusal_detail(capability, &cause, &detail);
+        let _ = self
+            .store
+            .finish_request(
+                id,
+                RequestState::Refused,
+                Some(&cause),
+                execution_refusal_entry(&audit_detail),
+            )
+            .await;
+        let _ = self.events.publish(id, Event::Refused).await;
+        Response::Refusal {
+            id: id.to_owned(),
+            cause,
+            detail,
+            recovery,
+        }
+    }
+
     /// Tears a deadline-expired waiting request down: cancel through the
     /// queue (whichever side holds it records the terminal state), audit
     /// the refusal, tell subscribers, answer the caller.
@@ -1524,6 +1657,26 @@ fn execute_failure_entry(detail: &str) -> AuditEntry<'_> {
         action: ACTION_EXECUTE,
         decision: Decision::Refuse,
         actor: Actor::System,
+        detail: Some(detail),
+    }
+}
+
+/// Audit detail for a refusal the capability itself decided.
+fn execution_refusal_detail(capability: &str, cause: &str, detail: &str) -> String {
+    serde_json::json!({
+        "capability": capability,
+        "cause": cause,
+        "detail": detail,
+    })
+    .to_string()
+}
+
+/// Terminal audit entry for a refusal the capability itself decided.
+fn execution_refusal_entry(detail: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action: ACTION_EXECUTION_REFUSAL,
+        decision: Decision::Refuse,
+        actor: Actor::Policy,
         detail: Some(detail),
     }
 }

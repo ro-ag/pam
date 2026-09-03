@@ -55,12 +55,22 @@ async fn fixture() -> Fixture {
     models.set_models_dir(dir.path()).await.unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let flows = crate::flow_service_test::flows_for_tests(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        &store,
+        &approvals,
+        &connectors,
+        &logs,
+    )
+    .await;
     let admin = AdminService::new(
         Arc::clone(&store),
         approvals,
         Arc::clone(&models),
         logs,
         connectors,
+        flows,
+        crate::flow_service_test::closed_submit(),
     );
     Fixture {
         store,

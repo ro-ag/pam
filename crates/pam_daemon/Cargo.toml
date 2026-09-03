@@ -12,6 +12,8 @@ pam_compact.workspace = true
 # the seven read-only connectors a flow step and the Connectors screen
 # reach through (`connector_service.rs`).
 pam_connectors.workspace = true
+# the flow schema, validator and library the engine runs (`flow_service.rs`).
+pam_flow.workspace = true
 pam_model.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true
@@ -32,6 +34,17 @@ zeromq.workspace = true
 # per-OS backend crate below is the only one actually built on each
 # target. Pure Rust — no C compile step.
 keyring-core = "=1.0.0"
+
+# A child process with four endings the flow engine's tests need (a clean
+# exit, a bad one, one that outlives its timeout, one that floods the output
+# cap). Always built rather than gated behind a `testing` feature: Cargo only
+# sets CARGO_BIN_EXE_pam-flow-helper when the binary is built, and a plain
+# `cargo test --workspace` does not turn such a feature on. It costs the
+# shipped product nothing — Cargo never builds a dependency's binaries, and
+# `pam` depends on this crate as a library.
+[[bin]]
+name = "pam-flow-helper"
+path = "src/bin/pam-flow-helper.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "=1.0.2", features = ["keychain"] }

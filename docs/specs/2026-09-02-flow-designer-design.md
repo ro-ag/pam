@@ -47,8 +47,9 @@ from `admin.flows.get` (and now from `admin.flows.normalize`).
 
 | node | source | shape |
 | --- | --- | --- |
-| step, `command` | `steps[i].action.kind == "command"` | raised card, `Terminal` glyph, argv preview |
-| step, `connector` | `steps[i].action.kind == "connector"` | raised card, `Plug` glyph, `connector · call` |
+| step, `command` | `steps[i].action.kind == "command"` | rail card, `Terminal` glyph, argv preview |
+| step, `connector` | `steps[i].action.kind == "connector"` | rail card, `Plug` glyph, `connector · call` |
+| note | `steps[i].note`, non-empty | surface note beside the step, tethered to it; selects the step |
 | Inputs frame | `inputs` | surface panel listing declared inputs, opens the inputs inspector |
 | Verdict frame | fixed | surface panel with the five outcome chips (solved / changed / verified / unresolved / blocked), grey until a run paints one |
 
@@ -76,6 +77,7 @@ Every card shows an order chip `1…N` (its index in `steps`).
 | `when: { succeeded: x }` | step `x` → step `i` | success tint, pill label `succeeded` |
 | `when: { failed: x }` | step `x` → step `i` | danger tint, pill label `failed` |
 | implicit terminal | every step with no outgoing edge → Verdict | faint, not persisted, not selectable |
+| note tether | note node → its step | bezier, ink-faint, dotted, not selectable; annotation, never execution |
 
 A step has one target handle and one source handle. A new connection
 drawn by hand is a `needs` edge; the inspector flips a selected edge to
@@ -222,18 +224,37 @@ rendered under the canvas tab too). Notes are parsed with
 
 ## Visual language and tokens
 
-The frontend-design skill governs the implementation. Nodes reuse the
-Panel raised recipe (`rounded-card border-edge bg-surface-raised
-shadow-raise`), 220 px wide: header = glyph + step id in the display
-font + order chip; body = argv or `connector · call` in the data font,
-two lines, ellipsis; footer = modifier chips (Badge tones). Rims are a
-2 px ring: selected accent, running accent + breathe, succeeded
-success, failed / blocked danger, skipped ink-faint, cancelled warning,
-invalid danger + marker chip. Handles are 10 px pills in `line`, accent
-on hover and while connecting. Edges are smoothstep, `line`, 1.5 px;
-`when` edges tinted success / danger with a pill label; running edges
-dashed in accent. Canvas ground is `chrome` with a dot grid in
-`separator`; the minimap sits on `surface`.
+The frontend-design skill governs the implementation. A step is a
+**rail card** (owner decision, 2026-09-03): the Panel raised recipe
+(`rounded-card border-edge bg-surface-raised shadow-raise`), 224 px
+wide, two rows deep, with a 4 px rail down its left edge. The rail is
+the run's voice: `line` when idle, accent + breathe while running,
+success for succeeded, danger for failed / blocked, ink-faint for
+skipped, warning for cancelled. The header row is the kind glyph
+(`Terminal` accent / `Plug` copper, 12 px), the step id in the display
+font (its role as the title), the modifier glyphs, and the order number
+in the data font; the second row is argv or `connector · call` in the
+data font, one line, ellipsis. Modifiers are 12 px glyphs with
+aria-labels, never chips: `Hand` warning for approval, `Sparkles`
+accent for summarize, `Clock` ink-faint for a non-default timeout,
+`RotateCw` ink-faint for a non-default retry, `EyeOff` ink-faint for a
+discarded output, `Pencil` copper for stateful; the value rides in the
+glyph's title. The 2 px ring means selection and nothing else, except
+that a validation marker borrows it in danger together with the marker
+chip and the cause / fix popover. Handles are 10 px pills in `line`,
+accent on hover and while connecting.
+
+Edges follow one rule: **square means execution, curved means
+annotation**. Step edges are orthogonal step paths with 8 px corners
+(`getSmoothStepPath`, `borderRadius: 8`), `line`, 1.5 px; `when` edges
+tinted success / danger with a pill label; running edges dashed and
+marching in accent; the terminal edge faint. A step's `note` (a free
+string in the YAML) is drawn as its own node — a surface card in the
+voice font, italic, ink-muted, 192 px wide — placed beside the step and
+tethered to it by a bezier in ink-faint, 1 px, dotted (`2 4`, round
+caps). The tether has no hit area; selecting a note selects its step.
+Canvas ground is `chrome` with a dot grid in `separator`; the minimap
+sits on `surface`.
 
 Acceptance bar (measurable): side by side with the YAML tab the canvas
 reads as a designed product within 2 s; every rim, chip, and edge kind
@@ -349,3 +370,16 @@ the places the code differs and why.
   Save disabled, `slow-demo` run painting running / succeeded / skipped
   rims with the animated edge and the Verdict frame's `solved` chip, in
   all four theme × mode palettes.
+- Owner decision 2026-09-03, after reviewing the canvas boards: steps are
+  rail cards (the run status is a 4 px left rail, the ring is selection
+  only, the modifier chips became header glyphs with aria-labels, the
+  role is the id's title), step connectors are square (step paths, 8 px
+  corners), and step notes are curved (a note node per non-empty
+  `steps[i].note`, tethered by a dotted bezier, placed at the step's
+  position + (240, −8) unless a stored position exists, never sent to
+  ELK, re-placed beside its step on Tidy). Notes live in the YAML as
+  `note:` on the step; the GUI writes the key only when the trimmed text
+  is non-empty. `pam_flow`'s `RawStep` does not accept `note` yet, so
+  the daemon's normalize refuses a noted flow until that lands (the
+  rail-card change is GUI-only). The `when: always` chip has no glyph in the decision and
+  was dropped from the card; the inspector's "when" line still says it.

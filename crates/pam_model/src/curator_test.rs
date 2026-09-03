@@ -100,6 +100,22 @@ async fn invoke_fresh(
     invoke(cli, prompt, deadline).await
 }
 
+/// [`detect`] with the ETXTBSY harness race retried: a script this test
+/// just wrote can still be held open by another test thread's
+/// forked-but-not-yet-exec'd child, and `probe_version` reports that
+/// spawn failure as `None`. Retry briefly until every version is known;
+/// a real probe failure still surfaces after the bound.
+fn detect_fresh(path_env: &OsStr, deadline: Duration) -> Vec<AgentCli> {
+    for _ in 0..50 {
+        let found = detect(path_env, deadline);
+        if found.iter().all(|cli| cli.version.is_some()) {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    detect(path_env, deadline)
+}
+
 /// A `PATH` value covering exactly `dirs`.
 fn path_env(dirs: &[&Path]) -> OsString {
     std::env::join_paths(dirs).unwrap()
@@ -119,7 +135,7 @@ fn detect_finds_a_cli_and_keeps_the_first_version_line() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_fake(dir.path(), "claude", Fake::Version);
 
-    let found = detect(&path_env(&[dir.path()]), PROBE_DEADLINE);
+    let found = detect_fresh(&path_env(&[dir.path()]), PROBE_DEADLINE);
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, AgentId::Claude);

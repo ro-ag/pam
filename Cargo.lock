@@ -3986,6 +3986,8 @@ dependencies = [
  "pam_proto",
  "pam_store",
  "serde_json",
+ "tauri",
+ "tauri-build",
  "tempfile",
  "tokio",
 ]
@@ -4081,7 +4083,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tauri",
- "tauri-build",
  "tempfile",
  "tokio",
  "zeromq",

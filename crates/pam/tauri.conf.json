@@ -5,7 +5,9 @@
   "identifier": "com.github.ro-ag.pam",
   "mainBinaryName": "pam",
   "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../../frontend" },
     "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../frontend" },
     "frontendDist": "../../frontend/dist"
   },
   "app": {
@@ -32,8 +34,12 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "category": "DeveloperTool",
+    "publisher": "ro-ag",
+    "copyright": "Copyright © 2026 pam contributors",
+    "shortDescription": "A local lifeguard for developers and AI agents",
+    "longDescription": "pam gives sandboxed agents controlled, audited access to real capabilities: local models, flows, connectors, and a desktop control center.",
     "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
   }
 }

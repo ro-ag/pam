@@ -51,9 +51,31 @@
 //! | 4 | result `unresolved` |
 //! | 5 | result `blocked` |
 
+use std::path::Path;
+
 pub use pam_client::{base_dir_from, caller, client, default_base_dir, request};
 
 pub mod render;
 
+/// True when `exe` sits inside a macOS application bundle
+/// (`…/Something.app/Contents/MacOS/pam`): a bare double-click launch,
+/// which should open the GUI. A bare terminal launch prints help.
+///
+/// The check is on a component's *extension*, not a suffix, so
+/// `pam.app.backup` and `pam.application` are not bundles; the macOS
+/// filesystem is case-insensitive, so the extension match is too.
+#[must_use]
+pub fn launched_from_app_bundle(exe: &Path) -> bool {
+    exe.components().any(|part| {
+        Path::new(part.as_os_str())
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    })
+}
+
+#[cfg(test)]
+mod config_test;
+#[cfg(test)]
+mod lib_test;
 #[cfg(test)]
 mod render_test;

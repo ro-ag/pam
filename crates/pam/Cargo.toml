@@ -9,8 +9,9 @@ repository.workspace = true
 [features]
 # Production GUI build: embed frontend/dist into the binary instead of the
 # dev-server context. `npm --prefix frontend run build` must run first.
-# Plain builds (feature off) load the Vite dev URL — see pam_gui's docs.
-gui-embed = ["pam_gui/embed"]
+# `tauri build` turns tauri/custom-protocol on by itself; this feature is
+# the manual equivalent for `npm run gui:build` and local proofs.
+gui-embed = ["tauri/custom-protocol", "pam_gui/embed"]
 
 [dependencies]
 clap.workspace = true
@@ -19,9 +20,13 @@ pam_daemon.workspace = true
 pam_gui.workspace = true
 pam_proto.workspace = true
 serde_json.workspace = true
+tauri.workspace = true
 # `signal` on top of the workspace features: `pam daemon` blocks on ctrl_c
 # (and SIGTERM on unix, for `pam daemon stop`).
 tokio = { workspace = true, features = ["signal"] }
+
+[build-dependencies]
+tauri-build.workspace = true
 
 [dev-dependencies]
 # The integration harness inspects the daemon's store directly.

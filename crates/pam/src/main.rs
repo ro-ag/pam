@@ -153,6 +153,9 @@ enum FlowCmd {
 }
 
 fn main() -> ExitCode {
+    if bare_bundle_launch() {
+        return gui_mode();
+    }
     match Cli::parse().command {
         Cmd::Daemon { action: None } => daemon_mode(),
         Cmd::Daemon {
@@ -163,14 +166,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// A bare launch (no arguments) from inside a macOS `.app` bundle is a
+/// double-click: open the GUI instead of printing help. Every other
+/// platform, and any bare terminal launch, stays in client mode.
+fn bare_bundle_launch() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::args_os().nth(1).is_none()
+        && std::env::current_exe().is_ok_and(|exe| pam::launched_from_app_bundle(&exe))
+}
+
 /// `pam gui`: hands the process to the Tauri event loop (must run on the
 /// main thread, before any async runtime exists) until the window closes.
 ///
-/// Which frontend the window loads is a compile-time property of the
-/// binary — plain builds load the Vite dev server, `--features gui-embed`
-/// builds carry the built frontend. See the [`pam_gui`] crate docs.
+/// The context (config, icons, capabilities) is generated from this
+/// crate's `tauri.conf.json`; which frontend the window loads is a
+/// compile-time property of the binary (`tauri build`, or
+/// `--features gui-embed`, embed `frontend/dist`; plain builds load the
+/// Vite dev server). See the [`pam_gui`] crate docs.
 fn gui_mode() -> ExitCode {
-    match pam_gui::run() {
+    match pam_gui::run(tauri::generate_context!()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("pam gui: {err}");

@@ -47,8 +47,18 @@ const approvalsRoute = createRoute({
 const flowsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/flows",
-  component: FlowsScreen,
+  // `?flow=<id>` preselects a flow so Ask Pam (and any shared link) can
+  // land on one; an empty or non-string value is dropped rather than
+  // refused, and an unknown id falls back to the top of the shelf.
+  validateSearch: (search: Record<string, unknown>): { flow?: string } =>
+    typeof search.flow === "string" && search.flow !== "" ? { flow: search.flow } : {},
+  component: FlowsRoute,
 });
+
+function FlowsRoute() {
+  const { flow } = flowsRoute.useSearch();
+  return <FlowsScreen initialFlow={flow} />;
+}
 
 const modelsRoute = createRoute({
   getParentRoute: () => rootRoute,

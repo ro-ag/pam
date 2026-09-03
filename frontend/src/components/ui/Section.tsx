@@ -7,14 +7,20 @@ import type { ReactNode } from "react";
  *
  * Shared by Settings and Models so the two read as the same product
  * rather than two takes on the same idea.
+ *
+ * `id` is the section's stable anchor: Ask Pam deep-links to a panel by
+ * hash (`/settings#retention`), so the slug has to live on the element
+ * the browser scrolls to, not on a wrapper.
  */
 export function Section({
+  id,
   eyebrow,
   eyebrowExtra,
   title,
   blurb,
   children,
 }: {
+  id?: string;
   eyebrow: string;
   eyebrowExtra?: ReactNode;
   title: string;
@@ -22,7 +28,7 @@ export function Section({
   children: ReactNode;
 }) {
   return (
-    <section aria-label={title} className="max-w-2xl space-y-4">
+    <section id={id} aria-label={title} className="max-w-2xl space-y-4">
       <header className="space-y-1.5">
         <div className="flex items-center gap-2">
           <p className="font-data text-xs tracking-widest text-ink-faint uppercase">

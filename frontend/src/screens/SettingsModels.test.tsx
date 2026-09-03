@@ -77,6 +77,7 @@ function cli(overrides: Partial<AgentCli> = {}): AgentCli {
 
 beforeEach(() => {
   applyTheme("ventisquero", "dark", { persist: false });
+  window.localStorage.removeItem("pam.ask.rephrase");
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
   mocks.daemonStop.mockResolvedValue({ outcome: "not_running", pid: null });
@@ -232,6 +233,23 @@ describe("storage", () => {
       expect(mocks.modelsSettingsSet).toHaveBeenCalledWith({ idle_unload_min: 0 }),
     );
     expect(section.getByText(/0 keeps the weights resident/)).toBeInTheDocument();
+  });
+});
+
+describe("ask pam", () => {
+  it("keeps the Ask Pam rephrase toggle off by default and remembers a flip", async () => {
+    window.localStorage.removeItem("pam.ask.rephrase");
+    const section = await renderModelsSection();
+    const toggle = await section.findByRole("switch", {
+      name: /rephrase answers with the light model/i,
+    });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(window.localStorage.getItem("pam.ask.rephrase")).toBe("on");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(window.localStorage.getItem("pam.ask.rephrase")).toBe("off");
   });
 });
 

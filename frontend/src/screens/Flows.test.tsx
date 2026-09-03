@@ -325,6 +325,26 @@ describe("the library column", () => {
     await renderFlows();
     expect(await screen.findByLabelText("pr-readiness yaml")).toBeInTheDocument();
   });
+
+  it("preselects the flow named by the route search", async () => {
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <FlowsScreen initialFlow="after-merge-checks" />
+      </QueryClientProvider>,
+    );
+    expect(
+      await screen.findByRole("region", { name: "flow after-merge-checks" }),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to the top of the shelf when the search names an unknown flow", async () => {
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <FlowsScreen initialFlow="no-such-flow" />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("region", { name: "flow pr-readiness" })).toBeInTheDocument();
+  });
 });
 
 describe("the YAML tab", () => {

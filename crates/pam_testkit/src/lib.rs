@@ -31,10 +31,17 @@ use pam_daemon::daemon::{
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES;
+use pam_daemon::secrets::SecretBackend;
 use pam_proto::{Caller, Envelope, Event, PROTOCOL_VERSION, Response};
 use pam_store::{AuditRow, RequestRow, RequestState, Store};
 use tokio::sync::watch;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+
+/// The scripted HTTP transport connector tests answer calls with.
+pub use pam_connectors::testing::FakeTransport;
+/// The in-memory credential store connector tests run on. Re-exported so a
+/// test needs one dependency, not three, to drive the Connectors surface.
+pub use pam_daemon::secrets::FakeSecretBackend;
 
 /// Wall deadline for any single harness await. Generous on purpose:
 /// loaded CI runners stretch wall time, and the budget only needs to
@@ -191,6 +198,24 @@ impl TestDaemon {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
         Self::spawn_at_with(tmp, mutate).await
+    }
+
+    /// [`Self::spawn`] with the connector host wired to fakes: a
+    /// keychain that lives in memory and a transport that answers from a
+    /// script.
+    ///
+    /// The caller keeps its own `Arc` to both, which is how a test reads
+    /// back what the daemon stored and what it asked the network for. No
+    /// test in this workspace touches a real keychain or a real service.
+    pub async fn spawn_with_connectors(
+        backend: Arc<FakeSecretBackend>,
+        transport: Arc<FakeTransport>,
+    ) -> Self {
+        Self::spawn_with(move |config| {
+            config.secret_backend = Some(backend as Arc<dyn SecretBackend>);
+            config.http_transport = Some(transport);
+        })
+        .await
     }
 
     /// Spawns on an existing temp dir — for restart tests reusing the

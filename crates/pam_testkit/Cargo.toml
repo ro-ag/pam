@@ -8,6 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# `FakeTransport`: connector tests script HTTP answers instead of reaching
+# a network, and the harness injects it into the daemon.
+pam_connectors = { workspace = true, features = ["testing"] }
 pam_daemon.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true

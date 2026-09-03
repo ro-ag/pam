@@ -98,8 +98,9 @@
 //! # The model ops live next door, under the same rules
 //!
 //! [`crate::admin_models`] holds the `admin.models.*` and
-//! `admin.curator.*` ops, and [`crate::admin_logs`] the `admin.log.*` and
-//! `admin.evidence.*` ones. They are dispatched from [`AdminService`]
+//! `admin.curator.*` ops, [`crate::admin_logs`] the `admin.log.*` and
+//! `admin.evidence.*` ones, and [`crate::admin_connectors`] the
+//! `admin.connectors.*` ones. They are dispatched from [`AdminService`]
 //! before this module's own `match` and are administration in every sense
 //! that matters here: same tripwire, same deadline, same request row, same
 //! single terminal audit row, no [`crate::policy::classify`] entry, no
@@ -114,6 +115,7 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use crate::approval::{ApprovalService, Resolution};
+use crate::connector_service::ConnectorService;
 use crate::daemon::{ACTION_DEADLINE_REFUSAL, CAUSE_DEADLINE_EXCEEDED, CAUSE_INTERNAL_ERROR};
 use crate::executor::outcome_str;
 use crate::log_service::LogService;
@@ -247,23 +249,28 @@ pub struct AdminService {
     /// The compression pipeline the `admin.log.*` / `admin.evidence.*` ops
     /// act through (see [`crate::admin_logs`]).
     pub(crate) logs: Arc<LogService>,
+    /// The connector host the `admin.connectors.*` ops act through (see
+    /// [`crate::admin_connectors`]).
+    pub(crate) connectors: Arc<ConnectorService>,
 }
 
 impl AdminService {
     /// Builds the service over the daemon's store, approval service,
-    /// model service, and log service.
+    /// model service, log service, and connector host.
     #[must_use]
     pub fn new(
         store: Arc<Store>,
         approvals: Arc<ApprovalService>,
         models: Arc<ModelService>,
         logs: Arc<LogService>,
+        connectors: Arc<ConnectorService>,
     ) -> Self {
         Self {
             store,
             approvals,
             models,
             logs,
+            connectors,
         }
     }
 
@@ -312,11 +319,13 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The model and log surfaces get first refusal:
-    /// [`Self::dispatch_models`] and [`Self::dispatch_logs`] answer `None`
-    /// for anything that is not one of their ops, and the match below
-    /// takes over. The log surface is handed the envelope's id because a
-    /// compress files its evidence under this very request row.
+    /// The model, log and connector surfaces get first refusal:
+    /// [`Self::dispatch_models`], [`Self::dispatch_logs`] and
+    /// [`Self::dispatch_connectors`] answer `None` for anything that is
+    /// not one of their ops, and the match below takes over. The log and
+    /// connector surfaces are handed the envelope's id because a compress
+    /// files its evidence, and a configure its change, under this very
+    /// request row.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, AdminRefusal> {
         let args = &envelope.args;
         if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
@@ -324,6 +333,12 @@ impl AdminService {
         }
         if let Some(answer) = self
             .dispatch_logs(&envelope.id, &envelope.capability, args)
+            .await
+        {
+            return answer;
+        }
+        if let Some(answer) = self
+            .dispatch_connectors(&envelope.id, &envelope.capability, args)
             .await
         {
             return answer;

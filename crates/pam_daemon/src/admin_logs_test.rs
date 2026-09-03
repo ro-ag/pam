@@ -19,6 +19,7 @@ use crate::admin_logs::{
     OP_EVIDENCE_GET, OP_EVIDENCE_LIST, OP_EVIDENCE_STATS, OP_LOG_COMPRESS, STATS_WINDOW_SECS,
 };
 use crate::approval::ApprovalService;
+use crate::connector_service::ConnectorService;
 use crate::daemon::TERMINAL_ACTIONS;
 use crate::log_service::{CAUSE_NO_DEFAULT, EVIDENCE_KIND_LOG_SOURCE, LogService};
 use crate::model_service::ModelService;
@@ -51,7 +52,8 @@ async fn fixture() -> Fixture {
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let admin = AdminService::new(Arc::clone(&store), approvals, models, logs);
+    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let admin = AdminService::new(Arc::clone(&store), approvals, models, logs, connectors);
     Fixture {
         store,
         admin,

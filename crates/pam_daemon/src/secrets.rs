@@ -260,6 +260,47 @@ fn map_keyring_error(error: &KeyringError, action: &str) -> SecretError {
     kind
 }
 
+/// [`NativeSecretBackend`] opened on first use, from whichever blocking
+/// thread makes the first call.
+///
+/// The open result is kept — a store that failed to open stays failed
+/// for the daemon's lifetime and every call answers the same sanitized
+/// error, so a broken keychain costs one platform round trip, not one
+/// per request.
+#[derive(Default)]
+pub struct LazyNativeBackend {
+    opened: std::sync::OnceLock<Result<NativeSecretBackend, SecretError>>,
+}
+
+impl LazyNativeBackend {
+    fn backend(&self) -> Result<&NativeSecretBackend, SecretError> {
+        self.opened
+            .get_or_init(NativeSecretBackend::open)
+            .as_ref()
+            .map_err(|error| *error)
+    }
+}
+
+impl fmt::Debug for LazyNativeBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LazyNativeBackend([REDACTED])")
+    }
+}
+
+impl SecretBackend for LazyNativeBackend {
+    fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+        self.backend()?.get(account)
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<(), SecretError> {
+        self.backend()?.set(account, secret)
+    }
+
+    fn delete(&self, account: &str) -> Result<bool, SecretError> {
+        self.backend()?.delete(account)
+    }
+}
+
 /// In-memory [`SecretBackend`] for tests.
 ///
 /// `entries` is not `pub`: nothing outside this module should read or
@@ -335,15 +376,20 @@ impl SecretStore {
         Self { backend }
     }
 
-    /// Builds a store over the platform's native credential backend.
+    /// Builds a store over the platform's native credential backend,
+    /// opened lazily on first use.
     ///
-    /// # Errors
-    ///
-    /// Returns a sanitized failure when the native store cannot be
-    /// opened; the daemon still boots in that case with
-    /// `store_available = false` (see `ConnectorService`, task #49).
-    pub fn native() -> Result<Self, SecretError> {
-        Ok(Self::new(Arc::new(NativeSecretBackend::open()?)))
+    /// Opening the native store is itself a blocking platform call — the
+    /// Linux Secret Service client spins up its own runtime and discovers
+    /// the session bus, which on a headless machine can stall — so it
+    /// never runs on the daemon's async threads or at boot: the first
+    /// `get`/`set`/`delete`/`present` opens it on the blocking pool, and
+    /// on macOS [`Self::warm`] does that in the background right after
+    /// boot. A store that will not open reports [`SecretError`] on every
+    /// call (logged once at the open), never a boot failure.
+    #[must_use]
+    pub fn native() -> Self {
+        Self::new(Arc::new(LazyNativeBackend::default()))
     }
 
     /// Fetches the secret stored for `connector_id`, if any.

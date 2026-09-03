@@ -3,9 +3,11 @@
 //! and communicating over typed channels.
 
 pub mod admin;
+pub mod admin_connectors;
 pub mod admin_logs;
 pub mod admin_models;
 pub mod approval;
+pub mod connector_service;
 pub mod daemon;
 pub mod executor;
 pub mod lifecycle;
@@ -18,6 +20,8 @@ pub mod secrets;
 pub mod transport;
 
 #[cfg(test)]
+mod admin_connectors_test;
+#[cfg(test)]
 mod admin_logs_test;
 #[cfg(test)]
 mod admin_models_test;
@@ -25,6 +29,8 @@ mod admin_models_test;
 mod admin_test;
 #[cfg(test)]
 mod approval_test;
+#[cfg(test)]
+mod connector_service_test;
 #[cfg(test)]
 mod daemon_test;
 #[cfg(test)]

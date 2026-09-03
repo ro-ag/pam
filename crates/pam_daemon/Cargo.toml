@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 # deterministic log reduction behind `admin.log.compress`.
 pam_compact.workspace = true
+# the seven read-only connectors a flow step and the Connectors screen
+# reach through (`connector_service.rs`).
+pam_connectors.workspace = true
 pam_model.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true
@@ -47,6 +50,9 @@ pam_testkit.workspace = true
 # the admin download op is proved end to end against pam_model own
 # range-serving origin rather than a second copy of it.
 pam_model = { workspace = true, features = ["testing"] }
+# `FakeTransport`: the connector tests script HTTP answers instead of
+# reaching a network.
+pam_connectors = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # `start_paused` tests for lease/reaper timing need the paused clock.
 tokio = { workspace = true, features = ["test-util"] }

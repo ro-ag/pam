@@ -1,4 +1,7 @@
-//! Build script for the pam GUI shell.
+//! Build script for the pam app crate: this crate owns the Tauri app
+//! (config, overlays, icons, capabilities) and produces the `pam` binary,
+//! which is what the Tauri CLI expects. The window and the commands
+//! themselves live in `pam_gui`.
 //!
 //! `tauri_build` reads `tauri.conf.json` (next to this file), validates the
 //! capability files under `capabilities/`, and generates the ACL manifest
@@ -8,9 +11,10 @@
 //!
 //! # Which frontend the binary carries (the "white window" law)
 //!
-//! `tauri::generate_context!` in `lib.rs` picks its webview source at
+//! `tauri::generate_context!` in `main.rs` picks its webview source at
 //! compile time, driven by the `custom-protocol` feature of the `tauri`
-//! crate (surfaced here as the `embed` feature of this crate):
+//! crate (turned on by `tauri build`, and by this crate's `gui-embed`
+//! feature for the manual path):
 //!
 //! - feature off (any plain `cargo build`, debug *or* release): the dev
 //!   context is compiled in — the window loads `devUrl`
@@ -32,5 +36,5 @@ fn main() {
         "read_daemon_log",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
-        .expect("failed to run the tauri build script for pam_gui");
+        .expect("failed to run the tauri build script for pam");
 }

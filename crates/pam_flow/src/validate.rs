@@ -332,6 +332,23 @@ pub fn parse(yaml: &str) -> Result<Flow, FlowError> {
     validate(raw)
 }
 
+/// [`parse`] for a flow already in memory as JSON in the file's own shape
+/// (`run` / `connector` / `call` / `with`, …) — what the designer canvas
+/// sends back. Same rules, same paths, no disk.
+///
+/// The value is rendered to YAML and handed to [`parse`], so both entry
+/// points report identical paths (`serde_json` errors carry none) and the
+/// size cap applies to the rendered text.
+///
+/// # Errors
+///
+/// As [`parse`]; a value YAML cannot render is `Invalid` at `yaml`.
+pub fn parse_value(raw: &serde_json::Value) -> Result<Flow, FlowError> {
+    let text = serde_yaml_ng::to_string(raw)
+        .map_err(|error| FlowError::invalid("yaml", error.to_string()))?;
+    parse(&text)
+}
+
 /// Turns a serde error into an `Invalid` error, keeping the path serde
 /// already worked out (`steps[1].when: invalid type: map`).
 fn from_yaml_error(error: &serde_yaml_ng::Error) -> FlowError {

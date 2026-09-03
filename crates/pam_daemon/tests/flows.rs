@@ -616,6 +616,41 @@ async fn a_missing_repo_refuses_before_anything_runs() {
     .await;
 }
 
+#[tokio::test]
+async fn every_step_publishes_a_running_note_then_its_settle_note() {
+    with_deadline(async {
+        let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
+        let mut client = flows.daemon.client().await;
+        let mut events = flows.daemon.subscribe(&["req_run"]).await;
+
+        let body = flows.run(&mut client, "req_run", "two-step").await;
+        assert_eq!(step(&body, "version")["status"], "succeeded");
+        assert_eq!(step(&body, "prove")["status"], "succeeded");
+
+        let seen: Vec<Event> = events.until_terminal("req_run").await;
+        let notes: Vec<String> = seen
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Progress { note, .. } => Some(note),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                "version: running (1/2)".to_owned(),
+                "version: succeeded".to_owned(),
+                "prove: running (2/2)".to_owned(),
+                "prove: succeeded".to_owned(),
+            ]
+        );
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
 /// A stateful step, which the gate always asks about.
 const STATEFUL: &str = "schema: 1\n\
 id: stateful\n\

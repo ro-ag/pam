@@ -1,5 +1,5 @@
 //! The flow half of the admin surface: `admin.flows.list`, `.get`,
-//! `.save`, `.delete`, `.run`, and the two settings ops.
+//! `.save`, `.delete`, `.run`, `.normalize`, and the two settings ops.
 //!
 //! These are ordinary admin ops — read [`crate::admin`]'s module docs for
 //! the security model, because every word of it applies here: the GUI
@@ -55,6 +55,14 @@ pub const OP_FLOWS_SAVE: &str = "admin.flows.save";
 /// `admin.flows.delete { id }` → `{ id, revealed_builtin }`.
 pub const OP_FLOWS_DELETE: &str = "admin.flows.delete";
 
+/// `admin.flows.normalize { yaml } | { flow }` → canonical rendering +
+/// validation of a flow that lives only in the GUI: the designer canvas
+/// sends its model here after every edit and shows the YAML it gets
+/// back. Valid: `{ valid: true, yaml, flow, digest }`; invalid: a normal
+/// reply `{ valid: false, error: { path, message } }`, so the canvas
+/// keeps drawing. Never touches disk; never a capability.
+pub const OP_FLOWS_NORMALIZE: &str = "admin.flows.normalize";
+
 /// `admin.flows.run { id, repo, inputs? }` → `{ ticket, position }`.
 pub const OP_FLOWS_RUN: &str = "admin.flows.run";
 
@@ -71,6 +79,7 @@ pub const FLOW_ADMIN_OPS: &[&str] = &[
     OP_FLOWS_LIST,
     OP_FLOWS_GET,
     OP_FLOWS_SAVE,
+    OP_FLOWS_NORMALIZE,
     OP_FLOWS_DELETE,
     OP_FLOWS_RUN,
     OP_FLOWS_SETTINGS_GET,
@@ -113,6 +122,7 @@ impl AdminService {
             OP_FLOWS_GET => self.flows_get(args).map_err(OwnedRefusal::from),
             OP_FLOWS_SAVE => self.flows_save(args).map_err(OwnedRefusal::from),
             OP_FLOWS_DELETE => self.flows_delete(args).map_err(OwnedRefusal::from),
+            OP_FLOWS_NORMALIZE => Self::flows_normalize(args).map_err(OwnedRefusal::from),
             OP_FLOWS_RUN => self.flows_run(args).await,
             OP_FLOWS_SETTINGS_GET => self.flows_settings_get().await.map_err(OwnedRefusal::from),
             OP_FLOWS_SETTINGS_SET => self
@@ -163,6 +173,48 @@ impl AdminService {
             outcome: Outcome::Verified,
             body: Value::Object(body),
             audit: json!({ "op": OP_FLOWS_GET, "id": id, "source": entry.source.as_str() }),
+        })
+    }
+
+    /// Renders one flow canonically, or names the first rule it breaks.
+    /// Needs no library: the flow exists only in the request.
+    fn flows_normalize(args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let yaml = args.get("yaml").and_then(Value::as_str);
+        let flow = args.get("flow").filter(|value| value.is_object());
+        let parsed = match (yaml, flow) {
+            (Some(text), None) => pam_flow::parse(text),
+            (None, Some(raw)) => pam_flow::parse_value(raw),
+            _ => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: format!(
+                        "{OP_FLOWS_NORMALIZE} takes exactly one of `yaml` (text) or `flow` (object)"
+                    ),
+                    recovery: RECOVERY_FLOW_EDIT,
+                });
+            }
+        };
+        let bytes = yaml.map_or(0, str::len);
+        let valid = parsed.is_ok();
+        let body = match parsed {
+            Ok(flow) => json!({
+                "valid": true,
+                "yaml": pam_flow::to_normalized_yaml(&flow),
+                "flow": flow,
+                "digest": pam_flow::digest(&flow),
+            }),
+            Err(error) => {
+                let (path, message) = match &error {
+                    FlowError::Invalid { path, message } => (path.clone(), message.clone()),
+                    other => ("yaml".to_owned(), other.to_string()),
+                };
+                json!({ "valid": false, "error": { "path": path, "message": message } })
+            }
+        };
+        Ok(AdminOk {
+            outcome: Outcome::Verified,
+            body,
+            audit: json!({ "op": OP_FLOWS_NORMALIZE, "valid": valid, "bytes": bytes }),
         })
     }
 

@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{RequestState, Store};
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::admin::{ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService, CAUSE_INVALID_ADMIN_ARGS};
 use crate::admin_flows::{
     CAUSE_ID_MISMATCH, CAUSE_NOT_FOUND, FLOW_ADMIN_OPS, FLOW_RUN_DEADLINE_MS, OP_FLOWS_DELETE,
-    OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_RUN, OP_FLOWS_SAVE, OP_FLOWS_SETTINGS_GET,
-    OP_FLOWS_SETTINGS_SET,
+    OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_NORMALIZE, OP_FLOWS_RUN, OP_FLOWS_SAVE,
+    OP_FLOWS_SETTINGS_GET, OP_FLOWS_SETTINGS_SET,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
@@ -125,7 +126,7 @@ fn the_bridge_whitelist_names_every_op_once() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), FLOW_ADMIN_OPS.len());
-    assert_eq!(FLOW_ADMIN_OPS.len(), 7);
+    assert_eq!(FLOW_ADMIN_OPS.len(), 8);
     for op in FLOW_ADMIN_OPS {
         assert!(op.starts_with("admin.flows."), "{op} is misnamed");
     }
@@ -479,4 +480,104 @@ async fn the_library_directory_is_created_on_the_first_save() {
         ))
         .await;
     assert!(Path::new(&tmp.path().join("flows")).is_dir());
+}
+
+#[tokio::test]
+async fn normalize_renders_yaml_canonically_and_carries_the_parsed_flow() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let messy = "name: Local flow\nschema: 1\nid: local\nsteps:\n  - run: [git, status]\n    id: look\n    timeout: 5m\n";
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_n1",
+                OP_FLOWS_NORMALIZE,
+                json!({ "yaml": messy }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["valid"], json!(true));
+    let yaml = body["yaml"].as_str().unwrap();
+    assert!(
+        yaml.starts_with("schema: 1\nid: local\nname: Local flow\n"),
+        "{yaml}"
+    );
+    assert!(
+        !yaml.contains("timeout"),
+        "default timeout is omitted: {yaml}"
+    );
+    assert_eq!(body["flow"]["steps"][0]["id"], json!("look"));
+    assert_eq!(body["flow"]["steps"][0]["action"]["kind"], json!("command"));
+    assert_eq!(body["digest"].as_str().unwrap().len(), 64);
+}
+
+#[tokio::test]
+async fn normalize_accepts_the_raw_flow_json_and_yields_the_same_digest() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let raw = json!({ "schema": 1, "id": "local", "name": "Local flow",
+        "steps": [{ "id": "look", "run": ["git", "status"] }] });
+    let from_flow = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_n2",
+                OP_FLOWS_NORMALIZE,
+                json!({ "flow": raw }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    let from_yaml = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_n3",
+                OP_FLOWS_NORMALIZE,
+                json!({ "yaml": from_flow["yaml"] }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(from_flow["digest"], from_yaml["digest"]);
+    assert_eq!(from_flow["yaml"], from_yaml["yaml"]);
+}
+
+#[tokio::test]
+async fn normalize_answers_invalid_flows_with_the_path_not_a_refusal() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let raw = json!({ "schema": 1, "id": "local", "name": "Local flow",
+        "steps": [{ "id": "look", "run": ["bash", "-c", "ls"] }] });
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_n4",
+                OP_FLOWS_NORMALIZE,
+                json!({ "flow": raw }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["valid"], json!(false));
+    assert_eq!(body["error"]["path"], json!("steps[0].run[0]"));
+    assert!(body["error"]["message"].as_str().unwrap().contains("shell"));
+    assert!(body.get("yaml").is_none());
+}
+
+#[tokio::test]
+async fn normalize_needs_exactly_one_of_yaml_or_flow() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    // Each call is its own request row, so each needs its own id.
+    for (index, args) in [json!({}), json!({ "yaml": "schema: 1\n", "flow": {} })]
+        .into_iter()
+        .enumerate()
+    {
+        let cause = cause_of(
+            admin
+                .handle(&admin_envelope(
+                    &format!("req_n5_{index}"),
+                    OP_FLOWS_NORMALIZE,
+                    args,
+                ))
+                .await,
+        );
+        assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS);
+    }
 }

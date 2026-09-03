@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use super::duration::format_duration;
 use super::schema::{Action, Approval, ConnectorId, Effect, Flow, OutputPolicy, Role, When};
 use super::validate::{
     FlowError, MAX_FILE_BYTES, connector_calls, is_sensitive_arg, is_shell, looks_secret_like,
-    parse,
+    parse, parse_value,
 };
 
 /// Wraps step YAML in the smallest valid flow around it.
@@ -565,4 +566,54 @@ fn the_connector_call_table_matches_the_spec() {
         })
         .collect();
     assert_eq!(logs, [("github", "job_log"), ("jenkins", "console")]);
+}
+
+#[test]
+fn parse_value_accepts_the_raw_json_shape() {
+    let raw = serde_json::json!({
+        "schema": 1, "id": "demo", "name": "Demo",
+        "steps": [
+            { "id": "status", "run": ["git", "status", "--short"], "role": "verify" },
+            { "id": "log", "run": ["git", "log", "--oneline"], "needs": ["status"],
+              "when": { "succeeded": "status" }, "timeout": "10m",
+              "retry": { "attempts": 2, "backoff": "1s" } }
+        ]
+    });
+    let flow = parse_value(&raw).expect("parses");
+    assert_eq!(flow.steps.len(), 2);
+    assert_eq!(flow.steps[1].needs, vec!["status"]);
+    assert_eq!(flow.steps[1].when, When::Succeeded("status".into()));
+    assert_eq!(format_duration(flow.steps[1].timeout), "10m");
+    assert_eq!(flow.steps[1].retry.attempts, 2);
+}
+
+#[test]
+fn parse_value_reports_the_same_paths_as_parse() {
+    let raw = serde_json::json!({
+        "schema": 1, "id": "demo", "name": "Demo",
+        "steps": [ { "id": "later", "run": ["git", "status"], "needs": ["missing"] } ]
+    });
+    let err = parse_value(&raw).unwrap_err();
+    let yaml_err = parse(
+        "schema: 1\nid: demo\nname: Demo\nsteps:\n  - id: later\n    run: [git, status]\n    needs: [missing]\n",
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), yaml_err.to_string());
+    assert!(err.to_string().starts_with("steps[0].needs[0]"), "{err}");
+}
+
+#[test]
+fn parse_value_refuses_an_unknown_key_by_path() {
+    let raw = serde_json::json!({
+        "schema": 1, "id": "demo", "name": "Demo",
+        "steps": [ { "id": "s", "run": ["git", "status"], "ui": { "x": 1 } } ]
+    });
+    let err = parse_value(&raw).unwrap_err();
+    match err {
+        FlowError::Invalid { path, message } => {
+            assert_eq!(path, "steps[0]", "{path}: {message}");
+            assert!(message.contains("unknown field `ui`"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
 }

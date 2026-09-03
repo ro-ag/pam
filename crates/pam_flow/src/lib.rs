@@ -43,7 +43,7 @@ pub use validate::{
     CallSpec, DEFAULT_TIMEOUT, FlowError, MAX_ARG_BYTES, MAX_ARGS, MAX_ARGV_BYTES,
     MAX_DESCRIPTION_BYTES, MAX_FILE_BYTES, MAX_ID_BYTES, MAX_INPUTS, MAX_LIBRARY_ENTRIES,
     MAX_NAME_BYTES, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_STEPS, MAX_TIMEOUT, SHELLS,
-    connector_calls, is_sensitive_arg, is_shell, looks_secret_like, parse,
+    connector_calls, is_sensitive_arg, is_shell, looks_secret_like, parse, parse_value,
 };
 pub use vars::{VarError, Vars, references, substitute};
 

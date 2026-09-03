@@ -1,0 +1,23 @@
+schema: 1
+id: sonar-gate-check
+name: SonarQube gate check
+description: >-
+  Read a project's quality gate status and, whatever it says, the open
+  issues behind it.
+inputs:
+  project:
+    description: the SonarQube project key
+steps:
+  - id: quality-gate
+    connector: sonarqube
+    call: quality_gate
+    with:
+      project: "${inputs.project}"
+    role: verify
+  - id: open-issues
+    connector: sonarqube
+    call: issues
+    with:
+      project: "${inputs.project}"
+      limit: 50
+    when: always

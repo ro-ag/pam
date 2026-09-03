@@ -22,5 +22,13 @@ pub use validate::{
     MAX_NAME_BYTES, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_STEPS, MAX_TIMEOUT, SHELLS,
     connector_calls, is_sensitive_arg, is_shell, looks_secret_like, parse,
 };
+pub mod normalize;
 #[cfg(test)]
 mod validate_test;
+pub use normalize::{digest, to_normalized_yaml};
+pub mod builtin;
+#[cfg(test)]
+mod normalize_test;
+pub use builtin::{BuiltinFlow, builtin, builtin_yaml};
+#[cfg(test)]
+mod builtin_test;

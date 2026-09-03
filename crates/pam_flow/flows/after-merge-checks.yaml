@@ -1,0 +1,15 @@
+schema: 1
+id: after-merge-checks
+name: After-merge checks
+description: >-
+  Refresh the local view of the remote after a merge, prove the working tree
+  is clean, and show the commits that landed.
+steps:
+  - id: fetch
+    run: [git, fetch, --prune]
+  - id: clean-tree
+    run: [git, status, --short]
+    role: verify
+  - id: recent-commits
+    run: [git, log, --oneline, "-20"]
+    output: summarize

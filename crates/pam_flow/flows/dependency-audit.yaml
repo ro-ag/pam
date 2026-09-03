@@ -1,0 +1,18 @@
+schema: 1
+id: dependency-audit
+name: Dependency audit
+description: >-
+  Look for advisories against the locked dependencies and for crates that
+  appear at more than one version. The first step needs cargo-audit
+  installed (cargo install cargo-audit); without it the step fails and the
+  duplicate report still runs.
+steps:
+  - id: audit
+    run: [cargo, audit]
+    role: verify
+    output: summarize
+    timeout: 10m
+  - id: duplicates
+    run: [cargo, tree, --duplicates]
+    when: always
+    timeout: 10m

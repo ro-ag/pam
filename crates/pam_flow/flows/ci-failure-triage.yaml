@@ -1,0 +1,33 @@
+schema: 1
+id: ci-failure-triage
+name: CI failure triage
+description: >-
+  Fetch the latest failed GitHub Actions run for this repository, list its
+  jobs, and summarize the log of the job that failed.
+inputs:
+  repo:
+    description: owner/name on GitHub; defaults to this repository's origin
+    default: "${repo.origin}"
+steps:
+  - id: latest-failed
+    connector: github
+    call: runs
+    with:
+      repo: "${inputs.repo}"
+      status: failure
+      limit: 1
+  - id: run-jobs
+    connector: github
+    call: run
+    with:
+      repo: "${inputs.repo}"
+      run_id: "${steps.latest-failed.result.runs[0].id}"
+    needs: [latest-failed]
+  - id: job-log
+    connector: github
+    call: job_log
+    with:
+      repo: "${inputs.repo}"
+      job_id: "${steps.run-jobs.result.jobs[0].id}"
+    needs: [run-jobs]
+    output: summarize

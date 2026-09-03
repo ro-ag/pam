@@ -1,0 +1,29 @@
+schema: 1
+id: pr-readiness
+name: PR readiness
+description: >-
+  Everything this repository asks for before a pull request opens: a clean
+  tree, an up-to-date remote, the commits the branch adds, and the three
+  Rust gates (format, clippy, tests).
+steps:
+  - id: clean-tree
+    run: [git, status, --short]
+    role: verify
+  - id: fetch
+    run: [git, fetch, --prune]
+  - id: branch-commits
+    run: [git, log, --oneline, origin/main..HEAD]
+    needs: [fetch]
+  - id: fmt
+    run: [cargo, fmt, --all, --check]
+    role: verify
+  - id: clippy
+    run: [cargo, clippy, --workspace, --all-targets, "--", "-D", warnings]
+    role: verify
+    output: summarize
+    timeout: 20m
+  - id: tests
+    run: [cargo, test, --workspace]
+    role: verify
+    output: summarize
+    timeout: 30m

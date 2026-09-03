@@ -443,10 +443,18 @@ function FlowDetailPane({
 
 // --- the screen ------------------------------------------------------------
 
-export function FlowsScreen() {
+export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
   const flows = useQuery({ queryKey: ["flows"], queryFn: flowsList });
-  const [picked, setPicked] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(initialFlow ?? null);
   const [tab, setTab] = useState<Tab>("canvas");
+
+  // `?flow=<id>` is a deep link (Ask Pam answers "run pr-readiness" with
+  // one), so a second link to a different flow while the screen is
+  // already mounted has to move the selection too. An id nobody has
+  // falls through to the shelf's own fallback below.
+  useEffect(() => {
+    if (initialFlow) setPicked(initialFlow);
+  }, [initialFlow]);
 
   const entries = flows.data?.flows ?? [];
   // Nothing picked yet means the top of the shelf; a flow that just went

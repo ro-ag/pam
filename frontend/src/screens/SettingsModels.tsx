@@ -5,6 +5,7 @@ import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { useRephrasePref } from "../lib/ask/prefs";
 import { cn } from "../lib/cn";
 import {
   curatorList,
@@ -147,6 +148,49 @@ function TierDefaultsPanel() {
       </div>
 
       {failure && <FailureNote failure={failure} label="defaults" />}
+    </Panel>
+  );
+}
+
+// --- ask pam ---------------------------------------------------------------
+
+/**
+ * The one model knob that is not the daemon's: whether Ask Pam may hand
+ * her finished sentence to the light model for a softer wording. It sits
+ * with the other model choices because that is where a human looks for
+ * it, but it never leaves the GUI — `localStorage`, like the theme.
+ */
+function AskPamPanel() {
+  const [rephrase, setRephrase] = useRephrasePref();
+
+  return (
+    <Panel ground="raised" className="space-y-4 p-5">
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">ask pam</p>
+        <Badge tone="accent">GUI-only</Badge>
+      </div>
+
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-data text-xs text-ink">
+          rephrase answers with the light model
+        </span>
+        <Button
+          size="sm"
+          variant={rephrase ? "primary" : "ghost"}
+          role="switch"
+          aria-checked={rephrase}
+          aria-label="rephrase answers with the light model"
+          onClick={() => setRephrase(!rephrase)}
+        >
+          {rephrase ? "on" : "off"}
+        </Button>
+      </div>
+
+      <p className="font-voice text-sm text-ink-muted italic">
+        {rephrase
+          ? "I keep every number and name; if the model drops one, my own sentence stands."
+          : "My answers are my own sentences from live state; turn this on to let the light model soften them."}
+      </p>
     </Panel>
   );
 }
@@ -389,6 +433,7 @@ export function SettingsModelsSection() {
   return (
     <div className="space-y-4">
       <TierDefaultsPanel />
+      <AskPamPanel />
       <CuratorPanel />
       <StoragePanel />
     </div>

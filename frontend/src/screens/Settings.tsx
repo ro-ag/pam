@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -894,6 +895,16 @@ function LogsPanel() {
 // --- the screen ------------------------------------------------------------
 
 export function SettingsScreen() {
+  // Every section carries a slug anchor so Ask Pam can answer "where do I
+  // change retention?" with a link that lands on the panel itself. The
+  // hash is watched rather than read once: a second deep link from the
+  // same screen changes only the hash, and the route never remounts.
+  const hash = useRouterState({ select: (state) => state.location.hash });
+  useEffect(() => {
+    if (!hash) return;
+    document.getElementById(hash.replace(/^#/, ""))?.scrollIntoView({ block: "start" });
+  }, [hash]);
+
   return (
     <div className="flex min-h-full flex-col px-8 pb-10">
       <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
@@ -906,6 +917,7 @@ export function SettingsScreen() {
 
       <div className="space-y-10 pt-6">
         <Section
+          id="appearance"
           eyebrow="appearance"
           title="Appearance"
           blurb="Two families, two modes — the palette is the only thing that changes."
@@ -914,6 +926,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="security"
           eyebrow="security"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
           title="Security"
@@ -926,6 +939,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="models"
           eyebrow="models"
           title="Models"
           blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
@@ -934,6 +948,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="flows"
           eyebrow="flows"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
           title="Flows"
@@ -943,6 +958,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="connectors"
           eyebrow="connectors"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
           title="Connectors"
@@ -952,6 +968,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="daemon"
           eyebrow="daemon"
           title="Daemon"
           blurb="The machine under the tower: what is running, and the one switch it has."
@@ -960,6 +977,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="retention"
           eyebrow="retention"
           title="Retention"
           blurb="How long the audit trail and its evidence stay on disk."
@@ -968,6 +986,7 @@ export function SettingsScreen() {
         </Section>
 
         <Section
+          id="logs"
           eyebrow="logs"
           title="Logs"
           blurb="The daemon's own diagnostics — readable even when the daemon is down."

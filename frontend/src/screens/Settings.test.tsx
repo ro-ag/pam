@@ -481,3 +481,35 @@ describe("logs", () => {
     expect(screen.getByText(/no Tauri bridge exists/)).toBeInTheDocument();
   });
 });
+
+describe("deep links", () => {
+  it("gives every section a stable anchor and scrolls to the hash", async () => {
+    const scrolled: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function scrollIntoViewStub(this: Element) {
+      scrolled.push(this.id);
+    };
+    try {
+      const router = createAppRouter(
+        createMemoryHistory({ initialEntries: ["/settings#retention"] }),
+      );
+      render(<App router={router} />);
+      await screen.findByRole("region", { name: "Retention" });
+      for (const id of [
+        "appearance",
+        "security",
+        "models",
+        "flows",
+        "connectors",
+        "daemon",
+        "retention",
+        "logs",
+      ]) {
+        expect(document.getElementById(id)).not.toBeNull();
+      }
+      await waitFor(() => expect(scrolled).toContain("retention"));
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+});

@@ -1,0 +1,346 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      run_id: ${{ steps.ci.outputs.run_id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate stable release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tags must be canonical stable SemVer (vX.Y.Z)."
+            exit 1
+          fi
+
+      - name: Verify version consistency
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          check() {
+            local file="$1" actual="$2"
+            if [[ "$actual" != "$version" ]]; then
+              echo "::error::$file declares version '$actual' but the tag requires '$version'."
+              exit 1
+            fi
+          }
+          check Cargo.toml "$(awk -F'"' 'in_section && /^version = /{print $2; exit} /^\[workspace\.package\]$/{in_section=1}' Cargo.toml)"
+          check crates/pam/tauri.conf.json "$(node -p 'require("./crates/pam/tauri.conf.json").version')"
+          check frontend/package.json "$(node -p 'require("./frontend/package.json").version')"
+          for path in README.md LICENSE CHANGELOG.md; do
+            test -s "$path" || { echo "::error::$path is missing or empty."; exit 1; }
+          done
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' heading."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify green CI run on the tag commit
+        id: ci
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Peel annotated tags to the commit; $GITHUB_SHA is the tag object.
+          sha="$(git rev-list -n 1 "$GITHUB_REF")"
+          run_id="$(gh run list --workflow ci.yml --commit "$sha" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          if [[ -z "$run_id" ]]; then
+            echo "::error::No green CI run on $sha; refusing to release unverified packages."
+            exit 1
+          fi
+          # CI artifacts expire after 7 days; fail here, not mid-build, when a
+          # tag lands late. Re-running the CI run refreshes its artifacts.
+          names="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not) | .name] | join(" ")')"
+          for artifact in pam-linux-amd64 pam-linux-arm64 pam-windows-amd64 pam-windows-arm64 pam-macos-arm64; do
+            if [[ " $names " != *" $artifact "* ]]; then
+              echo "::error::Artifact $artifact from CI run $run_id is missing or expired; re-run that CI run, then retry the release."
+              exit 1
+            fi
+          done
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: validate
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 package
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            family: linux
+            arch: amd64
+            artifact: pam-linux-amd64
+          - name: Linux arm64 package
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            family: linux
+            arch: arm64
+            artifact: pam-linux-arm64
+          - name: Windows amd64 package
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            family: windows
+            arch: amd64
+            artifact: pam-windows-amd64
+          - name: Windows arm64 package
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            family: windows
+            arch: arm64
+            artifact: pam-windows-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # Packages were built and verified by the CI run on the tag commit;
+      # the release repackages those artifacts instead of rebuilding.
+      - name: Download packages from the main CI run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.validate.outputs.run_id }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          # No checkout in this job: point gh at the repository explicitly.
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir downloaded
+
+      - name: Assemble Linux release archive
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          tar -xzf "downloaded/pam-${TARGET}-bundle.tar.gz" -C bundle
+          tar -C bundle -czf "$PWD/pam_${VERSION}_linux_${ARCH}.tar.gz" .
+
+      - name: Assemble Windows release archive
+        if: ${{ matrix.family == 'windows' }}
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Compress-Archive -Path "downloaded/*" -DestinationPath "pam_$($env:VERSION)_windows_$($env:ARCH).zip"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pam-${{ matrix.family }}-${{ matrix.arch }}
+          path: pam_*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS arm64 signed package
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      # The dmg is rebuilt below with tools/package-macos-dmg.sh.
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download packages from the main CI run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.validate.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # No checkout in this job: point gh at the repository explicitly.
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name pam-macos-arm64 --dir downloaded
+          mkdir -p bundle
+          tar -xzf downloaded/pam-macos-arm64-bundle.tar.gz -C bundle
+
+      - name: Prepare Apple signing and notarization
+        shell: bash
+        env:
+          APPLE_API_KEY_ID_SECRET: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_MATERIAL: ${{ secrets.APPLE_API_KEY }}
+          APPLE_CERTIFICATE_BASE64_SECRET: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD_SECRET: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_API_KEY_ID_SECRET APPLE_API_KEY_MATERIAL APPLE_CERTIFICATE_BASE64_SECRET APPLE_CERTIFICATE_PASSWORD_SECRET KEYCHAIN_PASSWORD_SECRET; do
+            [[ -n "${!name:-}" ]] || { echo "::error::Apple signing secret ${name%_SECRET} is not set on this repository; run ~/dev/apple-developer-signing/setup-github-secrets.sh ro-ag/pam and retry the tag."; exit 1; }
+          done
+          keychain="$RUNNER_TEMP/pam-build.keychain-db"
+          certificate="$RUNNER_TEMP/pam-certificate.p12"
+          private_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID_SECRET}.p8"
+          echo "PAM_BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64_SECRET" | base64 --decode > "$certificate"
+          printf '%s' "$APPLE_API_KEY_MATERIAL" | base64 --decode > "$private_key"
+          security create-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD_SECRET" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD_SECRET" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD_SECRET" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          [[ -n "$identity" ]]
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$private_key" >> "$GITHUB_ENV"
+
+      - name: Sign application
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hardened runtime is a notarization requirement; the Tauri build
+          # used to apply it at build time, so the post-hoc signature must too.
+          codesign --force --timestamp --options runtime --deep --sign "$APPLE_SIGNING_IDENTITY" "bundle/macos/pam.app"
+
+      - name: Rebuild the disk image from the signed application
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The CI-built dmg wraps the unsigned app, and notarization scans
+          # the dmg payload: it must be rebuilt around the signed bundle.
+          rm -rf bundle/dmg
+          tools/package-macos-dmg.sh "$PWD/bundle/macos/pam.app" "$PWD/bundle/dmg"
+
+      - name: Sign and notarize disk image
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "${APPLE_API_ISSUER:-}" ]] || { echo "::error::Apple signing secret APPLE_API_ISSUER is not set on this repository; run ~/dev/apple-developer-signing/setup-github-secrets.sh ro-ag/pam and retry the tag."; exit 1; }
+          dmg="$(find bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          submission="$(xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 20m --output-format json)"
+          printf '%s\n' "$submission"
+          submission_id="$(printf '%s' "$submission" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          status="$(printf '%s' "$submission" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+          if [[ "$status" != "Accepted" ]]; then
+            # Surface the exact rejection reasons instead of a bare staple error.
+            xcrun notarytool log "$submission_id" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER"
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -v "$dmg"
+
+      - name: Verify macOS package contract
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          app="bundle/macos/pam.app"
+          dmg="$(find bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          codesign --verify --deep --strict "$app"
+          codesign --verify --strict "$dmg"
+          xcrun stapler validate "$dmg"
+          release_dmg="pam_${VERSION}_darwin_arm64.dmg"
+          mv "$dmg" "$release_dmg"
+          echo "path=$release_dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pam-darwin-arm64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -n "${PAM_BUILD_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$PAM_BUILD_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/pam-certificate.p12" "$RUNNER_TEMP"/AuthKey_*.p8
+
+  release:
+    name: Publish release
+    needs: [validate, build, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pam-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum * > checksums.txt)
+          ls -l dist
+
+      - name: Extract release notes from changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/* \
+            --title "pam ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --verify-tag

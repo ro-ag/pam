@@ -2,8 +2,8 @@ use sha2::{Digest, Sha256};
 use turso::params;
 
 use crate::{
-    Actor, ApprovalResolution, AuditEntry, CompressionStats, Decision, EVIDENCE_KIND_LOG_COMPACT,
-    ModelJobRow, RequestState, Store, StoreError,
+    Actor, ApprovalResolution, AuditEntry, CompressionStats, ConnectorPatch, Decision,
+    EVIDENCE_KIND_LOG_COMPACT, ModelJobRow, RequestState, Store, StoreError,
 };
 
 /// The one model job row with `id`, read back through the bounded list.
@@ -45,7 +45,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert_eq!(store.schema_version().await.unwrap(), 5);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -715,7 +715,7 @@ async fn list_requests_filtered_applies_filters_newest_first() {
     // Unfiltered: everything, newest first (id DESC breaks the
     // same-second tie).
     let all = store
-        .list_requests_filtered(None, None, None, None)
+        .list_requests_filtered(None, None, None, None, None)
         .await
         .unwrap();
     let ids: Vec<&str> = all.iter().map(|row| row.id.as_str()).collect();
@@ -723,14 +723,14 @@ async fn list_requests_filtered_applies_filters_newest_first() {
 
     // By repo.
     let repo_a = store
-        .list_requests_filtered(None, Some("/repo/a"), None, None)
+        .list_requests_filtered(None, Some("/repo/a"), None, None, None)
         .await
         .unwrap();
     assert_eq!(repo_a.len(), 2);
 
     // By agent and state combined.
     let done_claude = store
-        .list_requests_filtered(None, None, Some("claude"), Some(RequestState::Done))
+        .list_requests_filtered(None, None, Some("claude"), Some(RequestState::Done), None)
         .await
         .unwrap();
     assert_eq!(done_claude.len(), 1);
@@ -738,7 +738,37 @@ async fn list_requests_filtered_applies_filters_newest_first() {
 
     // No match.
     let none = store
-        .list_requests_filtered(None, Some("/repo/none"), None, None)
+        .list_requests_filtered(None, Some("/repo/none"), None, None, None)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn list_requests_filtered_by_capability() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("req_1", "flow.run", "/repo/a", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_request("req_2", "echo", "/repo/a", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_request("req_3", "flow.run", "/repo/b", "codex", "{}", None)
+        .await
+        .unwrap();
+
+    let flow_runs = store
+        .list_requests_filtered(None, None, None, None, Some("flow.run"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = flow_runs.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(ids, ["req_3", "req_1"]);
+
+    let none = store
+        .list_requests_filtered(None, None, None, None, Some("no.such.capability"))
         .await
         .unwrap();
     assert!(none.is_empty());
@@ -756,14 +786,14 @@ async fn list_requests_filtered_bounds_the_limit() {
 
     // An explicit limit caps the rows.
     let two = store
-        .list_requests_filtered(Some(2), None, None, None)
+        .list_requests_filtered(Some(2), None, None, None, None)
         .await
         .unwrap();
     assert_eq!(two.len(), 2);
 
     // Zero is clamped up to one instead of returning nothing.
     let one = store
-        .list_requests_filtered(Some(0), None, None, None)
+        .list_requests_filtered(Some(0), None, None, None, None)
         .await
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -771,7 +801,7 @@ async fn list_requests_filtered_bounds_the_limit() {
     // An absurd limit is clamped to the maximum (observable only as
     // "does not error"; the clamp constant bounds the SQL LIMIT).
     let all = store
-        .list_requests_filtered(Some(u64::MAX), None, None, None)
+        .list_requests_filtered(Some(u64::MAX), None, None, None, None)
         .await
         .unwrap();
     assert_eq!(all.len(), 5);
@@ -1130,4 +1160,130 @@ async fn evidence_insert_refuses_an_unknown_request() {
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Database(_)));
+}
+
+#[tokio::test]
+async fn get_connector_returns_none_when_absent() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert_eq!(store.get_connector("github").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn upsert_connector_creates_then_patches_only_given_fields() {
+    let store = Store::open_in_memory().await.unwrap();
+
+    // Creates: unset fields land on their defaults.
+    let created = store
+        .upsert_connector(
+            "github",
+            ConnectorPatch {
+                enabled: Some(true),
+                base_url: Some(Some("https://api.github.com")),
+                username: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.id, "github");
+    assert!(created.enabled);
+    assert_eq!(created.base_url.as_deref(), Some("https://api.github.com"));
+    assert_eq!(created.username, None);
+    assert_eq!(created.last_test_status, None);
+
+    // Patches only `username`: `enabled` and `base_url` are untouched.
+    let patched = store
+        .upsert_connector(
+            "github",
+            ConnectorPatch {
+                enabled: None,
+                base_url: None,
+                username: Some(Some("octocat")),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(patched.enabled);
+    assert_eq!(patched.base_url.as_deref(), Some("https://api.github.com"));
+    assert_eq!(patched.username.as_deref(), Some("octocat"));
+    assert!(patched.updated_ts >= created.updated_ts);
+
+    // `Some(None)` clears `base_url`.
+    let cleared = store
+        .upsert_connector(
+            "github",
+            ConnectorPatch {
+                enabled: None,
+                base_url: Some(None),
+                username: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.base_url, None);
+    assert_eq!(cleared.username.as_deref(), Some("octocat"));
+    assert!(cleared.enabled);
+
+    // Read back through `get_connector` agrees.
+    let fetched = store.get_connector("github").await.unwrap().unwrap();
+    assert_eq!(fetched, cleared);
+}
+
+#[tokio::test]
+async fn list_connectors_is_ordered_by_id() {
+    let store = Store::open_in_memory().await.unwrap();
+    for id in ["jenkins", "github", "argo"] {
+        store
+            .upsert_connector(
+                id,
+                ConnectorPatch {
+                    enabled: Some(false),
+                    base_url: None,
+                    username: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows = store.list_connectors().await.unwrap();
+    let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(ids, ["argo", "github", "jenkins"]);
+}
+
+#[tokio::test]
+async fn record_connector_test_creates_row_when_absent_and_updates_it() {
+    let store = Store::open_in_memory().await.unwrap();
+
+    // No prior row: the test result creates one.
+    store
+        .record_connector_test("github", true, "reached /user")
+        .await
+        .unwrap();
+    let row = store.get_connector("github").await.unwrap().unwrap();
+    assert_eq!(row.last_test_status.as_deref(), Some("passed"));
+    assert_eq!(row.last_test_detail.as_deref(), Some("reached /user"));
+    assert!(row.last_test_ts.is_some());
+    assert!(!row.enabled, "record_connector_test must not enable it");
+
+    // A later failing test overwrites the verdict without touching
+    // fields it does not own.
+    store
+        .upsert_connector(
+            "github",
+            ConnectorPatch {
+                enabled: Some(true),
+                base_url: None,
+                username: None,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .record_connector_test("github", false, "401 unauthorized")
+        .await
+        .unwrap();
+    let row = store.get_connector("github").await.unwrap().unwrap();
+    assert_eq!(row.last_test_status.as_deref(), Some("failed"));
+    assert_eq!(row.last_test_detail.as_deref(), Some("401 unauthorized"));
+    assert!(row.enabled, "record_connector_test must not clear enabled");
 }

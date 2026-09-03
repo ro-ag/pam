@@ -407,6 +407,49 @@ pub struct CompressionStats {
     pub tokens_avoided_est: u64,
 }
 
+/// One row of the `connector` table: a connector's configuration and its
+/// last self-test verdict.
+///
+/// Secrets never live here: `base_url` and `username` are plain
+/// configuration; the credential itself belongs to the OS keychain via
+/// `pam_daemon`'s `SecretStore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorRow {
+    /// Connector id (`github`, `jenkins`, ...).
+    pub id: String,
+    /// Whether the connector is enabled.
+    pub enabled: bool,
+    /// Base URL, for connectors that need one (e.g. a self-hosted Jenkins).
+    pub base_url: Option<String>,
+    /// Username, for connectors whose auth needs one alongside a token.
+    pub username: Option<String>,
+    /// Outcome of the last self-test: `"passed"` or `"failed"`, once one
+    /// ran.
+    pub last_test_status: Option<String>,
+    /// Free-form detail from the last self-test.
+    pub last_test_detail: Option<String>,
+    /// Unix seconds when the last self-test ran.
+    pub last_test_ts: Option<i64>,
+    /// Unix seconds of the last change to this row.
+    pub updated_ts: i64,
+}
+
+/// A partial update to a [`ConnectorRow`]: a field left as `None` is left
+/// untouched by [`Store::upsert_connector`].
+///
+/// `base_url` and `username` are `Option<Option<&str>>` so a patch can
+/// distinguish "leave it" (`None`) from "clear it" (`Some(None)`) from
+/// "set it" (`Some(Some(value))`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectorPatch<'a> {
+    /// New `enabled` value, when given.
+    pub enabled: Option<bool>,
+    /// New `base_url`, when given; `Some(None)` clears it.
+    pub base_url: Option<Option<&'a str>>,
+    /// New `username`, when given; `Some(None)` clears it.
+    pub username: Option<Option<&'a str>>,
+}
+
 /// Handle to the durable state database.
 ///
 /// Async by design (the Turso engine drives its own I/O); the daemon
@@ -1006,6 +1049,7 @@ impl Store {
         repo: Option<&str>,
         agent: Option<&str>,
         state: Option<RequestState>,
+        capability: Option<&str>,
     ) -> Result<Vec<RequestRow>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let limit = limit
@@ -1017,6 +1061,7 @@ impl Store {
             ("repo", repo),
             ("caller_agent", agent),
             ("state", state.map(RequestState::as_str)),
+            ("capability", capability),
         ] {
             if let Some(value) = value {
                 args.push(value.to_owned());
@@ -1473,6 +1518,159 @@ impl Store {
             }
         }
         Ok(stats)
+    }
+
+    /// The `connector` column list every row query selects, in the order
+    /// [`Self::parse_connector_row`] expects.
+    const CONNECTOR_COLUMNS: &'static str = "id, enabled, base_url, username, \
+         last_test_status, last_test_detail, last_test_ts, updated_ts";
+
+    /// Builds a [`ConnectorRow`] from a row selected with
+    /// [`Self::CONNECTOR_COLUMNS`].
+    fn parse_connector_row(row: &turso::Row) -> Result<ConnectorRow, StoreError> {
+        let enabled: i64 = row.get(1)?;
+        Ok(ConnectorRow {
+            id: row.get(0)?,
+            enabled: enabled != 0,
+            base_url: row.get(2)?,
+            username: row.get(3)?,
+            last_test_status: row.get(4)?,
+            last_test_detail: row.get(5)?,
+            last_test_ts: row.get(6)?,
+            updated_ts: row.get(7)?,
+        })
+    }
+
+    /// Every connector row, ordered by id.
+    pub async fn list_connectors(&self) -> Result<Vec<ConnectorRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM connector ORDER BY id",
+                    Self::CONNECTOR_COLUMNS
+                ),
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::parse_connector_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Reads one connector row by id, or `None` if it has never been
+    /// configured or tested.
+    pub async fn get_connector(&self, id: &str) -> Result<Option<ConnectorRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM connector WHERE id = ?1",
+                    Self::CONNECTOR_COLUMNS
+                ),
+                params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(Self::parse_connector_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Creates or patches a connector row: `INSERT ... ON CONFLICT DO
+    /// UPDATE`, touching only the fields `patch` sets. `updated_ts` is
+    /// always bumped to now, whether the row was created or patched.
+    ///
+    /// A field of `patch` left as `None` keeps its current value across a
+    /// patch (or lands on its column default on first insert); a
+    /// `base_url`/`username` field given as `Some(None)` clears it.
+    pub async fn upsert_connector(
+        &self,
+        id: &str,
+        patch: ConnectorPatch<'_>,
+    ) -> Result<ConnectorRow, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let enabled = patch.enabled.unwrap_or(false);
+        let base_url = patch.base_url.flatten();
+        let username = patch.username.flatten();
+
+        // Only the fields the caller actually set are reassigned on
+        // conflict; the rest keep the existing row's value instead of
+        // being overwritten by the INSERT's (possibly default) values.
+        let mut set_clauses = vec!["updated_ts = excluded.updated_ts".to_owned()];
+        if patch.enabled.is_some() {
+            set_clauses.push("enabled = excluded.enabled".to_owned());
+        }
+        if patch.base_url.is_some() {
+            set_clauses.push("base_url = excluded.base_url".to_owned());
+        }
+        if patch.username.is_some() {
+            set_clauses.push("username = excluded.username".to_owned());
+        }
+        let sql = format!(
+            "INSERT INTO connector (id, enabled, base_url, username, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET {}",
+            set_clauses.join(", ")
+        );
+        self.conn
+            .execute(
+                &sql,
+                params![id, i64::from(enabled), base_url, username, now_ts()],
+            )
+            .await?;
+
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM connector WHERE id = ?1",
+                    Self::CONNECTOR_COLUMNS
+                ),
+                params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Self::parse_connector_row(&row),
+            None => Err(StoreError::NotFound {
+                table: "connector",
+                id: id.to_owned(),
+            }),
+        }
+    }
+
+    /// Records the result of a connector self-test, creating the row when
+    /// it does not exist yet. Only the self-test fields (and
+    /// `updated_ts`) are written; `enabled`, `base_url` and `username`
+    /// are left untouched on an existing row, and land on their column
+    /// defaults when the row is created here.
+    pub async fn record_connector_test(
+        &self,
+        id: &str,
+        passed: bool,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let status = if passed { "passed" } else { "failed" };
+        let now = now_ts();
+        self.conn
+            .execute(
+                "INSERT INTO connector
+                     (id, enabled, last_test_status, last_test_detail, last_test_ts, updated_ts)
+                 VALUES (?1, 0, ?2, ?3, ?4, ?4)
+                 ON CONFLICT (id) DO UPDATE SET
+                     last_test_status = excluded.last_test_status,
+                     last_test_detail = excluded.last_test_detail,
+                     last_test_ts = excluded.last_test_ts,
+                     updated_ts = excluded.updated_ts",
+                params![id, status, detail, now],
+            )
+            .await?;
+        Ok(())
     }
 }
 

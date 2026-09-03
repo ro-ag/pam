@@ -23,5 +23,18 @@ url.workspace = true
 # flavor — the daemon owns task placement.
 tokio = { version = "1", default-features = false, features = ["process", "io-util", "time", "rt", "sync", "macros"] }
 
+[dev-dependencies]
+# a temporary directory for the fake `aws` executable the CLI tests spawn.
+tempfile.workspace = true
+# `net` powers `tests/curl_origin.rs`: a throwaway HTTP/1.1 origin that real
+# curl is pointed at. The runtime features drive `#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time", "process", "sync"] }
+
+# The origin test needs `CurlTransport::allow_http_for_tests`, which only
+# exists outside the crate's own unit tests with the `testing` feature on.
+[[test]]
+name = "curl_origin"
+required-features = ["testing"]
+
 [lints]
 workspace = true

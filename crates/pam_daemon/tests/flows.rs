@@ -42,6 +42,7 @@ use pam_daemon::flow_service::{
     EVIDENCE_KIND_FLOW_RESULT, step_capability,
 };
 use pam_daemon::log_service::{EVIDENCE_KIND_LOG_SOURCE, EVIDENCE_KIND_LOG_SUMMARY};
+use pam_daemon::model_service::SETTING_DEFAULT_HEAVY;
 use pam_daemon::secrets::{SecretBackend, account_for};
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{EVIDENCE_KIND_LOG_COMPACT, RequestState};
@@ -1099,7 +1100,7 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
         flows
             .daemon
             .store()
-            .set_setting("models.default.heavy", &format!("\"{model}\""))
+            .set_setting(SETTING_DEFAULT_HEAVY, &format!("\"{model}\""))
             .await
             .expect("the heavy default persists");
         let mut client = flows.daemon.client().await;

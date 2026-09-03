@@ -10,7 +10,6 @@ import {
   type Connection,
   type EdgeChange,
   type NodeChange,
-  type OnSelectionChangeParams,
 } from "@xyflow/react";
 import { Maximize2, Plug, Terminal, Wand2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -54,6 +53,12 @@ import { StepNode } from "./StepNode";
  * nodes the canvas has already placed keep their place, and only the rest
  * are laid out by ELK — so an added step lands next to the flow instead
  * of scattering everything the human arranged.
+ *
+ * Selection is owned by the screen (the inspector shares it) and mirrored
+ * onto the nodes; the canvas reports back only what a gesture changed —
+ * the `select` changes xyflow emits on a click or a drag-select — never
+ * the store's own echo of the selection it was just handed, which lags a
+ * render behind and would otherwise argue with the mirror forever.
  */
 
 export type Selection =
@@ -78,23 +83,28 @@ const nodeTypes = { step: StepNode, inputs: FrameNode, verdict: FrameNode };
 const edgeTypes = { flow: FlowEdge };
 
 const FIT = { padding: 0.2 };
+// Stable identities: xyflow syncs every tracked prop into its store when
+// the reference changes, and a fresh array or object per render would
+// keep that sync, the store's subscribers, and this component in a loop.
+const SNAP_GRID: [number, number] = [16, 16];
+const PRO_OPTIONS = { hideAttribution: true };
 
 function sameSelection(a: Selection, b: Selection): boolean {
   if (a.kind !== b.kind) return false;
   return "id" in a && "id" in b ? a.id === b.id : true;
 }
 
-/** What xyflow's selection means to the inspector. The Verdict frame is never selectable. */
+/** What the selected nodes and edges mean to the inspector. The Verdict frame is never selectable. */
 export function selectionOf(
   nodes: readonly CanvasNode[],
   edges: readonly CanvasEdge[],
 ): Selection {
-  const node = nodes[0];
+  const node = nodes.find((candidate) => candidate.selected);
   if (node) {
     if (node.id === INPUTS_NODE) return { kind: "inputs" };
     if (node.id !== VERDICT_NODE) return { kind: "step", id: node.id };
   }
-  const edge = edges[0];
+  const edge = edges.find((candidate) => candidate.selected);
   if (edge && edge.data?.kind !== "terminal") return { kind: "edge", id: edge.id };
   return { kind: "none" };
 }
@@ -138,11 +148,14 @@ function Canvas({
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
   const [refused, setRefused] = useState<Refused | null>(null);
   const [saveTick, setSaveTick] = useState(0);
+  const [selectTick, setSelectTick] = useState(0);
 
   // Refs let the rebuild effect read the latest canvas state without
   // re-running on every measurement or selection change.
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const placedFor = useRef<string | null>(null);
@@ -241,15 +254,32 @@ function Canvas({
     savePositions(flowId, positionsOf(nodesRef.current));
   }, [saveTick, flowId]);
 
+  // A gesture selected something: read the settled canvas state and tell
+  // the screen, once, if it differs from what the screen already holds.
+  useEffect(() => {
+    if (selectTick === 0) return;
+    const next = selectionOf(nodesRef.current, edgesRef.current);
+    if (!sameSelection(next, selectionRef.current)) {
+      selectionRef.current = next;
+      onSelect(next);
+    }
+  }, [selectTick, onSelect]);
+
   const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => {
     setNodes((prev) => applyNodeChanges(changes, prev));
     if (changes.some((change) => change.type === "position" && change.dragging === false)) {
       setSaveTick((tick) => tick + 1);
     }
+    if (changes.some((change) => change.type === "select")) {
+      setSelectTick((tick) => tick + 1);
+    }
   }, []);
 
   const onEdgesChange = useCallback((changes: EdgeChange<CanvasEdge>[]) => {
     setEdges((prev) => applyEdgeChanges(changes, prev));
+    if (changes.some((change) => change.type === "select")) {
+      setSelectTick((tick) => tick + 1);
+    }
   }, []);
 
   const onConnect = useCallback(
@@ -263,14 +293,6 @@ function Canvas({
       }
     },
     [spec, onChange],
-  );
-
-  const onSelectionChange = useCallback(
-    (params: OnSelectionChangeParams<CanvasNode, CanvasEdge>) => {
-      const next = selectionOf(params.nodes, params.edges);
-      if (!sameSelection(next, selectionRef.current)) onSelect(next);
-    },
-    [onSelect],
   );
 
   const add = (kind: "command" | "connector") => {
@@ -339,14 +361,13 @@ function Canvas({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
-          onSelectionChange={onSelectionChange}
           snapToGrid
-          snapGrid={[16, 16]}
+          snapGrid={SNAP_GRID}
           fitView
           fitViewOptions={FIT}
           minZoom={0.3}
           maxZoom={1.5}
-          proOptions={{ hideAttribution: true }}
+          proOptions={PRO_OPTIONS}
           deleteKeyCode={null}
           className="font-sans"
         >

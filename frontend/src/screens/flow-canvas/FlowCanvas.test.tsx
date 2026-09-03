@@ -26,7 +26,7 @@ interface CapturedProps {
     targetHandle: string | null;
   }) => void;
   onNodesChange: (changes: unknown[]) => void;
-  onSelectionChange: (params: { nodes: CanvasNode[]; edges: CanvasEdge[] }) => void;
+  onEdgesChange: (changes: unknown[]) => void;
   snapToGrid: boolean;
   snapGrid: [number, number];
   proOptions: { hideAttribution: boolean };
@@ -481,24 +481,42 @@ describe("FlowCanvas toolbar", () => {
     expect(next.steps[2].needs).toEqual(["a"]);
   });
 
-  it("reports xyflow's selection as a step, an edge, the inputs frame, or nothing", async () => {
-    const { props } = renderCanvas();
+  it("reports a gesture's selection as a step, an edge, the inputs frame, or nothing", async () => {
+    const { props, rerender } = renderCanvas();
     await settle();
-    const nodes = captured.props?.nodes ?? [];
-    const pick = (
-      selected: Selection,
-      params: { nodes: CanvasNode[]; edges: CanvasEdge[] },
-    ) => {
-      act(() => captured.props?.onSelectionChange(params));
+    const select = (kind: "node" | "edge", id: string, selected: boolean) =>
+      act(() => {
+        const change = [{ type: "select", id, selected }];
+        if (kind === "node") captured.props?.onNodesChange(change);
+        else captured.props?.onEdgesChange(change);
+      });
+    // The screen answers every report by handing the selection back down.
+    const expectSelection = (selected: Selection) => {
       expect(props.onSelect).toHaveBeenLastCalledWith(selected);
+      rerender(<FlowCanvas {...props} selection={selected} />);
     };
-    pick({ kind: "step", id: "b" }, { nodes: nodes.filter((n) => n.id === "b"), edges: [] });
-    pick({ kind: "inputs" }, { nodes: nodes.filter((n) => n.id === "inputs"), edges: [] });
-    pick(
-      { kind: "edge", id: "needs:a->b" },
-      { nodes: [], edges: (captured.props?.edges ?? []).filter((e) => e.id === "needs:a->b") },
-    );
-    const verdict = nodes.find((n) => n.id === "verdict");
+
+    select("node", "b", true);
+    expectSelection({ kind: "step", id: "b" });
+    select("node", "b", false);
+    select("node", "inputs", true);
+    expectSelection({ kind: "inputs" });
+    select("node", "inputs", false);
+    select("edge", "needs:a->b", true);
+    expectSelection({ kind: "edge", id: "needs:a->b" });
+    select("edge", "needs:a->b", false);
+    expectSelection({ kind: "none" });
+
+    const verdict = (captured.props?.nodes ?? []).find((n) => n.id === "verdict");
     expect(verdict?.selectable).toBe(false);
+  });
+
+  it("does not echo the selection it was handed back to the screen", async () => {
+    const { props } = renderCanvas({ selection: { kind: "step", id: "b" } });
+    await settle();
+    // The mirror put `b` on the nodes; a select change that merely agrees
+    // (xyflow re-reporting the store) must not reach onSelect at all.
+    act(() => captured.props?.onNodesChange([{ type: "select", id: "b", selected: true }]));
+    expect(props.onSelect).not.toHaveBeenCalled();
   });
 });

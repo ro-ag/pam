@@ -3996,6 +3996,7 @@ version = "0.1.0"
 dependencies = [
  "pam_daemon",
  "pam_proto",
+ "serde",
  "serde_json",
  "sysinfo",
  "tempfile",

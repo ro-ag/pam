@@ -93,14 +93,16 @@
 //! Op names are constants (`OP_*`), all under [`ADMIN_PREFIX`]. An
 //! unrecognized `admin.*` capability is refused with
 //! [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here, or in
-//! [`crate::admin_models`] / [`crate::admin_logs`], and nowhere else.
+//! [`crate::admin_models`] / [`crate::admin_logs`] /
+//! [`crate::admin_retention`], and nowhere else.
 //!
 //! # The model ops live next door, under the same rules
 //!
 //! [`crate::admin_models`] holds the `admin.models.*` and
 //! `admin.curator.*` ops, [`crate::admin_logs`] the `admin.log.*` and
-//! `admin.evidence.*` ones, and [`crate::admin_connectors`] the
-//! `admin.connectors.*` ones. They are dispatched from [`AdminService`]
+//! `admin.evidence.*` ones, [`crate::admin_connectors`] the
+//! `admin.connectors.*` ones, and [`crate::admin_retention`] the
+//! `admin.retention.*` ones. They are dispatched from [`AdminService`]
 //! before this module's own `match` and are administration in every sense
 //! that matters here: same tripwire, same deadline, same request row, same
 //! single terminal audit row, no [`crate::policy::classify`] entry, no
@@ -368,13 +370,14 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The flow, model, log and connector surfaces get first refusal:
-    /// [`Self::dispatch_flows`], [`Self::dispatch_models`],
-    /// [`Self::dispatch_logs`] and [`Self::dispatch_connectors`] answer
-    /// `None` for anything that is not one of their ops, and the match
-    /// below takes over. The log and connector surfaces are handed the
-    /// envelope's id because a compress files its evidence, and a
-    /// configure its change, under this very request row.
+    /// The flow, model, log, connector and retention surfaces get first
+    /// refusal: [`Self::dispatch_flows`], [`Self::dispatch_models`],
+    /// [`Self::dispatch_logs`], [`Self::dispatch_connectors`] and
+    /// [`Self::dispatch_retention`] answer `None` for anything that is
+    /// not one of their ops, and the match below takes over. The log and
+    /// connector surfaces are handed the envelope's id because a compress
+    /// files its evidence, and a configure its change, under this very
+    /// request row.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, OwnedRefusal> {
         let args = &envelope.args;
         if let Some(answer) = self.dispatch_flows(&envelope.capability, args).await {
@@ -393,6 +396,9 @@ impl AdminService {
             .dispatch_connectors(&envelope.id, &envelope.capability, args)
             .await
         {
+            return answer.map_err(OwnedRefusal::from);
+        }
+        if let Some(answer) = self.dispatch_retention(&envelope.capability, args).await {
             return answer.map_err(OwnedRefusal::from);
         }
         let answer: Result<AdminOk, AdminRefusal> = match envelope.capability.as_str() {

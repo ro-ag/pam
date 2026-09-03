@@ -19,7 +19,8 @@ fn every_daemon_admin_op_is_whitelisted() {
         9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
             + pam_daemon::admin_logs::LOG_ADMIN_OPS.len()
             + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
-            + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len(),
+            + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len()
+            + pam_daemon::admin_retention::RETENTION_ADMIN_OPS.len(),
         "new admin ops need explicit wiring"
     );
 }
@@ -55,6 +56,15 @@ fn every_flow_admin_op_is_whitelisted() {
 fn every_connector_admin_op_is_whitelisted() {
     // Same for the connector surface behind Settings → Connectors.
     for op in pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+}
+
+#[test]
+fn every_retention_admin_op_is_whitelisted() {
+    // Same for the retention surface behind Settings → Retention: the
+    // panel's two selects and its Prune now button all land here.
+    for op in pam_daemon::admin_retention::RETENTION_ADMIN_OPS {
         assert!(is_known_admin_op(op), "{op} must be forwarded");
     }
 }

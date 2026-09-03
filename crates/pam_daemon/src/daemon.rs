@@ -14,7 +14,10 @@
 //!   request ([`Pipeline::handle`]);
 //! - an **executor loop** that leases queued work from the lanes and
 //!   runs it through [`BuiltinCapability`] dispatch;
-//! - the queue's **lease reaper**.
+//! - the queue's **lease reaper**;
+//! - the **retention pruner** ([`crate::retention`]), which prunes on
+//!   its first tick — so a boot prunes, right after crash recovery —
+//!   and every [`PRUNE_INTERVAL`] after that.
 //!
 //! # Ordering constraints
 //!
@@ -200,6 +203,7 @@ use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
 use crate::queue::{
     AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
 };
+use crate::retention::{PRUNE_INTERVAL, RetentionService};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::{SecretBackend, SecretStore};
 use crate::transport::{EventPublisher, IncomingRequest, Transport, TransportError};
@@ -643,6 +647,7 @@ pub async fn run_daemon_with(
 
     let tasks = vec![
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
+        RetentionService::new(Arc::clone(&store)).run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
         tokio::spawn(dispatch_loop(
             Arc::clone(&pipeline),
             incoming_rx,

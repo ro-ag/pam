@@ -31,6 +31,9 @@ steps:
     retry: { attempts: 2, backoff: 500ms }
     approval: none
     env: { CARGO_TERM_COLOR: never }
+    note: |-
+      Check the tree first.
+      Stale files hide real failures.
 ";
 
 fn raw(yaml: &str) -> Result<RawFlow, serde_yaml_ng::Error> {
@@ -74,6 +77,11 @@ fn a_full_featured_flow_deserializes() {
         second.env.as_ref().expect("env")["CARGO_TERM_COLOR"],
         "never"
     );
+    assert_eq!(
+        second.note.as_deref(),
+        Some("Check the tree first.\nStale files hide real failures.")
+    );
+    assert_eq!(flow.steps[0].note, None);
 }
 
 #[test]
@@ -190,6 +198,24 @@ fn a_flow_serializes_durations_as_strings() {
     assert_eq!(json["steps"][0]["retry"]["backoff"], "500ms");
     assert_eq!(json["steps"][0]["action"]["kind"], "command");
     assert_eq!(json["steps"][0]["action"]["argv"][0], "git");
+    assert!(
+        json["steps"][0].get("note").is_none(),
+        "an empty note is left out of the resolved JSON"
+    );
+}
+
+#[test]
+fn a_step_note_serializes_only_when_set() {
+    let step = Step {
+        id: "a".to_string(),
+        action: Action::Command {
+            argv: vec!["git".to_string()],
+        },
+        note: "Why this step exists.".to_string(),
+        ..step_defaults()
+    };
+    let json = serde_json::to_value(&step).expect("step serializes");
+    assert_eq!(json["note"], "Why this step exists.");
 }
 
 fn step_defaults() -> Step {
@@ -205,5 +231,6 @@ fn step_defaults() -> Step {
         retry: Retry::default(),
         approval: Approval::None,
         env: BTreeMap::new(),
+        note: String::new(),
     }
 }

@@ -99,6 +99,32 @@ fn the_description_is_bounded() {
 }
 
 #[test]
+fn a_step_note_is_optional_trimmed_and_bounded() {
+    let flow = good(&wrap("  - id: a\n    run: [git]\n"));
+    assert!(flow.steps[0].note.is_empty(), "no key means no note");
+
+    let flow = good(&wrap(
+        "  - id: a\n    run: [git]\n    note: \"  \\n\\t \"\n",
+    ));
+    assert!(flow.steps[0].note.is_empty(), "whitespace alone is no note");
+
+    let flow = good(&wrap(
+        "  - id: a\n    run: [git]\n    note: |\n      Why this runs first.\n      Keep it short.\n",
+    ));
+    assert_eq!(flow.steps[0].note, "Why this runs first.\nKeep it short.");
+
+    let flow = good(&wrap(
+        "  - id: a\n    connector: aws\n    call: commands\n    note: connector steps carry notes too\n",
+    ));
+    assert_eq!(flow.steps[0].note, "connector steps carry notes too");
+
+    let long = "n".repeat(2049);
+    let (path, message) = bad_step(&format!("  - id: a\n    run: [git]\n    note: {long}\n"));
+    assert_eq!(path, "steps[0].note");
+    assert!(message.contains("2048"), "{message}");
+}
+
+#[test]
 fn a_flow_needs_at_least_one_step_and_at_most_sixty_four() {
     let (path, _) = bad("schema: 1\nid: demo\nname: Demo\nsteps: []\n");
     assert_eq!(path, "steps");
@@ -421,6 +447,12 @@ fn secret_like_strings_are_refused_everywhere() {
             "  - id: a\n    connector: github\n    call: runs\n    with: {{ repo: '{secret}' }}\n"
         ));
         assert_eq!(path, "steps[0].with.repo", "{secret}");
+
+        let (path, message) = bad_step(&format!(
+            "  - id: a\n    run: [git]\n    note: '{secret}'\n"
+        ));
+        assert_eq!(path, "steps[0].note", "{secret}");
+        assert!(message.contains("secret"), "{message}");
     }
 
     for innocent in [
@@ -585,6 +617,16 @@ fn parse_value_accepts_the_raw_json_shape() {
     assert_eq!(flow.steps[1].when, When::Succeeded("status".into()));
     assert_eq!(format_duration(flow.steps[1].timeout), "10m");
     assert_eq!(flow.steps[1].retry.attempts, 2);
+}
+
+#[test]
+fn parse_value_carries_a_step_note_through_yaml() {
+    let raw = serde_json::json!({
+        "schema": 1, "id": "demo", "name": "Demo",
+        "steps": [ { "id": "status", "run": ["git", "status"], "note": "First line.\nSecond line." } ]
+    });
+    let flow = parse_value(&raw).expect("parses");
+    assert_eq!(flow.steps[0].note, "First line.\nSecond line.");
 }
 
 #[test]

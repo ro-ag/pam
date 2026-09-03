@@ -82,6 +82,8 @@ steps:
     retry: { attempts: 2, backoff: 500ms }   # attempts 1..5, backoff ≤ 60s, doubling, cap 60s
     approval: none                # none (default) | required; stateful ⇒ required is forced
     env: { CARGO_TERM_COLOR: never }         # additions only; names [A-Z_][A-Z0-9_]*, secret-like values refused
+    note: |                       # optional free text ≤ 2 KiB, never a secret; the designer's tethered note
+      Stale files hide real failures.
 ```
 
 Rules (every violation is a `FlowError::Invalid { path, message }`
@@ -104,6 +106,13 @@ naming the YAML path):
   read-only only.
 - Bounds: ≤ 64 steps, ≤ 16 inputs, file ≤ 256 KiB, `name` ≤ 120 bytes,
   `description` ≤ 2 KiB.
+- `note` (per step, optional): free text ≤ 2 KiB, trimmed — whitespace
+  alone is no note — and refused when it looks like a secret, exactly as
+  `description` is bounded and `env` values are screened. It is the last
+  key of a step in normalized order (after `env`), omitted when empty, so
+  only a real note moves the digest. The designer draws it as a tethered
+  note card beside the step; it lives in the YAML, never in GUI-local
+  state (owner decision 2026-09-03).
 - Secret hygiene (ported from pam-old): any string that looks like a
   bearer/PAT/AWS key/JWT or a URL with userinfo is rejected; argument
   names `--token=`, `--password`, `--secret`, `--api-key` (with or
@@ -122,7 +131,7 @@ pub struct Flow { pub schema: u16, pub id: String, pub name: String, pub descrip
 pub struct Input { pub description: String, pub default: Option<String> }
 pub struct Step { pub id, pub action: Action, pub timeout: Duration, pub effect: Effect, pub role: Role,
                   pub output: OutputPolicy, pub needs: Vec<String>, pub when: When, pub retry: Retry,
-                  pub approval: Approval, pub env: BTreeMap<String, String> }
+                  pub approval: Approval, pub env: BTreeMap<String, String>, pub note: String }
 pub enum Action { Command { argv: Vec<String> }, Connector { connector: ConnectorId, call: String, with: BTreeMap<String, ArgValue> } }
 pub enum Effect { ReadOnly, Stateful }        pub enum Role { Observe, Verify, Change }
 pub enum OutputPolicy { Compact, Summarize, Discard }

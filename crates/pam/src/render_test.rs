@@ -445,3 +445,48 @@ fn an_input_without_an_equals_sign_is_a_usage_error_naming_it() {
     let error = parse_flow_inputs(&["=value".to_owned()]).expect_err("an empty name is refused");
     assert_eq!(error, "input \"=value\" must be key=value");
 }
+
+#[test]
+fn service_report_prints_one_fact_per_line() {
+    use crate::render;
+    use pam_client::service::{ServiceReport, ServiceState};
+    let installed = ServiceReport {
+        platform: "macos",
+        exe: "/Applications/pam.app/Contents/MacOS/pam".into(),
+        state: ServiceState::Installed {
+            unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist".to_owned(),
+            loaded: true,
+        },
+        note: Some("stopped the running daemon (pid 7) so the managed one takes over".to_owned()),
+    };
+    let text = render::render_service_report(&installed);
+    assert_eq!(
+        text,
+        "platform  macos\n\
+         state     installed, loaded\n\
+         unit      /Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist\n\
+         exe       /Applications/pam.app/Contents/MacOS/pam\n\
+         note      stopped the running daemon (pid 7) so the managed one takes over\n"
+    );
+    let unsupported = ServiceReport {
+        platform: "other",
+        exe: "/x/pam".into(),
+        state: ServiceState::Unsupported {
+            reason: "freebsd has no login-start integration".to_owned(),
+        },
+        note: None,
+    };
+    assert!(
+        render::render_service_report(&unsupported)
+            .contains("state     unsupported: freebsd has no login-start integration\n")
+    );
+    let absent = ServiceReport {
+        platform: "linux",
+        exe: "/usr/bin/pam".into(),
+        state: ServiceState::NotInstalled {
+            unit: "/home/me/.config/systemd/user/pam-daemon.service".to_owned(),
+        },
+        note: None,
+    };
+    assert!(render::render_service_report(&absent).contains("state     not installed\n"));
+}

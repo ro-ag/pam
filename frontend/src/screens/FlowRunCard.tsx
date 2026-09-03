@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { cn } from "../lib/cn";
 import {
@@ -195,15 +196,32 @@ const REFUSED_MID_RUN: BridgeFailure = {
   recovery: "Open Activity and expand this request to read the refusal it recorded.",
 };
 
-const fieldClasses =
-  "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+/**
+ * What the card knows about its run, for whoever wants to paint it: the
+ * ticket, every progress note it has heard for that ticket in order, the
+ * settled request id once `done` / `refused` arrived, and whether it was
+ * a refusal. The canvas turns the notes into rims.
+ */
+export interface FlowRunState {
+  ticket: string | null;
+  notes: string[];
+  settled: string | null;
+  refused: boolean;
+}
 
-export function FlowRunCard({ flow }: { flow: FlowListEntry }) {
+export function FlowRunCard({
+  flow,
+  onRun,
+}: {
+  flow: FlowListEntry;
+  /** Called whenever the run state changes; notes accumulate per ticket. */
+  onRun?: (run: FlowRunState) => void;
+}) {
   const callers = useQuery({ queryKey: ["callers"], queryFn: callersList });
   const [repo, setRepo] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
   const [ticket, setTicket] = useState<string | null>(null);
-  const [progress, setProgress] = useState<string | null>(null);
+  const [notes, setNotes] = useState<string[]>([]);
   const [settled, setSettled] = useState<string | null>(null);
   const [refused, setRefused] = useState(false);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
@@ -216,11 +234,19 @@ export function FlowRunCard({ flow }: { flow: FlowListEntry }) {
     for (const input of flow.inputs) defaults[input.name] = input.default ?? "";
     setValues(defaults);
     setTicket(null);
-    setProgress(null);
+    setNotes([]);
     setSettled(null);
     setRefused(false);
     setFailure(null);
   }, [flow.id, flow.inputs]);
+
+  // Whoever listens gets every change, through a ref so a new callback
+  // identity never re-announces an unchanged run.
+  const onRunRef = useRef(onRun);
+  onRunRef.current = onRun;
+  useEffect(() => {
+    onRunRef.current?.({ ticket, notes, settled, refused });
+  }, [ticket, notes, settled, refused]);
 
   // The ticket's own events drive the progress line. Kept in a ref so the
   // subscription is opened once per run, not once per re-render.
@@ -233,7 +259,8 @@ export function FlowRunCard({ flow }: { flow: FlowListEntry }) {
     subscribeEvents((payload) => {
       if (payload.ticket !== ticketRef.current) return;
       if (payload.event.kind === "progress") {
-        setProgress(payload.event.note);
+        const note = payload.event.note;
+        setNotes((prev) => [...prev, note]);
         return;
       }
       if (payload.event.kind === "done" || payload.event.kind === "refused") {
@@ -260,10 +287,12 @@ export function FlowRunCard({ flow }: { flow: FlowListEntry }) {
     return [...seen].filter(Boolean).sort();
   }, [callers.data]);
 
+  const progress = notes.length > 0 ? notes[notes.length - 1] : null;
+
   const start = () => {
     setStarting(true);
     setFailure(null);
-    setProgress(null);
+    setNotes([]);
     setSettled(null);
     setRefused(false);
     flowsRun(flow.id, repo.trim(), values)

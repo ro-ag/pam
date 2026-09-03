@@ -3,7 +3,8 @@ use turso::params;
 
 use crate::{
     Actor, ApprovalResolution, AuditEntry, CompressionStats, ConnectorPatch, Decision,
-    EVIDENCE_KIND_LOG_COMPACT, ModelJobRow, RequestState, Store, StoreError,
+    EVIDENCE_KIND_LOG_COMPACT, EvidencePrune, ModelJobRow, RequestPrune, RequestState, Store,
+    StoreError,
 };
 
 /// The one model job row with `id`, read back through the bounded list.
@@ -1286,4 +1287,176 @@ async fn record_connector_test_creates_row_when_absent_and_updates_it() {
     assert_eq!(row.last_test_status.as_deref(), Some("failed"));
     assert_eq!(row.last_test_detail.as_deref(), Some("401 unauthorized"));
     assert!(row.enabled, "record_connector_test must not clear enabled");
+}
+
+/// Backdates every timestamp column of one request record so a prune with
+/// a later cutoff sees the whole record as old.
+async fn age_request(store: &Store, id: &str, ts: i64) {
+    for sql in [
+        "UPDATE request SET created_ts = ?2, updated_ts = ?2 WHERE id = ?1",
+        "UPDATE audit SET ts = ?2 WHERE request_id = ?1",
+        "UPDATE evidence SET ts = ?2 WHERE request_id = ?1",
+    ] {
+        store.conn.execute(sql, params![id, ts]).await.unwrap();
+    }
+}
+
+/// One counting query, straight through the connection.
+async fn count(store: &Store, sql: &str) -> i64 {
+    let mut rows = store.conn.query(sql, ()).await.unwrap();
+    rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+#[tokio::test]
+async fn prune_evidence_skips_the_kept_kind_and_inflight_requests() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "old_done").await;
+    store
+        .finish_request("old_done", RequestState::Done, None, entry("execute"))
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_a", "old_done", "log.source", b"0123456789", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_b", "old_done", "flow.result", b"{}", None)
+        .await
+        .unwrap();
+    insert_demo_request(&store, "old_running").await;
+    store
+        .update_request_state("old_running", RequestState::Running, None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_c", "old_running", "log.source", b"xyz", None)
+        .await
+        .unwrap();
+    age_request(&store, "old_done", 1_000).await;
+    age_request(&store, "old_running", 1_000).await;
+
+    let pruned = store
+        .prune_evidence_before(2_000, "flow.result")
+        .await
+        .unwrap();
+    assert_eq!(pruned, EvidencePrune { rows: 1, bytes: 10 });
+    assert!(store.get_evidence("ev_a").await.unwrap().is_none());
+    assert!(store.get_evidence("ev_b").await.unwrap().is_some());
+    assert!(store.get_evidence("ev_c").await.unwrap().is_some());
+    // A second pass has nothing left to do.
+    assert_eq!(
+        store
+            .prune_evidence_before(2_000, "flow.result")
+            .await
+            .unwrap(),
+        EvidencePrune::default()
+    );
+}
+
+#[tokio::test]
+async fn prune_evidence_leaves_rows_at_or_after_the_cutoff() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "fresh").await;
+    store
+        .finish_request("fresh", RequestState::Done, None, entry("execute"))
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_new", "fresh", "log.source", b"new", None)
+        .await
+        .unwrap();
+
+    // Inserted "now"; a cutoff far in the past keeps it.
+    assert_eq!(
+        store
+            .prune_evidence_before(1_000, "flow.result")
+            .await
+            .unwrap(),
+        EvidencePrune::default()
+    );
+    assert!(store.get_evidence("ev_new").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn prune_requests_removes_the_whole_terminal_record_only() {
+    let store = Store::open_in_memory().await.unwrap();
+    // Old and terminal: goes, with everything hanging off it.
+    insert_demo_request(&store, "old").await;
+    store.insert_approval("old", "release").await.unwrap();
+    store
+        .finish_request(
+            "old",
+            RequestState::Refused,
+            Some("denied"),
+            entry("gate_refusal"),
+        )
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_old", "old", "flow.result", b"verdict", None)
+        .await
+        .unwrap();
+    // Old but in flight: stays.
+    insert_demo_request(&store, "stuck").await;
+    store
+        .update_request_state("stuck", RequestState::Running, None)
+        .await
+        .unwrap();
+    // Terminal but fresh: stays.
+    insert_demo_request(&store, "fresh").await;
+    store
+        .finish_request("fresh", RequestState::Done, None, entry("execute"))
+        .await
+        .unwrap();
+    age_request(&store, "old", 1_000).await;
+    age_request(&store, "stuck", 1_000).await;
+
+    let pruned = store.prune_requests_before(2_000).await.unwrap();
+    assert_eq!(
+        pruned,
+        RequestPrune {
+            requests: 1,
+            audit_rows: 1,
+            approvals: 1,
+            evidence_rows: 1,
+            evidence_bytes: 7,
+        }
+    );
+    assert!(store.get_request("old").await.unwrap().is_none());
+    assert!(store.get_request("stuck").await.unwrap().is_some());
+    assert!(store.get_request("fresh").await.unwrap().is_some());
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM audit WHERE request_id = 'old'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM approval WHERE request_id = 'old'"
+        )
+        .await,
+        0
+    );
+    assert!(store.get_evidence("ev_old").await.unwrap().is_none());
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM audit WHERE request_id = 'fresh'"
+        )
+        .await,
+        1
+    );
+    // Nothing dangles: every audit row still has its request.
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM audit WHERE request_id NOT IN (SELECT id FROM request)"
+        )
+        .await,
+        0
+    );
 }

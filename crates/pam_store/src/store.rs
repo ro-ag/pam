@@ -407,6 +407,36 @@ pub struct CompressionStats {
     pub tokens_avoided_est: u64,
 }
 
+/// What one evidence prune pass removed: the retention window's report
+/// for the evidence half.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvidencePrune {
+    /// Evidence rows deleted.
+    pub rows: u64,
+    /// Total length of the blobs those rows held.
+    pub bytes: u64,
+}
+
+/// What one request prune pass removed, table by table.
+///
+/// An audit window prunes whole records, so the figures come from four
+/// tables at once; the panel adds the evidence halves together and shows
+/// one line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestPrune {
+    /// `request` rows deleted.
+    pub requests: u64,
+    /// `audit` rows deleted with them.
+    pub audit_rows: u64,
+    /// `approval` rows deleted with them.
+    pub approvals: u64,
+    /// `evidence` rows deleted with them, the kept kind included — the
+    /// verdict outlives the evidence window but not its own record.
+    pub evidence_rows: u64,
+    /// Total length of the blobs those evidence rows held.
+    pub evidence_bytes: u64,
+}
+
 /// One row of the `connector` table: a connector's configuration and its
 /// last self-test verdict.
 ///
@@ -1518,6 +1548,174 @@ impl Store {
             }
         }
         Ok(stats)
+    }
+
+    /// The `evidence` rows an evidence-window pass removes: older than
+    /// `cutoff_ts`, not `keep_kind`, and hanging off a request that has
+    /// already finished.
+    ///
+    /// A running request keeps its evidence whatever its age — the
+    /// executor is still writing it, and a half-pruned working set is
+    /// worse than an old one.
+    const EVIDENCE_PRUNE_FILTER: &'static str = "ts < ?1 AND kind <> ?2 AND request_id IN \
+         (SELECT id FROM request WHERE state IN ('done','refused','failed'))";
+
+    /// The `request` rows an audit-window pass removes: terminal, and
+    /// untouched since `cutoff_ts`.
+    const REQUEST_PRUNE_FILTER: &'static str =
+        "state IN ('done','refused','failed') AND updated_ts < ?1";
+
+    /// The same rows as a subquery, for the child tables.
+    const REQUEST_PRUNE_CHILDREN: &'static str = "request_id IN (SELECT id FROM request WHERE \
+         state IN ('done','refused','failed') AND updated_ts < ?1)";
+
+    /// Deletes evidence rows older than `cutoff_ts` whose kind is not
+    /// `keep_kind` and whose request is already terminal.
+    ///
+    /// This is the evidence half of retention: the bulky blobs go first
+    /// and the verdict (`keep_kind`) stays, so activity history keeps
+    /// reading straight after a pass. One transaction under the
+    /// connection lock; the figures are counted before the delete, so the
+    /// report is exact whatever the engine reports for a multi-row
+    /// statement.
+    pub async fn prune_evidence_before(
+        &self,
+        cutoff_ts: i64,
+        keep_kind: &str,
+    ) -> Result<EvidencePrune, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        self.conn.execute("BEGIN", ()).await?;
+        let pruned = self.prune_evidence_in_txn(cutoff_ts, keep_kind).await;
+        self.end_txn(pruned).await
+    }
+
+    /// The statements inside [`Self::prune_evidence_before`]'s transaction.
+    async fn prune_evidence_in_txn(
+        &self,
+        cutoff_ts: i64,
+        keep_kind: &str,
+    ) -> Result<EvidencePrune, StoreError> {
+        let filter = Self::EVIDENCE_PRUNE_FILTER;
+        let (rows, bytes) = self
+            .measure(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
+                     FROM evidence WHERE {filter}"
+                ),
+                params![cutoff_ts, keep_kind],
+            )
+            .await?;
+        if rows > 0 {
+            self.conn
+                .execute(
+                    &format!("DELETE FROM evidence WHERE {filter}"),
+                    params![cutoff_ts, keep_kind],
+                )
+                .await?;
+        }
+        Ok(EvidencePrune { rows, bytes })
+    }
+
+    /// Deletes terminal requests older than `cutoff_ts` together with
+    /// their audit, approval, and evidence rows — children first, one
+    /// transaction under the connection lock.
+    ///
+    /// This is the audit half of retention, and the destructive one: a
+    /// record leaves whole, verdict included, so nothing dangles and the
+    /// foreign keys stay satisfied. In-flight requests are never touched,
+    /// however old they look.
+    pub async fn prune_requests_before(&self, cutoff_ts: i64) -> Result<RequestPrune, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        self.conn.execute("BEGIN", ()).await?;
+        let pruned = self.prune_requests_in_txn(cutoff_ts).await;
+        self.end_txn(pruned).await
+    }
+
+    /// The statements inside [`Self::prune_requests_before`]'s transaction.
+    async fn prune_requests_in_txn(&self, cutoff_ts: i64) -> Result<RequestPrune, StoreError> {
+        let children = Self::REQUEST_PRUNE_CHILDREN;
+        let requests_filter = Self::REQUEST_PRUNE_FILTER;
+        let (evidence_rows, evidence_bytes) = self
+            .measure(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
+                     FROM evidence WHERE {children}"
+                ),
+                params![cutoff_ts],
+            )
+            .await?;
+        let (audit_rows, _) = self
+            .measure(
+                &format!("SELECT COUNT(*), 0 FROM audit WHERE {children}"),
+                params![cutoff_ts],
+            )
+            .await?;
+        let (approvals, _) = self
+            .measure(
+                &format!("SELECT COUNT(*), 0 FROM approval WHERE {children}"),
+                params![cutoff_ts],
+            )
+            .await?;
+        let (requests, _) = self
+            .measure(
+                &format!("SELECT COUNT(*), 0 FROM request WHERE {requests_filter}"),
+                params![cutoff_ts],
+            )
+            .await?;
+        if requests > 0 {
+            // Children first: the foreign keys point at `request`.
+            for sql in [
+                format!("DELETE FROM evidence WHERE {children}"),
+                format!("DELETE FROM approval WHERE {children}"),
+                format!("DELETE FROM audit WHERE {children}"),
+                format!("DELETE FROM request WHERE {requests_filter}"),
+            ] {
+                self.conn.execute(&sql, params![cutoff_ts]).await?;
+            }
+        }
+        Ok(RequestPrune {
+            requests,
+            audit_rows,
+            approvals,
+            evidence_rows,
+            evidence_bytes,
+        })
+    }
+
+    /// Reads one `SELECT count, bytes` row as a `(u64, u64)` pair. A
+    /// missing row or a negative figure reads as zero: a prune report
+    /// never invents work it did not do.
+    async fn measure<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<(u64, u64), StoreError> {
+        let mut rows = self.conn.query(sql, params).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok((0, 0));
+        };
+        let count: i64 = row.get(0)?;
+        let bytes: i64 = row.get(1)?;
+        Ok((
+            u64::try_from(count).unwrap_or(0),
+            u64::try_from(bytes).unwrap_or(0),
+        ))
+    }
+
+    /// Closes an open transaction around `result`: `COMMIT` when the
+    /// statements succeeded, best-effort `ROLLBACK` when they did not —
+    /// the original error is the one worth returning.
+    async fn end_txn<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+        match result {
+            Ok(value) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
     }
 
     /// The `connector` column list every row query selects, in the order

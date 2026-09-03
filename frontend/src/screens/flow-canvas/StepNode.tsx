@@ -1,91 +1,108 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { CircleAlert, Clock, Hand, Plug, RotateCw, Sparkles, Terminal } from "lucide-react";
+import {
+  CircleAlert,
+  Clock,
+  EyeOff,
+  Hand,
+  Pencil,
+  Plug,
+  RotateCw,
+  Sparkles,
+  Terminal,
+  type LucideIcon,
+} from "lucide-react";
 import { memo } from "react";
 import { Badge } from "../../components/ui/Badge";
 import { FailureNote } from "../../components/ui/FailureNote";
 import { Panel } from "../../components/ui/Panel";
 import { cn, cva } from "../../lib/cn";
 import type { FlowStep } from "../../lib/ipc";
-import { joinArgv, type StepNode as StepNodeType, type StepNodeData } from "./graph";
+import {
+  NOTE_HANDLE,
+  joinArgv,
+  type RunStatus,
+  type StepNode as StepNodeType,
+  type StepNodeData,
+} from "./graph";
+import { HIDDEN_HANDLE_CLASSES } from "./NoteNode";
 
 /**
- * A step card: a raised Panel standing on the chrome, three rows deep.
- * The header names the step (kind glyph, id in the display voice, its
- * role as a mono eyebrow, the order chip); the body is the fact of what
- * runs, in the data voice, two lines and no more; the footer carries the
- * modifiers as chips. Everything a run or a validator has to say about
- * the step is a 2 px ring around the card — one ring, one meaning.
+ * A step as a rail card: a raised Panel two rows deep with a 4 px rail
+ * down its left edge. The rail is the run's voice — it takes the status
+ * color and breathes while the step runs — so a whole flow's progress
+ * reads as a column of colored edges before a single word is read.
+ *
+ * The header names the step (kind glyph, id in the display voice, the
+ * modifier glyphs, the order number); the second row is the fact of what
+ * runs, in the data voice, one line. The role rides along as the id's
+ * title. The ring means exactly one thing, selection — except that a
+ * validation marker borrows it in danger, with the chip and the cause /
+ * fix note saying why.
  */
 
-export type Rim =
-  | "none"
-  | "selected"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "skipped"
-  | "blocked"
-  | "cancelled"
-  | "invalid"
-  | "approval";
+export type Ring = "none" | "selected" | "invalid";
+export type Rail = "none" | RunStatus;
 
-/** The rim map: every state is a ring in a semantic color, nothing else. */
+/** The ring: selection, or the validator's danger. Nothing else touches it. */
 export const stepNodeVariants = cva(
   "relative w-56 p-0 ring-offset-2 ring-offset-chrome transition-shadow duration-150",
   {
     variants: {
-      rim: {
+      ring: {
         none: "ring-0",
         selected: "ring-2 ring-accent",
-        running: "ring-2 ring-accent animate-breathe",
-        succeeded: "ring-2 ring-success",
-        failed: "ring-2 ring-danger",
-        skipped: "ring-2 ring-ink-faint",
-        blocked: "ring-2 ring-danger",
-        cancelled: "ring-2 ring-warning",
         invalid: "ring-2 ring-danger",
-        approval: "ring-2 ring-warning/60",
       },
     },
-    defaultVariants: { rim: "none" },
+    defaultVariants: { ring: "none" },
   },
 );
 
-/** The kind glyph's tile: commands sit on the accent, connectors on copper. */
-export const glyphVariants = cva(
-  "flex size-6 shrink-0 items-center justify-center rounded-control",
-  {
-    variants: {
-      kind: {
-        command: "bg-accent-soft text-accent",
-        connector: "bg-copper/15 text-copper",
-      },
+/** The rail: one semantic color per run status, the hairline when idle. */
+export const railVariants = cva("w-1 shrink-0 self-stretch transition-colors duration-300", {
+  variants: {
+    status: {
+      none: "bg-line",
+      running: "bg-accent animate-breathe",
+      succeeded: "bg-success",
+      failed: "bg-danger",
+      blocked: "bg-danger",
+      skipped: "bg-ink-faint",
+      cancelled: "bg-warning",
     },
-    defaultVariants: { kind: "command" },
   },
-);
+  defaultVariants: { status: "none" },
+});
+
+/** The kind glyph: commands in the accent, connectors in copper. */
+export const glyphVariants = cva("flex shrink-0", {
+  variants: {
+    kind: {
+      command: "text-accent",
+      connector: "text-copper",
+    },
+  },
+  defaultVariants: { kind: "command" },
+});
 
 /** Handles: 10 px pills in the line color, accent when the pointer finds them. */
 export const HANDLE_CLASSES = "size-2.5 rounded-pill bg-line hover:bg-accent";
 
-/**
- * Which ring the card wears. A validation marker outranks everything (the
- * flow will not run until it is fixed), a run status outranks selection
- * (the run is what the human is watching), selection outranks the standing
- * approval rim, and a card with nothing to say wears no ring at all.
- */
-export function rimFor(data: StepNodeData, selected: boolean): Rim {
+/** A validation marker outranks selection: the flow will not run until it is fixed. */
+export function ringFor(data: StepNodeData, selected: boolean): Ring {
   if (data.marker) return "invalid";
-  if (data.status) return data.status;
   if (selected) return "selected";
-  if (data.step.approval === "required") return "approval";
   return "none";
+}
+
+export function railFor(data: StepNodeData): Rail {
+  return data.status ?? "none";
 }
 
 const DEFAULT_TIMEOUT = "5m";
 const DEFAULT_RETRY = { attempts: 1, backoff: "500ms" };
 
-/** What the body says: the argv line, or `connector · call`. */
+/** What the second row says: the argv line, or `connector · call`. */
 export function stepBody(step: FlowStep): string {
   return step.action.kind === "command"
     ? joinArgv(step.action.argv)
@@ -96,114 +113,159 @@ function retryIsDefault(retry: FlowStep["retry"]): boolean {
   return retry.attempts === DEFAULT_RETRY.attempts && retry.backoff === DEFAULT_RETRY.backoff;
 }
 
-/** The footer chips, in the order the spec's modifier table lists them. */
-function Modifiers({ step }: { step: FlowStep }) {
-  const chips = [
-    step.approval === "required" && (
-      <Badge key="approval" tone="warning" aria-label="approval">
-        <Hand size={12} aria-hidden="true" />
-        approval
-      </Badge>
-    ),
-    step.effect === "stateful" && (
-      <Badge
-        key="stateful"
-        tone="neutral"
-        aria-label="stateful"
-        className="border-copper/40 bg-copper/10 text-copper"
-      >
-        changes
-      </Badge>
-    ),
-    step.output === "summarize" && (
-      <Badge key="summarize" tone="accent" aria-label="summarize">
-        <Sparkles size={12} aria-hidden="true" />
-        summarize
-      </Badge>
-    ),
-    step.output === "discard" && (
-      <Badge key="discard" tone="neutral" aria-label="discard">
-        discard
-      </Badge>
-    ),
-    !retryIsDefault(step.retry) && (
-      <Badge key="retry" tone="neutral" aria-label="retry">
-        <RotateCw size={12} aria-hidden="true" />×{step.retry.attempts} / {step.retry.backoff}
-      </Badge>
-    ),
-    step.timeout !== DEFAULT_TIMEOUT && (
-      <Badge key="timeout" tone="neutral" aria-label="timeout">
-        <Clock size={12} aria-hidden="true" />
-        {step.timeout}
-      </Badge>
-    ),
-    step.when === "always" && (
-      <Badge key="always" tone="neutral" aria-label="always">
-        always
-      </Badge>
-    ),
-  ].filter(Boolean);
-  if (chips.length === 0) {
-    return <span className="font-data text-xs text-ink-faint">defaults</span>;
+export interface Modifier {
+  /** The aria-label screen readers and the tests read. */
+  label: string;
+  /** The tooltip, carrying the value the glyph stands for. */
+  title: string;
+  tone: string;
+  Icon: LucideIcon;
+}
+
+/** The modifier glyphs, in the order the spec's modifier table lists them. */
+export function modifiersOf(step: FlowStep): Modifier[] {
+  const glyphs: Modifier[] = [];
+  if (step.approval === "required") {
+    glyphs.push({
+      label: "approval",
+      title: "approval required",
+      tone: "text-warning",
+      Icon: Hand,
+    });
   }
-  return <>{chips}</>;
+  if (step.effect === "stateful") {
+    glyphs.push({
+      label: "stateful",
+      title: "changes state",
+      tone: "text-copper",
+      Icon: Pencil,
+    });
+  }
+  if (step.output === "summarize") {
+    glyphs.push({
+      label: "summarize",
+      title: "output summarized",
+      tone: "text-accent",
+      Icon: Sparkles,
+    });
+  }
+  if (step.output === "discard") {
+    glyphs.push({
+      label: "discard",
+      title: "output discarded",
+      tone: "text-ink-faint",
+      Icon: EyeOff,
+    });
+  }
+  if (!retryIsDefault(step.retry)) {
+    glyphs.push({
+      label: "retry",
+      title: `retry ×${step.retry.attempts} / ${step.retry.backoff}`,
+      tone: "text-ink-faint",
+      Icon: RotateCw,
+    });
+  }
+  if (step.timeout !== DEFAULT_TIMEOUT) {
+    glyphs.push({
+      label: "timeout",
+      title: `timeout ${step.timeout}`,
+      tone: "text-ink-faint",
+      Icon: Clock,
+    });
+  }
+  return glyphs;
 }
 
 function StepNodeComponent({ data, selected }: NodeProps<StepNodeType>) {
   const { step, index, marker } = data;
   const kind = step.action.kind;
   const Glyph = kind === "command" ? Terminal : Plug;
+  const rail = railFor(data);
+  const modifiers = modifiersOf(step);
   return (
     <Panel
       ground="raised"
       aria-label={`step ${step.id}`}
       data-kind={kind}
-      className={cn(stepNodeVariants({ rim: rimFor(data, selected === true) }))}
+      data-status={rail}
+      className={cn(stepNodeVariants({ ring: ringFor(data, selected === true) }))}
     >
       <Handle type="target" position={Position.Left} className={HANDLE_CLASSES} />
+      <Handle
+        type="target"
+        id={NOTE_HANDLE}
+        position={Position.Top}
+        isConnectable={false}
+        className={HIDDEN_HANDLE_CLASSES}
+      />
 
-      <header className="flex items-start gap-2.5 border-b border-line px-3 py-2.5">
-        <span role="img" aria-label={kind} className={glyphVariants({ kind })}>
-          <Glyph size={14} aria-hidden="true" />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate font-display text-sm font-semibold text-ink">
-            {step.id}
-          </span>
-          <span className="block font-data text-xs tracking-widest text-ink-faint uppercase">
-            {step.role}
-          </span>
-        </span>
-        {marker && (
-          <Badge tone="danger" aria-label="validation marker" title={marker.message}>
-            <CircleAlert size={12} aria-hidden="true" />
-          </Badge>
-        )}
-        <Badge tone="neutral" aria-label={`order ${index + 1}`} className="tabular-nums">
-          {index + 1}
-        </Badge>
-      </header>
+      <div className="flex overflow-hidden rounded-card">
+        <span
+          data-testid="rail"
+          aria-hidden="true"
+          className={railVariants({ status: rail })}
+        />
 
-      <p className="line-clamp-2 px-3 py-2 font-data text-xs break-all text-ink-muted">
-        {stepBody(step)}
-      </p>
+        <div className="min-w-0 flex-1 px-3 py-2.5">
+          <header className="flex items-center gap-1.5">
+            <span role="img" aria-label={kind} className={glyphVariants({ kind })}>
+              <Glyph size={12} aria-hidden="true" />
+            </span>
+            <span
+              title={step.role}
+              className="min-w-0 flex-1 truncate font-display text-sm font-semibold text-ink"
+            >
+              {step.id}
+            </span>
+            {modifiers.length > 0 && (
+              <span className="flex shrink-0 items-center gap-1">
+                {modifiers.map(({ label, title, tone, Icon }) => (
+                  <span
+                    key={label}
+                    role="img"
+                    aria-label={label}
+                    title={title}
+                    className={cn("flex", tone)}
+                  >
+                    <Icon size={12} aria-hidden="true" />
+                  </span>
+                ))}
+              </span>
+            )}
+            {marker && (
+              <Badge
+                tone="danger"
+                aria-label="validation marker"
+                title={marker.message}
+                className="px-1.5"
+              >
+                <CircleAlert size={12} aria-hidden="true" />
+              </Badge>
+            )}
+            <span
+              aria-label={`order ${index + 1}`}
+              className="shrink-0 font-data text-xs text-ink-faint tabular-nums"
+            >
+              {index + 1}
+            </span>
+          </header>
 
-      <footer className="flex flex-wrap items-center gap-1.5 border-t border-line px-3 py-2">
-        <Modifiers step={step} />
-      </footer>
+          <p className="mt-0.5 truncate font-data text-xs text-ink-muted">{stepBody(step)}</p>
 
-      {selected && marker && (
-        <div className="px-3 pb-3">
-          <FailureNote
-            label="flow"
-            failure={{
-              cause: marker.message,
-              detail: marker.field ? `at \`${marker.field}\`` : "on this step",
-              recovery: "fix it in the inspector",
-            }}
-          />
+          {selected && marker && (
+            <div className="pt-2.5">
+              <FailureNote
+                label="flow"
+                failure={{
+                  cause: marker.message,
+                  detail: marker.field ? `at \`${marker.field}\`` : "on this step",
+                  recovery: "fix it in the inspector",
+                }}
+              />
+            </div>
+          )}
         </div>
-      )}
+      </div>
 
       <Handle type="source" position={Position.Right} className={HANDLE_CLASSES} />
     </Panel>

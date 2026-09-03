@@ -4,10 +4,12 @@ import { defaultStep, toGraph } from "./graph";
 import {
   LAYOUT_KEY,
   NODE_SIZE,
+  NOTE_OFFSET,
   applyPositions,
   autoLayout,
   clearPositions,
   loadPositions,
+  noteBeside,
   savePositions,
 } from "./layout";
 
@@ -129,6 +131,28 @@ describe("autoLayout", () => {
       b: { x: 200, y: 10 },
       verdict: { x: 300, y: 10 },
     });
+  });
+
+  it("keeps notes and tethers away from ELK and places each note beside its step", async () => {
+    elk.layout.mockImplementation(async (graph) => ({
+      ...graph,
+      children: graph.children.map((child, index) => ({ ...child, x: index * 100, y: 10 })),
+    }));
+    const noted: FlowSpec = {
+      ...spec,
+      steps: [{ ...spec.steps[0], note: "watch the exit code" }, spec.steps[1]],
+    };
+    const { nodes, edges } = toGraph(noted);
+    expect(nodes.some((node) => node.id === "note:a")).toBe(true);
+    const positions = await autoLayout(nodes, edges, {});
+
+    const graph = elk.layout.mock.calls[0][0];
+    expect(graph.children.map((child) => child.id)).toEqual(["inputs", "a", "b", "verdict"]);
+    expect(graph.edges.map((edge) => edge.id)).toEqual(["needs:a->b", "terminal:b"]);
+    expect(NOTE_OFFSET).toEqual({ x: 240, y: -8 });
+    expect(noteBeside({ x: 100, y: 10 })).toEqual({ x: 340, y: 2 });
+    expect(positions["note:a"]).toEqual(noteBeside(positions.a));
+    expect(positions.a).toEqual({ x: 100, y: 10 });
   });
 
   it("leaves out children ELK gave no coordinates", async () => {

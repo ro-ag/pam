@@ -12,6 +12,7 @@ import {
   joinArgv,
   markerFor,
   moveStep,
+  noteNodeId,
   removeStep,
   setEdgeKind,
   splitArgv,
@@ -109,6 +110,53 @@ describe("toGraph", () => {
     expect(step("c").status).toBeNull();
     expect(step("a").marker).toBeNull();
     expect(step("b").marker).toEqual(marker);
+  });
+
+  it("derives a note node and a tether edge only for steps with a non-empty note", () => {
+    const flow = spec({
+      a: { note: "watch the exit code" },
+      b: { note: "   " },
+      c: { note: "last word" },
+    });
+    const { nodes, edges } = toGraph(flow);
+    expect(noteNodeId("a")).toBe("note:a");
+    expect(nodes.map((node) => node.id)).toEqual([
+      INPUTS_NODE,
+      "a",
+      "b",
+      "c",
+      "note:a",
+      "note:c",
+      VERDICT_NODE,
+    ]);
+    const note = nodes.find((node) => node.id === "note:a");
+    expect(note).toMatchObject({
+      type: "note",
+      position: { x: 0, y: 0 },
+      selected: false,
+      data: { stepId: "a", text: "watch the exit code" },
+    });
+    const tether = edges.find((edge) => edge.id === "note:a");
+    expect(tether).toEqual({
+      id: "note:a",
+      type: "tether",
+      source: "note:a",
+      target: "a",
+      targetHandle: "note",
+      selectable: false,
+      data: { kind: "note" },
+    });
+    // The tether is annotation, never execution: `c` still feeds the verdict.
+    expect(edges.map((edge) => edge.id)).toContain("terminal:c");
+    expect(toGraph(spec()).nodes.some((node) => node.type === "note")).toBe(false);
+    expect(toGraph(spec()).edges.some((edge) => edge.type === "tether")).toBe(false);
+  });
+
+  it("drops the note node with its step", () => {
+    const flow = spec({ a: { note: "gone with a" } });
+    const { nodes, edges } = toGraph(removeStep(flow, "a"));
+    expect(nodes.some((node) => node.id === "note:a")).toBe(false);
+    expect(edges.some((edge) => edge.id === "note:a")).toBe(false);
   });
 });
 
@@ -255,6 +303,16 @@ describe("steps", () => {
     expect(find(patched, "a")).toEqual(find(flow, "a"));
   });
 
+  it("updateStep trims a note and removes the key when nothing is left", () => {
+    const noted = updateStep(spec(), "a", { note: "  keep me  " });
+    expect(find(noted, "a").note).toBe("keep me");
+    expect(find(noted, "b")).not.toHaveProperty("note");
+    const blank = updateStep(noted, "a", { note: "   " });
+    expect(find(blank, "a")).not.toHaveProperty("note");
+    expect(updateStep(noted, "a", { timeout: "1m" }).steps[0].note).toBe("keep me");
+    expect(find(updateStep(noted, "a", { note: "" }), "a")).not.toHaveProperty("note");
+  });
+
   it("moveStep refuses to move a step before one it needs", () => {
     const up = moveStep(spec(), "b", -1);
     expect(up.ok).toBe(false);
@@ -320,6 +378,13 @@ describe("toRaw", () => {
       expect(step).not.toHaveProperty("kind");
     }
     expect(raw.steps[2]).not.toHaveProperty("run");
+  });
+
+  it("copies a step note only when it says something", () => {
+    const raw = toRaw(spec({ a: { note: "watch the exit code" }, b: { note: "" } }));
+    expect(raw.steps[0].note).toBe("watch the exit code");
+    expect(raw.steps[1]).not.toHaveProperty("note");
+    expect(raw.steps[2]).not.toHaveProperty("note");
   });
 });
 

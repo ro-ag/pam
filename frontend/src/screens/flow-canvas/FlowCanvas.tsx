@@ -37,10 +37,13 @@ import {
   autoLayout,
   clearPositions,
   loadPositions,
+  noteBeside,
   savePositions,
   type Positions,
 } from "./layout";
+import { NoteNode } from "./NoteNode";
 import { StepNode } from "./StepNode";
+import { TetherEdge } from "./TetherEdge";
 
 /**
  * The canvas host: a toolbar, the xyflow viewport, the minimap. The flow
@@ -52,7 +55,8 @@ import { StepNode } from "./StepNode";
  * Positions are the one thing the spec does not know. Stored ones win,
  * nodes the canvas has already placed keep their place, and only the rest
  * are laid out by ELK — so an added step lands next to the flow instead
- * of scattering everything the human arranged.
+ * of scattering everything the human arranged. A note never asks ELK for
+ * anything: it sits beside its step, wherever that step is.
  *
  * Selection is owned by the screen (the inspector shares it) and mirrored
  * onto the nodes; the canvas reports back only what a gesture changed —
@@ -79,8 +83,8 @@ export interface FlowCanvasProps {
   onSelect: (selection: Selection) => void;
 }
 
-const nodeTypes = { step: StepNode, inputs: FrameNode, verdict: FrameNode };
-const edgeTypes = { flow: FlowEdge };
+const nodeTypes = { step: StepNode, inputs: FrameNode, verdict: FrameNode, note: NoteNode };
+const edgeTypes = { flow: FlowEdge, tether: TetherEdge };
 
 const FIT = { padding: 0.2 };
 
@@ -102,25 +106,45 @@ function sameSelection(a: Selection, b: Selection): boolean {
   return "id" in a && "id" in b ? a.id === b.id : true;
 }
 
-/** What the selected nodes and edges mean to the inspector. The Verdict frame is never selectable. */
+/**
+ * What the selected nodes and edges mean to the inspector. A note stands
+ * for its step; the Verdict frame is never selectable.
+ */
 export function selectionOf(
   nodes: readonly CanvasNode[],
   edges: readonly CanvasEdge[],
 ): Selection {
   const node = nodes.find((candidate) => candidate.selected);
   if (node) {
+    if (node.type === "note") return { kind: "step", id: node.data.stepId };
     if (node.id === INPUTS_NODE) return { kind: "inputs" };
     if (node.id !== VERDICT_NODE) return { kind: "step", id: node.id };
   }
   const edge = edges.find((candidate) => candidate.selected);
-  if (edge && edge.data?.kind !== "terminal") return { kind: "edge", id: edge.id };
+  if (edge && edge.type === "flow" && edge.data?.kind !== "terminal") {
+    return { kind: "edge", id: edge.id };
+  }
   return { kind: "none" };
 }
 
-function nodeSelected(selection: Selection, id: string): boolean {
-  if (selection.kind === "step") return selection.id === id;
-  if (selection.kind === "inputs") return id === INPUTS_NODE;
+/** Whether the screen's selection lands on this node; a step's note lights up with it. */
+function nodeSelected(selection: Selection, node: CanvasNode): boolean {
+  if (node.type === "verdict") return false;
+  if (node.type === "note")
+    return selection.kind === "step" && selection.id === node.data.stepId;
+  if (selection.kind === "step") return selection.id === node.id;
+  if (selection.kind === "inputs") return node.id === INPUTS_NODE;
   return false;
+}
+
+/** Every note among `nodes` that `targets` names, moved beside its step. */
+function settleNotes(nodes: CanvasNode[], targets: ReadonlySet<string>): CanvasNode[] {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  return nodes.map((node) => {
+    if (node.type !== "note" || !targets.has(node.id)) return node;
+    const step = byId.get(node.data.stepId);
+    return step ? ({ ...node, position: noteBeside(step.position) } as CanvasNode) : node;
+  });
 }
 
 function positionsOf(nodes: readonly CanvasNode[]): Positions {
@@ -181,10 +205,13 @@ function Canvas({
       const positions = await autoLayout(all, links, sizes);
       if (run !== layoutRun.current) return;
       setNodes((prev) =>
-        prev.map((node) =>
-          targets.has(node.id) && positions[node.id]
-            ? ({ ...node, position: positions[node.id] } as CanvasNode)
-            : node,
+        settleNotes(
+          prev.map((node) =>
+            targets.has(node.id) && positions[node.id]
+              ? ({ ...node, position: positions[node.id] } as CanvasNode)
+              : node,
+          ),
+          targets,
         ),
       );
       window.requestAnimationFrame(() => void fitView(FIT));
@@ -211,7 +238,7 @@ function Canvas({
       const base: CanvasNode =
         node.type === "verdict"
           ? { ...node, selectable: false, data: { outcome } }
-          : { ...node, selected: nodeSelected(current, node.id) };
+          : ({ ...node, selected: nodeSelected(current, node) } as CanvasNode);
       const prev = previous.get(node.id);
       const carried: CanvasNode = prev
         ? ({ ...base, position: prev.position, measured: prev.measured } as CanvasNode)
@@ -221,7 +248,13 @@ function Canvas({
       if (!prev) unplaced.add(node.id);
       return carried;
     });
-    setNodes(merged);
+    // A new note beside an already placed step needs no layout run at all;
+    // one whose step is new too rides along with that step's ELK placement.
+    const stepPlaced = (node: CanvasNode) =>
+      node.type === "note" && unplaced.has(node.id) && !unplaced.has(node.data.stepId);
+    const settled = settleNotes(merged, new Set(merged.filter(stepPlaced).map((n) => n.id)));
+    for (const node of merged) if (stepPlaced(node)) unplaced.delete(node.id);
+    setNodes(settled);
     setEdges(
       links.map((edge) => ({
         ...edge,
@@ -229,7 +262,7 @@ function Canvas({
       })),
     );
     setRefused(null);
-    if (unplaced.size > 0) void layout(merged, links, unplaced);
+    if (unplaced.size > 0) void layout(settled, links, unplaced);
   }, [flowId, spec, statuses, error, outcome, layout]);
 
   // The inspector's selection is the truth; mirror it onto the canvas.
@@ -237,7 +270,7 @@ function Canvas({
     setNodes((prev) => {
       let changed = false;
       const next = prev.map((node) => {
-        const want = node.id !== VERDICT_NODE && nodeSelected(selection, node.id);
+        const want = nodeSelected(selection, node);
         if ((node.selected === true) === want) return node;
         changed = true;
         return { ...node, selected: want } as CanvasNode;

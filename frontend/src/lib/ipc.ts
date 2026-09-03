@@ -666,6 +666,8 @@ export interface FlowStep {
   retry: { attempts: number; backoff: string };
   approval: FlowApproval;
   env: Record<string, string>;
+  /** A human note for the canvas; absent when the step has none. */
+  note?: string;
 }
 
 export interface FlowSpecInput {
@@ -697,6 +699,7 @@ export interface RawFlowStep {
   retry?: { attempts: number; backoff?: string };
   approval?: FlowApproval;
   env?: Record<string, string>;
+  note?: string;
 }
 
 /** The file's own shape, what `admin.flows.normalize { flow }` takes. */

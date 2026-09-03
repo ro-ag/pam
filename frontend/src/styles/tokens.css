@@ -168,3 +168,9 @@
 .flow-canvas .flow-edge-running {
   stroke-dasharray: 6;
 }
+
+/* a note's tether is dotted: on the canvas, square means execution and a curve means annotation */
+.flow-canvas .flow-edge-tether {
+  stroke-dasharray: 2 4;
+  stroke-linecap: round;
+}

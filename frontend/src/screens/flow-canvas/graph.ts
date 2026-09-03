@@ -49,10 +49,17 @@ export interface VerdictNodeData extends Record<string, unknown> {
   outcome: OutcomeName | null;
 }
 
+/** A step's note, drawn as its own node and tethered to the step. */
+export interface NoteNodeData extends Record<string, unknown> {
+  stepId: string;
+  text: string;
+}
+
 export type StepNode = Node<StepNodeData, "step">;
 export type InputsNode = Node<InputsNodeData, "inputs">;
 export type VerdictNode = Node<VerdictNodeData, "verdict">;
-export type CanvasNode = StepNode | InputsNode | VerdictNode;
+export type NoteNode = Node<NoteNodeData, "note">;
+export type CanvasNode = StepNode | InputsNode | VerdictNode | NoteNode;
 
 /** `terminal` is the implicit, unselectable edge into the Verdict frame. */
 export type EdgeKind = "needs" | "succeeded" | "failed" | "terminal";
@@ -63,10 +70,24 @@ export interface FlowEdgeData extends Record<string, unknown> {
   running: boolean;
 }
 
-export type CanvasEdge = Edge<FlowEdgeData, "flow">;
+/** The curved, dotted line from a note to its step: annotation, never execution. */
+export interface TetherEdgeData extends Record<string, unknown> {
+  kind: "note";
+}
+
+export type StepEdge = Edge<FlowEdgeData, "flow">;
+export type TetherEdge = Edge<TetherEdgeData, "tether">;
+export type CanvasEdge = StepEdge | TetherEdge;
 
 export const INPUTS_NODE = "inputs";
 export const VERDICT_NODE = "verdict";
+/** The hidden handle on a step card that a note's tether lands on. */
+export const NOTE_HANDLE = "note";
+
+/** The node (and tether edge) id for a step's note. */
+export function noteNodeId(stepId: string): string {
+  return `note:${stepId}`;
+}
 
 export type Refused = { cause: string; fix: string };
 export type Edit = { ok: true; spec: FlowSpec } | { ok: false; refused: Refused };
@@ -178,6 +199,15 @@ export function toGraph(
       marker: marked === step.id ? marker : null,
     },
   }));
+  const notes: NoteNode[] = spec.steps
+    .filter((step) => (step.note ?? "").trim() !== "")
+    .map((step) => ({
+      id: noteNodeId(step.id),
+      type: "note",
+      position: origin,
+      selected: false,
+      data: { stepId: step.id, text: step.note ?? "" },
+    }));
   const verdict: VerdictNode = {
     id: VERDICT_NODE,
     type: "verdict",
@@ -215,8 +245,19 @@ export function toGraph(
       data: { kind: "terminal", running: false },
     });
   }
+  for (const note of notes) {
+    edges.push({
+      id: note.id,
+      type: "tether",
+      source: note.id,
+      target: note.data.stepId,
+      targetHandle: NOTE_HANDLE,
+      selectable: false,
+      data: { kind: "note" },
+    });
+  }
 
-  return { nodes: [inputs, ...steps, verdict], edges };
+  return { nodes: [inputs, ...steps, ...notes, verdict], edges };
 }
 
 // --- edges -------------------------------------------------------------------
@@ -379,13 +420,27 @@ export function removeStep(spec: FlowSpec, id: string): FlowSpec {
   };
 }
 
+/** The step with `patch` applied; a note is trimmed, and a blank one drops the key. */
+function patched(step: FlowStep, patch: Partial<FlowStep>): FlowStep {
+  const { note, ...rest } = patch;
+  const next: FlowStep = { ...step, ...rest };
+  if (note === undefined) return next;
+  const trimmed = note.trim();
+  if (trimmed === "") {
+    delete next.note;
+  } else {
+    next.note = trimmed;
+  }
+  return next;
+}
+
 /** Patches one step; renaming its id rewrites the references to it. */
 export function updateStep(spec: FlowSpec, id: string, patch: Partial<FlowStep>): FlowSpec {
   const renamed = patch.id !== undefined && patch.id !== id ? patch.id : null;
   return {
     ...spec,
     steps: spec.steps.map((step) => {
-      if (step.id === id) return { ...step, ...patch };
+      if (step.id === id) return patched(step, patch);
       return renamed === null ? step : retarget(step, id, renamed);
     }),
   };
@@ -426,9 +481,10 @@ export function updateInputs(spec: FlowSpec, inputs: FlowSpec["inputs"]): FlowSp
 // --- graph → file ------------------------------------------------------------
 
 function rawStep(step: FlowStep): RawFlowStep {
-  const { action, ...rest } = step;
-  if (action.kind === "command") return { ...rest, run: action.argv };
-  return { ...rest, connector: action.connector, call: action.call, with: action.with };
+  const { action, note, ...rest } = step;
+  const base: RawFlowStep = note ? { ...rest, note } : rest;
+  if (action.kind === "command") return { ...base, run: action.argv };
+  return { ...base, connector: action.connector, call: action.call, with: action.with };
 }
 
 /** The file's own shape — what `admin.flows.normalize { flow }` takes. */

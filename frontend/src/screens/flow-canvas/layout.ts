@@ -16,10 +16,21 @@ export const LAYOUT_KEY = (flowId: string): string => `pam.flow.layout.${flowId}
 
 /** The footprint ELK plans with when the canvas has not measured a node yet. */
 export const NODE_SIZE = {
-  step: { width: 220, height: 112 },
+  step: { width: 224, height: 60 },
   inputs: { width: 200, height: 96 },
   verdict: { width: 200, height: 96 },
+  note: { width: 192, height: 56 },
 } as const;
+
+/**
+ * Where a note sits relative to its step: just past the card's right edge,
+ * a hair above its top, so the tether curves up and out of the flow's lane.
+ */
+export const NOTE_OFFSET = { x: 240, y: -8 } as const;
+
+export function noteBeside(step: { x: number; y: number }): { x: number; y: number } {
+  return { x: step.x + NOTE_OFFSET.x, y: step.y + NOTE_OFFSET.y };
+}
 
 function isPosition(value: unknown): value is { x: number; y: number } {
   return (
@@ -71,6 +82,9 @@ export function clearPositions(flowId: string): void {
  * Lays the whole graph out left to right with ELK's layered algorithm and
  * answers a position per node ELK placed. `sizes` carries the measured
  * footprints; unmeasured nodes fall back to `NODE_SIZE` by type.
+ *
+ * Notes and their tethers never reach ELK — they are annotation, not
+ * flow — and each note is answered beside the step ELK placed for it.
  */
 export async function autoLayout(
   nodes: readonly CanvasNode[],
@@ -88,21 +102,30 @@ export async function autoLayout(
       "elk.layered.spacing.nodeNodeBetweenLayers": "96",
       "elk.portConstraints": "FIXED_SIDE",
     },
-    children: nodes.map((node) => ({
-      id: node.id,
-      ...(sizes[node.id] ?? NODE_SIZE[node.type ?? "step"]),
-    })),
-    edges: edges.map((edge) => ({
-      id: edge.id,
-      sources: [edge.source],
-      targets: [edge.target],
-    })),
+    children: nodes
+      .filter((node) => node.type !== "note")
+      .map((node) => ({
+        id: node.id,
+        ...(sizes[node.id] ?? NODE_SIZE[node.type ?? "step"]),
+      })),
+    edges: edges
+      .filter((edge) => edge.type !== "tether")
+      .map((edge) => ({
+        id: edge.id,
+        sources: [edge.source],
+        targets: [edge.target],
+      })),
   });
   const positions: Positions = {};
   for (const child of laid.children ?? []) {
     if (typeof child.x === "number" && typeof child.y === "number") {
       positions[child.id] = { x: child.x, y: child.y };
     }
+  }
+  for (const node of nodes) {
+    if (node.type !== "note") continue;
+    const step = positions[node.data.stepId];
+    if (step) positions[node.id] = noteBeside(step);
   }
   return positions;
 }

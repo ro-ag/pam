@@ -1,5 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { createMemoryHistory } from "@tanstack/react-router";
+import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import App from "../../App";
+import { createAppRouter } from "../../router";
 import { Beacon } from "./Beacon";
 import { TopStrip } from "./TopStrip";
 
@@ -39,5 +42,26 @@ describe("TopStrip", () => {
       expect(control).not.toHaveAttribute("data-tauri-drag-region");
     }
     expect(screen.getAllByRole("button")).toHaveLength(2);
+  });
+});
+
+describe("Sidebar", () => {
+  it("puts Home first and renders the Home screen at /", async () => {
+    const router = createAppRouter(createMemoryHistory({ initialEntries: ["/"] }));
+    render(<App router={router} />);
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    const links = within(nav).getAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual([
+      "Home",
+      "Activity",
+      "Approvals",
+      "Flows",
+      "Models",
+      "Settings",
+    ]);
+    expect(links[0]).toHaveAttribute("aria-current", "page");
+    expect(
+      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
+    ).toBeInTheDocument();
   });
 });

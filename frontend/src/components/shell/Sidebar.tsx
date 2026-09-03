@@ -1,5 +1,13 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { Activity, Cpu, Hand, Settings, Workflow, type LucideIcon } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  Hand,
+  MessageCircleQuestion,
+  Settings,
+  Workflow,
+  type LucideIcon,
+} from "lucide-react";
 import { motion } from "motion/react";
 import { cn, cva, type VariantProps } from "../../lib/cn";
 
@@ -45,7 +53,7 @@ function NavLink({
   label,
   icon: Icon,
 }: {
-  to: "/activity" | "/approvals" | "/flows" | "/models" | "/settings";
+  to: "/" | "/activity" | "/approvals" | "/flows" | "/models" | "/settings";
   label: string;
   icon: LucideIcon;
 }) {
@@ -72,6 +80,9 @@ export function Sidebar() {
       animate="show"
       className="flex w-52 shrink-0 flex-col gap-1 pt-1"
     >
+      <motion.div variants={staggerItem}>
+        <NavLink to="/" label="Home" icon={MessageCircleQuestion} />
+      </motion.div>
       <motion.div variants={staggerItem}>
         <NavLink to="/activity" label="Activity" icon={Activity} />
       </motion.div>

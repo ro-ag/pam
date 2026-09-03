@@ -18,14 +18,16 @@ afterEach(() => {
 });
 
 describe("shell routing", () => {
-  it("redirects / to the Activity screen, the default view", async () => {
+  it("opens on Home, where Pam answers for herself", async () => {
     const router = renderShell("/");
-    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
-    expect(router.state.location.pathname).toBe("/activity");
+    expect(
+      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
+    ).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/");
   });
 
   it("switches the work panel content when a sidebar link is clicked", async () => {
-    renderShell("/");
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     fireEvent.click(screen.getByRole("link", { name: "Approvals" }));
     expect(await screen.findByRole("heading", { name: "Approvals" })).toBeInTheDocument();
@@ -42,10 +44,10 @@ describe("shell routing", () => {
     expect(screen.getByRole("link", { name: "Activity" })).not.toHaveAttribute("aria-current");
   });
 
-  it("renders all five nav entries, every one of them a real link", async () => {
-    renderShell("/");
+  it("renders all six nav entries, every one of them a real link", async () => {
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
-    for (const entry of ["Activity", "Approvals", "Flows", "Models", "Settings"]) {
+    for (const entry of ["Home", "Activity", "Approvals", "Flows", "Models", "Settings"]) {
       expect(screen.getByRole("link", { name: entry })).toBeInTheDocument();
     }
     // The last placeholder went when the Flows screen landed.
@@ -88,7 +90,7 @@ describe("shell routing", () => {
 
 describe("shell chrome", () => {
   it("keeps the whole top strip a window drag region", async () => {
-    renderShell("/");
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     const strip = document.querySelector("header[data-tauri-drag-region]");
     expect(strip).not.toBeNull();
@@ -100,13 +102,13 @@ describe("shell chrome", () => {
   });
 
   it("shows the beacon red while no daemon answers (jsdom has no bridge)", async () => {
-    renderShell("/");
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     expect(screen.getByRole("status", { name: "daemon unreachable" })).toBeInTheDocument();
   });
 
   it("cycles theme families by token redefinition on the root element", async () => {
-    renderShell("/");
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     fireEvent.click(screen.getByRole("button", { name: /Ventisquero/ }));
     expect(document.documentElement.dataset.theme).toBe("vina");
@@ -116,7 +118,7 @@ describe("shell chrome", () => {
   });
 
   it("toggles the mode axis independently of the family", async () => {
-    renderShell("/");
+    renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     // No stamped attributes in jsdom, so the strip assumes dark-first.
     fireEvent.click(screen.getByRole("button", { name: /switch to light mode/ }));

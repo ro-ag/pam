@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { createAppRouter } from "../router";
 import type { ActivityRow, PamEventPayload } from "../lib/ipc";
-import { EVENT_REFRESH_MS } from "./Activity";
+import { EVENT_REFRESH_MS, rowEnter } from "./Activity";
 
 /**
  * The Activity tide against a mocked bridge. The whole App mounts (shell
@@ -29,11 +29,14 @@ vi.mock("../lib/ipc", async (importOriginal) => {
   return { ...actual, ...mocks };
 });
 
-// The band's odometer rolls with `motion`; pinned still here so the tide's
-// own assertions never race an animation frame.
+// The band's odometer and the lane rows move with `motion`; pinned still
+// here so the tide's own assertions never race an animation frame. The one
+// test that watches a row land flips `reduced` for itself.
+const motionPrefs = vi.hoisted(() => ({ reduced: true }));
+
 vi.mock("motion/react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("motion/react")>();
-  return { ...actual, useReducedMotion: () => true };
+  return { ...actual, useReducedMotion: () => motionPrefs.reduced };
 });
 
 /** Handlers captured from every subscribeEvents call (screen + beacon). */
@@ -95,6 +98,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  motionPrefs.reduced = true;
   vi.useRealTimers();
   window.localStorage.clear();
   delete document.documentElement.dataset.theme;
@@ -112,9 +116,9 @@ describe("the tide", () => {
     renderActivity();
     expect(await screen.findByText("compress.log")).toBeInTheDocument();
     expect(screen.getByText("repo.push")).toBeInTheDocument();
-    // Truth vocabulary + live states as badges, scoped to the tide list
+    // Truth vocabulary + live states as badges, scoped to the lanes
     // ("refused" is also a segment label in the header).
-    const tide = within(screen.getByRole("list"));
+    const tide = within(screen.getByRole("group", { name: "lanes" }));
     expect(tide.getByText("solved")).toBeInTheDocument();
     expect(tide.getByText("running")).toBeInTheDocument();
     expect(tide.getByText("refused")).toBeInTheDocument();
@@ -158,9 +162,7 @@ describe("filters", () => {
   it("puts the repo filter in the URL and refetches with it", async () => {
     const router = renderActivity();
     await screen.findByText("compress.log");
-    fireEvent.change(screen.getByRole("combobox", { name: "repo filter" }), {
-      target: { value: "/Users/dev/other" },
-    });
+    fireEvent.click(screen.getByRole("button", { name: "repo other" }));
     await waitFor(() =>
       expect(mocks.activityList).toHaveBeenLastCalledWith(
         expect.objectContaining({ repo: "/Users/dev/other" }),
@@ -199,7 +201,123 @@ describe("filters", () => {
         expect.objectContaining({ repo: "/gone/repo", state: "failed" }),
       ),
     );
-    expect(screen.getByRole("combobox", { name: "repo filter" })).toHaveValue("/gone/repo");
+    // A repo nobody reports any more still gets its (pressed) chip, so the
+    // lens carried in from a shared URL stays visible and clearable.
+    expect(screen.getByRole("button", { name: "repo repo", pressed: true })).toHaveAttribute(
+      "title",
+      "/gone/repo",
+    );
+  });
+});
+
+describe("lanes", () => {
+  /** The daemon narrows server-side; the mock does the same for chips. */
+  function serverFilters() {
+    mocks.activityList.mockImplementation(
+      ({ repo, agent }: { repo?: string; agent?: string }) =>
+        Promise.resolve({
+          requests: TIDE.filter(
+            (candidate) =>
+              (repo === undefined || candidate.repo === repo) &&
+              (agent === undefined || candidate.agent === agent),
+          ),
+        }),
+    );
+  }
+
+  it("groups rows into one lane per agent, alphabetical, newest on top", async () => {
+    renderActivity();
+    const claude = within(await screen.findByRole("region", { name: "claude" }));
+    const codex = within(screen.getByRole("region", { name: "codex" }));
+    expect(claude.getAllByRole("listitem")).toHaveLength(2);
+    expect(codex.getAllByRole("listitem")).toHaveLength(1);
+    const lanes = screen
+      .getAllByRole("region")
+      .filter((region) =>
+        ["claude", "codex"].includes(region.getAttribute("aria-label") ?? ""),
+      );
+    expect(lanes.map((lane) => lane.getAttribute("aria-label"))).toEqual(["claude", "codex"]);
+    // The lane header carries the agent once; the rows no longer repeat it.
+    expect(claude.getAllByText("claude")).toHaveLength(1);
+    expect(screen.getByText(/3 requests · 2 lanes · newest first/)).toBeInTheDocument();
+  });
+
+  it("shows agent and repo chips; an agent chip narrows to one lane and writes the URL", async () => {
+    serverFilters();
+    const router = renderActivity();
+    fireEvent.click(await screen.findByRole("button", { name: "agent codex" }));
+    await waitFor(() => expect(router.state.location.search).toMatchObject({ agent: "codex" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "claude" })).toBeNull());
+    expect(screen.getByRole("region", { name: "codex" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "repo other" }));
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({ repo: "/Users/dev/other" }),
+    );
+    // A pressed chip is a toggle: clicking it again lets the water back in.
+    fireEvent.click(screen.getByRole("button", { name: "agent codex", pressed: true }));
+    await waitFor(() =>
+      expect(router.state.location.search).toEqual({ repo: "/Users/dev/other" }),
+    );
+  });
+
+  it("says so when the chips leave nothing, and clears them", async () => {
+    serverFilters();
+    const router = renderActivity("/activity?repo=/Users/dev/other");
+    fireEvent.click(await screen.findByRole("button", { name: "agent claude" }));
+    expect(await screen.findByText(/matches this lens/)).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "lanes" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
+    expect(await screen.findByRole("region", { name: "claude" })).toBeInTheDocument();
+  });
+
+  /**
+   * One event burst that lands a new claude row, settled: the debounce,
+   * then two ticks for the refetch to resolve and paint. Fake timers hold
+   * the enter animation at its first frame, which is what we came to see.
+   */
+  async function landLiveRow(ticket: string): Promise<HTMLElement | null> {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        row({ id: "req_new", capability: "flow.run", state: "running", outcome: null }),
+        ...TIDE,
+      ],
+    });
+    vi.useFakeTimers();
+    act(() => {
+      for (const handler of eventHandlers) handler({ ticket, event: { kind: "done" } });
+    });
+    for (const step of [EVENT_REFRESH_MS, 1, 1]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(step);
+      });
+    }
+    const claude = within(screen.getByRole("region", { name: "claude" }));
+    return claude.getByText("flow.run").closest("li");
+  }
+
+  it("lands a live row in its lane with the enter slide", async () => {
+    motionPrefs.reduced = false;
+    renderActivity();
+    await screen.findByRole("region", { name: "claude" });
+    await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
+
+    const landed = await landLiveRow("t2");
+    // Mounted at the enter frame: transparent, 8px above its resting place.
+    expect(landed?.style.opacity).toBe("0");
+    expect(landed?.style.transform).toContain("-8");
+    expect(rowEnter(false)).toEqual({ opacity: 0, y: -8 });
+  });
+
+  it("lands the same live row still, under reduced motion", async () => {
+    renderActivity();
+    await screen.findByRole("region", { name: "claude" });
+    await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
+
+    const landed = await landLiveRow("t3");
+    expect(landed).not.toBeNull();
+    expect(landed?.style.opacity).not.toBe("0");
+    expect(rowEnter(true)).toBe(false);
   });
 });
 

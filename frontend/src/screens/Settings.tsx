@@ -563,7 +563,11 @@ function RetentionPanel() {
   const save = useMutation({
     mutationFn: (patch: Partial<RetentionSettings>) => retentionSet(patch),
     onMutate: () => setFailure(null),
-    onSuccess: (next) => queryClient.setQueryData(["retention"], next),
+    onSuccess: (next) => {
+      // A save prunes at once; its run supersedes any manual report shown.
+      setReport(null);
+      queryClient.setQueryData(["retention"], next);
+    },
     onError: (error) => setFailure(toBridgeFailure(error)),
     onSettled: settle,
   });

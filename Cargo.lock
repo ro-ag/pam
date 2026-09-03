@@ -4036,6 +4036,7 @@ dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
  "pam_compact",
+ "pam_connectors",
  "pam_model",
  "pam_proto",
  "pam_store",
@@ -4128,6 +4129,7 @@ dependencies = [
 name = "pam_testkit"
 version = "0.1.0"
 dependencies = [
+ "pam_connectors",
  "pam_daemon",
  "pam_proto",
  "pam_store",

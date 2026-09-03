@@ -176,6 +176,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pam_connectors::{CurlTransport, HttpTransport};
 use pam_proto::{Envelope, Event, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
@@ -185,6 +186,7 @@ use tokio::time::timeout;
 
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
+use crate::connector_service::ConnectorService;
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
@@ -196,6 +198,7 @@ use crate::queue::{
     AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
 };
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
+use crate::secrets::{SecretBackend, SecretStore};
 use crate::transport::{EventPublisher, IncomingRequest, Transport, TransportError};
 
 /// Refusal cause when a waiting caller's `deadline_ms` elapsed.
@@ -472,7 +475,7 @@ impl DaemonHandle {
 
 /// Configuration for [`run_daemon_with`]. [`run_daemon`] uses the
 /// defaults.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonConfig {
     /// Base directory for the runtime dir and store; `None` means
     /// `~/.pam`.
@@ -483,6 +486,30 @@ pub struct DaemonConfig {
     /// How long a graceful shutdown waits for in-flight leases before
     /// cancelling them (default [`DEFAULT_DRAIN_TIMEOUT`]).
     pub drain_timeout: Duration,
+    /// Where connector credentials live; `None` opens the OS-native
+    /// credential store (tests inject
+    /// [`crate::secrets::FakeSecretBackend`]).
+    pub secret_backend: Option<Arc<dyn SecretBackend>>,
+    /// How connector calls reach the network; `None` builds a
+    /// [`CurlTransport`] over the system `curl` (tests inject
+    /// `pam_connectors::testing::FakeTransport`).
+    pub http_transport: Option<Arc<dyn HttpTransport>>,
+}
+
+impl std::fmt::Debug for DaemonConfig {
+    /// Neither injected dependency is `Debug` — and a credential backend
+    /// must never render itself — so they are reported as present or
+    /// absent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonConfig")
+            .field("base_dir", &self.base_dir)
+            .field("approval_timeout", &self.approval_timeout)
+            .field("drain_timeout", &self.drain_timeout)
+            .field("secret_backend", &self.secret_backend.is_some())
+            .field("http_transport", &self.http_transport.is_some())
+            .finish()
+    }
 }
 
 impl Default for DaemonConfig {
@@ -491,6 +518,8 @@ impl Default for DaemonConfig {
             base_dir: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            secret_backend: None,
+            http_transport: None,
         }
     }
 }
@@ -546,6 +575,17 @@ pub async fn run_daemon_with(
     let gate = PolicyGate::new(Arc::clone(&store)).await?;
     let models = ModelService::new(Arc::clone(&store)).await?;
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let secrets = open_secret_store(config.secret_backend);
+    if let Some(secrets) = secrets.as_ref() {
+        // macOS only inside: the first keychain touch of a session can be
+        // slow, and paying for it at boot keeps it off the first flow step.
+        secrets.warm();
+    }
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        secrets,
+        open_http_transport(config.http_transport),
+    ));
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     queue.rebuild_from_store().await?;
 
@@ -572,6 +612,7 @@ pub async fn run_daemon_with(
             Arc::clone(&approvals),
             Arc::clone(&models),
             logs,
+            connectors,
         ),
         models: Arc::clone(&models),
         events: transport.event_publisher(),
@@ -610,6 +651,51 @@ pub async fn run_daemon_with(
         phase,
         _lock: lock,
     })
+}
+
+/// Opens the connector credential store for this boot.
+///
+/// A keychain that will not open is not a boot failure: the daemon serves,
+/// the Connectors screen still draws (saying the store is unavailable), and
+/// anything that needs a credential refuses with the store's own cause. The
+/// reason is logged once, here.
+fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Option<Arc<SecretStore>> {
+    if let Some(backend) = injected {
+        return Some(Arc::new(SecretStore::new(backend)));
+    }
+    match SecretStore::native() {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            tracing::warn!(
+                cause = error.cause(),
+                "the native credential store did not open; connector credentials are unavailable"
+            );
+            None
+        }
+    }
+}
+
+/// Builds the transport connector calls run over.
+///
+/// Like the credential store, a missing `curl` degrades rather than stops:
+/// every HTTP connector then refuses with `connector_cli_missing` and the
+/// platform's install line, while AWS — which drives its own CLI — keeps
+/// working.
+fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<dyn HttpTransport>> {
+    if injected.is_some() {
+        return injected;
+    }
+    match pam_model::download::curl_path() {
+        Ok(curl) => Some(Arc::new(CurlTransport::new(curl))),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                recovery = pam_model::download::curl_recovery_line(),
+                "curl was not found; connector calls over HTTP will refuse"
+            );
+            None
+        }
+    }
 }
 
 /// Drives the graceful drain (see the module docs): waits for the

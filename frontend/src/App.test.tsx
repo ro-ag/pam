@@ -42,16 +42,20 @@ describe("shell routing", () => {
     expect(screen.getByRole("link", { name: "Activity" })).not.toHaveAttribute("aria-current");
   });
 
-  it("renders all five nav entries; only Flows is still a disabled non-link", async () => {
+  it("renders all five nav entries, every one of them a real link", async () => {
     renderShell("/");
     await screen.findByRole("heading", { name: "Activity" });
-    for (const entry of ["Activity", "Approvals", "Models", "Settings"]) {
+    for (const entry of ["Activity", "Approvals", "Flows", "Models", "Settings"]) {
       expect(screen.getByRole("link", { name: entry })).toBeInTheDocument();
     }
-    const flows = screen.getByText("Flows");
-    expect(flows.closest("a")).toBeNull();
-    expect(flows.closest("[aria-disabled='true']")).not.toBeNull();
-    expect(screen.getAllByText("soon")).toHaveLength(1);
+    // The last placeholder went when the Flows screen landed.
+    expect(screen.queryByText("soon")).not.toBeInTheDocument();
+    expect(document.querySelector("[aria-disabled='true']")).toBeNull();
+  });
+
+  it("routes /flows to the Flows screen", async () => {
+    renderShell("/flows");
+    expect(await screen.findByRole("heading", { name: "Flows" })).toBeInTheDocument();
   });
 
   it("routes /models to the Models screen", async () => {
@@ -65,7 +69,16 @@ describe("shell routing", () => {
   it("hosts the real Settings sections (the style proof is retired)", async () => {
     renderShell("/settings");
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    for (const section of ["Appearance", "Security", "Models", "Daemon", "Retention", "Logs"]) {
+    for (const section of [
+      "Appearance",
+      "Security",
+      "Models",
+      "Flows",
+      "Connectors",
+      "Daemon",
+      "Retention",
+      "Logs",
+    ]) {
       expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
     }
     // The design system's living proof moved out with task #30.

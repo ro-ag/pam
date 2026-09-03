@@ -120,7 +120,17 @@ export type AdminOp =
   | "admin.log.compress"
   | "admin.evidence.list"
   | "admin.evidence.get"
-  | "admin.evidence.stats";
+  | "admin.evidence.stats"
+  | "admin.flows.list"
+  | "admin.flows.get"
+  | "admin.flows.save"
+  | "admin.flows.delete"
+  | "admin.flows.run"
+  | "admin.flows.settings.get"
+  | "admin.flows.settings.set"
+  | "admin.connectors.list"
+  | "admin.connectors.configure"
+  | "admin.connectors.test";
 
 /** One generic admin call; prefer the typed wrappers below. */
 export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): Promise<T> {
@@ -216,8 +226,19 @@ export function approvalsResolve(
   });
 }
 
+/**
+ * The tide, narrowed. `capability` is what the Flows screen's run
+ * history uses to ask for `flow.run` rows only, instead of pulling the
+ * whole tide and sieving it client-side.
+ */
 export function activityList(
-  filters: { limit?: number; repo?: string; agent?: string; state?: RequestStateName } = {},
+  filters: {
+    limit?: number;
+    repo?: string;
+    agent?: string;
+    state?: RequestStateName;
+    capability?: string;
+  } = {},
 ): Promise<{ requests: ActivityRow[] }> {
   return adminCall("admin.activity.list", filters);
 }
@@ -558,6 +579,187 @@ export function evidenceStats(sinceTs?: number): Promise<EvidenceStats> {
   return adminCall("admin.evidence.stats", {
     ...(sinceTs === undefined ? {} : { since_ts: sinceTs }),
   });
+}
+
+// --- flows -----------------------------------------------------------------
+
+/**
+ * The flow surface (`pam_daemon::admin_flows`). Editing a flow is a
+ * human act — a flow file IS the list of commands pam will run — so
+ * these ops exist only here. *Running* one is not privileged:
+ * `flowsRun` makes the daemon build a genuine `flow.run` envelope and
+ * push it through its own pipeline, so the GUI follows the returned
+ * ticket's events exactly like any other subscriber.
+ */
+
+/** One declared input of a flow, as the run card renders its field. */
+export interface FlowInput {
+  name: string;
+  description: string;
+  default?: string;
+}
+
+/** One flow in the library column: builtins and library files merged. */
+export interface FlowListEntry {
+  id: string;
+  name: string;
+  description: string;
+  /** `builtin` ships with pam; `library` is a file under ~/.pam/flows. */
+  source: "builtin" | "library";
+  /** The library file's path; builtins have none until one shadows them. */
+  path?: string;
+  /** False when the YAML would not parse; `error` then says why. */
+  valid: boolean;
+  error?: string;
+  digest: string;
+  steps: number;
+  inputs: FlowInput[];
+}
+
+/** One flow with its text: what the YAML tab edits. */
+export interface FlowDetail extends FlowListEntry {
+  yaml: string;
+  /** The canonical rendering the digest is taken over. */
+  normalized_yaml: string;
+  /** The parsed shape, or null when the file is invalid. */
+  flow?: unknown;
+}
+
+/** The two knobs Settings › Flows edits. */
+export interface FlowSettings {
+  allowed_programs: string[];
+  extra_path: string[];
+}
+
+/** How one step of a run ended (`pam_daemon::flow_exec::StepStatus`). */
+export type FlowStepStatus = "succeeded" | "failed" | "skipped" | "blocked" | "cancelled";
+
+/** One step of a finished run, as the step table reads it. */
+export interface FlowStepReport {
+  id: string;
+  kind: "command" | "connector";
+  status: FlowStepStatus;
+  attempts: number;
+  duration_ms: number;
+  exit_status?: number;
+  evidence: string[];
+  summary?: string;
+  error?: BridgeFailure;
+}
+
+/** The `flow.result` evidence body: one run's whole verdict. */
+export interface FlowResult {
+  flow: { id: string; name: string; source: string; digest: string };
+  repo: string;
+  inputs: Record<string, string>;
+  outcome: OutcomeName;
+  summary: string;
+  steps: FlowStepReport[];
+}
+
+export function flowsList(): Promise<{ flows: FlowListEntry[] }> {
+  return adminCall("admin.flows.list");
+}
+
+export function flowsGet(id: string): Promise<FlowDetail> {
+  return adminCall("admin.flows.get", { id });
+}
+
+/**
+ * Validates and writes one library file. The daemon is the only
+ * validator — an invalid flow comes back as a refusal naming the YAML
+ * path, which is why the editor has no separate Validate button.
+ */
+export function flowsSave(id: string, yaml: string): Promise<FlowListEntry> {
+  return adminCall("admin.flows.save", { id, yaml });
+}
+
+/** Removes one library file; deleting a shadow reveals its builtin. */
+export function flowsDelete(id: string): Promise<{ id: string; revealed_builtin: boolean }> {
+  return adminCall("admin.flows.delete", { id });
+}
+
+/** Starts a run and answers with the ticket its events arrive under. */
+export function flowsRun(
+  id: string,
+  repo: string,
+  inputs: Record<string, string> = {},
+): Promise<{ ticket: string; position: number }> {
+  return adminCall("admin.flows.run", { id, repo, inputs });
+}
+
+export function flowsSettingsGet(): Promise<FlowSettings> {
+  return adminCall("admin.flows.settings.get");
+}
+
+/** Replaces the named lists; an omitted key is left exactly as it is. */
+export function flowsSettingsSet(patch: Partial<FlowSettings>): Promise<FlowSettings> {
+  return adminCall("admin.flows.settings.set", { ...patch });
+}
+
+// --- connectors ------------------------------------------------------------
+
+/**
+ * The connector surface (`pam_daemon::admin_connectors`). Handing pam a
+ * credential and pointing it at a service is a human act too, so this is
+ * GUI-only by construction. The secret travels once, over the same unix
+ * socket, straight into the OS keychain — it is never echoed back, never
+ * audited, and never read out again.
+ */
+
+/** How pam authenticates a connector. */
+export type ConnectorAuth = "bearer" | "basic_user_secret" | "token_as_user" | "aws_profile";
+
+/** One connector row in Settings › Connectors. */
+export interface ConnectorSummary {
+  id: string;
+  name: string;
+  auth: ConnectorAuth;
+  /** What this connector's `username` means, when it means anything. */
+  username_label?: string;
+  needs_base_url: boolean;
+  enabled: boolean;
+  base_url?: string;
+  username?: string;
+  /** Whether a secret is stored — false also when the store was mute. */
+  credential_present: boolean;
+  /** Whether the OS credential store answered at all. */
+  store_available: boolean;
+  last_test?: { status: "passed" | "failed"; detail: string; ts: number };
+}
+
+/** What a configure asks of the stored credential. */
+export type CredentialPatch = { set: string } | { clear: true };
+
+export function connectorsList(): Promise<{ connectors: ConnectorSummary[] }> {
+  return adminCall("admin.connectors.list");
+}
+
+/**
+ * Saves one connector's configuration. An omitted key leaves the stored
+ * value alone; an explicit `null` clears it.
+ */
+export function connectorsConfigure(
+  id: string,
+  patch: {
+    enabled?: boolean;
+    base_url?: string | null;
+    username?: string | null;
+    credential?: CredentialPatch;
+  },
+): Promise<ConnectorSummary> {
+  return adminCall("admin.connectors.configure", { id, ...patch });
+}
+
+/**
+ * Proves one connector's credential still works. A failing test is an
+ * answer, not a refusal; only a connector that could not be *tried*
+ * refuses. The bridge gives this op 15 s.
+ */
+export function connectorsTest(
+  id: string,
+): Promise<{ status: "passed" | "failed"; detail: string; ts: number }> {
+  return adminCall("admin.connectors.test", { id });
 }
 
 // --- daemon log ------------------------------------------------------------

@@ -39,6 +39,8 @@ use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_CALLERS_LIST, OP_GRANTS_ADD,
     OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET, OP_PROFILE_SET,
 };
+use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
+use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
 use pam_proto::Response;
@@ -57,6 +59,11 @@ const ADMIN_DEADLINE_MS: u64 = 30_000;
 /// time out a working model.
 const LONG_DEADLINE_MS: u64 = 120_000;
 
+/// Deadline for `admin.connectors.test`: the daemon gives the remote
+/// service ten seconds (`CONNECTOR_TEST_DEADLINE`), so the bridge waits
+/// just long enough to hear the verdict rather than time out over it.
+const CONNECTOR_TEST_DEADLINE_MS: u64 = 15_000;
+
 /// How long [`daemon_stop`] waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
@@ -74,11 +81,15 @@ const CORE_ADMIN_OPS: [&str; 9] = [
     OP_CALLERS_LIST,
 ];
 
-/// How many ops the whitelist carries: the core surface plus the model
-/// and log surfaces, counted from the daemon's own lists.
-const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len() + LOG_ADMIN_OPS.len();
+/// How many ops the whitelist carries: the core surface plus the model,
+/// log, flow and connector surfaces, counted from the daemon's own lists.
+const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len()
+    + MODEL_ADMIN_OPS.len()
+    + LOG_ADMIN_OPS.len()
+    + FLOW_ADMIN_OPS.len()
+    + CONNECTOR_ADMIN_OPS.len();
 
-/// Splices the three daemon-owned lists into one array at compile time —
+/// Splices the five daemon-owned lists into one array at compile time —
 /// no op name is retyped here, so the whitelist cannot drift from the
 /// daemon's dispatch.
 const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
@@ -90,22 +101,36 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
     }
     let mut model = 0;
     while model < MODEL_ADMIN_OPS.len() {
-        ops[CORE_ADMIN_OPS.len() + model] = MODEL_ADMIN_OPS[model];
+        ops[index + model] = MODEL_ADMIN_OPS[model];
         model += 1;
     }
+    index += MODEL_ADMIN_OPS.len();
     let mut log = 0;
     while log < LOG_ADMIN_OPS.len() {
-        ops[CORE_ADMIN_OPS.len() + MODEL_ADMIN_OPS.len() + log] = LOG_ADMIN_OPS[log];
+        ops[index + log] = LOG_ADMIN_OPS[log];
         log += 1;
+    }
+    index += LOG_ADMIN_OPS.len();
+    let mut flow = 0;
+    while flow < FLOW_ADMIN_OPS.len() {
+        ops[index + flow] = FLOW_ADMIN_OPS[flow];
+        flow += 1;
+    }
+    index += FLOW_ADMIN_OPS.len();
+    let mut connector = 0;
+    while connector < CONNECTOR_ADMIN_OPS.len() {
+        ops[index + connector] = CONNECTOR_ADMIN_OPS[connector];
+        connector += 1;
     }
     ops
 }
 
 /// Every admin op the bridge forwards; anything else is refused before
 /// touching the socket. Composed from `pam_daemon::admin`,
-/// `pam_daemon::admin_models` and `pam_daemon::admin_logs` — the daemon
-/// would refuse an unknown op too, this just fails faster and keeps the
-/// GUI surface explicit.
+/// `pam_daemon::admin_models`, `pam_daemon::admin_logs`,
+/// `pam_daemon::admin_flows` and `pam_daemon::admin_connectors` — the
+/// daemon would refuse an unknown op too, this just fails faster and
+/// keeps the GUI surface explicit.
 pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();
 
 /// True when `op` is an admin operation the bridge forwards.
@@ -119,11 +144,17 @@ pub fn is_known_admin_op(op: &str) -> bool {
 /// Every admin op is synchronous request/reply inside
 /// [`ADMIN_DEADLINE_MS`], except the two that do real work: a generation
 /// (`admin.models.try`), or a 64 MiB compaction plus a generation
-/// (`admin.log.compress`).
+/// (`admin.log.compress`). `admin.connectors.test` gets its own
+/// [`CONNECTOR_TEST_DEADLINE_MS`]: it reaches a remote service the daemon
+/// already bounds at ten seconds.
+///
+/// `admin.flows.run` is *not* long: it answers with a ticket the moment
+/// the pipeline admits the run, and the GUI follows that ticket's events.
 #[must_use]
 pub fn deadline_for(op: &str) -> u64 {
     match op {
         OP_MODELS_TRY | OP_LOG_COMPRESS => LONG_DEADLINE_MS,
+        OP_CONNECTORS_TEST => CONNECTOR_TEST_DEADLINE_MS,
         _ => ADMIN_DEADLINE_MS,
     }
 }

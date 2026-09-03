@@ -17,7 +17,9 @@ fn every_daemon_admin_op_is_whitelisted() {
     assert_eq!(
         ADMIN_OPS.len(),
         9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
-            + pam_daemon::admin_logs::LOG_ADMIN_OPS.len(),
+            + pam_daemon::admin_logs::LOG_ADMIN_OPS.len()
+            + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
+            + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len(),
         "new admin ops need explicit wiring"
     );
 }
@@ -41,9 +43,27 @@ fn every_log_admin_op_is_whitelisted() {
 }
 
 #[test]
+fn every_flow_admin_op_is_whitelisted() {
+    // The flow surface is spliced in from the daemon's own list, so the
+    // Flows screen cannot go dark on a rename there.
+    for op in pam_daemon::admin_flows::FLOW_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+}
+
+#[test]
+fn every_connector_admin_op_is_whitelisted() {
+    // Same for the connector surface behind Settings → Connectors.
+    for op in pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+}
+
+#[test]
 fn only_the_working_ops_get_the_long_deadline() {
     // Real work runs for minutes; every other admin op is a synchronous
-    // read or write and keeps the 30 s ceiling.
+    // read or write and keeps the 30 s ceiling — except the connector
+    // test, which talks to a remote service on its own 10 s budget.
     let long = [
         pam_daemon::admin_models::OP_MODELS_TRY,
         pam_daemon::admin_logs::OP_LOG_COMPRESS,
@@ -55,12 +75,27 @@ fn only_the_working_ops_get_the_long_deadline() {
             "{op} decodes tokens; 30 s would time out a working model"
         );
     }
+    let test_op = pam_daemon::admin_connectors::OP_CONNECTORS_TEST;
+    assert_eq!(
+        deadline_for(test_op),
+        15_000,
+        "{test_op} rides just above the daemon's own 10 s connector budget"
+    );
     for op in ADMIN_OPS {
-        if long.contains(&op) {
+        if long.contains(&op) || op == test_op {
             continue;
         }
         assert_eq!(deadline_for(op), 30_000, "{op} answers synchronously");
     }
+}
+
+#[test]
+fn a_flow_run_is_forwarded_but_never_becomes_a_capability_request() {
+    // `admin.flows.run` is the GUI's Run button: an admin op the bridge
+    // forwards, which the daemon turns into a real `flow.run` envelope.
+    // The bare capability name must never be forwardable here.
+    assert!(is_known_admin_op(pam_daemon::admin_flows::OP_FLOWS_RUN));
+    assert!(!is_known_admin_op("flow.run"));
 }
 
 #[test]

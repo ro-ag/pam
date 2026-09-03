@@ -4,6 +4,9 @@ import {
   activityList,
   adminCall,
   approvalsPending,
+  connectorsConfigure,
+  connectorsList,
+  connectorsTest,
   curatorList,
   curatorSet,
   curatorTest,
@@ -12,6 +15,13 @@ import {
   evidenceGet,
   evidenceList,
   evidenceStats,
+  flowsDelete,
+  flowsGet,
+  flowsList,
+  flowsRun,
+  flowsSave,
+  flowsSettingsGet,
+  flowsSettingsSet,
   grantsList,
   logCompress,
   modelsCatalog,
@@ -266,5 +276,105 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
   it("omits max_tokens entirely when the caller names no budget", async () => {
     await modelsTry("Say hello.");
     expect(sent().args).toEqual({ prompt: "Say hello." });
+  });
+});
+
+describe("flow and connector wrappers speak the daemon's op names and arg shapes", () => {
+  beforeEach(() => {
+    bridge.inShell = true;
+    bridge.invoke.mockResolvedValue({});
+  });
+
+  afterEach(() => {
+    bridge.inShell = false;
+  });
+
+  /** The op and args the wrapper handed the bridge on its one call. */
+  function sent(): { op: string; args: Record<string, unknown> } {
+    expect(bridge.invoke).toHaveBeenCalledTimes(1);
+    const [command, payload] = bridge.invoke.mock.calls[0] as [
+      string,
+      { op: string; args: Record<string, unknown> },
+    ];
+    expect(command).toBe("admin_call");
+    return payload;
+  }
+
+  it.each([
+    ["flowsList", () => flowsList(), "admin.flows.list", {}],
+    ["flowsGet", () => flowsGet("pr-readiness"), "admin.flows.get", { id: "pr-readiness" }],
+    [
+      "flowsSave",
+      () => flowsSave("mine", "id: mine\n"),
+      "admin.flows.save",
+      { id: "mine", yaml: "id: mine\n" },
+    ],
+    ["flowsDelete", () => flowsDelete("mine"), "admin.flows.delete", { id: "mine" }],
+    [
+      "flowsRun",
+      () => flowsRun("pr-readiness", "/work/pam", { base: "main" }),
+      "admin.flows.run",
+      { id: "pr-readiness", repo: "/work/pam", inputs: { base: "main" } },
+    ],
+    [
+      "flowsRun (nothing declared)",
+      () => flowsRun("pr-readiness", "/work/pam"),
+      "admin.flows.run",
+      { id: "pr-readiness", repo: "/work/pam", inputs: {} },
+    ],
+    ["flowsSettingsGet", () => flowsSettingsGet(), "admin.flows.settings.get", {}],
+    [
+      "flowsSettingsSet (one list at a time)",
+      () => flowsSettingsSet({ allowed_programs: ["git", "cargo"] }),
+      "admin.flows.settings.set",
+      { allowed_programs: ["git", "cargo"] },
+    ],
+    ["connectorsList", () => connectorsList(), "admin.connectors.list", {}],
+    [
+      "connectorsConfigure (enable + base url)",
+      () => connectorsConfigure("jenkins", { enabled: true, base_url: "https://ci.test" }),
+      "admin.connectors.configure",
+      { id: "jenkins", enabled: true, base_url: "https://ci.test" },
+    ],
+    [
+      "connectorsConfigure (set credential)",
+      () => connectorsConfigure("github", { credential: { set: "ghp_x" } }),
+      "admin.connectors.configure",
+      { id: "github", credential: { set: "ghp_x" } },
+    ],
+    [
+      "connectorsConfigure (clear credential)",
+      () => connectorsConfigure("github", { credential: { clear: true } }),
+      "admin.connectors.configure",
+      { id: "github", credential: { clear: true } },
+    ],
+    [
+      "connectorsConfigure (clear a text field)",
+      () => connectorsConfigure("jira", { username: null }),
+      "admin.connectors.configure",
+      { id: "jira", username: null },
+    ],
+    [
+      "connectorsTest",
+      () => connectorsTest("github"),
+      "admin.connectors.test",
+      { id: "github" },
+    ],
+  ] as const)("%s", async (_name, call, op, args) => {
+    await call();
+    expect(sent()).toEqual({ op, args });
+  });
+
+  it("narrows the tide to one capability for the run history", async () => {
+    await activityList({ capability: "flow.run", limit: 50 });
+    expect(sent()).toEqual({
+      op: "admin.activity.list",
+      args: { capability: "flow.run", limit: 50 },
+    });
+  });
+
+  it("sends an untouched connector field as an absent key, not an empty string", async () => {
+    await connectorsConfigure("github", { enabled: false });
+    expect(sent().args).toEqual({ id: "github", enabled: false });
   });
 });

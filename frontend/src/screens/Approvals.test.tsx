@@ -8,6 +8,7 @@ import {
   APPROVAL_TIMEOUT_S,
   WARNING_AFTER_S,
   approvalMeaning,
+  capabilityLabel,
   waitingClock,
 } from "./Approvals";
 
@@ -113,6 +114,29 @@ describe("raised hands", () => {
     expect(approvalMeaning("net.fetch").after).toMatch(/traffic leave/);
     expect(approvalMeaning("shell.run").after).toMatch(/execute this once/);
     expect(approvalMeaning("mystery.cap").after).toMatch(/continue this once/);
+  });
+
+  it("speaks for the flow, not the agent, when a gated step raises the hand", () => {
+    const meaning = approvalMeaning("flow.step:pr-readiness/tests");
+    expect(meaning.before).toBe("The flow asks to run a gated step, ");
+    expect(meaning.after).toBe(
+      ". Approving runs that step this once; remember keeps it for this flow.",
+    );
+    // `flow.run` is an ordinary capability, not a gated step.
+    expect(approvalMeaning("flow.run").after).toMatch(/continue this once/);
+  });
+
+  it("renders a gated step as flow and step, in the data voice", async () => {
+    mocks.approvalsPending.mockResolvedValue({
+      pending: [hand({ capability: "flow.step:pr-readiness/tests" })],
+    });
+    renderApprovals();
+    await screen.findByText("approvals · 1 hand raised");
+    const stepCard = card("flow.step:pr-readiness/tests");
+    expect(stepCard.getByText(/The flow asks to run a gated step,/)).toBeInTheDocument();
+    expect(stepCard.getByText("pr-readiness / tests")).toBeInTheDocument();
+    expect(capabilityLabel("flow.step:pr-readiness/tests")).toBe("pr-readiness / tests");
+    expect(capabilityLabel("repo.push")).toBe("repo.push");
   });
 });
 

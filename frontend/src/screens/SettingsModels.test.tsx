@@ -242,5 +242,14 @@ it("was reached at the right place in Settings: between Security and Daemon", as
   const headings = screen
     .getAllByRole("heading", { level: 2 })
     .map((heading) => heading.textContent);
-  expect(headings).toEqual(["Appearance", "Security", "Models", "Daemon", "Retention", "Logs"]);
+  expect(headings).toEqual([
+    "Appearance",
+    "Security",
+    "Models",
+    "Flows",
+    "Connectors",
+    "Daemon",
+    "Retention",
+    "Logs",
+  ]);
 });

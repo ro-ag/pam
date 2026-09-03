@@ -31,12 +31,14 @@ import {
   type ModeId,
 } from "../lib/theme";
 import { exactTime, formatDuration, relativeTime } from "../lib/time";
+import { SettingsConnectorsSection } from "./SettingsConnectors";
+import { SettingsFlowsSection } from "./SettingsFlows";
 import { SettingsModelsSection } from "./SettingsModels";
 
 /**
  * Settings — every knob, one place (task #30). One calm scrollable column
- * of grouped panels: Appearance, Security (the GUI-only admin surface),
- * Daemon, Retention, Logs. Wired controls round-trip against the real
+ * of grouped panels: Appearance, Security, Models, Flows, Connectors (the
+ * GUI-only admin surfaces), Daemon, Retention, Logs. Wired controls round-trip against the real
  * bridge; the one thing the daemon cannot do yet (retention pruning)
  * renders disabled and says so, honestly, instead of pretending.
  *
@@ -727,6 +729,24 @@ export function SettingsScreen() {
           blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
         >
           <SettingsModelsSection />
+        </Section>
+
+        <Section
+          eyebrow="flows"
+          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+          title="Flows"
+          blurb="Which programs a flow step may run, and where I look for them."
+        >
+          <SettingsFlowsSection />
+        </Section>
+
+        <Section
+          eyebrow="connectors"
+          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+          title="Connectors"
+          blurb="The services I may reach on a flow's behalf, and the credentials that let me."
+        >
+          <SettingsConnectorsSection />
         </Section>
 
         <Section

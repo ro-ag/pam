@@ -34,6 +34,11 @@ const mocks = vi.hoisted(() => ({
   modelsStatus: vi.fn(),
   modelsList: vi.fn(),
   curatorList: vi.fn(),
+  // Same for the Flows and Connectors sections between Models and
+  // Daemon: stubbed so their honest bridge-unavailable notes do not
+  // drown out the copy this file is here to assert.
+  flowsSettingsGet: vi.fn(),
+  connectorsList: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -91,6 +96,8 @@ beforeEach(() => {
   });
   mocks.modelsList.mockResolvedValue({ models: [], models_dir: "/Users/dev/llm" });
   mocks.curatorList.mockResolvedValue({ detected: [], selected: null });
+  mocks.flowsSettingsGet.mockResolvedValue({ allowed_programs: ["git"], extra_path: [] });
+  mocks.connectorsList.mockResolvedValue({ connectors: [] });
 });
 
 afterEach(() => {

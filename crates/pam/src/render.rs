@@ -289,6 +289,38 @@ pub fn parse_flow_inputs(raw: &[String]) -> Result<Value, String> {
     Ok(Value::Object(inputs))
 }
 
+/// `pam service …` human output: one fact per line, aligned like the
+/// rest of the CLI's summaries.
+#[must_use]
+pub fn render_service_report(report: &pam_client::service::ServiceReport) -> String {
+    use pam_client::service::ServiceState;
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "platform  {}", report.platform);
+    match &report.state {
+        ServiceState::Installed { unit, loaded } => {
+            let _ = writeln!(
+                out,
+                "state     installed, {}",
+                if *loaded { "loaded" } else { "not loaded" }
+            );
+            let _ = writeln!(out, "unit      {unit}");
+        }
+        ServiceState::NotInstalled { unit } => {
+            out.push_str("state     not installed\n");
+            let _ = writeln!(out, "unit      {unit}");
+        }
+        ServiceState::Unsupported { reason } => {
+            let _ = writeln!(out, "state     unsupported: {reason}");
+        }
+    }
+    let _ = writeln!(out, "exe       {}", report.exe.display());
+    if let Some(note) = &report.note {
+        let _ = writeln!(out, "note      {note}");
+    }
+    out
+}
+
 /// One step of a verdict as its table line (see [`render_flow_result`]).
 fn render_step_line(step: &Value) -> String {
     let status = field(step, "status");

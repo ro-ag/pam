@@ -36,6 +36,10 @@
 //!   not a 60 s request. The whole run travels in **one** request, so
 //!   nothing prints until it ends; to watch it step by step, start it
 //!   with `--no-wait` and follow the ticket with `pam subscribe`.
+//! - `pam service install | uninstall | status [--json]` — start the
+//!   daemon at login through a user-scope unit (macOS `LaunchAgent`, systemd
+//!   user unit, Windows scheduled task). `install` stops a loose daemon
+//!   first so the managed one takes over; `uninstall` never stops it.
 //! - `pam daemon` — run the daemon in the foreground;
 //!   `pam daemon stop` — signal the running daemon to drain and exit.
 //! - `pam gui` — open the desktop control center window.

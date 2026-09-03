@@ -100,6 +100,12 @@ enum Cmd {
         #[command(subcommand)]
         action: FlowCmd,
     },
+    /// Start the daemon at login: a user-scope launch agent, systemd user
+    /// unit, or scheduled task. Never sudo or admin.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
     /// Run the pam daemon in the foreground.
     Daemon {
         #[command(subcommand)]
@@ -113,6 +119,30 @@ enum Cmd {
 enum DaemonCmd {
     /// Signal the running daemon to drain and exit.
     Stop,
+}
+
+/// `pam service`: the login-start unit for the daemon.
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Register the unit and start the managed daemon now (a loose
+    /// daemon is stopped first so the managed one takes over).
+    Install {
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unregister and remove the unit. The running daemon is left alone.
+    Uninstall {
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show whether the unit exists and whether the manager has it loaded.
+    Status {
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `pam flow`: the flow library, and one run of one flow.
@@ -162,6 +192,7 @@ fn main() -> ExitCode {
             action: Some(DaemonCmd::Stop),
         } => daemon_stop(),
         Cmd::Gui => gui_mode(),
+        Cmd::Service { action } => service_command(&action),
         command => client_mode(command),
     }
 }
@@ -246,7 +277,47 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
         Cmd::Wait { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, false).await,
         Cmd::Subscribe { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, true).await,
         Cmd::Flow { action } => run_flow_command(base, action).await,
-        Cmd::Daemon { .. } | Cmd::Gui => unreachable!("handled in main"),
+        Cmd::Daemon { .. } | Cmd::Gui | Cmd::Service { .. } => unreachable!("handled in main"),
+    }
+}
+
+/// `pam service …`: the shared mechanics live in
+/// [`pam_client::service`]; this prints the report and maps failures.
+fn service_command(action: &ServiceCmd) -> ExitCode {
+    use pam_client::service::{self, CommandRunner, ServiceEnv};
+    let Some(base) = base_dir() else {
+        eprintln!("pam service: cannot resolve the home directory; set $HOME");
+        return ExitCode::FAILURE;
+    };
+    let env = match ServiceEnv::detect(&base) {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("pam service: {err}\n  {}", err.recovery());
+            return ExitCode::FAILURE;
+        }
+    };
+    let runner = CommandRunner;
+    let (result, json) = match *action {
+        ServiceCmd::Install { json } => (service::install(&env, &runner), json),
+        ServiceCmd::Uninstall { json } => (service::uninstall(&env, &runner), json),
+        ServiceCmd::Status { json } => (service::status(&env, &runner), json),
+    };
+    match result {
+        Ok(report) if json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(report) => {
+            print!("{}", render::render_service_report(&report));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("pam service: {err}\n  {}", err.recovery());
+            ExitCode::FAILURE
+        }
     }
 }
 

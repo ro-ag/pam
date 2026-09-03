@@ -1,11 +1,12 @@
+import { Position, getBezierPath, getSmoothStepPath } from "@xyflow/react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FlowSpec, FlowStep } from "../../lib/ipc";
 import { FlowCanvas, type FlowCanvasProps, type Selection } from "./FlowCanvas";
 import { edgeVariants } from "./FlowEdge";
 import { defaultStep, type CanvasEdge, type CanvasNode } from "./graph";
-import { LAYOUT_KEY, savePositions } from "./layout";
-import { stepNodeVariants, type Rim } from "./StepNode";
+import { LAYOUT_KEY, NOTE_OFFSET, savePositions } from "./layout";
+import { railVariants, stepNodeVariants, type Rail, type Ring } from "./StepNode";
 
 /**
  * The canvas against a stubbed ReactFlow: the real Handle, BaseEdge, path
@@ -171,6 +172,13 @@ function node(id: string): HTMLElement {
   return screen.getByLabelText(`step ${id}`);
 }
 
+function rail(id: string): HTMLElement {
+  return within(node(id)).getByTestId("rail");
+}
+
+/** Where the stub draws every edge; the path math is xyflow's own. */
+const EDGE_GEOMETRY = { sourceX: 0, sourceY: 0, targetX: 200, targetY: 40 };
+
 function edgePath(id: string): SVGPathElement {
   const path = document.querySelector<SVGPathElement>(
     `[data-edge="${id}"] path.react-flow__edge-path`,
@@ -204,27 +212,37 @@ describe("FlowCanvas nodes", () => {
     }
     expect(node("a")).toHaveTextContent("git status --porcelain");
     expect(node("c")).toHaveTextContent("github · runs");
-    expect(node("b")).toHaveTextContent("verify");
+    // The role rides as the id's title, not as a line of its own.
+    expect(within(node("b")).getByText("b")).toHaveAttribute("title", "verify");
+    expect(node("b")).not.toHaveTextContent("verify");
     expect(screen.getByLabelText("inputs frame")).toHaveTextContent("repo = {{ repo.root }}");
     expect(screen.getByLabelText("verdict frame")).toBeInTheDocument();
   });
 
-  it("shows the modifier chips: approval hand, summarize sparkle, retry, timeout", async () => {
+  it("shows the modifiers as labelled glyphs in the header, with no chip footer", async () => {
     renderCanvas();
     await settle();
     const b = node("b");
-    expect(within(b).getByLabelText("retry")).toHaveTextContent("×3 / 2s");
-    expect(within(b).getByLabelText("timeout")).toHaveTextContent("10m");
-    expect(within(b).getByLabelText("summarize")).toBeInTheDocument();
+    expect(within(b).getByLabelText("retry")).toHaveAttribute("title", "retry ×3 / 2s");
+    expect(within(b).getByLabelText("timeout")).toHaveAttribute("title", "timeout 10m");
+    expect(within(b).getByLabelText("summarize").className).toContain("text-accent");
     const c = node("c");
-    expect(within(c).getByLabelText("approval")).toHaveTextContent("approval");
-    expect(within(c).getByLabelText("stateful")).toHaveTextContent("changes");
-    expect(within(c).getByLabelText("discard")).toHaveTextContent("discard");
-    // Every default stays quiet; the footer says so instead of going blank.
+    expect(within(c).getByLabelText("approval").className).toContain("text-warning");
+    expect(within(c).getByLabelText("stateful").className).toContain("text-copper");
+    expect(within(c).getByLabelText("discard").className).toContain("text-ink-faint");
+    for (const label of ["approval", "stateful", "discard"]) {
+      expect(within(c).getByLabelText(label)).toHaveAttribute("role", "img");
+      expect(within(c).getByLabelText(label).getAttribute("title")).toBeTruthy();
+    }
+    // A step at its defaults wears nothing but its kind glyph.
     const a = node("a");
     expect(within(a).queryByLabelText("retry")).toBeNull();
     expect(within(a).queryByLabelText("timeout")).toBeNull();
-    expect(a).toHaveTextContent("defaults");
+    expect(within(a).getAllByRole("img")).toHaveLength(1);
+    expect(a).not.toHaveTextContent("defaults");
+    for (const id of ["a", "b", "c"]) {
+      expect(node(id).querySelector("footer")).toBeNull();
+    }
   });
 
   it("paints the marker on the node named by the error path", async () => {
@@ -246,53 +264,74 @@ describe("FlowCanvas nodes", () => {
     expect(node("b")).toHaveTextContent("fix it in the inspector");
   });
 
-  it("paints rims from statuses and the running dash on incoming edges", async () => {
+  it("paints the rail from statuses and the running dash on incoming edges", async () => {
     renderCanvas({ statuses: { a: "succeeded", b: "running" } });
     await settle();
-    expect(node("a").className).toContain("ring-success");
-    expect(node("b").className).toContain("animate-breathe");
-    expect(node("b").className).toContain("ring-accent");
-    expect(node("c").className).toContain("ring-warning");
+    expect(rail("a").className).toContain("bg-success");
+    expect(rail("b").className).toContain("bg-accent");
+    expect(rail("b").className).toContain("animate-breathe");
+    expect(rail("c").className).toContain("bg-line");
+    expect(node("a")).toHaveAttribute("data-status", "succeeded");
+    // A run never touches the ring; approval never paints a rim.
+    for (const id of ["a", "b", "c"]) {
+      expect(node(id).className).not.toContain("ring-2");
+    }
     const running = edgePath("needs:a->b");
     expect(running.classList.contains("flow-edge-running")).toBe(true);
     expect(running.classList.contains("animate-dash")).toBe(true);
     expect(edgePath("succeeded:b->c").classList.contains("flow-edge-running")).toBe(false);
   });
 
-  it("gives every rim a distinct, token-backed ring", () => {
-    const rims: Rim[] = [
+  it("wears the ring for selection alone", async () => {
+    renderCanvas({ selection: { kind: "step", id: "b" } });
+    await settle();
+    expect(node("b").className).toContain("ring-2");
+    expect(node("b").className).toContain("ring-accent");
+    expect(node("a").className).not.toContain("ring-2");
+    // `c` requires approval: its Hand glyph says so, its ring stays off.
+    expect(node("c").className).not.toContain("ring-2");
+    expect(node("c").className).not.toContain("ring-warning");
+  });
+
+  it("gives every rail status a distinct, token-backed color and the ring three states", () => {
+    const rails: Rail[] = [
       "none",
-      "selected",
       "running",
       "succeeded",
       "failed",
       "skipped",
       "blocked",
       "cancelled",
-      "invalid",
-      "approval",
     ];
-    const rendered = rims.map((rim) => stepNodeVariants({ rim }));
-    for (const classes of rendered) {
-      for (const utility of classes
-        .split(/\s+/)
-        .filter((c) => c.startsWith("ring-"))
-        .map((c) => c.split("/")[0])) {
-        expect(utility).toMatch(
-          /^ring-(0|2|accent|success|danger|warning|ink-faint|offset-2|offset-chrome)$/,
-        );
+    const rendered = new Map(rails.map((status) => [status, railVariants({ status })]));
+    for (const classes of rendered.values()) {
+      const colors = classes.split(/\s+/).filter((c) => c.startsWith("bg-"));
+      expect(colors).toHaveLength(1);
+      expect(colors[0]).toMatch(/^bg-(line|accent|success|danger|warning|ink-faint)$/);
+    }
+    // failed and blocked share danger on purpose; the other six rails all differ.
+    expect(rendered.get("failed")).toBe(rendered.get("blocked"));
+    const six = rails.filter((status) => status !== "blocked");
+    expect(new Set(six.map((status) => rendered.get(status))).size).toBe(six.length);
+    expect(rendered.get("running")).toContain("animate-breathe");
+
+    const rings: Ring[] = ["none", "selected", "invalid"];
+    const looks = rings.map((ring) => stepNodeVariants({ ring }));
+    expect(new Set(looks).size).toBe(rings.length);
+    for (const classes of looks) {
+      for (const utility of classes.split(/\s+/).filter((c) => c.startsWith("ring-"))) {
+        expect(utility).toMatch(/^ring-(0|2|accent|danger|offset-2|offset-chrome)$/);
       }
     }
-    // failed / blocked / invalid share the danger ring on purpose (the marker
-    // chip tells invalid apart); every other rim must look different.
-    const visible = rims.filter(
-      (rim) => !["none", "failed", "blocked", "invalid"].includes(rim),
+    // Selected differs from idle by the ring and nothing else.
+    const strip = (classes: string) =>
+      classes
+        .split(/\s+/)
+        .filter((c) => !c.startsWith("ring-"))
+        .join(" ");
+    expect(strip(stepNodeVariants({ ring: "selected" }))).toBe(
+      strip(stepNodeVariants({ ring: "none" })),
     );
-    const looks = new Set(visible.map((rim) => stepNodeVariants({ rim })));
-    expect(looks.size).toBe(visible.length);
-    expect(stepNodeVariants({ rim: "running" })).toContain("animate-breathe");
-    expect(stepNodeVariants({ rim: "blocked" })).toContain("ring-danger");
-    expect(stepNodeVariants({ rim: "invalid" })).toContain("ring-danger");
   });
 });
 
@@ -315,6 +354,23 @@ describe("FlowCanvas edges and frames", () => {
     );
   });
 
+  it("draws every step edge as an orthogonal path with 8 px corners", async () => {
+    renderCanvas();
+    await settle();
+    const [expected] = getSmoothStepPath({
+      ...EDGE_GEOMETRY,
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      borderRadius: 8,
+    });
+    for (const id of ["needs:a->b", "succeeded:b->c", "terminal:c"]) {
+      const d = edgePath(id).getAttribute("d") ?? "";
+      expect(d, id).toBe(expected);
+      // Square: straight runs and quarter-turn corners, never a free curve.
+      expect(d).not.toMatch(/C/);
+    }
+  });
+
   it("paints the verdict frame's outcome chip and fades the others", async () => {
     renderCanvas({ outcome: "solved" });
     await settle();
@@ -325,16 +381,95 @@ describe("FlowCanvas edges and frames", () => {
     }
   });
 
-  it("wires handles as 10px pills in the line color", async () => {
+  it("wires handles as 10px pills in the line color, plus a hidden anchor for the note", async () => {
     renderCanvas();
     await settle();
-    const handles = node("a").querySelectorAll(".react-flow__handle");
-    expect(handles.length).toBe(2);
-    for (const handle of handles) {
+    const handles = [...node("a").querySelectorAll(".react-flow__handle")];
+    expect(handles.length).toBe(3);
+    const hidden = handles.filter((handle) => handle.className.includes("opacity-0"));
+    expect(hidden).toHaveLength(1);
+    expect(hidden[0].className).toContain("pointer-events-none");
+    expect(hidden[0].getAttribute("data-handleid")).toBe("note");
+    for (const handle of handles.filter((handle) => !hidden.includes(handle))) {
       expect(handle.className).toContain("size-2.5");
       expect(handle.className).toContain("rounded-pill");
       expect(handle.className).toContain("bg-line");
     }
+  });
+});
+
+describe("FlowCanvas notes", () => {
+  function noted(): FlowSpec {
+    const spec = fixture();
+    spec.steps[0] = { ...spec.steps[0], note: "watch the exit code" };
+    return spec;
+  }
+
+  it("draws a note beside its step, tethered by a dotted curve", async () => {
+    renderCanvas({ spec: noted() });
+    await settle();
+    const note = screen.getByLabelText("note a");
+    expect(note).toHaveTextContent("watch the exit code");
+    expect(note.className).toContain("font-voice");
+    expect(screen.queryByLabelText("note b")).toBeNull();
+    const anchor = note.querySelector(".react-flow__handle");
+    expect(anchor?.className).toContain("opacity-0");
+
+    const tether = edgePath("note:a");
+    expect(tether.classList.contains("flow-edge-tether")).toBe(true);
+    expect(tether.classList.contains("stroke-ink-faint")).toBe(true);
+    const [curve] = getBezierPath({
+      ...EDGE_GEOMETRY,
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+    });
+    expect(tether.getAttribute("d")).toBe(curve);
+    expect(tether.getAttribute("d")).toMatch(/C/);
+    expect(edgePath("needs:a->b").getAttribute("d")).not.toMatch(/C/);
+    const stored = captured.props?.edges.find((edge) => edge.id === "note:a");
+    expect(stored).toMatchObject({ type: "tether", selectable: false, targetHandle: "note" });
+  });
+
+  it("selecting a note reports its step, and the step's selection lights the note", async () => {
+    const { props, rerender } = renderCanvas({ spec: noted() });
+    await settle();
+    act(() =>
+      captured.props?.onNodesChange([{ type: "select", id: "note:a", selected: true }]),
+    );
+    expect(props.onSelect).toHaveBeenLastCalledWith({ kind: "step", id: "a" });
+    rerender(<FlowCanvas {...props} spec={noted()} selection={{ kind: "step", id: "a" }} />);
+    await settle();
+    const nodes = captured.props?.nodes ?? [];
+    expect(nodes.find((candidate) => candidate.id === "a")?.selected).toBe(true);
+    expect(nodes.find((candidate) => candidate.id === "note:a")?.selected).toBe(true);
+    expect(screen.getByLabelText("note a").className).toContain("border-accent");
+    expect(node("a").className).toContain("ring-accent");
+  });
+
+  it("places a typed note beside its placed step without a layout run; Tidy hands it to ELK", async () => {
+    savePositions("fx", {
+      inputs: { x: 0, y: 0 },
+      a: { x: 300, y: 64 },
+      b: { x: 600, y: 0 },
+      c: { x: 900, y: 0 },
+      verdict: { x: 1200, y: 0 },
+    });
+    renderCanvas({ spec: noted() });
+    await settle();
+    expect(mocks.autoLayout).not.toHaveBeenCalled();
+    const at = (id: string) =>
+      (captured.props?.nodes ?? []).find((candidate) => candidate.id === id)?.position;
+    expect(at("note:a")).toEqual({ x: 300 + NOTE_OFFSET.x, y: 64 + NOTE_OFFSET.y });
+
+    fireEvent.click(screen.getByRole("button", { name: "Tidy" }));
+    await waitFor(() => expect(mocks.autoLayout).toHaveBeenCalledTimes(1));
+    await settle();
+    // The mock lays every node out by index, the note included (it is
+    // node 4): ELK's own placement is taken as is, not offset from the step.
+    const laid = mocks.autoLayout.mock.calls[0][0] as CanvasNode[];
+    expect(laid.map((candidate) => candidate.id)).toContain("note:a");
+    expect(at("a")).toEqual({ x: 300, y: 0 });
+    expect(at("note:a")).toEqual({ x: 1200, y: 0 });
   });
 });
 

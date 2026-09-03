@@ -224,6 +224,23 @@ describe("Inspector", () => {
     expect(screen.getByLabelText("when")).toHaveTextContent("runs when needs succeeded");
   });
 
+  it("round-trips a step note through the textarea, trimmed, and drops a blank one", () => {
+    const spec = fixture();
+    spec.steps[1] = { ...spec.steps[1], note: "watch the exit code" };
+    const props = renderInspector({ kind: "step", id: "b" }, { spec });
+    const note = screen.getByLabelText("note");
+    expect(note).toHaveValue("watch the exit code");
+    expect(note).toHaveAttribute("rows", "3");
+    fireEvent.change(note, { target: { value: "  flaky on CI  " } });
+    expect(props.onChange).not.toHaveBeenCalled();
+    fireEvent.blur(note);
+    expect(step(lastSpec(props), "b").note).toBe("flaky on CI");
+    expect(step(lastSpec(props), "a")).not.toHaveProperty("note");
+    fireEvent.change(note, { target: { value: "   " } });
+    fireEvent.blur(note);
+    expect(step(lastSpec(props), "b")).not.toHaveProperty("note");
+  });
+
   it("moves steps through the list and shows a refused move inline", () => {
     const spec = fixture();
     spec.steps[2] = { ...spec.steps[2], when: "needs_succeeded" };

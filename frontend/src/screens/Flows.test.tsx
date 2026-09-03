@@ -281,6 +281,11 @@ async function nodeFor(id: string): Promise<HTMLElement> {
 }
 
 /** Lets a debounce elapse and the reply land. */
+/** The step card's status rail, the run's voice on the canvas. */
+function rail(id: string): HTMLElement {
+  return within(screen.getByLabelText(`step ${id}`)).getByTestId("rail");
+}
+
 async function quiet(ms: number) {
   await act(async () => {
     vi.advanceTimersByTime(ms);
@@ -702,9 +707,7 @@ describe("the canvas tab", () => {
     act(() =>
       feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: running (1/3)" } }),
     );
-    await waitFor(() =>
-      expect(screen.getByLabelText("step fmt").className).toContain("animate-breathe"),
-    );
+    await waitFor(() => expect(rail("fmt").className).toContain("animate-breathe"));
     act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: succeeded" } }));
     act(() =>
       feed({ ticket: "req_run", event: { kind: "progress", note: "queued · nothing" } }),
@@ -713,48 +716,40 @@ describe("the canvas tab", () => {
       feed({ ticket: "req_run", event: { kind: "progress", note: "clippy: running (2/3)" } }),
     );
     await waitFor(() => {
-      expect(screen.getByLabelText("step fmt").className).toContain("ring-success");
-      expect(screen.getByLabelText("step clippy").className).toContain("animate-breathe");
+      expect(rail("fmt").className).toContain("bg-success");
+      expect(rail("clippy").className).toContain("animate-breathe");
     });
-    expect(screen.getByLabelText("step tests").className).not.toContain("ring-2");
+    expect(rail("tests").className).toContain("bg-line");
 
-    // Done: the verdict from evidence paints the final rims and the outcome chip.
+    // Done: the verdict from evidence paints the final rails and the outcome chip.
     act(() => feed({ ticket: "req_run", event: { kind: "done" } }));
     await screen.findByLabelText("run verdict");
     await waitFor(() => {
-      expect(screen.getByLabelText("step tests").className).toContain("ring-danger");
-      expect(screen.getByLabelText("step fmt").className).toContain("ring-success");
+      expect(rail("tests").className).toContain("bg-danger");
+      expect(rail("fmt").className).toContain("bg-success");
     });
-    expect(screen.getByLabelText("step clippy").className).not.toContain("ring-2");
+    expect(rail("clippy").className).toContain("bg-line");
     const verdictFrame = within(screen.getByLabelText("verdict frame"));
     expect(verdictFrame.getByText("verified").className).not.toContain("opacity-40");
     expect(verdictFrame.getByText("blocked").className).toContain("opacity-40");
   });
 
-  it("editing after a run clears the rims", async () => {
+  it("editing after a run clears the rails", async () => {
     await renderFlows();
     await nodeFor("fmt");
     await startRun();
     act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: succeeded" } }));
-    await waitFor(() =>
-      expect(screen.getByLabelText("step fmt").className).toContain("ring-success"),
-    );
+    await waitFor(() => expect(rail("fmt").className).toContain("bg-success"));
 
     fireEvent.click(screen.getByRole("button", { name: "Add command" }));
-    await waitFor(() =>
-      expect(screen.getByLabelText("step fmt").className).not.toContain("ring-success"),
-    );
+    await waitFor(() => expect(rail("fmt").className).not.toContain("bg-success"));
 
     // The same from the textarea.
     act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: failed" } }));
-    await waitFor(() =>
-      expect(screen.getByLabelText("step fmt").className).toContain("ring-danger"),
-    );
+    await waitFor(() => expect(rail("fmt").className).toContain("bg-danger"));
     fireEvent.change(screen.getByLabelText("pr-readiness yaml"), {
       target: { value: "id: pr-readiness\n" },
     });
-    await waitFor(() =>
-      expect(screen.getByLabelText("step fmt").className).not.toContain("ring-danger"),
-    );
+    await waitFor(() => expect(rail("fmt").className).not.toContain("bg-danger"));
   });
 });

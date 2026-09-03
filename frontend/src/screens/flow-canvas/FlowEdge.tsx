@@ -2,12 +2,15 @@ import { BaseEdge, getSmoothStepPath, type EdgeProps } from "@xyflow/react";
 import { memo } from "react";
 import { Badge } from "../../components/ui/Badge";
 import { cva } from "../../lib/cn";
-import type { CanvasEdge } from "./graph";
+import type { StepEdge } from "./graph";
 
 /**
  * One edge, four kinds: `needs` in the hairline, `succeeded` / `failed`
  * tinted and labelled with a pill, the implicit terminal edge faint. A
  * running edge marches its dashes toward the step that is running.
+ *
+ * The path is orthogonal with 8 px corners: on this canvas a square line
+ * means execution, and only a note's tether is allowed to curve.
  *
  * The label sits in a `foreignObject` on the edge's own path so it needs
  * no inline transform: SVG `x`/`y` are geometry, not style.
@@ -46,7 +49,7 @@ function FlowEdgeComponent({
   targetPosition,
   data,
   selected,
-}: EdgeProps<CanvasEdge>) {
+}: EdgeProps<StepEdge>) {
   const kind = data?.kind ?? "needs";
   const running = data?.running ?? false;
   const [path, labelX, labelY] = getSmoothStepPath({
@@ -56,7 +59,7 @@ function FlowEdgeComponent({
     targetX,
     targetY,
     targetPosition,
-    borderRadius: 12,
+    borderRadius: 8,
   });
   const labelled = kind === "succeeded" || kind === "failed";
   return (

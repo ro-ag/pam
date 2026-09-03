@@ -308,6 +308,32 @@ function ArgvLine({ step, commit }: { step: FlowStep; commit: (argv: string[]) =
   );
 }
 
+/**
+ * The step's note, committed on blur like the argv line: a note is prose,
+ * and trimming it on every keystroke would eat the space after each word.
+ */
+function NoteField({ step, commit }: { step: FlowStep; commit: (note: string) => void }) {
+  const current = step.note ?? "";
+  const [draft, setDraft] = useState(current);
+  useEffect(() => setDraft(current), [current, step.id]);
+  const flush = () => {
+    if (draft.trim() !== current) commit(draft);
+  };
+  return (
+    <Field label="note">
+      <textarea
+        aria-label="note"
+        rows={3}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={flush}
+        placeholder="a margin note beside the step, for whoever reads this flow next"
+        className={cn(fieldClasses, "h-auto resize-y py-1.5 leading-relaxed")}
+      />
+    </Field>
+  );
+}
+
 function ConnectorFields({
   step,
   patch,
@@ -597,6 +623,10 @@ function StepFields({
           <EnvRows step={step} patch={patch} />
         </Group>
       )}
+
+      <Group>
+        <NoteField step={step} commit={(note) => patch({ note })} />
+      </Group>
     </>
   );
 }

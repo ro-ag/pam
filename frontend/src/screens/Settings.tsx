@@ -902,7 +902,14 @@ export function SettingsScreen() {
   const hash = useRouterState({ select: (state) => state.location.hash });
   useEffect(() => {
     if (!hash) return;
-    document.getElementById(hash.replace(/^#/, ""))?.scrollIntoView({ block: "start" });
+    const id = hash.replace(/^#/, "");
+    const scroll = () => document.getElementById(id)?.scrollIntoView({ block: "start" });
+    // The panels above the target fill in asynchronously (grants, models,
+    // connectors) and push it back down after the first scroll, so the
+    // scroll repeats on a short, bounded schedule instead of once.
+    scroll();
+    const timers = [250, 700, 1500].map((ms) => window.setTimeout(scroll, ms));
+    return () => timers.forEach((timer) => clearTimeout(timer));
   }, [hash]);
 
   return (

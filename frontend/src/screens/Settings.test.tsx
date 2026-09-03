@@ -508,6 +508,12 @@ describe("deep links", () => {
         expect(document.getElementById(id)).not.toBeNull();
       }
       await waitFor(() => expect(scrolled).toContain("retention"));
+      // The scroll repeats while the panels above settle, so a late-growing
+      // grants list cannot push the target back out of view.
+      await waitFor(
+        () => expect(scrolled.filter((id) => id === "retention").length).toBeGreaterThan(1),
+        { timeout: 2_000 },
+      );
     } finally {
       Element.prototype.scrollIntoView = original;
     }

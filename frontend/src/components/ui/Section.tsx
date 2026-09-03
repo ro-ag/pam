@@ -28,7 +28,12 @@ export function Section({
   children: ReactNode;
 }) {
   return (
-    <section id={id} aria-label={title} className="max-w-2xl space-y-4">
+    <section
+      id={id}
+      aria-label={title}
+      // scroll-mt keeps an anchored title clear of the sticky screen header.
+      className="max-w-2xl scroll-mt-28 space-y-4"
+    >
       <header className="space-y-1.5">
         <div className="flex items-center gap-2">
           <p className="font-data text-xs tracking-widest text-ink-faint uppercase">

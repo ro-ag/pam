@@ -24,7 +24,7 @@ const DIGEST_DOMAIN: &[u8] = b"pam-flow-v1\0";
 
 /// Renders a flow in canonical form: `schema`, `id`, `name`, `description`,
 /// `inputs`, `steps`, and per step `id`, the action, then only the fields
-/// that differ from their defaults.
+/// that differ from their defaults, with the `note` last.
 ///
 /// # Panics
 ///
@@ -119,6 +119,8 @@ struct NormalStep<'a> {
     approval: Option<Approval>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     env: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    note: &'a str,
 }
 
 impl<'a> From<&'a Step> for NormalStep<'a> {
@@ -154,6 +156,7 @@ impl<'a> From<&'a Step> for NormalStep<'a> {
             }),
             approval: (step.approval != Approval::default()).then_some(step.approval),
             env: &step.env,
+            note: &step.note,
         }
     }
 }

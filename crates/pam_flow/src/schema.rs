@@ -300,6 +300,10 @@ pub struct Step {
     pub approval: Approval,
     /// Environment additions for a command step.
     pub env: BTreeMap<String, String>,
+    /// Free text beside the step — what the designer draws as a tethered
+    /// note card. Never a secret; empty when the file has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 impl Step {
@@ -398,6 +402,8 @@ pub(crate) struct RawStep {
     pub(crate) approval: Option<Approval>,
     #[serde(default)]
     pub(crate) env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) note: Option<String>,
 }
 
 /// A retry block exactly as YAML spells it.

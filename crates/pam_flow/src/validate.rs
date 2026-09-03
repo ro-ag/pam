@@ -541,6 +541,8 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
     let env = raw.env.unwrap_or_default();
     validate_env(&env, &at, scope)?;
 
+    let note = validate_note(raw.note.as_deref(), &at)?;
+
     Ok(Step {
         id: raw.id,
         action,
@@ -553,7 +555,18 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         retry,
         approval,
         env,
+        note,
     })
+}
+
+/// A note is trimmed — whitespace alone is no note — bounded like the
+/// description, and refused when it looks like a credential.
+fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
+    let note = note.map(str::trim).unwrap_or_default();
+    let path = format!("{at}.note");
+    check_length(&path, note.len(), MAX_DESCRIPTION_BYTES)?;
+    check_secrets(note, &path)?;
+    Ok(note.to_string())
 }
 
 fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowError> {

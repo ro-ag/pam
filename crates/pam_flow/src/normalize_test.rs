@@ -127,3 +127,37 @@ fn an_empty_description_and_empty_maps_disappear() {
         "schema: 1\nid: demo\nname: Demo\nsteps:\n- id: a\n  connector: aws\n  call: commands\n"
     );
 }
+
+#[test]
+fn a_note_is_the_last_step_key_and_round_trips_a_block_scalar() {
+    let yaml = "schema: 1\nid: demo\nname: Demo\nsteps:\n  - id: a\n    note: |\n      Check the tree first.\n      Stale files hide real failures.\n    run: [git, status]\n    env: { CARGO_TERM_COLOR: never }\n";
+    let once = normalized(yaml);
+    assert_eq!(
+        once,
+        "schema: 1\nid: demo\nname: Demo\nsteps:\n- id: a\n  run:\n  - git\n  - status\n  env:\n    CARGO_TERM_COLOR: never\n  note: |-\n    Check the tree first.\n    Stale files hide real failures.\n"
+    );
+    assert_eq!(once, normalized(&once), "a two-line note is idempotent");
+    assert_eq!(
+        parse(&once).expect("normalized form is valid").steps[0].note,
+        "Check the tree first.\nStale files hide real failures."
+    );
+}
+
+#[test]
+fn an_empty_note_disappears_and_only_a_real_note_moves_the_digest() {
+    let plain = "schema: 1\nid: demo\nname: Demo\nsteps:\n  - id: a\n    run: [git, status]\n";
+    let blank = "schema: 1\nid: demo\nname: Demo\nsteps:\n  - id: a\n    run: [git, status]\n    note: '   '\n";
+    let noted = "schema: 1\nid: demo\nname: Demo\nsteps:\n  - id: a\n    run: [git, status]\n    note: Read this first.\n";
+    assert_eq!(normalized(plain), normalized(blank));
+    assert!(
+        !normalized(blank).contains("note"),
+        "a blank note is left out"
+    );
+    assert!(normalized(noted).ends_with("  note: Read this first.\n"));
+
+    let plain = parse(plain).expect("valid flow");
+    let blank = parse(blank).expect("valid flow");
+    let noted = parse(noted).expect("valid flow");
+    assert_eq!(digest(&plain), digest(&blank));
+    assert_ne!(digest(&plain), digest(&noted));
+}

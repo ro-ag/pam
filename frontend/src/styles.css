@@ -17,6 +17,11 @@
 
 @import "tailwindcss";
 
+/* xyflow ships unlayered CSS; folding it into `components` lets the semantic
+   utilities on handles, edges and the minimap win over its own defaults
+   while its --xy-* variables (bound in tokens.css) still theme the rest. */
+@import "@xyflow/react/dist/style.css" layer(components);
+
 @import "./styles/themes.css" layer(base);
 @import "./styles/tokens.css";
 

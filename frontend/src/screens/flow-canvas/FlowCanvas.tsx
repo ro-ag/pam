@@ -83,6 +83,14 @@ const nodeTypes = { step: StepNode, inputs: FrameNode, verdict: FrameNode };
 const edgeTypes = { flow: FlowEdge };
 
 const FIT = { padding: 0.2 };
+
+/**
+ * xyflow derives the minimap's viewBox from `style.width` / `style.height`
+ * (its sizing API — a CSS box alone leaves the drawing scaled for 200×150
+ * and clipped), so the size goes through the prop: small enough to leave
+ * the flow's last column uncovered.
+ */
+const MINIMAP_SIZE = { width: 128, height: 96 };
 // Stable identities: xyflow syncs every tracked prop into its store when
 // the reference changes, and a fresh array or object per render would
 // keep that sync, the store's subscribers, and this component in a loop.
@@ -377,6 +385,7 @@ function Canvas({
             zoomable
             position="bottom-right"
             nodeClassName={minimapClass}
+            style={MINIMAP_SIZE}
             className="rounded-card border border-edge shadow-raise"
           />
         </ReactFlow>

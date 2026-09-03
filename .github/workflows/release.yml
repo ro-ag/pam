@@ -141,9 +141,13 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p bundle
+          mkdir -p bundle payload
           tar -xzf "downloaded/pam-${TARGET}-bundle.tar.gz" -C bundle
-          tar -C bundle -czf "$PWD/pam_${VERSION}_linux_${ARCH}.tar.gz" .
+          # Ship the installable files only, not the bundler's staging trees
+          # (deb/<name>/data, appimage/pam.AppDir) that ride along in the CI tarball.
+          cp bundle/deb/*.deb bundle/appimage/*.AppImage payload/
+          ls -l payload
+          tar -C payload -czf "$PWD/pam_${VERSION}_linux_${ARCH}.tar.gz" .
 
       - name: Assemble Windows release archive
         if: ${{ matrix.family == 'windows' }}

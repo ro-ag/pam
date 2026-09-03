@@ -631,9 +631,23 @@ impl AdminService {
         // The Flows screen's run history is this list narrowed to
         // `flow.run`, which is why the filter exists at all.
         let capability = args.get("capability").and_then(serde_json::Value::as_str);
+        // The GUI polls this very op (and `status`) every few seconds;
+        // asked to, the store drops that self-traffic so real agent work
+        // is not pushed out of the newest-N window.
+        let hide_probes = match args.get("hide_probes") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(other) => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: format!("{other} is not a boolean hide_probes"),
+                    recovery: RECOVERY_FIX_ARGS,
+                });
+            }
+        };
         let requests: Vec<serde_json::Value> = self
             .store
-            .list_requests_filtered(limit, repo, agent, state, capability)
+            .list_requests_filtered(limit, repo, agent, state, capability, hide_probes)
             .await?
             .into_iter()
             .map(|row| {

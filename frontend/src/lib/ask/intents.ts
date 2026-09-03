@@ -213,6 +213,10 @@ async function whatRan(args: Args, sources: Sources, ctx: AskContext): Promise<A
   try {
     ({ requests } = await sources.activityList({
       limit: 100,
+      // The day's count is agent work, not the GUI watching itself.
+      // (why_refused keeps the unfiltered view: refusals of admin ops
+      // are real refusals.)
+      hide_probes: true,
       ...(args.repo ? { repo: args.repo } : {}),
     }));
   } catch (error) {

@@ -89,11 +89,16 @@ describe("shell routing", () => {
 });
 
 describe("shell chrome", () => {
-  it("keeps the whole top strip a window drag region", async () => {
+  it("keeps the panel toolbar and the sidebar head window drag regions", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
-    const strip = document.querySelector("header[data-tauri-drag-region]");
-    expect(strip).not.toBeNull();
+    // No band across the window any more: the drag regions are the sidebar
+    // head and the toolbar row inside the panel.
+    expect(document.querySelector("header[data-tauri-drag-region]")).toBeNull();
+    expect(screen.getByRole("toolbar", { name: "panel controls" })).toHaveAttribute(
+      "data-tauri-drag-region",
+    );
+    expect(screen.getByText("PAM")).toHaveAttribute("data-tauri-drag-region");
     // Interactive chrome must NOT drag the window.
     const toggle = screen.getByRole("button", { name: /Ventisquero/ });
     expect(toggle).not.toHaveAttribute("data-tauri-drag-region");

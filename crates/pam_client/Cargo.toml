@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 pam_daemon.workspace = true
 pam_proto.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 pub mod caller;
 pub mod client;
 pub mod request;
+pub mod service;
 
 #[cfg(test)]
 mod caller_test;
@@ -24,6 +25,8 @@ mod client_test;
 mod lib_test;
 #[cfg(test)]
 mod request_test;
+#[cfg(test)]
+mod service_test;
 
 /// The base directory every pam mode works under: `$PAM_BASE_DIR` when
 /// set and non-empty, otherwise `~/.pam`. `None` only when neither the

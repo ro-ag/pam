@@ -274,8 +274,9 @@ jobs:
           app="$bundle/macos/pam.app"
           dmg="$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           [[ -n "$dmg" ]]
-          mapfile -t bundle_binaries < <(find "$app/Contents/MacOS" -maxdepth 1 -type f -exec basename {} \; | sort)
-          [[ "${bundle_binaries[*]}" == "pam" ]]
+          # macOS runners execute `shell: bash` with /bin/bash 3.2: no mapfile.
+          bundle_binaries="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -exec basename {} \; | sort | paste -sd ' ' -)"
+          [[ "$bundle_binaries" == "pam" ]]
           [[ "$(lipo -archs "$app/Contents/MacOS/pam")" == arm64 ]]
           [[ "$(otool -l "$app/Contents/MacOS/pam" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
           expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '

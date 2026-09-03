@@ -7,54 +7,287 @@ on:
     branches: [main]
     tags: ["v*"]
     paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+permissions:
+  contents: read
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are waste; a main run must finish so release.yml
+  # can reuse its artifacts.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 jobs:
   gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      packages: ${{ steps.packages.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Tauri system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev patchelf
       # rust-toolchain.toml pins 1.97.0; this action honors it
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: "rustfmt, clippy"
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm --prefix frontend ci
       - run: tools/check.sh
+      - name: Choose the desktop packages this run builds
+        id: packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          linux_amd64='{"name":"Linux amd64 package","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb","family":"linux","artifact":"pam-linux-amd64"}'
+          linux_arm64='{"name":"Linux arm64 package","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","bundles":"appimage,deb","family":"linux","artifact":"pam-linux-arm64"}'
+          windows_amd64='{"name":"Windows amd64 package","runner":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis","family":"windows","artifact":"pam-windows-amd64"}'
+          windows_arm64='{"name":"Windows arm64 package","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","bundles":"nsis","family":"windows","artifact":"pam-windows-arm64"}'
+          # Pull requests build the cheapest package only; main, tags and
+          # dispatch build the four that release.yml reuses.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            echo "matrix={\"include\":[$linux_amd64]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$linux_amd64,$linux_arm64,$windows_amd64,$windows_arm64]}" >> "$GITHUB_OUTPUT"
+          fi
   targets:
     needs: gate
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04-arm, macos-15, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --workspace
       - if: matrix.os == 'macos-15'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - if: matrix.os == 'macos-15'
         run: npm --prefix frontend ci && npm --prefix frontend run build && cargo build --release -p pam --features gui-embed
+  desktop-packages:
+    name: ${{ matrix.name }}
+    needs: [gate, targets]
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gate.outputs.packages) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Tauri system deps
+        if: ${{ matrix.family == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev patchelf xdg-utils
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: desktop-${{ matrix.target }}
+      - run: npm --prefix frontend ci
+      - name: Build desktop packages
+        run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Verify Linux package contract
+        if: ${{ matrix.family == 'linux' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          binary="target/$TARGET/release/pam"
+          mapfile -t appimages < <(find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
+          mapfile -t debs < <(find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
+          (( ${#appimages[@]} == 1 ))
+          (( ${#debs[@]} == 1 ))
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) expected_machine="Advanced Micro Devices X86-64"; expected_deb_arch="amd64" ;;
+            aarch64-unknown-linux-gnu) expected_machine="AArch64"; expected_deb_arch="arm64" ;;
+            *) echo "unsupported Linux verification target: $TARGET" >&2; exit 2 ;;
+          esac
+          for candidate in "$binary" "${appimages[0]}"; do
+            machine="$(readelf -h "$candidate" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+            [[ "$machine" == "$expected_machine" ]]
+          done
+          [[ "$(dpkg-deb --field "${debs[0]}" Architecture)" == "$expected_deb_arch" ]]
+          expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '
+            let input = ""; process.stdin.on("data", c => input += c);
+            process.stdin.on("end", () => { const m = JSON.parse(input); process.stdout.write(m.packages.find(p => p.name === "pam").version); });')"
+          verify_cli_contract() {
+            local candidate="$1"
+            [[ "$("$candidate" --version)" == "pam $expected_version" ]]
+            "$candidate" --help > "$RUNNER_TEMP/pam-help.txt"
+            grep -Fq "A local lifeguard for developers and AI agents." "$RUNNER_TEMP/pam-help.txt"
+            grep -Eq '^Usage: pam( |$)' "$RUNNER_TEMP/pam-help.txt"
+          }
+          verify_cli_contract "$binary"
+          deb_root="$RUNNER_TEMP/pam-deb-payload"; appimage_root="$RUNNER_TEMP/pam-appimage-payload"
+          mkdir -p "$deb_root" "$appimage_root"
+          dpkg-deb --extract "${debs[0]}" "$deb_root"
+          ( cd "$appimage_root" && "$GITHUB_WORKSPACE/${appimages[0]}" --appimage-extract >/dev/null )
+          verify_payload() {
+            local root="$1"
+            # Single-binary product; the AppImage additionally carries the
+            # xdg-open helper linuxdeploy bundles. Nothing else belongs here.
+            mapfile -t binaries < <(find "$root/usr/bin" -maxdepth 1 -type f -printf '%f\n' | sort)
+            [[ "${binaries[*]}" == "pam" || "${binaries[*]}" == "pam xdg-open" ]]
+            machine="$(readelf -h "$root/usr/bin/pam" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+            [[ "$machine" == "$expected_machine" ]]
+            verify_cli_contract "$root/usr/bin/pam"
+            # The desktop entry opens the GUI, not the help text.
+            grep -Eq '^Exec=.*pam gui' "$root/usr/share/applications/pam.desktop"
+          }
+          verify_payload "$deb_root"
+          verify_payload "$appimage_root/squashfs-root"
+      - name: Verify Windows package contract
+        if: ${{ matrix.family == 'windows' }}
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "target/$env:TARGET/release/bundle"
+          $binary = (Resolve-Path "target/$env:TARGET/release/pam.exe").Path
+          $installers = @(Get-ChildItem "$bundle/nsis" -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "expected exactly one NSIS installer" }
+          function Get-PeHeader([string] $Path) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "$Path is not a PE executable" }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ([Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") { throw "$Path has no PE signature" }
+            @{ Bytes = $bytes; Machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4); Subsystem = [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68) }
+          }
+          $expectedMachine = switch ($env:TARGET) {
+            'x86_64-pc-windows-msvc' { [UInt16] 0x8664 }
+            'aarch64-pc-windows-msvc' { [UInt16] 0xaa64 }
+            default { throw "unsupported Windows verification target: $env:TARGET" }
+          }
+          $header = Get-PeHeader $binary
+          if ($header.Machine -ne $expectedMachine) { throw ("PE machine 0x{0:x4} != 0x{1:x4}" -f $header.Machine, $expectedMachine) }
+          # Console subsystem (3): agents read pam's output on Windows too.
+          if ($header.Subsystem -ne 3) { throw "pam.exe must keep the console subsystem, found $($header.Subsystem)" }
+          $expectedVersion = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'pam' | Select-Object -ExpandProperty version
+          $version = & $binary --version
+          if ($version -ne "pam $expectedVersion") { throw "pam --version printed '$version'" }
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "$env:ProgramFiles/7-Zip/7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "7-Zip is required to inspect the NSIS payload" }
+          $extract = Join-Path $env:RUNNER_TEMP 'pam-nsis'
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          & $sevenZip x '-y' "-o$extract" $installers[0].FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to extract NSIS installer" }
+          $pamExecutables = @(Get-ChildItem $extract -Recurse -File -Filter 'pam*.exe')
+          if ((@($pamExecutables.Name | Sort-Object) -join ' ') -ne 'pam.exe') { throw "unexpected NSIS pam executable inventory" }
+          if ((Get-PeHeader $pamExecutables[0].FullName).Machine -ne $expectedMachine) { throw "packaged pam.exe has the wrong machine" }
+          # Silent per-user install: the Start-menu shortcut must open the GUI.
+          Start-Process -Wait -FilePath $installers[0].FullName -ArgumentList '/S'
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\pam.lnk'
+          if (-not (Test-Path $lnk)) { throw "no Start-menu shortcut at $lnk" }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          if ($shortcut.Arguments -ne 'gui') { throw "shortcut arguments are '$($shortcut.Arguments)', expected 'gui'" }
+          $installed = Join-Path $env:LOCALAPPDATA 'pam\pam.exe'
+          if ((& $installed --version) -ne "pam $expectedVersion") { throw "installed pam.exe --version failed" }
+          Start-Process -Wait -FilePath (Join-Path $env:LOCALAPPDATA 'pam\uninstall.exe') -ArgumentList '/S'
+      - name: Record package output
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle="target/$TARGET/release/bundle"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            archive="target/$TARGET/release/pam-$TARGET-bundle.tar.gz"
+            tar -C "$bundle" -czf "$PWD/$archive" .
+            echo "path=$archive" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$bundle" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+  macos-package:
+    name: macOS arm64 package
+    needs: [gate, targets]
+    # Unsigned preview; signing + notarization happen in release.yml on
+    # tags, which reuses this artifact. Never on pull requests.
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: desktop-aarch64-apple-darwin
+      - run: npm --prefix frontend ci
+      - name: Build application
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: npm --prefix frontend run tauri -- build --target aarch64-apple-darwin --bundles app
+      - name: Build disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/package-macos-dmg.sh "$PWD/target/aarch64-apple-darwin/release/bundle/macos/pam.app" "$PWD/target/aarch64-apple-darwin/release/bundle/dmg"
+      - name: Verify macOS package contract
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="target/aarch64-apple-darwin/release/bundle"
+          app="$bundle/macos/pam.app"
+          dmg="$(find "$bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]]
+          mapfile -t bundle_binaries < <(find "$app/Contents/MacOS" -maxdepth 1 -type f -exec basename {} \; | sort)
+          [[ "${bundle_binaries[*]}" == "pam" ]]
+          [[ "$(lipo -archs "$app/Contents/MacOS/pam")" == arm64 ]]
+          [[ "$(otool -l "$app/Contents/MacOS/pam" | awk '/cmd LC_BUILD_VERSION/ { seen=1 } seen && /minos/ { print $2; exit }')" == 12.0 ]]
+          expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '
+            let input = ""; process.stdin.on("data", c => input += c);
+            process.stdin.on("end", () => { const m = JSON.parse(input); process.stdout.write(m.packages.find(p => p.name === "pam").version); });')"
+          [[ "$("$app/Contents/MacOS/pam" --version)" == "pam $expected_version" ]]
+          archive="target/aarch64-apple-darwin/release/pam-macos-arm64-bundle.tar.gz"
+          tar -C "$bundle" -czf "$PWD/$archive" "macos/pam.app" "dmg/$(basename "$dmg")"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pam-macos-arm64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7

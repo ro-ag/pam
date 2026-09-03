@@ -133,6 +133,7 @@ export type AdminOp =
   | "admin.approvals.resolve"
   | "admin.activity.list"
   | "admin.callers.list"
+  | "admin.audit.request"
   | "admin.models.list"
   | "admin.models.catalog"
   | "admin.models.download"
@@ -280,6 +281,31 @@ export function activityList(
 
 export function callersList(): Promise<{ callers: CallerRow[] }> {
   return adminCall("admin.callers.list");
+}
+
+/**
+ * One audit row. `detail` is the daemon's own JSON when the row carried
+ * JSON (a refusal's `{ cause, detail, recovery }`), the raw string when
+ * it did not, and `null` when the row has none.
+ */
+export interface AuditRow {
+  id: number;
+  action: string;
+  decision: string;
+  actor: string;
+  detail: unknown;
+  ts: number;
+}
+
+/**
+ * The audit trail of one request, oldest first. An id the daemon does
+ * not know — pruned or mistyped — answers `rows: []` rather than
+ * refusing.
+ */
+export function auditRequest(
+  requestId: string,
+): Promise<{ request_id: string; rows: AuditRow[] }> {
+  return adminCall("admin.audit.request", { request_id: requestId });
 }
 
 // --- models ----------------------------------------------------------------

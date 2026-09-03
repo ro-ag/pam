@@ -267,7 +267,8 @@ fn xml_escape(text: &str) -> String {
 #[must_use]
 pub fn render_launch_agent(exe: &Path, log_dir: &Path, base_override: Option<&Path>) -> String {
     let exe = xml_escape(&exe.display().to_string());
-    let log = xml_escape(&log_dir.join("launchd.log").display().to_string());
+    // A macOS path in a macOS plist: always `/`, whatever host renders it.
+    let log = xml_escape(&format!("{}/launchd.log", log_dir.display()));
     let mut plist = String::new();
     plist.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     plist.push_str(

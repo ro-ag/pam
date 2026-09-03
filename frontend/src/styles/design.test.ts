@@ -93,10 +93,12 @@ function blockOf(css: string, selector: string): string {
   return css.slice(open + 1, close);
 }
 
-/** `--pam-*` declarations of a block as name → normalized value. */
-function declarationsOf(block: string): Record<string, string> {
+/** `--<prefix>-*` declarations of a block as name → normalized value. */
+function declarationsOf(block: string, prefix = "pam"): Record<string, string> {
   const decls: Record<string, string> = {};
-  for (const match of block.matchAll(/(--pam-[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const match of block.matchAll(
+    new RegExp(`(--${prefix}-[a-z0-9-]+)\\s*:\\s*([^;]+);`, "g"),
+  )) {
     decls[match[1]] = match[2].replace(/\s+/g, " ").trim();
   }
   return decls;
@@ -212,9 +214,7 @@ function expectTokenBacked(classString: string, label: string): void {
     // Strip state prefixes (hover:, active:, disabled:) and opacity (/40).
     const utility = (raw.split(":").pop() ?? raw).split("/")[0];
     const claim = (ok: boolean, role: string) => {
-      expect(ok, `${label}: ${raw} must resolve from the semantic ${role} tokens`).toBe(
-        true,
-      );
+      expect(ok, `${label}: ${raw} must resolve from the semantic ${role} tokens`).toBe(true);
     };
     if (utility.startsWith("bg-")) {
       claim(colors.has(utility.slice(3)), "color");
@@ -238,9 +238,7 @@ function expectTokenBacked(classString: string, label: string): void {
 /** Asserts each declared variant yields a distinct, token-backed class string. */
 function expectTotalAndDistinct(label: string, rendered: ReadonlyMap<string, string>): void {
   const outputs = [...rendered.values()];
-  expect(new Set(outputs).size, `${label} variants must style distinctly`).toBe(
-    outputs.length,
-  );
+  expect(new Set(outputs).size, `${label} variants must style distinctly`).toBe(outputs.length);
   for (const [variant, classes] of rendered) {
     expect(classes.trim().length, `${label}.${variant} renders classes`).toBeGreaterThan(0);
     expectTokenBacked(classes, `${label}.${variant}`);
@@ -271,11 +269,38 @@ describe("cva exemplars", () => {
     const sizes = ["sm", "md"] as const;
     const rendered = new Map(
       variants.flatMap((variant) =>
-        sizes.map(
-          (size) => [`${variant}-${size}`, buttonVariants({ variant, size })] as const,
-        ),
+        sizes.map((size) => [`${variant}-${size}`, buttonVariants({ variant, size })] as const),
       ),
     );
     expectTotalAndDistinct("Button", rendered);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 5 — xyflow: the canvas is themed only through the variables it reads.
+ * ------------------------------------------------------------------ */
+
+describe("xyflow bindings", () => {
+  it("binds every --xy-* variable to a semantic token, never a raw value", () => {
+    const declarations = declarationsOf(blockOf(tokens, ".flow-canvas .react-flow"), "xy");
+    const names = Object.keys(declarations);
+    expect(names.length).toBeGreaterThan(8);
+    for (const name of names) {
+      const value = declarations[name];
+      const ok =
+        /^var\(--(color|shadow)-[a-z-]+\)$/.test(value) ||
+        value === "transparent" ||
+        /^[0-9.]+$/.test(value) ||
+        /^1px solid var\(--color-[a-z-]+\)$/.test(value);
+      expect(ok, `${name}: ${value}`).toBe(true);
+    }
+  });
+
+  it("gives running edges their dash: an --animate-dash token, its keyframes, and the class", () => {
+    expect(tokens).toMatch(/--animate-dash\s*:\s*dash /);
+    expect(tokens).toContain("@keyframes dash");
+    expect(tokens).toMatch(
+      /\.flow-canvas \.flow-edge-running\s*\{\s*stroke-dasharray:\s*6;?\s*\}/,
+    );
   });
 });

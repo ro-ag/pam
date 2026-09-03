@@ -37,3 +37,28 @@ if (typeof window !== "undefined" && !window.localStorage) {
     configurable: true,
   });
 }
+
+// @xyflow/react measures nodes with ResizeObserver and reads the viewport
+// transform through DOMMatrixReadOnly on mount; jsdom ships neither.
+if (typeof window !== "undefined") {
+  if (!("ResizeObserver" in window)) {
+    class ResizeObserverStub {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    Object.defineProperty(window, "ResizeObserver", {
+      value: ResizeObserverStub,
+      configurable: true,
+    });
+  }
+  if (!("DOMMatrixReadOnly" in window)) {
+    class DOMMatrixReadOnlyStub {
+      m22 = 1;
+    }
+    Object.defineProperty(window, "DOMMatrixReadOnly", {
+      value: DOMMatrixReadOnlyStub,
+      configurable: true,
+    });
+  }
+}

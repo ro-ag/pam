@@ -126,6 +126,7 @@ export type AdminOp =
   | "admin.flows.save"
   | "admin.flows.delete"
   | "admin.flows.run"
+  | "admin.flows.normalize"
   | "admin.flows.settings.get"
   | "admin.flows.settings.set"
   | "admin.connectors.list"
@@ -616,13 +617,223 @@ export interface FlowListEntry {
   inputs: FlowInput[];
 }
 
+// The resolved flow (`pam_flow::Flow` as serde emits it): every default
+// filled in, durations as strings, an action that is exactly one thing.
+// This is what the canvas draws and edits.
+
+export type FlowWhen =
+  "needs_succeeded" | "always" | { succeeded: string } | { failed: string };
+export type FlowEffect = "read_only" | "stateful";
+export type FlowRole = "observe" | "verify" | "change";
+export type FlowOutput = "compact" | "summarize" | "discard";
+export type FlowApproval = "none" | "required";
+export type FlowConnectorId =
+  "github" | "jenkins" | "sonarqube" | "jira" | "confluence" | "sharepoint" | "aws";
+
+/** Every connector, in `ConnectorId::ALL` order (the order the GUI lists them). */
+export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
+  "github",
+  "jenkins",
+  "sonarqube",
+  "jira",
+  "confluence",
+  "sharepoint",
+  "aws",
+];
+
+/** A connector call argument: YAML scalars only, string or integer. */
+export type FlowArgValue = string | number;
+
+export type FlowAction =
+  | { kind: "command"; argv: string[] }
+  | {
+      kind: "connector";
+      connector: FlowConnectorId;
+      call: string;
+      with: Record<string, FlowArgValue>;
+    };
+
+export interface FlowStep {
+  id: string;
+  action: FlowAction;
+  /** A duration string (`5m`, `500ms`), as `pam_flow` formats it. */
+  timeout: string;
+  effect: FlowEffect;
+  role: FlowRole;
+  output: FlowOutput;
+  needs: string[];
+  when: FlowWhen;
+  retry: { attempts: number; backoff: string };
+  approval: FlowApproval;
+  env: Record<string, string>;
+}
+
+export interface FlowSpecInput {
+  description: string;
+  default: string | null;
+}
+
+export interface FlowSpec {
+  id: string;
+  name: string;
+  description: string;
+  inputs: Record<string, FlowSpecInput>;
+  steps: FlowStep[];
+}
+
+/** One step in the file's own shape: `run` or `connector`/`call`/`with`. */
+export interface RawFlowStep {
+  id: string;
+  run?: string[];
+  connector?: FlowConnectorId;
+  call?: string;
+  with?: Record<string, FlowArgValue>;
+  timeout?: string;
+  effect?: FlowEffect;
+  role?: FlowRole;
+  output?: FlowOutput;
+  needs?: string[];
+  when?: FlowWhen;
+  retry?: { attempts: number; backoff?: string };
+  approval?: FlowApproval;
+  env?: Record<string, string>;
+}
+
+/** The file's own shape, what `admin.flows.normalize { flow }` takes. */
+export interface RawFlow {
+  schema: 1;
+  id: string;
+  name: string;
+  description?: string;
+  inputs?: Record<string, { description?: string; default?: string | null }>;
+  steps: RawFlowStep[];
+}
+
+/** What `admin.flows.normalize` answers: canonical text + resolved flow, or the first error. */
+export type FlowNormalizeReply =
+  | { valid: true; yaml: string; flow: FlowSpec; digest: string }
+  | { valid: false; error: { path: string; message: string } };
+
+/** One read-only connector call and the arguments it takes. */
+export interface FlowCallSpec {
+  name: string;
+  args: { name: string; required: boolean }[];
+}
+
+/**
+ * The connector call table, mirrored verbatim from
+ * `pam_flow::validate::connector_calls` for the inspector's call picker.
+ * The daemon stays the validator; this only shapes the picker.
+ */
+export const FLOW_CONNECTOR_CALLS: Record<FlowConnectorId, FlowCallSpec[]> = {
+  github: [
+    {
+      name: "runs",
+      args: [
+        { name: "repo", required: true },
+        { name: "status", required: false },
+        { name: "limit", required: false },
+      ],
+    },
+    {
+      name: "run",
+      args: [
+        { name: "repo", required: true },
+        { name: "run_id", required: true },
+      ],
+    },
+    {
+      name: "job_log",
+      args: [
+        { name: "repo", required: true },
+        { name: "job_id", required: true },
+      ],
+    },
+  ],
+  jenkins: [
+    { name: "jobs", args: [{ name: "limit", required: false }] },
+    {
+      name: "builds",
+      args: [
+        { name: "job", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+    {
+      name: "console",
+      args: [
+        { name: "job", required: true },
+        { name: "build", required: true },
+      ],
+    },
+  ],
+  sonarqube: [
+    { name: "quality_gate", args: [{ name: "project", required: true }] },
+    {
+      name: "issues",
+      args: [
+        { name: "project", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+  ],
+  jira: [
+    {
+      name: "search",
+      args: [
+        { name: "jql", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+    { name: "issue", args: [{ name: "key", required: true }] },
+  ],
+  confluence: [
+    {
+      name: "search",
+      args: [
+        { name: "cql", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+    { name: "page", args: [{ name: "id", required: true }] },
+  ],
+  sharepoint: [
+    {
+      name: "documents",
+      args: [
+        { name: "site", required: true },
+        { name: "query", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+    {
+      name: "lists",
+      args: [
+        { name: "site", required: true },
+        { name: "limit", required: false },
+      ],
+    },
+  ],
+  aws: [
+    { name: "commands", args: [] },
+    {
+      name: "cli",
+      args: [
+        { name: "service", required: true },
+        { name: "command", required: true },
+        { name: "args", required: false },
+      ],
+    },
+  ],
+};
+
 /** One flow with its text: what the YAML tab edits. */
 export interface FlowDetail extends FlowListEntry {
   yaml: string;
   /** The canonical rendering the digest is taken over. */
   normalized_yaml: string;
   /** The parsed shape, or null when the file is invalid. */
-  flow?: unknown;
+  flow?: FlowSpec | null;
 }
 
 /** The two knobs Settings › Flows edits. */
@@ -677,6 +888,17 @@ export function flowsSave(id: string, yaml: string): Promise<FlowListEntry> {
 /** Removes one library file; deleting a shadow reveals its builtin. */
 export function flowsDelete(id: string): Promise<{ id: string; revealed_builtin: boolean }> {
   return adminCall("admin.flows.delete", { id });
+}
+
+/**
+ * Round-trips a flow through the daemon's validator without saving it:
+ * YAML text or the raw file shape in, canonical YAML + resolved flow out,
+ * or the first validation error with its path. GUI-only, never grantable.
+ */
+export function flowsNormalize(
+  input: { yaml: string } | { flow: RawFlow },
+): Promise<FlowNormalizeReply> {
+  return adminCall("admin.flows.normalize", { ...input });
 }
 
 /** Starts a run and answers with the ticket its events arrive under. */

@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronRight } from "lucide-react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
@@ -24,10 +25,16 @@ import {
 
 /**
  * Activity — the default screen: the tide. The owner watches the water
- * from here; every request the daemon has seen rolls in newest-first as a
- * compact row (~44px): state dot, capability in the data voice, agent
- * chip, repo tail, truth-vocabulary badge, live relative age. A row opens
- * into its detail (args JSON, id, exact stamps) in place.
+ * from here; every request the daemon has seen rolls in as a compact row
+ * (~44px): state dot, capability in the data voice, repo tail,
+ * truth-vocabulary badge, live relative age. A row opens into its detail
+ * (args JSON, id, exact stamps) in place.
+ *
+ * Rows run in lanes, one per agent, alphabetical so lanes never trade
+ * places, newest on top within a lane: two agents working at once read as
+ * two currents rather than one interleaved list. Chips under the state
+ * lens narrow to an agent or a repo (the same `?agent=` / `?repo=` params
+ * a shared URL carries).
  *
  * Live-ness: the daemon event stream invalidates the queries through one
  * ~300ms trailing debounce, so a burst of events becomes one refetch and
@@ -117,40 +124,95 @@ function repoTail(repo: string): string {
 
 // --- filter controls -------------------------------------------------------
 
-const selectClasses =
-  "h-8 max-w-40 truncate rounded-control border border-line bg-surface-raised px-2 " +
-  "font-data text-xs text-ink-muted";
+/** Sorted, de-duplicated chip values: registry ∪ the rows ∪ the lens. */
+function chipOptions(
+  registry: string[],
+  present: string[],
+  active: string | undefined,
+): string[] {
+  const values = new Set([...registry, ...present]);
+  if (active !== undefined) values.add(active);
+  return [...values].sort();
+}
 
-function FilterSelect({
+/** One toggle in the chip bar; pressed reads as the active lens. */
+function Chip({
   label,
-  value,
-  options,
-  allLabel,
-  onChange,
+  text,
+  title,
+  active,
+  onToggle,
 }: {
   label: string;
-  value: string;
-  options: string[];
-  allLabel: string;
-  onChange: (next: string) => void;
+  text: string;
+  title?: string;
+  active: boolean;
+  onToggle: () => void;
 }) {
-  // A value carried in from a shared URL stays selectable even when the
-  // caller registry doesn't (or can't) list it.
-  const listed = value === "" || options.includes(value) ? options : [value, ...options];
   return (
-    <select
+    <button
+      type="button"
       aria-label={label}
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      className={selectClasses}
+      aria-pressed={active}
+      title={title}
+      onClick={onToggle}
+      className={cn(
+        "h-7 max-w-40 truncate rounded-control px-2.5 font-data text-xs transition-colors duration-150",
+        active ? "bg-accent-soft text-ink" : "text-ink-faint hover:text-ink",
+      )}
     >
-      <option value="">{allLabel}</option>
-      {listed.map((option) => (
-        <option key={option} value={option}>
-          {option}
-        </option>
+      {text}
+    </button>
+  );
+}
+
+/**
+ * Agents then repos, one chip each. Clicking a pressed chip clears it, so
+ * the bar is its own "all". Options include whatever the rows and the URL
+ * carry, not just the caller registry: a lane never lacks its chip, and a
+ * lens shared from another machine stays visible and clearable.
+ */
+function ChipBar({
+  agents,
+  repos,
+  agent,
+  repo,
+  onAgent,
+  onRepo,
+}: {
+  agents: string[];
+  repos: string[];
+  agent: string | undefined;
+  repo: string | undefined;
+  onAgent: (next: string | undefined) => void;
+  onRepo: (next: string | undefined) => void;
+}) {
+  if (agents.length === 0 && repos.length === 0) return null;
+  return (
+    <div role="group" aria-label="chips" className="flex flex-wrap items-center gap-1">
+      {agents.map((option) => (
+        <Chip
+          key={`agent:${option}`}
+          label={`agent ${option}`}
+          text={option}
+          active={option === agent}
+          onToggle={() => onAgent(option === agent ? undefined : option)}
+        />
       ))}
-    </select>
+      {agents.length > 0 && repos.length > 0 && (
+        <span aria-hidden="true" className="mx-1 h-4 w-px bg-line" />
+      )}
+      {repos.map((option) => (
+        <Chip
+          key={`repo:${option}`}
+          label={`repo ${repoTail(option)}`}
+          text={repoTail(option)}
+          title={option}
+          active={option === repo}
+          onToggle={() => onRepo(option === repo ? undefined : option)}
+        />
+      ))}
+    </div>
   );
 }
 
@@ -200,7 +262,7 @@ function TideRow({
 }) {
   const badge = rowBadge(row);
   return (
-    <li>
+    <>
       <button
         type="button"
         aria-expanded={expanded}
@@ -218,9 +280,6 @@ function TideRow({
         <span className="min-w-0 flex-1 truncate font-data text-sm text-ink">
           {row.capability}
         </span>
-        <Badge tone="neutral" className="hidden shrink-0 sm:inline-flex">
-          {row.agent}
-        </Badge>
         <span
           className="hidden w-28 truncate font-data text-xs text-ink-faint md:block"
           title={row.repo}
@@ -268,8 +327,54 @@ function TideRow({
           <EvidenceStrip requestId={row.id} />
         </div>
       )}
-    </li>
+    </>
   );
+}
+
+// --- lanes -----------------------------------------------------------------
+
+/** At most this many rows per lane; the daemon clamps the tide to 100. */
+const LANE_ROW_CAP = 50;
+
+/** One agent's current: its rows newest first, and when it last moved. */
+interface Lane {
+  agent: string;
+  rows: ActivityRow[];
+  latest: number;
+}
+
+/**
+ * Rows into lanes: one per agent present, alphabetical so a lane never
+ * trades places with its neighbour while the owner is reading it.
+ */
+function toLanes(rows: ActivityRow[]): Lane[] {
+  const byAgent = new Map<string, ActivityRow[]>();
+  for (const row of rows) {
+    const lane = byAgent.get(row.agent);
+    if (lane) lane.push(row);
+    else byAgent.set(row.agent, [row]);
+  }
+  return [...byAgent.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([agent, laneRows]) => {
+      const newestFirst = [...laneRows].sort(
+        (left, right) => right.created_ts - left.created_ts,
+      );
+      return {
+        agent,
+        rows: newestFirst.slice(0, LANE_ROW_CAP),
+        latest: newestFirst[0]?.created_ts ?? 0,
+      };
+    });
+}
+
+/**
+ * A row's enter frame: it slides 8px down into its lane. Reduced motion
+ * answers `false`, which mounts the row at rest — the arrival still
+ * happens, it just doesn't travel.
+ */
+export function rowEnter(reduced: boolean | null): false | { opacity: number; y: number } {
+  return reduced ? false : { opacity: 0, y: -8 };
 }
 
 /** Skeleton tide while the first answer is on its way — tokens only. */
@@ -305,6 +410,13 @@ export function ActivityScreen() {
   const navigate = useNavigate({ from: "/activity" });
   const queryClient = useQueryClient();
   const now = useNow(CLOCK_TICK_MS);
+  // The settle: a row lands in 240ms, a lane (or a row a chip hides)
+  // leaves in 160ms. Reduced motion keeps the arrivals but drops the
+  // travel — nothing slides, nothing lingers on its way out.
+  const reduced = useReducedMotion();
+  const enter = rowEnter(reduced);
+  const settle = { duration: reduced ? 0 : 0.24, ease: "easeOut" } as const;
+  const fade = { opacity: 0, transition: { duration: reduced ? 0 : 0.16 } };
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // A compression answers with its report, not with the request id it
   // was filed under. So the band raises this flag, and the next tide to
@@ -366,14 +478,30 @@ export function ActivityScreen() {
     setPendingExpand(false);
   }, [pendingExpand, requests]);
 
-  const repoOptions = useMemo(() => {
-    const repos = new Set((callers.data?.callers ?? []).map((caller) => caller.repo));
-    return [...repos].sort();
-  }, [callers.data]);
-  const agentOptions = useMemo(() => {
-    const agents = new Set((callers.data?.callers ?? []).map((caller) => caller.agent));
-    return [...agents].sort();
-  }, [callers.data]);
+  const rows = useMemo(
+    () => (requests ?? []).filter((row) => matchesStateFilter(row.state, stateFilter)),
+    [requests, stateFilter],
+  );
+  const lanes = useMemo(() => toLanes(rows), [rows]);
+
+  const repoOptions = useMemo(
+    () =>
+      chipOptions(
+        (callers.data?.callers ?? []).map((caller) => caller.repo),
+        rows.map((row) => row.repo),
+        search.repo,
+      ),
+    [callers.data, rows, search.repo],
+  );
+  const agentOptions = useMemo(
+    () =>
+      chipOptions(
+        (callers.data?.callers ?? []).map((caller) => caller.agent),
+        rows.map((row) => row.agent),
+        search.agent,
+      ),
+    [callers.data, rows, search.agent],
+  );
 
   const setFilters = (patch: {
     repo?: string | undefined;
@@ -393,9 +521,6 @@ export function ActivityScreen() {
     });
   };
 
-  const rows = (requests ?? []).filter((row) =>
-    matchesStateFilter(row.state, stateFilter),
-  );
   const filtered =
     search.repo !== undefined || search.agent !== undefined || stateFilter !== "all";
   const failure = activity.isError ? toBridgeFailure(activity.error) : null;
@@ -408,22 +533,16 @@ export function ActivityScreen() {
         </p>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="mr-auto font-display text-title font-semibold text-ink">Activity</h1>
-          <FilterSelect
-            label="repo filter"
-            value={search.repo ?? ""}
-            options={repoOptions}
-            allLabel="all repos"
-            onChange={(repo) => setFilters({ repo })}
-          />
-          <FilterSelect
-            label="agent filter"
-            value={search.agent ?? ""}
-            options={agentOptions}
-            allLabel="all agents"
-            onChange={(agent) => setFilters({ agent })}
-          />
           <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
         </div>
+        <ChipBar
+          agents={agentOptions}
+          repos={repoOptions}
+          agent={search.agent}
+          repo={search.repo}
+          onAgent={(agent) => setFilters({ agent })}
+          onRepo={(repo) => setFilters({ repo })}
+        />
         <div className="border-b border-line" />
       </header>
 
@@ -463,19 +582,58 @@ export function ActivityScreen() {
 
       {!failure && rows.length > 0 && (
         <>
-          <ul className="divide-y divide-line">
-            {rows.map((row) => (
-              <TideRow
-                key={row.id}
-                row={row}
-                now={now}
-                expanded={expandedId === row.id}
-                onToggle={() => setExpandedId(expandedId === row.id ? null : row.id)}
-              />
-            ))}
-          </ul>
+          <div
+            role="group"
+            aria-label="lanes"
+            className="grid gap-4 md:grid-cols-2 xl:grid-cols-3"
+          >
+            <AnimatePresence initial={false}>
+              {lanes.map((lane) => (
+                <motion.section
+                  key={lane.agent}
+                  layout
+                  aria-label={lane.agent}
+                  exit={fade}
+                  transition={settle}
+                  className="min-w-0 rounded-card border border-line bg-surface-raised/40 p-2"
+                >
+                  <header className="flex items-center gap-2 px-2 pb-2">
+                    <Badge tone="accent">{lane.agent}</Badge>
+                    <span className="font-data text-xs text-ink-faint">{lane.rows.length}</span>
+                    <span className="ml-auto font-data text-xs text-ink-faint">
+                      {relativeTime(lane.latest, now)}
+                    </span>
+                  </header>
+                  <ul className="divide-y divide-line">
+                    <AnimatePresence initial={false}>
+                      {lane.rows.map((row) => (
+                        <motion.li
+                          key={row.id}
+                          layout="position"
+                          initial={enter}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={fade}
+                          transition={settle}
+                        >
+                          <TideRow
+                            row={row}
+                            now={now}
+                            expanded={expandedId === row.id}
+                            onToggle={() =>
+                              setExpandedId(expandedId === row.id ? null : row.id)
+                            }
+                          />
+                        </motion.li>
+                      ))}
+                    </AnimatePresence>
+                  </ul>
+                </motion.section>
+              ))}
+            </AnimatePresence>
+          </div>
           <p className="mt-3 font-data text-xs text-ink-faint">
-            {rows.length} request{rows.length === 1 ? "" : "s"} · newest first
+            {rows.length} request{rows.length === 1 ? "" : "s"} · {lanes.length} lane
+            {lanes.length === 1 ? "" : "s"} · newest first
           </p>
         </>
       )}

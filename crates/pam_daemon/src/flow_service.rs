@@ -942,11 +942,15 @@ impl RunState<'_> {
             if !self.should_run(step) {
                 self.reports
                     .push(StepReport::new(&step.id, step.kind(), StepStatus::Skipped));
+                self.publish_settled(index, total, &step.id, StepStatus::Skipped)
+                    .await;
                 continue;
             }
             self.publish_progress(index, total, &step.id).await;
             let report = self.run_step(step).await?;
             let blocked = report.status == StepStatus::Blocked;
+            self.publish_settled(index, total, &step.id, report.status)
+                .await;
             self.reports.push(report);
             if blocked {
                 break;
@@ -972,7 +976,21 @@ impl RunState<'_> {
 
     /// Tells subscribers which step is starting.
     async fn publish_progress(&self, index: usize, total: usize, step: &str) {
-        let done = u64::try_from(index).unwrap_or(0);
+        let note = format!("{step}: running ({}/{total})", index + 1);
+        self.publish_note(index, total, note).await;
+    }
+
+    /// Tells subscribers how a step ended, so a canvas can paint its rim
+    /// before the verdict lands.
+    async fn publish_settled(&self, index: usize, total: usize, step: &str, status: StepStatus) {
+        let note = format!("{step}: {}", status.as_str());
+        self.publish_note(index + 1, total, note).await;
+    }
+
+    /// One progress event: `done` of `total` steps as a percentage, plus
+    /// the note.
+    async fn publish_note(&self, done: usize, total: usize, note: String) {
+        let done = u64::try_from(done).unwrap_or(0);
         let total_u64 = u64::try_from(total).unwrap_or(1).max(1);
         let pct = u8::try_from(done * 100 / total_u64).unwrap_or(u8::MAX);
         let _ = self
@@ -982,7 +1000,7 @@ impl RunState<'_> {
                 &self.ctx.request_id,
                 pam_proto::Event::Progress {
                     pct: Some(pct),
-                    note: format!("{step}: running ({}/{total})", index + 1),
+                    note,
                 },
             )
             .await;

@@ -312,3 +312,40 @@ Frontend (vitest, jsdom with a ResizeObserver stub in `vitest.setup.ts`):
    `strings` finds `admin.flows.normalize`.
 4. PR checks green, squash-merge, main run for the merge commit green
    by id with conclusion `success`.
+
+## Landed deviations (2026-09-03)
+
+Recorded after plans #6's four waves landed (PRs ro-ag/pam#58, #59,
+#60, #63; harness fixes #61, #62). The design above stands; these are
+the places the code differs and why.
+
+- `pam_flow::parse_value` takes `&serde_json::Value` (clippy's
+  `needless_pass_by_value`) and renders the value to YAML before calling
+  `parse`, so both entry points report identical error paths; an
+  unknown step key lands on `steps[N]`. `admin.flows.normalize` is an
+  associated function (no library needed). The settle-note test lives in
+  `crates/pam_daemon/tests/flows.rs` because only the integration harness
+  actually runs a step.
+- `elkjs` landed at 0.12 (the latest 0.x). xyflow's stylesheet is
+  imported into `styles.css` under `layer(components)` so the token
+  utilities on handles, edges, and the minimap win; the `--xy-*`
+  bindings are unaffected. The ELK chunk (`elk.bundled-*.js`, ~1.4 MB /
+  438 kB gzip) is split out by the literal dynamic import.
+- Edge pill labels render through an SVG `foreignObject` instead of
+  `EdgeLabelRenderer`, which needs an inline transform. Edges gained a
+  `selected` variant because the layered xyflow rules no longer paint
+  selection. The approval rim is `ring-warning/60` so it stays distinct
+  from `cancelled`.
+- Selection flows only from xyflow's `select` node/edge changes;
+  `onSelectionChange` echoed the store one render late and ping-ponged
+  with the lifted selection. A drag end saves every node's position.
+- The minimap is 128 × 96 through xyflow's `style` size prop: the
+  drawing's viewBox derives from that prop, and a CSS box alone clips it.
+- Flows.tsx shows a "draft status" line (unsaved badge, checking /
+  invalid / save hint) above the tab content; the spec's dirty state had
+  no other home once FlowEditor became controlled.
+- Bench 2026-09-03 through the live fixture proxy: canvas for every
+  starter, inspector edit → normalized YAML, shell argv → node marker +
+  Save disabled, `slow-demo` run painting running / succeeded / skipped
+  rims with the animated edge and the Verdict frame's `solved` chip, in
+  all four theme × mode palettes.

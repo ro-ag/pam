@@ -5,12 +5,19 @@ import App from "../App";
 import type { GrantRow } from "../lib/ipc";
 import { applyTheme } from "../lib/theme";
 import { createAppRouter } from "../router";
-import { KNOWN_CAPABILITIES, LOG_LINE_CHOICES, PROFILE_SENTENCES, logTone } from "./Settings";
+import {
+  AUDIT_CHOICES,
+  EVIDENCE_CHOICES,
+  KNOWN_CAPABILITIES,
+  LOG_LINE_CHOICES,
+  PROFILE_SENTENCES,
+  logTone,
+} from "./Settings";
 
 /**
  * The Settings screen against a mocked bridge: profile round-trip with
  * the applies-next-start note, the grants table's two-tap revoke and add
- * flow, the theme selector, the honestly-disabled retention section, the
+ * flow, the theme selector, the retention windows and prune button, the
  * log viewer, and the daemon card. The whole App mounts (shell included)
  * so the query provider and the screen run exactly as shipped.
  */
@@ -39,6 +46,9 @@ const mocks = vi.hoisted(() => ({
   // drown out the copy this file is here to assert.
   flowsSettingsGet: vi.fn(),
   connectorsList: vi.fn(),
+  retentionGet: vi.fn(),
+  retentionSet: vi.fn(),
+  retentionPrune: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -98,6 +108,30 @@ beforeEach(() => {
   mocks.curatorList.mockResolvedValue({ detected: [], selected: null });
   mocks.flowsSettingsGet.mockResolvedValue({ allowed_programs: ["git"], extra_path: [] });
   mocks.connectorsList.mockResolvedValue({ connectors: [] });
+  mocks.retentionGet.mockResolvedValue({
+    evidence_days: 90,
+    audit_days: 365,
+    last_run: {
+      ts: nowSec - 720,
+      evidence_rows: 41,
+      evidence_bytes: 2_100_000,
+      requests: 3,
+      audit_rows: 5,
+    },
+  });
+  mocks.retentionSet.mockImplementation(async (patch) => ({
+    evidence_days: 90,
+    audit_days: 365,
+    last_run: null,
+    ...patch,
+  }));
+  mocks.retentionPrune.mockResolvedValue({
+    ts: nowSec,
+    evidence_rows: 2,
+    evidence_bytes: 512,
+    requests: 0,
+    audit_rows: 0,
+  });
 });
 
 afterEach(() => {
@@ -219,12 +253,63 @@ describe("appearance", () => {
 });
 
 describe("retention", () => {
-  it("renders the controls disabled with the honest tag", async () => {
+  it("renders the stored windows and the last run", async () => {
     renderSettings();
-    expect(await screen.findByLabelText("evidence age")).toBeDisabled();
-    expect(screen.getByLabelText("audit age")).toBeDisabled();
-    expect(screen.getByText("arrives with retention")).toBeInTheDocument();
-    expect(screen.getByText(/nothing prunes them yet/)).toBeInTheDocument();
+    const evidence = (await screen.findByLabelText("evidence age")) as HTMLSelectElement;
+    await waitFor(() => expect(evidence.value).toBe("90"));
+    expect((screen.getByLabelText("audit age") as HTMLSelectElement).value).toBe("365");
+    expect(
+      screen.getByText(/last pruned 12m ago · 41 evidence rows \(2 MB\) · 3 requests/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("arrives with retention")).not.toBeInTheDocument();
+    expect(EVIDENCE_CHOICES).toEqual([30, 90, 365, null]);
+    expect(AUDIT_CHOICES).toEqual([90, 365, null]);
+  });
+
+  it("saves a changed window through the daemon", async () => {
+    renderSettings();
+    const evidence = await screen.findByLabelText("evidence age");
+    await waitFor(() => expect((evidence as HTMLSelectElement).value).toBe("90"));
+    fireEvent.change(evidence, { target: { value: "forever" } });
+    await waitFor(() => expect(mocks.retentionSet).toHaveBeenCalledWith({ evidence_days: null }));
+    fireEvent.change(screen.getByLabelText("audit age"), { target: { value: "90" } });
+    await waitFor(() => expect(mocks.retentionSet).toHaveBeenCalledWith({ audit_days: 90 }));
+  });
+
+  it("shows the daemon's refusal and snaps the select back", async () => {
+    mocks.retentionSet.mockRejectedValue({
+      cause: "retention_invalid",
+      detail: "evidence window (1 year) exceeds audit window (90 days)",
+      recovery:
+        "Keep evidence no longer than audit rows: shorten the evidence window or lengthen the audit one.",
+    });
+    renderSettings();
+    const evidence = (await screen.findByLabelText("evidence age")) as HTMLSelectElement;
+    await waitFor(() => expect(evidence.value).toBe("90"));
+    fireEvent.change(evidence, { target: { value: "365" } });
+    expect(await screen.findByText(/exceeds audit window/)).toBeInTheDocument();
+    await waitFor(() => expect(evidence.value).toBe("90"));
+  });
+
+  it("prunes on demand and reports the counts", async () => {
+    renderSettings();
+    const prune = await screen.findByRole("button", { name: "Prune now" });
+    fireEvent.click(prune);
+    await waitFor(() => expect(mocks.retentionPrune).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/2 evidence rows \(512 B\) · 0 requests/)).toBeInTheDocument();
+  });
+
+  it("never pruned yet reads honestly", async () => {
+    mocks.retentionGet.mockResolvedValue({
+      evidence_days: null,
+      audit_days: null,
+      last_run: null,
+    });
+    renderSettings();
+    expect(await screen.findByText("never pruned yet")).toBeInTheDocument();
+    expect(((await screen.findByLabelText("evidence age")) as HTMLSelectElement).value).toBe(
+      "forever",
+    );
   });
 });
 

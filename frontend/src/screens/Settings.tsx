@@ -7,6 +7,7 @@ import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
 import { Section } from "../components/ui/Section";
+import { formatBytes } from "../lib/bytes";
 import { cn } from "../lib/cn";
 import {
   daemonStatus,
@@ -17,10 +18,15 @@ import {
   profileGet,
   profileSet,
   readDaemonLog,
+  retentionGet,
+  retentionPrune,
+  retentionSet,
   toBridgeFailure,
   type BridgeFailure,
   type GrantRow,
   type Profile,
+  type PruneReport,
+  type RetentionSettings,
 } from "../lib/ipc";
 import {
   applyTheme,
@@ -38,9 +44,9 @@ import { SettingsModelsSection } from "./SettingsModels";
 /**
  * Settings — every knob, one place (task #30). One calm scrollable column
  * of grouped panels: Appearance, Security, Models, Flows, Connectors (the
- * GUI-only admin surfaces), Daemon, Retention, Logs. Wired controls round-trip against the real
- * bridge; the one thing the daemon cannot do yet (retention pruning)
- * renders disabled and says so, honestly, instead of pretending.
+ * GUI-only admin surfaces), Daemon, Retention, Logs. Every control here
+ * round-trips against the real bridge, and every refusal it earns renders
+ * as the daemon worded it, instead of being pre-empted or swallowed.
  *
  * The design-system living proof that used to squat here is gone — the
  * real app is its own proof now. (The odometer concept returns with the
@@ -507,46 +513,150 @@ function DaemonPanel() {
 
 // --- retention -------------------------------------------------------------
 
+/** Evidence windows on offer; `null` is forever. */
+export const EVIDENCE_CHOICES: ReadonlyArray<number | null> = [30, 90, 365, null];
+
+/** Audit windows. Nothing shorter than 90 days: the trail is the point. */
+export const AUDIT_CHOICES: ReadonlyArray<number | null> = [90, 365, null];
+
+/** The one place a window is spoken: "30 days", "1 year", "forever". */
+export function windowLabel(days: number | null): string {
+  if (days === null) return "forever";
+  if (days === 365) return "1 year";
+  return `${days} days`;
+}
+
+/** A window as a `<select>` value — options need a string, and forever needs a name. */
+function windowValue(days: number | null): string {
+  return days === null ? "forever" : String(days);
+}
+
+/** One prune pass in the data voice: when it ran, and exactly what left. */
+export function pruneLine(report: PruneReport, nowMs?: number): string {
+  return (
+    `last pruned ${relativeTime(report.ts, nowMs)} · ` +
+    `${report.evidence_rows} evidence rows (${formatBytes(report.evidence_bytes)}) · ` +
+    `${report.requests} requests`
+  );
+}
+
 /**
- * The daemon has no retention settings yet — evidence storage lands
- * first, pruning arrives with it. The controls render disabled so the
- * shape of the section is real, and the mono tag says why nothing moves.
- * Follow-up: wire these to a real `admin.retention.*` op once evidence
- * storage exists.
+ * Settings → Retention: the two age windows, and the button that acts on
+ * them right now.
+ *
+ * Both windows default to forever, so nothing is ever lost until a human
+ * chooses to lose it. Evidence may not outlive the audit rows that
+ * explain it — the GUI does not pre-filter the choices for that rule, it
+ * lets the daemon refuse the order violation and renders the refusal, so
+ * the human learns the rule from pam (the same posture as Settings ›
+ * Flows). The selects are controlled from the stored settings, which is
+ * why a refused change snaps back on its own.
  */
 function RetentionPanel() {
+  const queryClient = useQueryClient();
+  const state = useQuery({ queryKey: ["retention"], queryFn: retentionGet });
+  const [failure, setFailure] = useState<BridgeFailure | null>(null);
+  const [report, setReport] = useState<PruneReport | null>(null);
+
+  const settle = () => void queryClient.invalidateQueries({ queryKey: ["retention"] });
+
+  const save = useMutation({
+    mutationFn: (patch: Partial<RetentionSettings>) => retentionSet(patch),
+    onMutate: () => setFailure(null),
+    onSuccess: (next) => queryClient.setQueryData(["retention"], next),
+    onError: (error) => setFailure(toBridgeFailure(error)),
+    onSettled: settle,
+  });
+
+  const prune = useMutation({
+    mutationFn: () => retentionPrune(),
+    onMutate: () => setFailure(null),
+    onSuccess: (fresh) => {
+      setReport(fresh);
+      settle();
+    },
+    onError: (error) => setFailure(toBridgeFailure(error)),
+  });
+
+  const listFailure = state.isError ? toBridgeFailure(state.error) : null;
+  const lastRun = report ?? state.data?.last_run ?? null;
+  const busy = state.isPending || save.isPending;
+
   const selectClasses =
     "h-8 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
+
+  const windowField = (
+    caption: string,
+    label: string,
+    choices: ReadonlyArray<number | null>,
+    days: number | null,
+    onPick: (next: number | null) => void,
+  ) => (
+    <label className="space-y-1">
+      <span className="block font-data text-xs text-ink-faint">{caption}</span>
+      <select
+        aria-label={label}
+        value={windowValue(days)}
+        disabled={busy}
+        onChange={(event) =>
+          onPick(event.target.value === "forever" ? null : Number(event.target.value))
+        }
+        className={selectClasses}
+      >
+        {choices.map((choice) => (
+          <option key={windowValue(choice)} value={windowValue(choice)}>
+            {windowLabel(choice)}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           storage pruning
         </p>
-        <Badge tone="neutral">arrives with retention</Badge>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={prune.isPending}
+          onClick={() => prune.mutate()}
+        >
+          Prune now
+        </Button>
       </div>
-      <div className="grid grid-cols-1 gap-4 opacity-60 sm:grid-cols-2">
-        <label className="space-y-1">
-          <span className="block font-data text-xs text-ink-faint">keep evidence for</span>
-          <select disabled aria-label="evidence age" className={selectClasses}>
-            <option>30 days</option>
-            <option>90 days</option>
-            <option>1 year</option>
-            <option>forever</option>
-          </select>
-        </label>
-        <label className="space-y-1">
-          <span className="block font-data text-xs text-ink-faint">keep audit rows for</span>
-          <select disabled aria-label="audit age" className={selectClasses}>
-            <option>90 days</option>
-            <option>1 year</option>
-            <option>forever</option>
-          </select>
-        </label>
+
+      {listFailure && <FailureNote failure={listFailure} label="retention" />}
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {windowField(
+          "keep evidence for",
+          "evidence age",
+          EVIDENCE_CHOICES,
+          state.data?.evidence_days ?? null,
+          (next) => save.mutate({ evidence_days: next }),
+        )}
+        {windowField(
+          "keep audit rows for",
+          "audit age",
+          AUDIT_CHOICES,
+          state.data?.audit_days ?? null,
+          (next) => save.mutate({ audit_days: next }),
+        )}
       </div>
+
+      <p className="font-data text-xs text-ink-muted">
+        {lastRun ? pruneLine(lastRun) : "never pruned yet"}
+      </p>
+
+      {failure && <FailureNote failure={failure} label="retention" />}
+
       <p className="font-voice text-sm text-ink-muted italic">
-        Evidence rows exist now — log sources, compacts, summaries — but nothing prunes them
-        yet. These knobs wake up with the retention plan.
+        I prune when I start, every hour after that, and whenever you change these. Evidence
+        goes first; a request&apos;s verdict stays until its audit rows go, then the whole
+        record leaves together.
       </p>
     </Panel>
   );

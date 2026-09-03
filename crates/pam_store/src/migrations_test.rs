@@ -9,11 +9,11 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert_eq!(store.schema_version().await.unwrap(), 5);
 }
 
 #[tokio::test]
-async fn all_eight_tables_exist() {
+async fn all_nine_tables_exist() {
     let store = Store::open_in_memory().await.unwrap();
     for table in [
         "request",
@@ -24,6 +24,7 @@ async fn all_eight_tables_exist() {
         "caller",
         "setting",
         "model_job",
+        "connector",
     ] {
         let mut rows = store
             .conn
@@ -72,7 +73,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 4
+            supported: 5
         }
     ));
     let message = err.to_string();
@@ -98,10 +99,11 @@ async fn v1_database_upgrades_to_v2() {
     conn.execute("PRAGMA user_version = 1", ()).await.unwrap();
     drop((conn, db));
 
-    // Opening runs migrations 2, 3 and 4: the idempotency column exists,
-    // the model job table exists, and the version advances.
+    // Opening runs migrations 2 through 5: the idempotency column
+    // exists, the model job table exists, the connector table exists,
+    // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert_eq!(store.schema_version().await.unwrap(), 5);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -133,7 +135,7 @@ async fn v3_database_gains_meta_json() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert_eq!(store.schema_version().await.unwrap(), 5);
     assert!(
         evidence_columns(&store)
             .await
@@ -152,6 +154,68 @@ async fn v3_database_gains_meta_json() {
         .unwrap();
     let row = store.get_evidence("ev_1").await.unwrap().unwrap();
     assert_eq!(row.meta_json, None);
+}
+
+#[tokio::test]
+async fn v4_database_upgrades_to_v5() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+
+    // Build a genuine v4 database by hand: apply migrations 1..=4 and
+    // stamp their version, so the `connector` table does not exist yet.
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    for migration in &migrations::MIGRATIONS[..4] {
+        conn.execute_batch(migration.sql).await.unwrap();
+    }
+    conn.execute("PRAGMA user_version = 4", ()).await.unwrap();
+    drop((conn, db));
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 5);
+
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'connector'",
+            (),
+        )
+        .await
+        .unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 1, "migration 5 did not create the connector table");
+
+    // `enabled` rejects anything but 0 or 1.
+    let err = store
+        .conn
+        .execute(
+            "INSERT INTO connector (id, enabled, updated_ts) VALUES ('x', 2, 0)",
+            (),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("check"),
+        "enabled CHECK not enforced: {err}"
+    );
+
+    // `last_test_status` only accepts 'passed' or 'failed'.
+    let err = store
+        .conn
+        .execute(
+            "INSERT INTO connector (id, enabled, last_test_status, updated_ts)
+             VALUES ('y', 0, 'maybe', 0)",
+            (),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("check"),
+        "last_test_status CHECK not enforced: {err}"
+    );
 }
 
 /// Column names of the `evidence` table, via `PRAGMA table_info`.

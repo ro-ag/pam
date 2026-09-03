@@ -56,7 +56,7 @@ not on the command line.
 ```sh
 pam service install     # register the unit and start the managed daemon now
 pam service status      # show whether the unit exists and is loaded
-pam service uninstall   # unregister and remove the unit (the running daemon is left alone)
+pam service uninstall   # unregister and remove the unit; the manager stops the managed daemon, the next pam command starts one lazily
 ```
 
 Each platform gets one user-scope unit, never sudo or admin:

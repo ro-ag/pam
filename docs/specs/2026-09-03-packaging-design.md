@@ -179,9 +179,14 @@ Install semantics on every platform: if a loose daemon holds the
 instance lock, stop it first (`client::stop_daemon`, bounded) so the
 managed instance takes over; on Windows, where stopping is not supported
 yet, the loose daemon keeps running and the task starts at the next
-logon (the report says so). Uninstall never stops the daemon. `pam
-daemon` exits 0 on `already running`, so a manager never restart-loops
-against a loose instance.
+logon (the report says so). Uninstall unregisters the unit; on macOS
+and Linux the manager stops the managed daemon with it (`launchctl
+bootout` and `systemctl disable --now` both terminate the unit's
+process), the report's note says so, and the next pam command starts one
+lazily. (Landed deviation: the first draft claimed uninstall never stops
+the daemon; the bench eyeball proved otherwise.) `pam daemon` exits 0 on
+`already running`, so a manager never restart-loops against a loose
+instance.
 
 ### CLI
 

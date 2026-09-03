@@ -8,9 +8,9 @@ use tempfile::TempDir;
 
 use crate::client::{StopError, StopOutcome};
 use crate::service::{
-    LAUNCHD_LABEL, Platform, Runner, SYSTEMD_UNIT, ServiceEnv, ServiceError, ServiceState, StopFn,
-    WINDOWS_TASK, install_with, render_launch_agent, render_systemd_unit, status, uninstall,
-    windows_task_action,
+    LAUNCHD_LABEL, MANAGED_STOPPED_NOTE, Platform, Runner, SYSTEMD_UNIT, ServiceEnv, ServiceError,
+    ServiceState, StopFn, WINDOWS_TASK, install_with, render_launch_agent, render_systemd_unit,
+    status, uninstall, windows_task_action,
 };
 
 #[test]
@@ -207,6 +207,7 @@ fn macos_uninstall_boots_out_and_removes_the_plist() {
     let runner = FakeRunner::default().answer("id -u", 0, "501\n", "");
     let report = uninstall(&e, &runner).unwrap();
     assert!(!plist.exists());
+    assert_eq!(report.note.as_deref(), Some(MANAGED_STOPPED_NOTE));
     assert_eq!(
         report.state,
         ServiceState::NotInstalled {
@@ -275,8 +276,9 @@ fn linux_uninstall_disables_removes_reloads() {
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
     std::fs::write(&unit, "x").unwrap();
     let runner = FakeRunner::default();
-    uninstall(&e, &runner).unwrap();
+    let report = uninstall(&e, &runner).unwrap();
     assert!(!unit.exists());
+    assert_eq!(report.note.as_deref(), Some(MANAGED_STOPPED_NOTE));
     assert_eq!(
         runner.calls(),
         vec![

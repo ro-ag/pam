@@ -55,8 +55,9 @@ import { TetherEdge } from "./TetherEdge";
  * Positions are the one thing the spec does not know. Stored ones win,
  * nodes the canvas has already placed keep their place, and only the rest
  * are laid out by ELK — so an added step lands next to the flow instead
- * of scattering everything the human arranged. A note never asks ELK for
- * anything: it sits beside its step, wherever that step is.
+ * of scattering everything the human arranged. ELK places notes too, as
+ * comment boxes beside their step; only a note typed onto a step that is
+ * already placed takes the fallback spot beside it until the next Tidy.
  *
  * Selection is owned by the screen (the inspector shares it) and mirrored
  * onto the nodes; the canvas reports back only what a gesture changed —
@@ -137,7 +138,7 @@ function nodeSelected(selection: Selection, node: CanvasNode): boolean {
   return false;
 }
 
-/** Every note among `nodes` that `targets` names, moved beside its step. */
+/** Every note among `nodes` that `targets` names, moved to the fallback spot beside its step. */
 function settleNotes(nodes: CanvasNode[], targets: ReadonlySet<string>): CanvasNode[] {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   return nodes.map((node) => {
@@ -205,13 +206,10 @@ function Canvas({
       const positions = await autoLayout(all, links, sizes);
       if (run !== layoutRun.current) return;
       setNodes((prev) =>
-        settleNotes(
-          prev.map((node) =>
-            targets.has(node.id) && positions[node.id]
-              ? ({ ...node, position: positions[node.id] } as CanvasNode)
-              : node,
-          ),
-          targets,
+        prev.map((node) =>
+          targets.has(node.id) && positions[node.id]
+            ? ({ ...node, position: positions[node.id] } as CanvasNode)
+            : node,
         ),
       );
       window.requestAnimationFrame(() => void fitView(FIT));
@@ -248,8 +246,9 @@ function Canvas({
       if (!prev) unplaced.add(node.id);
       return carried;
     });
-    // A new note beside an already placed step needs no layout run at all;
-    // one whose step is new too rides along with that step's ELK placement.
+    // A note typed onto a step that is already placed takes the fallback
+    // spot beside it, with no layout run; a note whose step is new too goes
+    // to ELK with that step and comes back where ELK reserved room for it.
     const stepPlaced = (node: CanvasNode) =>
       node.type === "note" && unplaced.has(node.id) && !unplaced.has(node.data.stepId);
     const settled = settleNotes(merged, new Set(merged.filter(stepPlaced).map((n) => n.id)));

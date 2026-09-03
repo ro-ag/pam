@@ -250,9 +250,9 @@ annotation**. Step edges are orthogonal step paths with 8 px corners
 tinted success / danger with a pill label; running edges dashed and
 marching in accent; the terminal edge faint. A step's `note` (a free
 string in the YAML) is drawn as its own node — a surface card in the
-voice font, italic, ink-muted, 192 px wide — placed beside the step and
-tethered to it by a bezier in ink-faint, 1 px, dotted (`2 4`, round
-caps). The tether has no hit area; selecting a note selects its step.
+voice font, italic, ink-muted, 192 px wide — placed by ELK as a comment
+box beside the step and tethered to it by a bezier in ink-faint, 1 px,
+dotted (`2 4`, round caps). The tether has no hit area; selecting a note selects its step.
 Canvas ground is `chrome` with a dot grid in `separator`; the minimap
 sits on `surface`.
 
@@ -375,9 +375,14 @@ the places the code differs and why.
   only, the modifier chips became header glyphs with aria-labels, the
   role is the id's title), step connectors are square (step paths, 8 px
   corners), and step notes are curved (a note node per non-empty
-  `steps[i].note`, tethered by a dotted bezier, placed at the step's
-  position + (240, −8) unless a stored position exists, never sent to
-  ELK, re-placed beside its step on Tidy). Notes live in the YAML as
+  `steps[i].note`, tethered by a dotted bezier). ELK places notes: each
+  goes in as a comment box (`org.eclipse.elk.commentBox`, honored by
+  elk.bundled 0.12) with its tether as an edge, so layered's comment
+  processors set it beside its step and reserve the room — a fixed
+  offset landed on the next layer's card. The step's position + (240,
+  −8) is only the fallback for a note typed onto an already placed step
+  (until the next Tidy) or one ELK returns no coordinates for; a stored
+  position always wins. Notes live in the YAML as
   `note:` on the step; the GUI writes the key only when the trimmed text
   is non-empty. `pam_flow`'s `RawStep` does not accept `note` yet, so
   the daemon's normalize refuses a noted flow until that lands (the

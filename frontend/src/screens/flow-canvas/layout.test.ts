@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FlowSpec } from "../../lib/ipc";
 import { defaultStep, toGraph } from "./graph";
 import {
+  COMMENT_BOX_OPTIONS,
   LAYOUT_KEY,
   NODE_SIZE,
   NOTE_OFFSET,
@@ -17,6 +18,7 @@ interface ElkChild {
   id: string;
   width: number;
   height: number;
+  layoutOptions?: Record<string, string>;
   x?: number;
   y?: number;
 }
@@ -133,26 +135,61 @@ describe("autoLayout", () => {
     });
   });
 
-  it("keeps notes and tethers away from ELK and places each note beside its step", async () => {
+  const noted: FlowSpec = {
+    ...spec,
+    steps: [{ ...spec.steps[0], note: "watch the exit code" }, spec.steps[1]],
+  };
+
+  it("hands ELK each note as a comment box with its tether, and uses the spot ELK answers", async () => {
     elk.layout.mockImplementation(async (graph) => ({
       ...graph,
-      children: graph.children.map((child, index) => ({ ...child, x: index * 100, y: 10 })),
+      children: graph.children.map((child) =>
+        child.id === "note:a"
+          ? { ...child, x: 116, y: 34 }
+          : { ...child, x: graph.children.indexOf(child) * 100, y: 100 },
+      ),
     }));
-    const noted: FlowSpec = {
-      ...spec,
-      steps: [{ ...spec.steps[0], note: "watch the exit code" }, spec.steps[1]],
-    };
     const { nodes, edges } = toGraph(noted);
-    expect(nodes.some((node) => node.id === "note:a")).toBe(true);
     const positions = await autoLayout(nodes, edges, {});
 
     const graph = elk.layout.mock.calls[0][0];
-    expect(graph.children.map((child) => child.id)).toEqual(["inputs", "a", "b", "verdict"]);
-    expect(graph.edges.map((edge) => edge.id)).toEqual(["needs:a->b", "terminal:b"]);
+    expect(graph.children.map((child) => child.id)).toEqual([
+      "inputs",
+      "a",
+      "b",
+      "note:a",
+      "verdict",
+    ]);
+    const note = graph.children.find((child) => child.id === "note:a");
+    expect(note).toEqual({
+      id: "note:a",
+      ...NODE_SIZE.note,
+      layoutOptions: COMMENT_BOX_OPTIONS,
+    });
+    expect(COMMENT_BOX_OPTIONS).toEqual({ "org.eclipse.elk.commentBox": "true" });
+    for (const child of graph.children) {
+      if (child.id !== "note:a") expect(child).not.toHaveProperty("layoutOptions");
+    }
+    expect(graph.edges).toContainEqual({ id: "note:a", sources: ["note:a"], targets: ["a"] });
+    // ELK's answer wins outright: no offset is added on top of it.
+    expect(positions["note:a"]).toEqual({ x: 116, y: 34 });
+    expect(positions.a).toEqual({ x: 100, y: 100 });
+  });
+
+  it("falls back to the fixed offset only when ELK gives the note no coordinates", async () => {
+    elk.layout.mockImplementation(async (graph) => ({
+      ...graph,
+      children: graph.children.map((child) =>
+        child.id === "note:a"
+          ? child
+          : { ...child, x: graph.children.indexOf(child) * 100, y: 10 },
+      ),
+    }));
+    const { nodes, edges } = toGraph(noted);
+    const positions = await autoLayout(nodes, edges, {});
     expect(NOTE_OFFSET).toEqual({ x: 240, y: -8 });
     expect(noteBeside({ x: 100, y: 10 })).toEqual({ x: 340, y: 2 });
     expect(positions["note:a"]).toEqual(noteBeside(positions.a));
-    expect(positions.a).toEqual({ x: 100, y: 10 });
   });
 
   it("leaves out children ELK gave no coordinates", async () => {

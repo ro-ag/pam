@@ -446,7 +446,7 @@ describe("FlowCanvas notes", () => {
     expect(node("a").className).toContain("ring-accent");
   });
 
-  it("places a note beside its step without a layout run, and Tidy keeps it there", async () => {
+  it("places a typed note beside its placed step without a layout run; Tidy hands it to ELK", async () => {
     savePositions("fx", {
       inputs: { x: 0, y: 0 },
       a: { x: 300, y: 64 },
@@ -464,9 +464,12 @@ describe("FlowCanvas notes", () => {
     fireEvent.click(screen.getByRole("button", { name: "Tidy" }));
     await waitFor(() => expect(mocks.autoLayout).toHaveBeenCalledTimes(1));
     await settle();
-    // The mock lays nodes out by index; the note follows its step, not the mock.
+    // The mock lays every node out by index, the note included (it is
+    // node 4): ELK's own placement is taken as is, not offset from the step.
+    const laid = mocks.autoLayout.mock.calls[0][0] as CanvasNode[];
+    expect(laid.map((candidate) => candidate.id)).toContain("note:a");
     expect(at("a")).toEqual({ x: 300, y: 0 });
-    expect(at("note:a")).toEqual({ x: 300 + NOTE_OFFSET.x, y: NOTE_OFFSET.y });
+    expect(at("note:a")).toEqual({ x: 1200, y: 0 });
   });
 });
 

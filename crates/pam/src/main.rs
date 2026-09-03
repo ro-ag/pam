@@ -29,6 +29,10 @@ const STOP_WAIT: Duration = Duration::from_secs(15);
 /// (10 minutes — [`pam::client::DEFAULT_FOLLOW_TIMEOUT`]).
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 
+/// Default deadline for `pam flow run`, in milliseconds (30 minutes): a
+/// flow that runs `cargo test` is not a 60 s request.
+const FLOW_DEADLINE_MS: u64 = 1_800_000;
+
 #[derive(Parser)]
 #[command(
     name = "pam",
@@ -91,6 +95,11 @@ enum Cmd {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS)]
         timeout_ms: u64,
     },
+    /// List, read, and run the flows this machine has.
+    Flow {
+        #[command(subcommand)]
+        action: FlowCmd,
+    },
     /// Run the pam daemon in the foreground.
     Daemon {
         #[command(subcommand)]
@@ -104,6 +113,43 @@ enum Cmd {
 enum DaemonCmd {
     /// Signal the running daemon to drain and exit.
     Stop,
+}
+
+/// `pam flow`: the flow library, and one run of one flow.
+#[derive(Subcommand)]
+enum FlowCmd {
+    /// List the flows this machine has: id, source, steps, and name.
+    List {
+        /// Print the raw response JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one flow's canonical YAML.
+    Show {
+        /// The flow id, as `pam flow list` spells it.
+        id: String,
+    },
+    /// Run one flow and print its verdict.
+    ///
+    /// The whole run happens in one request and nothing is printed until
+    /// it finishes: there are no live step lines here. To watch a run as
+    /// it goes, start it with `--no-wait` and follow the ticket it prints
+    /// with `pam subscribe <ticket>`.
+    Run {
+        /// The flow id, as `pam flow list` spells it.
+        id: String,
+        /// Values for the flow's declared inputs, as `key=value`.
+        inputs: Vec<String>,
+        /// Return a ticket immediately instead of waiting for the verdict.
+        #[arg(long)]
+        no_wait: bool,
+        /// Deadline for the run, in milliseconds (default 30 minutes).
+        #[arg(long, default_value_t = FLOW_DEADLINE_MS)]
+        deadline_ms: u64,
+        /// Print the raw response JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -185,7 +231,43 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
         }
         Cmd::Wait { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, false).await,
         Cmd::Subscribe { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, true).await,
+        Cmd::Flow { action } => run_flow_command(base, action).await,
         Cmd::Daemon { .. } | Cmd::Gui => unreachable!("handled in main"),
+    }
+}
+
+/// Dispatches one `pam flow` subcommand onto its capability.
+///
+/// `run` sends `wait: !no_wait`: a waiting run answers with the verdict
+/// body [`render::render_flow_result`] prints, and `--no-wait` answers
+/// with the ticket line — which is also the way to watch a run step by
+/// step, through `pam subscribe`.
+async fn run_flow_command(base: &Path, action: FlowCmd) -> ExitCode {
+    match action {
+        FlowCmd::List { json } => {
+            request(base, "flow.list", serde_json::json!({}), true, None, json).await
+        }
+        FlowCmd::Show { id } => {
+            let args = serde_json::json!({ "id": id });
+            request(base, "flow.show", args, true, None, false).await
+        }
+        FlowCmd::Run {
+            id,
+            inputs,
+            no_wait,
+            deadline_ms,
+            json,
+        } => {
+            let inputs = match render::parse_flow_inputs(&inputs) {
+                Ok(inputs) => inputs,
+                Err(err) => {
+                    eprintln!("pam flow run: {err}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            };
+            let args = serde_json::json!({ "id": id, "inputs": inputs });
+            request(base, "flow.run", args, !no_wait, Some(deadline_ms), json).await
+        }
     }
 }
 
@@ -220,6 +302,15 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
     match response {
         Response::Result { body, .. } if capability == "status" => {
             println!("{}", render::render_status(body));
+        }
+        Response::Result { body, .. } if capability == "flow.list" => {
+            println!("{}", render::render_flow_list(body));
+        }
+        Response::Result { body, .. } if capability == "flow.show" => {
+            println!("{}", render::render_flow_show(body));
+        }
+        Response::Result { body, .. } if capability == "flow.run" => {
+            println!("{}", render::render_flow_result(body));
         }
         Response::Result { body, .. } => println!("{}", render::render_body(body)),
         Response::Refusal {

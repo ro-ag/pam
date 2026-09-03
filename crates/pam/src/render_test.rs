@@ -1,8 +1,9 @@
 use pam_proto::{Event, Outcome, Response};
 
 use crate::render::{
-    EXIT_BLOCKED, EXIT_REFUSED, EXIT_UNRESOLVED, exit_code, render_event, render_json,
-    render_refusal, render_status, render_ticket,
+    EXIT_BLOCKED, EXIT_REFUSED, EXIT_UNRESOLVED, exit_code, parse_flow_inputs, render_event,
+    render_flow_list, render_flow_result, render_flow_show, render_json, render_refusal,
+    render_status, render_ticket,
 };
 
 fn result(outcome: Outcome) -> Response {
@@ -171,4 +172,267 @@ fn events_render_one_line_each() {
     assert!(render_event(&Event::ApprovalPending).contains("GUI"));
     assert_eq!(render_event(&Event::Done), "[done]");
     assert_eq!(render_event(&Event::Refused), "[refused]");
+}
+
+// --- pam flow -------------------------------------------------------
+
+#[test]
+fn the_flow_list_table_aligns_id_source_steps_and_name() {
+    let body = serde_json::json!({
+        "flows": [
+            {
+                "id": "after-merge-checks",
+                "name": "After-merge checks",
+                "description": "Refresh the local view of the remote.",
+                "source": "builtin",
+                "valid": true,
+                "steps": 3,
+                "inputs": [],
+            },
+            {
+                "id": "nightly",
+                "name": "Nightly",
+                "description": "",
+                "source": "library",
+                "valid": true,
+                "steps": 12,
+                "inputs": [],
+            },
+        ]
+    });
+    let text = render_flow_list(&body);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "text: {text}");
+    assert!(
+        lines[0].starts_with("after-merge-checks  builtin  "),
+        "text: {text}"
+    );
+    assert!(lines[0].ends_with(" 3  After-merge checks"), "text: {text}");
+    assert!(
+        lines[1].starts_with("nightly             library  "),
+        "text: {text}"
+    );
+    assert!(lines[1].ends_with("12  Nightly"), "text: {text}");
+}
+
+#[test]
+fn an_invalid_flow_says_why_instead_of_steps_and_name() {
+    let body = serde_json::json!({
+        "flows": [
+            {
+                "id": "broken",
+                "name": "broken",
+                "description": "",
+                "source": "library",
+                "valid": false,
+                "error": "steps: at least one step is required",
+                "steps": 0,
+                "inputs": [],
+            },
+        ]
+    });
+    assert_eq!(
+        render_flow_list(&body),
+        "broken  library  invalid: steps: at least one step is required"
+    );
+}
+
+#[test]
+fn an_empty_library_says_so_rather_than_printing_nothing() {
+    let text = render_flow_list(&serde_json::json!({ "flows": [] }));
+    assert!(text.contains("no flows"), "text: {text}");
+}
+
+#[test]
+fn flow_show_prints_the_canonical_yaml_verbatim() {
+    let body = serde_json::json!({
+        "id": "after-merge-checks",
+        "yaml": "schema: 1\n# a comment the canonical rendering drops\n",
+        "normalized_yaml": "schema: 1\nid: after-merge-checks\n",
+        "valid": true,
+    });
+    assert_eq!(render_flow_show(&body), "schema: 1\nid: after-merge-checks");
+}
+
+#[test]
+fn flow_show_falls_back_to_the_source_text_for_a_broken_flow() {
+    // An invalid flow has no canonical rendering, and its raw text is
+    // exactly what a human opened `show` to fix.
+    let body = serde_json::json!({
+        "id": "broken",
+        "yaml": "schema: 1\nsteps: []\n",
+        "normalized_yaml": "",
+        "valid": false,
+        "error": "steps: at least one step is required",
+    });
+    assert_eq!(render_flow_show(&body), "schema: 1\nsteps: []");
+}
+
+/// The verdict body of a run with one step of every interesting shape.
+fn flow_result_body() -> serde_json::Value {
+    serde_json::json!({
+        "flow": { "id": "release", "name": "Release", "source": "builtin", "digest": "abc" },
+        "repo": "/repo/test",
+        "inputs": {},
+        "outcome": "unresolved",
+        "summary": "4 steps: 1 succeeded, 1 failed, 1 blocked, 1 skipped (test, exit 101)",
+        "steps": [
+            {
+                "id": "clippy",
+                "kind": "command",
+                "status": "succeeded",
+                "attempts": 1,
+                "duration_ms": 4_200,
+                "evidence": ["ev_clippy"],
+            },
+            {
+                "id": "test",
+                "kind": "command",
+                "status": "failed",
+                "attempts": 2,
+                "duration_ms": 900,
+                "exit_status": 101,
+                "evidence": ["ev_test"],
+                "error": {
+                    "cause": "exit_status",
+                    "detail": "the step exited 101",
+                    "recovery": "read the log evidence and fix the failing test",
+                },
+            },
+            {
+                "id": "docs",
+                "kind": "command",
+                "status": "skipped",
+                "attempts": 0,
+                "duration_ms": 0,
+                "evidence": [],
+            },
+            {
+                "id": "deploy",
+                "kind": "command",
+                "status": "blocked",
+                "attempts": 0,
+                "duration_ms": 0,
+                "evidence": [],
+                "error": {
+                    "cause": "approval_denied",
+                    "detail": "a human denied the approval",
+                    "recovery": "open Pam \u{2192} Approvals",
+                },
+            },
+        ],
+    })
+}
+
+#[test]
+fn a_verdict_renders_one_line_per_step_then_the_summary_sentence() {
+    let text = render_flow_result(&flow_result_body());
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "\u{2713} clippy  succeeded  4.2s", "text: {text}");
+    assert_eq!(
+        lines[1], "\u{2717} test  failed  exit 101  ev_test",
+        "text: {text}"
+    );
+    assert_eq!(
+        lines[2], "  \u{2192} read the log evidence and fix the failing test",
+        "text: {text}"
+    );
+    assert_eq!(lines[3], "\u{b7} docs  skipped", "text: {text}");
+    assert_eq!(
+        lines[4], "\u{2298} deploy  blocked  approval_denied",
+        "text: {text}"
+    );
+    assert_eq!(lines[5], "  \u{2192} open Pam \u{2192} Approvals", "text: {text}");
+    assert!(
+        text.contains("4 steps: 1 succeeded, 1 failed, 1 blocked, 1 skipped (test, exit 101)"),
+        "text: {text}"
+    );
+}
+
+#[test]
+fn a_steps_summary_text_lands_indented_under_its_own_rule() {
+    let mut body = flow_result_body();
+    body["steps"][0]["summary"] =
+        serde_json::json!("Two warnings, both in tests.\nNothing blocking.");
+    let text = render_flow_result(&body);
+    assert!(
+        text.contains("\u{2500}\u{2500} clippy \u{2500}\u{2500}"),
+        "text: {text}"
+    );
+    assert!(text.contains("\n  Two warnings, both in tests.\n"), "text: {text}");
+    assert!(text.contains("\n  Nothing blocking."), "text: {text}");
+    // A step with no summary contributes no rule.
+    assert!(
+        !text.contains("\u{2500}\u{2500} docs \u{2500}\u{2500}"),
+        "text: {text}"
+    );
+}
+
+#[test]
+fn a_cancelled_step_names_its_cause_and_a_sub_second_step_reports_millis() {
+    let body = serde_json::json!({
+        "outcome": "unresolved",
+        "summary": "2 steps: 1 succeeded, 1 cancelled (fetch, cancelled)",
+        "steps": [
+            {
+                "id": "probe",
+                "kind": "command",
+                "status": "succeeded",
+                "attempts": 1,
+                "duration_ms": 120,
+                "evidence": [],
+            },
+            {
+                "id": "fetch",
+                "kind": "command",
+                "status": "cancelled",
+                "attempts": 1,
+                "duration_ms": 30,
+                "evidence": ["ev_fetch"],
+                "error": {
+                    "cause": "cancelled",
+                    "detail": "the request was cancelled",
+                    "recovery": "re-run the flow when you are ready",
+                },
+            },
+        ],
+    });
+    let text = render_flow_result(&body);
+    assert!(text.contains("\u{2713} probe  succeeded  120ms"), "text: {text}");
+    assert!(
+        text.contains("\u{2297} fetch  cancelled  cancelled  ev_fetch"),
+        "text: {text}"
+    );
+}
+
+#[test]
+fn a_verdict_without_steps_falls_back_to_the_raw_body() {
+    // An older daemon that answers `flow.run` with a different shape is
+    // still printed rather than swallowed.
+    let body = serde_json::json!({ "note": "nothing to report" });
+    assert!(render_flow_result(&body).contains("nothing to report"));
+}
+
+#[test]
+fn flow_inputs_parse_key_equals_value_pairs() {
+    let raw = vec!["repo=ro-ag/pam".to_owned(), "tag=v1.2.3=rc1".to_owned()];
+    let inputs = parse_flow_inputs(&raw).expect("well-formed inputs parse");
+    assert_eq!(
+        inputs,
+        serde_json::json!({ "repo": "ro-ag/pam", "tag": "v1.2.3=rc1" })
+    );
+    // No inputs is an empty object, not a missing one.
+    assert_eq!(
+        parse_flow_inputs(&[]).expect("no inputs parse"),
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn an_input_without_an_equals_sign_is_a_usage_error_naming_it() {
+    let error = parse_flow_inputs(&["x".to_owned()]).expect_err("a bare word is a usage error");
+    assert_eq!(error, "input \"x\" must be key=value");
+    // An empty name is no better than a missing one.
+    let error = parse_flow_inputs(&["=value".to_owned()]).expect_err("an empty name is refused");
+    assert_eq!(error, "input \"=value\" must be key=value");
 }

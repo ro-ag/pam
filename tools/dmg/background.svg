@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 420" width="660" height="420">
+  <!-- Pam disk-image backdrop, 660x420pt (the Finder window is fixed to this size).
+       Palette from frontend/src/styles.css: coral #ff674f, coral-soft #ff9c77,
+       night #06090d, surface #131a22, line #2a3542, paper #f6f3ec.
+       Dusk over the Pacific: the sky darkens upward, a lit horizon band runs
+       across y=317..338 (exactly where Finder paints the two icon labels, so
+       they stay legible whether the viewer's Mac draws them white or black).
+       The sun sets on that horizon between the two icons, and the coral
+       arrow crossing above it says which way to drag. Everything in the
+       middle stays light so the app's own coral mark keeps the eye.
+       Wordmark and caption are Futura Medium converted to outlines, so this
+       file renders identically anywhere with no font installed. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0.00" stop-color="#04070b"/>
+      <stop offset="0.28" stop-color="#071019"/>
+      <stop offset="0.46" stop-color="#0e1a27"/>
+      <stop offset="0.58" stop-color="#182131"/>
+      <stop offset="0.65" stop-color="#29283a"/>
+      <stop offset="0.70" stop-color="#4a3b40"/>
+      <stop offset="0.745" stop-color="#7f5440"/>
+      <stop offset="0.775" stop-color="#a56a4e"/>
+      <stop offset="0.815" stop-color="#a06549"/>
+      <stop offset="0.86" stop-color="#6e4736"/>
+      <stop offset="0.92" stop-color="#3a2823"/>
+      <stop offset="0.97" stop-color="#1d1512"/>
+      <stop offset="1.00" stop-color="#140e12"/>
+    </linearGradient>
+    <radialGradient id="bloom" cx="330" cy="330" r="330" gradientUnits="userSpaceOnUse"
+                    gradientTransform="matrix(1 0 0 0.46 0 178.2)">
+      <stop offset="0" stop-color="#ff674f" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#ff674f" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ff674f" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="wake" cx="330" cy="344" r="86" gradientUnits="userSpaceOnUse"
+                    gradientTransform="matrix(0.62 0 0 1 125.4 0)">
+      <stop offset="0" stop-color="#ff9c77" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#ff9c77" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="drag" x1="280" y1="0" x2="380" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff9c77"/>
+      <stop offset="1" stop-color="#ff674f"/>
+    </linearGradient>
+    <radialGradient id="dragGlow" cx="330" cy="250" r="96" gradientUnits="userSpaceOnUse"
+                    gradientTransform="matrix(1 0 0 0.38 0 155)">
+      <stop offset="0" stop-color="#ff674f" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#ff674f" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="330" cy="215" r="430" gradientUnits="userSpaceOnUse"
+                    gradientTransform="matrix(1 0 0 0.72 0 60.2)">
+      <stop offset="0.60" stop-color="#020407" stop-opacity="0"/>
+      <stop offset="1" stop-color="#020407" stop-opacity="0.55"/>
+    </radialGradient>
+  </defs>
+  <rect width="660" height="420" fill="url(#sky)"/>
+  <rect width="660" height="420" fill="url(#bloom)"/>
+  <rect y="326" width="660" height="94" fill="url(#wake)"/>
+  <rect width="660" height="420" fill="url(#dragGlow)"/>
+  <g fill="none" stroke="url(#drag)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M280 250H370"/>
+    <path d="M354 232L378 250L354 268"/>
+  </g>
+  <rect width="660" height="420" fill="url(#vignette)"/>
+  <path fill="#f6f3ec" d="M269.69 76.12V100.00H260.81V41.20H270.87Q278.26 41.20 282.03 42.22Q285.84 43.25 288.73 46.11Q293.80 51.06 293.80 58.60Q293.80 66.67 288.39 71.40Q282.98 76.12 273.80 76.12ZM269.69 67.89H273.00Q285.23 67.89 285.23 58.49Q285.23 49.38 272.62 49.38H269.69Z M329.58 62.90H338.19V100.00H329.58V96.12Q324.29 101.07 318.19 101.07Q310.50 101.07 305.47 95.51Q300.48 89.83 300.48 81.34Q300.48 73.00 305.47 67.44Q310.46 61.88 317.96 61.88Q324.44 61.88 329.58 67.21ZM309.24 81.34Q309.24 86.67 312.10 90.02Q315.03 93.41 319.49 93.41Q324.25 93.41 327.18 90.14Q330.11 86.75 330.11 81.53Q330.11 76.31 327.18 72.92Q324.25 69.61 319.56 69.61Q315.15 69.61 312.18 72.96Q309.24 76.35 309.24 81.34Z M349.94 62.90H358.51V66.33Q360.99 63.74 362.74 62.83Q364.60 61.88 367.42 61.88Q373.71 61.88 377.36 67.36Q381.40 61.88 388.29 61.88Q400.82 61.88 400.82 77.07V100.00H392.22V79.40Q392.22 74.06 390.92 71.85Q389.59 69.61 386.54 69.61Q383.00 69.61 381.38 72.27Q379.76 74.94 379.76 80.84V100.00H371.15V79.51Q371.15 69.61 365.44 69.61Q361.82 69.61 360.17 72.31Q358.51 75.02 358.51 80.84V100.00H349.94Z"/>
+  <path fill="#ff9c77" d="M260.09 132.00V124.08H261.75Q262.95 124.08 263.64 124.32Q264.38 124.55 264.99 125.10Q266.21 126.22 266.21 128.04Q266.21 129.87 264.94 131.00Q264.30 131.56 263.59 131.78Q262.94 132.00 261.73 132.00ZM261.29 130.88H261.83Q262.63 130.88 263.16 130.71Q263.70 130.53 264.13 130.14Q265.01 129.33 265.01 128.04Q265.01 126.74 264.14 125.93Q263.35 125.21 261.83 125.21H261.29Z M273.97 128.63 276.42 132.00H274.96L272.70 128.76H272.48V132.00H271.29V124.08H272.69Q274.26 124.08 274.95 124.67Q275.72 125.33 275.72 126.41Q275.72 127.25 275.24 127.85Q274.76 128.46 273.97 128.63ZM272.48 127.72H272.86Q274.56 127.72 274.56 126.42Q274.56 125.21 272.91 125.21H272.48Z M285.83 130.08H282.44L281.56 132.00H280.27L284.19 123.59L287.97 132.00H286.66ZM285.34 128.95 284.17 126.26 282.94 128.95Z M296.60 127.88H299.87V128.14Q299.87 129.03 299.66 129.72Q299.45 130.35 298.97 130.91Q297.86 132.15 296.16 132.15Q294.50 132.15 293.32 130.95Q292.13 129.74 292.13 128.06Q292.13 126.33 293.34 125.14Q294.54 123.93 296.27 123.93Q297.20 123.93 298.00 124.31Q298.77 124.69 299.51 125.54L298.66 126.36Q297.69 125.06 296.29 125.06Q295.03 125.06 294.18 125.92Q293.33 126.78 293.33 128.06Q293.33 129.38 294.28 130.24Q295.17 131.03 296.20 131.03Q297.08 131.03 297.79 130.44Q298.49 129.84 298.57 129.00H296.60Z M313.93 125.21V132.00H312.74V125.21H310.92V124.08H315.75V125.21Z M319.99 128.01Q319.99 126.33 321.22 125.14Q322.44 123.94 324.15 123.94Q325.84 123.94 327.05 125.15Q328.27 126.36 328.27 128.05Q328.27 129.76 327.05 130.95Q325.82 132.14 324.09 132.14Q322.55 132.14 321.33 131.08Q319.99 129.91 319.99 128.01ZM321.20 128.02Q321.20 129.33 322.08 130.18Q322.95 131.03 324.10 131.03Q325.35 131.03 326.20 130.16Q327.06 129.29 327.06 128.04Q327.06 126.78 326.21 125.92Q325.37 125.06 324.13 125.06Q322.90 125.06 322.05 125.92Q321.20 126.77 321.20 128.02Z M341.34 124.08V132.00H340.15V124.08Z M346.81 132.00V123.55L352.59 129.59V124.08H353.78V132.48L348.01 126.46V132.00Z M363.72 125.26 362.76 125.84Q362.48 125.37 362.24 125.22Q361.98 125.06 361.58 125.06Q361.08 125.06 360.75 125.34Q360.42 125.62 360.42 126.04Q360.42 126.62 361.28 126.97L362.07 127.29Q363.04 127.68 363.48 128.24Q363.93 128.81 363.93 129.62Q363.93 130.71 363.20 131.43Q362.47 132.14 361.38 132.14Q360.35 132.14 359.68 131.53Q359.02 130.92 358.85 129.82L360.06 129.55Q360.15 130.25 360.35 130.51Q360.72 131.03 361.43 131.03Q361.99 131.03 362.36 130.65Q362.73 130.28 362.73 129.70Q362.73 129.47 362.66 129.28Q362.60 129.09 362.46 128.93Q362.33 128.76 362.11 128.62Q361.89 128.48 361.60 128.35L360.83 128.04Q359.21 127.35 359.21 126.03Q359.21 125.14 359.89 124.54Q360.57 123.93 361.59 123.93Q362.96 123.93 363.72 125.26Z M371.12 125.21V132.00H369.93V125.21H368.11V124.08H372.94V125.21Z M382.23 130.08H378.84L377.96 132.00H376.67L380.59 123.59L384.36 132.00H383.06ZM381.74 128.95 380.57 126.26 379.33 128.95Z M390.12 124.08V130.88H392.45V132.00H388.92V124.08Z M398.34 124.08V130.88H400.67V132.00H397.15V124.08Z"/>
+</svg>

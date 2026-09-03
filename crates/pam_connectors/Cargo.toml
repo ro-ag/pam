@@ -1,0 +1,27 @@
+[package]
+name = "pam_connectors"
+description = "Read-only connectors for pam (GitHub Actions, Jenkins, SonarQube, Jira, Confluence, SharePoint, AWS CLI) over an injected HTTP transport backed by system curl."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Exposes `pam_connectors::testing` — the recording fake transport the
+# daemon's flow tests drive connector steps through.
+testing = []
+
+[dependencies]
+pam_flow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# base URL validation and request building; pure Rust.
+url.workspace = true
+# `process` spawns curl and the aws CLI, `io-util` bounds their output,
+# `time` carries deadlines, `rt` places the child readers. No runtime
+# flavor — the daemon owns task placement.
+tokio = { version = "1", default-features = false, features = ["process", "io-util", "time", "rt", "sync", "macros"] }
+
+[lints]
+workspace = true

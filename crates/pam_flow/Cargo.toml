@@ -1,0 +1,20 @@
+[package]
+name = "pam_flow"
+description = "Flow definitions for pam: YAML schema, validation, normalized rendering, digest, the embedded starter flows, and the global library directory."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# YAML flow files. Maintained fork of serde_yaml; pure Rust (unsafe-libyaml
+# is a Rust port of libyaml, no C compile step).
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

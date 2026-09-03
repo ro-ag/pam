@@ -58,7 +58,7 @@ schema: 1
 id: ci-failure-triage            # must equal the file stem; [a-z0-9-]{1,64}
 name: CI failure triage
 description: Fetch the latest failed GitHub Actions run for this repo and summarize its failing job log.
-inputs:                           # optional, ordered map
+inputs:                           # optional map (rendered sorted by name)
   repo:
     description: owner/name on GitHub
     default: ${repo.origin}       # defaults may use built-in variables
@@ -118,7 +118,7 @@ naming the YAML path):
 
 ```rust
 pub struct Flow { pub schema: u16, pub id: String, pub name: String, pub description: String,
-                  pub inputs: IndexMap<String, Input>, pub steps: Vec<Step> }
+                  pub inputs: BTreeMap<String, Input>, pub steps: Vec<Step> }
 pub struct Input { pub description: String, pub default: Option<String> }
 pub struct Step { pub id, pub action: Action, pub timeout: Duration, pub effect: Effect, pub role: Role,
                   pub output: OutputPolicy, pub needs: Vec<String>, pub when: When, pub retry: Retry,
@@ -165,8 +165,11 @@ Rust-flavoured ones are the owner's bench and read as templates.
 ## Crate: `pam_connectors`
 
 Pure library over an injected transport (`serde`, `serde_json`,
-`thiserror`, `tokio` process/io for the curl transport, `url`). One
-module per connector, one `_test.rs` sibling each with a fake transport.
+`thiserror`, `tokio` process/io for the curl transport, `url`, and
+`pam_flow` for `ConnectorId` and the call table so the two crates
+cannot disagree). One module per connector, one `_test.rs` sibling
+each with a fake transport (exported under a `testing` feature for the
+daemon tests).
 
 ```rust
 pub enum ConnectorId { Github, Jenkins, Sonarqube, Jira, Confluence, Sharepoint, Aws }
@@ -402,8 +405,9 @@ pam flow run <id> [k=v]... [--no-wait] [--deadline-ms N] [--json]   flow.run
 `· docs  skipped`), then the summary sentence and the summary text for
 `summarize` steps; refusals render as today. Exit codes reuse
 `render::exit_code` (0 / unresolved 4 / blocked 5 / refused 3).
-Progress events print as they arrive when waiting (`→ clippy (5/7)`),
-quiet under `--json`.
+`run` waits in one request; live step progress is `pam subscribe
+<ticket>`'s job after `--no-wait` (the terminal event carries no body,
+so a streaming `run` would need a second round trip for nothing).
 
 ## GUI (`pam_gui` + frontend)
 
@@ -413,9 +417,10 @@ quiet under `--json`.
 - **Flows screen** (`/flows`, sidebar entry replaces the "soon"
   placeholder): a library column (id, name, `builtin`/`library`
   badges, an invalid badge with the message) and a detail pane with
-  tabs **YAML** (textarea in the data voice; Validate, Save, Clone —
-  a builtin's Save becomes Clone with a new id —, Delete with the
-  confirm button; errors render as a `FailureNote` naming the path)
+  tabs **YAML** (textarea in the data voice; Save — a builtin's Save
+  becomes Clone with a new id —, Delete with the confirm button;
+  validation happens in the daemon on Save and its error renders as a
+  `FailureNote` naming the path; there is no separate Validate button)
   and **Runs** (the flow's `flow.run` requests newest-first with
   outcome badge, repo tail, age; a row expands into the step table
   from the `flow.result` evidence and the existing `EvidenceStrip`).

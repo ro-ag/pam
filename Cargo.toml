@@ -4,7 +4,9 @@ members = [
     "crates/pam",
     "crates/pam_client",
     "crates/pam_compact",
+    "crates/pam_connectors",
     "crates/pam_daemon",
+    "crates/pam_flow",
     "crates/pam_gui",
     "crates/pam_model",
     "crates/pam_proto",
@@ -21,7 +23,9 @@ repository = "https://github.com/ro-ag/pam"
 [workspace.dependencies]
 pam_client = { path = "crates/pam_client" }
 pam_compact = { path = "crates/pam_compact" }
+pam_connectors = { path = "crates/pam_connectors" }
 pam_daemon = { path = "crates/pam_daemon" }
+pam_flow = { path = "crates/pam_flow" }
 pam_gui = { path = "crates/pam_gui" }
 pam_model = { path = "crates/pam_model" }
 pam_proto = { path = "crates/pam_proto" }
@@ -86,6 +90,10 @@ tokenizers = { version = "0.22", default-features = false, features = ["fancy-re
 sha2 = "0.10"
 # hex digests for the sha256 above; pure Rust, no dependencies.
 hex = "0.4"
+# YAML flow files (pam_flow). Maintained serde_yaml fork; pure Rust.
+serde_yaml_ng = "0.10"
+# URL parsing for connector base URLs (pam_connectors); pure Rust.
+url = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

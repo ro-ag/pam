@@ -4,12 +4,15 @@
 
 pub mod admin;
 pub mod admin_connectors;
+pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;
 pub mod approval;
 pub mod connector_service;
 pub mod daemon;
 pub mod executor;
+pub mod flow_exec;
+pub mod flow_service;
 pub mod lifecycle;
 pub mod log_service;
 pub mod model_service;
@@ -21,6 +24,8 @@ pub mod transport;
 
 #[cfg(test)]
 mod admin_connectors_test;
+#[cfg(test)]
+mod admin_flows_test;
 #[cfg(test)]
 mod admin_logs_test;
 #[cfg(test)]
@@ -35,6 +40,10 @@ mod connector_service_test;
 mod daemon_test;
 #[cfg(test)]
 mod executor_test;
+#[cfg(test)]
+mod flow_exec_test;
+#[cfg(test)]
+mod flow_service_test;
 #[cfg(test)]
 mod lifecycle_test;
 #[cfg(test)]

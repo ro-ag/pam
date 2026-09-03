@@ -37,7 +37,23 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
-    let admin = AdminService::new(Arc::clone(&store), approvals, models, logs, connectors);
+    let flows = crate::flow_service_test::flows_for_tests(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        &store,
+        &approvals,
+        &connectors,
+        &logs,
+    )
+    .await;
+    let admin = AdminService::new(
+        Arc::clone(&store),
+        approvals,
+        models,
+        logs,
+        connectors,
+        flows,
+        crate::flow_service_test::closed_submit(),
+    );
     (store, admin, rx)
 }
 
@@ -59,12 +75,22 @@ async fn service_with_approvals() -> (
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let flows = crate::flow_service_test::flows_for_tests(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        &store,
+        &approvals,
+        &connectors,
+        &logs,
+    )
+    .await;
     let admin = AdminService::new(
         Arc::clone(&store),
         Arc::clone(&approvals),
         models,
         logs,
         connectors,
+        flows,
+        crate::flow_service_test::closed_submit(),
     );
     (store, admin, approvals, rx)
 }

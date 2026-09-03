@@ -29,6 +29,7 @@ use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, DAEMON_VERSION, DaemonConfig, DaemonHandle, TERMINAL_ACTIONS,
     run_daemon_with,
 };
+use pam_daemon::flow_service::{SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES;
 use pam_daemon::secrets::SecretBackend;
@@ -120,6 +121,53 @@ pub async fn seed_relaxed(tmp: &tempfile::TempDir) {
         .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
         .await
         .expect("relaxed profile persists");
+}
+
+/// Persists the programs a flow's command steps may run, before any
+/// daemon opens the store.
+///
+/// The default allowlist is a real toolchain (`git`, `cargo`, `npm`, …),
+/// which a test must not inherit: a flow test asserts about the programs
+/// it named and nothing else. Seed exactly what the flow under test
+/// runs.
+pub async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
+    seed_string_list(tmp, SETTING_ALLOWED_PROGRAMS, programs).await;
+}
+
+/// Persists the directories a flow's command steps resolve programs on,
+/// before any daemon opens the store.
+///
+/// Test binaries live in Cargo's target directory, which is on no
+/// `PATH`, so a test that drives `pam-flow-helper` seeds the directory of
+/// `env!("CARGO_BIN_EXE_pam-flow-helper")` here.
+pub async fn seed_extra_path(tmp: &tempfile::TempDir, dirs: &[&str]) {
+    seed_string_list(tmp, SETTING_EXTRA_PATH, dirs).await;
+}
+
+/// Writes one JSON string-list setting into a not-yet-opened store.
+async fn seed_string_list(tmp: &tempfile::TempDir, key: &str, values: &[&str]) {
+    let raw = serde_json::to_string(values).expect("a string list always serializes");
+    open_store(tmp)
+        .await
+        .set_setting(key, &raw)
+        .await
+        .unwrap_or_else(|error| panic!("setting {key} persists: {error}"));
+}
+
+/// Writes one flow file into the library a daemon on `tmp` will read,
+/// at `<base>/flows/<id>.yaml`.
+///
+/// Deliberately a plain file write rather than
+/// [`pam_flow::Library::save`]: a test that wants an *invalid* flow in
+/// the library (to prove the list renders its message) could not save
+/// one through the validator.
+#[must_use]
+pub fn seed_flow(tmp: &tempfile::TempDir, id: &str, yaml: &str) -> PathBuf {
+    let dir = base_of(tmp).join("flows");
+    std::fs::create_dir_all(&dir).expect("the flow library directory is created");
+    let path = dir.join(format!("{id}.yaml"));
+    std::fs::write(&path, yaml).expect("the flow file is written");
+    path
 }
 
 /// Guards the 104-byte unix socket path limit before the daemon tries

@@ -46,11 +46,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_model::runtime::RuntimeState;
-use pam_proto::{Event, Outcome, PROTOCOL_VERSION, Response};
+use pam_proto::{Caller, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::Store;
 use tokio::sync::watch;
 
+use crate::approval::ApprovalService;
 use crate::daemon::CompletionRouter;
+use crate::flow_service::{FlowService, RunArgs};
 use crate::model_service::ModelService;
 use crate::queue::{CAUSE_CANCELLED, CancelOutcome, QueueManager};
 use crate::transport::EventPublisher;
@@ -85,6 +87,17 @@ pub struct ExecContext {
     /// Completion router; the `cancel` built-in releases the waiters of
     /// a queued-cancelled request through it.
     pub router: CompletionRouter,
+    /// The approval service; the flow engine pauses a gated step on it
+    /// mid-run, which is the one place a capability waits for a human.
+    pub approvals: Arc<ApprovalService>,
+    /// The flow engine behind `flow.run` / `flow.list` / `flow.show`.
+    pub flows: Arc<FlowService>,
+    /// Who asked. A flow runs its command steps in
+    /// [`Caller::repo`](pam_proto::Caller::repo), so this is not
+    /// attribution here — it is where the work happens.
+    pub caller: Caller,
+    /// The capability being executed, as the envelope named it.
+    pub capability: String,
     /// When the daemon started, for the `status` uptime figure.
     pub started_at: std::time::Instant,
 }
@@ -112,6 +125,24 @@ pub enum CapabilityFailure {
         /// Human-readable failure description.
         detail: String,
     },
+    /// The capability refused before doing anything: the request asked
+    /// for something that does not exist, or is not usable as asked.
+    ///
+    /// This is the executor's own refusal, distinct from the policy
+    /// gate's — the gate decides whether a *capability* may run, while
+    /// this says the capability ran nothing because the request itself
+    /// was not answerable (an unknown flow id, a repo that is not a
+    /// directory). The pipeline answers it as a
+    /// [`Response::Refusal`] with its own terminal audit row (see
+    /// [`crate::daemon::ACTION_EXECUTION_REFUSAL`]).
+    Refused {
+        /// Machine-readable cause.
+        cause: String,
+        /// What happened, in one sentence.
+        detail: String,
+        /// The concrete fix.
+        recovery: String,
+    },
 }
 
 /// The static set of built-in capabilities, dispatched by enum (see the
@@ -126,6 +157,12 @@ pub enum BuiltinCapability {
     Echo,
     /// Cancel another request by ticket.
     Cancel,
+    /// Run one flow from the library (see [`crate::flow_service`]).
+    FlowRun,
+    /// List the flow library.
+    FlowList,
+    /// Read one flow's YAML, canonical rendering and digest.
+    FlowShow,
 }
 
 impl BuiltinCapability {
@@ -139,6 +176,9 @@ impl BuiltinCapability {
             "query" => Some(Self::Query),
             "echo" => Some(Self::Echo),
             "cancel" => Some(Self::Cancel),
+            crate::flow_service::CAP_FLOW_RUN => Some(Self::FlowRun),
+            crate::flow_service::CAP_FLOW_LIST => Some(Self::FlowList),
+            crate::flow_service::CAP_FLOW_SHOW => Some(Self::FlowShow),
             _ => None,
         }
     }
@@ -151,6 +191,9 @@ impl BuiltinCapability {
             Self::Query => "query",
             Self::Echo => "echo",
             Self::Cancel => "cancel",
+            Self::FlowRun => crate::flow_service::CAP_FLOW_RUN,
+            Self::FlowList => crate::flow_service::CAP_FLOW_LIST,
+            Self::FlowShow => crate::flow_service::CAP_FLOW_SHOW,
         }
     }
 
@@ -161,8 +204,34 @@ impl BuiltinCapability {
             Self::Query => query(&ctx).await,
             Self::Echo => echo(ctx).await,
             Self::Cancel => cancel(&ctx).await,
+            Self::FlowRun => flow_run(&ctx).await,
+            Self::FlowList => flow_list(&ctx),
+            Self::FlowShow => flow_show(&ctx),
         }
     }
+}
+
+/// `flow.run`: hands the request to the flow engine.
+async fn flow_run(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
+    let args = RunArgs::from_value(&ctx.args)?;
+    Arc::clone(&ctx.flows).run(ctx, args).await
+}
+
+/// `flow.list`: the flow library.
+fn flow_list(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
+    Ok(ctx.flows.list()?)
+}
+
+/// `flow.show`: one flow's text and canonical rendering.
+fn flow_show(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
+    let Some(id) = ctx.args.get("id").and_then(serde_json::Value::as_str) else {
+        return Err(CapabilityFailure::Refused {
+            cause: crate::flow_service::CAUSE_FLOW_NOT_FOUND.to_owned(),
+            detail: "flow.show needs args.id naming the flow to read".to_owned(),
+            recovery: crate::flow_service::RECOVERY_FLOW_LIST.to_owned(),
+        });
+    };
+    Ok(ctx.flows.show(id)?)
 }
 
 /// The `request.outcome` column value for an [`Outcome`].

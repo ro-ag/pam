@@ -112,15 +112,18 @@ use std::time::Duration;
 use pam_proto::{Envelope, Outcome, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::approval::{ApprovalService, Resolution};
 use crate::connector_service::ConnectorService;
 use crate::daemon::{ACTION_DEADLINE_REFUSAL, CAUSE_DEADLINE_EXCEEDED, CAUSE_INTERNAL_ERROR};
 use crate::executor::outcome_str;
+use crate::flow_service::FlowService;
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{PROFILE_SETTING_KEY, Profile};
+use crate::transport::IncomingRequest;
 
 /// Reserved capability prefix the dispatcher intercepts before the
 /// normal pipeline (see the module docs on the structural guard).
@@ -157,8 +160,8 @@ pub const OP_APPROVALS_PENDING: &str = "admin.approvals.pending";
 /// → delivers a human resolution to the waiting request.
 pub const OP_APPROVALS_RESOLVE: &str = "admin.approvals.resolve";
 
-/// `admin.activity.list { limit?, repo?, agent?, state? }` → recent
-/// request rows, newest first, bounded.
+/// `admin.activity.list { limit?, repo?, agent?, state?, capability? }`
+/// → recent request rows, newest first, bounded.
 pub const OP_ACTIVITY_LIST: &str = "admin.activity.list";
 
 /// `admin.callers.list` → the observed agent+repo registry.
@@ -236,6 +239,39 @@ impl From<StoreError> for AdminRefusal {
     }
 }
 
+/// The same refusal with owned text, which is what
+/// [`AdminService::finish_refused`] writes.
+///
+/// Almost every admin refusal is decided here and its cause and recovery
+/// line are compile-time constants. [`crate::admin_flows`]'s
+/// `admin.flows.run` is the exception: it submits a real `flow.run`
+/// envelope through the pipeline ingress and forwards whatever the
+/// pipeline answers, refusal included — and the pipeline's causes and
+/// recovery lines are built at run time. Rather than flatten a forwarded
+/// refusal into a generic one (which would cost the GUI the actual
+/// reason), the admin surface widens by exactly this one type.
+pub(crate) struct OwnedRefusal {
+    pub(crate) cause: String,
+    pub(crate) detail: String,
+    pub(crate) recovery: String,
+}
+
+impl From<AdminRefusal> for OwnedRefusal {
+    fn from(refusal: AdminRefusal) -> Self {
+        Self {
+            cause: refusal.cause.to_owned(),
+            detail: refusal.detail,
+            recovery: refusal.recovery.to_owned(),
+        }
+    }
+}
+
+impl From<StoreError> for OwnedRefusal {
+    fn from(err: StoreError) -> Self {
+        AdminRefusal::from(err).into()
+    }
+}
+
 /// The admin service: one per daemon, called only by the dispatcher's
 /// [`ADMIN_PREFIX`] intercept (see the module docs for the whole
 /// security model).
@@ -252,11 +288,20 @@ pub struct AdminService {
     /// The connector host the `admin.connectors.*` ops act through (see
     /// [`crate::admin_connectors`]).
     pub(crate) connectors: Arc<ConnectorService>,
+    /// The flow engine the `admin.flows.*` ops act through (see
+    /// [`crate::admin_flows`]).
+    pub(crate) flows: Arc<FlowService>,
+    /// The pipeline's own ingress. `admin.flows.run` builds a `flow.run`
+    /// envelope and sends it through here rather than executing anything
+    /// itself, so a run started from the GUI passes the same gate, lanes
+    /// and audit as one an agent started — the GUI gets no shortcut.
+    pub(crate) submit: mpsc::Sender<IncomingRequest>,
 }
 
 impl AdminService {
     /// Builds the service over the daemon's store, approval service,
-    /// model service, log service, and connector host.
+    /// model service, log service, connector host, flow engine, and the
+    /// pipeline ingress `admin.flows.run` submits through.
     #[must_use]
     pub fn new(
         store: Arc<Store>,
@@ -264,6 +309,8 @@ impl AdminService {
         models: Arc<ModelService>,
         logs: Arc<LogService>,
         connectors: Arc<ConnectorService>,
+        flows: Arc<FlowService>,
+        submit: mpsc::Sender<IncomingRequest>,
     ) -> Self {
         Self {
             store,
@@ -271,6 +318,8 @@ impl AdminService {
             models,
             logs,
             connectors,
+            flows,
+            submit,
         }
     }
 
@@ -319,31 +368,34 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The model, log and connector surfaces get first refusal:
-    /// [`Self::dispatch_models`], [`Self::dispatch_logs`] and
-    /// [`Self::dispatch_connectors`] answer `None` for anything that is
-    /// not one of their ops, and the match below takes over. The log and
-    /// connector surfaces are handed the envelope's id because a compress
-    /// files its evidence, and a configure its change, under this very
-    /// request row.
-    async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, AdminRefusal> {
+    /// The flow, model, log and connector surfaces get first refusal:
+    /// [`Self::dispatch_flows`], [`Self::dispatch_models`],
+    /// [`Self::dispatch_logs`] and [`Self::dispatch_connectors`] answer
+    /// `None` for anything that is not one of their ops, and the match
+    /// below takes over. The log and connector surfaces are handed the
+    /// envelope's id because a compress files its evidence, and a
+    /// configure its change, under this very request row.
+    async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, OwnedRefusal> {
         let args = &envelope.args;
-        if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
+        if let Some(answer) = self.dispatch_flows(&envelope.capability, args).await {
             return answer;
+        }
+        if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
+            return answer.map_err(OwnedRefusal::from);
         }
         if let Some(answer) = self
             .dispatch_logs(&envelope.id, &envelope.capability, args)
             .await
         {
-            return answer;
+            return answer.map_err(OwnedRefusal::from);
         }
         if let Some(answer) = self
             .dispatch_connectors(&envelope.id, &envelope.capability, args)
             .await
         {
-            return answer;
+            return answer.map_err(OwnedRefusal::from);
         }
-        match envelope.capability.as_str() {
+        let answer: Result<AdminOk, AdminRefusal> = match envelope.capability.as_str() {
             OP_PROFILE_GET => self.profile_get().await,
             OP_PROFILE_SET => self.profile_set(args).await,
             OP_GRANTS_LIST => self.grants_list().await,
@@ -358,7 +410,8 @@ impl AdminService {
                 detail: format!("no admin operation named {unknown:?} exists"),
                 recovery: RECOVERY_FIX_ARGS,
             }),
-        }
+        };
+        answer.map_err(OwnedRefusal::from)
     }
 
     /// The active profile: the persisted setting, or the platform
@@ -563,9 +616,12 @@ impl AdminService {
                 })
             })
             .transpose()?;
+        // The Flows screen's run history is this list narrowed to
+        // `flow.run`, which is why the filter exists at all.
+        let capability = args.get("capability").and_then(serde_json::Value::as_str);
         let requests: Vec<serde_json::Value> = self
             .store
-            .list_requests_filtered(limit, repo, agent, state, None)
+            .list_requests_filtered(limit, repo, agent, state, capability)
             .await?
             .into_iter()
             .map(|row| {
@@ -643,7 +699,7 @@ impl AdminService {
 
     /// Finishes a refused op: state `refused`, action [`ACTION_ADMIN`],
     /// decision `refuse`, actor `system`.
-    async fn finish_refused(&self, envelope: &Envelope, refusal: AdminRefusal) -> Response {
+    async fn finish_refused(&self, envelope: &Envelope, refusal: OwnedRefusal) -> Response {
         let detail = json!({
             "op": envelope.capability,
             "cause": refusal.cause,
@@ -655,7 +711,7 @@ impl AdminService {
             .finish_request(
                 &envelope.id,
                 RequestState::Refused,
-                Some(refusal.cause),
+                Some(&refusal.cause),
                 AuditEntry {
                     action: ACTION_ADMIN,
                     decision: Decision::Refuse,
@@ -666,9 +722,9 @@ impl AdminService {
             .await;
         Response::Refusal {
             id: envelope.id.clone(),
-            cause: refusal.cause.to_owned(),
+            cause: refusal.cause,
             detail: refusal.detail,
-            recovery: refusal.recovery.to_owned(),
+            recovery: refusal.recovery,
         }
     }
 

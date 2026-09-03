@@ -62,7 +62,23 @@ async fn fixture_with(transport: FakeTransport) -> Fixture {
         Arc::new(SecretStore::new(Arc::clone(&backend) as Arc<_>)),
         Arc::new(transport),
     ));
-    let admin = AdminService::new(Arc::clone(&store), approvals, models, logs, connectors);
+    let flows = crate::flow_service_test::flows_for_tests(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        &store,
+        &approvals,
+        &connectors,
+        &logs,
+    )
+    .await;
+    let admin = AdminService::new(
+        Arc::clone(&store),
+        approvals,
+        models,
+        logs,
+        connectors,
+        flows,
+        crate::flow_service_test::closed_submit(),
+    );
     Fixture {
         store,
         admin,

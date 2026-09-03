@@ -6,8 +6,12 @@ use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
+use crate::approval::ApprovalService;
+use crate::connector_service::ConnectorService;
 use crate::daemon::{CompletionRouter, Registration};
 use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext, outcome_str};
+use crate::flow_service::FlowService;
+use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{CapabilityClass, classify};
 use crate::queue::{ACTION_CANCEL, AdmitOutcome, CAUSE_CANCELLED, QueueManager};
@@ -19,6 +23,8 @@ struct Fixture {
     store: Arc<Store>,
     queue: Arc<QueueManager>,
     models: Arc<ModelService>,
+    approvals: Arc<ApprovalService>,
+    flows: Arc<FlowService>,
     router: CompletionRouter,
     events: EventPublisher,
     events_rx: mpsc::Receiver<(String, Event)>,
@@ -29,10 +35,27 @@ async fn fixture() -> Fixture {
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     let (events, events_rx) = EventPublisher::for_tests();
+    let approvals = Arc::new(ApprovalService::new(
+        Arc::clone(&store),
+        events.clone(),
+        DEADLINE,
+    ));
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let flows = crate::flow_service_test::flows_for_tests(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        &store,
+        &approvals,
+        &connectors,
+        &logs,
+    )
+    .await;
     Fixture {
         store,
         queue,
         models,
+        approvals,
+        flows,
         router: CompletionRouter::new(),
         events,
         events_rx,
@@ -55,6 +78,14 @@ impl Fixture {
             queue: Arc::clone(&self.queue),
             models: Arc::clone(&self.models),
             router: self.router.clone(),
+            approvals: Arc::clone(&self.approvals),
+            flows: Arc::clone(&self.flows),
+            caller: Caller {
+                agent: "claude".to_owned(),
+                repo: "/repo/test".to_owned(),
+                pid: 4242,
+            },
+            capability: "echo".to_owned(),
             started_at: std::time::Instant::now(),
         }
     }

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BridgeUnavailable,
+  FLOW_CONNECTORS,
+  FLOW_CONNECTOR_CALLS,
   activityList,
   adminCall,
   approvalsPending,
@@ -18,6 +20,7 @@ import {
   flowsDelete,
   flowsGet,
   flowsList,
+  flowsNormalize,
   flowsRun,
   flowsSave,
   flowsSettingsGet,
@@ -322,6 +325,21 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "admin.flows.run",
       { id: "pr-readiness", repo: "/work/pam", inputs: {} },
     ],
+    [
+      "flowsNormalize (yaml)",
+      () => flowsNormalize({ yaml: "schema: 1\n" }),
+      "admin.flows.normalize",
+      { yaml: "schema: 1\n" },
+    ],
+    [
+      "flowsNormalize (flow)",
+      () =>
+        flowsNormalize({
+          flow: { schema: 1, id: "mine", name: "Mine", steps: [{ id: "a", run: ["git"] }] },
+        }),
+      "admin.flows.normalize",
+      { flow: { schema: 1, id: "mine", name: "Mine", steps: [{ id: "a", run: ["git"] }] } },
+    ],
     ["flowsSettingsGet", () => flowsSettingsGet(), "admin.flows.settings.get", {}],
     [
       "flowsSettingsSet (one list at a time)",
@@ -363,6 +381,34 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
   ] as const)("%s", async (_name, call, op, args) => {
     await call();
     expect(sent()).toEqual({ op, args });
+  });
+
+  it("mirrors pam_flow::connector_calls for every connector, required args first", () => {
+    expect(Object.keys(FLOW_CONNECTOR_CALLS).sort()).toEqual([...FLOW_CONNECTORS].sort());
+    for (const calls of Object.values(FLOW_CONNECTOR_CALLS)) {
+      expect(calls.length).toBeGreaterThan(0);
+    }
+    expect(FLOW_CONNECTOR_CALLS.github.map((call) => call.name)).toEqual([
+      "runs",
+      "run",
+      "job_log",
+    ]);
+    expect(FLOW_CONNECTOR_CALLS.aws).toEqual([
+      { name: "commands", args: [] },
+      {
+        name: "cli",
+        args: [
+          { name: "service", required: true },
+          { name: "command", required: true },
+          { name: "args", required: false },
+        ],
+      },
+    ]);
+    expect(FLOW_CONNECTOR_CALLS.sharepoint[0].args.map((arg) => arg.name)).toEqual([
+      "site",
+      "query",
+      "limit",
+    ]);
   });
 
   it("narrows the tide to one capability for the run history", async () => {

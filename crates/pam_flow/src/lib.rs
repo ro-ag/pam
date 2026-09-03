@@ -1,7 +1,10 @@
-//! Flow definitions: the YAML schema, validation, normalized rendering,
-//! digest, the embedded starter flows, and the global library directory.
-//!
-//! Pure library — no daemon knowledge. See
-//! `docs/specs/2026-09-02-flows-connectors-design.md`.
-
+//! Flow definitions.
 #![forbid(unsafe_code)]
+pub mod duration;
+pub use duration::{DurationError, format_duration, parse_duration};
+#[cfg(test)]
+mod duration_test;
+pub mod schema;
+pub use schema::{Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Retry, Role, SCHEMA_VERSION, Step, When};
+#[cfg(test)]
+mod schema_test;

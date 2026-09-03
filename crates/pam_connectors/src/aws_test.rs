@@ -391,7 +391,30 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
+/// One `aws` call through the fake binary `fake_aws` just wrote.
+///
+/// On Linux a parallel test thread's forked-but-not-yet-exec'd child can
+/// still hold the script's `O_CLOEXEC` write descriptor, so executing it
+/// in that window fails with `ETXTBSY` ("Text file busy") — a race in
+/// the test harness, not in the connector, so it is retried briefly here
+/// rather than widened into a production retry the real CLI never needs.
 async fn cli(
+    conn: &Connection,
+    args: &BTreeMap<String, ArgValue>,
+    name: &str,
+) -> Result<CallResult, ConnectorError> {
+    for _ in 0..50 {
+        match call_once(conn, args, name).await {
+            Err(ConnectorError::Cli(detail)) if detail.contains("Text file busy") => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => return other,
+        }
+    }
+    call_once(conn, args, name).await
+}
+
+async fn call_once(
     conn: &Connection,
     args: &BTreeMap<String, ArgValue>,
     name: &str,

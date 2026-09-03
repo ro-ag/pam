@@ -550,7 +550,7 @@ impl AdminService {
             .transpose()?;
         let requests: Vec<serde_json::Value> = self
             .store
-            .list_requests_filtered(limit, repo, agent, state)
+            .list_requests_filtered(limit, repo, agent, state, None)
             .await?
             .into_iter()
             .map(|row| {

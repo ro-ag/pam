@@ -33,6 +33,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: SCHEMA_V4,
     },
+    Migration {
+        version: 5,
+        sql: SCHEMA_V5,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -209,3 +213,22 @@ CREATE INDEX model_job_state_idx ON model_job (state);
 /// the tokens-avoided odometer aggregates over the compacts, without
 /// reading a single blob.
 const SCHEMA_V4: &str = "ALTER TABLE evidence ADD COLUMN meta_json TEXT;";
+
+/// Migration 5: `connector` — one row per connector (`github`, `jenkins`,
+/// ...) holding its configuration and last self-test verdict.
+///
+/// Secrets never live here: only `base_url` and `username` are plain
+/// configuration; the credential itself belongs to the OS keychain via
+/// `pam_daemon`'s `SecretStore`.
+const SCHEMA_V5: &str = "
+CREATE TABLE connector (
+  id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  base_url TEXT,
+  username TEXT,
+  last_test_status TEXT CHECK (last_test_status IN ('passed', 'failed')),
+  last_test_detail TEXT,
+  last_test_ts INTEGER,
+  updated_ts INTEGER NOT NULL
+);
+";

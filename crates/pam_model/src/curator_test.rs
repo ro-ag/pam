@@ -75,6 +75,31 @@ fn write_fake(dir: &Path, stem: &str, fake: Fake) -> PathBuf {
     path
 }
 
+/// [`invoke`] against a stand-in that was written moments ago.
+///
+/// On Linux a script written by this thread can still be held open, for
+/// a few microseconds, by a child another test thread forked but has not
+/// exec'd yet (the write descriptor is `O_CLOEXEC`, so it dies at the
+/// child's exec, not at the fork). Executing it in that window fails
+/// with `ETXTBSY` ("Text file busy") — a race in the test harness, not
+/// in the curator, so it is retried briefly here rather than widened
+/// into a production retry the real agent CLIs never need.
+async fn invoke_fresh(
+    cli: &AgentCli,
+    prompt: &str,
+    deadline: Duration,
+) -> Result<String, CuratorError> {
+    for _ in 0..50 {
+        match invoke(cli, prompt, deadline).await {
+            Err(CuratorError::Io(err)) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => return other,
+        }
+    }
+    invoke(cli, prompt, deadline).await
+}
+
 /// A `PATH` value covering exactly `dirs`.
 fn path_env(dirs: &[&Path]) -> OsString {
     std::env::join_paths(dirs).unwrap()
@@ -186,7 +211,7 @@ async fn invoke_returns_what_the_agent_said_on_stdin() {
     let script = write_fake(dir.path(), "claude", Fake::EchoStdin);
     let cli = cli_at(AgentId::Claude, &script);
 
-    let answer = invoke(&cli, "Reply with the single word OK.", PROBE_DEADLINE)
+    let answer = invoke_fresh(&cli, "Reply with the single word OK.", PROBE_DEADLINE)
         .await
         .unwrap();
 
@@ -199,7 +224,7 @@ async fn invoke_passes_the_prompt_as_an_argument_when_the_agent_wants_it() {
     let script = write_fake(dir.path(), "gemini", Fake::EchoArgs);
     let cli = cli_at(AgentId::Gemini, &script);
 
-    let answer = invoke(&cli, "Reply with the single word OK.", PROBE_DEADLINE)
+    let answer = invoke_fresh(&cli, "Reply with the single word OK.", PROBE_DEADLINE)
         .await
         .unwrap();
 
@@ -217,7 +242,7 @@ async fn invoke_times_out_and_kills_the_child() {
     let cli = cli_at(AgentId::Codex, &script);
 
     let deadline = Duration::from_millis(200);
-    let failure = invoke(&cli, "anything", deadline).await.unwrap_err();
+    let failure = invoke_fresh(&cli, "anything", deadline).await.unwrap_err();
 
     match failure {
         CuratorError::Timeout(id, waited) => {
@@ -234,7 +259,9 @@ async fn invoke_reports_the_exit_code_and_the_complaint() {
     let script = write_fake(dir.path(), "copilot", Fake::Fail);
     let cli = cli_at(AgentId::Copilot, &script);
 
-    let failure = invoke(&cli, "anything", PROBE_DEADLINE).await.unwrap_err();
+    let failure = invoke_fresh(&cli, "anything", PROBE_DEADLINE)
+        .await
+        .unwrap_err();
 
     match failure {
         CuratorError::Failed(id, code, detail) => {
@@ -258,7 +285,9 @@ async fn invoke_on_a_binary_that_cannot_be_spawned_is_an_io_error() {
     // exit 1, so a `.cmd` path would prove nothing about the spawn error.
     let cli = cli_at(AgentId::Claude, &dir.path().join("no-such-agent"));
 
-    let failure = invoke(&cli, "anything", PROBE_DEADLINE).await.unwrap_err();
+    let failure = invoke_fresh(&cli, "anything", PROBE_DEADLINE)
+        .await
+        .unwrap_err();
 
     assert!(matches!(failure, CuratorError::Io(_)), "got {failure:?}");
 }

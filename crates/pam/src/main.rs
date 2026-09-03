@@ -131,7 +131,8 @@ enum ServiceCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Unregister and remove the unit. The running daemon is left alone.
+    /// Unregister and remove the unit. On macOS and Linux the manager
+    /// stops the managed daemon with it; the next pam command starts one.
     Uninstall {
         /// Print the report as JSON.
         #[arg(long)]

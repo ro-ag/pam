@@ -11,7 +11,9 @@
 //! Install semantics: stop a loose daemon first (bounded, through
 //! [`crate::client::stop_daemon`]) so the managed instance takes over,
 //! write the unit, register and start it. Uninstall unregisters and
-//! removes the unit; it never stops the daemon. `pam daemon` exits 0 on
+//! removes the unit; on macOS and Linux the manager stops the managed
+//! daemon along with it (`launchctl bootout`, `systemctl disable --now`),
+//! and the next pam command starts one lazily. `pam daemon` exits 0 on
 //! `already running`, so a manager never restart-loops against a loose
 //! instance.
 
@@ -36,6 +38,9 @@ pub const WINDOWS_TASK: &str = r"pam\daemon";
 /// How long `install` waits for a loose daemon to drain before the
 /// managed instance is started.
 pub const STOP_WAIT: Duration = Duration::from_secs(15);
+/// The uninstall report's note on macOS and Linux, where unregistering
+/// the unit also stops the daemon it was running.
+pub const MANAGED_STOPPED_NOTE: &str = "the manager stopped the managed daemon along with its unit; the next pam command starts one lazily";
 
 /// The platforms with a login-start manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -626,7 +631,9 @@ pub fn install_with(
     ))
 }
 
-/// Unregisters and removes the unit. Never stops a running daemon.
+/// Unregisters and removes the unit. On macOS and Linux the manager
+/// stops the managed daemon with it; the report's note says so, and the
+/// next pam command starts one lazily. A loose daemon is never touched.
 ///
 /// # Errors
 ///
@@ -637,6 +644,10 @@ pub fn uninstall(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport,
     }
     let unit = unit_path(env);
     let unit_name = unit.display().to_string();
+    let note = match env.platform {
+        Platform::Macos | Platform::Linux => Some(MANAGED_STOPPED_NOTE.to_owned()),
+        Platform::Windows | Platform::Other => None,
+    };
     match env.platform {
         Platform::Macos => {
             let uid = macos_uid(runner)?;
@@ -668,6 +679,6 @@ pub fn uninstall(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport,
     Ok(report(
         env,
         ServiceState::NotInstalled { unit: unit_name },
-        None,
+        note,
     ))
 }

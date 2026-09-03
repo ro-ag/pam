@@ -342,7 +342,10 @@ fn a_verdict_renders_one_line_per_step_then_the_summary_sentence() {
         lines[4], "\u{2298} deploy  blocked  approval_denied",
         "text: {text}"
     );
-    assert_eq!(lines[5], "  \u{2192} open Pam \u{2192} Approvals", "text: {text}");
+    assert_eq!(
+        lines[5], "  \u{2192} open Pam \u{2192} Approvals",
+        "text: {text}"
+    );
     assert!(
         text.contains("4 steps: 1 succeeded, 1 failed, 1 blocked, 1 skipped (test, exit 101)"),
         "text: {text}"
@@ -359,7 +362,10 @@ fn a_steps_summary_text_lands_indented_under_its_own_rule() {
         text.contains("\u{2500}\u{2500} clippy \u{2500}\u{2500}"),
         "text: {text}"
     );
-    assert!(text.contains("\n  Two warnings, both in tests.\n"), "text: {text}");
+    assert!(
+        text.contains("\n  Two warnings, both in tests.\n"),
+        "text: {text}"
+    );
     assert!(text.contains("\n  Nothing blocking."), "text: {text}");
     // A step with no summary contributes no rule.
     assert!(
@@ -398,7 +404,10 @@ fn a_cancelled_step_names_its_cause_and_a_sub_second_step_reports_millis() {
         ],
     });
     let text = render_flow_result(&body);
-    assert!(text.contains("\u{2713} probe  succeeded  120ms"), "text: {text}");
+    assert!(
+        text.contains("\u{2713} probe  succeeded  120ms"),
+        "text: {text}"
+    );
     assert!(
         text.contains("\u{2297} fetch  cancelled  cancelled  ev_fetch"),
         "text: {text}"

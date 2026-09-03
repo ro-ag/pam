@@ -3,13 +3,21 @@
 //! dispatches to — [`client::send_request`], [`client::follow_ticket`],
 //! and the renderers. The binary itself stays a thin clap shell, so
 //! driving the lib functions covers the surface.
+//!
+//! The `pam flow` suite is the exception: its subject *is* the shell —
+//! argument parsing, the capability each subcommand sends, the process
+//! exit code, and which stream the text lands on. Those tests execute
+//! the compiled binary ([`run_pam`]) against the in-process daemon over
+//! its real sockets, with `PAM_BASE_DIR` pointing at the same temp base.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use pam::client;
 use pam::render;
 use pam_daemon::daemon::{DaemonHandle, run_daemon};
+use pam_daemon::flow_service::SETTING_ALLOWED_PROGRAMS;
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_proto::{Event, Outcome, Response};
 use pam_store::{RequestRow, RequestState, Store};
@@ -46,8 +54,18 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start() -> Self {
+        Self::start_with_allowed_programs(&[]).await
+    }
+
+    /// A daemon whose flow steps may run exactly `programs` — the
+    /// default allowlist is a whole toolchain, which a flow test must
+    /// not inherit.
+    async fn start_with_allowed_programs(programs: &[&str]) -> Self {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
+        if !programs.is_empty() {
+            seed_allowed_programs(&tmp, programs).await;
+        }
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
             .await
@@ -90,6 +108,18 @@ async fn seed_relaxed(tmp: &tempfile::TempDir) {
         .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
         .await
         .expect("relaxed profile persists");
+}
+
+/// Persists the programs a flow's command steps may run, before the
+/// daemon opens the store.
+async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
+    let raw = serde_json::to_string(programs).expect("a string list always serializes");
+    Store::open(&base_of(tmp).join("state.sqlite3"))
+        .await
+        .expect("store opens")
+        .set_setting(SETTING_ALLOWED_PROGRAMS, &raw)
+        .await
+        .expect("the allowlist persists");
 }
 
 /// Polls the store until the request row satisfies `pred`.
@@ -315,4 +345,344 @@ async fn a_refusal_renders_cause_detail_and_recovery_and_exits_three() {
     })
     .await
     .expect("test within deadline");
+}
+
+// --- pam flow, through the compiled binary --------------------------
+
+/// Wall deadline for a flow test: a run spawns real `git` processes
+/// through a real socket, so it needs more room than an `echo`.
+const FLOW_DEADLINE: Duration = Duration::from_mins(1);
+
+/// Exit code for a usage error (the crate docs' exit-code table).
+const EXIT_USAGE: i32 = 2;
+
+/// Every flow that ships in the binary.
+const BUILTIN_FLOWS: [&str; 7] = [
+    "after-merge-checks",
+    "ci-failure-triage",
+    "dependency-audit",
+    "pr-readiness",
+    "release-readiness",
+    "sonar-gate-check",
+    "summarize-build-log",
+];
+
+/// A library flow that declares one input and runs one allowed program,
+/// so a run proves the `key=value` argument reached the daemon.
+const INPUT_ECHO_FLOW: &str = "\
+schema: 1
+id: input-echo
+name: Input echo
+description: Carries one declared input through a run.
+inputs:
+  label:
+    description: A value the verdict body echoes back
+    default: unset
+steps:
+  - id: version
+    run: [git, --version]
+";
+
+/// What one execution of the compiled binary produced.
+struct CliRun {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Executes the freshly built binary once, outside any test deadline.
+///
+/// macOS assesses a new executable the first time it runs (once per
+/// inode) and `cargo test` links a fresh inode every run, so without
+/// this the first `pam flow` exec would spend seconds in `_dyld_start`
+/// inside the test's own budget. See `live_subscribe.rs`, which pays the
+/// same toll.
+fn warm_binary() {
+    let _ = Command::new(env!("CARGO_BIN_EXE_pam"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Runs the compiled `pam` binary against the daemon on `base`, from
+/// `cwd` — which is the repository the daemon attributes the request to.
+async fn run_pam(base: &Path, cwd: &Path, args: &[&str]) -> CliRun {
+    let base = base.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    // Off the runtime thread: the daemon serving this very request runs
+    // in this process, and a blocking exec would sit on top of it.
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new(env!("CARGO_BIN_EXE_pam"))
+            .args(&args)
+            .env("PAM_BASE_DIR", &base)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the pam binary runs");
+        CliRun {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("the pam exec joins")
+}
+
+/// A git repository with one commit and an `origin` remote pointing at
+/// itself, so the builtin's `git fetch --prune` succeeds with no network.
+fn temp_git_repo() -> tempfile::TempDir {
+    let tmp = short_tempdir();
+    let repo = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} exited {status}");
+    };
+    git(&["init", "--quiet", "."]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "user.name", "pam test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path().join("README.md"), "pam flow test\n").expect("the file is written");
+    git(&["add", "README.md"]);
+    git(&["commit", "--quiet", "--message", "first"]);
+    git(&["remote", "add", "origin", &tmp.path().display().to_string()]);
+    tmp
+}
+
+/// Writes one flow into the library a running daemon reads on demand.
+fn seed_flow(tmp: &tempfile::TempDir, id: &str, yaml: &str) {
+    let dir = base_of(tmp).join("flows");
+    std::fs::create_dir_all(&dir).expect("the flow library directory is created");
+    std::fs::write(dir.join(format!("{id}.yaml")), yaml).expect("the flow file is written");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_list_prints_every_builtin_and_exits_zero() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+
+        let run = run_pam(&daemon.base(), daemon.tmp.path(), &["flow", "list"]).await;
+
+        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        assert_eq!(
+            run.stdout.lines().count(),
+            BUILTIN_FLOWS.len(),
+            "stdout: {}",
+            run.stdout
+        );
+        for id in BUILTIN_FLOWS {
+            assert!(run.stdout.contains(id), "stdout: {}", run.stdout);
+        }
+        assert!(run.stdout.contains("builtin"), "stdout: {}", run.stdout);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_show_prints_the_canonical_yaml_of_a_builtin() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+
+        let run = run_pam(
+            &daemon.base(),
+            daemon.tmp.path(),
+            &["flow", "show", "after-merge-checks"],
+        )
+        .await;
+
+        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        assert!(
+            run.stdout.starts_with("schema: 1"),
+            "stdout: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("id: after-merge-checks"),
+            "stdout: {}",
+            run.stdout
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_flow_id_is_refused_on_stderr_and_exits_three() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+
+        let run = run_pam(
+            &daemon.base(),
+            daemon.tmp.path(),
+            &["flow", "show", "no-such-flow"],
+        )
+        .await;
+
+        assert_eq!(
+            run.code,
+            i32::from(render::EXIT_REFUSED),
+            "stdout: {}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("refused (flow_not_found)"),
+            "stderr: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("pam flow list"),
+            "stderr: {}",
+            run.stderr
+        );
+        assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        let repo = temp_git_repo();
+
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "after-merge-checks"],
+        )
+        .await;
+
+        assert_eq!(
+            run.code, 0,
+            "stdout: {}\nstderr: {}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            run.stdout.contains("\u{2713} fetch  succeeded"),
+            "stdout: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("3 steps: 3 succeeded"),
+            "stdout: {}",
+            run.stdout
+        );
+
+        // `--json` hands the agent the same verdict unrendered.
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "after-merge-checks", "--json"],
+        )
+        .await;
+
+        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        let response: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
+        assert_eq!(response["outcome"], "verified", "response: {response}");
+        assert_eq!(
+            response["body"]["outcome"], "verified",
+            "response: {response}"
+        );
+        assert_eq!(
+            response["body"]["flow"]["id"], "after-merge-checks",
+            "response: {response}"
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        seed_flow(&daemon.tmp, "input-echo", INPUT_ECHO_FLOW);
+        let repo = temp_git_repo();
+
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "input-echo", "label=carried", "--json"],
+        )
+        .await;
+
+        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        let response: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
+        assert_eq!(
+            response["body"]["inputs"]["label"], "carried",
+            "response: {response}"
+        );
+        assert_eq!(
+            response["body"]["flow"]["source"], "library",
+            "response: {response}"
+        );
+
+        // With no argument the flow's declared default stands instead.
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "input-echo", "--json"],
+        )
+        .await;
+
+        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        let response: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
+        assert_eq!(
+            response["body"]["inputs"]["label"], "unset",
+            "response: {response}"
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_positional_input_without_an_equals_sign_never_reaches_the_daemon() {
+    warm_binary();
+    // No daemon on purpose: the shell refuses before it opens a socket.
+    let tmp = short_tempdir();
+
+    let run = run_pam(
+        &base_of(&tmp),
+        tmp.path(),
+        &["flow", "run", "after-merge-checks", "oops"],
+    )
+    .await;
+
+    assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
+    assert_eq!(
+        run.stderr.trim(),
+        "pam flow run: input \"oops\" must be key=value"
+    );
+    assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
 }

@@ -259,7 +259,10 @@ pub fn render_flow_result(body: &Value) -> String {
             continue;
         }
         lines.push(String::new());
-        lines.push(format!("\u{2500}\u{2500} {} \u{2500}\u{2500}", field(step, "id")));
+        lines.push(format!(
+            "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+            field(step, "id")
+        ));
         lines.extend(text.lines().map(|line| format!("  {line}")));
     }
     lines.join("\n")
@@ -314,12 +317,7 @@ fn render_step_line(step: &Value) -> String {
                 }
             }
             if let Some(evidence) = step.get("evidence").and_then(Value::as_array) {
-                parts.extend(
-                    evidence
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned),
-                );
+                parts.extend(evidence.iter().filter_map(Value::as_str).map(str::to_owned));
             }
         }
     }
@@ -365,7 +363,9 @@ fn is_valid(flow: &Value) -> bool {
 
 /// A flow list entry's step count.
 fn step_count(flow: &Value) -> u64 {
-    flow.get("steps").and_then(Value::as_u64).unwrap_or_default()
+    flow.get("steps")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 /// A JSON scalar without quotes, everything else as compact JSON.

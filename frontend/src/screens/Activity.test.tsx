@@ -126,11 +126,13 @@ describe("the tide", () => {
     const tail = screen.getAllByTitle("/Users/dev/pam")[0];
     expect(tail).toHaveTextContent(/^pam$/);
     expect(screen.getAllByText("claude").length).toBeGreaterThan(0);
+    // The GUI's own polling never appears in its own tide.
     expect(mocks.activityList).toHaveBeenCalledWith({
       limit: 100,
       repo: undefined,
       agent: undefined,
       state: undefined,
+      hide_probes: true,
     });
   });
 

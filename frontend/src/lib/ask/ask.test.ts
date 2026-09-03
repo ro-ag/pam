@@ -175,44 +175,50 @@ describe("ask", () => {
   });
 
   it("counts today's requests by verdict, narrowed to a repo when named", async () => {
+    const filters: Array<{ hide_probes?: boolean }> = [];
     const sources = fakeSources({
-      activityList: async ({ repo }) => ({
-        requests: [
-          {
-            id: "a",
-            capability: "echo",
-            repo: "/Users/me/pam",
-            agent: "claude",
-            state: "done",
-            outcome: "solved",
-            created_ts: NOW - 60,
-          },
-          {
-            id: "b",
-            capability: "flow.run",
-            repo: "/Users/me/other",
-            agent: "codex",
-            state: "refused",
-            outcome: "not_granted",
-            created_ts: NOW - 120,
-          },
-          {
-            id: "c",
-            capability: "echo",
-            repo: "/Users/me/pam",
-            agent: "claude",
-            state: "done",
-            outcome: "solved",
-            created_ts: NOW - 90_000,
-          },
-        ].filter((r) => !repo || r.repo.includes(repo)),
-      }),
+      activityList: async (f) => (
+        filters.push(f),
+        {
+          requests: [
+            {
+              id: "a",
+              capability: "echo",
+              repo: "/Users/me/pam",
+              agent: "claude",
+              state: "done",
+              outcome: "solved",
+              created_ts: NOW - 60,
+            },
+            {
+              id: "b",
+              capability: "flow.run",
+              repo: "/Users/me/other",
+              agent: "codex",
+              state: "refused",
+              outcome: "not_granted",
+              created_ts: NOW - 120,
+            },
+            {
+              id: "c",
+              capability: "echo",
+              repo: "/Users/me/pam",
+              agent: "claude",
+              state: "done",
+              outcome: "solved",
+              created_ts: NOW - 90_000,
+            },
+          ].filter((r) => !f.repo || r.repo.includes(f.repo)),
+        }
+      ),
     });
     const all = await ask("what ran today?", ctx, sources, off);
     expect(all.sentence).toBe("Today 2 requests ran: 1 solved, 1 refused.");
     const pam = await ask("what ran today in pam", ctx, sources, off);
     expect(pam.sentence).toBe("Today 1 request ran in pam: 1 solved.");
     expect(pam.links[0]).toMatchObject({ to: "/activity", search: { repo: "pam" } });
+    // The day's count is agent work, not the GUI polling itself.
+    expect(filters.every((f) => f.hide_probes === true)).toBe(true);
   });
 
   it("describes the loaded model or the idle default", async () => {

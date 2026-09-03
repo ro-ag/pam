@@ -716,7 +716,7 @@ async fn list_requests_filtered_applies_filters_newest_first() {
     // Unfiltered: everything, newest first (id DESC breaks the
     // same-second tie).
     let all = store
-        .list_requests_filtered(None, None, None, None, None)
+        .list_requests_filtered(None, None, None, None, None, false)
         .await
         .unwrap();
     let ids: Vec<&str> = all.iter().map(|row| row.id.as_str()).collect();
@@ -724,14 +724,21 @@ async fn list_requests_filtered_applies_filters_newest_first() {
 
     // By repo.
     let repo_a = store
-        .list_requests_filtered(None, Some("/repo/a"), None, None, None)
+        .list_requests_filtered(None, Some("/repo/a"), None, None, None, false)
         .await
         .unwrap();
     assert_eq!(repo_a.len(), 2);
 
     // By agent and state combined.
     let done_claude = store
-        .list_requests_filtered(None, None, Some("claude"), Some(RequestState::Done), None)
+        .list_requests_filtered(
+            None,
+            None,
+            Some("claude"),
+            Some(RequestState::Done),
+            None,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(done_claude.len(), 1);
@@ -739,10 +746,49 @@ async fn list_requests_filtered_applies_filters_newest_first() {
 
     // No match.
     let none = store
-        .list_requests_filtered(None, Some("/repo/none"), None, None, None)
+        .list_requests_filtered(None, Some("/repo/none"), None, None, None, false)
         .await
         .unwrap();
     assert!(none.is_empty());
+}
+
+#[tokio::test]
+async fn list_requests_filtered_hides_the_gui_own_probes() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("req_1", "echo", "/repo/a", "claude", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_request(
+            "req_2",
+            "admin.activity.list",
+            "/repo/a",
+            "pam-gui",
+            "{}",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .insert_request("req_3", "status", "/repo/a", "pam-gui", "{}", None)
+        .await
+        .unwrap();
+
+    // The observatory watching itself is not activity.
+    let real = store
+        .list_requests_filtered(None, None, None, None, None, true)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = real.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(ids, ["req_1"]);
+
+    // Off by default: the audit view still sees everything.
+    let all = store
+        .list_requests_filtered(None, None, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]
@@ -762,14 +808,14 @@ async fn list_requests_filtered_by_capability() {
         .unwrap();
 
     let flow_runs = store
-        .list_requests_filtered(None, None, None, None, Some("flow.run"))
+        .list_requests_filtered(None, None, None, None, Some("flow.run"), false)
         .await
         .unwrap();
     let ids: Vec<&str> = flow_runs.iter().map(|row| row.id.as_str()).collect();
     assert_eq!(ids, ["req_3", "req_1"]);
 
     let none = store
-        .list_requests_filtered(None, None, None, None, Some("no.such.capability"))
+        .list_requests_filtered(None, None, None, None, Some("no.such.capability"), false)
         .await
         .unwrap();
     assert!(none.is_empty());
@@ -787,14 +833,14 @@ async fn list_requests_filtered_bounds_the_limit() {
 
     // An explicit limit caps the rows.
     let two = store
-        .list_requests_filtered(Some(2), None, None, None, None)
+        .list_requests_filtered(Some(2), None, None, None, None, false)
         .await
         .unwrap();
     assert_eq!(two.len(), 2);
 
     // Zero is clamped up to one instead of returning nothing.
     let one = store
-        .list_requests_filtered(Some(0), None, None, None, None)
+        .list_requests_filtered(Some(0), None, None, None, None, false)
         .await
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -802,7 +848,7 @@ async fn list_requests_filtered_bounds_the_limit() {
     // An absurd limit is clamped to the maximum (observable only as
     // "does not error"; the clamp constant bounds the SQL LIMIT).
     let all = store
-        .list_requests_filtered(Some(u64::MAX), None, None, None, None)
+        .list_requests_filtered(Some(u64::MAX), None, None, None, None, false)
         .await
         .unwrap();
     assert_eq!(all.len(), 5);

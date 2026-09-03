@@ -1073,6 +1073,11 @@ impl Store {
     /// `limit` defaults to [`DEFAULT_REQUEST_LIST_LIMIT`] and is clamped
     /// into `1..=`[`MAX_REQUEST_LIST_LIMIT`], so the query stays bounded
     /// no matter what the caller asks for.
+    ///
+    /// `hide_probes` drops the observatory's own traffic — every
+    /// `admin.*` op and the `status` health probe — so the GUI polling
+    /// itself every few seconds cannot crowd real agent work out of the
+    /// newest-N window. Auditors pass `false` and see everything.
     pub async fn list_requests_filtered(
         &self,
         limit: Option<u64>,
@@ -1080,6 +1085,7 @@ impl Store {
         agent: Option<&str>,
         state: Option<RequestState>,
         capability: Option<&str>,
+        hide_probes: bool,
     ) -> Result<Vec<RequestRow>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let limit = limit
@@ -1097,6 +1103,11 @@ impl Store {
                 args.push(value.to_owned());
                 clauses.push(format!("{column} = ?{}", args.len()));
             }
+        }
+        if hide_probes {
+            // Literal, not a bound arg: the pattern is ours, never the
+            // caller's.
+            clauses.push("capability NOT LIKE 'admin.%' AND capability <> 'status'".to_owned());
         }
         let where_sql = if clauses.is_empty() {
             String::new()

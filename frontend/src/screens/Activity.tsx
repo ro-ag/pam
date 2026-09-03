@@ -434,6 +434,10 @@ export function ActivityScreen() {
         repo: search.repo,
         agent: search.agent,
         state: serverState,
+        // The observatory polls this op (and `status`) every few
+        // seconds; without this the newest-N window fills with the GUI
+        // watching itself and the real lanes wash out.
+        hide_probes: true,
       }),
     // Keep the previous tide on screen while a narrower lens loads.
     placeholderData: (previous) => previous,
@@ -633,7 +637,7 @@ export function ActivityScreen() {
           </div>
           <p className="mt-3 font-data text-xs text-ink-faint">
             {rows.length} request{rows.length === 1 ? "" : "s"} · {lanes.length} lane
-            {lanes.length === 1 ? "" : "s"} · newest first
+            {lanes.length === 1 ? "" : "s"} · newest first · own probes hidden
           </p>
         </>
       )}

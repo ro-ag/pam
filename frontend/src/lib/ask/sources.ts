@@ -25,6 +25,7 @@ export interface Sources {
     agent?: string;
     state?: string;
     capability?: string;
+    hide_probes?: boolean;
   }): Promise<{
     requests: Array<{
       id: string;

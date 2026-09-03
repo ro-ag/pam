@@ -274,6 +274,8 @@ export function activityList(
     agent?: string;
     state?: RequestStateName;
     capability?: string;
+    /** Drop the GUI's own `admin.*` and `status` polling from the list. */
+    hide_probes?: boolean;
   } = {},
 ): Promise<{ requests: ActivityRow[] }> {
   return adminCall("admin.activity.list", filters);

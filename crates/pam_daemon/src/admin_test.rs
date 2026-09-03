@@ -542,6 +542,69 @@ async fn activity_list_filters_by_agent_and_state() {
 }
 
 #[tokio::test]
+async fn activity_list_hides_the_gui_own_probes_when_asked() {
+    timeout(DEADLINE, async {
+        let (store, admin, _events) = service().await;
+        store
+            .insert_request("req_p1", "echo", "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+        store
+            .insert_request("req_p2", "status", "/repo/a", "pam-gui", "{}", None)
+            .await
+            .unwrap();
+        store
+            .insert_request(
+                "req_p3",
+                "admin.callers.list",
+                "/repo/a",
+                "pam-gui",
+                "{}",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_l3",
+                OP_ACTIVITY_LIST,
+                serde_json::json!({ "hide_probes": true }),
+            ))
+            .await;
+
+        let body = expect_result(response, Outcome::Verified);
+        let requests = body["requests"].as_array().unwrap();
+        let ids: Vec<&str> = requests
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["req_p1"]);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn activity_list_refuses_a_non_bool_hide_probes() {
+    timeout(DEADLINE, async {
+        let (_store, admin, _events) = service().await;
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_l4",
+                OP_ACTIVITY_LIST,
+                serde_json::json!({ "hide_probes": "yes" }),
+            ))
+            .await;
+
+        expect_refusal(response, CAUSE_INVALID_ADMIN_ARGS);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn activity_list_refuses_an_unknown_state_filter() {
     timeout(DEADLINE, async {
         let (_store, admin, _events) = service().await;

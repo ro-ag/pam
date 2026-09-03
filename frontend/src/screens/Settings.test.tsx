@@ -108,7 +108,7 @@ beforeEach(() => {
       kind: "not_installed",
       unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
     },
-    note: null,
+    note: "the manager stopped the managed daemon along with its unit; the next pam command starts one lazily",
   });
   mocks.approvalsPending.mockResolvedValue({ pending: [] });
   mocks.activityList.mockResolvedValue({ requests: [] });
@@ -302,7 +302,9 @@ describe("retention", () => {
     const evidence = await screen.findByLabelText("evidence age");
     await waitFor(() => expect((evidence as HTMLSelectElement).value).toBe("90"));
     fireEvent.change(evidence, { target: { value: "forever" } });
-    await waitFor(() => expect(mocks.retentionSet).toHaveBeenCalledWith({ evidence_days: null }));
+    await waitFor(() =>
+      expect(mocks.retentionSet).toHaveBeenCalledWith({ evidence_days: null }),
+    );
     fireEvent.change(screen.getByLabelText("audit age"), { target: { value: "90" } });
     await waitFor(() => expect(mocks.retentionSet).toHaveBeenCalledWith({ audit_days: 90 }));
   });
@@ -327,7 +329,9 @@ describe("retention", () => {
     const prune = await screen.findByRole("button", { name: "Prune now" });
     fireEvent.click(prune);
     await waitFor(() => expect(mocks.retentionPrune).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText(/2 evidence rows \(512 B\) · 0 requests/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/2 evidence rows \(512 B\) · 0 requests/),
+    ).toBeInTheDocument();
   });
 
   it("never pruned yet reads honestly", async () => {
@@ -404,7 +408,10 @@ describe("daemon", () => {
     expect(mocks.serviceUninstall).not.toHaveBeenCalled();
     fireEvent.click(card.getByRole("button", { name: "remove it?" }));
     await waitFor(() => expect(mocks.serviceUninstall).toHaveBeenCalledTimes(1));
-    expect(await card.findByText(/removed · the daemon keeps running/)).toBeInTheDocument();
+    // The module's own note wins over the panel's fallback line.
+    expect(
+      await card.findByText(/the manager stopped the managed daemon along with its unit/),
+    ).toBeInTheDocument();
   });
 
   it("explains an unsupported platform instead of offering buttons", async () => {

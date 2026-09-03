@@ -446,7 +446,8 @@ function DaemonPanel() {
       setServiceFailure(null);
       setServiceNote(null);
     },
-    onSuccess: (reply) => applyService(reply, "removed · the daemon keeps running until it exits"),
+    onSuccess: (reply) =>
+      applyService(reply, "removed · the next pam command starts the daemon lazily"),
     onError: (error) => setServiceFailure(toBridgeFailure(error)),
   });
   const serviceState = service.data?.state;
@@ -459,7 +460,11 @@ function DaemonPanel() {
           ? "not installed"
           : "unsupported";
   const serviceTone =
-    serviceState?.kind === "installed" ? (serviceState.loaded ? "success" : "warning") : "neutral";
+    serviceState?.kind === "installed"
+      ? serviceState.loaded
+        ? "success"
+        : "warning"
+      : "neutral";
   const serviceDetail =
     serviceState === undefined
       ? ""

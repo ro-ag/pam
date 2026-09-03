@@ -1,12 +1,13 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
+import { cn } from "../lib/cn";
 import {
   flowsDelete,
-  flowsGet,
   flowsSave,
   toBridgeFailure,
   type BridgeFailure,
@@ -18,12 +19,18 @@ import {
  * is. No form, no wizard: the file is the contract, and a human editing
  * it should see exactly what the daemon will read.
  *
+ * The text is not this component's to keep. The Flows screen owns one
+ * draft per selected flow and hands it to the canvas and to this
+ * textarea alike, so an edit on either side shows up on the other; what
+ * lives here is the file's own row of verbs — Save, Clone, Delete — and
+ * the refusal the daemon answers them with.
+ *
  * There is no Validate button, deliberately. The daemon is the only
  * validator worth trusting (it is the one that will run this), so Save
  * *is* validation: an invalid flow comes back as a refusal naming the
  * YAML path that offended, rendered as the same FailureNote every other
- * screen uses. A second, client-side opinion could only ever be wrong in
- * a new way.
+ * screen uses. The live check the screen runs between keystrokes only
+ * ever *disables* Save; it never claims a flow is fine.
  *
  * A builtin cannot be edited in place — it ships with pam. Saving one
  * clones it into the library under a new id, which then shadows the
@@ -45,32 +52,36 @@ export function withId(yaml: string, id: string): string {
   return lines.join("\n");
 }
 
-export function FlowEditor({
-  entry,
-  onSaved,
-  onDeleted,
-}: {
+export interface FlowEditorProps {
   entry: FlowListEntry;
+  /** The draft's text, owned by the Flows screen. */
+  yaml: string;
+  onYamlChange: (yaml: string) => void;
+  /** True while the draft is invalid or still being checked. */
+  saveDisabled: boolean;
   onSaved: (id: string) => void;
   onDeleted: () => void;
-}) {
+}
+
+export function FlowEditor({
+  entry,
+  yaml,
+  onYamlChange,
+  saveDisabled,
+  onSaved,
+  onDeleted,
+}: FlowEditorProps) {
   const queryClient = useQueryClient();
-  const detail = useQuery({ queryKey: ["flow", entry.id], queryFn: () => flowsGet(entry.id) });
-  const [yaml, setYaml] = useState("");
   const [cloneId, setCloneId] = useState("");
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
 
   const builtin = entry.source === "builtin";
-  const text = detail.data?.yaml;
 
-  // The textarea follows the selected flow; an edit in progress is not
-  // carried across a selection change, because it would silently belong
-  // to the wrong file.
+  // A clone id or a refusal belongs to the flow it was typed against.
   useEffect(() => {
-    setYaml(text ?? "");
     setCloneId("");
     setFailure(null);
-  }, [text, entry.id]);
+  }, [entry.id]);
 
   const settle = (id: string) => {
     void queryClient.invalidateQueries({ queryKey: ["flows"] });
@@ -97,18 +108,15 @@ export function FlowEditor({
     onError: (error) => setFailure(toBridgeFailure(error)),
   });
 
-  const loadFailure = detail.isError ? toBridgeFailure(detail.error) : null;
   const cloneReady = cloneId.trim().length > 0;
 
   return (
     <div className="space-y-3">
-      {loadFailure && <FailureNote failure={loadFailure} label="flow" />}
-
       <textarea
         aria-label={`${entry.id} yaml`}
         spellCheck={false}
         value={yaml}
-        onChange={(event) => setYaml(event.target.value)}
+        onChange={(event) => onYamlChange(event.target.value)}
         rows={20}
         className="w-full resize-y rounded-card border border-line bg-chrome p-3 font-data text-xs leading-relaxed text-ink-muted"
       />
@@ -125,13 +133,13 @@ export function FlowEditor({
             value={cloneId}
             onChange={(event) => setCloneId(event.target.value)}
             placeholder="new id for your copy"
-            className="h-8 w-48 rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
+            className={cn(fieldClasses, "w-48")}
           />
         )}
 
         <Button
           size="sm"
-          disabled={save.isPending || (builtin && !cloneReady)}
+          disabled={save.isPending || saveDisabled || (builtin && !cloneReady)}
           onClick={() => {
             const id = builtin ? cloneId.trim() : entry.id;
             save.mutate({ id, body: builtin ? withId(yaml, id) : yaml });

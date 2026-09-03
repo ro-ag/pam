@@ -1,17 +1,22 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAppQueryClient } from "../App";
 import type {
   ActivityRow,
   EvidenceContent,
   EvidenceMeta,
   FlowListEntry,
+  FlowNormalizeReply,
   FlowResult,
+  FlowSpec,
+  FlowStep,
   PamEventPayload,
+  RawFlow,
 } from "../lib/ipc";
+import { defaultStep, type CanvasNode } from "./flow-canvas/graph";
 import { withId } from "./FlowEditor";
-import { FlowsScreen } from "./Flows";
+import { CANVAS_QUIET_MS, FlowsScreen, YAML_QUIET_MS } from "./Flows";
 import { flowIdOf } from "./FlowRuns";
 
 /**
@@ -26,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   flowsGet: vi.fn(),
   flowsSave: vi.fn(),
   flowsDelete: vi.fn(),
+  flowsNormalize: vi.fn(),
   flowsRun: vi.fn(),
   callersList: vi.fn(),
   activityList: vi.fn(),
@@ -37,6 +43,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return { ...actual, ...mocks };
+});
+
+// The canvas is real here; only ELK is kept out — a resolved grid stands
+// in for the layout so the bundled engine never loads under jsdom.
+vi.mock("./flow-canvas/layout", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./flow-canvas/layout")>();
+  return {
+    ...actual,
+    autoLayout: vi.fn(async (nodes: CanvasNode[]) =>
+      Object.fromEntries(nodes.map((node, index) => [node.id, { x: index * 300, y: 0 }])),
+    ),
+  };
 });
 
 const nowSec = Math.floor(Date.now() / 1000);
@@ -78,6 +96,55 @@ const FLOWS: FlowListEntry[] = [
     steps: 0,
   }),
 ];
+
+/** The parsed shape of pr-readiness: three commands, a needs edge, a when edge. */
+const SPEC: FlowSpec = {
+  id: "pr-readiness",
+  name: "PR readiness",
+  description: "Everything I check before you open a pull request.",
+  inputs: {},
+  steps: [
+    { ...defaultStep("fmt", "command"), action: { kind: "command", argv: ["cargo", "fmt"] } },
+    {
+      ...defaultStep("clippy", "command"),
+      action: { kind: "command", argv: ["cargo", "clippy"] },
+      needs: ["fmt"],
+    },
+    {
+      ...defaultStep("tests", "command"),
+      action: { kind: "command", argv: ["cargo", "test"] },
+      when: { failed: "clippy" },
+    },
+  ],
+};
+
+/** What the daemon would resolve a raw file shape into, defaults filled. */
+function resolve(raw: RawFlow): FlowSpec {
+  return {
+    id: raw.id,
+    name: raw.name,
+    description: raw.description ?? "",
+    inputs: Object.fromEntries(
+      Object.entries(raw.inputs ?? {}).map(([name, input]) => [
+        name,
+        { description: input.description ?? "", default: input.default ?? null },
+      ]),
+    ),
+    steps: raw.steps.map((step): FlowStep => ({
+      ...defaultStep(step.id, step.run ? "command" : "connector"),
+      ...(step.run ? { action: { kind: "command", argv: step.run } } : {}),
+      needs: step.needs ?? [],
+      when: step.when ?? "needs_succeeded",
+    })),
+  };
+}
+
+/** The canonical YAML the normalizer answers a raw flow with. */
+function canonical(raw: RawFlow): string {
+  return `schema: 1\nid: ${raw.id}\nname: ${raw.name}\n# steps: ${raw.steps
+    .map((step) => step.id)
+    .join(", ")}\n`;
+}
 
 const VERDICT: FlowResult = {
   flow: { id: "pr-readiness", name: "PR readiness", source: "builtin", digest: "sha256:abcd" },
@@ -150,7 +217,16 @@ beforeEach(() => {
       ...(FLOWS.find((flow) => flow.id === id) ?? FLOWS[0]),
       yaml: `id: ${id}\nname: PR readiness\nsteps: []\n`,
       normalized_yaml: `id: ${id}\n`,
+      flow: id === "broken" ? null : { ...SPEC, id },
     }),
+  );
+  mocks.flowsNormalize.mockImplementation(
+    (input: { yaml: string } | { flow: RawFlow }): Promise<FlowNormalizeReply> =>
+      Promise.resolve(
+        "flow" in input
+          ? { valid: true, yaml: canonical(input.flow), flow: resolve(input.flow), digest: "d" }
+          : { valid: true, yaml: input.yaml, flow: SPEC, digest: "d" },
+      ),
   );
   mocks.flowsSave.mockResolvedValue(entry({ id: "mine", source: "library" }));
   mocks.flowsDelete.mockResolvedValue({ id: "mine", revealed_builtin: false });
@@ -194,8 +270,31 @@ async function editorFor(id: string): Promise<HTMLTextAreaElement> {
 
 /** Picks a flow off the shelf and waits for its editor to follow. */
 async function pick(id: string) {
-  fireEvent.click(await screen.findByText(id));
+  const library = within(await screen.findByLabelText("flow library"));
+  fireEvent.click(library.getByText(id));
   return editorFor(id);
+}
+
+/** A step's card on the canvas. */
+async function nodeFor(id: string): Promise<HTMLElement> {
+  return screen.findByLabelText(`step ${id}`);
+}
+
+/** Lets a debounce elapse and the reply land. */
+async function quiet(ms: number) {
+  await act(async () => {
+    vi.advanceTimersByTime(ms);
+  });
+}
+
+/** Starts a run of the selected flow from its card and waits for the ticket. */
+async function startRun() {
+  const card = within(await screen.findByLabelText("run this flow"));
+  fireEvent.change(card.getByLabelText("repo path"), {
+    target: { value: "/Users/dev/work/pam" },
+  });
+  fireEvent.click(card.getByRole("button", { name: "Run" }));
+  await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
 }
 
 describe("the library column", () => {
@@ -236,7 +335,10 @@ describe("the YAML tab", () => {
     await pick("mine");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(mocks.flowsSave).toHaveBeenCalledWith("mine", "id: mine\nname: PR readiness\nsteps: []\n"),
+      expect(mocks.flowsSave).toHaveBeenCalledWith(
+        "mine",
+        "id: mine\nname: PR readiness\nsteps: []\n",
+      ),
     );
   });
 
@@ -287,7 +389,9 @@ describe("the YAML tab", () => {
   it("rewrites only the top-level id line when cloning", () => {
     expect(withId("id: a\nname: A\n", "b")).toBe("id: b\nname: A\n");
     expect(withId("name: A\n", "b")).toBe("id: b\nname: A\n");
-    expect(withId("id: a\nsteps:\n  - id: inner\n", "b")).toBe("id: b\nsteps:\n  - id: inner\n");
+    expect(withId("id: a\nsteps:\n  - id: inner\n", "b")).toBe(
+      "id: b\nsteps:\n  - id: inner\n",
+    );
   });
 });
 
@@ -411,5 +515,246 @@ describe("the Runs tab", () => {
     await editorFor("pr-readiness");
     fireEvent.click(screen.getByRole("button", { name: "runs" }));
     expect(await screen.findByText(/This flow has not run yet/)).toBeInTheDocument();
+  });
+});
+
+describe("the canvas tab", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("opens on the canvas tab with one node per step", async () => {
+    await renderFlows();
+    const tabs = within(screen.getByRole("group", { name: "flow view" }));
+    expect(tabs.getAllByRole("button").map((tab) => tab.textContent)).toEqual([
+      "canvas",
+      "yaml",
+      "runs",
+    ]);
+    expect(tabs.getByRole("button", { name: "canvas" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    for (const [id, order] of [
+      ["fmt", "1"],
+      ["clippy", "2"],
+      ["tests", "3"],
+    ]) {
+      expect(within(await nodeFor(id)).getByLabelText(`order ${order}`)).toHaveTextContent(
+        order,
+      );
+    }
+    expect(screen.getByLabelText("inspector")).toBeInTheDocument();
+    // The editor and the run card sit under the canvas too: one draft, two readings.
+    expect(screen.getByLabelText("pr-readiness yaml")).toBeInTheDocument();
+    expect(screen.getByLabelText("run this flow")).toBeInTheDocument();
+    expect(mocks.flowsNormalize).not.toHaveBeenCalled();
+  });
+
+  it("a canvas edit normalizes and rewrites the yaml tab's text", async () => {
+    await renderFlows();
+    await nodeFor("fmt");
+    fireEvent.click(screen.getByRole("button", { name: "Add command" }));
+    // The node is there at once; the daemon is asked only after the quiet.
+    expect(await nodeFor("step-1")).toBeInTheDocument();
+    expect(screen.getByLabelText("draft status")).toHaveTextContent("unsaved");
+    expect(mocks.flowsNormalize).not.toHaveBeenCalled();
+
+    await quiet(CANVAS_QUIET_MS);
+    await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1));
+    const sent = mocks.flowsNormalize.mock.calls[0][0] as { flow: RawFlow };
+    expect(sent.flow.schema).toBe(1);
+    expect(sent.flow.steps.map((step) => step.id)).toEqual([
+      "fmt",
+      "clippy",
+      "tests",
+      "step-1",
+    ]);
+    expect(sent.flow.steps[3].run).toEqual(["git", "status"]);
+    expect(sent.flow.steps[3]).not.toHaveProperty("action");
+    expect(sent.flow.steps[1].needs).toEqual(["fmt"]);
+    expect(sent.flow.steps[2].when).toEqual({ failed: "clippy" });
+
+    fireEvent.click(screen.getByRole("button", { name: "yaml" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("pr-readiness yaml")).toHaveValue(canonical(sent.flow)),
+    );
+    // The canvas keeps the resolved reply, not its own guess.
+    fireEvent.click(screen.getByRole("button", { name: "canvas" }));
+    expect(await nodeFor("step-1")).toBeInTheDocument();
+    expect(screen.getByLabelText("draft status")).toHaveTextContent("Save writes it");
+  });
+
+  it("a yaml edit re-parses into the canvas after the debounce", async () => {
+    await renderFlows();
+    await pick("mine");
+    const typed = "id: mine\nname: Mine\nsteps:\n  - id: extra\n    run: [git, log]\n";
+    mocks.flowsNormalize.mockResolvedValue({
+      valid: true,
+      yaml: "schema: 1\nid: mine\n# canonical\n",
+      flow: {
+        ...SPEC,
+        id: "mine",
+        steps: [
+          {
+            ...defaultStep("extra", "command"),
+            action: { kind: "command", argv: ["git", "log"] },
+          },
+        ],
+      },
+      digest: "d2",
+    });
+    fireEvent.change(screen.getByLabelText("mine yaml"), { target: { value: typed } });
+    expect(screen.getByLabelText("draft status")).toHaveTextContent("checking the flow…");
+
+    await quiet(YAML_QUIET_MS - 1);
+    expect(mocks.flowsNormalize).not.toHaveBeenCalled();
+    await quiet(1);
+    await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledWith({ yaml: typed }));
+
+    expect(await nodeFor("extra")).toBeInTheDocument();
+    expect(screen.queryByLabelText("step fmt")).toBeNull();
+    // The human's text is theirs until Save; the reply never rewrites it.
+    expect(screen.getByLabelText("mine yaml")).toHaveValue(typed);
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
+  it("switching to the canvas flushes a pending yaml check and drops stale replies", async () => {
+    await renderFlows();
+    await pick("mine");
+    fireEvent.click(screen.getByRole("button", { name: "yaml" }));
+    let answer: (reply: FlowNormalizeReply) => void = () => {};
+    mocks.flowsNormalize.mockImplementationOnce(
+      () =>
+        new Promise<FlowNormalizeReply>((resolvePromise) => {
+          answer = resolvePromise;
+        }),
+    );
+    fireEvent.change(screen.getByLabelText("mine yaml"), { target: { value: "id: mine\n" } });
+    expect(mocks.flowsNormalize).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "canvas" }));
+    expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1);
+
+    // A newer edit lands while the first answer is still out: when that
+    // first answer finally arrives it is ignored, and only the second counts.
+    fireEvent.click(screen.getByRole("button", { name: "Add command" }));
+    await quiet(CANVAS_QUIET_MS);
+    await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByLabelText("draft status")).toHaveTextContent("Save"),
+    );
+    await act(async () => {
+      answer({
+        valid: false,
+        error: { path: "steps[0].run", message: "stale answer, must be dropped" },
+      });
+    });
+    expect(screen.queryByText(/stale answer/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
+  it("an invalid reply marks the node and disables Save", async () => {
+    await renderFlows();
+    await pick("mine");
+    mocks.flowsNormalize.mockResolvedValue({
+      valid: false,
+      error: { path: "steps[1].run[0]", message: "shells are refused" },
+    });
+    fireEvent.change(screen.getByLabelText("mine yaml"), {
+      target: { value: "id: mine\nsteps:\n  - run: [bash]\n" },
+    });
+    await quiet(YAML_QUIET_MS);
+    await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1));
+
+    const clippy = await nodeFor("clippy");
+    await waitFor(() =>
+      expect(within(clippy).getByLabelText("validation marker")).toHaveAttribute(
+        "title",
+        "shells are refused",
+      ),
+    );
+    expect(clippy.className).toContain("ring-danger");
+    expect(within(await nodeFor("fmt")).queryByLabelText("validation marker")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByLabelText("draft status")).toHaveTextContent("will not run as written");
+
+    // A flow-level path has no node to sit on: it is said above the canvas.
+    mocks.flowsNormalize.mockResolvedValue({
+      valid: false,
+      error: { path: "id", message: "ids are [a-z0-9-]" },
+    });
+    fireEvent.change(screen.getByLabelText("mine yaml"), { target: { value: "id: Mine!\n" } });
+    await quiet(YAML_QUIET_MS);
+    // Said above the canvas, and again in the inspector's own note.
+    expect(await screen.findAllByText(/flow · ids are \[a-z0-9-\]/)).toHaveLength(2);
+    expect(within(await nodeFor("clippy")).queryByLabelText("validation marker")).toBeNull();
+  });
+
+  it("run notes paint rims and the verdict settles them", async () => {
+    await renderFlows();
+    await nodeFor("fmt");
+    await startRun();
+
+    act(() =>
+      feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: running (1/3)" } }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("step fmt").className).toContain("animate-breathe"),
+    );
+    act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: succeeded" } }));
+    act(() =>
+      feed({ ticket: "req_run", event: { kind: "progress", note: "queued · nothing" } }),
+    );
+    act(() =>
+      feed({ ticket: "req_run", event: { kind: "progress", note: "clippy: running (2/3)" } }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("step fmt").className).toContain("ring-success");
+      expect(screen.getByLabelText("step clippy").className).toContain("animate-breathe");
+    });
+    expect(screen.getByLabelText("step tests").className).not.toContain("ring-2");
+
+    // Done: the verdict from evidence paints the final rims and the outcome chip.
+    act(() => feed({ ticket: "req_run", event: { kind: "done" } }));
+    await screen.findByLabelText("run verdict");
+    await waitFor(() => {
+      expect(screen.getByLabelText("step tests").className).toContain("ring-danger");
+      expect(screen.getByLabelText("step fmt").className).toContain("ring-success");
+    });
+    expect(screen.getByLabelText("step clippy").className).not.toContain("ring-2");
+    const verdictFrame = within(screen.getByLabelText("verdict frame"));
+    expect(verdictFrame.getByText("verified").className).not.toContain("opacity-40");
+    expect(verdictFrame.getByText("blocked").className).toContain("opacity-40");
+  });
+
+  it("editing after a run clears the rims", async () => {
+    await renderFlows();
+    await nodeFor("fmt");
+    await startRun();
+    act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: succeeded" } }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("step fmt").className).toContain("ring-success"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add command" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("step fmt").className).not.toContain("ring-success"),
+    );
+
+    // The same from the textarea.
+    act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: failed" } }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("step fmt").className).toContain("ring-danger"),
+    );
+    fireEvent.change(screen.getByLabelText("pr-readiness yaml"), {
+      target: { value: "id: pr-readiness\n" },
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("step fmt").className).not.toContain("ring-danger"),
+    );
   });
 });

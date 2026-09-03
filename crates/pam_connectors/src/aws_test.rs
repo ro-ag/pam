@@ -307,14 +307,7 @@ async fn verify_reports_the_account_and_the_arn() {
     ) else {
         return;
     };
-    let report = verify(
-        ConnectorId::Aws,
-        &connection(None),
-        &FakeTransport::new(),
-        deadline(),
-    )
-    .await
-    .unwrap();
+    let report = verify_aws(&connection(None)).await.unwrap();
     clear_binary_for_tests();
     assert_eq!(
         report.detail,
@@ -327,14 +320,7 @@ async fn verify_treats_a_non_zero_exit_as_a_credential_problem() {
     let Some(_dir) = fake_aws(r"printf '%s' 'Unable to locate credentials' >&2; exit 255") else {
         return;
     };
-    let error = verify(
-        ConnectorId::Aws,
-        &connection(None),
-        &FakeTransport::new(),
-        deadline(),
-    )
-    .await
-    .unwrap_err();
+    let error = verify_aws(&connection(None)).await.unwrap_err();
     clear_binary_for_tests();
     assert_eq!(error, ConnectorError::Auth);
 }
@@ -344,14 +330,7 @@ async fn verify_refuses_an_identity_without_an_account_or_an_arn() {
     let Some(_dir) = fake_aws(r#"printf '%s' '{"UserId":"A"}'"#) else {
         return;
     };
-    let error = verify(
-        ConnectorId::Aws,
-        &connection(None),
-        &FakeTransport::new(),
-        deadline(),
-    )
-    .await
-    .unwrap_err();
+    let error = verify_aws(&connection(None)).await.unwrap_err();
     clear_binary_for_tests();
     assert_eq!(error.cause(), "connector_bad_response");
 }
@@ -412,6 +391,20 @@ async fn cli(
         }
     }
     call_once(conn, args, name).await
+}
+
+/// [`verify`] through the fake binary, with the same `ETXTBSY` retry as
+/// [`cli`] — both spawn the script `fake_aws` just wrote.
+async fn verify_aws(conn: &Connection) -> Result<crate::VerifyReport, ConnectorError> {
+    for _ in 0..50 {
+        match verify(ConnectorId::Aws, conn, &FakeTransport::new(), deadline()).await {
+            Err(ConnectorError::Cli(detail)) if detail.contains("Text file busy") => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => return other,
+        }
+    }
+    verify(ConnectorId::Aws, conn, &FakeTransport::new(), deadline()).await
 }
 
 async fn call_once(

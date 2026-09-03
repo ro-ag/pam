@@ -14,6 +14,7 @@ pub mod model_service;
 pub mod policy;
 pub mod queue;
 pub mod runtime_dir;
+pub mod secrets;
 pub mod transport;
 
 #[cfg(test)]
@@ -40,3 +41,5 @@ mod policy_test;
 mod queue_test;
 #[cfg(test)]
 mod runtime_dir_test;
+#[cfg(test)]
+mod secrets_test;

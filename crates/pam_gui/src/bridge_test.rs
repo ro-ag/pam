@@ -16,7 +16,7 @@ fn every_daemon_admin_op_is_whitelisted() {
     }
     assert_eq!(
         ADMIN_OPS.len(),
-        9 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
+        10 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
             + pam_daemon::admin_logs::LOG_ADMIN_OPS.len()
             + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
             + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len()

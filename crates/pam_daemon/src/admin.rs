@@ -169,6 +169,11 @@ pub const OP_ACTIVITY_LIST: &str = "admin.activity.list";
 /// `admin.callers.list` → the observed agent+repo registry.
 pub const OP_CALLERS_LIST: &str = "admin.callers.list";
 
+/// `admin.audit.request { request_id }` — every audit row the daemon
+/// wrote for one request, oldest first. Read-only; the GUI quotes
+/// refusals with it ("why was that refused").
+pub const OP_AUDIT_REQUEST: &str = "admin.audit.request";
+
 /// `audit.action` recording an admin operation's terminal state
 /// (success or refusal; the tripwire has its own action).
 pub const ACTION_ADMIN: &str = "admin";
@@ -411,6 +416,7 @@ impl AdminService {
             OP_APPROVALS_RESOLVE => self.approvals_resolve(args).await,
             OP_ACTIVITY_LIST => self.activity_list(args).await,
             OP_CALLERS_LIST => self.callers_list().await,
+            OP_AUDIT_REQUEST => self.audit_request(args).await,
             unknown => Err(AdminRefusal {
                 cause: CAUSE_UNKNOWN_ADMIN_OP,
                 detail: format!("no admin operation named {unknown:?} exists"),
@@ -674,6 +680,49 @@ impl AdminService {
             outcome: Outcome::Verified,
             body: json!({ "callers": callers }),
             audit: json!({ "op": OP_CALLERS_LIST }),
+        })
+    }
+
+    /// The audit trail of one request, oldest first. Unknown ids answer
+    /// an empty list: a pruned or mistyped id is a state to render, not
+    /// a refusal.
+    async fn audit_request(&self, args: &serde_json::Value) -> Result<AdminOk, AdminRefusal> {
+        let request_id = args
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: "request_id (non-empty string) is required".to_owned(),
+                recovery: RECOVERY_FIX_ARGS,
+            })?;
+        let rows: Vec<serde_json::Value> = self
+            .store
+            .audit_for_request(request_id)
+            .await?
+            .into_iter()
+            .map(|row| {
+                // Parsed back to JSON when it is JSON, so the GUI reads
+                // `detail.cause` instead of a doubly-encoded string; a
+                // free-form detail survives as the raw string.
+                let detail = row.detail.map(|raw| {
+                    serde_json::from_str::<serde_json::Value>(&raw)
+                        .unwrap_or(serde_json::Value::String(raw))
+                });
+                json!({
+                    "id": row.id,
+                    "action": row.action,
+                    "decision": row.decision.as_str(),
+                    "actor": row.actor.as_str(),
+                    "detail": detail,
+                    "ts": row.ts,
+                })
+            })
+            .collect();
+        Ok(AdminOk {
+            outcome: Outcome::Verified,
+            body: json!({ "request_id": request_id, "rows": rows }),
+            audit: json!({ "op": OP_AUDIT_REQUEST, "request_id": request_id }),
         })
     }
 

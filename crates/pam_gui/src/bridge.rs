@@ -36,8 +36,9 @@ use std::time::Duration;
 
 use pam_client::client::{self, RequestError};
 use pam_daemon::admin::{
-    OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_CALLERS_LIST, OP_GRANTS_ADD,
-    OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET, OP_PROFILE_SET,
+    OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_AUDIT_REQUEST,
+    OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET,
+    OP_PROFILE_SET,
 };
 use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
 use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
@@ -69,8 +70,8 @@ const CONNECTOR_TEST_DEADLINE_MS: u64 = 15_000;
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The core admin surface (`pam_daemon::admin`): profile, grants,
-/// approvals, activity, callers.
-const CORE_ADMIN_OPS: [&str; 9] = [
+/// approvals, activity, callers, audit.
+const CORE_ADMIN_OPS: [&str; 10] = [
     OP_PROFILE_GET,
     OP_PROFILE_SET,
     OP_GRANTS_LIST,
@@ -80,6 +81,7 @@ const CORE_ADMIN_OPS: [&str; 9] = [
     OP_APPROVALS_RESOLVE,
     OP_ACTIVITY_LIST,
     OP_CALLERS_LIST,
+    OP_AUDIT_REQUEST,
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model,

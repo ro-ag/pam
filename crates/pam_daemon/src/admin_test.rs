@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
-use pam_store::{Actor, ApprovalResolution, Decision, RequestState, Store, StoreError};
+use pam_store::{Actor, ApprovalResolution, AuditEntry, Decision, RequestState, Store, StoreError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -11,8 +11,8 @@ use crate::admin::{
     ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService,
     CAUSE_ADMIN_DENIED, CAUSE_ALREADY_GRANTED, CAUSE_INVALID_ADMIN_ARGS, CAUSE_NO_ACTIVE_GRANT,
     CAUSE_NO_PENDING_APPROVAL, CAUSE_UNKNOWN_ADMIN_OP, OP_ACTIVITY_LIST, OP_APPROVALS_PENDING,
-    OP_APPROVALS_RESOLVE, OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST, OP_GRANTS_REVOKE,
-    OP_PROFILE_GET, OP_PROFILE_SET,
+    OP_APPROVALS_RESOLVE, OP_AUDIT_REQUEST, OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST,
+    OP_GRANTS_REVOKE, OP_PROFILE_GET, OP_PROFILE_SET,
 };
 use crate::approval::{ApprovalOutcome, ApprovalService};
 use crate::connector_service::ConnectorService;
@@ -578,6 +578,113 @@ async fn callers_list_returns_the_observed_registry() {
         let body = expect_result(response, Outcome::Verified);
         let callers = body["callers"].as_array().unwrap();
         assert_eq!(callers.len(), 2);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn audit_request_lists_a_requests_rows_oldest_first() {
+    timeout(DEADLINE, async {
+        let (store, admin, _events) = service().await;
+        store
+            .insert_request("req_ad1", "repo.push", "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+        // A plain-string detail first, so the handler's JSON parse has a
+        // row that is not JSON to pass through untouched.
+        store
+            .append_audit(
+                "req_ad1",
+                "enqueue",
+                Decision::Allow,
+                Actor::System,
+                Some("queued behind the gate"),
+            )
+            .await
+            .unwrap();
+        store
+            .finish_request(
+                "req_ad1",
+                RequestState::Refused,
+                Some("not_granted"),
+                AuditEntry {
+                    action: "execute",
+                    decision: Decision::Refuse,
+                    actor: Actor::Policy,
+                    detail: Some(
+                        r#"{"cause":"not_granted","detail":"repo.push is not granted","recovery":"Grant it in Settings › Security."}"#,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_q1",
+                OP_AUDIT_REQUEST,
+                serde_json::json!({ "request_id": "req_ad1" }),
+            ))
+            .await;
+
+        let body = expect_result(response, Outcome::Verified);
+        assert_eq!(body["request_id"], "req_ad1");
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["action"], "enqueue");
+        assert_eq!(rows[0]["decision"], "allow");
+        assert_eq!(rows[0]["actor"], "system");
+        assert_eq!(
+            rows[0]["detail"], "queued behind the gate",
+            "a non-JSON detail stays the raw string"
+        );
+        let last = rows.last().unwrap();
+        assert!(
+            last["id"].as_i64().unwrap() > rows[0]["id"].as_i64().unwrap(),
+            "oldest first"
+        );
+        assert_eq!(last["action"], "execute");
+        assert_eq!(last["decision"], "refuse");
+        assert_eq!(last["actor"], "policy");
+        assert_eq!(last["detail"]["cause"], "not_granted");
+        assert!(last["ts"].as_i64().unwrap() > 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn audit_request_answers_empty_for_an_unknown_id_and_refuses_a_missing_one() {
+    timeout(DEADLINE, async {
+        let (_store, admin, _events) = service().await;
+        let response = admin
+            .handle(&admin_envelope(
+                "req_q2",
+                OP_AUDIT_REQUEST,
+                serde_json::json!({ "request_id": "req_nope" }),
+            ))
+            .await;
+        let body = expect_result(response, Outcome::Verified);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_q3",
+                OP_AUDIT_REQUEST,
+                serde_json::json!({}),
+            ))
+            .await;
+        expect_refusal(response, CAUSE_INVALID_ADMIN_ARGS);
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_q4",
+                OP_AUDIT_REQUEST,
+                serde_json::json!({ "request_id": "" }),
+            ))
+            .await;
+        expect_refusal(response, CAUSE_INVALID_ADMIN_ARGS);
     })
     .await
     .unwrap();

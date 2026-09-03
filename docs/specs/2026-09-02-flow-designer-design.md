@@ -105,9 +105,10 @@ screen): a toolbar row, then the canvas (fills the column, min height
 `lg` and above, stacked below the canvas under it.
 
 Toolbar: left `Add command`, `Add connector` (ghost, `sm`); right
-`Tidy`, `Fit` (ghost), `Delete` (ConfirmButton, danger, enabled with a
-selection). Save / Clone / Delete of the whole flow stay in FlowEditor's
-row, which now renders under both tabs.
+`Tidy`, `Fit` (ghost), `Remove` (ConfirmButton, danger, enabled with a
+selected step or edge; removes that step and its edges, or that edge).
+Save / Clone / Delete of the whole flow stay in FlowEditor's row, which
+now renders under both tabs.
 
 Inspector, per selected node:
 
@@ -148,9 +149,8 @@ it from `admin.flows.get`.
   (source) sides. Applied to nodes without a stored position on open,
   and to every node on `Tidy` (which also clears the stored positions).
 - Snap grid 16 px; minimap bottom-right (nodes filled by kind);
-  xyflow's Controls and attribution hidden (the toolbar and the
-  keyboard cover them: `Fit` = `Ctrl/Cmd+0` handled by the toolbar
-  button only, no global shortcut in this plan).
+  xyflow's Controls and attribution hidden; the toolbar's `Fit` covers
+  fit-to-view and no keyboard shortcut is added in this plan.
 
 ## Daemon
 

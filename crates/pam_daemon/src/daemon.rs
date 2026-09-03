@@ -576,14 +576,13 @@ pub async fn run_daemon_with(
     let models = ModelService::new(Arc::clone(&store)).await?;
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let secrets = open_secret_store(config.secret_backend);
-    if let Some(secrets) = secrets.as_ref() {
-        // macOS only inside: the first keychain touch of a session can be
-        // slow, and paying for it at boot keeps it off the first flow step.
-        secrets.warm();
-    }
+    // macOS only inside: the first keychain touch of a session can be
+    // slow, and paying for it right after boot keeps it off the first
+    // flow step.
+    secrets.warm();
     let connectors = Arc::new(ConnectorService::from_parts(
         Arc::clone(&store),
-        secrets,
+        Some(secrets),
         open_http_transport(config.http_transport),
     ));
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
@@ -653,26 +652,19 @@ pub async fn run_daemon_with(
     })
 }
 
-/// Opens the connector credential store for this boot.
+/// The connector credential store for this boot.
 ///
-/// A keychain that will not open is not a boot failure: the daemon serves,
-/// the Connectors screen still draws (saying the store is unavailable), and
-/// anything that needs a credential refuses with the store's own cause. The
-/// reason is logged once, here.
-fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Option<Arc<SecretStore>> {
-    if let Some(backend) = injected {
-        return Some(Arc::new(SecretStore::new(backend)));
-    }
-    match SecretStore::native() {
-        Ok(store) => Some(Arc::new(store)),
-        Err(error) => {
-            tracing::warn!(
-                cause = error.cause(),
-                "the native credential store did not open; connector credentials are unavailable"
-            );
-            None
-        }
-    }
+/// The native store opens lazily, off the async threads, on its first
+/// use (see [`SecretStore::native`]) — boot never touches the keychain
+/// or the Secret Service bus. A keychain that then will not open is not
+/// a boot failure either: the daemon serves, the Connectors screen still
+/// draws (saying the store is unavailable), and anything that needs a
+/// credential refuses with the store's own cause.
+fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Arc<SecretStore> {
+    Arc::new(match injected {
+        Some(backend) => SecretStore::new(backend),
+        None => SecretStore::native(),
+    })
 }
 
 /// Builds the transport connector calls run over.

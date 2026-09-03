@@ -131,7 +131,10 @@ export type AdminOp =
   | "admin.flows.settings.set"
   | "admin.connectors.list"
   | "admin.connectors.configure"
-  | "admin.connectors.test";
+  | "admin.connectors.test"
+  | "admin.retention.get"
+  | "admin.retention.set"
+  | "admin.retention.prune";
 
 /** One generic admin call; prefer the typed wrappers below. */
 export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): Promise<T> {
@@ -920,6 +923,60 @@ export function flowsSettingsGet(): Promise<FlowSettings> {
 /** Replaces the named lists; an omitted key is left exactly as it is. */
 export function flowsSettingsSet(patch: Partial<FlowSettings>): Promise<FlowSettings> {
   return adminCall("admin.flows.settings.set", { ...patch });
+}
+
+// --- retention -------------------------------------------------------------
+
+/**
+ * The retention surface (`pam_daemon::admin_retention`). Deciding how
+ * long the audit trail lives is the most human act the daemon has, so
+ * these are GUI-only by construction — no agent, CLI, or MCP call can
+ * shorten its own record.
+ *
+ * `null` in either window means *forever*: nothing of that kind is ever
+ * pruned. It is the shipped default, so an upgrade loses nothing until a
+ * human picks a window here.
+ */
+
+/** The two age windows, in whole days; `null` is forever. */
+export interface RetentionSettings {
+  evidence_days: number | null;
+  audit_days: number | null;
+}
+
+/** What one prune pass removed, as the daemon last recorded it. */
+export interface PruneReport {
+  /** Unix seconds the pass finished. */
+  ts: number;
+  evidence_rows: number;
+  evidence_bytes: number;
+  requests: number;
+  audit_rows: number;
+}
+
+/** The settings plus the last pass — what `get` and `set` both answer. */
+export interface RetentionState extends RetentionSettings {
+  last_run: PruneReport | null;
+}
+
+export function retentionGet(): Promise<RetentionState> {
+  return adminCall("admin.retention.get");
+}
+
+/**
+ * Saves one or both windows and prunes at once, answering the stored
+ * settings and that fresh run. An omitted key is left exactly as it is;
+ * an explicit `null` sets that window back to forever. Evidence may not
+ * outlive audit rows — the daemon refuses that order violation rather
+ * than the GUI pre-filtering the choices.
+ */
+export function retentionSet(patch: Partial<RetentionSettings>): Promise<RetentionState> {
+  return adminCall("admin.retention.set", { ...patch });
+}
+
+/** Runs one prune pass now, on the stored windows, and reports it. */
+export function retentionPrune(): Promise<PruneReport> {
+  return adminCall("admin.retention.prune");
 }
 
 // --- connectors ------------------------------------------------------------

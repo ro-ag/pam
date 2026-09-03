@@ -18,13 +18,16 @@ fn tauri_conf() -> serde_json::Value {
 
 /// Every bridge command the frontend may invoke: `build.rs` mints its
 /// `allow-<command>` permission and the main-window capability grants it.
-const BRIDGE_COMMANDS: [&str; 6] = [
+const BRIDGE_COMMANDS: [&str; 9] = [
     "daemon_status",
     "admin_call",
     "request_capability",
     "daemon_stop",
     "events_subscribe",
     "read_daemon_log",
+    "service_status",
+    "service_install",
+    "service_uninstall",
 ];
 
 #[test]

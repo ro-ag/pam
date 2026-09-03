@@ -21,12 +21,16 @@ import {
   retentionGet,
   retentionPrune,
   retentionSet,
+  serviceInstall,
+  serviceStatus,
+  serviceUninstall,
   toBridgeFailure,
   type BridgeFailure,
   type GrantRow,
   type Profile,
   type PruneReport,
   type RetentionSettings,
+  type ServiceReport,
 } from "../lib/ipc";
 import {
   applyTheme,
@@ -392,6 +396,11 @@ function statusField(status: Record<string, unknown> | null | undefined, key: st
   return "—";
 }
 
+/**
+ * The daemon card: live status facts, stop/restart, and the login-start
+ * row — whether the platform's user-scope unit (LaunchAgent, systemd
+ * user unit, scheduled task) is installed, with Install / Remove.
+ */
 function DaemonPanel() {
   const queryClient = useQueryClient();
   const status = useQuery({
@@ -413,6 +422,50 @@ function DaemonPanel() {
     onError: (error) => setFailure(toBridgeFailure(error)),
     onSettled: refreshSoon,
   });
+
+  const service = useQuery({ queryKey: ["daemon", "service"], queryFn: serviceStatus });
+  const [serviceNote, setServiceNote] = useState<string | null>(null);
+  const [serviceFailure, setServiceFailure] = useState<BridgeFailure | null>(null);
+  const applyService = (reply: ServiceReport, fallback: string) => {
+    queryClient.setQueryData(["daemon", "service"], reply);
+    setServiceNote(reply.note ?? fallback);
+  };
+  const install = useMutation({
+    mutationFn: () => serviceInstall(),
+    onMutate: () => {
+      setServiceFailure(null);
+      setServiceNote(null);
+    },
+    onSuccess: (reply) => applyService(reply, "installed · the daemon now starts at login"),
+    onError: (error) => setServiceFailure(toBridgeFailure(error)),
+    onSettled: refreshSoon,
+  });
+  const remove = useMutation({
+    mutationFn: () => serviceUninstall(),
+    onMutate: () => {
+      setServiceFailure(null);
+      setServiceNote(null);
+    },
+    onSuccess: (reply) => applyService(reply, "removed · the daemon keeps running until it exits"),
+    onError: (error) => setServiceFailure(toBridgeFailure(error)),
+  });
+  const serviceState = service.data?.state;
+  const serviceLabel =
+    serviceState === undefined
+      ? "—"
+      : serviceState.kind === "installed"
+        ? `installed, ${serviceState.loaded ? "loaded" : "not loaded"}`
+        : serviceState.kind === "not_installed"
+          ? "not installed"
+          : "unsupported";
+  const serviceTone =
+    serviceState?.kind === "installed" ? (serviceState.loaded ? "success" : "warning") : "neutral";
+  const serviceDetail =
+    serviceState === undefined
+      ? ""
+      : serviceState.kind === "unsupported"
+        ? serviceState.reason
+        : serviceState.unit;
 
   const connected = status.data?.connected === true;
   const body = status.data?.status;
@@ -452,6 +505,36 @@ function DaemonPanel() {
           ))}
         </dl>
       )}
+
+      {/* Login-start: the unit is a property of this machine's session,
+          not of the running daemon, so the row stands whether or not the
+          daemon answers — only a dead bridge hides it. */}
+      {!bridgeDown && (
+        <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <p className="font-data text-xs text-ink-faint">start at login</p>
+            <p className="truncate font-data text-xs text-ink-muted" title={serviceDetail}>
+              {serviceDetail || "—"}
+            </p>
+          </div>
+          <Badge tone={serviceTone}>{serviceLabel}</Badge>
+          {serviceState?.kind === "not_installed" && (
+            <Button size="sm" disabled={install.isPending} onClick={() => install.mutate()}>
+              Install
+            </Button>
+          )}
+          {serviceState?.kind === "installed" && (
+            <ConfirmButton
+              label="Remove"
+              confirmLabel="remove it?"
+              busy={remove.isPending}
+              onConfirm={() => remove.mutate()}
+            />
+          )}
+        </div>
+      )}
+      {serviceNote && <p className="font-data text-xs text-ink-muted">{serviceNote}</p>}
+      {serviceFailure && <FailureNote failure={serviceFailure} label="start at login" />}
 
       {!bridgeDown && status.data && !connected && (
         <p className="font-voice text-sm text-ink-muted italic">

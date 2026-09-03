@@ -49,6 +49,9 @@ const mocks = vi.hoisted(() => ({
   retentionGet: vi.fn(),
   retentionSet: vi.fn(),
   retentionPrune: vi.fn(),
+  serviceStatus: vi.fn(),
+  serviceInstall: vi.fn(),
+  serviceUninstall: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -79,6 +82,34 @@ beforeEach(() => {
     status: { daemon_version: "0.10.1", protocol: 1, uptime_s: 3_723, active_requests: 2 },
   });
   mocks.daemonStop.mockResolvedValue({ outcome: "stopped", pid: 42 });
+  mocks.serviceStatus.mockResolvedValue({
+    platform: "macos",
+    exe: "/Applications/pam.app/Contents/MacOS/pam",
+    state: {
+      kind: "not_installed",
+      unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
+    },
+    note: null,
+  });
+  mocks.serviceInstall.mockResolvedValue({
+    platform: "macos",
+    exe: "/Applications/pam.app/Contents/MacOS/pam",
+    state: {
+      kind: "installed",
+      unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
+      loaded: true,
+    },
+    note: "stopped the running daemon (pid 7) so the managed one takes over",
+  });
+  mocks.serviceUninstall.mockResolvedValue({
+    platform: "macos",
+    exe: "/Applications/pam.app/Contents/MacOS/pam",
+    state: {
+      kind: "not_installed",
+      unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
+    },
+    note: null,
+  });
   mocks.approvalsPending.mockResolvedValue({ pending: [] });
   mocks.activityList.mockResolvedValue({ requests: [] });
   mocks.callersList.mockResolvedValue({ callers: [] });
@@ -343,6 +374,56 @@ describe("daemon", () => {
     fireEvent.click(restart);
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/starting it again/)).toBeInTheDocument();
+  });
+
+  it("offers to install the login unit when none exists", async () => {
+    renderSettings();
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("not installed")).toBeInTheDocument();
+    expect(card.getByText(/com\.github\.ro-ag\.pam\.daemon\.plist/)).toBeInTheDocument();
+    fireEvent.click(card.getByRole("button", { name: "Install" }));
+    await waitFor(() => expect(mocks.serviceInstall).toHaveBeenCalledTimes(1));
+    expect(await card.findByText(/stopped the running daemon \(pid 7\)/)).toBeInTheDocument();
+  });
+
+  it("removes the login unit only after the two-tap confirm", async () => {
+    mocks.serviceStatus.mockResolvedValue({
+      platform: "linux",
+      exe: "/usr/bin/pam",
+      state: {
+        kind: "installed",
+        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        loaded: false,
+      },
+      note: null,
+    });
+    renderSettings();
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("installed, not loaded")).toBeInTheDocument();
+    fireEvent.click(card.getByRole("button", { name: "Remove" }));
+    expect(mocks.serviceUninstall).not.toHaveBeenCalled();
+    fireEvent.click(card.getByRole("button", { name: "remove it?" }));
+    await waitFor(() => expect(mocks.serviceUninstall).toHaveBeenCalledTimes(1));
+    expect(await card.findByText(/removed · the daemon keeps running/)).toBeInTheDocument();
+  });
+
+  it("explains an unsupported platform instead of offering buttons", async () => {
+    mocks.serviceStatus.mockResolvedValue({
+      platform: "windows",
+      exe: "C:\\pam\\pam.exe",
+      state: {
+        kind: "unsupported",
+        reason:
+          "scheduled tasks carry no environment, so PAM_BASE_DIR cannot be honoured; unset it to install the login task",
+      },
+      note: null,
+    });
+    renderSettings();
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("unsupported")).toBeInTheDocument();
+    expect(card.getByText(/PAM_BASE_DIR cannot be honoured/)).toBeInTheDocument();
+    expect(card.queryByRole("button", { name: "Install" })).toBeNull();
+    expect(card.queryByRole("button", { name: "Remove" })).toBeNull();
   });
 });
 

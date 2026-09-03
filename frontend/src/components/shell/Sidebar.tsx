@@ -7,7 +7,8 @@ import { cn, cva, type VariantProps } from "../../lib/cn";
  * Sidebar — the ZCode trait the owner loves: it has NO ground of its own.
  * No card, no border, no fill; the items float directly on the chrome (the
  * dark water) while the work panel floats beside them. Active screen gets
- * the accent-soft pill; future screens sit faint with a mono "soon" tag.
+ * the accent-soft pill. Every entry is a real screen now — the last
+ * placeholder went when Flows landed.
  *
  * The mount stagger is one of exactly two orchestrated motions in the shell
  * (the other is the work panel's route transition) — nothing else animates.
@@ -19,7 +20,6 @@ export const navItemVariants = cva(
       state: {
         idle: "text-ink-muted hover:bg-accent-soft/60 hover:text-ink",
         active: "bg-accent-soft text-ink",
-        soon: "text-ink-faint",
       },
     },
     defaultVariants: {
@@ -45,7 +45,7 @@ function NavLink({
   label,
   icon: Icon,
 }: {
-  to: "/activity" | "/approvals" | "/models" | "/settings";
+  to: "/activity" | "/approvals" | "/flows" | "/models" | "/settings";
   label: string;
   icon: LucideIcon;
 }) {
@@ -60,16 +60,6 @@ function NavLink({
       <Icon aria-hidden="true" className={cn("size-4 shrink-0", active && "text-accent")} />
       {label}
     </Link>
-  );
-}
-
-function NavSoon({ label, icon: Icon }: { label: string; icon: LucideIcon }) {
-  return (
-    <span aria-disabled="true" className={navItemVariants({ state: "soon" })}>
-      <Icon aria-hidden="true" className="size-4 shrink-0" />
-      {label}
-      <span className="ml-auto font-data text-xs tracking-wider">soon</span>
-    </span>
   );
 }
 
@@ -89,7 +79,7 @@ export function Sidebar() {
         <NavLink to="/approvals" label="Approvals" icon={Hand} />
       </motion.div>
       <motion.div variants={staggerItem}>
-        <NavSoon label="Flows" icon={Workflow} />
+        <NavLink to="/flows" label="Flows" icon={Workflow} />
       </motion.div>
       <motion.div variants={staggerItem}>
         <NavLink to="/models" label="Models" icon={Cpu} />

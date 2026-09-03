@@ -61,6 +61,20 @@ function useNow(intervalMs: number): number {
 
 // --- what approving means --------------------------------------------------
 
+/** How a gated flow step names itself: `flow.step:<flow>/<step>`. */
+export const FLOW_STEP_PREFIX = "flow.step:";
+
+/**
+ * What the sentence renders in the data voice. Almost always the
+ * capability verbatim — except a gated flow step, whose name carries two
+ * facts a human reads separately: which flow, and which step of it.
+ */
+export function capabilityLabel(capability: string): string {
+  if (!capability.startsWith(FLOW_STEP_PREFIX)) return capability;
+  const [flow, ...rest] = capability.slice(FLOW_STEP_PREFIX.length).split("/");
+  return rest.length > 0 ? `${flow} / ${rest.join("/")}` : flow;
+}
+
 /**
  * The serif sentence per capability family, split around the capability
  * so it can render in the data voice mid-sentence. The daemon registry
@@ -68,6 +82,14 @@ function useNow(intervalMs: number): number {
  * generic fallback the spec names.
  */
 export function approvalMeaning(capability: string): { before: string; after: string } {
+  // A gated flow step is its own family: the asker is the flow, not the
+  // agent, and a yes is scoped to that one step of that one flow.
+  if (capability.startsWith(FLOW_STEP_PREFIX)) {
+    return {
+      before: "The flow asks to run a gated step, ",
+      after: ". Approving runs that step this once; remember keeps it for this flow.",
+    };
+  }
   switch (capability.split(".")[0]) {
     case "repo":
     case "git":
@@ -194,7 +216,9 @@ function ApprovalCard({
 
       <p className="max-w-md font-voice text-base text-ink-muted italic">
         {meaning.before}
-        <span className="font-data text-sm text-ink not-italic">{approval.capability}</span>
+        <span className="font-data text-sm text-ink not-italic">
+          {capabilityLabel(approval.capability)}
+        </span>
         {meaning.after}
       </p>
 

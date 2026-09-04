@@ -1,4 +1,6 @@
 import { Link, useRouterState } from "@tanstack/react-router";
+import { useSyncExternalStore } from "react";
+import { subscribeWorkspace, workspaceSnapshot } from "../../lib/workspace";
 import {
   Activity,
   Cpu,
@@ -41,14 +43,21 @@ function NavLink({
 }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const active = pathname === to;
+  const compact =
+    useSyncExternalStore(subscribeWorkspace, workspaceSnapshot).sidebar === "compact";
   return (
     <Link
       to={to}
       aria-current={active ? "page" : undefined}
-      className={navItemVariants({ state: active ? "active" : "idle" })}
+      aria-label={label}
+      title={compact ? label : undefined}
+      className={cn(
+        navItemVariants({ state: active ? "active" : "idle" }),
+        compact && "justify-center px-0",
+      )}
     >
       <Icon aria-hidden="true" className={cn("size-4 shrink-0", active && "text-accent")} />
-      {label}
+      {!compact && label}
     </Link>
   );
 }
@@ -65,20 +74,25 @@ function hasTrafficLights(): boolean {
  * macOS traffic lights sit at x 16 / y 17, so the head drops below them.
  */
 function SidebarHead() {
+  const compact =
+    useSyncExternalStore(subscribeWorkspace, workspaceSnapshot).sidebar === "compact";
   return (
     <div
       data-tauri-drag-region=""
       className={cn(
         "flex w-full shrink-0 flex-col gap-0.5 px-3 pb-5",
         hasTrafficLights() ? "pt-10" : "pt-4",
+        compact && "items-center px-0",
       )}
     >
       <span data-tauri-drag-region="" className="font-display text-sm font-semibold text-ink">
         PAM
       </span>
-      <span data-tauri-drag-region="" className="font-sans text-xs text-ink-faint">
-        personal agent machine
-      </span>
+      {!compact && (
+        <span data-tauri-drag-region="" className="font-sans text-xs text-ink-faint">
+          personal agent machine
+        </span>
+      )}
     </div>
   );
 }

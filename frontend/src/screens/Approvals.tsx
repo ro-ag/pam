@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
+import { PageHeader } from "../components/ui/PageHeader";
 import { cn } from "../lib/cn";
 import {
   approvalsPending,
@@ -403,14 +404,14 @@ export function ApprovalsScreen() {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+      <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Approvals</h1>
         <p className="text-sm text-ink-muted">
           {count === undefined
             ? "Review agent requests before they run."
             : `${count} request${count === 1 ? "" : "s"} awaiting review`}
         </p>
-      </header>
+      </PageHeader>
 
       {failure && (
         <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">

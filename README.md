@@ -60,6 +60,9 @@ not on the command line.
 - Settings uses eight tabs with retained drafts and wide-screen layouts.
   Appearance offers four Costa palettes, surface opacity, and background
   motion speed and intensity. System accessibility preferences take priority.
+- Home, Flows, Activity, Approvals and Models keep their page controls fixed
+  while the active task pane scrolls. Keyboard-accessible tabs separate flow
+  editing and runs, activity compression, and model operations.
 
 ## Start at login
 

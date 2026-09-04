@@ -6,6 +6,23 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-04
+
+### Changed
+
+- Standardized Home, Flows, Activity, Approvals and Models on the Settings
+  page structure, with fixed page headers and one bounded scroll region per
+  active pane.
+- Split dense tasks into keyboard-accessible tabs: flow canvas, YAML,
+  execution and history; activity requests and compression; and model
+  runtime, installation, downloads and testing.
+- Kept Home answers beside the composer and preserved compression and flow-run
+  results when filters or task views change.
+
+### Compatibility
+
+- No CLI, protocol or stored-data changes.
+
 ## [0.2.0] - 2026-09-04
 
 ### Added

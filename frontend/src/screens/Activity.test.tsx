@@ -112,6 +112,40 @@ function renderActivity(path = "/activity") {
 }
 
 describe("the tide", () => {
+  it("keeps a successful compression visible and preserves the request filters", async () => {
+    mocks.logCompress.mockResolvedValue({
+      source: { id: "source", bytes: 1000 },
+      compact: { id: "compact", bytes: 100 },
+      summary: null,
+      compact_text: "Build completed",
+      summary_text: null,
+      stats: {
+        source_bytes: 1000,
+        compact_bytes: 100,
+        source_records: 10,
+        retained_records: 1,
+        tokens_source_est: 250,
+        tokens_compact_est: 25,
+        tokens_avoided_est: 225,
+      },
+      model: null,
+      model_skipped: null,
+    });
+    const router = renderActivity("/activity?state=refused");
+    const compression = await screen.findByRole("tab", { name: "Log compression" });
+    fireEvent.click(compression);
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/audit.log" },
+    });
+    const button = screen.getByRole("button", { name: "Compress" });
+    button.focus();
+    fireEvent.click(button);
+    expect(await screen.findByText(/225 tokens avoided/)).toBeVisible();
+    expect(compression).toHaveAttribute("aria-selected", "true");
+    expect(button).toHaveFocus();
+    expect(router.state.location.search.state).toBe("refused");
+  });
+
   it("renders one row per request with capability, agent, repo tail, and verdict", async () => {
     renderActivity();
     expect(await screen.findByText("compress.log")).toBeInTheDocument();
@@ -266,7 +300,7 @@ describe("lanes", () => {
     serverFilters();
     const router = renderActivity("/activity?repo=/Users/dev/other");
     fireEvent.click(await screen.findByRole("button", { name: "agent claude" }));
-    expect(await screen.findByText(/matches this lens/)).toBeInTheDocument();
+    expect(await screen.findByText(/No requests match these filters/)).toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "lanes" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
@@ -350,14 +384,14 @@ describe("quiet and broken water", () => {
   it("speaks in Pam's voice when the log is empty", async () => {
     mocks.activityList.mockResolvedValue({ requests: [] });
     renderActivity();
-    expect(await screen.findByText(/watching the water/)).toBeInTheDocument();
+    expect(await screen.findByText(/No activity yet/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
   });
 
   it("offers to clear the lens when filters leave nothing", async () => {
     mocks.activityList.mockResolvedValue({ requests: [] });
     const router = renderActivity("/activity?agent=codex");
-    expect(await screen.findByText(/matches this lens/)).toBeInTheDocument();
+    expect(await screen.findByText(/No requests match these filters/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
   });
@@ -370,6 +404,6 @@ describe("quiet and broken water", () => {
     expect(await screen.findByText(/disconnected · bridge_unavailable/)).toBeInTheDocument();
     expect(screen.getByText(/pam -- gui/)).toBeInTheDocument();
     // A broken bridge never claims calm water.
-    expect(screen.queryByText(/watching the water/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/No activity yet/)).not.toBeInTheDocument();
   });
 });

@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
-import { cn, cva } from "../lib/cn";
+import { cn } from "../lib/cn";
+import { PageTabs } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
   flowsGet,
@@ -40,7 +41,7 @@ import { FlowRuns } from "./FlowRuns";
  */
 
 /** The tabs of the detail pane; the canvas comes first. */
-const TABS = ["canvas", "yaml", "runs"] as const;
+const TABS = ["canvas", "yaml", "run", "runs"] as const;
 
 type Tab = (typeof TABS)[number];
 
@@ -49,19 +50,6 @@ export const CANVAS_QUIET_MS = 150;
 
 /** How long the textarea waits — typing is bursty, a canvas gesture is not. */
 export const YAML_QUIET_MS = 400;
-
-const tabVariants = cva(
-  "h-8 rounded-control px-3 font-data text-xs transition-colors duration-150",
-  {
-    variants: {
-      state: {
-        active: "bg-accent-soft text-ink",
-        idle: "text-ink-faint hover:text-ink",
-      },
-    },
-    defaultVariants: { state: "idle" },
-  },
-);
 
 // --- the library rail ------------------------------------------------------
 
@@ -79,17 +67,17 @@ function LibraryEntry({
       <button
         type="button"
         aria-current={active ? "true" : undefined}
+        title={entry.id}
         onClick={onSelect}
         className={cn(
           "w-full space-y-1 rounded-control px-2.5 py-2 text-left transition-colors duration-150",
           active ? "bg-accent-soft" : "hover:bg-accent-soft/40",
         )}
       >
-        <span className="flex items-center gap-2">
-          <span className="min-w-0 flex-1 truncate font-data text-sm text-ink">{entry.id}</span>
-          <Badge tone={entry.source === "builtin" ? "neutral" : "accent"}>{entry.source}</Badge>
+        <span className="block font-sans text-sm font-medium text-ink">
+          {entry.name || entry.id}
         </span>
-        <span className="block truncate font-sans text-xs text-ink-muted">{entry.name}</span>
+        {entry.source !== "builtin" && <Badge tone="accent">Custom</Badge>}
         {!entry.valid && (
           <>
             <Badge tone="danger" title={entry.error ?? "this flow will not parse"}>
@@ -306,6 +294,11 @@ function FlowDetailPane({
   const [run, setRun] = useState<FlowRunState | null>(null);
   const { statuses, outcome } = useRunStatuses(run);
   const error = useStableIssue(draft.error);
+  const pane = useRef<HTMLDivElement>(null);
+  const scrollPositions = useRef<Record<Tab, number>>({ canvas: 0, yaml: 0, run: 0, runs: 0 });
+  useLayoutEffect(() => {
+    if (pane.current) pane.current.scrollTop = scrollPositions.current[tab];
+  }, [tab]);
 
   // A new flow means a fresh selection; the run card resets itself.
   useEffect(() => {
@@ -340,31 +333,46 @@ function FlowDetailPane({
 
   return (
     <>
+      <PageTabs
+        id="flow"
+        label="flow view"
+        tabs={TABS.map((id) => ({
+          id,
+          label:
+            id === "yaml"
+              ? "YAML"
+              : id === "runs"
+                ? "Run history"
+                : id === "run"
+                  ? "Run flow"
+                  : "Canvas",
+        }))}
+        selected={tab}
+        onSelect={(candidate) => {
+          scrollPositions.current[tab] = pane.current?.scrollTop ?? 0;
+          if (candidate === "canvas") flush();
+          onTab(candidate);
+        }}
+      />
+      {TABS.filter((candidate) => candidate !== tab).map((candidate) => (
+        <div
+          key={candidate}
+          id={`flow-pane-${candidate}`}
+          role="tabpanel"
+          aria-labelledby={`flow-tab-${candidate}`}
+          hidden
+        />
+      ))}
       <div
-        role="group"
-        aria-label="flow view"
-        className="flex items-center gap-0.5 border-b border-line pb-2"
+        ref={pane}
+        id={`flow-pane-${tab}`}
+        role="tabpanel"
+        aria-labelledby={`flow-tab-${tab}`}
+        tabIndex={0}
+        className="page-content"
       >
-        {TABS.map((candidate) => (
-          <button
-            key={candidate}
-            type="button"
-            aria-pressed={tab === candidate}
-            onClick={() => {
-              if (candidate === "canvas") flush();
-              onTab(candidate);
-            }}
-            className={tabVariants({ state: tab === candidate ? "active" : "idle" })}
-          >
-            {candidate}
-          </button>
-        ))}
-      </div>
-
-      {tab === "runs" ? (
-        <FlowRuns flowId={entry.id} />
-      ) : (
-        <div className="space-y-4">
+        {tab === "runs" && <FlowRuns flowId={entry.id} />}
+        <div className="space-y-4" hidden={tab === "run" || tab === "runs"}>
           {loadFailure && <FailureNote failure={loadFailure} label="flow" />}
 
           {draft.dirty && (
@@ -391,8 +399,8 @@ function FlowDetailPane({
                       detail: `at \`${flowIssue.path}\``,
                       recovery:
                         draft.spec === null
-                          ? "fix the YAML below; the canvas draws it as soon as it parses"
-                          : "fix it in the inspector or the YAML below",
+                          ? "Open YAML to fix the flow; the canvas returns once it parses"
+                          : "Fix it in the inspector or open YAML",
                     }}
                   />
                 )}
@@ -429,14 +437,23 @@ function FlowDetailPane({
             key={entry.id}
             entry={entry}
             yaml={draft.yaml}
+            showYaml={tab === "yaml"}
             onYamlChange={onYamlChange}
             saveDisabled={saveDisabled}
             onSaved={onSaved}
             onDeleted={onDeleted}
           />
+        </div>
+        <div hidden={tab !== "run"} className="space-y-4">
+          <p className="text-sm text-ink-muted">Choose a repository and run the saved flow.</p>
+          {draft.dirty && (
+            <p className="text-sm text-warning">
+              You have unsaved changes. Save or clone them before running the updated flow.
+            </p>
+          )}
           <FlowRunCard key={`run-${entry.id}`} flow={entry} onRun={setRun} />
         </div>
-      )}
+      </div>
     </>
   );
 }
@@ -463,7 +480,7 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
   const failure = flows.isError ? toBridgeFailure(flows.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-6 pb-6">
+    <div className="page-workspace">
       <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
         <p className="text-sm text-ink-muted">Reusable workflows and execution history.</p>
@@ -487,8 +504,8 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
       )}
 
       {!failure && selected !== null && (
-        <div className="flow-library-layout flex flex-1 gap-5 pt-5">
-          <section aria-label="flow library" className="flow-library min-w-0 shrink-0 pb-3">
+        <div className="flow-library-layout flex flex-1">
+          <section aria-label="flow library" className="flow-library min-w-0 shrink-0">
             <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
             <ul className="space-y-0.5">
               {entries.map((entry) => (
@@ -502,22 +519,36 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
             </ul>
           </section>
 
-          <section
-            aria-label={`flow ${selected.id}`}
-            className="flow-detail min-w-0 flex-1 space-y-4"
-          >
-            <div className="space-y-1.5">
+          <section aria-label={`flow ${selected.id}`} className="flow-detail min-w-0 flex-1">
+            <label className="flow-picker space-y-1">
+              <span className="block text-xs font-medium text-ink-muted">Flow library</span>
+              <select
+                aria-label="Choose flow"
+                value={selected.id}
+                onChange={(event) => setPicked(event.target.value)}
+                className="field-control h-8 w-full rounded-control border border-control-line bg-inset px-2 text-sm"
+              >
+                {entries.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.name || entry.id}
+                    {entry.valid ? "" : " (invalid)"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flow-detail-header shrink-0 space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>
               <p className="max-w-xl font-sans text-sm text-ink-muted">
                 {selected.description || "This flow describes itself in its own YAML."}
               </p>
               <p className="font-data text-xs text-ink-faint">
-                {selected.id} · {selected.steps} step{selected.steps === 1 ? "" : "s"}
-                {selected.digest ? ` · ${selected.digest}` : ""}
+                {selected.steps} step{selected.steps === 1 ? "" : "s"} ·{" "}
+                {selected.source === "builtin" ? "Built-in flow" : "Custom flow"}
               </p>
             </div>
 
             <FlowDetailPane
+              key={selected.id}
               entry={selected}
               tab={tab}
               onTab={setTab}

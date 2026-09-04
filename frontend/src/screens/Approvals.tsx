@@ -403,7 +403,7 @@ export function ApprovalsScreen() {
   const failure = approvals.isError ? toBridgeFailure(approvals.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-6 pb-6">
+    <div className="page-workspace">
       <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Approvals</h1>
         <p className="text-sm text-ink-muted">
@@ -411,72 +411,75 @@ export function ApprovalsScreen() {
             ? "Review agent requests before they run."
             : `${count} request${count === 1 ? "" : "s"} awaiting review`}
         </p>
+        {pending.length > 0 && (
+          <p className="text-xs text-ink-muted">
+            Oldest first · unanswered requests time out in 15 minutes.
+          </p>
+        )}
       </PageHeader>
+      <div className="page-content" role="region" aria-label="Approval queue" tabIndex={0}>
+        {failure && (
+          <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
+            <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
+            <p className="font-sans text-sm text-ink">{failure.detail}.</p>
+            <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
+          </section>
+        )}
 
-      {failure && (
-        <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-          <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
-          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
-          <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
-        </section>
-      )}
+        {!failure && approvals.isPending && <RaisedSkeleton />}
 
-      {!failure && approvals.isPending && <RaisedSkeleton />}
+        {!failure && !approvals.isPending && pending.length === 0 && (
+          <div className="flex flex-1 flex-col items-start justify-center gap-4 py-16">
+            <span
+              aria-hidden="true"
+              className="flex size-10 items-center justify-center rounded-pill border border-line bg-surface-raised"
+            >
+              <Hand className="size-5 text-ink-faint" />
+            </span>
+            <p className="max-w-md font-sans text-lg text-ink-muted">
+              No hands raised. When an agent needs your yes, it appears here first.
+            </p>
+            <p className="font-data text-xs text-ink-faint">
+              approvals resolve only in this app — no agent or CLI can answer for you
+            </p>
+          </div>
+        )}
 
-      {!failure && !approvals.isPending && pending.length === 0 && (
-        <div className="flex flex-1 flex-col items-start justify-center gap-4 py-16">
-          <span
-            aria-hidden="true"
-            className="flex size-10 items-center justify-center rounded-pill border border-line bg-surface-raised"
-          >
-            <Hand className="size-5 text-ink-faint" />
-          </span>
-          <p className="max-w-md font-sans text-lg text-ink-muted">
-            No hands raised. When an agent needs your yes, it appears here first.
-          </p>
-          <p className="font-data text-xs text-ink-faint">
-            approvals resolve only in this app — no agent or CLI can answer for you
-          </p>
-        </div>
-      )}
-
-      {!failure && pending.length > 0 && (
-        <>
-          <ul className="max-w-4xl space-y-4 pt-5">
-            <AnimatePresence>
-              {pending.map((hand, index) => (
-                <motion.li
-                  key={hand.request_id}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{
-                    opacity: 1,
-                    y: 0,
-                    transition: {
-                      duration: 0.18,
-                      ease: "easeOut",
-                      delay: stagger ? Math.min(index, 8) * 0.05 : 0,
-                    },
-                  }}
-                  exit={{ opacity: 0, transition: { duration: 0.15, ease: "easeOut" } }}
-                >
-                  <ApprovalCard
-                    approval={hand}
-                    now={now}
-                    resolving={resolving[hand.request_id]}
-                    failure={failures[hand.request_id]}
-                    onResolve={(resolution, options) =>
-                      resolve.mutate({ requestId: hand.request_id, resolution, options })
-                    }
-                  />
-                </motion.li>
-              ))}
-            </AnimatePresence>
-          </ul>
-          <p className="mt-4 font-data text-xs text-ink-faint">
-            {pending.length} waiting · oldest first · unanswered hands time out in 15m
-          </p>
-        </>
-      )}
+        {!failure && pending.length > 0 && (
+          <>
+            <ul className="max-w-4xl space-y-4">
+              <AnimatePresence>
+                {pending.map((hand, index) => (
+                  <motion.li
+                    key={hand.request_id}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{
+                      opacity: 1,
+                      y: 0,
+                      transition: {
+                        duration: 0.18,
+                        ease: "easeOut",
+                        delay: stagger ? Math.min(index, 8) * 0.05 : 0,
+                      },
+                    }}
+                    exit={{ opacity: 0, transition: { duration: 0.15, ease: "easeOut" } }}
+                  >
+                    <ApprovalCard
+                      approval={hand}
+                      now={now}
+                      resolving={resolving[hand.request_id]}
+                      failure={failures[hand.request_id]}
+                      onResolve={(resolution, options) =>
+                        resolve.mutate({ requestId: hand.request_id, resolution, options })
+                      }
+                    />
+                  </motion.li>
+                ))}
+              </AnimatePresence>
+            </ul>
+          </>
+        )}
+      </div>
     </div>
   );
 }

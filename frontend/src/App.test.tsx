@@ -61,9 +61,10 @@ describe("shell routing", () => {
   it("routes /models to the Models screen", async () => {
     renderShell("/models");
     expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
-    for (const section of ["Runtime", "Library", "Catalog", "Try box"]) {
-      expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
+    for (const section of ["Runtime", "Installed", "Downloads", "Test model"]) {
+      expect(screen.getByRole("tab", { name: section })).toBeInTheDocument();
     }
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
   });
 
   it("hosts the Settings categories with only Appearance initially visible", async () => {

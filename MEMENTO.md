@@ -92,3 +92,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## no-codex-branch-prefix
+- kind: habit
+- scope: project
+- rule: Never use the codex/ prefix for branches in Rodox repositories; use the repository's conventional feat/, fix/, chore/, or docs/ prefix.
+- fix: Rename any local codex/* branch before push or PR creation, and choose the scope-appropriate conventional prefix from the start.
+- hits: 2026-09-04
+- cost: 0
+- status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
+

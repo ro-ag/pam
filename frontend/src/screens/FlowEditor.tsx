@@ -56,6 +56,7 @@ export interface FlowEditorProps {
   entry: FlowListEntry;
   /** The draft's text, owned by the Flows screen. */
   yaml: string;
+  showYaml?: boolean;
   onYamlChange: (yaml: string) => void;
   /** True while the draft is invalid or still being checked. */
   saveDisabled: boolean;
@@ -66,6 +67,7 @@ export interface FlowEditorProps {
 export function FlowEditor({
   entry,
   yaml,
+  showYaml = true,
   onYamlChange,
   saveDisabled,
   onSaved,
@@ -112,19 +114,23 @@ export function FlowEditor({
 
   return (
     <div className="space-y-3">
-      <textarea
-        aria-label={`${entry.id} yaml`}
-        spellCheck={false}
-        value={yaml}
-        onChange={(event) => onYamlChange(event.target.value)}
-        rows={20}
-        className="w-full resize-y rounded-card border border-line bg-chrome p-3 font-data text-xs leading-relaxed text-ink-muted"
-      />
+      {showYaml && (
+        <textarea
+          aria-label={`${entry.id} yaml`}
+          spellCheck={false}
+          value={yaml}
+          onChange={(event) => onYamlChange(event.target.value)}
+          rows={20}
+          className="w-full resize-y rounded-card border border-line bg-chrome p-3 font-data text-xs leading-relaxed text-ink-muted"
+        />
+      )}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <p className="font-data text-xs text-ink-faint" title={entry.path ?? entry.digest}>
-          {entry.path ?? "ships with pam"}
-        </p>
+        {entry.path && (
+          <p className="min-w-0 break-all font-data text-xs text-ink-faint" title={entry.path}>
+            {entry.path}
+          </p>
+        )}
         <span className="flex-1" />
 
         {builtin && (
@@ -163,8 +169,7 @@ export function FlowEditor({
 
       {builtin && (
         <p className="max-w-md font-sans text-sm text-ink-muted">
-          This one ships with me, so it cannot be edited in place. Give your copy a name and it
-          shadows the builtin — delete the copy and the builtin comes back.
+          Clone to save your changes as a custom flow. The built-in original stays available.
         </p>
       )}
 

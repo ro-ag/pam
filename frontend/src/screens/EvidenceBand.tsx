@@ -109,7 +109,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
   const compressFailure = compress.isError ? toBridgeFailure(compress.error) : null;
   const figures = stats.data;
   const inputClasses =
-    "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50";
+    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50";
 
   return (
     <Panel
@@ -182,7 +182,11 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           summarize with the heavy model
         </label>
         <div className="flex flex-wrap items-center gap-3">
-          <Button size="sm" type="submit" disabled={compress.isPending || !isAbsolutePath(path)}>
+          <Button
+            size="sm"
+            type="submit"
+            disabled={compress.isPending || !isAbsolutePath(path)}
+          >
             Compress
           </Button>
           <span className="font-voice text-sm text-ink-muted italic">

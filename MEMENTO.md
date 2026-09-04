@@ -29,3 +29,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 120
 - status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
 
+## stage-only-task-files
+- kind: habit
+- scope: project
+- rule: Stage only task-owned tracked changes or explicit new files; never stage a whole source directory when untracked user data is present.
+- fix: Use git add -u for existing tracked edits, inspect git diff --cached --stat before committing, and stage intended new files by exact path.
+- hits: 2026-09-03
+- cost: 0
+- status: watching
+

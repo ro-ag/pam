@@ -210,7 +210,7 @@ function RuntimeCard({
           value={pick}
           disabled={selectable.length === 0 || load.isPending}
           onChange={(event) => setChoice(event.target.value)}
-          className="h-8 min-w-56 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+          className="h-8 min-w-56 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
         >
           {selectable.length === 0 && <option value="">nothing installed</option>}
           {selectable.map((model) => (
@@ -556,7 +556,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
   const presets = (catalog.data?.presets ?? []).filter((preset) => preset.fits_host);
 
   const inputClasses =
-    "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
@@ -687,7 +687,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
         disabled={closed}
         onChange={(event) => setPrompt(event.target.value)}
         placeholder="Say hello in five words."
-        className="w-full rounded-control border border-line bg-surface p-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
+        className="w-full rounded-control field-control border border-control-line bg-inset p-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
       />
 
       <div className="flex flex-wrap items-end gap-2">
@@ -700,7 +700,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
             value={maxTokens}
             disabled={closed}
             onChange={(event) => setMaxTokens(event.target.value)}
-            className="h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
           />
         </label>
         <Button
@@ -769,8 +769,8 @@ export function ModelsScreen() {
   const jobs = status.data?.jobs ?? [];
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-10">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-10">
+      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           models · what runs, what&apos;s on disk, what&apos;s on offer
         </p>

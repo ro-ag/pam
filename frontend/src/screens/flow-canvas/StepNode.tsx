@@ -68,7 +68,7 @@ export const railVariants = cva("w-1 shrink-0 self-stretch transition-colors dur
       failed: "bg-danger",
       blocked: "bg-danger",
       skipped: "bg-ink-faint",
-      cancelled: "bg-warning",
+      cancelled: "warm-marker bg-warning",
     },
   },
   defaultVariants: { status: "none" },
@@ -79,7 +79,7 @@ export const glyphVariants = cva("flex shrink-0", {
   variants: {
     kind: {
       command: "text-accent",
-      connector: "text-copper",
+      connector: "warm-label text-ink-muted",
     },
   },
   defaultVariants: { kind: "command" },
@@ -137,7 +137,7 @@ export function modifiersOf(step: FlowStep): Modifier[] {
     glyphs.push({
       label: "stateful",
       title: "changes state",
-      tone: "text-copper",
+      tone: "warm-label text-ink-muted",
       Icon: Pencil,
     });
   }

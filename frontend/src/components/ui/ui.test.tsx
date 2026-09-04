@@ -23,7 +23,7 @@ describe("Panel", () => {
     const panel = screen.getByTestId("panel");
     expect(panel.className).toContain("bg-surface-raised");
     expect(panel.className).toContain("rounded-card");
-    expect(panel.className).toContain("shadow-raise");
+    expect(panel.className).not.toContain("shadow-raise");
   });
 
   it("merges caller overrides through cn", () => {

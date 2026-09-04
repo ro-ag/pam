@@ -46,7 +46,7 @@ export const STORE_UNAVAILABLE_COPY =
   "the OS credential store is unavailable; see the daemon log";
 
 const fieldClasses =
-  "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
 /** AWS authenticates by named profile: there is no secret to store. */
 function usesProfile(connector: ConnectorSummary): boolean {

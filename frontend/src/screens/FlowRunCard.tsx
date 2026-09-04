@@ -312,7 +312,7 @@ export function FlowRunCard({
             aria-label="known repo"
             value={repos.includes(repo) ? repo : ""}
             onChange={(event) => setRepo(event.target.value)}
-            className="h-8 w-full rounded-control border border-line bg-surface px-2 font-data text-xs text-ink"
+            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
           >
             <option value="">pick a repo pam has seen</option>
             {repos.map((known) => (

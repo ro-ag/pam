@@ -79,7 +79,7 @@ const stateDot = cva("size-2 shrink-0 rounded-pill", {
     state: {
       queued: "bg-ink-faint",
       running: "animate-breathe bg-accent",
-      waiting_approval: "animate-breathe bg-warning",
+      waiting_approval: "warm-marker bg-warning",
       done: "bg-success",
       refused: "border border-danger bg-transparent",
       failed: "bg-danger",
@@ -157,7 +157,7 @@ function Chip({
       title={title}
       onClick={onToggle}
       className={cn(
-        "h-7 max-w-40 truncate rounded-control px-2.5 font-data text-xs transition-colors duration-150",
+        "h-7 max-w-40 truncate rounded-control px-2.5 font-data text-xs transition-colors duration-100",
         active ? "bg-accent-soft text-ink" : "text-ink-faint hover:text-ink",
       )}
     >
@@ -236,7 +236,7 @@ function StateSegments({
           aria-pressed={filter === value}
           onClick={() => onChange(filter)}
           className={cn(
-            "h-full rounded-control px-2.5 font-data text-xs transition-colors duration-150",
+            "h-full rounded-control px-2.5 font-data text-xs transition-colors duration-100",
             filter === value ? "bg-accent-soft text-ink" : "text-ink-faint hover:text-ink",
           )}
         >
@@ -267,12 +267,12 @@ function TideRow({
         type="button"
         aria-expanded={expanded}
         onClick={onToggle}
-        className="group flex h-11 w-full items-center gap-3 rounded-control px-2 text-left transition-colors duration-150 hover:bg-accent-soft/40"
+        className="group flex h-9 w-full items-center gap-2 rounded-control px-2 text-left transition-colors duration-100 hover:bg-accent-soft/40"
       >
         <ChevronRight
           aria-hidden="true"
           className={cn(
-            "size-3.5 shrink-0 text-ink-faint transition-transform duration-150",
+            "size-3.5 shrink-0 text-ink-faint transition-transform duration-100",
             expanded && "rotate-90",
           )}
         />
@@ -281,7 +281,7 @@ function TideRow({
           {row.capability}
         </span>
         <span
-          className="hidden w-28 truncate font-data text-xs text-ink-faint md:block"
+          className="lane-repo w-28 shrink-0 truncate font-data text-xs text-ink-faint"
           title={row.repo}
         >
           {repoTail(row.repo)}
@@ -299,7 +299,7 @@ function TideRow({
       </button>
       {expanded && (
         <div className="mt-1 mb-3 ml-9 space-y-3 border-l border-line pl-4">
-          <dl className="flex flex-wrap gap-x-6 gap-y-1 font-data text-xs text-ink-muted">
+          <dl className="activity-details flex flex-wrap gap-x-6 gap-y-1 font-data text-xs text-ink-muted">
             <div className="flex gap-1.5">
               <dt className="text-ink-faint">id</dt>
               <dd>{row.id}</dd>
@@ -369,12 +369,12 @@ function toLanes(rows: ActivityRow[]): Lane[] {
 }
 
 /**
- * A row's enter frame: it slides 8px down into its lane. Reduced motion
+ * A row's enter frame: it slides 4px down into its lane. Reduced motion
  * answers `false`, which mounts the row at rest — the arrival still
  * happens, it just doesn't travel.
  */
 export function rowEnter(reduced: boolean | null): false | { opacity: number; y: number } {
-  return reduced ? false : { opacity: 0, y: -8 };
+  return reduced ? false : { opacity: 0, y: -4 };
 }
 
 /** Skeleton tide while the first answer is on its way — tokens only. */
@@ -410,13 +410,13 @@ export function ActivityScreen() {
   const navigate = useNavigate({ from: "/activity" });
   const queryClient = useQueryClient();
   const now = useNow(CLOCK_TICK_MS);
-  // The settle: a row lands in 240ms, a lane (or a row a chip hides)
-  // leaves in 160ms. Reduced motion keeps the arrivals but drops the
+  // The settle: a row lands in 180ms, a lane (or a row a chip hides)
+  // leaves in 120ms. Reduced motion keeps the arrivals but drops the
   // travel — nothing slides, nothing lingers on its way out.
   const reduced = useReducedMotion();
   const enter = rowEnter(reduced);
-  const settle = { duration: reduced ? 0 : 0.24, ease: "easeOut" } as const;
-  const fade = { opacity: 0, transition: { duration: reduced ? 0 : 0.16 } };
+  const settle = { duration: reduced ? 0 : 0.18, ease: "easeOut" } as const;
+  const fade = { opacity: 0, transition: { duration: reduced ? 0 : 0.12 } };
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // A compression answers with its report, not with the request id it
   // was filed under. So the band raises this flag, and the next tide to
@@ -530,8 +530,8 @@ export function ActivityScreen() {
   const failure = activity.isError ? toBridgeFailure(activity.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           lifeguard tower · watching
         </p>
@@ -586,11 +586,7 @@ export function ActivityScreen() {
 
       {!failure && rows.length > 0 && (
         <>
-          <div
-            role="group"
-            aria-label="lanes"
-            className="grid gap-4 md:grid-cols-2 xl:grid-cols-3"
-          >
+          <div role="group" aria-label="lanes" className="activity-lanes grid gap-4">
             <AnimatePresence initial={false}>
               {lanes.map((lane) => (
                 <motion.section
@@ -599,7 +595,7 @@ export function ActivityScreen() {
                   aria-label={lane.agent}
                   exit={fade}
                   transition={settle}
-                  className="min-w-0 rounded-card border border-line bg-surface-raised/40 p-2"
+                  className="activity-lane min-w-0 rounded-card border border-line bg-surface-raised p-2"
                 >
                   <header className="flex items-center gap-2 px-2 pb-2">
                     <Badge tone="accent">{lane.agent}</Badge>

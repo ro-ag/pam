@@ -367,7 +367,7 @@ function GrantsPanel() {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           placeholder="capability, e.g. echo"
-          className="h-8 min-w-48 flex-1 rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
+          className="h-8 min-w-48 flex-1 rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
         />
         <datalist id="known-capabilities">
           {KNOWN_CAPABILITIES.map((capability) => (
@@ -676,7 +676,7 @@ function RetentionPanel() {
   const busy = state.isPending || save.isPending;
 
   const selectClasses =
-    "h-8 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
+    "h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
 
   const windowField = (
     caption: string,
@@ -806,7 +806,7 @@ function LogsPanel() {
           aria-label="lines to show"
           value={lineCount}
           onChange={(event) => setLineCount(Number(event.target.value))}
-          className="h-8 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink"
+          className="h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
         >
           {LOG_LINE_CHOICES.map((choice) => (
             <option key={choice} value={choice}>
@@ -913,8 +913,8 @@ export function SettingsScreen() {
   }, [hash]);
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-10">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-10">
+      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           settings · every knob, one place
         </p>

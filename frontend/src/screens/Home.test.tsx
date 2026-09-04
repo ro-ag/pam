@@ -171,7 +171,9 @@ describe("Home shell", () => {
     expect(await screen.findByText("Nothing waits for you.")).toBeInTheDocument();
     await askQuestion("is the daemon running?");
     expect(
-      await screen.findByText("The daemon answers: version 0.1.0, up for 1h 02m, 1 active request."),
+      await screen.findByText(
+        "The daemon answers: version 0.1.0, up for 1h 02m, 1 active request.",
+      ),
     ).toBeInTheDocument();
     await askQuestion("does pam start at login?");
     expect(await screen.findByText("No: nothing starts me at login.")).toBeInTheDocument();
@@ -213,7 +215,7 @@ describe("Home shell", () => {
     expect(router.state.location.hash.replace(/^#/, "")).toBe("daemon");
   });
 
-  it("explains the placeholder memory rule and disables the input while asking", async () => {
+  it("keeps the memory rule visible and exposes pending state while asking", async () => {
     let release: (value: { pending: never[] }) => void = () => {};
     mocks.approvalsPending.mockImplementation(
       () =>
@@ -223,13 +225,14 @@ describe("Home shell", () => {
     );
     renderHome();
     const input = await screen.findByRole("textbox", { name: "ask pam" });
-    expect(input).toHaveAttribute(
-      "placeholder",
-      "Ask about pam itself — I keep only this screen and the last three exchanges",
+    expect(input).toHaveAccessibleDescription(
+      "Ask about PAM itself. I keep only this screen and the last three exchanges.",
     );
+    expect(screen.getByText("Ask PAM", { selector: "label" })).toHaveAttribute("for", input.id);
     fireEvent.change(input, { target: { value: "what's waiting for my approval?" } });
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(input).toBeDisabled());
+    expect(screen.getByRole("button", { name: "Ask" })).toHaveAttribute("aria-busy", "true");
     release({ pending: [] });
     await waitFor(() => expect(input).toBeEnabled());
     expect(await screen.findByText("Nothing waits for you.")).toBeInTheDocument();
@@ -242,7 +245,9 @@ describe("Home shell", () => {
     expect(
       await screen.findByText("The water is calm: nothing waits for you."),
     ).toBeInTheDocument();
-    expect(screen.queryByText("answers stay in my own words: no light model is set")).toBeNull();
+    expect(
+      screen.queryByText("answers stay in my own words: no light model is set"),
+    ).toBeNull();
     unmount();
 
     window.localStorage.setItem(rephraseStorageKey, "on");

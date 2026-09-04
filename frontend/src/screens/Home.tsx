@@ -137,8 +137,8 @@ export function HomeScreen() {
     } as Parameters<typeof navigate>[0]);
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-10">
-      <header className="space-y-3 pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-10">
+      <header className="space-y-3 pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           home · ask pam
         </p>
@@ -146,24 +146,37 @@ export function HomeScreen() {
         <p className="font-voice text-lg text-ink-muted italic">{greeting}</p>
       </header>
 
-      <Panel ground="raised" className="space-y-3 p-5">
+      <Panel ground="command" className="space-y-3 p-4" aria-busy={asking}>
+        <label htmlFor="ask-pam" className="block font-sans text-sm font-medium text-ink">
+          Ask PAM
+        </label>
         <div className="flex items-center gap-3">
           <input
+            id="ask-pam"
             aria-label="ask pam"
+            aria-describedby="ask-pam-help"
             value={question}
             disabled={asking}
-            placeholder="Ask about pam itself — I keep only this screen and the last three exchanges"
+            placeholder="Ask about requests, models, or settings"
             onChange={(event) => setQuestion(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") submit(question);
               if (event.key === "Escape") setQuestion("");
             }}
-            className="h-10 min-w-0 flex-1 rounded-control border border-line bg-surface px-3 font-voice text-base text-ink italic placeholder:text-ink-faint disabled:opacity-50"
+            className="field-control h-8 min-w-0 flex-1 rounded-control border border-control-line bg-inset px-3 font-voice text-base text-ink italic placeholder:text-ink-faint disabled:opacity-50"
           />
-          <Button variant="ghost" disabled={asking} onClick={() => submit(question)}>
+          <Button
+            disabled={asking || question.trim() === ""}
+            aria-busy={asking}
+            onClick={() => submit(question)}
+          >
             Ask
           </Button>
         </div>
+
+        <p id="ask-pam-help" className="font-sans text-sm text-ink-muted">
+          Ask about PAM itself. I keep only this screen and the last three exchanges.
+        </p>
 
         <div className="flex flex-wrap gap-1.5">
           {INTENTS.map((intent) => (
@@ -192,7 +205,12 @@ export function HomeScreen() {
         )}
       </Panel>
 
-      <ol aria-label="exchanges" className="space-y-4 pt-6">
+      <ol
+        aria-label="exchanges"
+        aria-live="polite"
+        aria-relevant="additions text"
+        className="space-y-4 pt-6"
+      >
         {exchanges.map((exchange) => (
           <li key={exchange.id} className="space-y-2">
             <p className="font-data text-xs text-ink-faint">{exchange.question}</p>
@@ -238,12 +256,7 @@ function AnswerCard({
       {(answer.links.length > 0 || answer.rephrased) && (
         <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
           {answer.links.map((link) => (
-            <Button
-              key={link.label}
-              size="sm"
-              variant="ghost"
-              onClick={() => onFollow(link)}
-            >
+            <Button key={link.label} size="sm" variant="ghost" onClick={() => onFollow(link)}>
               {link.label}
             </Button>
           ))}

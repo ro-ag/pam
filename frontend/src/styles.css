@@ -42,6 +42,8 @@
     margin: 0;
     min-width: 320px;
     font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    line-height: 1.5;
     color: var(--color-ink);
     background: var(--color-chrome);
   }
@@ -63,6 +65,95 @@
 }
 
 @layer components {
+  .desktop-sidebar {
+    width: 208px;
+  }
+  .nav-current {
+    box-shadow: inset 3px 0 0 var(--color-focus);
+  }
+  .action-control {
+    background-image: var(--pam-action-gradient);
+    box-shadow: var(--pam-shadow-control);
+  }
+  .action-control:hover:not(:disabled),
+  .action-control:active:not(:disabled) {
+    background: var(--color-accent-hover);
+  }
+  .field-control {
+    box-shadow: var(--pam-shadow-raise);
+  }
+  .warm-marker {
+    background: var(--pam-warm-material);
+  }
+  .warm-badge {
+    border: 1px solid transparent;
+    background:
+      var(--pam-warm-surface) padding-box,
+      var(--pam-warm-edge) border-box;
+  }
+  .warm-label::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-inline-end: 4px;
+    border-radius: var(--radius-badge);
+    background: var(--pam-warm-material);
+  }
+  .material-edge {
+    position: relative;
+  }
+  .material-edge::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0;
+    height: 1px;
+    background: var(--pam-warm-edge);
+    pointer-events: none;
+  }
+  .command-surface {
+    border: 1px solid transparent;
+    border-radius: var(--radius-overlay);
+    background:
+      var(--pam-glass-gradient) padding-box,
+      var(--pam-glass-edge) border-box;
+  }
+  .activity-lanes {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  }
+  .activity-lane {
+    container-type: inline-size;
+  }
+  .lane-repo {
+    display: none;
+  }
+  @container (min-width: 600px) {
+    .lane-repo {
+      display: block;
+    }
+  }
+  .activity-details > div {
+    min-width: 0;
+  }
+  .activity-details dd {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .flow-detail {
+    container-type: inline-size;
+  }
+  .flow-workbench {
+    flex-direction: column;
+  }
+  @container (min-width: 880px) {
+    .flow-workbench {
+      flex-direction: row;
+      align-items: flex-start;
+    }
+    .flow-inspector {
+      width: 380px;
+    }
+  }
   /* The chrome atmosphere: a barely-there radial wash so the dark water has
      depth without competing with the lit panel. Gradients (not images) keep
      the strict CSP happy. The one place raw color math is allowed. */
@@ -82,5 +173,55 @@
         color-mix(in oklab, var(--color-copper) 10%, transparent),
         transparent 55%
       );
+  }
+}
+
+/* Keep state feedback available without movement or theme-colored images. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  *,
+  *::before,
+  *::after {
+    background-image: none !important;
+    box-shadow: none !important;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    border: 1px solid ButtonText;
+  }
+  :focus-visible {
+    outline-color: Highlight;
+  }
+  [aria-current="page"],
+  [aria-pressed="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  [aria-current="page"]:focus-visible,
+  [aria-pressed="true"]:focus-visible {
+    outline-style: dashed;
+    outline-offset: 3px;
+    border-inline-start: 3px solid Highlight;
+  }
+  .warm-marker,
+  .warm-label::before {
+    background: Highlight;
+  }
+  .warm-badge,
+  .command-surface {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
   }
 }

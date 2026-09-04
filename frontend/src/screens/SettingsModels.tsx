@@ -73,7 +73,7 @@ function TierSelect({
         value={value ?? ""}
         disabled={disabled}
         onChange={(event) => onChange(event.target.value === "" ? null : event.target.value)}
-        className="h-8 w-full rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+        className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
       >
         <option value="">none (deterministic)</option>
         {models.map((model) => (
@@ -360,7 +360,7 @@ function StoragePanel() {
   });
 
   const inputClasses =
-    "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">

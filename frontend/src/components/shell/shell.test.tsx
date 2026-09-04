@@ -51,10 +51,11 @@ describe("Beacon", () => {
     expect(beacon.innerHTML).toContain(tokenClass);
   });
 
-  it("breathes — the glow layer uses the breathe motion token", () => {
+  it("keeps the idle beacon still and labels its state", () => {
     render(<Beacon state="connected" />);
     const beacon = screen.getByRole("status", { name: "daemon connected" });
-    expect(beacon.innerHTML).toContain("animate-breathe");
+    expect(beacon.innerHTML).not.toContain("animate-breathe");
+    expect(beacon).toHaveTextContent("Connected");
   });
 });
 

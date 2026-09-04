@@ -1,5 +1,5 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { motion } from "motion/react";
+import { motion, useReducedMotion } from "motion/react";
 import { Panel } from "../ui/Panel";
 import { PanelToolbar } from "./PanelToolbar";
 import { Sidebar } from "./Sidebar";
@@ -17,10 +17,11 @@ import { Sidebar } from "./Sidebar";
  * renders beneath it.
  *
  * Route content re-mounts inside the panel with a keyed fade-and-rise
- * (~180ms); MotionConfig in App.tsx collapses it to an opacity fade under
+ * (~180ms); the entire transition is removed under
  * prefers-reduced-motion.
  */
 export function Shell() {
+  const reducedMotion = useReducedMotion();
   const pathname = useRouterState({ select: (state) => state.location.pathname });
 
   return (
@@ -32,9 +33,9 @@ export function Shell() {
           <PanelToolbar />
           <motion.div
             key={pathname}
-            initial={{ opacity: 0, y: 6 }}
+            initial={reducedMotion ? false : { opacity: 0, y: 4 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.18, ease: "easeOut" }}
+            transition={{ duration: reducedMotion ? 0 : 0.18, ease: [0.2, 0, 0, 1] }}
             className="min-h-0 flex-1 overflow-y-auto"
           >
             <Outlet />

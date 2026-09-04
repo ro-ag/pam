@@ -38,6 +38,9 @@ const SEMANTIC_COLORS = [
   // hairlines
   "line",
   "edge",
+  "control-line",
+  "inset",
+  "selection-ink",
   "separator",
   // accent ramp
   "accent",
@@ -67,7 +70,7 @@ const SEMANTIC_COLORS = [
 ] as const;
 
 const SEMANTIC_SHADOWS = ["raise", "float"] as const;
-const SEMANTIC_RADII = ["control", "card", "panel", "pill"] as const;
+const SEMANTIC_RADII = ["control", "card", "panel", "badge", "overlay", "pill"] as const;
 const SEMANTIC_FONTS = ["display", "voice", "data", "sans"] as const;
 
 /** Non-color `text-*` utilities that legitimately survive the wipe. */
@@ -99,7 +102,11 @@ function declarationsOf(block: string, prefix = "pam"): Record<string, string> {
   for (const match of block.matchAll(
     new RegExp(`(--${prefix}-[a-z0-9-]+)\\s*:\\s*([^;]+);`, "g"),
   )) {
-    decls[match[1]] = match[2].replace(/\s+/g, " ").trim();
+    decls[match[1]] = match[2]
+      .replace(/\s+/g, " ")
+      .replace(/\(\s+/g, "(")
+      .replace(/\s+\)/g, ")")
+      .trim();
   }
   return decls;
 }
@@ -127,7 +134,7 @@ describe("tokens.css semantic namespace", () => {
     }
   });
 
-  it("declares exactly the two shadows, the four radii, and the four voices", () => {
+  it("declares exactly the two shadows, the compact radii, and the four voices", () => {
     for (const name of SEMANTIC_SHADOWS) {
       expect(tokens).toMatch(new RegExp(`--shadow-${name}\\s*:`));
     }
@@ -246,8 +253,8 @@ function expectTotalAndDistinct(label: string, rendered: ReadonlyMap<string, str
 }
 
 describe("cva exemplars", () => {
-  it("Panel: both grounds render distinct token-backed elevations", () => {
-    const grounds = ["surface", "raised"] as const;
+  it("Panel: all grounds render distinct token-backed elevations", () => {
+    const grounds = ["surface", "raised", "command"] as const;
     expectTotalAndDistinct(
       "Panel",
       new Map(grounds.map((ground) => [ground, panelVariants({ ground })])),
@@ -260,7 +267,7 @@ describe("cva exemplars", () => {
     expectTotalAndDistinct("Badge", rendered);
     for (const classes of rendered.values()) {
       expect(classes).toContain("font-data");
-      expect(classes).toContain("rounded-pill");
+      expect(classes).toContain("rounded-badge");
     }
   });
 

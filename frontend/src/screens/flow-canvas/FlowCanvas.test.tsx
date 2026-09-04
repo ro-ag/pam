@@ -228,7 +228,7 @@ describe("FlowCanvas nodes", () => {
     expect(within(b).getByLabelText("summarize").className).toContain("text-accent");
     const c = node("c");
     expect(within(c).getByLabelText("approval").className).toContain("text-warning");
-    expect(within(c).getByLabelText("stateful").className).toContain("text-copper");
+    expect(within(c).getByLabelText("stateful").className).toContain("warm-label");
     expect(within(c).getByLabelText("discard").className).toContain("text-ink-faint");
     for (const label of ["approval", "stateful", "discard"]) {
       expect(within(c).getByLabelText(label)).toHaveAttribute("role", "img");

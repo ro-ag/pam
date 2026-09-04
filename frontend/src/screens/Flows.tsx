@@ -381,7 +381,7 @@ function FlowDetailPane({
           )}
 
           {tab === "canvas" && (
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+            <div className="flow-workbench flex gap-4">
               <div className="min-w-0 flex-1 space-y-3">
                 {flowIssue && (
                   <FailureNote
@@ -412,7 +412,7 @@ function FlowDetailPane({
                 ) : null}
               </div>
               {draft.spec && (
-                <div className="shrink-0 lg:w-80">
+                <div className="flow-inspector shrink-0">
                   <Inspector
                     spec={draft.spec}
                     selection={selection}
@@ -463,8 +463,8 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
   const failure = flows.isError ? toBridgeFailure(flows.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           {entries.length > 0 ? `flows · ${entries.length} on the shelf` : "flows"}
         </p>
@@ -491,7 +491,11 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
 
       {!failure && selected !== null && (
         <div className="flex flex-1 flex-col gap-5 pt-6 lg:flex-row">
-          <Panel ground="raised" aria-label="flow library" className="w-full p-2 lg:w-64">
+          <Panel
+            ground="raised"
+            aria-label="flow library"
+            className="w-full shrink-0 p-2 lg:w-64"
+          >
             <ul className="space-y-0.5">
               {entries.map((entry) => (
                 <LibraryEntry
@@ -504,7 +508,10 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
             </ul>
           </Panel>
 
-          <section aria-label={`flow ${selected.id}`} className="min-w-0 flex-1 space-y-4">
+          <section
+            aria-label={`flow ${selected.id}`}
+            className="flow-detail min-w-0 flex-1 space-y-4"
+          >
             <div className="space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>
               <p className="max-w-xl font-voice text-base text-ink-muted italic">

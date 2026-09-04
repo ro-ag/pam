@@ -1,12 +1,6 @@
 import { cn, cva, type VariantProps } from "../../lib/cn";
 
-/**
- * The beacon — daemon state readable from the corner of the eye, no text.
- * A small lighthouse dot with a breathing glow: green when the daemon
- * answers, amber while an approval waits (wired by the approvals task),
- * red when the daemon is unreachable. Colors come from the beacon token
- * aliases so a theme can retune them without touching this component.
- */
+/** Static daemon indicator with a visible state label and a material pending marker. */
 export type BeaconState = "connected" | "pending" | "down";
 
 const beaconLabels: Record<BeaconState, string> = {
@@ -19,7 +13,7 @@ export const beaconVariants = cva("rounded-pill", {
   variants: {
     state: {
       connected: "bg-beacon-green",
-      pending: "bg-beacon-amber",
+      pending: "warm-marker bg-beacon-amber",
       down: "bg-beacon-red",
     },
   },
@@ -36,16 +30,19 @@ export function Beacon({ state, className }: BeaconProps) {
     <span
       role="status"
       aria-label={beaconLabels[resolved]}
-      className={cn("relative flex size-2", className)}
+      className={cn("flex items-center gap-2 font-data text-xs text-ink-muted", className)}
     >
       <span
         aria-hidden="true"
-        className={cn(
-          beaconVariants({ state: resolved }),
-          "absolute inset-0 animate-breathe blur-xs",
-        )}
+        className={cn(beaconVariants({ state: resolved }), "size-2 shrink-0")}
       />
-      <span className={cn(beaconVariants({ state: resolved }), "relative size-2")} />
+      <span>
+        {resolved === "connected"
+          ? "Connected"
+          : resolved === "pending"
+            ? "Awaiting review"
+            : "Offline"}
+      </span>
     </span>
   );
 }

@@ -280,7 +280,7 @@ function ApprovalCard({
           value={note}
           onChange={(event) => setNote(event.target.value)}
           placeholder="why — this line travels with the audit trail"
-          className="h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
+          className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
         />
       )}
     </Panel>
@@ -404,8 +404,8 @@ export function ApprovalsScreen() {
   const failure = approvals.isError ? toBridgeFailure(approvals.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
+    <div className="flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
         <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
           {count === undefined
             ? "approvals"

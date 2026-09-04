@@ -105,7 +105,7 @@ describe("raised hands", () => {
     expect(pushCard.getByText(/alter shared history/)).toBeInTheDocument();
     // Unknown families fall back to the generic sentence.
     expect(card("echo").getByText(/lets it continue this once/)).toBeInTheDocument();
-    expect(screen.getByText(/2 waiting · oldest first/)).toBeInTheDocument();
+    expect(screen.getByText(/Oldest first · unanswered requests time out/)).toBeInTheDocument();
   });
 
   it("phrases what approving means per capability family", () => {

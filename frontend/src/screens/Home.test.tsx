@@ -126,7 +126,7 @@ async function askQuestion(question: string) {
   const input = await screen.findByRole("textbox", { name: "ask pam" });
   await waitFor(() => expect(input).toBeEnabled());
   fireEvent.change(input, { target: { value: question } });
-  fireEvent.keyDown(input, { key: "Enter" });
+  fireEvent.submit(screen.getByRole("form", { name: "Ask PAM" }));
 }
 
 describe("Home shell", () => {
@@ -156,9 +156,7 @@ describe("Home shell", () => {
 
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
     renderHome();
-    expect(
-      await screen.findByText("The daemon is not answering; the next question starts it."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Active requests: Unavailable")).toBeInTheDocument();
   });
 
   it("shows unavailable state instead of inventing zero counts and keeps workspace links usable", async () => {
@@ -166,9 +164,12 @@ describe("Home shell", () => {
     mocks.approvalsPending.mockRejectedValue(new Error("unavailable"));
     const router = renderHome();
     const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
-    await waitFor(() => expect(within(overview).getAllByText("Unavailable")).toHaveLength(2));
+    await waitFor(() =>
+      expect(within(overview).getByText("Approval queue unavailable.")).toBeInTheDocument(),
+    );
+    expect(within(overview).getByText("Active requests: Unavailable")).toBeInTheDocument();
     expect(within(overview).queryByText("0")).not.toBeInTheDocument();
-    fireEvent.click(within(overview).getByRole("link", { name: /Inspect activity/ }));
+    fireEvent.click(within(overview).getByRole("link", { name: /Active requests/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/activity"));
   });
 
@@ -200,6 +201,7 @@ describe("Home shell", () => {
 
   it("asks the canonical question when a pill is clicked", async () => {
     renderHome();
+    fireEvent.click(await screen.findByText("Suggested questions"));
     const pill = await screen.findByRole("button", {
       name: "ask: what's waiting for my approval?",
     });
@@ -237,7 +239,7 @@ describe("Home shell", () => {
     );
     expect(screen.getByText("Ask PAM", { selector: "label" })).toHaveAttribute("for", input.id);
     fireEvent.change(input, { target: { value: "what's waiting for my approval?" } });
-    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.submit(screen.getByRole("form", { name: "Ask PAM" }));
     await waitFor(() => expect(input).toBeDisabled());
     expect(screen.getByRole("button", { name: "Ask" })).toHaveAttribute("aria-busy", "true");
     release({ pending: [] });

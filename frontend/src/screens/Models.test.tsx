@@ -232,10 +232,11 @@ describe("runtime card", () => {
   it("says Pam's idle sentence and closes the try box with a reason", async () => {
     renderModels();
     expect(await screen.findByText(IDLE_RUNTIME_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByText("idle unload after 10 min")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Test model" }));
     expect(screen.getByLabelText("prompt")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
     expect(screen.getByText(/Load a model first/)).toBeInTheDocument();
-    expect(screen.getByText("idle unload after 10 min")).toBeInTheDocument();
   });
 
   it("shows the loaded model's id, quant and tokens/sec in the display face", async () => {
@@ -270,6 +271,7 @@ describe("runtime card", () => {
 describe("library", () => {
   it("renders Pam's empty-shelf sentence when nothing is installed", async () => {
     renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
     expect(await screen.findByText(EMPTY_LIBRARY_SENTENCE)).toBeInTheDocument();
   });
 
@@ -279,7 +281,8 @@ describe("library", () => {
       models_dir: "/Users/dev/llm",
     });
     renderModels();
-    const table = within(await screen.findByRole("region", { name: "Library" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
+    const table = within(await screen.findByRole("region", { name: "Installed models" }));
     expect(await table.findByText("test only")).toBeInTheDocument();
     expect(table.getByText(FLOOR_SENTENCE)).toBeInTheDocument();
     expect(table.getByRole("button", { name: "Set light" })).toBeDisabled();
@@ -293,7 +296,8 @@ describe("library", () => {
   it("offers a verified engine row its defaults, its size and its digest verdict", async () => {
     mocks.modelsList.mockResolvedValue({ models: [entry()], models_dir: "/Users/dev/llm" });
     renderModels();
-    const table = within(await screen.findByRole("region", { name: "Library" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
+    const table = within(await screen.findByRole("region", { name: "Installed models" }));
     expect(await table.findByText("engine")).toBeInTheDocument();
     expect(table.getByText("verified")).toBeInTheDocument();
     expect(table.getByText("18.6 GB")).toBeInTheDocument();
@@ -312,7 +316,8 @@ describe("library", () => {
       models_dir: "/Users/dev/llm",
     });
     renderModels();
-    const table = within(await screen.findByRole("region", { name: "Library" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
+    const table = within(await screen.findByRole("region", { name: "Installed models" }));
     const cell = await table.findByText("bad magic");
     expect(cell.className).toContain("text-danger");
   });
@@ -320,7 +325,8 @@ describe("library", () => {
   it("deletes in two taps", async () => {
     mocks.modelsList.mockResolvedValue({ models: [entry()], models_dir: "/Users/dev/llm" });
     renderModels();
-    const table = within(await screen.findByRole("region", { name: "Library" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
+    const table = within(await screen.findByRole("region", { name: "Installed models" }));
     fireEvent.click(await table.findByRole("button", { name: "Delete" }));
     expect(mocks.modelsDelete).not.toHaveBeenCalled();
     fireEvent.click(table.getByRole("button", { name: "delete it?" }));
@@ -344,7 +350,8 @@ describe("catalog", () => {
       floor_bytes: 18_000_000_000,
     });
     renderModels();
-    const catalog = within(await screen.findByRole("region", { name: "Catalog" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
     expect(await catalog.findByText("Qwen3-Coder-30B-A3B Q4_K_M")).toBeInTheDocument();
     expect(catalog.queryByText("Too big for this host")).not.toBeInTheDocument();
     expect(catalog.getByText("Already here")).toBeInTheDocument();
@@ -355,7 +362,8 @@ describe("catalog", () => {
 
   it("starts a preset download and names the license", async () => {
     renderModels();
-    const catalog = within(await screen.findByRole("region", { name: "Catalog" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
     fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
     await waitFor(() =>
       expect(mocks.modelsDownload).toHaveBeenCalledWith({
@@ -371,7 +379,8 @@ describe("catalog", () => {
   it("renders a running download's percentage and cancels that job", async () => {
     mocks.modelsStatus.mockResolvedValue(idleStatus({ jobs: [job()] }));
     renderModels();
-    const catalog = within(await screen.findByRole("region", { name: "Catalog" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
     expect(await catalog.findByText("50%")).toBeInTheDocument();
     expect(catalog.getByLabelText("download progress")).toBeInTheDocument();
     expect(catalog.queryByRole("button", { name: "Download" })).not.toBeInTheDocument();
@@ -388,7 +397,8 @@ describe("catalog", () => {
 
   it("sends a pasted URL with its vendor, and says pasted files stay unverified", async () => {
     renderModels();
-    const catalog = within(await screen.findByRole("region", { name: "Catalog" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
     fireEvent.change(await catalog.findByLabelText("gguf url"), {
       target: { value: "https://example.test/model.gguf" },
     });
@@ -417,7 +427,8 @@ describe("try box", () => {
       tokens_per_sec: 23.33,
     });
     renderModels();
-    const box = within(await screen.findByRole("region", { name: "Try box" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Test model" }));
+    const box = within(await screen.findByRole("region", { name: "Test model" }));
     const prompt = await box.findByLabelText("prompt");
     await waitFor(() => expect(prompt).toBeEnabled());
     fireEvent.change(prompt, { target: { value: "Say hello in five words." } });
@@ -438,7 +449,8 @@ describe("try box", () => {
       recovery: "Shorten the prompt; the context holds 8192 tokens.",
     });
     renderModels();
-    const box = within(await screen.findByRole("region", { name: "Try box" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Test model" }));
+    const box = within(await screen.findByRole("region", { name: "Test model" }));
     const prompt = await box.findByLabelText("prompt");
     await waitFor(() => expect(prompt).toBeEnabled());
     fireEvent.change(prompt, { target: { value: "war and peace" } });

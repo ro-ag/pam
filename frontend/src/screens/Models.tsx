@@ -6,6 +6,7 @@ import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { PageTabs, PagePane } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Section } from "../components/ui/Section";
 import { formatBytes, percentOf } from "../lib/bytes";
@@ -65,7 +66,7 @@ export const FLOOR_NOTE =
 
 /** Empty library, in Pam's voice. */
 export const EMPTY_LIBRARY_SENTENCE =
-  "No weights on the shelf yet. Pick a model from the catalog below and I'll fetch and verify it.";
+  "No weights on the shelf yet. Pick a model from Downloads and I'll fetch and verify it.";
 
 /** Idle runtime, in Pam's voice. */
 export const IDLE_RUNTIME_SENTENCE =
@@ -739,7 +740,15 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
 
 // --- the screen ------------------------------------------------------------
 
+const MODEL_TABS = [
+  { id: "runtime", label: "Runtime" },
+  { id: "library", label: "Installed" },
+  { id: "catalog", label: "Downloads" },
+  { id: "test", label: "Test model" },
+] as const;
+
 export function ModelsScreen() {
+  const [tab, setTab] = useState<(typeof MODEL_TABS)[number]["id"]>("runtime");
   const status = useQuery({
     queryKey: ["models", "status"],
     queryFn: modelsStatus,
@@ -766,25 +775,33 @@ export function ModelsScreen() {
   const jobs = status.data?.jobs ?? [];
 
   return (
-    <div className="flex min-h-full flex-col px-6 pb-10">
+    <div className="page-workspace">
       <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Models</h1>
         <p className="text-sm text-ink-muted">Local models, runtime and downloads.</p>
       </PageHeader>
 
-      <div className="space-y-6 pt-6">
+      <PageTabs
+        id="models"
+        label="Model tasks"
+        tabs={MODEL_TABS}
+        selected={tab}
+        onSelect={setTab}
+      />
+      <PagePane id="models" tab="runtime" active={tab === "runtime"}>
         <Section
           eyebrow="runtime"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
           title="Runtime"
-          blurb="What is in memory right now, and the two buttons that change that."
+          blurb="Load or unload a model and see what is in memory."
         >
           <RuntimeCard status={status.data} models={models} failure={statusFailure} />
         </Section>
-
+      </PagePane>
+      <PagePane id="models" tab="library" active={tab === "library"}>
         <Section
           eyebrow="library"
-          title="Library"
+          title="Installed models"
           blurb="Every set of weights on disk, with what I know about each one."
         >
           <LibraryTable
@@ -795,23 +812,25 @@ export function ModelsScreen() {
             failure={libraryFailure}
           />
         </Section>
-
+      </PagePane>
+      <PagePane id="models" tab="catalog" active={tab === "catalog"}>
         <Section
           eyebrow="catalog"
-          title="Catalog"
+          title="Downloads"
           blurb="The models I know how to fetch and verify — only the ones this machine can hold."
         >
           <CatalogPanel jobs={jobs} />
         </Section>
-
+      </PagePane>
+      <PagePane id="models" tab="test" active={tab === "test"}>
         <Section
           eyebrow="diagnostics"
-          title="Try box"
+          title="Test model"
           blurb="One prompt against whatever is loaded, so you can see it answer before trusting it with a job."
         >
           <TryBox status={status.data} />
         </Section>
-      </div>
+      </PagePane>
     </div>
   );
 }

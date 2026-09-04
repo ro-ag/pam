@@ -263,6 +263,7 @@ function renderFlows() {
 
 /** Waits until the editor holds the named flow's own text. */
 async function editorFor(id: string): Promise<HTMLTextAreaElement> {
+  fireEvent.click(await screen.findByRole("tab", { name: "YAML" }));
   const editor = (await screen.findByLabelText(`${id} yaml`)) as HTMLTextAreaElement;
   await waitFor(() => expect(editor.value).toContain(`id: ${id}`));
   return editor;
@@ -271,7 +272,7 @@ async function editorFor(id: string): Promise<HTMLTextAreaElement> {
 /** Picks a flow off the shelf and waits for its editor to follow. */
 async function pick(id: string) {
   const library = within(await screen.findByLabelText("flow library"));
-  fireEvent.click(library.getByText(id));
+  fireEvent.click(library.getByTitle(id));
   return editorFor(id);
 }
 
@@ -294,21 +295,24 @@ async function quiet(ms: number) {
 
 /** Starts a run of the selected flow from its card and waits for the ticket. */
 async function startRun() {
+  fireEvent.click(screen.getByRole("tab", { name: "Run flow" }));
   const card = within(await screen.findByLabelText("run this flow"));
   fireEvent.change(card.getByLabelText("repo path"), {
     target: { value: "/Users/dev/work/pam" },
   });
   fireEvent.click(card.getByRole("button", { name: "Run" }));
   await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
+  fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
 }
 
 describe("the library column", () => {
-  it("shelves every flow with its source badge", async () => {
+  it("names each flow once and marks custom copies", async () => {
     await renderFlows();
     const library = within(await screen.findByLabelText("flow library"));
-    for (const flow of FLOWS) expect(library.getByText(flow.id)).toBeInTheDocument();
-    expect(library.getAllByText("builtin")).toHaveLength(2);
-    expect(library.getAllByText("library")).toHaveLength(2);
+    for (const flow of FLOWS)
+      expect(library.getByRole("button", { name: new RegExp(flow.name) })).toBeInTheDocument();
+    expect(library.getAllByText("Custom")).toHaveLength(2);
+    expect(library.queryByText("builtin")).not.toBeInTheDocument();
   });
 
   it("marks an unparseable flow invalid and says why, twice over", async () => {
@@ -323,7 +327,7 @@ describe("the library column", () => {
 
   it("opens the first flow on the shelf without being asked", async () => {
     await renderFlows();
-    expect(await screen.findByLabelText("pr-readiness yaml")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "PR readiness" })).toBeInTheDocument();
   });
 
   it("preselects the flow named by the route search", async () => {
@@ -343,7 +347,9 @@ describe("the library column", () => {
         <FlowsScreen initialFlow="no-such-flow" />
       </QueryClientProvider>,
     );
-    expect(await screen.findByRole("region", { name: "flow pr-readiness" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "flow pr-readiness" }),
+    ).toBeInTheDocument();
   });
 });
 
@@ -423,6 +429,7 @@ describe("the YAML tab", () => {
 describe("the run card", () => {
   it("offers the repos pam has seen and takes a free-text path too", async () => {
     await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(await screen.findByLabelText("run this flow"));
     await waitFor(() =>
       expect(card.getByRole("option", { name: "/Users/dev/work/pam" })).toBeInTheDocument(),
@@ -439,6 +446,7 @@ describe("the run card", () => {
   it("gives every declared input a field, prefilled with its default", async () => {
     await renderFlows();
     await pick("after-merge-checks");
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(screen.getByLabelText("run this flow"));
     expect(card.getByLabelText("base")).toHaveValue("main");
     expect(card.getByText("the branch to compare against")).toBeInTheDocument();
@@ -446,6 +454,7 @@ describe("the run card", () => {
 
   it("runs, narrates the ticket's progress, then lands the verdict", async () => {
     await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(await screen.findByLabelText("run this flow"));
     fireEvent.change(card.getByLabelText("repo path"), {
       target: { value: "/Users/dev/work/pam" },
@@ -482,6 +491,7 @@ describe("the run card", () => {
       recovery: "Grant it in Pam → Settings → Security.",
     });
     await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(await screen.findByLabelText("run this flow"));
     fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
     fireEvent.click(card.getByRole("button", { name: "Run" }));
@@ -490,6 +500,7 @@ describe("the run card", () => {
 
   it("shows a mid-run refusal instead of pretending a verdict exists", async () => {
     await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(await screen.findByLabelText("run this flow"));
     fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
     fireEvent.click(card.getByRole("button", { name: "Run" }));
@@ -509,7 +520,7 @@ describe("the Runs tab", () => {
     });
     await renderFlows();
     await editorFor("pr-readiness");
-    fireEvent.click(screen.getByRole("button", { name: "runs" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Run history" }));
 
     await waitFor(() =>
       expect(mocks.activityList).toHaveBeenCalledWith({ capability: "flow.run", limit: 50 }),
@@ -538,7 +549,7 @@ describe("the Runs tab", () => {
     mocks.activityList.mockResolvedValue({ requests: [] });
     await renderFlows();
     await editorFor("pr-readiness");
-    fireEvent.click(screen.getByRole("button", { name: "runs" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Run history" }));
     expect(await screen.findByText(/This flow has not run yet/)).toBeInTheDocument();
   });
 });
@@ -554,16 +565,14 @@ describe("the canvas tab", () => {
 
   it("opens on the canvas tab with one node per step", async () => {
     await renderFlows();
-    const tabs = within(screen.getByRole("group", { name: "flow view" }));
-    expect(tabs.getAllByRole("button").map((tab) => tab.textContent)).toEqual([
-      "canvas",
-      "yaml",
-      "runs",
+    const tabs = within(screen.getByRole("tablist", { name: "flow view" }));
+    expect(tabs.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Canvas",
+      "YAML",
+      "Run flow",
+      "Run history",
     ]);
-    expect(tabs.getByRole("button", { name: "canvas" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(tabs.getByRole("tab", { name: "Canvas" })).toHaveAttribute("aria-selected", "true");
     for (const [id, order] of [
       ["fmt", "1"],
       ["clippy", "2"],
@@ -574,9 +583,10 @@ describe("the canvas tab", () => {
       );
     }
     expect(screen.getByLabelText("inspector")).toBeInTheDocument();
-    // The editor and the run card sit under the canvas too: one draft, two readings.
-    expect(screen.getByLabelText("pr-readiness yaml")).toBeInTheDocument();
-    expect(screen.getByLabelText("run this flow")).toBeInTheDocument();
+    // Canvas has shared save/run actions, but no duplicate YAML editor.
+    expect(screen.queryByLabelText("pr-readiness yaml")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("run this flow")).not.toBeVisible();
+    expect(screen.getByRole("tab", { name: "Run flow" })).toBeInTheDocument();
     expect(mocks.flowsNormalize).not.toHaveBeenCalled();
   });
 
@@ -604,12 +614,12 @@ describe("the canvas tab", () => {
     expect(sent.flow.steps[1].needs).toEqual(["fmt"]);
     expect(sent.flow.steps[2].when).toEqual({ failed: "clippy" });
 
-    fireEvent.click(screen.getByRole("button", { name: "yaml" }));
+    fireEvent.click(screen.getByRole("tab", { name: "YAML" }));
     await waitFor(() =>
       expect(screen.getByLabelText("pr-readiness yaml")).toHaveValue(canonical(sent.flow)),
     );
     // The canvas keeps the resolved reply, not its own guess.
-    fireEvent.click(screen.getByRole("button", { name: "canvas" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     expect(await nodeFor("step-1")).toBeInTheDocument();
     expect(screen.getByLabelText("draft status")).toHaveTextContent("Save writes it");
   });
@@ -641,17 +651,18 @@ describe("the canvas tab", () => {
     await quiet(1);
     await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledWith({ yaml: typed }));
 
-    expect(await nodeFor("extra")).toBeInTheDocument();
-    expect(screen.queryByLabelText("step fmt")).toBeNull();
     // The human's text is theirs until Save; the reply never rewrites it.
     expect(screen.getByLabelText("mine yaml")).toHaveValue(typed);
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
+    expect(await nodeFor("extra")).toBeInTheDocument();
+    expect(screen.queryByLabelText("step fmt")).toBeNull();
     expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
   });
 
   it("switching to the canvas flushes a pending yaml check and drops stale replies", async () => {
     await renderFlows();
     await pick("mine");
-    fireEvent.click(screen.getByRole("button", { name: "yaml" }));
+    fireEvent.click(screen.getByRole("tab", { name: "YAML" }));
     let answer: (reply: FlowNormalizeReply) => void = () => {};
     mocks.flowsNormalize.mockImplementationOnce(
       () =>
@@ -661,7 +672,7 @@ describe("the canvas tab", () => {
     );
     fireEvent.change(screen.getByLabelText("mine yaml"), { target: { value: "id: mine\n" } });
     expect(mocks.flowsNormalize).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "canvas" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1);
 
     // A newer edit lands while the first answer is still out: when that
@@ -695,6 +706,7 @@ describe("the canvas tab", () => {
     await quiet(YAML_QUIET_MS);
     await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1));
 
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     const clippy = await nodeFor("clippy");
     await waitFor(() =>
       expect(within(clippy).getByLabelText("validation marker")).toHaveAttribute(
@@ -712,8 +724,10 @@ describe("the canvas tab", () => {
       valid: false,
       error: { path: "id", message: "ids are [a-z0-9-]" },
     });
+    fireEvent.click(screen.getByRole("tab", { name: "YAML" }));
     fireEvent.change(screen.getByLabelText("mine yaml"), { target: { value: "id: Mine!\n" } });
     await quiet(YAML_QUIET_MS);
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     // Said above the canvas, and again in the inspector's own note.
     expect(await screen.findAllByText(/flow · ids are \[a-z0-9-\]/)).toHaveLength(2);
     expect(within(await nodeFor("clippy")).queryByLabelText("validation marker")).toBeNull();
@@ -767,9 +781,11 @@ describe("the canvas tab", () => {
     // The same from the textarea.
     act(() => feed({ ticket: "req_run", event: { kind: "progress", note: "fmt: failed" } }));
     await waitFor(() => expect(rail("fmt").className).toContain("bg-danger"));
+    fireEvent.click(screen.getByRole("tab", { name: "YAML" }));
     fireEvent.change(screen.getByLabelText("pr-readiness yaml"), {
       target: { value: "id: pr-readiness\n" },
     });
+    fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     await waitFor(() => expect(rail("fmt").className).not.toContain("bg-danger"));
   });
 });

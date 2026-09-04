@@ -1,11 +1,11 @@
 import type { HTMLAttributes } from "react";
 import { cn } from "../../lib/cn";
 
-/** Titles share the page material; scroll normally so content cannot overlap them. */
+/** Settings-sized header, outside each workspace's scrolling content. */
 export function PageHeader({ className, ...props }: HTMLAttributes<HTMLElement>) {
   return (
     <header
-      className={cn("shrink-0 space-y-1 border-b border-line py-5", className)}
+      className={cn("page-header shrink-0 space-y-1 border-b border-line", className)}
       {...props}
     />
   );

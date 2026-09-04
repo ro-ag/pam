@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { cn, cva } from "../lib/cn";
+import { PageTabs, PagePane } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
   activityList,
@@ -407,6 +408,7 @@ function PamMoment({ children, aside }: { children: ReactNode; aside?: ReactNode
 // --- the screen ------------------------------------------------------------
 
 export function ActivityScreen() {
+  const [tab, setTab] = useState<"requests" | "compression">("requests");
   const search = useSearch({ from: "/activity" });
   const navigate = useNavigate({ from: "/activity" });
   const queryClient = useQueryClient();
@@ -531,13 +533,23 @@ export function ActivityScreen() {
   const failure = activity.isError ? toBridgeFailure(activity.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-6 pb-6">
-      <PageHeader className="space-y-3">
-        <p className="font-data text-xs text-ink-faint">Live requests</p>
-        <div className="flex flex-wrap items-center gap-3">
-          <h1 className="mr-auto font-display text-title font-semibold text-ink">Activity</h1>
-          <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
-        </div>
+    <div className="page-workspace">
+      <PageHeader>
+        <h1 className="font-sans text-title font-semibold text-ink">Activity</h1>
+        <p className="text-sm text-ink-muted">Agent requests, results and evidence.</p>
+      </PageHeader>
+      <PageTabs
+        id="activity"
+        label="Activity views"
+        tabs={[
+          { id: "requests", label: "Requests" },
+          { id: "compression", label: "Log compression" },
+        ]}
+        selected={tab}
+        onSelect={setTab}
+      />
+      <div className="page-toolbar space-y-3" hidden={tab !== "requests"}>
+        <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
         <ChipBar
           agents={agentOptions}
           repos={repoOptions}
@@ -546,93 +558,107 @@ export function ActivityScreen() {
           onAgent={(agent) => setFilters({ agent })}
           onRepo={(repo) => setFilters({ repo })}
         />
-      </PageHeader>
+      </div>
+      <PagePane id="activity" tab="compression" active={tab === "compression"}>
+        <h2 className="text-lg font-semibold">Log compression</h2>
+        <p className="mb-4 text-sm text-ink-muted">
+          Compress a local log and inspect the saved evidence in Requests.
+        </p>
+        <EvidenceBand
+          onCompressed={() => {
+            setPendingExpand(true);
+          }}
+        />
+      </PagePane>
+      <PagePane id="activity" tab="requests" active={tab === "requests"}>
+        {failure && (
+          <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
+            <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
+            <p className="font-sans text-sm text-ink">{failure.detail}.</p>
+            <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
+          </section>
+        )}
 
-      <EvidenceBand onCompressed={() => setPendingExpand(true)} />
+        {!failure && activity.isPending && <TideSkeleton />}
 
-      {failure && (
-        <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-          <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
-          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
-          <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
-        </section>
-      )}
-
-      {!failure && activity.isPending && <TideSkeleton />}
-
-      {!failure && !activity.isPending && rows.length === 0 && (
-        <PamMoment
-          aside={
-            filtered && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setFilters({ repo: undefined, agent: undefined, state: "all" })}
-              >
-                Clear filters
-              </Button>
-            )
-          }
-        >
-          {filtered
-            ? "Nothing in the water matches this lens. Widen it, or let it go."
-            : "I’m watching the water. Nothing needs your hand right now — when something does, I’ll raise mine first."}
-        </PamMoment>
-      )}
-
-      {!failure && rows.length > 0 && (
-        <>
-          <div role="group" aria-label="lanes" className="activity-lanes grid gap-4">
-            <AnimatePresence initial={false}>
-              {lanes.map((lane) => (
-                <motion.section
-                  key={lane.agent}
-                  layout
-                  aria-label={lane.agent}
-                  exit={fade}
-                  transition={settle}
-                  className="activity-lane min-w-0 rounded-card border border-line bg-surface-raised p-2"
+        {!failure && !activity.isPending && rows.length === 0 && (
+          <PamMoment
+            aside={
+              filtered && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    setFilters({ repo: undefined, agent: undefined, state: "all" })
+                  }
                 >
-                  <header className="flex items-center gap-2 px-2 pb-2">
-                    <Badge tone="accent">{lane.agent}</Badge>
-                    <span className="font-data text-xs text-ink-faint">{lane.rows.length}</span>
-                    <span className="ml-auto font-data text-xs text-ink-faint">
-                      {relativeTime(lane.latest, now)}
-                    </span>
-                  </header>
-                  <ul className="divide-y divide-line">
-                    <AnimatePresence initial={false}>
-                      {lane.rows.map((row) => (
-                        <motion.li
-                          key={row.id}
-                          layout="position"
-                          initial={enter}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={fade}
-                          transition={settle}
-                        >
-                          <TideRow
-                            row={row}
-                            now={now}
-                            expanded={expandedId === row.id}
-                            onToggle={() =>
-                              setExpandedId(expandedId === row.id ? null : row.id)
-                            }
-                          />
-                        </motion.li>
-                      ))}
-                    </AnimatePresence>
-                  </ul>
-                </motion.section>
-              ))}
-            </AnimatePresence>
-          </div>
-          <p className="mt-3 font-data text-xs text-ink-faint">
-            {rows.length} request{rows.length === 1 ? "" : "s"} · {lanes.length} lane
-            {lanes.length === 1 ? "" : "s"} · newest first · own probes hidden
-          </p>
-        </>
-      )}
+                  Clear filters
+                </Button>
+              )
+            }
+          >
+            {filtered
+              ? "No requests match these filters."
+              : "No activity yet. Agent requests will appear here with their results and evidence."}
+          </PamMoment>
+        )}
+
+        {!failure && rows.length > 0 && (
+          <>
+            <div role="group" aria-label="lanes" className="activity-lanes grid gap-4">
+              <AnimatePresence initial={false}>
+                {lanes.map((lane) => (
+                  <motion.section
+                    key={lane.agent}
+                    layout
+                    aria-label={lane.agent}
+                    exit={fade}
+                    transition={settle}
+                    className="activity-lane min-w-0 rounded-card border border-line bg-surface-raised p-2"
+                  >
+                    <header className="flex items-center gap-2 px-2 pb-2">
+                      <Badge tone="accent">{lane.agent}</Badge>
+                      <span className="font-data text-xs text-ink-faint">
+                        {lane.rows.length}
+                      </span>
+                      <span className="ml-auto font-data text-xs text-ink-faint">
+                        {relativeTime(lane.latest, now)}
+                      </span>
+                    </header>
+                    <ul className="divide-y divide-line">
+                      <AnimatePresence initial={false}>
+                        {lane.rows.map((row) => (
+                          <motion.li
+                            key={row.id}
+                            layout="position"
+                            initial={enter}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={fade}
+                            transition={settle}
+                          >
+                            <TideRow
+                              row={row}
+                              now={now}
+                              expanded={expandedId === row.id}
+                              onToggle={() =>
+                                setExpandedId(expandedId === row.id ? null : row.id)
+                              }
+                            />
+                          </motion.li>
+                        ))}
+                      </AnimatePresence>
+                    </ul>
+                  </motion.section>
+                ))}
+              </AnimatePresence>
+            </div>
+            <p className="mt-3 font-data text-xs text-ink-faint">
+              {rows.length} request{rows.length === 1 ? "" : "s"} · {lanes.length} lane
+              {lanes.length === 1 ? "" : "s"} · newest first · own probes hidden
+            </p>
+          </>
+        )}
+      </PagePane>
     </div>
   );
 }

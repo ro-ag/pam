@@ -7,14 +7,14 @@ import { Sidebar } from "./Sidebar";
 export function Shell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   return (
-    <div className="desktop-shell relative flex h-screen overflow-hidden bg-chrome text-ink">
+    <div className="desktop-shell relative flex h-screen overflow-clip bg-chrome text-ink">
       <Sidebar />
       <main className="min-w-0 flex-1 p-3">
         <Panel className="desktop-panel flex h-full flex-col overflow-hidden shadow-float">
           <PanelToolbar />
           <div
             key={pathname}
-            className="workspace-scroll min-h-0 flex-1 overflow-y-auto"
+            className="workspace-scroll min-h-0 flex-1 overflow-hidden"
             data-settings={pathname === "/settings" || undefined}
           >
             <Outlet />

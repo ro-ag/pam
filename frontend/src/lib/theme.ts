@@ -21,6 +21,14 @@ export type ModeId = (typeof modeIds)[number];
 export type MaterialId = "glass" | "opaque";
 export const materialStorageKey = "pam-material";
 
+export const backgroundMotionIds = ["off", "slow", "slower"] as const;
+export type BackgroundMotionId = (typeof backgroundMotionIds)[number];
+export const backgroundMotionStorageKey = "pam-background-motion";
+
+export function isBackgroundMotionId(value: unknown): value is BackgroundMotionId {
+  return backgroundMotionIds.includes(value as BackgroundMotionId);
+}
+
 export function isMaterialId(value: unknown): value is MaterialId {
   return value === "glass" || value === "opaque";
 }
@@ -79,6 +87,7 @@ export interface ThemeState {
   theme: ThemeId;
   mode: ModeId;
   material: MaterialId;
+  backgroundMotion: BackgroundMotionId;
 }
 
 let snapshot: ThemeState | null = null;
@@ -106,6 +115,7 @@ export function themeSnapshot(): ThemeState {
       theme: isThemeId(theme) ? theme : defaultTheme,
       mode: isModeId(mode) ? mode : systemMode(),
       material: isMaterialId(material) ? material : "glass",
+      backgroundMotion: readBackgroundMotion(),
     };
   }
   return snapshot;
@@ -141,7 +151,12 @@ export function applyTheme(
   }
   syncNativeWindow(mode);
   const material = document.documentElement.dataset.material;
-  snapshot = { theme, mode, material: isMaterialId(material) ? material : "glass" };
+  snapshot = {
+    theme,
+    mode,
+    material: isMaterialId(material) ? material : "glass",
+    backgroundMotion: readBackgroundMotion(),
+  };
   for (const listener of listeners) listener();
 }
 
@@ -150,6 +165,19 @@ export function applyMaterial(material: MaterialId, options?: { persist?: boolea
   document.documentElement.dataset.material = material;
   if (options?.persist !== false) persist(materialStorageKey, material);
   snapshot = { ...themeSnapshot(), material };
+  for (const listener of listeners) listener();
+}
+
+function readBackgroundMotion(): BackgroundMotionId {
+  const value = document.documentElement.dataset.backgroundMotion;
+  return isBackgroundMotionId(value) ? value : "slow";
+}
+
+/** Store the chosen speed; CSS honors accessibility overrides independently. */
+export function applyBackgroundMotion(backgroundMotion: BackgroundMotionId): void {
+  document.documentElement.dataset.backgroundMotion = backgroundMotion;
+  persist(backgroundMotionStorageKey, backgroundMotion);
+  snapshot = { ...themeSnapshot(), backgroundMotion };
   for (const listener of listeners) listener();
 }
 
@@ -184,6 +212,8 @@ export function initTheme(): { theme: ThemeId; mode: ModeId } {
   const mode = stored(modeStorageKey, isModeId) ?? systemMode();
   document.documentElement.dataset.material =
     stored(materialStorageKey, isMaterialId) ?? "glass";
+  document.documentElement.dataset.backgroundMotion =
+    stored(backgroundMotionStorageKey, isBackgroundMotionId) ?? "slow";
   applyTheme(theme, mode, { persist: false });
   return { theme, mode };
 }

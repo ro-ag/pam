@@ -26,6 +26,30 @@ describe("desktop workspace materials", () => {
     }
   });
 
+  it("offers reversible slow drift, an off switch and reduced-motion protection", () => {
+    for (const [speed, seconds] of [
+      ["slow", 120],
+      ["slower", 240],
+    ]) {
+      expect(styles).toContain(
+        `[data-background-motion="${speed}"] .desktop-shell::before {\n    animation: background-drift ${seconds}s ease-in-out infinite alternate;`,
+      );
+    }
+    expect(styles).toMatch(
+      /\[data-background-motion="off"\] .desktop-shell::before\s*\{\s*animation: none/,
+    );
+    const keyframes = styles.slice(
+      styles.indexOf("@keyframes background-drift"),
+      styles.indexOf(".desktop-sidebar"),
+    );
+    expect(keyframes).toContain("transform: scale(1) rotate(0deg)");
+    expect(keyframes).toContain("transform: scale(1.2) rotate(2deg)");
+    expect(keyframes.match(/\b[\w-]+:/g)).toEqual(["transform:", "transform:"]);
+    const reduced = styles.slice(styles.indexOf("@media (prefers-reduced-motion: reduce)"));
+    expect(reduced).toContain("*::before");
+    expect(reduced).toContain("animation: none !important");
+  });
+
   it("removes textures for opaque, reduced transparency and forced colors", () => {
     const opaque = styles.slice(styles.indexOf('[data-material="opaque"]'));
     expect(opaque).toMatch(/\.desktop-shell::before\s*\{\s*display: none/);

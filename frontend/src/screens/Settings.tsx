@@ -36,6 +36,8 @@ import {
 import {
   applyTheme,
   applyMaterial,
+  applyBackgroundMotion,
+  backgroundMotionIds,
   modeIds,
   subscribeTheme,
   themes,
@@ -68,7 +70,10 @@ import { SettingsModelsSection } from "./SettingsModels";
  * until someone misses it; two honest buttons beat three subtle states.
  */
 function AppearancePanel() {
-  const { theme, mode, material } = useSyncExternalStore(subscribeTheme, themeSnapshot);
+  const { theme, mode, material, backgroundMotion } = useSyncExternalStore(
+    subscribeTheme,
+    themeSnapshot,
+  );
 
   return (
     <Panel ground="raised" className="appearance-panel space-y-4 p-4">
@@ -169,6 +174,35 @@ function AppearancePanel() {
         </label>
         <p id="material-help" className="font-sans text-sm text-ink-muted">
           Use solid surfaces without texture or blur. Your choice applies throughout PAM.
+        </p>
+      </div>
+      <div className="space-y-2 border-t border-line pt-3">
+        <div
+          role="group"
+          aria-label="Background motion"
+          aria-describedby="background-motion-help"
+          className="flex flex-wrap items-center gap-2"
+        >
+          <span className="mr-auto font-sans text-sm text-ink">Background motion</span>
+          {backgroundMotionIds.map((speed) => (
+            <Button
+              key={speed}
+              size="sm"
+              variant={backgroundMotion === speed ? "primary" : "ghost"}
+              aria-pressed={backgroundMotion === speed}
+              onClick={() => applyBackgroundMotion(speed)}
+            >
+              {{ off: "Off", slow: "Slow", slower: "Slower" }[speed]}
+            </Button>
+          ))}
+        </div>
+        <p id="background-motion-help" className="font-sans text-sm text-ink-muted">
+          {material === "opaque"
+            ? "Hidden while transparency is reduced. Your speed is remembered."
+            : backgroundMotion === "off"
+              ? "The background stays still."
+              : `Gentle zoom and rotation · ${backgroundMotion === "slow" ? "4" : "8"}-minute round trip.`}{" "}
+          Respects system motion and transparency preferences.
         </p>
       </div>
     </Panel>

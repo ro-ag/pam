@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyTheme,
   applyMaterial,
+  applyBackgroundMotion,
+  backgroundMotionStorageKey,
+  isBackgroundMotionId,
   materialStorageKey,
   defaultTheme,
   initTheme,
@@ -22,6 +25,7 @@ afterEach(() => {
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.mode;
   delete document.documentElement.dataset.material;
+  delete document.documentElement.dataset.backgroundMotion;
   document.documentElement.style.colorScheme = "";
 });
 
@@ -52,7 +56,12 @@ describe("the shared theme store", () => {
   it("keeps the snapshot referentially stable between applies", () => {
     applyTheme("vina", "dark", { persist: false });
     expect(themeSnapshot()).toBe(themeSnapshot());
-    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "dark", material: "glass" });
+    expect(themeSnapshot()).toEqual({
+      theme: "vina",
+      mode: "dark",
+      material: "glass",
+      backgroundMotion: "slow",
+    });
   });
 
   it("notifies subscribers on every apply, until they unsubscribe", () => {
@@ -63,7 +72,12 @@ describe("the shared theme store", () => {
     applyTheme("ventisquero", "light", { persist: false });
     applyTheme("vina", "light", { persist: false });
     expect(seen).toBe(2);
-    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light", material: "glass" });
+    expect(themeSnapshot()).toEqual({
+      theme: "vina",
+      mode: "light",
+      material: "glass",
+      backgroundMotion: "slow",
+    });
     unsubscribe();
     applyTheme("vina", "dark", { persist: false });
     expect(seen).toBe(2);
@@ -130,7 +144,12 @@ describe("Costa material preference", () => {
   it("persists and restores material without changing the selected theme", () => {
     applyTheme("vina", "light");
     applyMaterial("opaque");
-    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light", material: "opaque" });
+    expect(themeSnapshot()).toEqual({
+      theme: "vina",
+      mode: "light",
+      material: "opaque",
+      backgroundMotion: "slow",
+    });
     expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
     delete document.documentElement.dataset.material;
     initTheme();
@@ -160,5 +179,56 @@ describe("Costa material preference", () => {
     expect(themeSnapshot().material).toBe("glass");
     expect(document.documentElement.dataset.material).toBe("glass");
     expect(window.localStorage.getItem(materialStorageKey)).toBe("clear");
+  });
+});
+
+describe("background motion preference", () => {
+  it("defaults to slow without persisting a fallback", () => {
+    initTheme();
+    expect(themeSnapshot().backgroundMotion).toBe("slow");
+    expect(document.documentElement.dataset.backgroundMotion).toBe("slow");
+    expect(window.localStorage.getItem(backgroundMotionStorageKey)).toBeNull();
+    window.localStorage.setItem(backgroundMotionStorageKey, "fast");
+    initTheme();
+    expect(themeSnapshot().backgroundMotion).toBe("slow");
+    expect(isBackgroundMotionId("fast")).toBe(false);
+  });
+
+  it.each(["off", "slow", "slower"] as const)("persists and restores %s", (speed) => {
+    initTheme();
+    applyBackgroundMotion(speed);
+    expect(window.localStorage.getItem(backgroundMotionStorageKey)).toBe(speed);
+    delete document.documentElement.dataset.backgroundMotion;
+    initTheme();
+    expect(themeSnapshot().backgroundMotion).toBe(speed);
+    expect(document.documentElement.dataset.backgroundMotion).toBe(speed);
+    expect(themeSnapshot()).toBe(themeSnapshot());
+  });
+
+  it("retains speed across palette and material changes and notifies subscribers", () => {
+    initTheme();
+    const listener = vi.fn();
+    const unsubscribe = subscribeTheme(listener);
+    applyBackgroundMotion("slower");
+    expect(listener).toHaveBeenCalledTimes(1);
+    applyMaterial("opaque");
+    applyTheme("vina", "dark");
+    expect(themeSnapshot().backgroundMotion).toBe("slower");
+    applyMaterial("glass");
+    expect(themeSnapshot().backgroundMotion).toBe("slower");
+    unsubscribe();
+    listener.mockClear();
+    applyBackgroundMotion("off");
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("still switches for this session when persistence is unavailable", () => {
+    initTheme();
+    vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+      throw new Error("storage denied");
+    });
+    expect(() => applyBackgroundMotion("off")).not.toThrow();
+    expect(themeSnapshot().backgroundMotion).toBe("off");
+    expect(document.documentElement.dataset.backgroundMotion).toBe("off");
   });
 });

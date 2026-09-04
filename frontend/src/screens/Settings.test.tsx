@@ -3,7 +3,13 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import type { GrantRow } from "../lib/ipc";
-import { applyTheme, applyMaterial, materialStorageKey } from "../lib/theme";
+import {
+  applyTheme,
+  applyMaterial,
+  materialStorageKey,
+  applyBackgroundMotion,
+  backgroundMotionStorageKey,
+} from "../lib/theme";
 import { createAppRouter } from "../router";
 import {
   AUDIT_CHOICES,
@@ -76,6 +82,7 @@ beforeEach(() => {
   // Deterministic theme regardless of what an earlier test applied.
   applyTheme("ventisquero", "dark", { persist: false });
   applyMaterial("glass", { persist: false });
+  applyBackgroundMotion("slow");
 
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({
@@ -171,6 +178,7 @@ afterEach(() => {
   window.localStorage.clear();
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.mode;
+  delete document.documentElement.dataset.backgroundMotion;
 });
 
 function renderSettings(hash = "") {
@@ -410,6 +418,37 @@ describe("grants", () => {
 });
 
 describe("appearance", () => {
+  it("switches background speed and off, retaining the choice through material and tab changes", async () => {
+    renderSettings();
+    const group = await screen.findByRole("group", { name: "Background motion" });
+    const slow = within(group).getByRole("button", { name: "Slow" });
+    const slower = within(group).getByRole("button", { name: "Slower" });
+    const off = within(group).getByRole("button", { name: "Off" });
+    expect(slow).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(slower);
+    expect(slower).toHaveAttribute("aria-pressed", "true");
+    expect(slow).toHaveAttribute("aria-pressed", "false");
+    expect(document.documentElement.dataset.backgroundMotion).toBe("slower");
+    expect(window.localStorage.getItem(backgroundMotionStorageKey)).toBe("slower");
+    expect(screen.getByText(/8-minute round trip/)).toBeInTheDocument();
+    const transparency = screen.getByRole("checkbox", { name: "Reduce transparency" });
+    fireEvent.click(transparency);
+    expect(screen.getByText(/Hidden while transparency is reduced/)).toBeInTheDocument();
+    expect(slower).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(transparency);
+    fireEvent.click(off);
+    expect(document.documentElement.dataset.backgroundMotion).toBe("off");
+    expect(screen.getByText(/The background stays still/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Security" }));
+    await screen.findByRole("tabpanel", { name: "Security" });
+    fireEvent.click(screen.getByRole("tab", { name: "Appearance" }));
+    await screen.findByRole("tabpanel", { name: "Appearance" });
+    expect(off).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(slow);
+    expect(document.documentElement.dataset.backgroundMotion).toBe("slow");
+    expect(screen.getByText(/4-minute round trip/)).toBeInTheDocument();
+  });
+
   it("applies a theme family from its swatch card", async () => {
     renderSettings();
     const vina = await screen.findByRole("button", { name: "Viña del Mar Night" });

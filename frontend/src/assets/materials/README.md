@@ -21,6 +21,9 @@ This is a soft backdrop, not a true optical refraction filter.
 The single wave field is local, static and decorative. The user-supplied
 photograph was an alternative, not a second layer, and is not included.
 There is no grain, linework or texture applied to individual cards.
-No remote image requests, animated turbulence or runtime blur runs.
+No remote image requests, animated turbulence or runtime blur runs. The shell
+animates only this layer's transform: a gentle zoom and two-degree rotation,
+reversing over a four-minute (Slow) or eight-minute (Slower) round trip. Off and
+system reduced motion keep it still; reduced transparency hides the layer.
 The opaque material preference, reduced-transparency media query and forced
 colors remove the decorative layers.

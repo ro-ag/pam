@@ -85,7 +85,7 @@ export function AppearancePanel() {
         </div>
       </div>
       <div className="appearance-control-grid">
-        <Panel ground="raised" className="appearance-control-card">
+        <Panel ground="translucent" className="appearance-control-card">
           <header className="appearance-control-heading">
             <span className="appearance-control-icon">
               <Droplets aria-hidden="true" size={18} />
@@ -140,7 +140,7 @@ export function AppearancePanel() {
           </div>
         </Panel>
         <Panel
-          ground="raised"
+          ground="translucent"
           className="appearance-control-card"
           role="group"
           aria-label="Background motion"

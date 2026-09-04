@@ -34,6 +34,20 @@ describe("Panel", () => {
     );
     expect(screen.getByTestId("panel").className).toContain("p-10");
   });
+
+  it("offers Tailwind translucency with solid accessibility overrides and no effects", () => {
+    render(
+      <Panel ground="translucent" data-testid="panel">
+        card
+      </Panel>,
+    );
+    const classes = screen.getByTestId("panel").className;
+    expect(classes).toContain("bg-surface-translucent");
+    expect(classes).toContain("material-opaque:bg-surface-raised");
+    expect(classes).toContain("transparency-reduce:bg-surface-raised");
+    expect(classes).toContain("forced-colors:bg-system-canvas");
+    expect(classes).not.toMatch(/blur|shadow|filter/);
+  });
 });
 
 describe("Badge", () => {

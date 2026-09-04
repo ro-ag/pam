@@ -83,3 +83,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-preserve-transparency-without-glass-library
+- kind: habit
+- scope: project
+- rule: Removing a rejected optical-effect library must not silently discard independently desired translucent surfaces.
+- fix: Separate plain CSS surface opacity from refraction and glow. Inventory visual behaviors before removal and preserve user-approved transparency without the dependency.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+

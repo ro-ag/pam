@@ -73,11 +73,10 @@
     -webkit-mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
     opacity: 0.65;
   }
-  [data-background-motion="slow"] .desktop-shell::before {
-    animation: background-drift 120s ease-in-out infinite alternate;
-  }
+  [data-background-motion="slow"] .desktop-shell::before,
   [data-background-motion="slower"] .desktop-shell::before {
-    animation: background-drift 240s ease-in-out infinite alternate;
+    animation: background-drift var(--background-drift-duration, 120s) ease-in-out infinite
+      alternate;
   }
   [data-background-motion="off"] .desktop-shell::before {
     animation: none;

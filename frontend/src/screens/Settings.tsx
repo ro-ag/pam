@@ -37,7 +37,7 @@ import {
   applyTheme,
   applyMaterial,
   applyBackgroundMotion,
-  backgroundMotionIds,
+  applyBackgroundSpeed,
   modeIds,
   subscribeTheme,
   themes,
@@ -70,7 +70,7 @@ import { SettingsModelsSection } from "./SettingsModels";
  * until someone misses it; two honest buttons beat three subtle states.
  */
 function AppearancePanel() {
-  const { theme, mode, material, backgroundMotion } = useSyncExternalStore(
+  const { theme, mode, material, backgroundMotion, backgroundSpeed } = useSyncExternalStore(
     subscribeTheme,
     themeSnapshot,
   );
@@ -183,25 +183,46 @@ function AppearancePanel() {
           aria-describedby="background-motion-help"
           className="flex flex-wrap items-center gap-2"
         >
-          <span className="mr-auto font-sans text-sm text-ink">Background motion</span>
-          {backgroundMotionIds.map((speed) => (
-            <Button
-              key={speed}
-              size="sm"
-              variant={backgroundMotion === speed ? "primary" : "ghost"}
-              aria-pressed={backgroundMotion === speed}
-              onClick={() => applyBackgroundMotion(speed)}
-            >
-              {{ off: "Off", slow: "Slow", slower: "Slower" }[speed]}
-            </Button>
-          ))}
+          <label className="mr-auto flex items-center gap-2 font-sans text-sm text-ink">
+            <input
+              type="checkbox"
+              checked={backgroundMotion !== "off"}
+              onChange={(event) => applyBackgroundMotion(event.target.checked ? "slow" : "off")}
+              className="size-4 accent-accent-strong"
+            />
+            Animate background
+          </label>
+          <output
+            htmlFor="background-speed"
+            className="font-data text-xs tabular-nums text-ink-muted"
+          >
+            {backgroundSpeed.toFixed(1)}× · {Math.round(240 / backgroundSpeed)}s loop
+          </output>
+          <div className="flex basis-full items-center gap-3">
+            <span className="font-data text-xs text-ink-faint">Slower</span>
+            <input
+              id="background-speed"
+              type="range"
+              min="0.5"
+              max="12"
+              step="0.1"
+              value={backgroundSpeed}
+              disabled={backgroundMotion === "off"}
+              aria-label="Background animation speed"
+              aria-valuetext={`${backgroundSpeed.toFixed(1)} times speed, ${Math.round(240 / backgroundSpeed)} seconds per loop`}
+              aria-describedby="background-motion-help"
+              onChange={(event) => applyBackgroundSpeed(Number(event.target.value))}
+              className="h-6 min-w-0 flex-1 cursor-pointer accent-accent-strong disabled:cursor-not-allowed disabled:opacity-40"
+            />
+            <span className="font-data text-xs text-ink-faint">Faster</span>
+          </div>
         </div>
         <p id="background-motion-help" className="font-sans text-sm text-ink-muted">
           {material === "opaque"
             ? "Hidden while transparency is reduced. Your speed is remembered."
             : backgroundMotion === "off"
               ? "The background stays still."
-              : `Gentle zoom and rotation · ${backgroundMotion === "slow" ? "4" : "8"}-minute round trip.`}{" "}
+              : "Gentle zoom and rotation. Drag toward Faster to preview the movement."}{" "}
           Respects system motion and transparency preferences.
         </p>
       </div>

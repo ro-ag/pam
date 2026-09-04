@@ -24,6 +24,11 @@ export const materialStorageKey = "pam-material";
 export const backgroundMotionIds = ["off", "slow", "slower"] as const;
 export type BackgroundMotionId = (typeof backgroundMotionIds)[number];
 export const backgroundMotionStorageKey = "pam-background-motion";
+export const backgroundSpeedStorageKey = "pam-background-speed";
+
+export function isBackgroundSpeed(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 12;
+}
 
 export function isBackgroundMotionId(value: unknown): value is BackgroundMotionId {
   return backgroundMotionIds.includes(value as BackgroundMotionId);
@@ -88,6 +93,7 @@ export interface ThemeState {
   mode: ModeId;
   material: MaterialId;
   backgroundMotion: BackgroundMotionId;
+  backgroundSpeed: number;
 }
 
 let snapshot: ThemeState | null = null;
@@ -116,6 +122,7 @@ export function themeSnapshot(): ThemeState {
       mode: isModeId(mode) ? mode : systemMode(),
       material: isMaterialId(material) ? material : "glass",
       backgroundMotion: readBackgroundMotion(),
+      backgroundSpeed: readBackgroundSpeed(),
     };
   }
   return snapshot;
@@ -156,6 +163,7 @@ export function applyTheme(
     mode,
     material: isMaterialId(material) ? material : "glass",
     backgroundMotion: readBackgroundMotion(),
+    backgroundSpeed: readBackgroundSpeed(),
   };
   for (const listener of listeners) listener();
 }
@@ -171,6 +179,42 @@ export function applyMaterial(material: MaterialId, options?: { persist?: boolea
 function readBackgroundMotion(): BackgroundMotionId {
   const value = document.documentElement.dataset.backgroundMotion;
   return isBackgroundMotionId(value) ? value : "slow";
+}
+
+function readBackgroundSpeed(): number {
+  const speed = Number(document.documentElement.dataset.backgroundSpeed);
+  return isBackgroundSpeed(speed) ? speed : readBackgroundMotion() === "slower" ? 0.5 : 1;
+}
+
+function stampBackgroundSpeed(speed: number): void {
+  // Preserve the current phase while dragging, rather than jumping to the
+  // position implied by a new CSS duration. No animation exists while off.
+  const drift = document
+    .getAnimations?.()
+    .find(
+      (animation) =>
+        "animationName" in animation && animation.animationName === "background-drift",
+    );
+  const duration = drift?.effect?.getComputedTiming().duration;
+  const phase =
+    drift &&
+    typeof drift.currentTime === "number" &&
+    typeof duration === "number" &&
+    duration > 0
+      ? drift.currentTime / duration
+      : null;
+  document.documentElement.dataset.backgroundSpeed = String(speed);
+  document.documentElement.style.setProperty("--background-drift-duration", `${120 / speed}s`);
+  if (drift && phase !== null) drift.currentTime = phase * (120_000 / speed);
+}
+
+/** Multiples of the original four-minute cycle; keep the chosen speed while off. */
+export function applyBackgroundSpeed(speed: number): void {
+  if (!isBackgroundSpeed(speed)) return;
+  stampBackgroundSpeed(speed);
+  persist(backgroundSpeedStorageKey, String(speed));
+  snapshot = { ...themeSnapshot(), backgroundSpeed: speed };
+  for (const listener of listeners) listener();
 }
 
 /** Store the chosen speed; CSS honors accessibility overrides independently. */
@@ -214,6 +258,12 @@ export function initTheme(): { theme: ThemeId; mode: ModeId } {
     stored(materialStorageKey, isMaterialId) ?? "glass";
   document.documentElement.dataset.backgroundMotion =
     stored(backgroundMotionStorageKey, isBackgroundMotionId) ?? "slow";
+  const savedSpeed = Number(
+    stored(backgroundSpeedStorageKey, (value): value is string => typeof value === "string"),
+  );
+  stampBackgroundSpeed(
+    isBackgroundSpeed(savedSpeed) ? savedSpeed : readBackgroundMotion() === "slower" ? 0.5 : 1,
+  );
   applyTheme(theme, mode, { persist: false });
   return { theme, mode };
 }

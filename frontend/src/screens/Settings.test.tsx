@@ -9,6 +9,8 @@ import {
   materialStorageKey,
   applyBackgroundMotion,
   backgroundMotionStorageKey,
+  applyBackgroundSpeed,
+  backgroundSpeedStorageKey,
 } from "../lib/theme";
 import { createAppRouter } from "../router";
 import {
@@ -83,6 +85,7 @@ beforeEach(() => {
   applyTheme("ventisquero", "dark", { persist: false });
   applyMaterial("glass", { persist: false });
   applyBackgroundMotion("slow");
+  applyBackgroundSpeed(1);
 
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({
@@ -179,6 +182,8 @@ afterEach(() => {
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.mode;
   delete document.documentElement.dataset.backgroundMotion;
+  delete document.documentElement.dataset.backgroundSpeed;
+  document.documentElement.style.removeProperty("--background-drift-duration");
 });
 
 function renderSettings(hash = "") {
@@ -421,32 +426,33 @@ describe("appearance", () => {
   it("switches background speed and off, retaining the choice through material and tab changes", async () => {
     renderSettings();
     const group = await screen.findByRole("group", { name: "Background motion" });
-    const slow = within(group).getByRole("button", { name: "Slow" });
-    const slower = within(group).getByRole("button", { name: "Slower" });
-    const off = within(group).getByRole("button", { name: "Off" });
-    expect(slow).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(slower);
-    expect(slower).toHaveAttribute("aria-pressed", "true");
-    expect(slow).toHaveAttribute("aria-pressed", "false");
-    expect(document.documentElement.dataset.backgroundMotion).toBe("slower");
-    expect(window.localStorage.getItem(backgroundMotionStorageKey)).toBe("slower");
-    expect(screen.getByText(/8-minute round trip/)).toBeInTheDocument();
+    const slider = within(group).getByRole("slider", { name: "Background animation speed" });
+    const enabled = within(group).getByRole("checkbox", { name: "Animate background" });
+    expect(enabled).toBeChecked();
+    expect(slider).toHaveValue("1");
+    fireEvent.change(slider, { target: { value: "6.3" } });
+    expect(window.localStorage.getItem(backgroundSpeedStorageKey)).toBe("6.3");
+    expect(slider).toHaveAttribute("aria-valuetext", "6.3 times speed, 38 seconds per loop");
+    expect(screen.getByText("6.3× · 38s loop")).toBeInTheDocument();
     const transparency = screen.getByRole("checkbox", { name: "Reduce transparency" });
     fireEvent.click(transparency);
     expect(screen.getByText(/Hidden while transparency is reduced/)).toBeInTheDocument();
-    expect(slower).toHaveAttribute("aria-pressed", "true");
+    expect(slider).toHaveValue("6.3");
     fireEvent.click(transparency);
-    fireEvent.click(off);
+    fireEvent.click(enabled);
     expect(document.documentElement.dataset.backgroundMotion).toBe("off");
+    expect(window.localStorage.getItem(backgroundMotionStorageKey)).toBe("off");
+    expect(slider).toBeDisabled();
     expect(screen.getByText(/The background stays still/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Security" }));
     await screen.findByRole("tabpanel", { name: "Security" });
     fireEvent.click(screen.getByRole("tab", { name: "Appearance" }));
     await screen.findByRole("tabpanel", { name: "Appearance" });
-    expect(off).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(slow);
+    expect(enabled).not.toBeChecked();
+    fireEvent.click(enabled);
     expect(document.documentElement.dataset.backgroundMotion).toBe("slow");
-    expect(screen.getByText(/4-minute round trip/)).toBeInTheDocument();
+    expect(slider).toBeEnabled();
+    expect(slider).toHaveValue("6.3");
   });
 
   it("applies a theme family from its swatch card", async () => {

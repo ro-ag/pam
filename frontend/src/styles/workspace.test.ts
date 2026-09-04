@@ -27,14 +27,11 @@ describe("desktop workspace materials", () => {
   });
 
   it("offers reversible slow drift, an off switch and reduced-motion protection", () => {
-    for (const [speed, seconds] of [
-      ["slow", 120],
-      ["slower", 240],
-    ]) {
-      expect(styles).toContain(
-        `[data-background-motion="${speed}"] .desktop-shell::before {\n    animation: background-drift ${seconds}s ease-in-out infinite alternate;`,
-      );
-    }
+    expect(styles).toContain(
+      "animation: background-drift var(--background-drift-duration, 120s)",
+    );
+    expect(styles).toContain("ease-in-out infinite");
+    expect(styles).toContain("alternate;");
     expect(styles).toMatch(
       /\[data-background-motion="off"\] .desktop-shell::before\s*\{\s*animation: none/,
     );

@@ -4,6 +4,9 @@ import {
   applyMaterial,
   applyBackgroundMotion,
   backgroundMotionStorageKey,
+  applyBackgroundSpeed,
+  backgroundSpeedStorageKey,
+  isBackgroundSpeed,
   isBackgroundMotionId,
   materialStorageKey,
   defaultTheme,
@@ -26,6 +29,8 @@ afterEach(() => {
   delete document.documentElement.dataset.mode;
   delete document.documentElement.dataset.material;
   delete document.documentElement.dataset.backgroundMotion;
+  delete document.documentElement.dataset.backgroundSpeed;
+  document.documentElement.style.removeProperty("--background-drift-duration");
   document.documentElement.style.colorScheme = "";
 });
 
@@ -61,6 +66,7 @@ describe("the shared theme store", () => {
       mode: "dark",
       material: "glass",
       backgroundMotion: "slow",
+      backgroundSpeed: 1,
     });
   });
 
@@ -77,6 +83,7 @@ describe("the shared theme store", () => {
       mode: "light",
       material: "glass",
       backgroundMotion: "slow",
+      backgroundSpeed: 1,
     });
     unsubscribe();
     applyTheme("vina", "dark", { persist: false });
@@ -149,6 +156,7 @@ describe("Costa material preference", () => {
       mode: "light",
       material: "opaque",
       backgroundMotion: "slow",
+      backgroundSpeed: 1,
     });
     expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
     delete document.documentElement.dataset.material;
@@ -183,6 +191,78 @@ describe("Costa material preference", () => {
 });
 
 describe("background motion preference", () => {
+  it.each([5_000, 15_000])("preserves loop phase when changing speed at %sms", (time) => {
+    initTheme();
+    const drift = {
+      animationName: "background-drift",
+      currentTime: time,
+      effect: { getComputedTiming: () => ({ duration: 10_000 }) },
+    };
+    const original = Object.getOwnPropertyDescriptor(document, "getAnimations");
+    Object.defineProperty(document, "getAnimations", {
+      configurable: true,
+      value: () => [drift],
+    });
+    try {
+      applyBackgroundSpeed(6);
+      expect(drift.currentTime).toBe(time * 2);
+      expect(
+        document.documentElement.style.getPropertyValue("--background-drift-duration"),
+      ).toBe("20s");
+    } finally {
+      if (original) Object.defineProperty(document, "getAnimations", original);
+      else Reflect.deleteProperty(document, "getAnimations");
+    }
+  });
+
+  it("persists arbitrary slider speed and remembers it while disabled", () => {
+    initTheme();
+    applyBackgroundSpeed(6.3);
+    expect(window.localStorage.getItem(backgroundSpeedStorageKey)).toBe("6.3");
+    applyBackgroundMotion("off");
+    initTheme();
+    expect(themeSnapshot().backgroundMotion).toBe("off");
+    expect(themeSnapshot().backgroundSpeed).toBe(6.3);
+    applyBackgroundMotion("slow");
+    applyTheme("vina", "light");
+    applyMaterial("opaque");
+    expect(themeSnapshot().backgroundSpeed).toBe(6.3);
+    expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
+      `${120 / 6.3}s`,
+    );
+  });
+
+  it.each([
+    ["slow", 1],
+    ["slower", 0.5],
+    ["off", 1],
+  ])("preserves old %s preset timing", (preset, speed) => {
+    window.localStorage.setItem(backgroundMotionStorageKey, String(preset));
+    initTheme();
+    expect(themeSnapshot().backgroundSpeed).toBe(speed);
+    expect(window.localStorage.getItem(backgroundSpeedStorageKey)).toBeNull();
+  });
+
+  it("validates speed boundaries and ignores invalid updates", () => {
+    initTheme();
+    for (const speed of [0, -1, 0.4, 12.1, Infinity, NaN]) {
+      expect(isBackgroundSpeed(speed)).toBe(false);
+      applyBackgroundSpeed(speed);
+      expect(themeSnapshot().backgroundSpeed).toBe(1);
+    }
+    applyBackgroundSpeed(0.5);
+    expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
+      "240s",
+    );
+    applyBackgroundSpeed(12);
+    expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
+      "10s",
+    );
+    window.localStorage.setItem(backgroundSpeedStorageKey, "garbage");
+    initTheme();
+    expect(themeSnapshot().backgroundSpeed).toBe(1);
+  });
+
   it("defaults to slow without persisting a fallback", () => {
     initTheme();
     expect(themeSnapshot().backgroundMotion).toBe("slow");

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouterState } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Badge } from "../components/ui/Badge";
@@ -35,6 +35,7 @@ import {
 } from "../lib/ipc";
 import {
   applyTheme,
+  applyMaterial,
   modeIds,
   subscribeTheme,
   themes,
@@ -68,54 +69,73 @@ import { SettingsModelsSection } from "./SettingsModels";
  * until someone misses it; two honest buttons beat three subtle states.
  */
 function AppearancePanel() {
-  const { theme, mode } = useSyncExternalStore(subscribeTheme, themeSnapshot);
+  const { theme, mode, material } = useSyncExternalStore(subscribeTheme, themeSnapshot);
 
   return (
-    <Panel ground="raised" className="space-y-5 p-5">
+    <Panel ground="raised" className="space-y-5 p-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        {themes.map((family) => {
-          const active = family.id === theme;
-          return (
-            <button
-              key={family.id}
-              type="button"
-              aria-pressed={active}
-              onClick={() => applyTheme(family.id, mode)}
-              className={cn(
-                "rounded-card border p-1.5 text-left transition-colors duration-150",
-                active ? "border-accent-strong" : "border-line hover:border-ink-faint",
-              )}
-            >
-              {/*
-               * The swatch IS the theme: re-scoping data-theme/data-mode on
-               * this subtree makes every --pam-* token below resolve to the
-               * family being previewed — the palette renders itself, no
-               * per-family color tokens to keep in sync.
-               */}
-              <span
-                data-theme={family.id}
-                data-mode={mode}
-                className="block rounded-card border border-edge bg-chrome p-3"
+        {themes.flatMap((family) =>
+          modeIds.map((appearance) => {
+            const active = family.id === theme && appearance === mode;
+            return (
+              <button
+                key={`${family.id}-${appearance}`}
+                type="button"
+                aria-label={`${family.label} ${family.appearances[appearance]}`}
+                aria-pressed={active}
+                onClick={() => applyTheme(family.id, appearance)}
+                className={cn(
+                  "rounded-card border p-1.5 text-left transition-colors duration-100",
+                  active ? "border-focus" : "border-line hover:border-ink-faint",
+                )}
               >
-                <span className="block rounded-control border border-edge bg-surface p-2.5 shadow-raise">
-                  <span className="flex items-center gap-2">
-                    <span className="size-3 rounded-pill border border-edge bg-chrome" />
-                    <span className="size-3 rounded-pill border border-edge bg-surface-raised" />
-                    <span className="size-3 rounded-pill bg-accent-strong" />
-                    <span className="ml-auto h-1.5 w-10 rounded-pill bg-accent-soft" />
+                <span
+                  data-theme={family.id}
+                  data-mode={appearance}
+                  className="theme-preview block space-y-3 rounded-card bg-chrome p-3"
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="font-sans text-sm font-semibold">
+                      {family.appearances[appearance]}
+                    </span>
+                    {active && <Check aria-hidden="true" className="size-4 text-accent" />}
+                    <span className="ml-auto font-data text-xs text-ink-muted">
+                      {appearance}
+                    </span>
                   </span>
+                  <span className="theme-swatches" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  <span
+                    className="command-surface block space-y-3 rounded-overlay p-3"
+                    aria-hidden="true"
+                  >
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="font-sans text-sm font-medium">Material preview</span>
+                      <span className="warm-marker size-2 rounded-pill" />
+                    </span>
+                    <span className="block font-sans text-xs text-ink-muted">
+                      {family.id === "vina"
+                        ? "Pacific sunset · rose reflections"
+                        : "Glacier light · autumn copper"}
+                    </span>
+                    <span className="action-control inline-flex h-8 items-center rounded-control border border-control-line px-3 font-sans text-xs text-on-accent">
+                      Primary action
+                    </span>
+                  </span>
+                  <span className="block font-sans text-sm font-medium">{family.label}</span>
                 </span>
-              </span>
-              <span className="flex items-center justify-between px-1.5 pt-2 pb-1">
-                <span className="font-sans text-sm font-medium text-ink">{family.label}</span>
-                {active && <Check aria-hidden="true" className="size-4 text-accent" />}
-              </span>
-            </button>
-          );
-        })}
+              </button>
+            );
+          }),
+        )}
       </div>
 
-      <div className="flex items-center gap-3 border-t border-line pt-4">
+      <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
         <span className="font-data text-xs text-ink-faint">mode</span>
         {modeIds.map((candidate: ModeId) => (
           <Button
@@ -136,6 +156,21 @@ function AppearancePanel() {
         <span className="ml-auto font-data text-xs text-ink-faint">
           applies instantly · remembered
         </span>
+      </div>
+      <div className="space-y-2 border-t border-line pt-4">
+        <label className="flex items-center gap-2 font-sans text-sm text-ink">
+          <input
+            type="checkbox"
+            checked={material === "opaque"}
+            onChange={(event) => applyMaterial(event.target.checked ? "opaque" : "glass")}
+            aria-describedby="material-help"
+            className="size-4 accent-accent-strong"
+          />
+          Reduce transparency
+        </label>
+        <p id="material-help" className="font-sans text-sm text-ink-muted">
+          Use solid backgrounds instead of reflected glass for command and decision panels.
+        </p>
       </div>
     </Panel>
   );
@@ -191,9 +226,7 @@ function ProfilePanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        policy profile
-      </p>
+      <p className="font-data text-xs text-ink-faint">policy profile</p>
       <div role="radiogroup" aria-label="policy profile" className="space-y-2">
         {PROFILE_ORDER.map((candidate) => {
           const selected = current === candidate;
@@ -219,7 +252,7 @@ function ProfilePanel() {
                 <span className="block font-data text-sm font-medium text-ink">
                   {candidate}
                 </span>
-                <span className="block font-voice text-sm text-ink-muted italic">
+                <span className="block font-sans text-sm text-ink-muted">
                   {PROFILE_SENTENCES[candidate]}
                 </span>
               </span>
@@ -314,14 +347,12 @@ function GrantsPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        capability grants
-      </p>
+      <p className="font-data text-xs text-ink-faint">capability grants</p>
 
       {listFailure && <FailureNote failure={listFailure} label="grants" />}
 
       {!listFailure && rows.length === 0 && !grants.isPending && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           No grants yet. Everything an agent asks for beyond read-only will raise a hand until
           you grant its capability here.
         </p>
@@ -331,7 +362,7 @@ function GrantsPanel() {
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead>
-              <tr className="text-left font-data text-xs tracking-widest text-ink-faint uppercase">
+              <tr className="text-left font-data text-xs text-ink-faint">
                 <th className="pb-2 pr-3 font-medium">capability</th>
                 <th className="pb-2 pr-3 font-medium">scope</th>
                 <th className="pb-2 pr-3 font-medium">granted</th>
@@ -367,7 +398,7 @@ function GrantsPanel() {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           placeholder="capability, e.g. echo"
-          className="h-8 min-w-48 flex-1 rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
+          className="h-8 min-w-48 flex-1 rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
         />
         <datalist id="known-capabilities">
           {KNOWN_CAPABILITIES.map((capability) => (
@@ -488,7 +519,7 @@ function DaemonPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">daemon</p>
+        <p className="font-data text-xs text-ink-faint">daemon</p>
         {status.data &&
           (connected ? (
             <Badge tone="success">running</Badge>
@@ -543,7 +574,7 @@ function DaemonPanel() {
       {serviceFailure && <FailureNote failure={serviceFailure} label="start at login" />}
 
       {!bridgeDown && status.data && !connected && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           The daemon is not answering; the next status poll starts it lazily.
         </p>
       )}
@@ -676,7 +707,7 @@ function RetentionPanel() {
   const busy = state.isPending || save.isPending;
 
   const selectClasses =
-    "h-8 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
+    "h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
 
   const windowField = (
     caption: string,
@@ -708,9 +739,7 @@ function RetentionPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          storage pruning
-        </p>
+        <p className="font-data text-xs text-ink-faint">storage pruning</p>
         <Button
           size="sm"
           variant="ghost"
@@ -746,7 +775,7 @@ function RetentionPanel() {
 
       {failure && <FailureNote failure={failure} label="retention" />}
 
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-sans text-sm text-ink-muted">
         I prune when I start, every hour after that, and whenever you change these. Evidence
         goes first; a request&apos;s verdict stays until its audit rows go, then the whole
         record leaves together.
@@ -800,13 +829,13 @@ function LogsPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">daemon.log</p>
+        <p className="font-data text-xs text-ink-faint">daemon.log</p>
         <span className="flex-1" />
         <select
           aria-label="lines to show"
           value={lineCount}
           onChange={(event) => setLineCount(Number(event.target.value))}
-          className="h-8 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink"
+          className="h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
         >
           {LOG_LINE_CHOICES.map((choice) => (
             <option key={choice} value={choice}>
@@ -913,93 +942,118 @@ export function SettingsScreen() {
   }, [hash]);
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-10">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          settings · every knob, one place
-        </p>
-        <h1 className="font-display text-title font-semibold text-ink">Settings</h1>
-        <div className="border-b border-line" />
+    <div className="settings-workspace flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+        <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
+        <p className="text-sm text-ink-muted">Appearance, permissions and local services.</p>
       </header>
 
-      <div className="space-y-10 pt-6">
-        <Section
-          id="appearance"
-          eyebrow="appearance"
-          title="Appearance"
-          blurb="Two families, two modes — the palette is the only thing that changes."
+      <div className="settings-layout grid items-start gap-6 pt-6">
+        <nav
+          aria-label="Settings categories"
+          className="settings-navigation flex flex-wrap gap-1"
         >
-          <AppearancePanel />
-        </Section>
+          {[
+            "Appearance",
+            "Security",
+            "Models",
+            "Flows",
+            "Connectors",
+            "Daemon",
+            "Retention",
+            "Logs",
+          ].map((label) => (
+            <Link
+              key={label}
+              to="/settings"
+              hash={label.toLowerCase()}
+              activeOptions={{ includeHash: true }}
+              data-selected={(hash.replace(/^#/, "") || "appearance") === label.toLowerCase()}
+              className="settings-category rounded-control px-3 py-2 text-sm text-ink-muted transition-colors hover:bg-accent-soft hover:text-ink"
+            >
+              {label}
+            </Link>
+          ))}
+        </nav>
+        <div className="min-w-0 space-y-8">
+          <Section
+            id="appearance"
+            eyebrow="appearance"
+            title="Appearance"
+            blurb="Costa’s four appearances, with reflected glass for command and decision panels."
+          >
+            <AppearancePanel />
+          </Section>
 
-        <Section
-          id="security"
-          eyebrow="security"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Security"
-          blurb="Profiles and grants change only here — no agent, CLI, or MCP call can touch them."
-        >
-          <div className="space-y-4">
-            <ProfilePanel />
-            <GrantsPanel />
-          </div>
-        </Section>
+          <Section
+            id="security"
+            eyebrow="security"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Security"
+            blurb="Profiles and grants change only here — no agent, CLI, or MCP call can touch them."
+          >
+            <div className="space-y-4">
+              <ProfilePanel />
+              <GrantsPanel />
+            </div>
+          </Section>
 
-        <Section
-          id="models"
-          eyebrow="models"
-          title="Models"
-          blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
-        >
-          <SettingsModelsSection />
-        </Section>
+          <Section
+            id="models"
+            eyebrow="models"
+            title="Models"
+            blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
+          >
+            <SettingsModelsSection />
+          </Section>
 
-        <Section
-          id="flows"
-          eyebrow="flows"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Flows"
-          blurb="Which programs a flow step may run, and where I look for them."
-        >
-          <SettingsFlowsSection />
-        </Section>
+          <Section
+            id="flows"
+            eyebrow="flows"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Flows"
+            blurb="Which programs a flow step may run, and where I look for them."
+          >
+            <SettingsFlowsSection />
+          </Section>
 
-        <Section
-          id="connectors"
-          eyebrow="connectors"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Connectors"
-          blurb="The services I may reach on a flow's behalf, and the credentials that let me."
-        >
-          <SettingsConnectorsSection />
-        </Section>
+          <Section
+            id="connectors"
+            eyebrow="connectors"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Connectors"
+            blurb="The services I may reach on a flow's behalf, and the credentials that let me."
+          >
+            <SettingsConnectorsSection />
+          </Section>
 
-        <Section
-          id="daemon"
-          eyebrow="daemon"
-          title="Daemon"
-          blurb="The machine under the tower: what is running, and the one switch it has."
-        >
-          <DaemonPanel />
-        </Section>
+          <Section
+            id="daemon"
+            eyebrow="daemon"
+            title="Daemon"
+            blurb="Connection, installed service and daemon controls."
+          >
+            <DaemonPanel />
+          </Section>
 
-        <Section
-          id="retention"
-          eyebrow="retention"
-          title="Retention"
-          blurb="How long the audit trail and its evidence stay on disk."
-        >
-          <RetentionPanel />
-        </Section>
+          <Section
+            id="retention"
+            eyebrow="retention"
+            title="Retention"
+            blurb="How long the audit trail and its evidence stay on disk."
+          >
+            <RetentionPanel />
+          </Section>
 
-        <Section
-          id="logs"
-          eyebrow="logs"
-          title="Logs"
-          blurb="The daemon's own diagnostics — readable even when the daemon is down."
-        >
-          <LogsPanel />
-        </Section>
+          <Section
+            id="logs"
+            eyebrow="logs"
+            title="Logs"
+            blurb="The daemon's own diagnostics — readable even when the daemon is down."
+          >
+            <LogsPanel />
+          </Section>
+        </div>
       </div>
     </div>
   );

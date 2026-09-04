@@ -5,7 +5,7 @@
  * settings row read as the same product.
  */
 export const fieldClasses =
-  "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  "field-control h-8 w-full rounded-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
 /** The eyebrow above a field: mono, faint, one word. */
 export const fieldLabelClasses = "block font-data text-xs text-ink-faint";

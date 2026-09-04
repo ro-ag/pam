@@ -28,7 +28,7 @@ import {
  */
 
 const fieldClasses =
-  "h-8 min-w-40 flex-1 rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  "h-8 min-w-40 flex-1 rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
 /** One removable chip: the value in the data voice, and a way out. */
 function ListChip({
@@ -41,7 +41,7 @@ function ListChip({
   onRemove: () => void;
 }) {
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-pill border border-line bg-surface px-2.5 py-0.5 font-data text-xs text-ink-muted">
+    <span className="inline-flex items-center gap-1.5 rounded-badge border border-line bg-surface px-2.5 py-0.5 font-data text-xs text-ink-muted">
       {value}
       <button
         type="button"
@@ -78,9 +78,9 @@ function ListEditor({
   const [draft, setDraft] = useState("");
   return (
     <div className="space-y-3">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">{title}</p>
+      <p className="font-data text-xs text-ink-faint">{title}</p>
       {values.length === 0 ? (
-        <p className="font-voice text-sm text-ink-muted italic">{empty}</p>
+        <p className="font-sans text-sm text-ink-muted">{empty}</p>
       ) : (
         <div className="flex flex-wrap gap-2">
           {values.map((value) => (
@@ -165,7 +165,7 @@ export function SettingsFlowsSection() {
 
       {failure && <FailureNote failure={failure} label="flow settings" />}
 
-      <p className="border-t border-line pt-4 font-voice text-sm text-ink-muted italic">
+      <p className="border-t border-line pt-4 font-sans text-sm text-ink-muted">
         A flow may name any program; I run only the ones on this list. That is the whole reason
         a flow file is safe to read and safe to keep.
       </p>

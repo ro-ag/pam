@@ -1,19 +1,10 @@
 /* PAM GUI stylesheet — the single CSS entry.
  *
- * Order matters: self-hosted fonts (CSP forbids remote), Tailwind, then the
+ * Order matters: Tailwind, then the
  * design system: primitive theme palettes (themes.css) and the semantic
  * token layer (tokens.css). Components never add CSS files of their own —
  * they compose semantic utilities via cn()/cva.
  */
-
-/* Three voices + furniture, self-hosted via fontsource. */
-@import "@fontsource-variable/archivo";
-@import "@fontsource-variable/newsreader";
-@import "@fontsource-variable/newsreader/wght-italic.css";
-@import "@fontsource-variable/inter";
-@import "@fontsource/ibm-plex-mono/400.css";
-@import "@fontsource/ibm-plex-mono/500.css";
-@import "@fontsource/ibm-plex-mono/600.css";
 
 @import "tailwindcss";
 
@@ -42,6 +33,8 @@
     margin: 0;
     min-width: 320px;
     font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    line-height: 1.5;
     color: var(--color-ink);
     background: var(--color-chrome);
   }
@@ -63,24 +56,262 @@
 }
 
 @layer components {
-  /* The chrome atmosphere: a barely-there radial wash so the dark water has
-     depth without competing with the lit panel. Gradients (not images) keep
-     the strict CSP happy. The one place raw color math is allowed. */
-  .atmosphere {
+  .desktop-sidebar {
+    width: 208px;
+  }
+  .canvas-dock {
+    min-height: 564px;
+  }
+  .canvas-workspace {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .canvas-viewport {
+    height: 520px;
+    min-height: 520px;
+  }
+  .canvas-workspace-maximized {
     position: fixed;
     inset: 0;
-    z-index: -1;
-    pointer-events: none;
+    z-index: 50;
+    padding: 40px 16px 16px;
+    color: var(--pam-ink);
+    background: var(--pam-chrome);
+  }
+  .canvas-workspace-maximized .canvas-viewport {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
+  .canvas-titlebar {
+    min-height: 24px;
+  }
+  .flow-library-layout {
+    flex-direction: column;
+  }
+  .flow-library {
+    border-bottom: 1px solid var(--pam-line);
+  }
+  .workspace-scroll {
+    container-type: inline-size;
+  }
+  .home-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .home-prompts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-category[data-selected="true"] {
+    background: var(--pam-accent-soft);
+    color: var(--pam-selection-ink);
+    font-weight: 600;
+  }
+  @container (min-width: 640px) {
+    .home-prompts {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .flow-library-layout {
+      flex-direction: row;
+    }
+    .flow-library {
+      width: 208px;
+      border-bottom: 0;
+      border-right: 1px solid var(--pam-line);
+      padding-right: 12px;
+    }
+  }
+  @container (min-width: 960px) {
+    .home-columns {
+      grid-template-columns: minmax(0, 1fr) 380px;
+    }
+    .settings-layout {
+      grid-template-columns: 160px minmax(0, 1fr);
+    }
+    .settings-navigation {
+      position: sticky;
+      top: 112px;
+      flex-direction: column;
+    }
+  }
+  .nav-current {
+    box-shadow: inset 3px 0 0 var(--color-focus);
+  }
+  .action-control {
+    background-image: var(--pam-action-gradient);
+    box-shadow: var(--pam-shadow-control);
+  }
+  .action-control:hover:not(:disabled),
+  .action-control:active:not(:disabled) {
+    background: var(--color-accent-hover);
+  }
+  .field-control {
+    box-shadow: var(--pam-shadow-raise);
+  }
+  .warm-marker {
+    background: var(--pam-warm-material);
+  }
+  .warm-badge {
+    border: 1px solid transparent;
     background:
-      radial-gradient(
-        120% 90% at 18% -10%,
-        color-mix(in oklab, var(--color-accent-strong) 16%, transparent),
-        transparent 60%
-      ),
-      radial-gradient(
-        90% 70% at 100% 110%,
-        color-mix(in oklab, var(--color-copper) 10%, transparent),
-        transparent 55%
-      );
+      var(--pam-warm-surface) padding-box,
+      var(--pam-warm-edge) border-box;
+  }
+  .warm-label::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-inline-end: 4px;
+    border-radius: var(--radius-badge);
+    background: var(--pam-warm-material);
+  }
+  .material-edge {
+    position: relative;
+  }
+  .material-edge::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0;
+    height: 1px;
+    background: var(--pam-warm-edge);
+    pointer-events: none;
+  }
+  .command-surface {
+    border: 1px solid transparent;
+    border-radius: var(--radius-overlay);
+    background:
+      var(--pam-glass-gradient) padding-box,
+      var(--pam-glass-edge) border-box;
+    box-shadow: var(--pam-shadow-float), var(--pam-glass-highlight);
+  }
+  [data-material="opaque"] .command-surface {
+    background: var(--pam-surface-raised);
+    border-color: var(--pam-edge);
+    box-shadow: none;
+  }
+  .theme-swatches {
+    display: flex;
+    height: 20px;
+    overflow: hidden;
+    border-radius: var(--radius-badge);
+  }
+  .theme-swatches > span {
+    flex: 1;
+  }
+  .theme-swatches > :nth-child(1) {
+    background: var(--pam-chrome);
+  }
+  .theme-swatches > :nth-child(2) {
+    background: var(--pam-surface);
+  }
+  .theme-swatches > :nth-child(3) {
+    background: var(--pam-action-gradient);
+  }
+  .theme-swatches > :nth-child(4) {
+    background: var(--pam-warm-material);
+  }
+  .theme-swatches > :nth-child(5) {
+    background: var(--pam-ink);
+  }
+  .theme-preview {
+    color: var(--pam-ink);
+  }
+  .activity-lanes {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  }
+  .activity-lane {
+    container-type: inline-size;
+  }
+  .lane-repo {
+    display: none;
+  }
+  @container (min-width: 600px) {
+    .lane-repo {
+      display: block;
+    }
+  }
+  .activity-details > div {
+    min-width: 0;
+  }
+  .activity-details dd {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .flow-detail {
+    container-type: inline-size;
+  }
+  .flow-workbench {
+    flex-direction: column;
+  }
+  @container (min-width: 880px) {
+    .flow-workbench {
+      flex-direction: row;
+      align-items: flex-start;
+    }
+    .flow-inspector {
+      width: 380px;
+    }
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .command-surface {
+    background: var(--pam-surface-raised);
+    border-color: var(--pam-edge);
+    box-shadow: none;
+  }
+}
+
+/* Keep state feedback available without movement or theme-colored images. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  *,
+  *::before,
+  *::after {
+    background-image: none !important;
+    box-shadow: none !important;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    border: 1px solid ButtonText;
+  }
+  :focus-visible {
+    outline-color: Highlight;
+  }
+  [aria-current="page"],
+  [aria-pressed="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  [aria-current="page"]:focus-visible,
+  [aria-pressed="true"]:focus-visible {
+    outline-style: dashed;
+    outline-offset: 3px;
+    border-inline-start: 3px solid Highlight;
+  }
+  .warm-marker,
+  .warm-label::before {
+    background: Highlight;
+  }
+  .warm-badge,
+  .command-surface {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
   }
 }

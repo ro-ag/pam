@@ -96,7 +96,7 @@ function card(capability: string) {
 describe("raised hands", () => {
   it("renders one raised card per pending approval, with a live count", async () => {
     renderApprovals();
-    expect(await screen.findByText("approvals · 2 hands raised")).toBeInTheDocument();
+    expect(await screen.findByText("2 requests awaiting review")).toBeInTheDocument();
     // Capability in the data voice, agent chip, repo tail with full path.
     const pushCard = card("repo.push");
     expect(pushCard.getByText("claude")).toBeInTheDocument();
@@ -131,7 +131,7 @@ describe("raised hands", () => {
       pending: [hand({ capability: "flow.step:pr-readiness/tests" })],
     });
     renderApprovals();
-    await screen.findByText("approvals · 1 hand raised");
+    await screen.findByText("1 request awaiting review");
     const stepCard = card("flow.step:pr-readiness/tests");
     expect(stepCard.getByText(/The flow asks to run a gated step,/)).toBeInTheDocument();
     expect(stepCard.getByText("pr-readiness / tests")).toBeInTheDocument();
@@ -143,7 +143,7 @@ describe("raised hands", () => {
 describe("resolving", () => {
   it("approves with the remember flag once the checkbox is ticked", async () => {
     renderApprovals();
-    await screen.findByText("approvals · 2 hands raised");
+    await screen.findByText("2 requests awaiting review");
     const pushCard = card("repo.push");
     fireEvent.click(pushCard.getByRole("checkbox", { name: "remember this capability" }));
     fireEvent.click(pushCard.getByRole("button", { name: "Approve" }));
@@ -156,7 +156,7 @@ describe("resolving", () => {
 
   it("approves without remembering by default", async () => {
     renderApprovals();
-    await screen.findByText("approvals · 2 hands raised");
+    await screen.findByText("2 requests awaiting review");
     fireEvent.click(card("echo").getByRole("button", { name: "Approve" }));
     await waitFor(() =>
       expect(mocks.approvalsResolve).toHaveBeenCalledWith("req_b", "approved", {
@@ -167,7 +167,7 @@ describe("resolving", () => {
 
   it("denies carrying the optional note", async () => {
     renderApprovals();
-    await screen.findByText("approvals · 2 hands raised");
+    await screen.findByText("2 requests awaiting review");
     const pushCard = card("repo.push");
     fireEvent.click(pushCard.getByRole("button", { name: "add note" }));
     fireEvent.change(pushCard.getByRole("textbox", { name: "resolution note" }), {
@@ -185,7 +185,7 @@ describe("resolving", () => {
     // A resolve that never settles: the card must not wait for it.
     mocks.approvalsResolve.mockImplementation(() => new Promise(() => {}));
     renderApprovals();
-    await screen.findByText("approvals · 2 hands raised");
+    await screen.findByText("2 requests awaiting review");
     fireEvent.click(card("repo.push").getByRole("button", { name: "Approve" }));
     await waitFor(() =>
       expect(
@@ -203,7 +203,7 @@ describe("resolving", () => {
       recovery: "Retry; the daemon restarts lazily.",
     });
     renderApprovals();
-    await screen.findByText("approvals · 2 hands raised");
+    await screen.findByText("2 requests awaiting review");
     fireEvent.click(card("repo.push").getByRole("button", { name: "Approve" }));
     expect(await screen.findByText(/resolve failed · daemon_unreachable/)).toBeInTheDocument();
     const pushCard = card("repo.push");
@@ -232,7 +232,7 @@ describe("the waiting clock", () => {
       pending: [hand({ request_id: "req_a", requested_ts: nowSec() - (WARNING_AFTER_S - 30) })],
     });
     renderApprovals();
-    await screen.findByText("approvals · 1 hand raised");
+    await screen.findByText("1 request awaiting review");
     expect(screen.queryByText(/times out in/)).not.toBeInTheDocument();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(40_000);
@@ -247,7 +247,7 @@ describe("live updates", () => {
       pending: [hand({ request_id: "req_a", capability: "repo.push" })],
     });
     renderApprovals();
-    await screen.findByText("approvals · 1 hand raised");
+    await screen.findByText("1 request awaiting review");
     await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
 
     mocks.approvalsPending.mockResolvedValue({
@@ -265,7 +265,7 @@ describe("live updates", () => {
     expect(
       await screen.findByRole("region", { name: "approval net.fetch" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("approvals · 2 hands raised")).toBeInTheDocument();
+    expect(screen.getByText("2 requests awaiting review")).toBeInTheDocument();
   });
 });
 
@@ -275,7 +275,7 @@ describe("lowered hands and broken water", () => {
     renderApprovals();
     expect(await screen.findByText(/No hands raised/)).toBeInTheDocument();
     expect(screen.getByText(/no agent or CLI can answer for you/)).toBeInTheDocument();
-    expect(screen.getByText("approvals · no hands raised")).toBeInTheDocument();
+    expect(screen.getByText("0 requests awaiting review")).toBeInTheDocument();
   });
 
   it("renders the disconnected banner from the uniform failure shape", async () => {

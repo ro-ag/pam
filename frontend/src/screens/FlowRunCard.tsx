@@ -76,15 +76,13 @@ export function stepDuration(ms: number): string {
  */
 export function StepTable({ steps }: { steps: FlowStepReport[] }) {
   if (steps.length === 0) {
-    return (
-      <p className="font-voice text-sm text-ink-muted italic">This run took no steps at all.</p>
-    );
+    return <p className="font-sans text-sm text-ink-muted">This run took no steps at all.</p>;
   }
   return (
     <div className="overflow-x-auto">
       <table className="w-full border-collapse">
         <thead>
-          <tr className="text-left font-data text-xs tracking-widest text-ink-faint uppercase">
+          <tr className="text-left font-data text-xs text-ink-faint">
             <th className="pb-2 pr-3 font-medium">step</th>
             <th className="pb-2 pr-3 font-medium">kind</th>
             <th className="pb-2 pr-3 font-medium">status</th>
@@ -99,7 +97,7 @@ export function StepTable({ steps }: { steps: FlowStepReport[] }) {
               <td className="py-2.5 pr-3 font-data text-sm text-ink">
                 {step.id}
                 {step.summary && (
-                  <span className="mt-1 block max-w-md font-voice text-sm text-ink-muted italic">
+                  <span className="mt-1 block max-w-md font-sans text-sm text-ink-muted">
                     {step.summary}
                   </span>
                 )}
@@ -140,7 +138,7 @@ export function FlowVerdict({ result }: { result: FlowResult }) {
           {result.flow.id} · {result.repo}
         </span>
       </div>
-      <p className="max-w-xl font-voice text-base text-ink italic">{result.summary}</p>
+      <p className="max-w-xl font-sans text-sm text-ink">{result.summary}</p>
       <StepTable steps={result.steps} />
     </div>
   );
@@ -179,7 +177,7 @@ export function FlowVerdictPanel({ requestId }: { requestId: string }) {
   }
   if (!verdict.data) {
     return (
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-sans text-sm text-ink-muted">
         This run left no verdict — it never reached its first step.
       </p>
     );
@@ -303,7 +301,7 @@ export function FlowRunCard({
 
   return (
     <Panel ground="raised" aria-label="run this flow" className="space-y-4 p-4">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">run</p>
+      <p className="font-data text-xs text-ink-faint">run</p>
 
       <div className="space-y-1.5">
         <span className="block font-data text-xs text-ink-faint">repo</span>
@@ -312,7 +310,7 @@ export function FlowRunCard({
             aria-label="known repo"
             value={repos.includes(repo) ? repo : ""}
             onChange={(event) => setRepo(event.target.value)}
-            className="h-8 w-full rounded-control border border-line bg-surface px-2 font-data text-xs text-ink"
+            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
           >
             <option value="">pick a repo pam has seen</option>
             {repos.map((known) => (
@@ -345,7 +343,7 @@ export function FlowRunCard({
                 className={fieldClasses}
               />
               {input.description && (
-                <span className="block font-voice text-sm text-ink-muted italic">
+                <span className="block font-sans text-sm text-ink-muted">
                   {input.description}
                 </span>
               )}

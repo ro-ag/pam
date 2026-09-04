@@ -112,7 +112,7 @@ function ClassBadge({ entry }: { entry: ModelEntry }) {
   return (
     <span className="space-y-1">
       <Badge tone="neutral">test only</Badge>
-      <span className="block font-voice text-xs text-ink-faint italic">{FLOOR_SENTENCE}</span>
+      <span className="block font-sans text-xs text-ink-faint">{FLOOR_SENTENCE}</span>
     </span>
   );
 }
@@ -169,7 +169,7 @@ function RuntimeCard({
   return (
     <Panel ground="raised" className="space-y-5 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">in memory</p>
+        <p className="font-data text-xs text-ink-faint">in memory</p>
         {runtime?.state === "loaded" && <Badge tone="success">loaded</Badge>}
         {runtime?.state === "loading" && (
           <Badge tone="warning">loading · {runtime.phase}</Badge>
@@ -180,7 +180,7 @@ function RuntimeCard({
       {failure && <FailureNote failure={failure} label="runtime" />}
 
       {!failure && runtime?.state === "idle" && (
-        <p className="font-voice text-base text-ink-muted italic">{IDLE_RUNTIME_SENTENCE}</p>
+        <p className="font-sans text-sm text-ink-muted">{IDLE_RUNTIME_SENTENCE}</p>
       )}
 
       {loaded && (
@@ -210,7 +210,7 @@ function RuntimeCard({
           value={pick}
           disabled={selectable.length === 0 || load.isPending}
           onChange={(event) => setChoice(event.target.value)}
-          className="h-8 min-w-56 rounded-control border border-line bg-surface px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+          className="h-8 min-w-56 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
         >
           {selectable.length === 0 && <option value="">nothing installed</option>}
           {selectable.map((model) => (
@@ -390,7 +390,7 @@ function LibraryTable({
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">on disk</p>
+        <p className="font-data text-xs text-ink-faint">on disk</p>
         {modelsDir && (
           <span className="truncate font-data text-xs text-ink-faint">{modelsDir}</span>
         )}
@@ -399,14 +399,14 @@ function LibraryTable({
       {failure && <FailureNote failure={failure} label="library" />}
 
       {!failure && models.length === 0 && !pending && (
-        <p className="font-voice text-base text-ink-muted italic">{EMPTY_LIBRARY_SENTENCE}</p>
+        <p className="font-sans text-sm text-ink-muted">{EMPTY_LIBRARY_SENTENCE}</p>
       )}
 
       {models.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead>
-              <tr className="text-left font-data text-xs tracking-widest text-ink-faint uppercase">
+              <tr className="text-left font-data text-xs text-ink-faint">
                 <th className="pb-2 pr-3 font-medium">model</th>
                 <th className="pb-2 pr-3 font-medium">quant</th>
                 <th className="pb-2 pr-3 font-medium">size</th>
@@ -556,14 +556,12 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
   const presets = (catalog.data?.presets ?? []).filter((preset) => preset.fits_host);
 
   const inputClasses =
-    "h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          curated presets
-        </p>
+        <p className="font-data text-xs text-ink-faint">curated presets</p>
         {catalog.data && (
           <span className="font-data text-xs text-ink-faint tabular-nums">
             host RAM {formatBytes(catalog.data.host_ram_bytes)}
@@ -574,7 +572,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
       {listFailure && <FailureNote failure={listFailure} label="catalog" />}
 
       {!listFailure && presets.length === 0 && !catalog.isPending && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           Nothing in the catalog fits this machine's memory. The paste-URL box below still
           works, honestly labelled.
         </p>
@@ -607,9 +605,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           }
         }}
       >
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          paste a URL
-        </p>
+        <p className="font-data text-xs text-ink-faint">paste a URL</p>
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-64 flex-1 space-y-1">
             <span className="block font-data text-xs text-ink-faint">gguf url</span>
@@ -639,7 +635,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
             Fetch
           </Button>
         </div>
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           A pasted file arrives with no expected digest, so it stays unverified until you run
           Verify and I know its hash. {FLOOR_NOTE}
         </p>
@@ -674,7 +670,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">one prompt</p>
+        <p className="font-data text-xs text-ink-faint">one prompt</p>
         {closed && (
           <span className="font-data text-xs text-ink-faint">{TRY_DISABLED_REASON}</span>
         )}
@@ -687,7 +683,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
         disabled={closed}
         onChange={(event) => setPrompt(event.target.value)}
         placeholder="Say hello in five words."
-        className="w-full rounded-control border border-line bg-surface p-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
+        className="w-full rounded-control field-control border border-control-line bg-inset p-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
       />
 
       <div className="flex flex-wrap items-end gap-2">
@@ -700,7 +696,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
             value={maxTokens}
             disabled={closed}
             onChange={(event) => setMaxTokens(event.target.value)}
-            className="h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
           />
         </label>
         <Button
@@ -718,7 +714,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
           )}
           Run
         </Button>
-        <span className="font-voice text-sm text-ink-muted italic">
+        <span className="font-sans text-sm text-ink-muted">
           Diagnostics, not a chat — this one runs on test-only weights too.
         </span>
       </div>
@@ -769,16 +765,13 @@ export function ModelsScreen() {
   const jobs = status.data?.jobs ?? [];
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-10">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          models · what runs, what&apos;s on disk, what&apos;s on offer
-        </p>
-        <h1 className="font-display text-title font-semibold text-ink">Models</h1>
-        <div className="border-b border-line" />
+    <div className="flex min-h-full flex-col px-6 pb-10">
+      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+        <h1 className="font-sans text-title font-semibold text-ink">Models</h1>
+        <p className="text-sm text-ink-muted">Local models, runtime and downloads.</p>
       </header>
 
-      <div className="space-y-10 pt-6">
+      <div className="space-y-6 pt-6">
         <Section
           eyebrow="runtime"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}

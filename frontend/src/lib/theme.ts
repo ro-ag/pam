@@ -18,14 +18,22 @@ export type ThemeId = (typeof themeIds)[number];
 export const modeIds = ["light", "dark"] as const;
 export type ModeId = (typeof modeIds)[number];
 
+export type MaterialId = "glass" | "opaque";
+export const materialStorageKey = "pam-material";
+
+export function isMaterialId(value: unknown): value is MaterialId {
+  return value === "glass" || value === "opaque";
+}
+
 export interface ThemeDefinition {
   id: ThemeId;
   label: string;
+  appearances: Record<ModeId, string>;
 }
 
 export const themes: readonly ThemeDefinition[] = [
-  { id: "ventisquero", label: "Ventisquero" },
-  { id: "vina", label: "Viña del Mar" },
+  { id: "ventisquero", label: "Ventisquero", appearances: { dark: "Bedrock", light: "Mist" } },
+  { id: "vina", label: "Viña del Mar", appearances: { dark: "Night", light: "Dawn" } },
 ];
 
 export const defaultTheme: ThemeId = "ventisquero";
@@ -70,6 +78,7 @@ export function nextMode(current: ModeId): ModeId {
 export interface ThemeState {
   theme: ThemeId;
   mode: ModeId;
+  material: MaterialId;
 }
 
 let snapshot: ThemeState | null = null;
@@ -92,9 +101,11 @@ export function themeSnapshot(): ThemeState {
   if (snapshot === null) {
     const theme = document.documentElement.dataset.theme;
     const mode = document.documentElement.dataset.mode;
+    const material = document.documentElement.dataset.material;
     snapshot = {
       theme: isThemeId(theme) ? theme : defaultTheme,
       mode: isModeId(mode) ? mode : systemMode(),
+      material: isMaterialId(material) ? material : "glass",
     };
   }
   return snapshot;
@@ -129,7 +140,16 @@ export function applyTheme(
     persist(modeStorageKey, mode);
   }
   syncNativeWindow(mode);
-  snapshot = { theme, mode };
+  const material = document.documentElement.dataset.material;
+  snapshot = { theme, mode, material: isMaterialId(material) ? material : "glass" };
+  for (const listener of listeners) listener();
+}
+
+/** Costa material preference is independent of the palette and native tint. */
+export function applyMaterial(material: MaterialId, options?: { persist?: boolean }): void {
+  document.documentElement.dataset.material = material;
+  if (options?.persist !== false) persist(materialStorageKey, material);
+  snapshot = { ...themeSnapshot(), material };
   for (const listener of listeners) listener();
 }
 
@@ -162,6 +182,8 @@ function systemMode(): ModeId {
 export function initTheme(): { theme: ThemeId; mode: ModeId } {
   const theme = stored(themeStorageKey, isThemeId) ?? defaultTheme;
   const mode = stored(modeStorageKey, isModeId) ?? systemMode();
+  document.documentElement.dataset.material =
+    stored(materialStorageKey, isMaterialId) ?? "glass";
   applyTheme(theme, mode, { persist: false });
   return { theme, mode };
 }

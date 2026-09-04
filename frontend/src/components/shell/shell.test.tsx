@@ -1,5 +1,5 @@
 import { createMemoryHistory } from "@tanstack/react-router";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { createAppRouter } from "../../router";
@@ -51,10 +51,11 @@ describe("Beacon", () => {
     expect(beacon.innerHTML).toContain(tokenClass);
   });
 
-  it("breathes — the glow layer uses the breathe motion token", () => {
+  it("keeps the idle beacon still and labels its state", () => {
     render(<Beacon state="connected" />);
     const beacon = screen.getByRole("status", { name: "daemon connected" });
-    expect(beacon.innerHTML).toContain("animate-breathe");
+    expect(beacon.innerHTML).not.toContain("animate-breathe");
+    expect(beacon).toHaveTextContent("Connected");
   });
 });
 
@@ -73,6 +74,16 @@ describe("PanelToolbar", () => {
 });
 
 describe("shell layout", () => {
+  it("starts a new screen at the top of its workspace", async () => {
+    renderShell("/activity");
+    await screen.findByRole("heading", { name: "Activity" });
+    const workspace = document.querySelector<HTMLElement>(".workspace-scroll")!;
+    workspace.scrollTop = 480;
+    fireEvent.click(screen.getByRole("link", { name: "Home" }));
+    await screen.findByRole("heading", { name: "Home" });
+    expect(document.querySelector(".workspace-scroll")?.scrollTop).toBe(0);
+  });
+
   it("has no window-wide top strip above the sidebar and the panel", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
@@ -93,7 +104,7 @@ describe("shell layout", () => {
     );
   });
 
-  it("makes the toolbar the panel's first child, inside the panel", async () => {
+  it("keeps the draggable toolbar above the scrolling workspace", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     const panel = document.querySelector("main section");
@@ -144,8 +155,6 @@ describe("Sidebar", () => {
       "Settings",
     ]);
     expect(links[0]).toHaveAttribute("aria-current", "page");
-    expect(
-      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
   });
 });

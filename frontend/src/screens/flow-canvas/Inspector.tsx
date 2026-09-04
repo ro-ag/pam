@@ -82,9 +82,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function Eyebrow({ children }: { children: ReactNode }) {
-  return (
-    <p className="font-data text-xs tracking-widest text-ink-faint uppercase">{children}</p>
-  );
+  return <p className="font-data text-xs text-ink-faint">{children}</p>;
 }
 
 function Group({ children }: { children: ReactNode }) {
@@ -178,7 +176,7 @@ function FlowFields({
           className={cn(fieldClasses, "h-auto resize-y py-1.5 leading-relaxed")}
         />
       </Field>
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-sans text-sm text-ink-muted">
         Pick a step to edit it; drag from one handle to another to make a step wait.
       </p>
     </>
@@ -202,7 +200,7 @@ function InputsFields({
   return (
     <>
       {names.length === 0 && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           This flow takes no inputs; every step runs as written.
         </p>
       )}
@@ -613,7 +611,7 @@ function StepFields({
             />
           </Field>
         </div>
-        <p aria-label="when" className="font-voice text-sm text-ink-muted italic">
+        <p aria-label="when" className="font-sans text-sm text-ink-muted">
           {whenText(step)}
         </p>
       </Group>
@@ -730,7 +728,7 @@ function EdgeFields({
   const [refused, setRefused] = useState<Refused | null>(null);
   const edge = parseEdge(id);
   if (!edge) {
-    return <p className="font-voice text-sm text-ink-muted italic">That edge is implicit.</p>;
+    return <p className="font-sans text-sm text-ink-muted">That edge is implicit.</p>;
   }
   const flip = (kind: EditableEdgeKind) => {
     const edit = setEdgeKind(spec, id, kind);
@@ -799,7 +797,7 @@ export function Inspector({ spec, selection, onChange, onSelect, error }: Inspec
       : undefined;
 
   return (
-    <Panel ground="raised" aria-label="inspector" className="space-y-4 p-4">
+    <Panel ground="command" aria-label="inspector" className="space-y-4 p-4">
       <div className="flex items-center gap-2">
         <Eyebrow>inspector</Eyebrow>
         <Badge tone={selection.kind === "none" ? "neutral" : "accent"}>

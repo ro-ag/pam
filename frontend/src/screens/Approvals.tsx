@@ -180,14 +180,14 @@ function ApprovalCard({
 
   return (
     <Panel
-      ground="raised"
+      ground="command"
       aria-label={`approval ${approval.capability}`}
       className="space-y-4 p-5"
     >
       <div className="flex items-start gap-3">
         <span
           aria-hidden="true"
-          className="flex size-8 shrink-0 items-center justify-center rounded-pill bg-warning-soft"
+          className="warm-badge flex size-8 shrink-0 items-center justify-center rounded-control text-warning"
         >
           <Hand className="size-4 text-warning" />
         </span>
@@ -214,7 +214,7 @@ function ApprovalCard({
         </time>
       </div>
 
-      <p className="max-w-md font-voice text-base text-ink-muted italic">
+      <p className="max-w-md font-sans text-sm text-ink-muted">
         {meaning.before}
         <span className="font-data text-sm text-ink not-italic">
           {capabilityLabel(approval.capability)}
@@ -224,10 +224,8 @@ function ApprovalCard({
 
       {failure && (
         <div className="space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
-          <p className="font-data text-xs tracking-widest text-danger uppercase">
-            resolve failed · {failure.cause}
-          </p>
-          <p className="font-voice text-sm text-ink italic">{failure.detail}.</p>
+          <p className="font-data text-xs text-danger">resolve failed · {failure.cause}</p>
+          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
           <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
         </div>
       )}
@@ -280,7 +278,7 @@ function ApprovalCard({
           value={note}
           onChange={(event) => setNote(event.target.value)}
           placeholder="why — this line travels with the audit trail"
-          className="h-8 w-full rounded-control border border-line bg-surface px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
+          className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
         />
       )}
     </Panel>
@@ -404,25 +402,20 @@ export function ApprovalsScreen() {
   const failure = approvals.isError ? toBridgeFailure(approvals.error) : null;
 
   return (
-    <div className="flex min-h-full flex-col px-8 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-8 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
+    <div className="flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+        <h1 className="font-sans text-title font-semibold text-ink">Approvals</h1>
+        <p className="text-sm text-ink-muted">
           {count === undefined
-            ? "approvals"
-            : count > 0
-              ? `approvals · ${count} hand${count === 1 ? "" : "s"} raised`
-              : "approvals · no hands raised"}
+            ? "Review agent requests before they run."
+            : `${count} request${count === 1 ? "" : "s"} awaiting review`}
         </p>
-        <h1 className="font-display text-title font-semibold text-ink">Approvals</h1>
-        <div className="border-b border-line" />
       </header>
 
       {failure && (
         <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-          <p className="font-data text-xs tracking-widest text-danger uppercase">
-            disconnected · {failure.cause}
-          </p>
-          <p className="font-voice text-base text-ink italic">{failure.detail}.</p>
+          <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
+          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
           <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
         </section>
       )}
@@ -437,7 +430,7 @@ export function ApprovalsScreen() {
           >
             <Hand className="size-5 text-ink-faint" />
           </span>
-          <p className="max-w-md font-voice text-lg text-ink-muted italic">
+          <p className="max-w-md font-sans text-lg text-ink-muted">
             No hands raised. When an agent needs your yes, it appears here first.
           </p>
           <p className="font-data text-xs text-ink-faint">
@@ -448,7 +441,7 @@ export function ApprovalsScreen() {
 
       {!failure && pending.length > 0 && (
         <>
-          <ul className="max-w-2xl space-y-4 pt-4">
+          <ul className="max-w-4xl space-y-4 pt-5">
             <AnimatePresence>
               {pending.map((hand, index) => (
                 <motion.li

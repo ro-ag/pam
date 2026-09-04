@@ -1,278 +1,307 @@
-/**
- * PAM themes — primitive palettes only.
- *
- * THE CONTRACT
- * ------------
- * A theme is a token set, nothing more. Theming has TWO AXES, exactly like
- * v1: `data-theme` picks the family (ventisquero | vina) and `data-mode`
- * picks the variant (light | dark) — four palettes total. Each block below
- * redefines the SAME primitive `--pam-*` custom properties; `tokens.css`
- * maps them once into Tailwind's semantic namespace (`bg-surface`,
- * `text-ink`, `shadow-float`, …). Components consume semantic utilities
- * ONLY — they never read a `--pam-*` primitive and never know which
- * theme or mode is active. Adding a theme = adding two blocks here,
- * zero component edits.
- *
- * All four palettes are ported verbatim from pam-old
- * `frontend/src/styles.css` (`@layer tokens` — the blocks the owner kept
- * because "they are pretty"):
- *
- *   Ventisquero light ("Mist")     ← :root[data-theme="ventisquero"][data-mode="light"]
- *   Ventisquero dark  ("Bedrock")  ← [data-theme="ventisquero"][data-mode="dark"]
- *   Viña del Mar light ("Dawn")    ← [data-theme="vina"][data-mode="light"]
- *   Viña del Mar dark  ("Night")   ← [data-theme="vina"][data-mode="dark"]
- *
- * Three v2 adjustments, applied consistently to all four (documented per
- * block): grounds reordered monotonically chrome → surface → raised (v1's
- * raised sometimes sat below its surface), `--pam-ink-faint` derived as ink
- * at ~50% alpha (v1 had no third ink step), and `--pam-warning-soft`
- * synthesized to match each palette's soft-alpha pattern (v1 had none).
- *
- * The three grounds (lifeguard tower at night):
- *   --pam-chrome          the water — window + sidebar ground
- *   --pam-surface         the lit tower deck — the floating work panel
- *   --pam-surface-raised  cards standing on the deck
- *
- * DEFAULT: `initTheme()` stamps both attributes before first render, so the
- * bare-`:root` fallback below only covers the pre-JS frame and tests: it is
- * Ventisquero in the system's preferred mode (light block on `:root`, dark
- * block repeated under `prefers-color-scheme: dark` — kept verbatim in sync
- * with the attributed dark block).
+/** Costa palettes adapted to PAM's semantic roles.
+ * Source: costa-design-system/themes/tokens.json (2026-09-03).
+ * Family and mode only redefine tokens; geometry and behavior are shared.
+ * Keep the pre-JS system-dark fallback identical to Ventisquero dark.
  */
-
-/* The one deliberately theme-independent token: v1's warm copper hairline
-   between chrome groups. Brand signature — do not theme it. */
 :root {
-  --pam-separator: rgba(246, 154, 111, 0.31);
   --pam-density: 1;
+  /* Costa dt-glass inset reflection, shared by all four appearances. */
+  --pam-glass-highlight: inset 0 1px 0 #ffffff26;
 }
 
-/* ---------------------------------------------------------------- *
- * Ventisquero · light ("Mist") — icy pale water, warm paper deck,
- * deep-teal ice accent. (pam-old ventisquero, light mode.)
- * ---------------------------------------------------------------- */
 :root,
 [data-theme="ventisquero"][data-mode="light"] {
   color-scheme: light;
-
-  /* grounds — v1's cool ice tint #eef3f5 becomes the receding water,
-     its bright paper #fdfcf9 floats as the panel; pure white is the one
-     added stop (v1 had no third ground) so raised cards still lift */
-  --pam-chrome: #eef3f5;
+  --pam-chrome: #f6f3ec;
+  --pam-sidebar: #e9edef;
   --pam-surface: #fdfcf9;
   --pam-surface-raised: #ffffff;
-
-  /* ink */
-  --pam-ink: #0c1117;
-  --pam-ink-muted: #5c6b7a;
-  --pam-ink-faint: rgba(12, 17, 23, 0.52);
-
-  /* hairlines */
-  --pam-line: #d4dcdf;
-  --pam-edge: rgba(12, 17, 23, 0.08);
-
-  /* accent — the ice ramp reads dark-on-light, so text and fill share it */
-  --pam-accent: #1d7893;
+  --pam-ink: #14212a;
+  --pam-ink-muted: #536574;
+  --pam-ink-faint: #536574;
+  --pam-line: #cbd6db;
+  --pam-edge: #cbd6db;
+  --pam-control-line: #73838d;
+  --pam-separator: #cbd6db;
+  --pam-accent: #14586d;
   --pam-accent-strong: #1d7893;
-  --pam-accent-hover: #2f9db8;
-  --pam-accent-pressed: #14586d;
-  --pam-accent-soft: #e3f9fd;
+  --pam-accent-hover: #176a83;
+  --pam-accent-pressed: #176a83;
+  --pam-accent-soft: #d8eaf0;
   --pam-on-accent: #e3f9fd;
-
-  /* status + warmth */
-  --pam-copper: #b0612f;
-  --pam-success: #6fbf8e;
-  --pam-success-soft: #edf8f1;
-  --pam-warning: #cd7f45;
-  --pam-warning-soft: rgba(205, 127, 69, 0.12);
-  --pam-danger: #bf5238;
-  --pam-danger-soft: #fff1f1;
-
-  --pam-focus: #1d7893;
-  --pam-overlay: rgba(12, 17, 23, 0.36);
-
-  /* elevation — exactly two shadows in the whole system */
-  --pam-shadow-raise: 0 16px 48px rgba(42, 53, 66, 0.1), 0 2px 8px rgba(42, 53, 66, 0.06);
-  --pam-shadow-float: 0 24px 72px rgba(10, 5, 20, 0.18), 0 4px 14px rgba(10, 5, 20, 0.1);
+  --pam-selection-ink: #14586d;
+  --pam-success: #276842;
+  --pam-danger: #a3382e;
+  --pam-warning: #53252a;
+  --pam-copper: #536574;
+  --pam-focus: #14586d;
+  --pam-overlay: #07182366;
+  --pam-shadow-float: 0 8px 24px #14303b12;
+  --pam-shadow-raise: inset 0 1px 3px #14303b12;
+  --pam-shadow-control: inset 0 1px 0 #ffffff24, 0 1px 2px #00000018;
+  --pam-inset: #e7edf0;
+  --pam-action-gradient: linear-gradient(110deg, #14586d 0%, #1d7893 65%, #176780 100%);
+  --pam-warm-material: linear-gradient(
+    125deg,
+    #651e27 0%,
+    #9e3930 30%,
+    #cd7f45 62%,
+    #efbe8c 78%,
+    #ab5838 100%
+  );
+  --pam-warm-surface: linear-gradient(
+    125deg,
+    #efd6db 0%,
+    #eed5bd 48%,
+    #fae8cf 78%,
+    #edcfc4 100%
+  );
+  --pam-warm-edge: linear-gradient(125deg, #81303c 0%, #bb6744 52%, #e0a06b 78%, #854334 100%);
+  --pam-glass-gradient: linear-gradient(
+    135deg,
+    #ffffff 0%,
+    #edf3f5 38%,
+    #deeff3 75%,
+    #f1eee6 100%
+  );
+  --pam-glass-edge: linear-gradient(135deg, #9daeb7, #7cafbf 58%, #c4dce0);
+  --pam-success-soft: color-mix(in srgb, #276842 8%, #fdfcf9);
+  --pam-danger-soft: color-mix(in srgb, #a3382e 8%, #fdfcf9);
+  --pam-warning-soft: #fdfcf9;
 }
 
-/* ---------------------------------------------------------------- *
- * Ventisquero · dark ("Bedrock") — glacial night: near-black blue
- * chrome, ice-cyan accent, copper warmth. (pam-old ventisquero, dark.)
- * ---------------------------------------------------------------- */
 [data-theme="ventisquero"][data-mode="dark"] {
   color-scheme: dark;
-
-  /* grounds — #06090d / #0c1117 / #131a22 are the ventisquero night ramp;
-     v2 orders them chrome → surface → raised (one step lighter per ground) */
   --pam-chrome: #06090d;
-  --pam-surface: #0c1117;
-  --pam-surface-raised: #131a22;
-
-  /* ink */
+  --pam-sidebar: #0c1117;
+  --pam-surface: #131a22;
+  --pam-surface-raised: #1c2530;
   --pam-ink: #eef3f5;
   --pam-ink-muted: #b9c6cd;
-  --pam-ink-faint: rgba(238, 243, 245, 0.45);
-
-  /* hairlines */
+  --pam-ink-faint: #b9c6cd;
   --pam-line: #2a3542;
-  --pam-edge: rgba(238, 243, 245, 0.08);
-
-  /* accent — ice ramp; bright #5cc4dc for text/rings, deep #1d7893 fills */
-  --pam-accent: #5cc4dc;
+  --pam-edge: #2a3542;
+  --pam-control-line: #788997;
+  --pam-separator: #2a3542;
+  --pam-accent: #93dcea;
   --pam-accent-strong: #1d7893;
-  --pam-accent-hover: #2f9db8;
-  --pam-accent-pressed: #14586d;
-  --pam-accent-soft: #122a33;
+  --pam-accent-hover: #176a83;
+  --pam-accent-pressed: #176a83;
+  --pam-accent-soft: #183c49;
   --pam-on-accent: #e3f9fd;
-
-  /* status + warmth */
-  --pam-copper: #cd7f45;
-  --pam-success: #6fbf8e;
-  --pam-success-soft: rgba(111, 191, 142, 0.16);
-  --pam-warning: #cd7f45;
-  --pam-warning-soft: rgba(205, 127, 69, 0.16);
-  --pam-danger: #d4634f;
-  --pam-danger-soft: rgba(212, 99, 79, 0.16);
-
-  --pam-focus: #5cc4dc;
-  --pam-overlay: rgba(6, 9, 13, 0.68);
-
-  --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.24);
-  --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.5), 0 4px 14px rgba(0, 0, 0, 0.32);
+  --pam-selection-ink: #c4eff7;
+  --pam-success: #8ed5aa;
+  --pam-danger: #f2a391;
+  --pam-warning: #eef3f5;
+  --pam-copper: #b9c6cd;
+  --pam-focus: #93dcea;
+  --pam-overlay: #02060aa6;
+  --pam-shadow-float: 0 8px 24px #00000038;
+  --pam-shadow-raise: inset 0 1px 3px #00000030;
+  --pam-shadow-control: inset 0 1px 0 #ffffff24, 0 1px 2px #00000018;
+  --pam-inset: #090e14;
+  --pam-action-gradient: linear-gradient(110deg, #14586d 0%, #1d7893 65%, #176780 100%);
+  --pam-warm-material: linear-gradient(
+    125deg,
+    #651e27 0%,
+    #9e3930 30%,
+    #cd7f45 62%,
+    #efbe8c 78%,
+    #ab5838 100%
+  );
+  --pam-warm-surface: linear-gradient(
+    125deg,
+    #391b25 0%,
+    #482922 48%,
+    #63432d 78%,
+    #38221e 100%
+  );
+  --pam-warm-edge: linear-gradient(125deg, #81303c 0%, #bb6744 52%, #e0a06b 78%, #854334 100%);
+  --pam-glass-gradient: linear-gradient(
+    135deg,
+    #26343e 0%,
+    #192732 38%,
+    #203b46 75%,
+    #253238 100%
+  );
+  --pam-glass-edge: linear-gradient(135deg, #829ca7, #376677 58%, #94c4cf);
+  --pam-success-soft: color-mix(in srgb, #8ed5aa 8%, #131a22);
+  --pam-danger-soft: color-mix(in srgb, #f2a391 8%, #131a22);
+  --pam-warning-soft: #131a22;
 }
 
-/* ---------------------------------------------------------------- *
- * Viña del Mar · light ("Dawn") — cream paper, magenta-violet accent,
- * coral warmth. (pam-old vina, light mode.)
- * ---------------------------------------------------------------- */
 [data-theme="vina"][data-mode="light"] {
   color-scheme: light;
-
-  /* grounds — cream page recedes, the panel floats brighter; pure white is
-     the one added stop (v1 had no third ground) so raised cards still lift */
-  --pam-chrome: #f5f3eb;
-  --pam-surface: #fdfcf9;
+  --pam-chrome: #f5f2f6;
+  --pam-sidebar: #edeaf3;
+  --pam-surface: #fffafd;
   --pam-surface-raised: #ffffff;
-
-  /* ink */
-  --pam-ink: #1a0b2e;
-  --pam-ink-muted: #4a306d;
-  --pam-ink-faint: rgba(26, 11, 46, 0.52);
-
-  /* hairlines */
-  --pam-line: #d4c8e0;
-  --pam-edge: rgba(26, 11, 46, 0.08);
-
-  /* accent — dawn magenta ramp */
-  --pam-accent: #a84595;
-  --pam-accent-strong: #a84595;
-  --pam-accent-hover: #c456b0;
-  --pam-accent-pressed: #7c2d6b;
-  --pam-accent-soft: #fdefff;
-  --pam-on-accent: #fdefff;
-
-  /* status + warmth */
-  --pam-copper: #e86a3e;
-  --pam-success: #0d9488;
-  --pam-success-soft: rgba(13, 148, 136, 0.1);
-  --pam-warning: #e86a3e;
-  --pam-warning-soft: rgba(232, 106, 62, 0.12);
-  --pam-danger: #c93737;
-  --pam-danger-soft: rgba(201, 55, 55, 0.1);
-
-  --pam-focus: #a84595;
-  --pam-overlay: rgba(26, 11, 46, 0.38);
-
-  --pam-shadow-raise: 0 16px 48px rgba(10, 5, 20, 0.1), 0 2px 8px rgba(10, 5, 20, 0.06);
-  --pam-shadow-float: 0 24px 72px rgba(10, 5, 20, 0.18), 0 4px 14px rgba(10, 5, 20, 0.1);
+  --pam-ink: #211d38;
+  --pam-ink-muted: #625b75;
+  --pam-ink-faint: #625b75;
+  --pam-line: #d5cbdc;
+  --pam-edge: #d5cbdc;
+  --pam-control-line: #80738f;
+  --pam-separator: #d5cbdc;
+  --pam-accent: #693689;
+  --pam-accent-strong: #873677;
+  --pam-accent-hover: #752a68;
+  --pam-accent-pressed: #752a68;
+  --pam-accent-soft: #eadcf2;
+  --pam-on-accent: #ffffff;
+  --pam-selection-ink: #512471;
+  --pam-success: #176b56;
+  --pam-danger: #a52e3a;
+  --pam-warning: #53223e;
+  --pam-copper: #625b75;
+  --pam-focus: #713c92;
+  --pam-overlay: #19142d66;
+  --pam-shadow-float: 0 8px 24px #38234a12;
+  --pam-shadow-raise: inset 0 1px 3px #38234a12;
+  --pam-shadow-control: inset 0 1px 0 #ffffff24, 0 1px 2px #00000018;
+  --pam-inset: #ece9f3;
+  --pam-action-gradient: linear-gradient(110deg, #493c91 0%, #873677 55%, #a33d53 100%);
+  --pam-warm-material: linear-gradient(
+    115deg,
+    #334f9c 0%,
+    #9c367f 35%,
+    #ed628e 65%,
+    #ffb177 90%,
+    #ffe1a5 100%
+  );
+  --pam-warm-surface: linear-gradient(115deg, #e7e6fb 0%, #f4d9e6 55%, #fbe1d0 100%);
+  --pam-warm-edge: linear-gradient(115deg, #6473bd 0%, #b84380 50%, #b85b37 100%);
+  --pam-glass-gradient: linear-gradient(
+    135deg,
+    #edf1ff 0%,
+    #f6f3fb 35%,
+    #f7e3f0 70%,
+    #ffe8dc 100%
+  );
+  --pam-glass-edge: linear-gradient(135deg, #96a6d7, #bf8bb6 58%, #d5a087);
+  --pam-success-soft: color-mix(in srgb, #176b56 8%, #fffafd);
+  --pam-danger-soft: color-mix(in srgb, #a52e3a 8%, #fffafd);
+  --pam-warning-soft: #fffafd;
 }
 
-/* ---------------------------------------------------------------- *
- * Viña del Mar · dark ("Night") — deep violet night, electric fuchsia
- * accent, coral warmth. (pam-old vina, dark mode.)
- * ---------------------------------------------------------------- */
 [data-theme="vina"][data-mode="dark"] {
   color-scheme: dark;
-
-  /* grounds — #0a0514 / #1a0b2e / #2d1b4e are the vina night ramp; v2
-     orders them chrome → surface → raised (one step lighter per ground) */
-  --pam-chrome: #0a0514;
-  --pam-surface: #1a0b2e;
-  --pam-surface-raised: #2d1b4e;
-
-  /* ink */
-  --pam-ink: #ffffff;
-  --pam-ink-muted: #e8e0f0;
-  --pam-ink-faint: rgba(255, 255, 255, 0.45);
-
-  /* hairlines */
-  --pam-line: #4a306d;
-  --pam-edge: rgba(255, 255, 255, 0.08);
-
-  /* accent — fuchsia #e879f9 for text/rings, magenta #a84595 fills */
-  --pam-accent: #e879f9;
-  --pam-accent-strong: #a84595;
-  --pam-accent-hover: #c456b0;
-  --pam-accent-pressed: #7c2d6b;
-  --pam-accent-soft: #3d2569;
-  --pam-on-accent: #fdefff;
-
-  /* status + warmth */
-  --pam-copper: #ff784b;
-  --pam-success: #0d9488;
-  --pam-success-soft: rgba(13, 148, 136, 0.18);
-  --pam-warning: #ff784b;
-  --pam-warning-soft: rgba(255, 120, 75, 0.16);
-  --pam-danger: #e25555;
-  --pam-danger-soft: rgba(226, 85, 85, 0.16);
-
-  --pam-focus: #e879f9;
-  --pam-overlay: rgba(10, 5, 20, 0.64);
-
-  --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.22);
-  --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.48), 0 4px 14px rgba(0, 0, 0, 0.3);
+  --pam-chrome: #090e1c;
+  --pam-sidebar: #101629;
+  --pam-surface: #172039;
+  --pam-surface-raised: #22283f;
+  --pam-ink: #f6eff8;
+  --pam-ink-muted: #b8bfd3;
+  --pam-ink-faint: #b8bfd3;
+  --pam-line: #374360;
+  --pam-edge: #374360;
+  --pam-control-line: #8390ad;
+  --pam-separator: #374360;
+  --pam-accent: #cbb7ff;
+  --pam-accent-strong: #d38fd1;
+  --pam-accent-hover: #e5abdf;
+  --pam-accent-pressed: #e5abdf;
+  --pam-accent-soft: #343052;
+  --pam-on-accent: #20122d;
+  --pam-selection-ink: #f4e6ff;
+  --pam-success: #89d4bf;
+  --pam-danger: #ffb1ad;
+  --pam-warning: #fff0e9;
+  --pam-copper: #b8bfd3;
+  --pam-focus: #f3a5d5;
+  --pam-overlay: #050815a6;
+  --pam-shadow-float: 0 8px 24px #00000038;
+  --pam-shadow-raise: inset 0 1px 3px #00000030;
+  --pam-shadow-control: inset 0 1px 0 #ffffff24, 0 1px 2px #00000018;
+  --pam-inset: #0d1427;
+  --pam-action-gradient: linear-gradient(110deg, #9aa8f5 0%, #d38fd1 55%, #f4a396 100%);
+  --pam-warm-material: linear-gradient(
+    115deg,
+    #334f9c 0%,
+    #9c367f 35%,
+    #ed628e 65%,
+    #ffb177 90%,
+    #ffe1a5 100%
+  );
+  --pam-warm-surface: linear-gradient(115deg, #25234b 0%, #6c294e 55%, #813e35 100%);
+  --pam-warm-edge: linear-gradient(115deg, #7885df 0%, #d54c8e 50%, #f4a570 100%);
+  --pam-glass-gradient: linear-gradient(
+    135deg,
+    #263453 0%,
+    #1d2843 35%,
+    #3b2849 70%,
+    #5b3449 100%
+  );
+  --pam-glass-edge: linear-gradient(135deg, #748ec3, #945a9f 58%, #d39284);
+  --pam-success-soft: color-mix(in srgb, #89d4bf 8%, #172039);
+  --pam-danger-soft: color-mix(in srgb, #ffb1ad 8%, #172039);
+  --pam-warning-soft: #172039;
 }
 
-/* ---------------------------------------------------------------- *
- * Bare-:root fallback, dark half: before initTheme() stamps the
- * attributes, a system that prefers dark gets Ventisquero dark.
- * KEEP VERBATIM IN SYNC with [data-theme="ventisquero"][data-mode="dark"].
- * ---------------------------------------------------------------- */
 @media (prefers-color-scheme: dark) {
   :root:not([data-mode]) {
     color-scheme: dark;
-
     --pam-chrome: #06090d;
-    --pam-surface: #0c1117;
-    --pam-surface-raised: #131a22;
-
+    --pam-sidebar: #0c1117;
+    --pam-surface: #131a22;
+    --pam-surface-raised: #1c2530;
     --pam-ink: #eef3f5;
     --pam-ink-muted: #b9c6cd;
-    --pam-ink-faint: rgba(238, 243, 245, 0.45);
-
+    --pam-ink-faint: #b9c6cd;
     --pam-line: #2a3542;
-    --pam-edge: rgba(238, 243, 245, 0.08);
-
-    --pam-accent: #5cc4dc;
+    --pam-edge: #2a3542;
+    --pam-control-line: #788997;
+    --pam-separator: #2a3542;
+    --pam-accent: #93dcea;
     --pam-accent-strong: #1d7893;
-    --pam-accent-hover: #2f9db8;
-    --pam-accent-pressed: #14586d;
-    --pam-accent-soft: #122a33;
+    --pam-accent-hover: #176a83;
+    --pam-accent-pressed: #176a83;
+    --pam-accent-soft: #183c49;
     --pam-on-accent: #e3f9fd;
-
-    --pam-copper: #cd7f45;
-    --pam-success: #6fbf8e;
-    --pam-success-soft: rgba(111, 191, 142, 0.16);
-    --pam-warning: #cd7f45;
-    --pam-warning-soft: rgba(205, 127, 69, 0.16);
-    --pam-danger: #d4634f;
-    --pam-danger-soft: rgba(212, 99, 79, 0.16);
-
-    --pam-focus: #5cc4dc;
-    --pam-overlay: rgba(6, 9, 13, 0.68);
-
-    --pam-shadow-raise: 0 16px 48px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.24);
-    --pam-shadow-float: 0 24px 72px rgba(0, 0, 0, 0.5), 0 4px 14px rgba(0, 0, 0, 0.32);
+    --pam-selection-ink: #c4eff7;
+    --pam-success: #8ed5aa;
+    --pam-danger: #f2a391;
+    --pam-warning: #eef3f5;
+    --pam-copper: #b9c6cd;
+    --pam-focus: #93dcea;
+    --pam-overlay: #02060aa6;
+    --pam-shadow-float: 0 8px 24px #00000038;
+    --pam-shadow-raise: inset 0 1px 3px #00000030;
+    --pam-shadow-control: inset 0 1px 0 #ffffff24, 0 1px 2px #00000018;
+    --pam-inset: #090e14;
+    --pam-action-gradient: linear-gradient(110deg, #14586d 0%, #1d7893 65%, #176780 100%);
+    --pam-warm-material: linear-gradient(
+      125deg,
+      #651e27 0%,
+      #9e3930 30%,
+      #cd7f45 62%,
+      #efbe8c 78%,
+      #ab5838 100%
+    );
+    --pam-warm-surface: linear-gradient(
+      125deg,
+      #391b25 0%,
+      #482922 48%,
+      #63432d 78%,
+      #38221e 100%
+    );
+    --pam-warm-edge: linear-gradient(
+      125deg,
+      #81303c 0%,
+      #bb6744 52%,
+      #e0a06b 78%,
+      #854334 100%
+    );
+    --pam-glass-gradient: linear-gradient(
+      135deg,
+      #26343e 0%,
+      #192732 38%,
+      #203b46 75%,
+      #253238 100%
+    );
+    --pam-glass-edge: linear-gradient(135deg, #829ca7, #376677 58%, #94c4cf);
+    --pam-success-soft: color-mix(in srgb, #8ed5aa 8%, #131a22);
+    --pam-danger-soft: color-mix(in srgb, #f2a391 8%, #131a22);
+    --pam-warning-soft: #131a22;
   }
 }

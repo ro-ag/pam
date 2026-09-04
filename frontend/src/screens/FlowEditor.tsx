@@ -162,7 +162,7 @@ export function FlowEditor({
       </div>
 
       {builtin && (
-        <p className="max-w-md font-voice text-sm text-ink-muted italic">
+        <p className="max-w-md font-sans text-sm text-ink-muted">
           This one ships with me, so it cannot be edited in place. Give your copy a name and it
           shadows the builtin — delete the copy and the builtin comes back.
         </p>

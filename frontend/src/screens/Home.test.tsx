@@ -132,12 +132,8 @@ async function askQuestion(question: string) {
 describe("Home shell", () => {
   it("greets in Pam's voice from the daemon and approvals state", async () => {
     renderHome();
-    expect(
-      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
-    ).toBeInTheDocument();
-    expect(
-      await screen.findByText("The water is calm: nothing waits for you."),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
+    expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
   });
 
   it("greets a raised hand, and says so when the daemon is silent", async () => {
@@ -155,7 +151,7 @@ describe("Home shell", () => {
     const { unmount } = render(
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
-    expect(await screen.findByText("One request waits for your hand.")).toBeInTheDocument();
+    expect(await screen.findByText("One request awaiting your approval.")).toBeInTheDocument();
     unmount();
 
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
@@ -165,13 +161,26 @@ describe("Home shell", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows unavailable state instead of inventing zero counts and keeps workspace links usable", async () => {
+    mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
+    mocks.approvalsPending.mockRejectedValue(new Error("unavailable"));
+    const router = renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() => expect(within(overview).getAllByText("Unavailable")).toHaveLength(2));
+    expect(within(overview).queryByText("0")).not.toBeInTheDocument();
+    fireEvent.click(within(overview).getByRole("link", { name: /Inspect activity/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/activity"));
+  });
+
   it("answers a typed question and keeps only the last three exchanges", async () => {
     renderHome();
     await askQuestion("what's waiting for my approval?");
     expect(await screen.findByText("Nothing waits for you.")).toBeInTheDocument();
     await askQuestion("is the daemon running?");
     expect(
-      await screen.findByText("The daemon answers: version 0.1.0, up for 1h 02m, 1 active request."),
+      await screen.findByText(
+        "The daemon answers: version 0.1.0, up for 1h 02m, 1 active request.",
+      ),
     ).toBeInTheDocument();
     await askQuestion("does pam start at login?");
     expect(await screen.findByText("No: nothing starts me at login.")).toBeInTheDocument();
@@ -213,7 +222,7 @@ describe("Home shell", () => {
     expect(router.state.location.hash.replace(/^#/, "")).toBe("daemon");
   });
 
-  it("explains the placeholder memory rule and disables the input while asking", async () => {
+  it("keeps the memory rule visible and exposes pending state while asking", async () => {
     let release: (value: { pending: never[] }) => void = () => {};
     mocks.approvalsPending.mockImplementation(
       () =>
@@ -223,13 +232,14 @@ describe("Home shell", () => {
     );
     renderHome();
     const input = await screen.findByRole("textbox", { name: "ask pam" });
-    expect(input).toHaveAttribute(
-      "placeholder",
-      "Ask about pam itself — I keep only this screen and the last three exchanges",
+    expect(input).toHaveAccessibleDescription(
+      "Ask about PAM itself. I keep only this screen and the last three exchanges.",
     );
+    expect(screen.getByText("Ask PAM", { selector: "label" })).toHaveAttribute("for", input.id);
     fireEvent.change(input, { target: { value: "what's waiting for my approval?" } });
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(input).toBeDisabled());
+    expect(screen.getByRole("button", { name: "Ask" })).toHaveAttribute("aria-busy", "true");
     release({ pending: [] });
     await waitFor(() => expect(input).toBeEnabled());
     expect(await screen.findByText("Nothing waits for you.")).toBeInTheDocument();
@@ -239,10 +249,10 @@ describe("Home shell", () => {
     const { unmount } = render(
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
+    expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
     expect(
-      await screen.findByText("The water is calm: nothing waits for you."),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("answers stay in my own words: no light model is set")).toBeNull();
+      screen.queryByText("answers stay in my own words: no light model is set"),
+    ).toBeNull();
     unmount();
 
     window.localStorage.setItem(rephraseStorageKey, "on");

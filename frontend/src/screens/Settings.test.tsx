@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import type { GrantRow } from "../lib/ipc";
-import { applyTheme } from "../lib/theme";
+import { applyTheme, applyMaterial, materialStorageKey } from "../lib/theme";
 import { createAppRouter } from "../router";
 import {
   AUDIT_CHOICES,
@@ -75,6 +75,7 @@ function grant(overrides: Partial<GrantRow>): GrantRow {
 beforeEach(() => {
   // Deterministic theme regardless of what an earlier test applied.
   applyTheme("ventisquero", "dark", { persist: false });
+  applyMaterial("glass", { persist: false });
 
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({
@@ -178,6 +179,27 @@ function renderSettings() {
   return router;
 }
 
+describe("settings navigation", () => {
+  it("selects one category and preserves dirty form state across category jumps", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    const router = renderSettings();
+    const categories = await screen.findByRole("navigation", { name: "Settings categories" });
+    const links = within(categories).getAllByRole("link");
+    expect(links.filter((link) => link.dataset.selected === "true")).toHaveLength(1);
+    const field = await screen.findByRole("textbox", { name: "models directory" });
+    await waitFor(() => expect(field).toHaveValue("/Users/dev/llm"));
+    fireEvent.change(field, { target: { value: "/tmp/unsaved-models" } });
+    fireEvent.click(within(categories).getByRole("link", { name: "Retention" }));
+    await waitFor(() => expect(router.state.location.hash).toBe("retention"));
+    expect(links.filter((link) => link.dataset.selected === "true")).toHaveLength(1);
+    expect(within(categories).getByRole("link", { name: "Retention" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(field).toHaveValue("/tmp/unsaved-models");
+  });
+});
+
 describe("profile", () => {
   it("renders the daemon's current profile checked, with a sentence each", async () => {
     renderSettings();
@@ -254,7 +276,7 @@ describe("grants", () => {
 describe("appearance", () => {
   it("applies a theme family from its swatch card", async () => {
     renderSettings();
-    const vina = await screen.findByRole("button", { name: /Viña del Mar/ });
+    const vina = await screen.findByRole("button", { name: "Viña del Mar Night" });
     expect(vina).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(vina);
     expect(document.documentElement.dataset.theme).toBe("vina");
@@ -274,12 +296,34 @@ describe("appearance", () => {
     expect(document.documentElement.dataset.mode).toBe("dark");
   });
 
-  it("previews each family's palette by re-scoping the theme attributes", async () => {
+  it("previews all four Costa appearances with their own palette scope", async () => {
     renderSettings();
-    const vina = await screen.findByRole("button", { name: /Viña del Mar/ });
-    const scope = vina.querySelector("[data-theme='vina']");
-    expect(scope).not.toBeNull();
-    expect(scope).toHaveAttribute("data-mode", "dark");
+    for (const [label, family, mode] of [
+      ["Ventisquero Bedrock", "ventisquero", "dark"],
+      ["Ventisquero Mist", "ventisquero", "light"],
+      ["Viña del Mar Night", "vina", "dark"],
+      ["Viña del Mar Dawn", "vina", "light"],
+    ]) {
+      const card = await screen.findByRole("button", { name: label });
+      expect(card.querySelector(`[data-theme='${family}']`)).toHaveAttribute("data-mode", mode);
+    }
+  });
+
+  it("uses the material control without resetting a form draft", async () => {
+    renderSettings();
+    const input = await screen.findByLabelText("capability to grant");
+    fireEvent.change(input, { target: { value: "echo" } });
+    const material = screen.getByRole("checkbox", { name: "Reduce transparency" });
+    expect(material).not.toBeChecked();
+    fireEvent.click(material);
+    expect(material).toBeChecked();
+    expect(document.documentElement.dataset.material).toBe("opaque");
+    expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
+    fireEvent.click(screen.getByRole("button", { name: "Viña del Mar Dawn" }));
+    expect(document.documentElement.dataset.material).toBe("opaque");
+    expect(input).toHaveValue("echo");
+    fireEvent.click(material);
+    expect(document.documentElement.dataset.material).toBe("glass");
   });
 });
 

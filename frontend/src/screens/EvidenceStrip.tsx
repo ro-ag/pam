@@ -67,9 +67,7 @@ function EvidenceViewer({ content }: { content: EvidenceContent }) {
     <div className="space-y-2">
       {content.kind === KIND_COMPACT && <CompactStatsLine meta={content.meta} />}
       {content.kind === KIND_SUMMARY ? (
-        <p className="font-voice text-base whitespace-pre-line text-ink italic">
-          {content.text}
-        </p>
+        <p className="font-sans text-sm whitespace-pre-line text-ink">{content.text}</p>
       ) : (
         <pre className="max-h-96 overflow-auto rounded-card border border-line bg-chrome p-3 font-data text-xs leading-relaxed text-ink-muted">
           {content.text}

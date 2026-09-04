@@ -23,8 +23,7 @@ import { useDaemonStatus } from "./useDaemonStatus";
  * on the exact element under the pointer) is a drag region, so the window
  * still moves when the user grabs the empty space beside the controls; the
  * theme and mode buttons never carry the attribute and stay clickable.
- * The copper hairline underneath is the one theme-independent token, kept
- * from v1 as the brand signature.
+ * The material hairline and small theme marker use Costa’s shared gradients.
  */
 export function PanelToolbar() {
   const daemon = useDaemonStatus();
@@ -40,13 +39,13 @@ export function PanelToolbar() {
       role="toolbar"
       aria-label="panel controls"
       data-tauri-drag-region=""
-      className="flex h-12 shrink-0 items-center justify-end gap-2 border-b border-separator px-3"
+      className="material-edge flex h-11 shrink-0 items-center justify-end gap-2 px-3"
     >
       <span data-tauri-drag-region="" className="flex items-center pr-1">
         <Beacon state={daemon} />
       </span>
       <Button variant="ghost" size="sm" onClick={cycleTheme}>
-        <span aria-hidden="true">◐</span>
+        <span aria-hidden="true" className="warm-marker size-2 rounded-pill" />
         {themeDefinition(theme).label}
       </Button>
       <Button

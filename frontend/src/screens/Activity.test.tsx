@@ -305,10 +305,10 @@ describe("lanes", () => {
     await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
 
     const landed = await landLiveRow("t2");
-    // Mounted at the enter frame: transparent, 8px above its resting place.
+    // Mounted at the enter frame: transparent, 4px above its resting place.
     expect(landed?.style.opacity).toBe("0");
-    expect(landed?.style.transform).toContain("-8");
-    expect(rowEnter(false)).toEqual({ opacity: 0, y: -8 });
+    expect(landed?.style.transform).toContain("-4");
+    expect(rowEnter(false)).toEqual({ opacity: 0, y: -4 });
   });
 
   it("lands the same live row still, under reduced motion", async () => {

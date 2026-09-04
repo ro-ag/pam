@@ -197,6 +197,56 @@ beforeEach(() => {
   );
 });
 
+describe("maximized canvas", () => {
+  it("moves the same graph into a full-window view and restores it on Escape without resetting selection or positions", async () => {
+    const { container, props } = renderCanvas({ selection: { kind: "step", id: "b" } });
+    container.id = "root";
+    await settle();
+    const selected = node("b");
+    const positions = captured.props?.nodes.map(({ id, position }) => ({ id, position }));
+    const layoutCalls = mocks.autoLayout.mock.calls.length;
+    const dock = container.querySelector<HTMLElement>(".canvas-dock")!;
+    vi.spyOn(dock, "getBoundingClientRect").mockImplementation(
+      () =>
+        ({
+          height:
+            dock.querySelector(".canvas-workspace-maximized") || !dock.firstChild ? 564 : 640,
+        }) as DOMRect,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Maximize canvas" }));
+    expect(dock.style.minHeight).toBe("640px");
+    const dialog = screen.getByRole("dialog", { name: "Flow canvas" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(container.inert).toBe(true);
+    expect(container).not.toContainElement(selected);
+    expect(within(dialog).getByLabelText("step b")).toBe(selected);
+    expect(screen.getByRole("button", { name: "Restore canvas" })).toHaveFocus();
+    expect(captured.props?.nodes.map(({ id, position }) => ({ id, position }))).toEqual(
+      positions,
+    );
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(container.inert).toBe(false);
+    expect(container).toContainElement(selected);
+    expect(dock.style.minHeight).toBe("");
+    expect(screen.getByRole("button", { name: "Maximize canvas" })).toHaveFocus();
+    expect(mocks.autoLayout.mock.calls).toHaveLength(layoutCalls);
+    expect(props.onChange).not.toHaveBeenCalled();
+    expect(props.onSelect).not.toHaveBeenCalled();
+  });
+
+  it("restores background interaction when an expanded canvas unmounts", async () => {
+    const { container, unmount } = renderCanvas();
+    container.id = "root";
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Maximize canvas" }));
+    expect(container.inert).toBe(true);
+    unmount();
+    expect(container.inert).toBe(false);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
 describe("FlowCanvas nodes", () => {
   it("renders one node per step with its order chip and kind glyph", async () => {
     renderCanvas();
@@ -228,7 +278,7 @@ describe("FlowCanvas nodes", () => {
     expect(within(b).getByLabelText("summarize").className).toContain("text-accent");
     const c = node("c");
     expect(within(c).getByLabelText("approval").className).toContain("text-warning");
-    expect(within(c).getByLabelText("stateful").className).toContain("text-copper");
+    expect(within(c).getByLabelText("stateful").className).toContain("warm-label");
     expect(within(c).getByLabelText("discard").className).toContain("text-ink-faint");
     for (const label of ["approval", "stateful", "discard"]) {
       expect(within(c).getByLabelText(label)).toHaveAttribute("role", "img");
@@ -410,7 +460,7 @@ describe("FlowCanvas notes", () => {
     await settle();
     const note = screen.getByLabelText("note a");
     expect(note).toHaveTextContent("watch the exit code");
-    expect(note.className).toContain("font-voice");
+    expect(note.className).toContain("font-sans");
     expect(screen.queryByLabelText("note b")).toBeNull();
     const anchor = note.querySelector(".react-flow__handle");
     expect(anchor?.className).toContain("opacity-0");
@@ -480,8 +530,7 @@ describe("FlowCanvas toolbar", () => {
     const host = container.querySelector(".flow-canvas");
     expect(host).not.toBeNull();
     for (const cls of [
-      "h-130",
-      "min-h-130",
+      "canvas-viewport",
       "w-full",
       "overflow-hidden",
       "rounded-card",

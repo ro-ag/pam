@@ -18,6 +18,14 @@ describe("desktop workspace materials", () => {
     expect(styles.slice(material)).toMatch(/\.desktop-panel\s*\{\s*background: color-mix/);
   });
 
+  it("stretches the wave mask to both window dimensions without tiling", () => {
+    for (const property of ["mask", "-webkit-mask"]) {
+      expect(styles).toContain(
+        `${property}: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat`,
+      );
+    }
+  });
+
   it("removes textures for opaque, reduced transparency and forced colors", () => {
     const opaque = styles.slice(styles.indexOf('[data-material="opaque"]'));
     expect(opaque).toMatch(/\.desktop-shell::before\s*\{\s*display: none/);

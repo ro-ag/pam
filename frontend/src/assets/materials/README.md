@@ -4,10 +4,12 @@
   treatment (1422 × 800, 28 paths, `ccchaos-grad`). It replaces the previous
   contour texture. No external references, scripts or embedded HTML are present.
 - `chaos-soft.webp`: rendered with librsvg at 1422 × 800; its alpha channel is
-  Gaussian-blurred with sigma 10, normalized and encoded at quality 80.
-  PAM uses **only the alpha** as one theme-tinted backdrop mask. This keeps
-  the supplied form but softens its small lines and dashes, without runtime
-  SVG filters or blur on large windows.
+  extracted and its empty margins trimmed, then Gaussian-blurred with sigma 5
+  (half the original 10), normalized and encoded at quality 80. PAM uses
+  **only the alpha** as one theme-tinted backdrop mask, stretched independently
+  to 100% of the window width and height rather than preserving the original
+  aspect ratio. This fills the window with the visible pattern instead of its
+  empty margins, without runtime SVG filters or blur.
 
 Source reference: <https://www.fffuel.co/ccchaos/>. The user supplied and
 authorized this asset for PAM. No independent redistribution license was

@@ -56,3 +56,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 8
 - status: watching
 
+## pam-backdrop-visible-bounds
+- kind: project-way
+- scope: project
+- rule: When stretching the PAM wave backdrop across the window, trim transparent margins in the derived mask and size it to 100% 100%; keep the supplied source unchanged.
+- fix: Extract alpha, trim +repage, blur at sigma 5, normalize and copy alpha; use CSS mask-size 100% 100% instead of cover.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+

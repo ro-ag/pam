@@ -56,7 +56,7 @@
 }
 
 @layer components {
-  /* One heavily blurred wave field behind the frame. No surface grain. */
+  /* One softly blurred wave field stretched across the frame. No surface grain. */
   .desktop-shell {
     isolation: isolate;
   }
@@ -69,8 +69,8 @@
   }
   .desktop-shell::before {
     background: var(--pam-action-gradient);
-    mask: url("./assets/materials/chaos-soft.webp") center / cover no-repeat;
-    -webkit-mask: url("./assets/materials/chaos-soft.webp") center / cover no-repeat;
+    mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
+    -webkit-mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
     opacity: 0.65;
   }
   .desktop-sidebar {

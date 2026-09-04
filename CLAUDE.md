@@ -112,4 +112,5 @@ Standing rules for any agent working in this project (from ~/dev/ai):
 Rules promoted from the memento ledger. Details/fix: `memento show <slug>`.
 - PAM test harnesses must seed the relaxed policy profile explicitly and must not assert unix-only lock/signal details; Profile::platform_default is standard off macOS, Windows byte-range locks hide the holder pid, and Windows has no SIGTERM (memento: pam-tests-never-ran-off-macos)
 - A turso (Limbo) Connection must never run statements from two tasks at once: it fails with Misuse("concurrent use forbidden"), and a swallowed failure on a terminal write leaves rows stuck forever (looked like a PUB/SUB or follow-timeout flake). Serialize every statement behind one async mutex and hold it across explicit BEGIN..COMMIT (memento: turso-connection-concurrent-use)
+- Never use the codex/ prefix for branches in Rodox repositories; use the repository's conventional feat/, fix/, chore/, or docs/ prefix. (memento: no-codex-branch-prefix)
 

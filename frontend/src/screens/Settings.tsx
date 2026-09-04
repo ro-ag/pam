@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
-import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { LayoutGroup, motion } from "motion/react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -38,6 +39,7 @@ import {
   applyMaterial,
   applyBackgroundMotion,
   applyBackgroundSpeed,
+  applyBackgroundIntensity,
   modeIds,
   subscribeTheme,
   themes,
@@ -70,10 +72,8 @@ import { SettingsModelsSection } from "./SettingsModels";
  * until someone misses it; two honest buttons beat three subtle states.
  */
 function AppearancePanel() {
-  const { theme, mode, material, backgroundMotion, backgroundSpeed } = useSyncExternalStore(
-    subscribeTheme,
-    themeSnapshot,
-  );
+  const { theme, mode, material, backgroundMotion, backgroundSpeed, backgroundIntensity } =
+    useSyncExternalStore(subscribeTheme, themeSnapshot);
 
   return (
     <Panel ground="raised" className="appearance-panel space-y-4 p-4">
@@ -217,12 +217,43 @@ function AppearancePanel() {
             <span className="font-data text-xs text-ink-faint">Faster</span>
           </div>
         </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <label htmlFor="background-intensity" className="mr-auto font-sans text-sm text-ink">
+            Movement intensity
+          </label>
+          <output
+            htmlFor="background-intensity"
+            className="font-data text-xs tabular-nums text-ink-muted"
+          >
+            {backgroundIntensity}%
+          </output>
+          <div className="flex basis-full items-center gap-3">
+            <span className="font-data text-xs text-ink-faint">Still</span>
+            <input
+              id="background-intensity"
+              type="range"
+              min="0"
+              max="100"
+              step="1"
+              value={backgroundIntensity}
+              disabled={backgroundMotion === "off"}
+              aria-valuetext={`${backgroundIntensity} percent movement`}
+              aria-describedby="background-intensity-help"
+              onChange={(event) => applyBackgroundIntensity(Number(event.target.value))}
+              className="h-6 min-w-0 flex-1 cursor-pointer accent-accent-strong disabled:cursor-not-allowed disabled:opacity-40"
+            />
+            <span className="font-data text-xs text-ink-faint">Immersive</span>
+          </div>
+        </div>
+        <p id="background-intensity-help" className="font-sans text-sm text-ink-muted">
+          Controls how far the texture travels, zooms and turns—not how fast.
+        </p>
         <p id="background-motion-help" className="font-sans text-sm text-ink-muted">
           {material === "opaque"
             ? "Hidden while transparency is reduced. Your speed is remembered."
             : backgroundMotion === "off"
               ? "The background stays still."
-              : "Gentle zoom and rotation. Drag toward Faster to preview the movement."}{" "}
+              : "Drift inward, turn, then take a different path home. Drag toward Faster to preview."}{" "}
           Respects system motion and transparency preferences.
         </p>
       </div>
@@ -1059,6 +1090,7 @@ function SettingsPane({
 }
 
 export function SettingsScreen() {
+  const motionGroup = useId();
   const hash = useRouterState({ select: (state) => state.location.hash });
   const navigate = useNavigate();
   const tabs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -1097,43 +1129,59 @@ export function SettingsScreen() {
           LOCAL PREFERENCES
         </span>
       </header>
-      <div role="tablist" aria-label="Settings categories" className="settings-tabs">
-        {SETTINGS_CATEGORIES.map((category, index) => (
-          <button
-            key={category.id}
-            ref={(element) => {
-              tabs.current[index] = element;
-            }}
-            type="button"
-            role="tab"
-            id={`settings-tab-${category.id}`}
-            aria-selected={selected === category.id}
-            aria-controls={category.id}
-            tabIndex={selected === category.id ? 0 : -1}
-            onClick={() => select(category.id)}
-            onKeyDown={(event) => {
-              const last = SETTINGS_CATEGORIES.length - 1;
-              const next =
-                event.key === "ArrowRight"
-                  ? (index + 1) % (last + 1)
-                  : event.key === "ArrowLeft"
-                    ? (index + last) % (last + 1)
-                    : event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? last
-                        : null;
-              if (next === null) return;
-              event.preventDefault();
-              tabs.current[next]?.focus();
-              select(SETTINGS_CATEGORIES[next].id);
-            }}
-            className="settings-tab"
-          >
-            {category.label}
-          </button>
-        ))}
-      </div>
+      <LayoutGroup id={motionGroup}>
+        <motion.div
+          layoutScroll
+          role="tablist"
+          aria-label="Settings categories"
+          className="settings-tabs"
+        >
+          {SETTINGS_CATEGORIES.map((category, index) => (
+            <button
+              key={category.id}
+              ref={(element) => {
+                tabs.current[index] = element;
+              }}
+              type="button"
+              role="tab"
+              id={`settings-tab-${category.id}`}
+              aria-selected={selected === category.id}
+              aria-controls={category.id}
+              tabIndex={selected === category.id ? 0 : -1}
+              onClick={() => select(category.id)}
+              onKeyDown={(event) => {
+                const last = SETTINGS_CATEGORIES.length - 1;
+                const next =
+                  event.key === "ArrowRight"
+                    ? (index + 1) % (last + 1)
+                    : event.key === "ArrowLeft"
+                      ? (index + last) % (last + 1)
+                      : event.key === "Home"
+                        ? 0
+                        : event.key === "End"
+                          ? last
+                          : null;
+                if (next === null) return;
+                event.preventDefault();
+                tabs.current[next]?.focus();
+                select(SETTINGS_CATEGORIES[next].id);
+              }}
+              className="settings-tab"
+            >
+              {category.label}
+              {selected === category.id && (
+                <motion.span
+                  aria-hidden="true"
+                  className="settings-tab-indicator"
+                  layoutId="settings-tab-indicator"
+                  initial={false}
+                  transition={{ type: "tween", duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                />
+              )}
+            </button>
+          ))}
+        </motion.div>
+      </LayoutGroup>
       <div className="settings-panes">
         {SETTINGS_CATEGORIES.map((category) => (
           <SettingsPane key={category.id} category={category} active={selected === category.id}>

@@ -11,6 +11,8 @@ import {
   backgroundMotionStorageKey,
   applyBackgroundSpeed,
   backgroundSpeedStorageKey,
+  applyBackgroundIntensity,
+  backgroundIntensityStorageKey,
 } from "../lib/theme";
 import { createAppRouter } from "../router";
 import {
@@ -86,6 +88,7 @@ beforeEach(() => {
   applyMaterial("glass", { persist: false });
   applyBackgroundMotion("slow");
   applyBackgroundSpeed(1);
+  applyBackgroundIntensity(70);
 
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({
@@ -183,6 +186,8 @@ afterEach(() => {
   delete document.documentElement.dataset.mode;
   delete document.documentElement.dataset.backgroundMotion;
   delete document.documentElement.dataset.backgroundSpeed;
+  delete document.documentElement.dataset.backgroundIntensity;
+  document.documentElement.style.removeProperty("--background-intensity");
   document.documentElement.style.removeProperty("--background-drift-duration");
 });
 
@@ -423,6 +428,23 @@ describe("grants", () => {
 });
 
 describe("appearance", () => {
+  it("adjusts movement intensity independently from speed and retains it when off", async () => {
+    renderSettings();
+    const intensity = await screen.findByRole("slider", { name: "Movement intensity" });
+    expect(intensity).toHaveValue("70");
+    fireEvent.change(intensity, { target: { value: "95" } });
+    expect(window.localStorage.getItem(backgroundIntensityStorageKey)).toBe("95");
+    expect(document.documentElement.style.getPropertyValue("--background-intensity")).toBe(
+      "0.95",
+    );
+    expect(screen.getByRole("slider", { name: "Background animation speed" })).toHaveValue("1");
+    const enabled = screen.getByRole("checkbox", { name: "Animate background" });
+    fireEvent.click(enabled);
+    expect(intensity).toBeDisabled();
+    fireEvent.click(enabled);
+    expect(intensity).toBeEnabled();
+    expect(intensity).toHaveValue("95");
+  });
   it("switches background speed and off, retaining the choice through material and tab changes", async () => {
     renderSettings();
     const group = await screen.findByRole("group", { name: "Background motion" });

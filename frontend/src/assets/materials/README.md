@@ -22,8 +22,11 @@ The single wave field is local, static and decorative. The user-supplied
 photograph was an alternative, not a second layer, and is not included.
 There is no grain, linework or texture applied to individual cards.
 No remote image requests, animated turbulence or runtime blur runs. The shell
-animates only this layer's transform: a gentle zoom and two-degree rotation,
-reversing over a four-minute round trip at 1×. The speed fader runs from 0.5×
+animates only this layer's transform: an asymmetric inward zoom, sideways drift,
+and opposite rotation on the return path, closing a four-minute loop at 1×.
+Movement intensity (0–100%, default70%) scales travel, zoom and rotation independently
+of speed; 100% peaks at1.5× zoom and turns from+3° to−4°. Zero keeps it still.
+The speed fader runs from 0.5×
 (eight minutes) to 12× (20 seconds, useful for previewing motion). Turning motion
 off remembers the chosen speed. System reduced motion keeps it still;
 reduced transparency hides the layer.

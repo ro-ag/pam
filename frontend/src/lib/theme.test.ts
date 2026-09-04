@@ -7,6 +7,8 @@ import {
   applyBackgroundSpeed,
   backgroundSpeedStorageKey,
   isBackgroundSpeed,
+  applyBackgroundIntensity,
+  backgroundIntensityStorageKey,
   isBackgroundMotionId,
   materialStorageKey,
   defaultTheme,
@@ -30,6 +32,8 @@ afterEach(() => {
   delete document.documentElement.dataset.material;
   delete document.documentElement.dataset.backgroundMotion;
   delete document.documentElement.dataset.backgroundSpeed;
+  delete document.documentElement.dataset.backgroundIntensity;
+  document.documentElement.style.removeProperty("--background-intensity");
   document.documentElement.style.removeProperty("--background-drift-duration");
   document.documentElement.style.colorScheme = "";
 });
@@ -67,6 +71,7 @@ describe("the shared theme store", () => {
       material: "glass",
       backgroundMotion: "slow",
       backgroundSpeed: 1,
+      backgroundIntensity: 70,
     });
   });
 
@@ -84,6 +89,7 @@ describe("the shared theme store", () => {
       material: "glass",
       backgroundMotion: "slow",
       backgroundSpeed: 1,
+      backgroundIntensity: 70,
     });
     unsubscribe();
     applyTheme("vina", "dark", { persist: false });
@@ -157,6 +163,7 @@ describe("Costa material preference", () => {
       material: "opaque",
       backgroundMotion: "slow",
       backgroundSpeed: 1,
+      backgroundIntensity: 70,
     });
     expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
     delete document.documentElement.dataset.material;
@@ -191,6 +198,38 @@ describe("Costa material preference", () => {
 });
 
 describe("background motion preference", () => {
+  it("defaults intensity to70, persists zero and preserves intensity across other choices", () => {
+    initTheme();
+    expect(themeSnapshot().backgroundIntensity).toBe(70);
+    expect(window.localStorage.getItem(backgroundIntensityStorageKey)).toBeNull();
+    applyBackgroundIntensity(0);
+    initTheme();
+    expect(themeSnapshot().backgroundIntensity).toBe(0);
+    expect(document.documentElement.style.getPropertyValue("--background-intensity")).toBe("0");
+    applyBackgroundIntensity(92);
+    applyBackgroundMotion("off");
+    applyTheme("vina", "dark");
+    applyMaterial("opaque");
+    applyBackgroundSpeed(12);
+    initTheme();
+    expect(themeSnapshot().backgroundIntensity).toBe(92);
+    expect(document.documentElement.style.getPropertyValue("--background-intensity")).toBe(
+      "0.92",
+    );
+  });
+
+  it("rejects invalid intensity and restores safe defaults from invalid storage", () => {
+    initTheme();
+    for (const value of [-1, 101, NaN, Infinity]) {
+      applyBackgroundIntensity(value);
+      expect(themeSnapshot().backgroundIntensity).toBe(70);
+    }
+    for (const stored of ["", "garbage", "101", "-1"]) {
+      window.localStorage.setItem(backgroundIntensityStorageKey, stored);
+      initTheme();
+      expect(themeSnapshot().backgroundIntensity).toBe(70);
+    }
+  });
   it.each([5_000, 15_000])("preserves loop phase when changing speed at %sms", (time) => {
     initTheme();
     const drift = {
@@ -205,10 +244,10 @@ describe("background motion preference", () => {
     });
     try {
       applyBackgroundSpeed(6);
-      expect(drift.currentTime).toBe(time * 2);
+      expect(drift.currentTime).toBe(time * 4);
       expect(
         document.documentElement.style.getPropertyValue("--background-drift-duration"),
-      ).toBe("20s");
+      ).toBe("40s");
     } finally {
       if (original) Object.defineProperty(document, "getAnimations", original);
       else Reflect.deleteProperty(document, "getAnimations");
@@ -228,7 +267,7 @@ describe("background motion preference", () => {
     applyMaterial("opaque");
     expect(themeSnapshot().backgroundSpeed).toBe(6.3);
     expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
-      `${120 / 6.3}s`,
+      `${240 / 6.3}s`,
     );
   });
 
@@ -252,11 +291,11 @@ describe("background motion preference", () => {
     }
     applyBackgroundSpeed(0.5);
     expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
-      "240s",
+      "480s",
     );
     applyBackgroundSpeed(12);
     expect(document.documentElement.style.getPropertyValue("--background-drift-duration")).toBe(
-      "10s",
+      "20s",
     );
     window.localStorage.setItem(backgroundSpeedStorageKey, "garbage");
     initTheme();

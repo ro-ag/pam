@@ -25,6 +25,11 @@ export const backgroundMotionIds = ["off", "slow", "slower"] as const;
 export type BackgroundMotionId = (typeof backgroundMotionIds)[number];
 export const backgroundMotionStorageKey = "pam-background-motion";
 export const backgroundSpeedStorageKey = "pam-background-speed";
+export const backgroundIntensityStorageKey = "pam-background-intensity";
+
+export function isBackgroundIntensity(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
+}
 
 export function isBackgroundSpeed(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 12;
@@ -94,6 +99,7 @@ export interface ThemeState {
   material: MaterialId;
   backgroundMotion: BackgroundMotionId;
   backgroundSpeed: number;
+  backgroundIntensity: number;
 }
 
 let snapshot: ThemeState | null = null;
@@ -123,6 +129,7 @@ export function themeSnapshot(): ThemeState {
       material: isMaterialId(material) ? material : "glass",
       backgroundMotion: readBackgroundMotion(),
       backgroundSpeed: readBackgroundSpeed(),
+      backgroundIntensity: readBackgroundIntensity(),
     };
   }
   return snapshot;
@@ -164,6 +171,7 @@ export function applyTheme(
     material: isMaterialId(material) ? material : "glass",
     backgroundMotion: readBackgroundMotion(),
     backgroundSpeed: readBackgroundSpeed(),
+    backgroundIntensity: readBackgroundIntensity(),
   };
   for (const listener of listeners) listener();
 }
@@ -186,6 +194,24 @@ function readBackgroundSpeed(): number {
   return isBackgroundSpeed(speed) ? speed : readBackgroundMotion() === "slower" ? 0.5 : 1;
 }
 
+function readBackgroundIntensity(): number {
+  const value = document.documentElement.dataset.backgroundIntensity;
+  return value !== undefined && isBackgroundIntensity(Number(value)) ? Number(value) : 70;
+}
+
+function stampBackgroundIntensity(intensity: number): void {
+  document.documentElement.dataset.backgroundIntensity = String(intensity);
+  document.documentElement.style.setProperty("--background-intensity", String(intensity / 100));
+}
+
+export function applyBackgroundIntensity(intensity: number): void {
+  if (!isBackgroundIntensity(intensity)) return;
+  stampBackgroundIntensity(intensity);
+  persist(backgroundIntensityStorageKey, String(intensity));
+  snapshot = { ...themeSnapshot(), backgroundIntensity: intensity };
+  for (const listener of listeners) listener();
+}
+
 function stampBackgroundSpeed(speed: number): void {
   // Preserve the current phase while dragging, rather than jumping to the
   // position implied by a new CSS duration. No animation exists while off.
@@ -204,8 +230,8 @@ function stampBackgroundSpeed(speed: number): void {
       ? drift.currentTime / duration
       : null;
   document.documentElement.dataset.backgroundSpeed = String(speed);
-  document.documentElement.style.setProperty("--background-drift-duration", `${120 / speed}s`);
-  if (drift && phase !== null) drift.currentTime = phase * (120_000 / speed);
+  document.documentElement.style.setProperty("--background-drift-duration", `${240 / speed}s`);
+  if (drift && phase !== null) drift.currentTime = phase * (240_000 / speed);
 }
 
 /** Multiples of the original four-minute cycle; keep the chosen speed while off. */
@@ -264,6 +290,12 @@ export function initTheme(): { theme: ThemeId; mode: ModeId } {
   stampBackgroundSpeed(
     isBackgroundSpeed(savedSpeed) ? savedSpeed : readBackgroundMotion() === "slower" ? 0.5 : 1,
   );
+  const savedIntensity = stored(
+    backgroundIntensityStorageKey,
+    (value): value is string =>
+      typeof value === "string" && value.trim() !== "" && isBackgroundIntensity(Number(value)),
+  );
+  stampBackgroundIntensity(savedIntensity === null ? 70 : Number(savedIntensity));
   applyTheme(theme, mode, { persist: false });
   return { theme, mode };
 }

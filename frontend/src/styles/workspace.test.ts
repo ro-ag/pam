@@ -28,10 +28,10 @@ describe("desktop workspace materials", () => {
 
   it("offers reversible slow drift, an off switch and reduced-motion protection", () => {
     expect(styles).toContain(
-      "animation: background-drift var(--background-drift-duration, 120s)",
+      "animation: background-drift var(--background-drift-duration, 240s)",
     );
     expect(styles).toContain("ease-in-out infinite");
-    expect(styles).toContain("alternate;");
+    expect(styles).not.toContain("alternate;");
     expect(styles).toMatch(
       /\[data-background-motion="off"\] .desktop-shell::before\s*\{\s*animation: none/,
     );
@@ -39,9 +39,11 @@ describe("desktop workspace materials", () => {
       styles.indexOf("@keyframes background-drift"),
       styles.indexOf(".desktop-sidebar"),
     );
-    expect(keyframes).toContain("transform: scale(1) rotate(0deg)");
-    expect(keyframes).toContain("transform: scale(1.2) rotate(2deg)");
-    expect(keyframes.match(/\b[\w-]+:/g)).toEqual(["transform:", "transform:"]);
+    expect(keyframes).toContain("translate(0, 0) scale(1) rotate(0deg)");
+    expect(keyframes).toContain("rotate(calc(3deg * var(--background-intensity, 0.7)))");
+    expect(keyframes).toContain("rotate(calc(-4deg * var(--background-intensity, 0.7)))");
+    expect(keyframes).toContain("scale(calc(1 + 0.5 * var(--background-intensity, 0.7)))");
+    expect(keyframes.match(/\b[\w-]+:/g)).toEqual(Array(4).fill("transform:"));
     const reduced = styles.slice(styles.indexOf("@media (prefers-reduced-motion: reduce)"));
     expect(reduced).toContain("*::before");
     expect(reduced).toContain("animation: none !important");
@@ -62,6 +64,14 @@ describe("desktop workspace materials", () => {
 });
 
 describe("Settings layout contract", () => {
+  it("animates only active pane contents, preserving the static pane container", () => {
+    expect(styles).toContain(".settings-pane:not([hidden]) > section");
+    expect(styles).toContain("animation: settings-pane-enter 180ms");
+    expect(styles).toContain("transform: translateY(4px)");
+    const reduced = styles.slice(styles.indexOf("@media (prefers-reduced-motion: reduce)"));
+    expect(reduced).toMatch(/\.settings-tab-indicator\s*\{\s*display: none/);
+    expect(reduced).toContain("box-shadow: inset 0 -2px 0 var(--pam-accent)");
+  });
   it("scrolls the active pane while keeping the workspace and tabs fixed", () => {
     expect(styles).toMatch(/\.workspace-scroll\[data-settings\]\s*\{\s*overflow: hidden/);
     expect(styles).toMatch(/\.settings-pane\s*\{[^}]*overflow: auto/);

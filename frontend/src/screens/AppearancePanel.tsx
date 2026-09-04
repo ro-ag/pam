@@ -30,57 +30,59 @@ export function AppearancePanel() {
   const motionOff = backgroundMotion === "off";
   return (
     <div className="appearance-panel">
-      <div className="appearance-palette-heading">
-        <span>COLOR PALETTE</span>
-        <span>Applies instantly · remembered</span>
-      </div>
-      <div className="appearance-grid grid gap-3">
-        {themes.flatMap((family) =>
-          modeIds.map((appearance) => {
-            const active = family.id === theme && appearance === mode;
-            return (
-              <button
-                key={`${family.id}-${appearance}`}
-                type="button"
-                aria-label={`${family.label} ${family.appearances[appearance]}`}
-                aria-pressed={active}
-                onClick={() => applyTheme(family.id, appearance)}
-                className={cn("appearance-palette", active && "appearance-palette-selected")}
-              >
-                <span
-                  data-theme={family.id}
-                  data-mode={appearance}
-                  className="theme-preview appearance-palette-preview"
+      <div className="appearance-palette-section">
+        <div className="appearance-palette-heading">
+          <span>COLOR PALETTE</span>
+          <span>Applies instantly · remembered</span>
+        </div>
+        <div className="appearance-grid grid gap-3">
+          {themes.flatMap((family) =>
+            modeIds.map((appearance) => {
+              const active = family.id === theme && appearance === mode;
+              return (
+                <button
+                  key={`${family.id}-${appearance}`}
+                  type="button"
+                  aria-label={`${family.label} ${family.appearances[appearance]}`}
+                  aria-pressed={active}
+                  onClick={() => applyTheme(family.id, appearance)}
+                  className={cn("appearance-palette", active && "appearance-palette-selected")}
                 >
-                  <span className="appearance-palette-name">
-                    <span>{family.appearances[appearance]}</span>
-                    {active && <Check aria-hidden="true" className="size-3.5" />}
-                  </span>
-                  <span className="appearance-mini-window" aria-hidden="true">
-                    <span className="appearance-mini-rail" />
-                    <span className="appearance-mini-content">
+                  <span
+                    data-theme={family.id}
+                    data-mode={appearance}
+                    className="theme-preview appearance-palette-preview"
+                  >
+                    <span className="appearance-palette-name">
+                      <span>{family.appearances[appearance]}</span>
+                      {active && <Check aria-hidden="true" className="size-3.5" />}
+                    </span>
+                    <span className="appearance-mini-window" aria-hidden="true">
+                      <span className="appearance-mini-rail" />
+                      <span className="appearance-mini-content">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                      <span className="appearance-mini-accent" />
+                    </span>
+                    <span className="theme-swatches" aria-hidden="true">
+                      <span />
+                      <span />
                       <span />
                       <span />
                       <span />
                     </span>
-                    <span className="appearance-mini-accent" />
                   </span>
-                  <span className="theme-swatches" aria-hidden="true">
-                    <span />
-                    <span />
-                    <span />
-                    <span />
-                    <span />
+                  <span className="appearance-palette-caption">
+                    <span>{family.label}</span>
+                    <span>{appearance}</span>
                   </span>
-                </span>
-                <span className="appearance-palette-caption">
-                  <span>{family.label}</span>
-                  <span>{appearance}</span>
-                </span>
-              </button>
-            );
-          }),
-        )}
+                </button>
+              );
+            }),
+          )}
+        </div>
       </div>
       <div className="appearance-control-grid">
         <Panel ground="raised" className="appearance-control-card">

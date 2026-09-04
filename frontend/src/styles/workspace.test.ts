@@ -64,8 +64,14 @@ describe("desktop workspace materials", () => {
 });
 
 describe("Settings layout contract", () => {
-  it("bounds controls rather than stretching faders across large monitors", () => {
-    expect(styles).toMatch(/\.appearance-panel\s*\{[^}]*max-width: 1240px/);
+  it("uses three columns on wide screens while bounding individual controls", () => {
+    expect(styles).not.toMatch(/\.appearance-panel\s*\{[^}]*max-width:/);
+    expect(styles).toContain("@container (min-width: 1280px)");
+    expect(styles).toContain(
+      "grid-template-columns: minmax(300px, 0.95fr) minmax(330px, 1fr) minmax(360px, 1.1fr)",
+    );
+    expect(styles).toMatch(/\.appearance-control-grid\s*\{\s*display: contents/);
+    expect(styles).toMatch(/\.appearance-control-card > \*\s*\{[^}]*max-width: 640px/);
     expect(styles).toMatch(
       /\.appearance-control-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
     );

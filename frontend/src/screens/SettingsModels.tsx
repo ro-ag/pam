@@ -113,7 +113,7 @@ function TierDefaultsPanel() {
       : null;
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="font-data text-xs text-ink-faint">tier defaults</p>
         <Badge tone="accent">GUI-only</Badge>
@@ -158,7 +158,7 @@ function AskPamPanel() {
   const [rephrase, setRephrase] = useRephrasePref();
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="font-data text-xs text-ink-faint">ask pam</p>
         <Badge tone="accent">GUI-only</Badge>
@@ -222,7 +222,7 @@ function CuratorPanel() {
   const listFailure = curator.isError ? toBridgeFailure(curator.error) : null;
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">curator agent</p>
       <p className="font-sans text-sm text-ink-muted">
         A vendor CLI you already pay for, asked one question at a time. PAM holds no API keys —
@@ -355,7 +355,7 @@ function StoragePanel() {
     "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">storage &amp; residency</p>
 
       <form
@@ -366,7 +366,7 @@ function StoragePanel() {
           if (next) apply.mutate({ models_dir: next });
         }}
       >
-        <label className="min-w-64 flex-1 space-y-1">
+        <label className="min-w-0 flex-1 space-y-1">
           <span className="block font-data text-xs text-ink-faint">models directory</span>
           <input
             aria-label="models directory"
@@ -421,7 +421,7 @@ function StoragePanel() {
 /** The Models block Settings mounts between Security and Daemon. */
 export function SettingsModelsSection() {
   return (
-    <div className="space-y-4">
+    <div className="settings-grid settings-models">
       <TierDefaultsPanel />
       <AskPamPanel />
       <CuratorPanel />

@@ -51,6 +51,16 @@ pam gui                 # open the desktop control center
 Grants, approvals, and profiles are managed in the GUI (Settings › Security),
 not on the command line.
 
+## Desktop workspace
+
+- Use Cmd/Ctrl+K to jump to pages, Settings categories, models or flows.
+  Navigation never runs a flow automatically.
+- Choose Monitor, Build or Focus from Workspace, or save a layout and route
+  for later. Expand a flow canvas and press Escape to restore the workspace.
+- Settings uses eight tabs with retained drafts and wide-screen layouts.
+  Appearance offers four Costa palettes, surface opacity, and background
+  motion speed and intensity. System accessibility preferences take priority.
+
 ## Start at login
 
 ```sh
@@ -86,7 +96,7 @@ npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb
 2. Move the changelog's `## [Unreleased]` entries under
    `## [X.Y.Z] - YYYY-MM-DD`.
 3. Merge, and wait for the `main` CI run to finish green.
-4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
 
 `release.yml` validates, signs, notarizes, and publishes the packages.
 Releases are cut only from CI on a tag push — never locally.

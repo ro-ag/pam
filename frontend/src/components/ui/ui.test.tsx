@@ -3,6 +3,32 @@ import { describe, expect, it } from "vitest";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
 import { Panel } from "./Panel";
+import { PageHeader } from "./PageHeader";
+
+describe("PageHeader", () => {
+  it("inherits the page material without a sticky opaque title strip", () => {
+    render(
+      <PageHeader data-testid="heading">
+        <h1>Models</h1>
+      </PageHeader>,
+    );
+    const header = screen.getByTestId("heading");
+    expect(header.tagName).toBe("HEADER");
+    expect(header.className).toContain("border-line");
+    expect(header.className).not.toMatch(/bg-|sticky|fixed|backdrop|shadow/);
+    expect(screen.getByRole("heading", { name: "Models", level: 1 })).toBeTruthy();
+  });
+
+  it("retains room for Activity filters through the spacing override", () => {
+    render(
+      <PageHeader data-testid="heading" className="space-y-3">
+        Activity
+      </PageHeader>,
+    );
+    expect(screen.getByTestId("heading").className).toContain("space-y-3");
+    expect(screen.getByTestId("heading").className).not.toContain("space-y-1");
+  });
+});
 
 describe("Panel", () => {
   it("defaults to a flat working surface", () => {
@@ -33,6 +59,20 @@ describe("Panel", () => {
       </Panel>,
     );
     expect(screen.getByTestId("panel").className).toContain("p-10");
+  });
+
+  it("offers Tailwind translucency with solid accessibility overrides and no effects", () => {
+    render(
+      <Panel ground="translucent" data-testid="panel">
+        card
+      </Panel>,
+    );
+    const classes = screen.getByTestId("panel").className;
+    expect(classes).toContain("bg-surface-translucent");
+    expect(classes).toContain("material-opaque:bg-surface-raised");
+    expect(classes).toContain("transparency-reduce:bg-surface-raised");
+    expect(classes).toContain("forced-colors:bg-system-canvas");
+    expect(classes).not.toMatch(/blur|shadow|filter/);
   });
 });
 

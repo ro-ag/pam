@@ -16,6 +16,9 @@
  *    so switching `data-theme` restyles the whole app with zero re-render.
  */
 
+@custom-variant material-opaque (&:where([data-material="opaque"] *));
+@custom-variant transparency-reduce (@media (prefers-reduced-transparency: reduce));
+
 @theme inline {
   /* ---------------------------------------------------------------- *
    * Color — wipe the stock palette, then the PAM roles.
@@ -27,6 +30,12 @@
   --color-sidebar: var(--pam-sidebar);
   --color-surface: var(--pam-surface);
   --color-surface-raised: var(--pam-surface-raised);
+  --color-surface-translucent: color-mix(
+    in srgb,
+    var(--pam-surface-raised) var(--glass-opacity, 84%),
+    transparent
+  );
+  --color-system-canvas: Canvas;
 
   /* ink (text) */
   --color-ink: var(--pam-ink);

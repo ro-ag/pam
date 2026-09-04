@@ -47,3 +47,48 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-textures-are-alternatives
+- kind: project-way
+- scope: project
+- rule: Treat PAM texture references as alternatives, not stacked surface decoration; a wave backdrop must be heavily blurred until individual lines are unreadable.
+- fix: Use one preblurred alpha wave field only behind the frame; remove photograph and command-surface texture overlays. Keep controls and cards clean.
+- hits: 2026-09-04
+- cost: 8
+- status: watching
+
+## pam-backdrop-visible-bounds
+- kind: project-way
+- scope: project
+- rule: When stretching the PAM wave backdrop across the window, trim transparent margins in the derived mask and size it to 100% 100%; keep the supplied source unchanged.
+- fix: Extract alpha, trim +repage, blur at sigma 5, normalize and copy alpha; use CSS mask-size 100% 100% instead of cover.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+
+## pam-bounded-desktop-controls
+- kind: project-way
+- scope: project
+- rule: PAM appearance controls must stay in bounded, grouped panels on large monitors instead of stretching sliders across the full workspace.
+- fix: Cap Appearance at1240px, use two responsive control cards with custom native range tracks/readouts and compact switches; stack below760px.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+
+## pam-liquid-glass-safari
+- kind: habit
+- scope: project
+- rule: Do not equate a liquid-glass library's Playwright WebKit support claim or mocked wiring tests with actual Safari/WKWebView rendering compatibility.
+- fix: Use a matched-settings minimal reproduction in real Safari before claiming optical portability. Keep the user's confirmed Chrome-versus-Safari screenshots as failure evidence; distinguish integration failure from universal library incompatibility.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+
+## pam-preserve-transparency-without-glass-library
+- kind: habit
+- scope: project
+- rule: Removing a rejected optical-effect library must not silently discard independently desired translucent surfaces.
+- fix: Separate plain CSS surface opacity from refraction and glow. Inventory visual behaviors before removal and preserve user-approved transparency without the dependency.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+

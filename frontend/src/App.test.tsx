@@ -66,7 +66,7 @@ describe("shell routing", () => {
     }
   });
 
-  it("hosts the real Settings sections (the style proof is retired)", async () => {
+  it("hosts the Settings categories with only Appearance initially visible", async () => {
     renderShell("/settings");
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     for (const section of [
@@ -79,8 +79,10 @@ describe("shell routing", () => {
       "Retention",
       "Logs",
     ]) {
-      expect(screen.getByRole("heading", { name: section })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: section })).toBeInTheDocument();
     }
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
     // The design system's living proof moved out with task #30.
     expect(screen.queryByText(/tokens avoided this week/)).not.toBeInTheDocument();
   });

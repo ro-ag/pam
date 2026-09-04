@@ -6,6 +6,7 @@ import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { PageHeader } from "../components/ui/PageHeader";
 import { Section } from "../components/ui/Section";
 import { formatBytes, percentOf } from "../lib/bytes";
 import {
@@ -766,10 +767,10 @@ export function ModelsScreen() {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-10">
-      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+      <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Models</h1>
         <p className="text-sm text-ink-muted">Local models, runtime and downloads.</p>
-      </header>
+      </PageHeader>
 
       <div className="space-y-6 pt-6">
         <Section

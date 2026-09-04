@@ -1,10 +1,10 @@
 import { createMemoryHistory } from "@tanstack/react-router";
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { createAppRouter } from "../../router";
 import { Beacon } from "./Beacon";
-import { PanelToolbar } from "./PanelToolbar";
+import { initWorkspace } from "../../lib/workspace";
 
 /** Mount the whole shell on a fresh, isolated memory history. */
 function renderShell(path = "/") {
@@ -17,6 +17,33 @@ function renderShell(path = "/") {
  * `hasTrafficLights()` from the outside.
  */
 const realUserAgent = navigator.userAgent;
+const realShowModal = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
+const realClose = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "close");
+beforeAll(() => {
+  Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+    configurable: true,
+    value(this: HTMLDialogElement) {
+      this.open = true;
+    },
+  });
+  Object.defineProperty(HTMLDialogElement.prototype, "close", {
+    configurable: true,
+    value(this: HTMLDialogElement) {
+      this.open = false;
+    },
+  });
+});
+afterAll(() => {
+  if (realShowModal)
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", realShowModal);
+  else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+  if (realClose) Object.defineProperty(HTMLDialogElement.prototype, "close", realClose);
+  else Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
+});
+beforeEach(() => {
+  window.localStorage.clear();
+  initWorkspace();
+});
 
 function stubTrafficLights(present: boolean) {
   Object.defineProperty(window.navigator, "userAgent", {
@@ -60,13 +87,13 @@ describe("Beacon", () => {
 });
 
 describe("PanelToolbar", () => {
-  it("is a labelled toolbar whose row drags the window but whose controls do not", () => {
-    render(<PanelToolbar />);
-    const toolbar = screen.getByRole("toolbar", { name: "panel controls" });
+  it("is a labelled toolbar whose row drags the window but whose controls do not", async () => {
+    renderShell();
+    const toolbar = await screen.findByRole("toolbar", { name: "panel controls" });
     expect(toolbar).toHaveAttribute("data-tauri-drag-region");
     expect(within(toolbar).getByRole("status")).toBeInTheDocument();
     const controls = within(toolbar).getAllByRole("button");
-    expect(controls).toHaveLength(2);
+    expect(controls).toHaveLength(4);
     for (const control of controls) {
       expect(control).not.toHaveAttribute("data-tauri-drag-region");
     }
@@ -74,6 +101,31 @@ describe("PanelToolbar", () => {
 });
 
 describe("shell layout", () => {
+  it("wires palette navigation and restores a saved screen with its workspace layout", async () => {
+    renderShell("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const search = screen.getByRole("combobox", {
+      name: "Search pages, settings, flows, and models",
+    });
+    fireEvent.change(search, { target: { value: "retention" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    await screen.findByRole("tabpanel", { name: "Retention" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "Compact" }));
+    fireEvent.click(screen.getByRole("button", { name: "Focused" }));
+    fireEvent.change(screen.getByLabelText("Layout name"), { target: { value: "My desk" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Monitor" }));
+    await screen.findByRole("heading", { name: "Activity" });
+    fireEvent.click(screen.getByRole("button", { name: "Workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "My desk" }));
+    await screen.findByRole("tabpanel", { name: "Retention" });
+    expect(document.documentElement.dataset.workspaceSidebar).toBe("compact");
+    expect(document.documentElement.dataset.workspaceWidth).toBe("focused");
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("title", "Settings");
+  });
   it("starts a new screen at the top of its workspace", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
@@ -115,7 +167,7 @@ describe("shell layout", () => {
       within(toolbar).getByRole("status", { name: "daemon unreachable" }),
     ).toBeInTheDocument();
     const controls = within(toolbar).getAllByRole("button");
-    expect(controls).toHaveLength(2);
+    expect(controls).toHaveLength(4);
     for (const control of controls) {
       expect(control).not.toHaveAttribute("data-tauri-drag-region");
     }

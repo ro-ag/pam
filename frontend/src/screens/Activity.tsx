@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { cn, cva } from "../lib/cn";
+import { PageHeader } from "../components/ui/PageHeader";
 import {
   activityList,
   callersList,
@@ -531,7 +532,7 @@ export function ActivityScreen() {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 border-b border-line bg-surface py-5">
+      <PageHeader className="space-y-3">
         <p className="font-data text-xs text-ink-faint">Live requests</p>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="mr-auto font-display text-title font-semibold text-ink">Activity</h1>
@@ -545,7 +546,7 @@ export function ActivityScreen() {
           onAgent={(agent) => setFilters({ agent })}
           onRepo={(repo) => setFilters({ repo })}
         />
-      </header>
+      </PageHeader>
 
       <EvidenceBand onCompressed={() => setPendingExpand(true)} />
 

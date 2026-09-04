@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn, cva } from "../lib/cn";
+import { PageHeader } from "../components/ui/PageHeader";
 import {
   flowsGet,
   flowsList,
@@ -463,10 +464,10 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+      <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
         <p className="text-sm text-ink-muted">Reusable workflows and execution history.</p>
-      </header>
+      </PageHeader>
 
       {failure && (
         <div className="max-w-xl pt-4">

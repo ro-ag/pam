@@ -100,7 +100,7 @@ beforeEach(() => {
 });
 
 async function renderModelsSection() {
-  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/settings"] }));
+  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/settings#models"] }));
   render(<App router={router} />);
   return within(await screen.findByRole("region", { name: "Models" }));
 }
@@ -253,21 +253,13 @@ describe("ask pam", () => {
   });
 });
 
-it("was reached at the right place in Settings: between Security and Daemon", async () => {
-  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/settings"] }));
+it("opens Models as the only visible Settings category", async () => {
+  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/settings#models"] }));
   render(<App router={router} />);
   await screen.findByRole("region", { name: "Models" });
   const headings = screen
     .getAllByRole("heading", { level: 2 })
     .map((heading) => heading.textContent);
-  expect(headings).toEqual([
-    "Appearance",
-    "Security",
-    "Models",
-    "Flows",
-    "Connectors",
-    "Daemon",
-    "Retention",
-    "Logs",
-  ]);
+  expect(headings).toEqual(["Models"]);
+  expect(screen.getByRole("tab", { name: "Models" })).toHaveAttribute("aria-selected", "true");
 });

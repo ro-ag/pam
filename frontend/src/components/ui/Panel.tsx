@@ -9,6 +9,9 @@ export const panelVariants = cva("border", {
       surface: "rounded-panel border-edge bg-surface",
       /** A flat working card: as many as the layout needs. */
       raised: "rounded-card border-edge bg-surface-raised",
+      /** Plain translucency; no blur, glow, refraction or copied backgrounds. */
+      translucent:
+        "rounded-card border-edge bg-surface-translucent material-opaque:bg-surface-raised transparency-reduce:bg-surface-raised forced-colors:bg-system-canvas",
       /** Opaque reflected material for a command or decision surface. */
       command: "command-surface rounded-overlay",
     },

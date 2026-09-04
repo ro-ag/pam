@@ -6,6 +6,36 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-04
+
+### Added
+
+- Navigation command palette with Cmd/Ctrl+K for pages, Settings categories,
+  models and flows. Selecting a flow opens it without executing it.
+- Monitor, Build and Focus workspace presets, compact navigation, and up to
+  eight saved workspace layouts with their current route.
+- Adjustable glass opacity and ambient background motion, with continuous
+  speed and movement-intensity controls. Reduced-motion, reduced-transparency
+  and forced-color preferences take priority.
+- Expanded flow-canvas mode with toolbar and Escape restoration, preserving
+  viewport, selected steps and unsaved edits.
+
+### Changed
+
+- Applied the Costa design across the desktop app: four appearance palettes,
+  native typography, clearer controls and a soft, theme-tinted wave backdrop.
+- Organized Settings into eight keyboard-accessible tabs with retained drafts,
+  tab transitions and denser layouts that use wide desktop windows.
+- Added translucent Appearance cards and removed opaque page-title strips
+  from Models, Activity, Approvals and Flows.
+- Improved Home hierarchy and kept workspace scrolling stable when navigating
+  or expanding the flow canvas.
+
+### Compatibility
+
+- No CLI or protocol changes. Flows remain executable actions available from
+  the CLI; appearance and workspace preferences are local to the desktop app.
+
 ## [0.1.0] - 2026-09-03
 
 First packaged release of pam v2: the spine (daemon, CLI, GUI shell), the

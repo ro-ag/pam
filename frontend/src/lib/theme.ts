@@ -20,6 +20,29 @@ export type ModeId = (typeof modeIds)[number];
 
 export type MaterialId = "glass" | "opaque";
 export const materialStorageKey = "pam-material";
+export const glassOpacityStorageKey = "pam-glass-opacity";
+
+export function isGlassOpacity(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 60 && value <= 100;
+}
+
+export const backgroundMotionIds = ["off", "slow", "slower"] as const;
+export type BackgroundMotionId = (typeof backgroundMotionIds)[number];
+export const backgroundMotionStorageKey = "pam-background-motion";
+export const backgroundSpeedStorageKey = "pam-background-speed";
+export const backgroundIntensityStorageKey = "pam-background-intensity";
+
+export function isBackgroundIntensity(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+export function isBackgroundSpeed(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 12;
+}
+
+export function isBackgroundMotionId(value: unknown): value is BackgroundMotionId {
+  return backgroundMotionIds.includes(value as BackgroundMotionId);
+}
 
 export function isMaterialId(value: unknown): value is MaterialId {
   return value === "glass" || value === "opaque";
@@ -79,6 +102,10 @@ export interface ThemeState {
   theme: ThemeId;
   mode: ModeId;
   material: MaterialId;
+  glassOpacity: number;
+  backgroundMotion: BackgroundMotionId;
+  backgroundSpeed: number;
+  backgroundIntensity: number;
 }
 
 let snapshot: ThemeState | null = null;
@@ -106,6 +133,10 @@ export function themeSnapshot(): ThemeState {
       theme: isThemeId(theme) ? theme : defaultTheme,
       mode: isModeId(mode) ? mode : systemMode(),
       material: isMaterialId(material) ? material : "glass",
+      glassOpacity: readGlassOpacity(),
+      backgroundMotion: readBackgroundMotion(),
+      backgroundSpeed: readBackgroundSpeed(),
+      backgroundIntensity: readBackgroundIntensity(),
     };
   }
   return snapshot;
@@ -141,7 +172,15 @@ export function applyTheme(
   }
   syncNativeWindow(mode);
   const material = document.documentElement.dataset.material;
-  snapshot = { theme, mode, material: isMaterialId(material) ? material : "glass" };
+  snapshot = {
+    theme,
+    mode,
+    material: isMaterialId(material) ? material : "glass",
+    glassOpacity: readGlassOpacity(),
+    backgroundMotion: readBackgroundMotion(),
+    backgroundSpeed: readBackgroundSpeed(),
+    backgroundIntensity: readBackgroundIntensity(),
+  };
   for (const listener of listeners) listener();
 }
 
@@ -150,6 +189,91 @@ export function applyMaterial(material: MaterialId, options?: { persist?: boolea
   document.documentElement.dataset.material = material;
   if (options?.persist !== false) persist(materialStorageKey, material);
   snapshot = { ...themeSnapshot(), material };
+  for (const listener of listeners) listener();
+}
+
+function readGlassOpacity(): number {
+  const opacity = Number(document.documentElement.dataset.glassOpacity);
+  return isGlassOpacity(opacity) ? opacity : 84;
+}
+
+function stampGlassOpacity(opacity: number): void {
+  document.documentElement.dataset.glassOpacity = String(opacity);
+  document.documentElement.style.setProperty("--glass-opacity", `${opacity}%`);
+}
+
+export function applyGlassOpacity(opacity: number): void {
+  if (!isGlassOpacity(opacity)) return;
+  stampGlassOpacity(opacity);
+  persist(glassOpacityStorageKey, String(opacity));
+  snapshot = { ...themeSnapshot(), glassOpacity: opacity };
+  for (const listener of listeners) listener();
+}
+
+function readBackgroundMotion(): BackgroundMotionId {
+  const value = document.documentElement.dataset.backgroundMotion;
+  return isBackgroundMotionId(value) ? value : "slow";
+}
+
+function readBackgroundSpeed(): number {
+  const speed = Number(document.documentElement.dataset.backgroundSpeed);
+  return isBackgroundSpeed(speed) ? speed : readBackgroundMotion() === "slower" ? 0.5 : 1;
+}
+
+function readBackgroundIntensity(): number {
+  const value = document.documentElement.dataset.backgroundIntensity;
+  return value !== undefined && isBackgroundIntensity(Number(value)) ? Number(value) : 70;
+}
+
+function stampBackgroundIntensity(intensity: number): void {
+  document.documentElement.dataset.backgroundIntensity = String(intensity);
+  document.documentElement.style.setProperty("--background-intensity", String(intensity / 100));
+}
+
+export function applyBackgroundIntensity(intensity: number): void {
+  if (!isBackgroundIntensity(intensity)) return;
+  stampBackgroundIntensity(intensity);
+  persist(backgroundIntensityStorageKey, String(intensity));
+  snapshot = { ...themeSnapshot(), backgroundIntensity: intensity };
+  for (const listener of listeners) listener();
+}
+
+function stampBackgroundSpeed(speed: number): void {
+  // Preserve the current phase while dragging, rather than jumping to the
+  // position implied by a new CSS duration. No animation exists while off.
+  const drift = document
+    .getAnimations?.()
+    .find(
+      (animation) =>
+        "animationName" in animation && animation.animationName === "background-drift",
+    );
+  const duration = drift?.effect?.getComputedTiming().duration;
+  const phase =
+    drift &&
+    typeof drift.currentTime === "number" &&
+    typeof duration === "number" &&
+    duration > 0
+      ? drift.currentTime / duration
+      : null;
+  document.documentElement.dataset.backgroundSpeed = String(speed);
+  document.documentElement.style.setProperty("--background-drift-duration", `${240 / speed}s`);
+  if (drift && phase !== null) drift.currentTime = phase * (240_000 / speed);
+}
+
+/** Multiples of the original four-minute cycle; keep the chosen speed while off. */
+export function applyBackgroundSpeed(speed: number): void {
+  if (!isBackgroundSpeed(speed)) return;
+  stampBackgroundSpeed(speed);
+  persist(backgroundSpeedStorageKey, String(speed));
+  snapshot = { ...themeSnapshot(), backgroundSpeed: speed };
+  for (const listener of listeners) listener();
+}
+
+/** Store the chosen speed; CSS honors accessibility overrides independently. */
+export function applyBackgroundMotion(backgroundMotion: BackgroundMotionId): void {
+  document.documentElement.dataset.backgroundMotion = backgroundMotion;
+  persist(backgroundMotionStorageKey, backgroundMotion);
+  snapshot = { ...themeSnapshot(), backgroundMotion };
   for (const listener of listeners) listener();
 }
 
@@ -184,6 +308,24 @@ export function initTheme(): { theme: ThemeId; mode: ModeId } {
   const mode = stored(modeStorageKey, isModeId) ?? systemMode();
   document.documentElement.dataset.material =
     stored(materialStorageKey, isMaterialId) ?? "glass";
+  const savedOpacity = Number(
+    stored(glassOpacityStorageKey, (value): value is string => typeof value === "string"),
+  );
+  stampGlassOpacity(isGlassOpacity(savedOpacity) ? savedOpacity : 84);
+  document.documentElement.dataset.backgroundMotion =
+    stored(backgroundMotionStorageKey, isBackgroundMotionId) ?? "slow";
+  const savedSpeed = Number(
+    stored(backgroundSpeedStorageKey, (value): value is string => typeof value === "string"),
+  );
+  stampBackgroundSpeed(
+    isBackgroundSpeed(savedSpeed) ? savedSpeed : readBackgroundMotion() === "slower" ? 0.5 : 1,
+  );
+  const savedIntensity = stored(
+    backgroundIntensityStorageKey,
+    (value): value is string =>
+      typeof value === "string" && value.trim() !== "" && isBackgroundIntensity(Number(value)),
+  );
+  stampBackgroundIntensity(savedIntensity === null ? 70 : Number(savedIntensity));
   applyTheme(theme, mode, { persist: false });
   return { theme, mode };
 }

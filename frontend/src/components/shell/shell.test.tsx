@@ -1,5 +1,5 @@
 import { createMemoryHistory } from "@tanstack/react-router";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "../../App";
 import { createAppRouter } from "../../router";
@@ -74,6 +74,16 @@ describe("PanelToolbar", () => {
 });
 
 describe("shell layout", () => {
+  it("starts a new screen at the top of its workspace", async () => {
+    renderShell("/activity");
+    await screen.findByRole("heading", { name: "Activity" });
+    const workspace = document.querySelector<HTMLElement>(".workspace-scroll")!;
+    workspace.scrollTop = 480;
+    fireEvent.click(screen.getByRole("link", { name: "Home" }));
+    await screen.findByRole("heading", { name: "Home" });
+    expect(document.querySelector(".workspace-scroll")?.scrollTop).toBe(0);
+  });
+
   it("has no window-wide top strip above the sidebar and the panel", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });

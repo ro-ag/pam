@@ -205,7 +205,16 @@ describe("maximized canvas", () => {
     const selected = node("b");
     const positions = captured.props?.nodes.map(({ id, position }) => ({ id, position }));
     const layoutCalls = mocks.autoLayout.mock.calls.length;
+    const dock = container.querySelector<HTMLElement>(".canvas-dock")!;
+    vi.spyOn(dock, "getBoundingClientRect").mockImplementation(
+      () =>
+        ({
+          height:
+            dock.querySelector(".canvas-workspace-maximized") || !dock.firstChild ? 564 : 640,
+        }) as DOMRect,
+    );
     fireEvent.click(screen.getByRole("button", { name: "Maximize canvas" }));
+    expect(dock.style.minHeight).toBe("640px");
     const dialog = screen.getByRole("dialog", { name: "Flow canvas" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(container.inert).toBe(true);
@@ -219,6 +228,7 @@ describe("maximized canvas", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(container.inert).toBe(false);
     expect(container).toContainElement(selected);
+    expect(dock.style.minHeight).toBe("");
     expect(screen.getByRole("button", { name: "Maximize canvas" })).toHaveFocus();
     expect(mocks.autoLayout.mock.calls).toHaveLength(layoutCalls);
     expect(props.onChange).not.toHaveBeenCalled();

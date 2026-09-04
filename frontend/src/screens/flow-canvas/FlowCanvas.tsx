@@ -183,6 +183,7 @@ function Canvas({
   // viewport, node selection and in-flight edits alive outside CSS containment.
   const [host] = useState(() => document.createElement("div"));
   const dock = useRef<HTMLDivElement>(null);
+  const dockHeight = useRef(0);
   useLayoutEffect(() => {
     const anchor = dock.current;
     if (!maximized) {
@@ -191,7 +192,7 @@ function Canvas({
     }
     // Reserve the measured dock, including wrapped toolbar rows or errors.
     const previousMinHeight = anchor?.style.minHeight ?? "";
-    if (anchor) anchor.style.minHeight = `${anchor.getBoundingClientRect().height}px`;
+    if (anchor) anchor.style.minHeight = `${dockHeight.current}px`;
     const app = document.getElementById("root");
     const wasInert = app?.inert ?? false;
     document.body.appendChild(host);
@@ -453,7 +454,12 @@ function Canvas({
               data-canvas-maximize=""
               aria-label={maximized ? "Restore canvas" : "Maximize canvas"}
               aria-pressed={maximized}
-              onClick={() => setMaximized((value) => !value)}
+              onClick={() => {
+                // Measure before rendering the fixed canvas or detaching its host.
+                if (!maximized)
+                  dockHeight.current = dock.current?.getBoundingClientRect().height ?? 0;
+                setMaximized((value) => !value);
+              }}
             >
               {maximized ? (
                 <Minimize2 size={14} aria-hidden="true" />

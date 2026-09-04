@@ -47,3 +47,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-textures-are-alternatives
+- kind: project-way
+- scope: project
+- rule: Treat PAM texture references as alternatives, not stacked surface decoration; a wave backdrop must be heavily blurred until individual lines are unreadable.
+- fix: Use one preblurred alpha wave field only behind the frame; remove photograph and command-surface texture overlays. Keep controls and cards clean.
+- hits: 2026-09-04
+- cost: 8
+- status: watching
+

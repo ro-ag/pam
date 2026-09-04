@@ -462,7 +462,7 @@ describe("appearance", () => {
     expect(document.documentElement.dataset.material).toBe("glass");
     fireEvent.click(screen.getByRole("tab", { name: "Security" }));
     await waitFor(() => expectActiveCategory("Security"));
-    expect(screen.getByRole("textbox", { name: "capability to grant" })).toHaveValue("echo");
+    expect(screen.getByRole("combobox", { name: "capability to grant" })).toHaveValue("echo");
   });
 });
 

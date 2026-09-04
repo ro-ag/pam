@@ -89,7 +89,7 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
   return (
     <div
       aria-label={`connector ${connector.name}`}
-      className="space-y-3 border-t border-line pt-4 first:border-t-0 first:pt-0"
+      className="connector-card space-y-3 rounded-card border border-line bg-surface-raised p-4"
     >
       <div className="flex flex-wrap items-center gap-2">
         <input
@@ -237,14 +237,21 @@ export function SettingsConnectorsSection() {
   const rows = connectors.data?.connectors ?? [];
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <div className="settings-connectors">
       {failure && <FailureNote failure={failure} label="connectors" />}
       {!failure && connectors.isPending && (
         <p className="font-data text-xs text-ink-faint">asking the keychain…</p>
       )}
-      {rows.map((connector) => (
-        <ConnectorRow key={connector.id} connector={connector} />
-      ))}
-    </Panel>
+      <div className="settings-grid connector-grid">
+        {rows.map((connector) => (
+          <ConnectorRow key={connector.id} connector={connector} />
+        ))}
+      </div>
+      {!failure && !connectors.isPending && rows.length === 0 && (
+        <Panel ground="raised" className="p-4 text-sm text-ink-muted">
+          No connectors available.
+        </Panel>
+      )}
+    </div>
   );
 }

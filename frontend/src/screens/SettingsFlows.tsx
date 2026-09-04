@@ -136,7 +136,7 @@ export function SettingsFlowsSection() {
   const extraPath = settings.data?.extra_path ?? [];
 
   return (
-    <Panel ground="raised" className="space-y-5 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       {listFailure && <FailureNote failure={listFailure} label="flow settings" />}
 
       <ListEditor

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useRouterState } from "@tanstack/react-router";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -48,9 +48,8 @@ import { SettingsFlowsSection } from "./SettingsFlows";
 import { SettingsModelsSection } from "./SettingsModels";
 
 /**
- * Settings — every knob, one place (task #30). One calm scrollable column
- * of grouped panels: Appearance, Security, Models, Flows, Connectors (the
- * GUI-only admin surfaces), Daemon, Retention, Logs. Every control here
+ * Settings — hash-addressed desktop tabs. Visited panes retain form drafts;
+ * unvisited panes do not read services until opened. Every control here
  * round-trips against the real bridge, and every refusal it earns renders
  * as the daemon worded it, instead of being pre-empted or swallowed.
  *
@@ -72,8 +71,8 @@ function AppearancePanel() {
   const { theme, mode, material } = useSyncExternalStore(subscribeTheme, themeSnapshot);
 
   return (
-    <Panel ground="raised" className="space-y-5 p-4">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+    <Panel ground="raised" className="appearance-panel space-y-4 p-4">
+      <div className="appearance-grid grid gap-3">
         {themes.flatMap((family) =>
           modeIds.map((appearance) => {
             const active = family.id === theme && appearance === mode;
@@ -92,7 +91,7 @@ function AppearancePanel() {
                 <span
                   data-theme={family.id}
                   data-mode={appearance}
-                  className="theme-preview block space-y-3 rounded-card bg-chrome p-3"
+                  className="theme-preview block space-y-2 rounded-card bg-chrome p-3"
                 >
                   <span className="flex items-center justify-between gap-2">
                     <span className="font-sans text-sm font-semibold">
@@ -111,11 +110,11 @@ function AppearancePanel() {
                     <span />
                   </span>
                   <span
-                    className="command-surface block space-y-3 rounded-overlay p-3"
+                    className="command-surface block space-y-2 rounded-overlay p-3"
                     aria-hidden="true"
                   >
                     <span className="flex flex-wrap items-center gap-2">
-                      <span className="font-sans text-sm font-medium">Material preview</span>
+                      <span className="font-sans text-sm font-medium">Liquid glass</span>
                       <span className="warm-marker size-2 rounded-pill" />
                     </span>
                     <span className="block font-sans text-xs text-ink-muted">
@@ -135,7 +134,7 @@ function AppearancePanel() {
         )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
+      <div className="appearance-controls flex flex-wrap items-center gap-3 border-t border-line pt-3">
         <span className="font-data text-xs text-ink-faint">mode</span>
         {modeIds.map((candidate: ModeId) => (
           <Button
@@ -157,7 +156,7 @@ function AppearancePanel() {
           applies instantly · remembered
         </span>
       </div>
-      <div className="space-y-2 border-t border-line pt-4">
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-line pt-3">
         <label className="flex items-center gap-2 font-sans text-sm text-ink">
           <input
             type="checkbox"
@@ -169,7 +168,7 @@ function AppearancePanel() {
           Reduce transparency
         </label>
         <p id="material-help" className="font-sans text-sm text-ink-muted">
-          Use solid backgrounds instead of reflected glass for command and decision panels.
+          Use solid surfaces without texture or blur. Your choice applies throughout PAM.
         </p>
       </div>
     </Panel>
@@ -225,7 +224,7 @@ function ProfilePanel() {
       : null;
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">policy profile</p>
       <div role="radiogroup" aria-label="policy profile" className="space-y-2">
         {PROFILE_ORDER.map((candidate) => {
@@ -346,7 +345,7 @@ function GrantsPanel() {
   const listFailure = grants.isError ? toBridgeFailure(grants.error) : null;
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">capability grants</p>
 
       {listFailure && <FailureNote failure={listFailure} label="grants" />}
@@ -433,12 +432,13 @@ function statusField(status: Record<string, unknown> | null | undefined, key: st
  * row — whether the platform's user-scope unit (LaunchAgent, systemd
  * user unit, scheduled task) is installed, with Install / Remove.
  */
-function DaemonPanel() {
+function DaemonPanel({ active }: { active: boolean }) {
   const queryClient = useQueryClient();
   const status = useQuery({
     queryKey: ["daemon", "status"],
     queryFn: daemonStatus,
-    refetchInterval: 5_000,
+    enabled: active,
+    refetchInterval: active ? 5_000 : false,
   });
   const [note, setNote] = useState<string | null>(null);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
@@ -517,7 +517,7 @@ function DaemonPanel() {
   ];
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="font-data text-xs text-ink-faint">daemon</p>
         {status.data &&
@@ -737,7 +737,7 @@ function RetentionPanel() {
   );
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="font-data text-xs text-ink-faint">storage pruning</p>
         <Button
@@ -802,7 +802,7 @@ export function logTone(line: string): "danger" | "warning" | null {
   return null;
 }
 
-function LogsPanel() {
+function LogsPanel({ active }: { active: boolean }) {
   const [lineCount, setLineCount] = useState<number>(500);
   const [auto, setAuto] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -810,7 +810,8 @@ function LogsPanel() {
   const log = useQuery({
     queryKey: ["daemon-log", lineCount],
     queryFn: () => readDaemonLog(lineCount),
-    refetchInterval: auto ? LOG_REFRESH_MS : false,
+    enabled: active,
+    refetchInterval: active && auto ? LOG_REFRESH_MS : false,
   });
 
   const failure = log.isError ? toBridgeFailure(log.error) : null;
@@ -827,7 +828,7 @@ function LogsPanel() {
   };
 
   return (
-    <Panel ground="raised" className="space-y-4 p-5">
+    <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <p className="font-data text-xs text-ink-faint">daemon.log</p>
         <span className="flex-1" />
@@ -923,137 +924,167 @@ function LogsPanel() {
 
 // --- the screen ------------------------------------------------------------
 
+const SETTINGS_CATEGORIES = [
+  {
+    id: "appearance",
+    label: "Appearance",
+    blurb: "Four Costa appearances. Soft light, clear working surfaces.",
+  },
+  {
+    id: "security",
+    label: "Security",
+    blurb: "Policy profiles and capability grants. Only you can change these.",
+    admin: true,
+  },
+  {
+    id: "models",
+    label: "Models",
+    blurb: "Default models, agent assistance and local storage.",
+  },
+  {
+    id: "flows",
+    label: "Flows",
+    blurb: "Allowed programs and search paths for flow steps.",
+    admin: true,
+  },
+  {
+    id: "connectors",
+    label: "Connectors",
+    blurb: "Service connections and credentials, managed locally.",
+    admin: true,
+  },
+  { id: "daemon", label: "Daemon", blurb: "Connection, login service and daemon controls." },
+  {
+    id: "retention",
+    label: "Retention",
+    blurb: "How long requests and their evidence stay on disk.",
+  },
+  {
+    id: "logs",
+    label: "Logs",
+    blurb: "Local diagnostics, available even when the daemon is down.",
+  },
+] as const;
+
+type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number];
+
+/** Keep drafts and pane scroll positions, but don't mount unvisited services. */
+function SettingsPane({
+  category,
+  active,
+  children,
+}: {
+  category: SettingsCategory;
+  active: boolean;
+  children: ReactNode;
+}) {
+  const [visited, setVisited] = useState(active);
+  if (active && !visited) setVisited(true);
+  return (
+    <div
+      id={category.id}
+      role="tabpanel"
+      aria-labelledby={`settings-tab-${category.id}`}
+      hidden={!active}
+      tabIndex={active ? 0 : -1}
+      className="settings-pane"
+    >
+      {visited && (
+        <Section
+          eyebrow={category.id}
+          title={category.label}
+          blurb={category.blurb}
+          eyebrowExtra={"admin" in category && <Badge tone="accent">GUI-only</Badge>}
+        >
+          {children}
+        </Section>
+      )}
+    </div>
+  );
+}
+
 export function SettingsScreen() {
-  // Every section carries a slug anchor so Ask Pam can answer "where do I
-  // change retention?" with a link that lands on the panel itself. The
-  // hash is watched rather than read once: a second deep link from the
-  // same screen changes only the hash, and the route never remounts.
   const hash = useRouterState({ select: (state) => state.location.hash });
-  useEffect(() => {
-    if (!hash) return;
-    const id = hash.replace(/^#/, "");
-    const scroll = () => document.getElementById(id)?.scrollIntoView({ block: "start" });
-    // The panels above the target fill in asynchronously (grants, models,
-    // connectors) and push it back down after the first scroll, so the
-    // scroll repeats on a short, bounded schedule instead of once.
-    scroll();
-    const timers = [250, 700, 1500].map((ms) => window.setTimeout(scroll, ms));
-    return () => timers.forEach((timer) => clearTimeout(timer));
-  }, [hash]);
+  const navigate = useNavigate();
+  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
+  const selected =
+    SETTINGS_CATEGORIES.find((category) => category.id === hash.replace(/^#/, ""))?.id ??
+    "appearance";
+
+  const select = (id: SettingsCategory["id"]) => {
+    void navigate({ to: "/settings", hash: id, resetScroll: false, hashScrollIntoView: false });
+  };
+
+  const content: Record<SettingsCategory["id"], ReactNode> = {
+    appearance: <AppearancePanel />,
+    security: (
+      <div className="settings-grid settings-security">
+        <ProfilePanel />
+        <GrantsPanel />
+      </div>
+    ),
+    models: <SettingsModelsSection />,
+    flows: <SettingsFlowsSection />,
+    connectors: <SettingsConnectorsSection />,
+    daemon: <DaemonPanel active={selected === "daemon"} />,
+    retention: <RetentionPanel />,
+    logs: <LogsPanel active={selected === "logs"} />,
+  };
 
   return (
-    <div className="settings-workspace flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
-        <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
-        <p className="text-sm text-ink-muted">Appearance, permissions and local services.</p>
-      </header>
-
-      <div className="settings-layout grid items-start gap-6 pt-6">
-        <nav
-          aria-label="Settings categories"
-          className="settings-navigation flex flex-wrap gap-1"
-        >
-          {[
-            "Appearance",
-            "Security",
-            "Models",
-            "Flows",
-            "Connectors",
-            "Daemon",
-            "Retention",
-            "Logs",
-          ].map((label) => (
-            <Link
-              key={label}
-              to="/settings"
-              hash={label.toLowerCase()}
-              activeOptions={{ includeHash: true }}
-              data-selected={(hash.replace(/^#/, "") || "appearance") === label.toLowerCase()}
-              className="settings-category rounded-control px-3 py-2 text-sm text-ink-muted transition-colors hover:bg-accent-soft hover:text-ink"
-            >
-              {label}
-            </Link>
-          ))}
-        </nav>
-        <div className="min-w-0 space-y-8">
-          <Section
-            id="appearance"
-            eyebrow="appearance"
-            title="Appearance"
-            blurb="Costa’s four appearances, with reflected glass for command and decision panels."
-          >
-            <AppearancePanel />
-          </Section>
-
-          <Section
-            id="security"
-            eyebrow="security"
-            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-            title="Security"
-            blurb="Profiles and grants change only here — no agent, CLI, or MCP call can touch them."
-          >
-            <div className="space-y-4">
-              <ProfilePanel />
-              <GrantsPanel />
-            </div>
-          </Section>
-
-          <Section
-            id="models"
-            eyebrow="models"
-            title="Models"
-            blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
-          >
-            <SettingsModelsSection />
-          </Section>
-
-          <Section
-            id="flows"
-            eyebrow="flows"
-            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-            title="Flows"
-            blurb="Which programs a flow step may run, and where I look for them."
-          >
-            <SettingsFlowsSection />
-          </Section>
-
-          <Section
-            id="connectors"
-            eyebrow="connectors"
-            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-            title="Connectors"
-            blurb="The services I may reach on a flow's behalf, and the credentials that let me."
-          >
-            <SettingsConnectorsSection />
-          </Section>
-
-          <Section
-            id="daemon"
-            eyebrow="daemon"
-            title="Daemon"
-            blurb="Connection, installed service and daemon controls."
-          >
-            <DaemonPanel />
-          </Section>
-
-          <Section
-            id="retention"
-            eyebrow="retention"
-            title="Retention"
-            blurb="How long the audit trail and its evidence stay on disk."
-          >
-            <RetentionPanel />
-          </Section>
-
-          <Section
-            id="logs"
-            eyebrow="logs"
-            title="Logs"
-            blurb="The daemon's own diagnostics — readable even when the daemon is down."
-          >
-            <LogsPanel />
-          </Section>
+    <div className="settings-workspace">
+      <header className="settings-header">
+        <div>
+          <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
+          <p className="text-sm text-ink-muted">Your machine. Your defaults.</p>
         </div>
+        <span className="settings-context font-data text-xs text-ink-muted">
+          LOCAL PREFERENCES
+        </span>
+      </header>
+      <div role="tablist" aria-label="Settings categories" className="settings-tabs">
+        {SETTINGS_CATEGORIES.map((category, index) => (
+          <button
+            key={category.id}
+            ref={(element) => {
+              tabs.current[index] = element;
+            }}
+            type="button"
+            role="tab"
+            id={`settings-tab-${category.id}`}
+            aria-selected={selected === category.id}
+            aria-controls={category.id}
+            tabIndex={selected === category.id ? 0 : -1}
+            onClick={() => select(category.id)}
+            onKeyDown={(event) => {
+              const last = SETTINGS_CATEGORIES.length - 1;
+              const next =
+                event.key === "ArrowRight"
+                  ? (index + 1) % (last + 1)
+                  : event.key === "ArrowLeft"
+                    ? (index + last) % (last + 1)
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? last
+                        : null;
+              if (next === null) return;
+              event.preventDefault();
+              tabs.current[next]?.focus();
+              select(SETTINGS_CATEGORIES[next].id);
+            }}
+            className="settings-tab"
+          >
+            {category.label}
+          </button>
+        ))}
+      </div>
+      <div className="settings-panes">
+        {SETTINGS_CATEGORIES.map((category) => (
+          <SettingsPane key={category.id} category={category} active={selected === category.id}>
+            {content[category.id]}
+          </SettingsPane>
+        ))}
       </div>
     </div>
   );

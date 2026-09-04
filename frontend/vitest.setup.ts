@@ -12,6 +12,7 @@ afterEach(() => {
 // router's scroll restoration calls it after navigation — stub it quiet.
 if (typeof window !== "undefined") {
   window.scrollTo = () => {};
+  Element.prototype.scrollIntoView = () => {};
 }
 
 // This jsdom build ships no window.localStorage (Node's own experimental

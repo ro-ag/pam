@@ -1,0 +1,24 @@
+# Desktop glass materials
+
+- `chaos.svg`: the exact SVG supplied by the user on 2026-09-04 for this
+  treatment (1422 × 800, 28 paths, `ccchaos-grad`). It replaces the previous
+  contour texture. No external references, scripts or embedded HTML are present.
+- `chaos-soft.webp`: rendered with librsvg at 1422 × 800; its alpha channel is
+  Gaussian-blurred with sigma 10, normalized and encoded at quality 80.
+  PAM uses **only the alpha** as one theme-tinted backdrop mask. This keeps
+  the supplied form but softens its small lines and dashes, without runtime
+  SVG filters or blur on large windows.
+
+Source reference: <https://www.fffuel.co/ccchaos/>. The user supplied and
+authorized this asset for PAM. No independent redistribution license was
+provided: fffuel's published image terms restrict redistribution, so review
+the asset rights before publishing the source or packaged app. These files
+are not represented as CC0 or relicensed under PAM's code license.
+This is a soft backdrop, not a true optical refraction filter.
+
+The single wave field is local, static and decorative. The user-supplied
+photograph was an alternative, not a second layer, and is not included.
+There is no grain, linework or texture applied to individual cards.
+No remote image requests, animated turbulence or runtime blur runs.
+The opaque material preference, reduced-transparency media query and forced
+colors remove the decorative layers.

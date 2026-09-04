@@ -117,6 +117,39 @@
     background:
       var(--pam-glass-gradient) padding-box,
       var(--pam-glass-edge) border-box;
+    box-shadow: var(--pam-shadow-float), var(--pam-glass-highlight);
+  }
+  [data-material="opaque"] .command-surface {
+    background: var(--pam-surface-raised);
+    border-color: var(--pam-edge);
+    box-shadow: none;
+  }
+  .theme-swatches {
+    display: flex;
+    height: 20px;
+    overflow: hidden;
+    border-radius: var(--radius-badge);
+  }
+  .theme-swatches > span {
+    flex: 1;
+  }
+  .theme-swatches > :nth-child(1) {
+    background: var(--pam-chrome);
+  }
+  .theme-swatches > :nth-child(2) {
+    background: var(--pam-surface);
+  }
+  .theme-swatches > :nth-child(3) {
+    background: var(--pam-action-gradient);
+  }
+  .theme-swatches > :nth-child(4) {
+    background: var(--pam-warm-material);
+  }
+  .theme-swatches > :nth-child(5) {
+    background: var(--pam-ink);
+  }
+  .theme-preview {
+    color: var(--pam-ink);
   }
   .activity-lanes {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
@@ -173,6 +206,14 @@
         color-mix(in oklab, var(--color-copper) 10%, transparent),
         transparent 55%
       );
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .command-surface {
+    background: var(--pam-surface-raised);
+    border-color: var(--pam-edge);
+    box-shadow: none;
   }
 }
 

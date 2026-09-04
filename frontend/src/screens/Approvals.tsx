@@ -180,14 +180,14 @@ function ApprovalCard({
 
   return (
     <Panel
-      ground="raised"
+      ground="command"
       aria-label={`approval ${approval.capability}`}
       className="space-y-4 p-5"
     >
       <div className="flex items-start gap-3">
         <span
           aria-hidden="true"
-          className="flex size-8 shrink-0 items-center justify-center rounded-pill bg-warning-soft"
+          className="warm-badge flex size-8 shrink-0 items-center justify-center rounded-control text-warning"
         >
           <Hand className="size-4 text-warning" />
         </span>

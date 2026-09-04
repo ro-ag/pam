@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyTheme,
+  applyMaterial,
+  materialStorageKey,
   defaultTheme,
   initTheme,
   isModeId,
@@ -19,6 +21,7 @@ afterEach(() => {
   window.localStorage.clear();
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.mode;
+  delete document.documentElement.dataset.material;
   document.documentElement.style.colorScheme = "";
 });
 
@@ -49,7 +52,7 @@ describe("the shared theme store", () => {
   it("keeps the snapshot referentially stable between applies", () => {
     applyTheme("vina", "dark", { persist: false });
     expect(themeSnapshot()).toBe(themeSnapshot());
-    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "dark" });
+    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "dark", material: "glass" });
   });
 
   it("notifies subscribers on every apply, until they unsubscribe", () => {
@@ -60,7 +63,7 @@ describe("the shared theme store", () => {
     applyTheme("ventisquero", "light", { persist: false });
     applyTheme("vina", "light", { persist: false });
     expect(seen).toBe(2);
-    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light" });
+    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light", material: "glass" });
     unsubscribe();
     applyTheme("vina", "dark", { persist: false });
     expect(seen).toBe(2);
@@ -120,5 +123,42 @@ describe("initTheme", () => {
     initTheme();
     expect(window.localStorage.getItem(themeStorageKey)).toBeNull();
     expect(window.localStorage.getItem(modeStorageKey)).toBeNull();
+  });
+});
+
+describe("Costa material preference", () => {
+  it("persists and restores material without changing the selected theme", () => {
+    applyTheme("vina", "light");
+    applyMaterial("opaque");
+    expect(themeSnapshot()).toEqual({ theme: "vina", mode: "light", material: "opaque" });
+    expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
+    delete document.documentElement.dataset.material;
+    initTheme();
+    expect(document.documentElement.dataset.material).toBe("opaque");
+    applyTheme("ventisquero", "dark");
+    expect(themeSnapshot().material).toBe("opaque");
+  });
+
+  it("notifies subscribers and does not persist an implicit mode choice", () => {
+    initTheme();
+    let seen = 0;
+    const unsubscribe = subscribeTheme(() => {
+      seen += 1;
+    });
+    applyMaterial("opaque");
+    expect(seen).toBe(1);
+    expect(window.localStorage.getItem(modeStorageKey)).toBeNull();
+    expect(window.localStorage.getItem(themeStorageKey)).toBeNull();
+    unsubscribe();
+    applyMaterial("glass");
+    expect(seen).toBe(1);
+  });
+
+  it("defaults to glass for missing or invalid stored material", () => {
+    window.localStorage.setItem(materialStorageKey, "clear");
+    initTheme();
+    expect(themeSnapshot().material).toBe("glass");
+    expect(document.documentElement.dataset.material).toBe("glass");
+    expect(window.localStorage.getItem(materialStorageKey)).toBe("clear");
   });
 });

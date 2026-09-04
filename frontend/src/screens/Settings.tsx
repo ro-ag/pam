@@ -35,6 +35,7 @@ import {
 } from "../lib/ipc";
 import {
   applyTheme,
+  applyMaterial,
   modeIds,
   subscribeTheme,
   themes,
@@ -68,54 +69,73 @@ import { SettingsModelsSection } from "./SettingsModels";
  * until someone misses it; two honest buttons beat three subtle states.
  */
 function AppearancePanel() {
-  const { theme, mode } = useSyncExternalStore(subscribeTheme, themeSnapshot);
+  const { theme, mode, material } = useSyncExternalStore(subscribeTheme, themeSnapshot);
 
   return (
     <Panel ground="raised" className="space-y-5 p-5">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        {themes.map((family) => {
-          const active = family.id === theme;
-          return (
-            <button
-              key={family.id}
-              type="button"
-              aria-pressed={active}
-              onClick={() => applyTheme(family.id, mode)}
-              className={cn(
-                "rounded-card border p-1.5 text-left transition-colors duration-150",
-                active ? "border-accent-strong" : "border-line hover:border-ink-faint",
-              )}
-            >
-              {/*
-               * The swatch IS the theme: re-scoping data-theme/data-mode on
-               * this subtree makes every --pam-* token below resolve to the
-               * family being previewed — the palette renders itself, no
-               * per-family color tokens to keep in sync.
-               */}
-              <span
-                data-theme={family.id}
-                data-mode={mode}
-                className="block rounded-card border border-edge bg-chrome p-3"
+        {themes.flatMap((family) =>
+          modeIds.map((appearance) => {
+            const active = family.id === theme && appearance === mode;
+            return (
+              <button
+                key={`${family.id}-${appearance}`}
+                type="button"
+                aria-label={`${family.label} ${family.appearances[appearance]}`}
+                aria-pressed={active}
+                onClick={() => applyTheme(family.id, appearance)}
+                className={cn(
+                  "rounded-card border p-1.5 text-left transition-colors duration-100",
+                  active ? "border-focus" : "border-line hover:border-ink-faint",
+                )}
               >
-                <span className="block rounded-control border border-edge bg-surface p-2.5 shadow-raise">
-                  <span className="flex items-center gap-2">
-                    <span className="size-3 rounded-pill border border-edge bg-chrome" />
-                    <span className="size-3 rounded-pill border border-edge bg-surface-raised" />
-                    <span className="size-3 rounded-pill bg-accent-strong" />
-                    <span className="ml-auto h-1.5 w-10 rounded-pill bg-accent-soft" />
+                <span
+                  data-theme={family.id}
+                  data-mode={appearance}
+                  className="theme-preview block space-y-3 rounded-card bg-chrome p-3"
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="font-sans text-sm font-semibold">
+                      {family.appearances[appearance]}
+                    </span>
+                    {active && <Check aria-hidden="true" className="size-4 text-accent" />}
+                    <span className="ml-auto font-data text-xs text-ink-muted">
+                      {appearance}
+                    </span>
                   </span>
+                  <span className="theme-swatches" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  <span
+                    className="command-surface block space-y-3 rounded-overlay p-3"
+                    aria-hidden="true"
+                  >
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="font-sans text-sm font-medium">Material preview</span>
+                      <span className="warm-marker size-2 rounded-pill" />
+                    </span>
+                    <span className="block font-sans text-xs text-ink-muted">
+                      {family.id === "vina"
+                        ? "Pacific sunset · rose reflections"
+                        : "Glacier light · autumn copper"}
+                    </span>
+                    <span className="action-control inline-flex h-8 items-center rounded-control border border-control-line px-3 font-sans text-xs text-on-accent">
+                      Primary action
+                    </span>
+                  </span>
+                  <span className="block font-sans text-sm font-medium">{family.label}</span>
                 </span>
-              </span>
-              <span className="flex items-center justify-between px-1.5 pt-2 pb-1">
-                <span className="font-sans text-sm font-medium text-ink">{family.label}</span>
-                {active && <Check aria-hidden="true" className="size-4 text-accent" />}
-              </span>
-            </button>
-          );
-        })}
+              </button>
+            );
+          }),
+        )}
       </div>
 
-      <div className="flex items-center gap-3 border-t border-line pt-4">
+      <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
         <span className="font-data text-xs text-ink-faint">mode</span>
         {modeIds.map((candidate: ModeId) => (
           <Button
@@ -136,6 +156,21 @@ function AppearancePanel() {
         <span className="ml-auto font-data text-xs text-ink-faint">
           applies instantly · remembered
         </span>
+      </div>
+      <div className="space-y-2 border-t border-line pt-4">
+        <label className="flex items-center gap-2 font-sans text-sm text-ink">
+          <input
+            type="checkbox"
+            checked={material === "opaque"}
+            onChange={(event) => applyMaterial(event.target.checked ? "opaque" : "glass")}
+            aria-describedby="material-help"
+            className="size-4 accent-accent-strong"
+          />
+          Reduce transparency
+        </label>
+        <p id="material-help" className="font-sans text-sm text-ink-muted">
+          Use solid backgrounds instead of reflected glass for command and decision panels.
+        </p>
       </div>
     </Panel>
   );
@@ -927,7 +962,7 @@ export function SettingsScreen() {
           id="appearance"
           eyebrow="appearance"
           title="Appearance"
-          blurb="Two families, two modes — the palette is the only thing that changes."
+          blurb="Costa’s four appearances, with reflected glass for command and decision panels."
         >
           <AppearancePanel />
         </Section>

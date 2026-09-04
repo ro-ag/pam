@@ -5,6 +5,8 @@
  */
 :root {
   --pam-density: 1;
+  /* Costa dt-glass inset reflection, shared by all four appearances. */
+  --pam-glass-highlight: inset 0 1px 0 #ffffff26;
 }
 
 :root,

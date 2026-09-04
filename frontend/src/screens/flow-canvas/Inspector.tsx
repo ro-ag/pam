@@ -799,7 +799,7 @@ export function Inspector({ spec, selection, onChange, onSelect, error }: Inspec
       : undefined;
 
   return (
-    <Panel ground="raised" aria-label="inspector" className="space-y-4 p-4">
+    <Panel ground="command" aria-label="inspector" className="space-y-4 p-4">
       <div className="flex items-center gap-2">
         <Eyebrow>inspector</Eyebrow>
         <Badge tone={selection.kind === "none" ? "neutral" : "accent"}>

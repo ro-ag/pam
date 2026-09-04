@@ -38,3 +38,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## costa-glass-fidelity
+- kind: habit
+- scope: project
+- rule: When Costa is the supplied visual target, carry its complete glass material recipe and decision-pane usage into the app; palette-only changes are insufficient.
+- fix: Compare the built Costa reference before editing; implement reflected gradient, gradient edge, inset highlight and bounded shadow together, and verify visible glass versus opaque material in all four themes.
+- hits: 2026-09-03
+- cost: 0
+- status: watching
+

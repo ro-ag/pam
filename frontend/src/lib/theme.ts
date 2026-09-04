@@ -241,22 +241,23 @@ export function applyBackgroundIntensity(intensity: number): void {
 function stampBackgroundSpeed(speed: number): void {
   // Preserve the current phase while dragging, rather than jumping to the
   // position implied by a new CSS duration. No animation exists while off.
-  const drifts = (document.getAnimations?.() ?? []).filter(
-    (animation) =>
-      "animationName" in animation && animation.animationName === "background-drift",
-  );
-  const phases = drifts.map((drift) => {
-    const duration = drift.effect?.getComputedTiming().duration;
-    return typeof drift.currentTime === "number" && typeof duration === "number" && duration > 0
+  const drift = document
+    .getAnimations?.()
+    .find(
+      (animation) =>
+        "animationName" in animation && animation.animationName === "background-drift",
+    );
+  const duration = drift?.effect?.getComputedTiming().duration;
+  const phase =
+    drift &&
+    typeof drift.currentTime === "number" &&
+    typeof duration === "number" &&
+    duration > 0
       ? drift.currentTime / duration
       : null;
-  });
   document.documentElement.dataset.backgroundSpeed = String(speed);
   document.documentElement.style.setProperty("--background-drift-duration", `${240 / speed}s`);
-  drifts.forEach((drift, index) => {
-    const phase = phases[index];
-    if (phase !== null) drift.currentTime = phase * (240_000 / speed);
-  });
+  if (drift && phase !== null) drift.currentTime = phase * (240_000 / speed);
 }
 
 /** Multiples of the original four-minute cycle; keep the chosen speed while off. */

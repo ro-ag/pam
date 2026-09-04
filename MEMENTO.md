@@ -74,3 +74,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-liquid-glass-safari
+- kind: habit
+- scope: project
+- rule: Do not equate a liquid-glass library's Playwright WebKit support claim or mocked wiring tests with actual Safari/WKWebView rendering compatibility.
+- fix: Use a matched-settings minimal reproduction in real Safari before claiming optical portability. Keep the user's confirmed Chrome-versus-Safari screenshots as failure evidence; distinguish integration failure from universal library incompatibility.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+

@@ -2,7 +2,6 @@ import { Check, Droplets, Moon, Sun, Waves } from "lucide-react";
 import { useSyncExternalStore } from "react";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
-import { LiquidGlassBackdrop } from "../components/ui/LiquidGlassBackdrop";
 import { PreferenceRange, PreferenceToggle } from "../components/ui/PreferenceControls";
 import { cn } from "../lib/cn";
 import {
@@ -86,15 +85,14 @@ export function AppearancePanel() {
         </div>
       </div>
       <div className="appearance-control-grid">
-        <Panel ground="raised" className="appearance-control-card liquid-glass-panel">
-          <LiquidGlassBackdrop />
+        <Panel ground="raised" className="appearance-control-card">
           <header className="appearance-control-heading">
             <span className="appearance-control-icon">
               <Droplets aria-hidden="true" size={18} />
             </span>
             <div>
               <h3>Glass & surfaces</h3>
-              <p>Refracted light. Clear, readable controls.</p>
+              <p>Set the balance between depth and clarity.</p>
             </div>
           </header>
           <div className="appearance-mode-row">
@@ -143,11 +141,10 @@ export function AppearancePanel() {
         </Panel>
         <Panel
           ground="raised"
-          className="appearance-control-card liquid-glass-panel"
+          className="appearance-control-card"
           role="group"
           aria-label="Background motion"
         >
-          <LiquidGlassBackdrop />
           <header className="appearance-control-heading">
             <span className="appearance-control-icon">
               <Waves aria-hidden="true" size={18} />

@@ -273,18 +273,14 @@ describe("background motion preference", () => {
       currentTime: time,
       effect: { getComputedTiming: () => ({ duration: 10_000 }) },
     };
-    const copy = { ...drift };
-    const entrance = { ...drift, animationName: "workspace-enter" };
     const original = Object.getOwnPropertyDescriptor(document, "getAnimations");
     Object.defineProperty(document, "getAnimations", {
       configurable: true,
-      value: () => [drift, copy, entrance],
+      value: () => [drift],
     });
     try {
       applyBackgroundSpeed(6);
       expect(drift.currentTime).toBe(time * 4);
-      expect(copy.currentTime).toBe(drift.currentTime);
-      expect(entrance.currentTime).toBe(time);
       expect(
         document.documentElement.style.getPropertyValue("--background-drift-duration"),
       ).toBe("40s");

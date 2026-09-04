@@ -1,19 +1,10 @@
 /* PAM GUI stylesheet — the single CSS entry.
  *
- * Order matters: self-hosted fonts (CSP forbids remote), Tailwind, then the
+ * Order matters: Tailwind, then the
  * design system: primitive theme palettes (themes.css) and the semantic
  * token layer (tokens.css). Components never add CSS files of their own —
  * they compose semantic utilities via cn()/cva.
  */
-
-/* Three voices + furniture, self-hosted via fontsource. */
-@import "@fontsource-variable/archivo";
-@import "@fontsource-variable/newsreader";
-@import "@fontsource-variable/newsreader/wght-italic.css";
-@import "@fontsource-variable/inter";
-@import "@fontsource/ibm-plex-mono/400.css";
-@import "@fontsource/ibm-plex-mono/500.css";
-@import "@fontsource/ibm-plex-mono/600.css";
 
 @import "tailwindcss";
 
@@ -67,6 +58,84 @@
 @layer components {
   .desktop-sidebar {
     width: 208px;
+  }
+  .canvas-dock {
+    min-height: 564px;
+  }
+  .canvas-workspace {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .canvas-viewport {
+    height: 520px;
+    min-height: 520px;
+  }
+  .canvas-workspace-maximized {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    padding: 40px 16px 16px;
+    color: var(--pam-ink);
+    background: var(--pam-chrome);
+  }
+  .canvas-workspace-maximized .canvas-viewport {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
+  .canvas-titlebar {
+    min-height: 24px;
+  }
+  .flow-library-layout {
+    flex-direction: column;
+  }
+  .flow-library {
+    border-bottom: 1px solid var(--pam-line);
+  }
+  .workspace-scroll {
+    container-type: inline-size;
+  }
+  .home-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .home-prompts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-category[data-selected="true"] {
+    background: var(--pam-accent-soft);
+    color: var(--pam-selection-ink);
+    font-weight: 600;
+  }
+  @container (min-width: 640px) {
+    .home-prompts {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .flow-library-layout {
+      flex-direction: row;
+    }
+    .flow-library {
+      width: 208px;
+      border-bottom: 0;
+      border-right: 1px solid var(--pam-line);
+      padding-right: 12px;
+    }
+  }
+  @container (min-width: 960px) {
+    .home-columns {
+      grid-template-columns: minmax(0, 1fr) 380px;
+    }
+    .settings-layout {
+      grid-template-columns: 160px minmax(0, 1fr);
+    }
+    .settings-navigation {
+      position: sticky;
+      top: 112px;
+      flex-direction: column;
+    }
   }
   .nav-current {
     box-shadow: inset 3px 0 0 var(--color-focus);
@@ -186,26 +255,6 @@
     .flow-inspector {
       width: 380px;
     }
-  }
-  /* The chrome atmosphere: a barely-there radial wash so the dark water has
-     depth without competing with the lit panel. Gradients (not images) keep
-     the strict CSP happy. The one place raw color math is allowed. */
-  .atmosphere {
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    pointer-events: none;
-    background:
-      radial-gradient(
-        120% 90% at 18% -10%,
-        color-mix(in oklab, var(--color-accent-strong) 16%, transparent),
-        transparent 60%
-      ),
-      radial-gradient(
-        90% 70% at 100% 110%,
-        color-mix(in oklab, var(--color-copper) 10%, transparent),
-        transparent 55%
-      );
   }
 }
 

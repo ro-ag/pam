@@ -73,13 +73,10 @@ function SidebarHead() {
         hasTrafficLights() ? "pt-10" : "pt-4",
       )}
     >
-      <span
-        data-tauri-drag-region=""
-        className="font-display text-sm font-semibold tracking-widest text-ink"
-      >
+      <span data-tauri-drag-region="" className="font-display text-sm font-semibold text-ink">
         PAM
       </span>
-      <span data-tauri-drag-region="" className="font-data text-xs text-ink-faint">
+      <span data-tauri-drag-region="" className="font-sans text-xs text-ink-faint">
         personal agent machine
       </span>
     </div>
@@ -90,7 +87,10 @@ export function Sidebar() {
   return (
     <div className="desktop-sidebar flex h-full shrink-0 flex-col px-3">
       <SidebarHead />
-      <nav aria-label="Primary" className="flex min-h-0 w-full flex-1 flex-col gap-1 pb-3">
+      <nav
+        aria-label="Primary"
+        className="flex min-h-0 w-full flex-1 flex-col gap-1 overflow-y-auto pb-3"
+      >
         <div>
           <NavLink to="/" label="Home" icon={MessageCircleQuestion} />
         </div>

@@ -157,7 +157,7 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
       )}
 
       {profile && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           This one signs with a named AWS profile from the machine&rsquo;s own credentials —
           there is no secret for me to keep.
         </p>

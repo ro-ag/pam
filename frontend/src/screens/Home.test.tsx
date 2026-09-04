@@ -132,12 +132,8 @@ async function askQuestion(question: string) {
 describe("Home shell", () => {
   it("greets in Pam's voice from the daemon and approvals state", async () => {
     renderHome();
-    expect(
-      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
-    ).toBeInTheDocument();
-    expect(
-      await screen.findByText("The water is calm: nothing waits for you."),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
+    expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
   });
 
   it("greets a raised hand, and says so when the daemon is silent", async () => {
@@ -155,7 +151,7 @@ describe("Home shell", () => {
     const { unmount } = render(
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
-    expect(await screen.findByText("One request waits for your hand.")).toBeInTheDocument();
+    expect(await screen.findByText("One request awaiting your approval.")).toBeInTheDocument();
     unmount();
 
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
@@ -163,6 +159,17 @@ describe("Home shell", () => {
     expect(
       await screen.findByText("The daemon is not answering; the next question starts it."),
     ).toBeInTheDocument();
+  });
+
+  it("shows unavailable state instead of inventing zero counts and keeps workspace links usable", async () => {
+    mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
+    mocks.approvalsPending.mockRejectedValue(new Error("unavailable"));
+    const router = renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() => expect(within(overview).getAllByText("Unavailable")).toHaveLength(2));
+    expect(within(overview).queryByText("0")).not.toBeInTheDocument();
+    fireEvent.click(within(overview).getByRole("link", { name: /Inspect activity/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/activity"));
   });
 
   it("answers a typed question and keeps only the last three exchanges", async () => {
@@ -242,9 +249,7 @@ describe("Home shell", () => {
     const { unmount } = render(
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
-    expect(
-      await screen.findByText("The water is calm: nothing waits for you."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
     expect(
       screen.queryByText("answers stay in my own words: no light model is set"),
     ).toBeNull();

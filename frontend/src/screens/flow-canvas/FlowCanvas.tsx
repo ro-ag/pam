@@ -11,8 +11,10 @@ import {
   type EdgeChange,
   type NodeChange,
 } from "@xyflow/react";
-import { Maximize2, Plug, Terminal, Wand2 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Expand, Maximize2, Minimize2, Plug, Terminal, Wand2 } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { cn } from "../../lib/cn";
 import { Button } from "../../components/ui/Button";
 import { ConfirmButton } from "../../components/ui/ConfirmButton";
 import { FailureNote } from "../../components/ui/FailureNote";
@@ -176,6 +178,60 @@ function Canvas({
   selection,
   onSelect,
 }: FlowCanvasProps) {
+  const [maximized, setMaximized] = useState(false);
+  // The portal target never changes. Moving its DOM host keeps ReactFlow's
+  // viewport, node selection and in-flight edits alive outside CSS containment.
+  const [host] = useState(() => document.createElement("div"));
+  const dock = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const anchor = dock.current;
+    if (!maximized) {
+      if (host.parentNode !== anchor) anchor?.appendChild(host);
+      return () => host.remove();
+    }
+    // Reserve the measured dock, including wrapped toolbar rows or errors.
+    const previousMinHeight = anchor?.style.minHeight ?? "";
+    if (anchor) anchor.style.minHeight = `${anchor.getBoundingClientRect().height}px`;
+    const app = document.getElementById("root");
+    const wasInert = app?.inert ?? false;
+    document.body.appendChild(host);
+    if (app) app.inert = true;
+    const toggle = () => host.querySelector<HTMLButtonElement>("[data-canvas-maximize]");
+    toggle()?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setMaximized(false);
+      } else if (event.key === "Tab") {
+        const controls = [
+          ...host.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+          ),
+        ].filter((element) => element.getClientRects().length > 0);
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      if (app) app.inert = wasInert;
+      if (anchor?.isConnected) {
+        anchor.appendChild(host);
+        anchor.style.minHeight = previousMinHeight;
+        toggle()?.focus();
+      } else host.remove();
+    };
+  }, [host, maximized]);
+
   const { fitView } = useReactFlow<CanvasNode, CanvasEdge>();
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
@@ -354,74 +410,110 @@ function Canvas({
   };
 
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Button variant="ghost" size="sm" onClick={() => add("command")}>
-          <Terminal size={14} aria-hidden="true" />
-          Add command
-        </Button>
-        <Button variant="ghost" size="sm" onClick={() => add("connector")}>
-          <Plug size={14} aria-hidden="true" />
-          Add connector
-        </Button>
-        <span className="flex-1" />
-        <Button variant="ghost" size="sm" onClick={tidy}>
-          <Wand2 size={14} aria-hidden="true" />
-          Tidy
-        </Button>
-        <Button variant="ghost" size="sm" onClick={() => void fitView(FIT)}>
-          <Maximize2 size={14} aria-hidden="true" />
-          Fit
-        </Button>
-        <ConfirmButton
-          label="Remove"
-          confirmLabel="remove it?"
-          disabled={!removable}
-          onConfirm={remove}
-        />
-      </div>
-
-      {refused && (
-        <FailureNote
-          label="canvas"
-          failure={{
-            cause: "connection refused",
-            detail: refused.cause,
-            recovery: refused.fix,
-          }}
-        />
-      )}
-
-      <div className="flow-canvas h-130 min-h-130 w-full overflow-hidden rounded-card border border-edge">
-        <ReactFlow<CanvasNode, CanvasEdge>
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          snapToGrid
-          snapGrid={SNAP_GRID}
-          fitView
-          fitViewOptions={FIT}
-          minZoom={0.3}
-          maxZoom={1.5}
-          proOptions={PRO_OPTIONS}
-          deleteKeyCode={null}
-          className="font-sans"
+    <div ref={dock} className="canvas-dock">
+      {createPortal(
+        <div
+          role={maximized ? "dialog" : "region"}
+          aria-label="Flow canvas"
+          aria-modal={maximized || undefined}
+          className={cn("canvas-workspace", maximized && "canvas-workspace-maximized")}
         >
-          <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-          <MiniMap
-            pannable
-            zoomable
-            position="bottom-right"
-            nodeClassName={minimapClass}
-            style={MINIMAP_SIZE}
-            className="rounded-card border border-edge shadow-raise"
-          />
-        </ReactFlow>
-      </div>
+          {maximized && (
+            <div
+              data-tauri-drag-region=""
+              className="canvas-titlebar flex items-center justify-between gap-3 text-sm font-medium"
+            >
+              <span data-tauri-drag-region="">{spec.name || flowId}</span>
+              <span className="text-xs font-normal text-ink-muted">
+                Canvas · Escape to restore
+              </span>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => add("command")}>
+              <Terminal size={14} aria-hidden="true" />
+              Add command
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => add("connector")}>
+              <Plug size={14} aria-hidden="true" />
+              Add connector
+            </Button>
+            <span className="flex-1" />
+            <Button variant="ghost" size="sm" onClick={tidy}>
+              <Wand2 size={14} aria-hidden="true" />
+              Tidy
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => void fitView(FIT)}>
+              <Maximize2 size={14} aria-hidden="true" />
+              Fit
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              data-canvas-maximize=""
+              aria-label={maximized ? "Restore canvas" : "Maximize canvas"}
+              aria-pressed={maximized}
+              onClick={() => setMaximized((value) => !value)}
+            >
+              {maximized ? (
+                <Minimize2 size={14} aria-hidden="true" />
+              ) : (
+                <Expand size={14} aria-hidden="true" />
+              )}
+              {maximized ? "Restore" : "Maximize"}
+            </Button>
+            <ConfirmButton
+              label="Remove"
+              confirmLabel="remove it?"
+              disabled={!removable}
+              onConfirm={remove}
+            />
+          </div>
+
+          {refused && (
+            <FailureNote
+              label="canvas"
+              failure={{
+                cause: "connection refused",
+                detail: refused.cause,
+                recovery: refused.fix,
+              }}
+            />
+          )}
+
+          <div className="flow-canvas canvas-viewport w-full overflow-hidden rounded-card border border-edge">
+            <ReactFlow<CanvasNode, CanvasEdge>
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              snapToGrid
+              snapGrid={SNAP_GRID}
+              fitView
+              fitViewOptions={FIT}
+              minZoom={0.3}
+              maxZoom={1.5}
+              proOptions={PRO_OPTIONS}
+              deleteKeyCode={null}
+              className="font-sans"
+            >
+              <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+              <MiniMap
+                pannable
+                zoomable
+                position="bottom-right"
+                nodeClassName={minimapClass}
+                style={MINIMAP_SIZE}
+                className="rounded-card border border-edge shadow-raise"
+              />
+            </ReactFlow>
+          </div>
+        </div>,
+        host,
+      )}
     </div>
   );
 }

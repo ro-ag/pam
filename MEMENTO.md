@@ -41,9 +41,9 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 ## costa-glass-fidelity
 - kind: habit
 - scope: project
-- rule: When Costa is the supplied visual target, carry its complete glass material recipe and decision-pane usage into the app; palette-only changes are insufficient.
-- fix: Compare the built Costa reference before editing; implement reflected gradient, gradient edge, inset highlight and bounded shadow together, and verify visible glass versus opaque material in all four themes.
-- hits: 2026-09-03
+- rule: Use Costa typography, palettes and complete materials for requested screen redesigns, while preserving the user-approved ZCode/p-track outer frame.
+- fix: Use the Costa native UI and mono stacks; keep PAM full-height sidebar, inset rounded main panel and quiet toolbar. Redesign screen contents within that frame, and verify the native Tauri app before finishing.
+- hits: 2026-09-03, 2026-09-03, 2026-09-03
 - cost: 0
 - status: watching
 

@@ -75,7 +75,7 @@ function CompressedNote({ report }: { report: CompressReport }) {
         {report.stats.tokens_avoided_est.toLocaleString()} tokens avoided
       </p>
       {report.model_skipped && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           No summary this time — {report.model_skipped.detail}.
         </p>
       )}
@@ -118,9 +118,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
       className="mt-2 mb-4 flex flex-col gap-6 p-5 md:flex-row md:items-start md:justify-between"
     >
       <div className="space-y-1">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          tokens avoided · 7 days
-        </p>
+        <p className="font-data text-xs text-ink-faint">tokens avoided · 7 days</p>
         {figures ? (
           <Odometer value={figures.tokens_avoided_est} />
         ) : (
@@ -144,9 +142,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           if (isAbsolutePath(path) && !compress.isPending) compress.mutate();
         }}
       >
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          compress a log
-        </p>
+        <p className="font-data text-xs text-ink-faint">compress a log</p>
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-56 flex-1 space-y-1">
             <span className="block font-data text-xs text-ink-faint">log path</span>
@@ -189,7 +185,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           >
             Compress
           </Button>
-          <span className="font-voice text-sm text-ink-muted italic">
+          <span className="font-sans text-sm text-ink-muted">
             I read the file as myself, so name a path I can reach.
           </span>
         </div>

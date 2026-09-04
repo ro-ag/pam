@@ -119,7 +119,7 @@ describe("the viewer", () => {
     );
   });
 
-  it("gives a summary the serif voice and no stats line", async () => {
+  it("gives a summary the UI font and no stats line", async () => {
     mocks.evidenceList.mockResolvedValue({
       evidence: [meta({ id: "ev_m", kind: "log.summary", bytes: 300 })],
     });
@@ -134,7 +134,7 @@ describe("the viewer", () => {
     renderStrip();
     fireEvent.click(await screen.findByRole("button", { name: "log.summary · 300 B" }));
     const prose = await screen.findByText("The build failed on one type mismatch.");
-    expect(prose.className).toContain("font-voice");
+    expect(prose.className).toContain("font-sans");
     expect(screen.queryByText(/records ·/)).not.toBeInTheDocument();
   });
 

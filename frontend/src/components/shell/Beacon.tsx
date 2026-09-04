@@ -30,7 +30,7 @@ export function Beacon({ state, className }: BeaconProps) {
     <span
       role="status"
       aria-label={beaconLabels[resolved]}
-      className={cn("flex items-center gap-2 font-data text-xs text-ink-muted", className)}
+      className={cn("flex items-center gap-2 font-sans text-xs text-ink-muted", className)}
     >
       <span
         aria-hidden="true"

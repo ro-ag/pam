@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouterState } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, Moon, RefreshCw, Sun } from "lucide-react";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Badge } from "../components/ui/Badge";
@@ -72,7 +72,7 @@ function AppearancePanel() {
   const { theme, mode, material } = useSyncExternalStore(subscribeTheme, themeSnapshot);
 
   return (
-    <Panel ground="raised" className="space-y-5 p-5">
+    <Panel ground="raised" className="space-y-5 p-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {themes.flatMap((family) =>
           modeIds.map((appearance) => {
@@ -226,9 +226,7 @@ function ProfilePanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        policy profile
-      </p>
+      <p className="font-data text-xs text-ink-faint">policy profile</p>
       <div role="radiogroup" aria-label="policy profile" className="space-y-2">
         {PROFILE_ORDER.map((candidate) => {
           const selected = current === candidate;
@@ -254,7 +252,7 @@ function ProfilePanel() {
                 <span className="block font-data text-sm font-medium text-ink">
                   {candidate}
                 </span>
-                <span className="block font-voice text-sm text-ink-muted italic">
+                <span className="block font-sans text-sm text-ink-muted">
                   {PROFILE_SENTENCES[candidate]}
                 </span>
               </span>
@@ -349,14 +347,12 @@ function GrantsPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        capability grants
-      </p>
+      <p className="font-data text-xs text-ink-faint">capability grants</p>
 
       {listFailure && <FailureNote failure={listFailure} label="grants" />}
 
       {!listFailure && rows.length === 0 && !grants.isPending && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           No grants yet. Everything an agent asks for beyond read-only will raise a hand until
           you grant its capability here.
         </p>
@@ -366,7 +362,7 @@ function GrantsPanel() {
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead>
-              <tr className="text-left font-data text-xs tracking-widest text-ink-faint uppercase">
+              <tr className="text-left font-data text-xs text-ink-faint">
                 <th className="pb-2 pr-3 font-medium">capability</th>
                 <th className="pb-2 pr-3 font-medium">scope</th>
                 <th className="pb-2 pr-3 font-medium">granted</th>
@@ -523,7 +519,7 @@ function DaemonPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">daemon</p>
+        <p className="font-data text-xs text-ink-faint">daemon</p>
         {status.data &&
           (connected ? (
             <Badge tone="success">running</Badge>
@@ -578,7 +574,7 @@ function DaemonPanel() {
       {serviceFailure && <FailureNote failure={serviceFailure} label="start at login" />}
 
       {!bridgeDown && status.data && !connected && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           The daemon is not answering; the next status poll starts it lazily.
         </p>
       )}
@@ -743,9 +739,7 @@ function RetentionPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          storage pruning
-        </p>
+        <p className="font-data text-xs text-ink-faint">storage pruning</p>
         <Button
           size="sm"
           variant="ghost"
@@ -781,7 +775,7 @@ function RetentionPanel() {
 
       {failure && <FailureNote failure={failure} label="retention" />}
 
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-sans text-sm text-ink-muted">
         I prune when I start, every hour after that, and whenever you change these. Evidence
         goes first; a request&apos;s verdict stays until its audit rows go, then the whole
         record leaves together.
@@ -835,7 +829,7 @@ function LogsPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">daemon.log</p>
+        <p className="font-data text-xs text-ink-faint">daemon.log</p>
         <span className="flex-1" />
         <select
           aria-label="lines to show"
@@ -948,93 +942,118 @@ export function SettingsScreen() {
   }, [hash]);
 
   return (
-    <div className="flex min-h-full flex-col px-6 pb-10">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          settings · every knob, one place
-        </p>
-        <h1 className="font-display text-title font-semibold text-ink">Settings</h1>
-        <div className="border-b border-line" />
+    <div className="settings-workspace flex min-h-full flex-col px-6 pb-6">
+      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+        <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
+        <p className="text-sm text-ink-muted">Appearance, permissions and local services.</p>
       </header>
 
-      <div className="space-y-10 pt-6">
-        <Section
-          id="appearance"
-          eyebrow="appearance"
-          title="Appearance"
-          blurb="Costa’s four appearances, with reflected glass for command and decision panels."
+      <div className="settings-layout grid items-start gap-6 pt-6">
+        <nav
+          aria-label="Settings categories"
+          className="settings-navigation flex flex-wrap gap-1"
         >
-          <AppearancePanel />
-        </Section>
+          {[
+            "Appearance",
+            "Security",
+            "Models",
+            "Flows",
+            "Connectors",
+            "Daemon",
+            "Retention",
+            "Logs",
+          ].map((label) => (
+            <Link
+              key={label}
+              to="/settings"
+              hash={label.toLowerCase()}
+              activeOptions={{ includeHash: true }}
+              data-selected={(hash.replace(/^#/, "") || "appearance") === label.toLowerCase()}
+              className="settings-category rounded-control px-3 py-2 text-sm text-ink-muted transition-colors hover:bg-accent-soft hover:text-ink"
+            >
+              {label}
+            </Link>
+          ))}
+        </nav>
+        <div className="min-w-0 space-y-8">
+          <Section
+            id="appearance"
+            eyebrow="appearance"
+            title="Appearance"
+            blurb="Costa’s four appearances, with reflected glass for command and decision panels."
+          >
+            <AppearancePanel />
+          </Section>
 
-        <Section
-          id="security"
-          eyebrow="security"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Security"
-          blurb="Profiles and grants change only here — no agent, CLI, or MCP call can touch them."
-        >
-          <div className="space-y-4">
-            <ProfilePanel />
-            <GrantsPanel />
-          </div>
-        </Section>
+          <Section
+            id="security"
+            eyebrow="security"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Security"
+            blurb="Profiles and grants change only here — no agent, CLI, or MCP call can touch them."
+          >
+            <div className="space-y-4">
+              <ProfilePanel />
+              <GrantsPanel />
+            </div>
+          </Section>
 
-        <Section
-          id="models"
-          eyebrow="models"
-          title="Models"
-          blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
-        >
-          <SettingsModelsSection />
-        </Section>
+          <Section
+            id="models"
+            eyebrow="models"
+            title="Models"
+            blurb="Which weights answer which tier, and which agent CLI I borrow when I need a second opinion."
+          >
+            <SettingsModelsSection />
+          </Section>
 
-        <Section
-          id="flows"
-          eyebrow="flows"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Flows"
-          blurb="Which programs a flow step may run, and where I look for them."
-        >
-          <SettingsFlowsSection />
-        </Section>
+          <Section
+            id="flows"
+            eyebrow="flows"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Flows"
+            blurb="Which programs a flow step may run, and where I look for them."
+          >
+            <SettingsFlowsSection />
+          </Section>
 
-        <Section
-          id="connectors"
-          eyebrow="connectors"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
-          title="Connectors"
-          blurb="The services I may reach on a flow's behalf, and the credentials that let me."
-        >
-          <SettingsConnectorsSection />
-        </Section>
+          <Section
+            id="connectors"
+            eyebrow="connectors"
+            eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+            title="Connectors"
+            blurb="The services I may reach on a flow's behalf, and the credentials that let me."
+          >
+            <SettingsConnectorsSection />
+          </Section>
 
-        <Section
-          id="daemon"
-          eyebrow="daemon"
-          title="Daemon"
-          blurb="The machine under the tower: what is running, and the one switch it has."
-        >
-          <DaemonPanel />
-        </Section>
+          <Section
+            id="daemon"
+            eyebrow="daemon"
+            title="Daemon"
+            blurb="Connection, installed service and daemon controls."
+          >
+            <DaemonPanel />
+          </Section>
 
-        <Section
-          id="retention"
-          eyebrow="retention"
-          title="Retention"
-          blurb="How long the audit trail and its evidence stay on disk."
-        >
-          <RetentionPanel />
-        </Section>
+          <Section
+            id="retention"
+            eyebrow="retention"
+            title="Retention"
+            blurb="How long the audit trail and its evidence stay on disk."
+          >
+            <RetentionPanel />
+          </Section>
 
-        <Section
-          id="logs"
-          eyebrow="logs"
-          title="Logs"
-          blurb="The daemon's own diagnostics — readable even when the daemon is down."
-        >
-          <LogsPanel />
-        </Section>
+          <Section
+            id="logs"
+            eyebrow="logs"
+            title="Logs"
+            blurb="The daemon's own diagnostics — readable even when the daemon is down."
+          >
+            <LogsPanel />
+          </Section>
+        </div>
       </div>
     </div>
   );

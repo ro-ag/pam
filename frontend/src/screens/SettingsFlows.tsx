@@ -78,9 +78,9 @@ function ListEditor({
   const [draft, setDraft] = useState("");
   return (
     <div className="space-y-3">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">{title}</p>
+      <p className="font-data text-xs text-ink-faint">{title}</p>
       {values.length === 0 ? (
-        <p className="font-voice text-sm text-ink-muted italic">{empty}</p>
+        <p className="font-sans text-sm text-ink-muted">{empty}</p>
       ) : (
         <div className="flex flex-wrap gap-2">
           {values.map((value) => (
@@ -165,7 +165,7 @@ export function SettingsFlowsSection() {
 
       {failure && <FailureNote failure={failure} label="flow settings" />}
 
-      <p className="border-t border-line pt-4 font-voice text-sm text-ink-muted italic">
+      <p className="border-t border-line pt-4 font-sans text-sm text-ink-muted">
         A flow may name any program; I run only the ones on this list. That is the whole reason
         a flow file is safe to read and safe to keep.
       </p>

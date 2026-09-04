@@ -65,9 +65,7 @@ function TierSelect({
 }) {
   return (
     <label className="space-y-1.5">
-      <span className="block font-data text-xs tracking-widest text-ink-faint uppercase">
-        {tier}
-      </span>
+      <span className="block font-data text-xs text-ink-faint">{tier}</span>
       <select
         aria-label={`${tier} tier default`}
         value={value ?? ""}
@@ -87,9 +85,7 @@ function TierSelect({
           </option>
         ))}
       </select>
-      <span className="block font-voice text-sm text-ink-muted italic">
-        {TIER_SENTENCES[tier]}
-      </span>
+      <span className="block font-sans text-sm text-ink-muted">{TIER_SENTENCES[tier]}</span>
     </label>
   );
 }
@@ -119,16 +115,14 @@ function TierDefaultsPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          tier defaults
-        </p>
+        <p className="font-data text-xs text-ink-faint">tier defaults</p>
         <Badge tone="accent">GUI-only</Badge>
       </div>
 
       {listFailure && <FailureNote failure={listFailure} label="models" />}
 
       {!listFailure && models.length === 0 && !library.isPending && (
-        <p className="font-voice text-sm text-ink-muted italic">
+        <p className="font-sans text-sm text-ink-muted">
           Nothing installed to point a tier at yet. Every job takes the deterministic path until
           weights exist.
         </p>
@@ -166,7 +160,7 @@ function AskPamPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">ask pam</p>
+        <p className="font-data text-xs text-ink-faint">ask pam</p>
         <Badge tone="accent">GUI-only</Badge>
       </div>
 
@@ -186,7 +180,7 @@ function AskPamPanel() {
         </Button>
       </div>
 
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-sans text-sm text-ink-muted">
         {rephrase
           ? "I keep every number and name; if the model drops one, my own sentence stands."
           : "My answers are my own sentences from live state; turn this on to let the light model soften them."}
@@ -229,10 +223,8 @@ function CuratorPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        curator agent
-      </p>
-      <p className="font-voice text-sm text-ink-muted italic">
+      <p className="font-data text-xs text-ink-faint">curator agent</p>
+      <p className="font-sans text-sm text-ink-muted">
         A vendor CLI you already pay for, asked one question at a time. PAM holds no API keys —
         it rides your own subscription, or nothing.
       </p>
@@ -364,9 +356,7 @@ function StoragePanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-        storage &amp; residency
-      </p>
+      <p className="font-data text-xs text-ink-faint">storage &amp; residency</p>
 
       <form
         className="flex flex-wrap items-end gap-2"
@@ -415,7 +405,7 @@ function StoragePanel() {
         <Button size="sm" type="submit" variant="ghost" disabled={apply.isPending}>
           Apply
         </Button>
-        <span className="font-voice text-sm text-ink-muted italic">
+        <span className="font-sans text-sm text-ink-muted">
           0 keeps the weights resident until you unload them yourself.
         </span>
       </form>

@@ -128,7 +128,7 @@ export function FlowRuns({ flowId }: { flowId: string }) {
 
   if (rows.length === 0) {
     return (
-      <p className="max-w-md font-voice text-base text-ink-muted italic">
+      <p className="max-w-md font-sans text-sm text-ink-muted">
         This flow has not run yet. Every run — yours or an agent&rsquo;s — lands here with its
         verdict and everything it left behind.
       </p>

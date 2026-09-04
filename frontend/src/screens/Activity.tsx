@@ -397,7 +397,7 @@ function TideSkeleton() {
 function PamMoment({ children, aside }: { children: ReactNode; aside?: ReactNode }) {
   return (
     <div className="flex flex-1 flex-col items-start justify-center gap-4 py-16">
-      <p className="max-w-md font-voice text-lg text-ink-muted italic">{children}</p>
+      <p className="max-w-md font-sans text-lg text-ink-muted">{children}</p>
       {aside}
     </div>
   );
@@ -531,10 +531,8 @@ export function ActivityScreen() {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          lifeguard tower · watching
-        </p>
+      <header className="sticky top-0 z-10 space-y-3 border-b border-line bg-surface py-5">
+        <p className="font-data text-xs text-ink-faint">Live requests</p>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="mr-auto font-display text-title font-semibold text-ink">Activity</h1>
           <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
@@ -547,17 +545,14 @@ export function ActivityScreen() {
           onAgent={(agent) => setFilters({ agent })}
           onRepo={(repo) => setFilters({ repo })}
         />
-        <div className="border-b border-line" />
       </header>
 
       <EvidenceBand onCompressed={() => setPendingExpand(true)} />
 
       {failure && (
         <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-          <p className="font-data text-xs tracking-widest text-danger uppercase">
-            disconnected · {failure.cause}
-          </p>
-          <p className="font-voice text-base text-ink italic">{failure.detail}.</p>
+          <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
+          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
           <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
         </section>
       )}

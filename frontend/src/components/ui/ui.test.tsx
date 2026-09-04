@@ -5,13 +5,13 @@ import { Button } from "./Button";
 import { Panel } from "./Panel";
 
 describe("Panel", () => {
-  it("defaults to the floating surface ground", () => {
+  it("defaults to a flat working surface", () => {
     render(<Panel data-testid="panel">deck</Panel>);
     const panel = screen.getByTestId("panel");
     expect(panel.tagName).toBe("SECTION");
     expect(panel.className).toContain("bg-surface");
     expect(panel.className).toContain("rounded-panel");
-    expect(panel.className).toContain("shadow-float");
+    expect(panel.className).not.toContain("shadow-float");
   });
 
   it("renders the raised ground for cards", () => {

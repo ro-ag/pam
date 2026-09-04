@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
-import { Panel } from "../components/ui/Panel";
 import { cn, cva } from "../lib/cn";
 import {
   flowsGet,
@@ -464,12 +463,9 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
 
   return (
     <div className="flex min-h-full flex-col px-6 pb-6">
-      <header className="sticky top-0 z-10 space-y-3 bg-surface pt-6 pb-3">
-        <p className="font-data text-xs tracking-widest text-ink-faint uppercase">
-          {entries.length > 0 ? `flows · ${entries.length} on the shelf` : "flows"}
-        </p>
-        <h1 className="font-display text-title font-semibold text-ink">Flows</h1>
-        <div className="border-b border-line" />
+      <header className="sticky top-0 z-10 space-y-1 border-b border-line bg-surface py-5">
+        <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
+        <p className="text-sm text-ink-muted">Reusable workflows and execution history.</p>
       </header>
 
       {failure && (
@@ -483,19 +479,16 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
       )}
 
       {!failure && !flows.isPending && selected === null && (
-        <p className="max-w-md pt-6 font-voice text-lg text-ink-muted italic">
+        <p className="max-w-md pt-6 font-sans text-lg text-ink-muted">
           There are no flows installed at all — not even mine. Something is wrong with the flow
           library; the daemon log will say what.
         </p>
       )}
 
       {!failure && selected !== null && (
-        <div className="flex flex-1 flex-col gap-5 pt-6 lg:flex-row">
-          <Panel
-            ground="raised"
-            aria-label="flow library"
-            className="w-full shrink-0 p-2 lg:w-64"
-          >
+        <div className="flow-library-layout flex flex-1 gap-5 pt-5">
+          <section aria-label="flow library" className="flow-library min-w-0 shrink-0 pb-3">
+            <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
             <ul className="space-y-0.5">
               {entries.map((entry) => (
                 <LibraryEntry
@@ -506,7 +499,7 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
                 />
               ))}
             </ul>
-          </Panel>
+          </section>
 
           <section
             aria-label={`flow ${selected.id}`}
@@ -514,7 +507,7 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
           >
             <div className="space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>
-              <p className="max-w-xl font-voice text-base text-ink-muted italic">
+              <p className="max-w-xl font-sans text-sm text-ink-muted">
                 {selected.description || "This flow describes itself in its own YAML."}
               </p>
               <p className="font-data text-xs text-ink-faint">

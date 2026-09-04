@@ -13,10 +13,10 @@ import type { BridgeFailure } from "../../lib/ipc";
 export function FailureNote({ failure, label }: { failure: BridgeFailure; label: string }) {
   return (
     <div className="space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
-      <p className="font-data text-xs tracking-widest text-danger uppercase">
+      <p className="font-data text-xs text-danger">
         {label} · {failure.cause}
       </p>
-      <p className="font-voice text-sm text-ink italic">{failure.detail}.</p>
+      <p className="font-sans text-sm text-ink">{failure.detail}.</p>
       <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
     </div>
   );

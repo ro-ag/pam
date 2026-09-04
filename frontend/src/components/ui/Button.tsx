@@ -13,6 +13,8 @@ export const buttonVariants = cva(
       variant: {
         primary:
           "action-control border border-control-line bg-accent-strong text-on-accent hover:bg-accent-hover active:bg-accent-pressed",
+        secondary:
+          "field-control border border-control-line bg-surface-raised text-ink hover:bg-accent-soft",
         ghost: "text-ink-muted hover:bg-accent-soft hover:text-ink active:bg-accent-soft",
         danger:
           "border border-danger/40 bg-danger-soft text-danger hover:border-danger active:border-danger",

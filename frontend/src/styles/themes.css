@@ -13,6 +13,7 @@
 [data-theme="ventisquero"][data-mode="light"] {
   color-scheme: light;
   --pam-chrome: #f6f3ec;
+  --pam-sidebar: #e9edef;
   --pam-surface: #fdfcf9;
   --pam-surface-raised: #ffffff;
   --pam-ink: #14212a;
@@ -72,6 +73,7 @@
 [data-theme="ventisquero"][data-mode="dark"] {
   color-scheme: dark;
   --pam-chrome: #06090d;
+  --pam-sidebar: #0c1117;
   --pam-surface: #131a22;
   --pam-surface-raised: #1c2530;
   --pam-ink: #eef3f5;
@@ -131,6 +133,7 @@
 [data-theme="vina"][data-mode="light"] {
   color-scheme: light;
   --pam-chrome: #f5f2f6;
+  --pam-sidebar: #edeaf3;
   --pam-surface: #fffafd;
   --pam-surface-raised: #ffffff;
   --pam-ink: #211d38;
@@ -184,6 +187,7 @@
 [data-theme="vina"][data-mode="dark"] {
   color-scheme: dark;
   --pam-chrome: #090e1c;
+  --pam-sidebar: #101629;
   --pam-surface: #172039;
   --pam-surface-raised: #22283f;
   --pam-ink: #f6eff8;
@@ -238,6 +242,7 @@
   :root:not([data-mode]) {
     color-scheme: dark;
     --pam-chrome: #06090d;
+    --pam-sidebar: #0c1117;
     --pam-surface: #131a22;
     --pam-surface-raised: #1c2530;
     --pam-ink: #eef3f5;

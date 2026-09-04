@@ -179,6 +179,27 @@ function renderSettings() {
   return router;
 }
 
+describe("settings navigation", () => {
+  it("selects one category and preserves dirty form state across category jumps", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    const router = renderSettings();
+    const categories = await screen.findByRole("navigation", { name: "Settings categories" });
+    const links = within(categories).getAllByRole("link");
+    expect(links.filter((link) => link.dataset.selected === "true")).toHaveLength(1);
+    const field = await screen.findByRole("textbox", { name: "models directory" });
+    await waitFor(() => expect(field).toHaveValue("/Users/dev/llm"));
+    fireEvent.change(field, { target: { value: "/tmp/unsaved-models" } });
+    fireEvent.click(within(categories).getByRole("link", { name: "Retention" }));
+    await waitFor(() => expect(router.state.location.hash).toBe("retention"));
+    expect(links.filter((link) => link.dataset.selected === "true")).toHaveLength(1);
+    expect(within(categories).getByRole("link", { name: "Retention" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(field).toHaveValue("/tmp/unsaved-models");
+  });
+});
+
 describe("profile", () => {
   it("renders the daemon's current profile checked, with a sentence each", async () => {
     renderSettings();

@@ -70,7 +70,7 @@ function InputsFrame({ data, selected }: NodeProps<InputsNode>) {
         marker={data.marker}
       />
       {names.length === 0 ? (
-        <p className="px-3 py-2.5 font-voice text-sm text-ink-muted italic">no inputs</p>
+        <p className="px-3 py-2.5 font-sans text-sm text-ink-muted">no inputs</p>
       ) : (
         <ul className="space-y-1 px-3 py-2.5">
           {names.map((name) => {

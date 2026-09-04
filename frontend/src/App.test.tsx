@@ -20,9 +20,7 @@ afterEach(() => {
 describe("shell routing", () => {
   it("opens on Home, where Pam answers for herself", async () => {
     const router = renderShell("/");
-    expect(
-      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
     expect(router.state.location.pathname).toBe("/");
   });
 

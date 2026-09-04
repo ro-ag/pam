@@ -24,6 +24,7 @@
 
   /* three grounds */
   --color-chrome: var(--pam-chrome);
+  --color-sidebar: var(--pam-sidebar);
   --color-surface: var(--pam-surface);
   --color-surface-raised: var(--pam-surface-raised);
 
@@ -96,18 +97,12 @@
   --radius-overlay: 0.75rem;
   --radius-pill: 9999px; /* circular indicators and true toggles */
 
-  /* ---------------------------------------------------------------- *
-   * Typography — three voices + furniture.
-   *   display: Archivo    — the tower's signage (numbers, heroes)
-   *   voice:   Newsreader — Pam speaks in serif, data never does
-   *   data:    Plex Mono  — evidence, hashes, paths, audit rows
-   *   sans:    Inter      — controls and labels; furniture, not personality
-   * ---------------------------------------------------------------- */
+  /* Costa native typography: UI for prose and controls, mono for evidence. */
   --font-*: initial;
-  --font-display: "Archivo Variable", "Inter Variable", sans-serif;
-  --font-voice: "Newsreader Variable", Georgia, serif;
-  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
-  --font-sans: "Inter Variable", system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-voice: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-data: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 
   /* Fixed desktop typography: more width exposes work, not larger controls. */
   --text-sm: 0.8125rem;

@@ -94,7 +94,7 @@ describe("shell layout", () => {
     );
   });
 
-  it("makes the toolbar the panel's first child, inside the panel", async () => {
+  it("keeps the draggable toolbar above the scrolling workspace", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
     const panel = document.querySelector("main section");
@@ -145,8 +145,6 @@ describe("Sidebar", () => {
       "Settings",
     ]);
     expect(links[0]).toHaveAttribute("aria-current", "page");
-    expect(
-      await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)$/ }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeInTheDocument();
   });
 });

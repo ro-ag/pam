@@ -20,6 +20,11 @@ export type ModeId = (typeof modeIds)[number];
 
 export type MaterialId = "glass" | "opaque";
 export const materialStorageKey = "pam-material";
+export const glassOpacityStorageKey = "pam-glass-opacity";
+
+export function isGlassOpacity(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 60 && value <= 100;
+}
 
 export const backgroundMotionIds = ["off", "slow", "slower"] as const;
 export type BackgroundMotionId = (typeof backgroundMotionIds)[number];
@@ -97,6 +102,7 @@ export interface ThemeState {
   theme: ThemeId;
   mode: ModeId;
   material: MaterialId;
+  glassOpacity: number;
   backgroundMotion: BackgroundMotionId;
   backgroundSpeed: number;
   backgroundIntensity: number;
@@ -127,6 +133,7 @@ export function themeSnapshot(): ThemeState {
       theme: isThemeId(theme) ? theme : defaultTheme,
       mode: isModeId(mode) ? mode : systemMode(),
       material: isMaterialId(material) ? material : "glass",
+      glassOpacity: readGlassOpacity(),
       backgroundMotion: readBackgroundMotion(),
       backgroundSpeed: readBackgroundSpeed(),
       backgroundIntensity: readBackgroundIntensity(),
@@ -169,6 +176,7 @@ export function applyTheme(
     theme,
     mode,
     material: isMaterialId(material) ? material : "glass",
+    glassOpacity: readGlassOpacity(),
     backgroundMotion: readBackgroundMotion(),
     backgroundSpeed: readBackgroundSpeed(),
     backgroundIntensity: readBackgroundIntensity(),
@@ -181,6 +189,24 @@ export function applyMaterial(material: MaterialId, options?: { persist?: boolea
   document.documentElement.dataset.material = material;
   if (options?.persist !== false) persist(materialStorageKey, material);
   snapshot = { ...themeSnapshot(), material };
+  for (const listener of listeners) listener();
+}
+
+function readGlassOpacity(): number {
+  const opacity = Number(document.documentElement.dataset.glassOpacity);
+  return isGlassOpacity(opacity) ? opacity : 84;
+}
+
+function stampGlassOpacity(opacity: number): void {
+  document.documentElement.dataset.glassOpacity = String(opacity);
+  document.documentElement.style.setProperty("--glass-opacity", `${opacity}%`);
+}
+
+export function applyGlassOpacity(opacity: number): void {
+  if (!isGlassOpacity(opacity)) return;
+  stampGlassOpacity(opacity);
+  persist(glassOpacityStorageKey, String(opacity));
+  snapshot = { ...themeSnapshot(), glassOpacity: opacity };
   for (const listener of listeners) listener();
 }
 
@@ -282,6 +308,10 @@ export function initTheme(): { theme: ThemeId; mode: ModeId } {
   const mode = stored(modeStorageKey, isModeId) ?? systemMode();
   document.documentElement.dataset.material =
     stored(materialStorageKey, isMaterialId) ?? "glass";
+  const savedOpacity = Number(
+    stored(glassOpacityStorageKey, (value): value is string => typeof value === "string"),
+  );
+  stampGlassOpacity(isGlassOpacity(savedOpacity) ? savedOpacity : 84);
   document.documentElement.dataset.backgroundMotion =
     stored(backgroundMotionStorageKey, isBackgroundMotionId) ?? "slow";
   const savedSpeed = Number(

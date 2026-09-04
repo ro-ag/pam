@@ -9,6 +9,8 @@ import {
   isBackgroundSpeed,
   applyBackgroundIntensity,
   backgroundIntensityStorageKey,
+  applyGlassOpacity,
+  glassOpacityStorageKey,
   isBackgroundMotionId,
   materialStorageKey,
   defaultTheme,
@@ -30,6 +32,8 @@ afterEach(() => {
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.mode;
   delete document.documentElement.dataset.material;
+  delete document.documentElement.dataset.glassOpacity;
+  document.documentElement.style.removeProperty("--glass-opacity");
   delete document.documentElement.dataset.backgroundMotion;
   delete document.documentElement.dataset.backgroundSpeed;
   delete document.documentElement.dataset.backgroundIntensity;
@@ -69,6 +73,7 @@ describe("the shared theme store", () => {
       theme: "vina",
       mode: "dark",
       material: "glass",
+      glassOpacity: 84,
       backgroundMotion: "slow",
       backgroundSpeed: 1,
       backgroundIntensity: 70,
@@ -87,6 +92,7 @@ describe("the shared theme store", () => {
       theme: "vina",
       mode: "light",
       material: "glass",
+      glassOpacity: 84,
       backgroundMotion: "slow",
       backgroundSpeed: 1,
       backgroundIntensity: 70,
@@ -154,6 +160,35 @@ describe("initTheme", () => {
 });
 
 describe("Costa material preference", () => {
+  it("persists glass opacity independently from solid-surface overrides", () => {
+    initTheme();
+    expect(themeSnapshot().glassOpacity).toBe(84);
+    expect(window.localStorage.getItem(glassOpacityStorageKey)).toBeNull();
+    applyGlassOpacity(72);
+    applyMaterial("opaque");
+    initTheme();
+    expect(themeSnapshot().glassOpacity).toBe(72);
+    expect(themeSnapshot().material).toBe("opaque");
+    applyTheme("vina", "dark");
+    applyMaterial("glass");
+    expect(document.documentElement.style.getPropertyValue("--glass-opacity")).toBe("72%");
+    expect(themeSnapshot().glassOpacity).toBe(72);
+  });
+
+  it("validates opacity and uses a safe fallback for invalid storage", () => {
+    initTheme();
+    for (const invalid of [59, 101, NaN, Infinity]) {
+      applyGlassOpacity(invalid);
+      expect(themeSnapshot().glassOpacity).toBe(84);
+    }
+    window.localStorage.setItem(glassOpacityStorageKey, "garbage");
+    initTheme();
+    expect(themeSnapshot().glassOpacity).toBe(84);
+    applyGlassOpacity(60);
+    expect(themeSnapshot().glassOpacity).toBe(60);
+    applyGlassOpacity(100);
+    expect(themeSnapshot().glassOpacity).toBe(100);
+  });
   it("persists and restores material without changing the selected theme", () => {
     applyTheme("vina", "light");
     applyMaterial("opaque");
@@ -161,6 +196,7 @@ describe("Costa material preference", () => {
       theme: "vina",
       mode: "light",
       material: "opaque",
+      glassOpacity: 84,
       backgroundMotion: "slow",
       backgroundSpeed: 1,
       backgroundIntensity: 70,

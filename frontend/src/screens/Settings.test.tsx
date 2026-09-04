@@ -13,6 +13,8 @@ import {
   backgroundSpeedStorageKey,
   applyBackgroundIntensity,
   backgroundIntensityStorageKey,
+  applyGlassOpacity,
+  glassOpacityStorageKey,
 } from "../lib/theme";
 import { createAppRouter } from "../router";
 import {
@@ -89,6 +91,7 @@ beforeEach(() => {
   applyBackgroundMotion("slow");
   applyBackgroundSpeed(1);
   applyBackgroundIntensity(70);
+  applyGlassOpacity(84);
 
   mocks.subscribeEvents.mockResolvedValue(() => {});
   mocks.daemonStatus.mockResolvedValue({
@@ -187,6 +190,8 @@ afterEach(() => {
   delete document.documentElement.dataset.backgroundMotion;
   delete document.documentElement.dataset.backgroundSpeed;
   delete document.documentElement.dataset.backgroundIntensity;
+  delete document.documentElement.dataset.glassOpacity;
+  document.documentElement.style.removeProperty("--glass-opacity");
   document.documentElement.style.removeProperty("--background-intensity");
   document.documentElement.style.removeProperty("--background-drift-duration");
 });
@@ -428,6 +433,20 @@ describe("grants", () => {
 });
 
 describe("appearance", () => {
+  it("adjusts opacity while preserving the reduced-transparency override", async () => {
+    renderSettings();
+    const opacity = await screen.findByRole("slider", { name: "Glass opacity" });
+    expect(opacity).toHaveValue("84");
+    fireEvent.change(opacity, { target: { value: "72" } });
+    expect(window.localStorage.getItem(glassOpacityStorageKey)).toBe("72");
+    expect(document.documentElement.style.getPropertyValue("--glass-opacity")).toBe("72%");
+    const reduce = screen.getByRole("checkbox", { name: "Reduce transparency" });
+    fireEvent.click(reduce);
+    expect(opacity).toBeDisabled();
+    fireEvent.click(reduce);
+    expect(opacity).toHaveValue("72");
+    expect(opacity).toBeEnabled();
+  });
   it("adjusts movement intensity independently from speed and retains it when off", async () => {
     renderSettings();
     const intensity = await screen.findByRole("slider", { name: "Movement intensity" });

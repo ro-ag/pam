@@ -74,7 +74,7 @@ export function CommandPalette() {
       <Button variant="ghost" size="sm" onClick={show} aria-label="Open command palette">
         <Search size={14} aria-hidden="true" />
         <span className="hidden sm:inline">Jump to…</span>
-        <kbd className="hidden font-mono text-micro text-ink-faint sm:inline">
+        <kbd className="hidden font-data text-xs text-ink-faint sm:inline">
           {/Mac|iPhone|iPad/.test(navigator.platform) ? "⌘K" : "Ctrl K"}
         </kbd>
       </Button>
@@ -176,7 +176,7 @@ function PaletteDialog({
       aria-labelledby={`${id}-title`}
       aria-describedby={`${id}-hint`}
       aria-modal="true"
-      className="m-auto w-full max-w-xl overflow-hidden rounded-panel border border-line bg-surface p-0 text-ink shadow-lg backdrop:bg-black/50"
+      className="command-palette-dialog m-auto w-full max-w-xl overflow-hidden rounded-panel border border-line bg-surface p-0 text-ink shadow-lg"
       onKeyDown={keyDown}
       onCancel={(event) => {
         event.preventDefault();

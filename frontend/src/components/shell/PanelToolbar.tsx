@@ -11,6 +11,8 @@ import {
 import { Button } from "../ui/Button";
 import { Beacon } from "./Beacon";
 import { useDaemonStatus } from "./useDaemonStatus";
+import { CommandPalette } from "./CommandPalette";
+import { WorkspaceMenu } from "./WorkspaceMenu";
 
 /**
  * The panel toolbar — the shell's chrome controls, living INSIDE the work
@@ -41,6 +43,10 @@ export function PanelToolbar() {
       data-tauri-drag-region=""
       className="material-edge flex h-11 shrink-0 items-center justify-end gap-2 px-3"
     >
+      <div className="flex min-w-0 items-center gap-1 mr-auto">
+        <CommandPalette />
+        <WorkspaceMenu />
+      </div>
       <span data-tauri-drag-region="" className="flex items-center pr-1">
         <Beacon state={daemon} />
       </span>

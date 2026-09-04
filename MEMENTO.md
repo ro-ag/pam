@@ -65,3 +65,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-bounded-desktop-controls
+- kind: project-way
+- scope: project
+- rule: PAM appearance controls must stay in bounded, grouped panels on large monitors instead of stretching sliders across the full workspace.
+- fix: Cap Appearance at1240px, use two responsive control cards with custom native range tracks/readouts and compact switches; stack below760px.
+- hits: 2026-09-04
+- cost: 0
+- status: watching
+

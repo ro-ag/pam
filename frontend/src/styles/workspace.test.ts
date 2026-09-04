@@ -64,6 +64,21 @@ describe("desktop workspace materials", () => {
 });
 
 describe("Settings layout contract", () => {
+  it("bounds controls rather than stretching faders across large monitors", () => {
+    expect(styles).toMatch(/\.appearance-panel\s*\{[^}]*max-width: 1240px/);
+    expect(styles).toMatch(
+      /\.appearance-control-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
+    );
+    expect(styles).toContain("@container (max-width: 760px)");
+    expect(styles).toContain(".preference-range input::-webkit-slider-thumb");
+    expect(styles).toContain(".preference-range input::-moz-range-thumb");
+    expect(styles).toContain("var(--glass-opacity, 84%)");
+  });
+
+  it("adds page entrances without transforming the scroll container", () => {
+    expect(styles).toContain(".workspace-scroll:not([data-settings]) > *");
+    expect(styles).toContain("animation: workspace-enter 180ms");
+  });
   it("animates only active pane contents, preserving the static pane container", () => {
     expect(styles).toContain(".settings-pane:not([hidden]) > section");
     expect(styles).toContain("animation: settings-pane-enter 180ms");

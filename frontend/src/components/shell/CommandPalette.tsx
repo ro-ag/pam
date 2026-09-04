@@ -5,6 +5,7 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { flowsList, modelsList } from "../../lib/ipc";
 import { Button } from "../ui/Button";
+import { LiquidGlassBackdrop } from "../ui/LiquidGlassBackdrop";
 
 type Destination = {
   id: string;
@@ -176,7 +177,7 @@ function PaletteDialog({
       aria-labelledby={`${id}-title`}
       aria-describedby={`${id}-hint`}
       aria-modal="true"
-      className="command-palette-dialog m-auto w-full max-w-xl overflow-hidden rounded-panel border border-line bg-surface p-0 text-ink shadow-lg"
+      className="command-palette-dialog liquid-glass-panel m-auto w-full max-w-xl overflow-hidden rounded-panel border border-line bg-surface p-0 text-ink shadow-lg"
       onKeyDown={keyDown}
       onCancel={(event) => {
         event.preventDefault();
@@ -186,6 +187,7 @@ function PaletteDialog({
         if (event.target === event.currentTarget) onClose();
       }}
     >
+      <LiquidGlassBackdrop />
       <div className="flex items-center justify-between px-4 pt-3">
         <h2 id={`${id}-title`} className="text-sm font-semibold">
           Jump to

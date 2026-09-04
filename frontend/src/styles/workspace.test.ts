@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import styles from "../styles.css?raw";
 
 describe("desktop workspace materials", () => {
+  it("scrolls dialog content independently of its stationary glass backdrop", () => {
+    expect(styles).toMatch(/\.workspace-dialog-content\s*\{[^}]*overflow-y: auto/);
+    expect(styles).toMatch(/\.liquid-glass-backdrop\s*\{[^}]*position: absolute/);
+  });
   it("uses one preblurred backdrop without surface textures or remote requests", () => {
     expect(styles).not.toContain("glass-droplets");
     expect(styles).toContain('url("./assets/materials/chaos-soft.webp")');
@@ -71,7 +75,9 @@ describe("Settings layout contract", () => {
       "grid-template-columns: minmax(300px, 0.95fr) minmax(330px, 1fr) minmax(360px, 1.1fr)",
     );
     expect(styles).toMatch(/\.appearance-control-grid\s*\{\s*display: contents/);
-    expect(styles).toMatch(/\.appearance-control-card > \*\s*\{[^}]*max-width: 640px/);
+    expect(styles).toMatch(
+      /\.appearance-control-card > :not\(\.liquid-glass-backdrop\)\s*\{[^}]*max-width: 640px/,
+    );
     expect(styles).toMatch(
       /\.appearance-control-grid\s*\{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
     );

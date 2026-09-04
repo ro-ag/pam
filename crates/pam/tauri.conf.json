@@ -7,7 +7,10 @@
   "build": {
     "beforeDevCommand": { "script": "npm run dev", "cwd": "../../frontend" },
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": { "script": "npm run build", "cwd": "../../frontend" },
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../../frontend"
+    },
     "frontendDist": "../../frontend/dist"
   },
   "app": {
@@ -29,7 +32,7 @@
     ],
     "security": {
       "capabilities": ["main-window"],
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; font-src 'self'; img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; font-src 'self'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
       "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420; font-src 'self' data:; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'"
     }
   },

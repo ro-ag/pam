@@ -67,19 +67,63 @@
     z-index: -1;
     pointer-events: none;
   }
-  .desktop-shell::before {
+  .desktop-shell::before,
+  .liquid-glass-texture {
     background: var(--pam-action-gradient);
     mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
     -webkit-mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
     opacity: 0.65;
   }
   [data-background-motion="slow"] .desktop-shell::before,
-  [data-background-motion="slower"] .desktop-shell::before {
+  [data-background-motion="slower"] .desktop-shell::before,
+  [data-background-motion="slow"] .liquid-glass-texture,
+  [data-background-motion="slower"] .liquid-glass-texture {
     animation: background-drift var(--background-drift-duration, 240s) ease-in-out infinite;
     transform-origin: 55% 48%;
   }
   [data-background-motion="off"] .desktop-shell::before {
     animation: none;
+  }
+  .liquid-glass-panel {
+    isolation: isolate;
+  }
+  .liquid-glass-panel:not(dialog) {
+    position: relative;
+  }
+  .liquid-glass-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+    border-radius: inherit;
+    pointer-events: none;
+  }
+  .liquid-glass-source {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    contain: paint;
+  }
+  .liquid-glass-scene {
+    position: absolute;
+    width: var(--glass-scene-width);
+    height: var(--glass-scene-height);
+    left: var(--glass-scene-left);
+    top: var(--glass-scene-top);
+    background: var(--pam-chrome);
+  }
+  .liquid-glass-texture,
+  .liquid-glass-scene::after {
+    position: absolute;
+    inset: 0;
+  }
+  .liquid-glass-scene::after {
+    content: "";
+    background: color-mix(
+      in srgb,
+      var(--pam-surface-raised) var(--glass-opacity, 84%),
+      transparent
+    );
   }
   @keyframes background-drift {
     0%,
@@ -125,6 +169,11 @@
   .workspace-dialog {
     width: min(25rem, calc(100vw - 2rem));
     max-height: calc(100dvh - 2rem);
+  }
+  .workspace-dialog-content {
+    max-height: calc(100dvh - 2rem - 2px);
+    overflow-y: auto;
+    padding: 20px;
   }
   .workspace-dialog::backdrop,
   .command-palette-dialog::backdrop {
@@ -471,7 +520,7 @@
     .appearance-control-card {
       align-self: stretch;
     }
-    .appearance-control-card > * {
+    .appearance-control-card > :not(.liquid-glass-backdrop) {
       width: 100%;
       max-width: 640px;
       margin-inline: auto;

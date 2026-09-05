@@ -1,18 +1,7 @@
-//! Vendored from candle-transformers 0.9.2 `models/quantized_qwen3_moe.rs`
-//! (Apache-2.0, Hugging Face); the only change is `clear_kv_cache`, which
-//! upstream lacks and which PAM needs to start each generation from an empty
-//! cache without rebuilding the model.
-//!
-//! Rebuilding is what the alternative costs: `GGUFQWenMoE`'s layers are
-//! private upstream, so with no reset the only way to get an empty cache is
-//! to re-read the file and re-map every tensor — tens of seconds for an
-//! 18 GB engine-class `MoE`, before every prompt. Three lines of vendored
-//! code buy that back.
-//!
-//! Everything else is upstream's, byte for byte apart from the `use` paths
-//! (`super::`/`crate::` become the public `candle_transformers::…` ones) so
-//! that a future upstream diff stays readable. Fix bugs here only if they
-//! are also fixed upstream.
+//! Adapted from candle-transformers 0.9.2 `models/quantized_qwen3_moe.rs`
+//! (Apache-2.0, Hugging Face). PAM adds KV-cache reset and a portable
+//! quantized sparse-expert adapter: upstream's fused GGUF `MoE` kernel only
+//! supports CUDA, while PAM ships CPU and Metal backends.
 
 // Three pedantic lints are waived for the whole vendored module rather than
 // at each site. Every other one this file used to trip has been fixed in the
@@ -43,12 +32,13 @@
     clippy::many_single_char_names
 )]
 
+use crate::sparse_moe::{SparseMoe, split_expert_tensors};
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Linear;
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::{Embedding, Module};
-use candle_transformers::fused_moe::{FusedMoeGGUF, MoeCfg};
+use candle_transformers::fused_moe::MoeCfg;
 use candle_transformers::models::quantized_qwen3::{Gguf, RotaryEmbedding};
 use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
@@ -71,15 +61,15 @@ impl Module for Mlp {
 }
 
 enum MoeOrMlp {
-    FusedMoe(FusedMoeGGUF),
+    FusedMoe(SparseMoe),
     Mlp(Mlp),
 }
 
 impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
         match self {
             Self::Mlp(m) => m.forward(xs),
-            Self::FusedMoe(m) => m.forward(xs, is_prefill),
+            Self::FusedMoe(m) => m.forward(xs),
         }
     }
 }
@@ -297,11 +287,12 @@ pub struct GGUFQWenMoE {
 
 impl GGUFQWenMoE {
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
-        ct: gguf_file::Content,
+        mut ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        split_expert_tensors(&mut ct)?;
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle_core::bail!("cannot find {s} in metadata"),
@@ -384,19 +375,14 @@ impl GGUFQWenMoE {
                     .dequantize(device)?
                     .to_dtype(DType::F32)?;
                 let gate = Linear::new(gate_ws, None);
-                let gate_experts = Arc::new(gg.tensor(&format!("{prefix}.ffn_gate_exps.weight"))?);
-                let up_experts = Arc::new(gg.tensor(&format!("{prefix}.ffn_up_exps.weight"))?);
-                let down_experts = Arc::new(gg.tensor(&format!("{prefix}.ffn_down_exps.weight"))?);
-                let moe = FusedMoeGGUF {
+                let moe = SparseMoe::load(
+                    &mut gg,
+                    &prefix,
                     gate,
-                    gate_experts,
-                    up_experts,
-                    down_experts,
-                    act: candle_nn::Activation::Silu,
-                    norm_topk_prob: moe_cfg.norm_topk_prob,
-                    num_experts_per_tok: moe_cfg.num_experts_per_tok,
-                    dtype,
-                };
+                    moe_cfg.num_experts,
+                    moe_cfg.num_experts_per_tok,
+                    moe_cfg.norm_topk_prob,
+                )?;
 
                 MoeOrMlp::FusedMoe(moe)
             } else {

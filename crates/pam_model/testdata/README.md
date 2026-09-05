@@ -13,8 +13,9 @@ one.
 
 The download tests (task #33) serve their bytes from a tokio TCP server
 started inside the test, and the runtime bench (task #34) reads a real model
-from the path in `PAM_BENCH_MODEL` when the developer sets it, skipping
-otherwise.
+from the path in `PAM_BENCH_MODEL`. It is explicitly ignored by default;
+run it with `PAM_BENCH_BACKEND=cpu` or `metal` and `--ignored --nocapture`.
+An ordinary test pass does not establish real-model inference qualification.
 
 Nothing here is read at runtime; this directory exists to say why it is
 empty.

@@ -214,8 +214,7 @@ const RECOVERY_SUPPORTED_ARCH: &str =
     "PAM runs qwen3 and qwen3moe GGUF models; pick one of those from the catalog.";
 
 /// Recovery line for a load candle refused.
-const RECOVERY_VERIFY_FILE: &str =
-    "Verify the file on the PAM GUI Models screen; a truncated or foreign GGUF cannot be mapped.";
+const RECOVERY_VERIFY_FILE: &str = "Read the load error detail. For an unsupported quantization/backend, choose a supported model/backend and retain the model file and error when reporting it. For a truncated or unreadable GGUF, verify the file on the PAM GUI Models screen.";
 
 /// Recovery line for a curator that is not there.
 const RECOVERY_CURATOR_PICK: &str =
@@ -811,16 +810,18 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
 }
 
 /// A refusal for a runtime failure, keeping the runtime's own cause.
-fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
+pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
     let recovery = match err {
         pam_model::RuntimeError::NoModelLoaded => RECOVERY_LOAD_A_MODEL,
         pam_model::RuntimeError::UnsupportedArchitecture(_) => RECOVERY_SUPPORTED_ARCH,
         pam_model::RuntimeError::LoadFailed(_) => RECOVERY_VERIFY_FILE,
         pam_model::RuntimeError::PromptTooLong { .. } => RECOVERY_SHORTEN_PROMPT,
         pam_model::RuntimeError::Busy => RECOVERY_RETRY_LATER,
-        pam_model::RuntimeError::Cancelled
-        | pam_model::RuntimeError::GenerationFailed(_)
-        | pam_model::RuntimeError::Crashed => RECOVERY_INTERNAL,
+        pam_model::RuntimeError::Cancelled => "The generation was cancelled. Try again when ready.",
+        pam_model::RuntimeError::GenerationFailed(_) => {
+            "Keep the error detail and report it with the model file, architecture, quantization and backend from model status. Try a supported model/backend; restarting does not repair incompatible inference kernels."
+        }
+        pam_model::RuntimeError::Crashed => RECOVERY_INTERNAL,
     };
     AdminRefusal {
         cause: err.cause(),

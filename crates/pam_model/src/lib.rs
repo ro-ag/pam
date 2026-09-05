@@ -52,6 +52,9 @@ pub mod gguf;
 pub mod qwen3_moe;
 pub mod registry;
 pub mod runtime;
+mod sparse_moe;
+#[cfg(test)]
+mod sparse_moe_test;
 pub mod tokenizer;
 
 /// A range-serving HTTP origin for download tests.

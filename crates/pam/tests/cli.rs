@@ -686,3 +686,117 @@ async fn a_positional_input_without_an_equals_sign_never_reaches_the_daemon() {
     );
     assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
 }
+
+/// A repository in a specific dirty state, with config that would hide untracked files.
+fn clean_tree_fixture(state: &str) -> tempfile::TempDir {
+    let repo = temp_git_repo();
+    // User configuration must not hide untracked changes from the assertion.
+    assert!(
+        Command::new("git")
+            .args(["config", "status.showUntrackedFiles", "no"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    match state {
+        "staged" | "unstaged" => {
+            std::fs::write(repo.path().join("README.md"), "changed\n").unwrap();
+            if state == "staged" {
+                assert!(
+                    Command::new("git")
+                        .args(["add", "README.md"])
+                        .current_dir(repo.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        "untracked" => {
+            std::fs::write(repo.path().join("dirty.txt"), "untracked\n").unwrap();
+        }
+        _ => {}
+    }
+    repo
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cli() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        let store = Store::open(&daemon.base().join("state.sqlite3"))
+            .await
+            .unwrap();
+        for state in ["clean", "staged", "unstaged", "untracked"] {
+            let repo = clean_tree_fixture(state);
+            let run = run_pam(
+                &daemon.base(),
+                repo.path(),
+                &["flow", "run", "after-merge-checks", "--json"],
+            )
+            .await;
+            let expected_code = if state == "clean" {
+                0
+            } else {
+                i32::from(render::EXIT_UNRESOLVED)
+            };
+            assert_eq!(
+                run.code, expected_code,
+                "{state}: {} {}",
+                run.stdout, run.stderr
+            );
+            let response: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            let outcome = if state == "clean" {
+                "verified"
+            } else {
+                "unresolved"
+            };
+            assert_eq!(response["outcome"], outcome, "{state}: {response}");
+            let step = response["body"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["id"] == "clean-tree")
+                .unwrap();
+            assert_eq!(
+                step["exit_status"], 0,
+                "git itself exits zero even when dirty"
+            );
+            assert_eq!(
+                step["status"],
+                if state == "clean" {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
+            if state != "clean" {
+                assert_eq!(step["error"]["cause"], "output_assertion");
+                let mut retained = Vec::new();
+                for id in step["evidence"].as_array().unwrap() {
+                    let evidence = store
+                        .get_evidence(id.as_str().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    retained.extend(evidence.content);
+                }
+                let text = String::from_utf8_lossy(&retained);
+                let path = if state == "untracked" {
+                    "dirty.txt"
+                } else {
+                    "README.md"
+                };
+                assert!(
+                    text.contains(path),
+                    "{state} evidence lost dirty path: {text}"
+                );
+            }
+        }
+        daemon.stop().await;
+    })
+    .await
+    .expect("clean-tree CLI cases complete within deadline");
+}

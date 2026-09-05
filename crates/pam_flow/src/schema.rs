@@ -288,6 +288,9 @@ pub struct Step {
     pub effect: Effect,
     /// Observe, verify or change.
     pub role: Role,
+    /// Require no stdout or stderr bytes, in addition to a zero command exit.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub expect_empty_output: bool,
     /// What happens to the output.
     pub output: OutputPolicy,
     /// Earlier step ids this one waits for.
@@ -392,6 +395,8 @@ pub(crate) struct RawStep {
     pub(crate) role: Option<Role>,
     #[serde(default)]
     pub(crate) output: Option<OutputPolicy>,
+    #[serde(default)]
+    pub(crate) expect_empty_output: Option<bool>,
     #[serde(default)]
     pub(crate) needs: Option<Vec<String>>,
     #[serde(default)]

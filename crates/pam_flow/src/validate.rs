@@ -450,6 +450,16 @@ struct Scope {
     earlier: BTreeSet<String>,
 }
 
+fn reject_connector_output_assertion(value: Option<bool>, at: &str) -> Result<(), FlowError> {
+    if value.is_some() {
+        return Err(FlowError::invalid(
+            format!("{at}.expect_empty_output"),
+            "`expect_empty_output` belongs to a command step",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, FlowError> {
     let at = format!("steps[{index}]");
     check_id(&raw.id, &format!("{at}.id"), "a step id")?;
@@ -490,6 +500,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
             Action::Command { argv }
         }
         (None, Some(connector)) => {
+            reject_connector_output_assertion(raw.expect_empty_output, &at)?;
             if raw.env.is_some() {
                 return Err(FlowError::invalid(
                     format!("{at}.env"),
@@ -550,6 +561,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         effect,
         role,
         output: raw.output.unwrap_or_default(),
+        expect_empty_output: raw.expect_empty_output.unwrap_or_default(),
         needs,
         when,
         retry,

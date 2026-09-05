@@ -161,3 +161,17 @@ fn an_empty_note_disappears_and_only_a_real_note_moves_the_digest() {
     assert_eq!(digest(&plain), digest(&blank));
     assert_ne!(digest(&plain), digest(&noted));
 }
+
+#[test]
+fn empty_output_assertion_survives_normalization_and_changes_digest() {
+    let plain =
+        parse("schema: 1\nid: clean\nname: Clean\nsteps:\n  - id: clean\n    run: [git, status]\n")
+            .unwrap();
+    let mut asserted = plain.clone();
+    asserted.steps[0].expect_empty_output = true;
+    let yaml = to_normalized_yaml(&asserted);
+    assert!(yaml.contains("expect_empty_output: true"));
+    assert_eq!(parse(&yaml).unwrap(), asserted);
+    assert_ne!(digest(&plain), digest(&asserted));
+    assert!(!to_normalized_yaml(&plain).contains("expect_empty_output"));
+}

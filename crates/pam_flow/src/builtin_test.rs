@@ -93,14 +93,26 @@ fn the_command_starters_match_the_spec_table() {
         argv("after-merge-checks"),
         [
             vec!["git", "fetch", "--prune"],
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "log", "--oneline", "-20"],
         ]
     );
     assert_eq!(
         argv("pr-readiness"),
         [
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "fetch", "--prune"],
             vec!["git", "log", "--oneline", "origin/main..HEAD"],
             vec!["cargo", "fmt", "--all", "--check"],
@@ -119,7 +131,13 @@ fn the_command_starters_match_the_spec_table() {
     assert_eq!(
         argv("release-readiness"),
         [
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "describe", "--tags", "--abbrev=0"],
             vec!["cargo", "test", "--workspace"],
             vec!["cargo", "package", "--list", "--allow-dirty"],
@@ -208,4 +226,32 @@ fn the_connector_starters_call_the_spec_table() {
     );
     assert_eq!(flow.steps[2].output, OutputPolicy::Summarize);
     assert!(flow.steps.iter().all(super::schema::Step::gated));
+}
+
+#[test]
+fn readiness_clean_tree_steps_assert_all_porcelain_output_is_empty() {
+    for id in ["after-merge-checks", "pr-readiness", "release-readiness"] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        let step = flow
+            .steps
+            .iter()
+            .find(|step| step.id == "clean-tree")
+            .unwrap();
+        assert!(step.expect_empty_output, "{id}");
+        assert_eq!(step.role, Role::Verify);
+        assert_eq!(
+            step.action,
+            Action::Command {
+                argv: [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none"
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            }
+        );
+    }
 }

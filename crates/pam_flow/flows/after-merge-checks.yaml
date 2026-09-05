@@ -8,7 +8,8 @@ steps:
   - id: fetch
     run: [git, fetch, --prune]
   - id: clean-tree
-    run: [git, status, --short]
+    run: [git, status, --porcelain=v1, --untracked-files=all, --ignore-submodules=none]
+    expect_empty_output: true
     role: verify
   - id: recent-commits
     run: [git, log, --oneline, "-20"]

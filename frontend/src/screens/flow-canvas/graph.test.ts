@@ -432,3 +432,8 @@ describe("argv and ids", () => {
     expect(isStepId("has space")).toBe(false);
   });
 });
+
+it("preserves command output assertions through designer serialization", () => {
+  const raw = toRaw(spec({ a: { expect_empty_output: true } }));
+  expect(raw.steps[0].expect_empty_output).toBe(true);
+});

@@ -135,6 +135,8 @@ pub const CAUSE_OUTPUT_LIMIT: &str = "output_limit";
 
 /// Step cause: the program exited non-zero.
 pub const CAUSE_EXIT_STATUS: &str = "exit_status";
+/// Refusal cause: a command expected to be silent emitted output.
+pub const CAUSE_OUTPUT_ASSERTION: &str = "output_assertion";
 
 /// Step cause: the program could not be started at all.
 pub const CAUSE_SPAWN_FAILED: &str = "spawn_failed";
@@ -1222,6 +1224,16 @@ impl RunState<'_> {
     /// request was cancelled.
     async fn attempt_command(&mut self, spec: &CommandSpec, step: &Step) -> Option<Attempt> {
         match run_command(spec.clone(), &mut self.cancel).await {
+            CommandOutcome::Exited { status: 0, output }
+                if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
+                    exit_status: Some(0),
+                    output,
+                    status: StepStatus::Failed,
+                    cause: CAUSE_OUTPUT_ASSERTION,
+                    detail: format!("step {:?} expected empty output but the command emitted bytes", step.id),
+                    recovery: "read the step's evidence, resolve the reported changes or warnings, and re-run the flow".to_owned(),
+                    retry_after: None,
+                }),
             CommandOutcome::Exited { status: 0, output } => Some(Attempt::Succeeded {
                 exit_status: Some(0),
                 output,

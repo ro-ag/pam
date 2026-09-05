@@ -659,3 +659,15 @@ fn parse_value_refuses_an_unknown_key_by_path() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn empty_output_assertion_is_command_only() {
+    let flow = good(&wrap(
+        "  - id: clean\n    run: [git, status]\n    expect_empty_output: true\n",
+    ));
+    assert!(flow.steps[0].expect_empty_output);
+    let (path, _) = bad_step(
+        "  - id: runs\n    connector: github\n    call: runs\n    expect_empty_output: true\n",
+    );
+    assert_eq!(path, "steps[0].expect_empty_output");
+}

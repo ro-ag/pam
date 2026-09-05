@@ -334,7 +334,7 @@ fn resources(pid: u32) -> Value {
     #[cfg(not(target_os = "macos"))]
     let thread_count = std::fs::read_dir(format!("/proc/{pid}/task"))
         .ok()
-        .map(|entries| entries.count());
+        .map(Iterator::count);
     json!({"rss_kib_cpu_percent": rss_cpu, "numeric_fd_count": fd_count, "thread_rows": thread_count})
 }
 

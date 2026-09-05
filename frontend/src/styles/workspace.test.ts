@@ -1,3 +1,4 @@
+import tokens from "./tokens.css?raw";
 import { describe, expect, it } from "vitest";
 import styles from "../styles.css?raw";
 
@@ -113,4 +114,21 @@ describe("Settings layout contract", () => {
     expect(forced).toContain('[role="tab"][aria-selected="true"]');
     expect(forced).toContain("outline: 2px solid Highlight");
   });
+});
+
+it("sizes the flow canvas from the remaining pane and gives the inspector its own scroll area", () => {
+  expect(styles).not.toContain("52vh");
+  expect(styles).not.toContain("height: 520px");
+  expect(styles).toMatch(/\.canvas-dock,\s*\.canvas-host\s*\{[^}]*height: 100%/);
+  expect(styles).toMatch(/\.canvas-viewport\s*\{[^}]*flex: 1;[^}]*min-height: 0/);
+  expect(styles).toMatch(/\.flow-canvas-pane\s*\{[^}]*overflow: hidden/);
+  expect(styles).toMatch(/\.flow-inspector\s*\{[^}]*max-height: 35%;[^}]*overflow: auto/);
+});
+it("preserves measured connection anchors and a 24px screen target at every supported zoom", () => {
+  expect(tokens).toMatch(/\.flow-connection-handle\s*\{[^}]*width: 10px;[^}]*height: 10px/);
+  for (const dimension of ["width", "height"]) {
+    expect(tokens).toContain(`${dimension}: calc(24px / var(--flow-zoom, 1))`);
+  }
+  expect(tokens).toContain("vector-effect: non-scaling-stroke");
+  expect(tokens).toContain("background: var(--color-flow-edge)");
 });

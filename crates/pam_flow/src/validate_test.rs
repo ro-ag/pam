@@ -659,3 +659,34 @@ fn parse_value_refuses_an_unknown_key_by_path() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn empty_output_assertion_is_command_only() {
+    let flow = good(&wrap(
+        "  - id: clean\n    run: [git, status]\n    expect_empty_output: true\n",
+    ));
+    assert!(flow.steps[0].expect_empty_output);
+    let (path, _) = bad_step(
+        "  - id: runs\n    connector: github\n    call: runs\n    expect_empty_output: true\n",
+    );
+    assert_eq!(path, "steps[0].expect_empty_output");
+}
+
+#[test]
+fn status_assertions_are_bounded_connector_literals() {
+    let yaml = "  - id: gate\n    connector: sonarqube\n    call: quality_gate\n    with: { project: pam }\n    expect_status: OK\n";
+    assert_eq!(
+        good(&wrap(yaml)).steps[0].expect_status.as_deref(),
+        Some("OK")
+    );
+    for expected in ["''".to_owned(), "' OK '".to_owned(), "X".repeat(65)] {
+        assert_eq!(
+            bad_step(&yaml.replace("expect_status: OK", &format!("expect_status: {expected}"))).0,
+            "steps[0].expect_status"
+        );
+    }
+    assert_eq!(
+        bad_step("  - id: command\n    run: [git, status]\n    expect_status: OK\n").0,
+        "steps[0].expect_status"
+    );
+}

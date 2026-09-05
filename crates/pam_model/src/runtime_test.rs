@@ -267,3 +267,40 @@ async fn a_reply_never_arrives_before_the_mirror_has_settled() {
         );
     }
 }
+
+/// Header-only compatibility evidence; deliberately no weight payload exists.
+#[test]
+fn tensor_dtype_preflight_refuses_known_backend_kernel_gaps() {
+    use candle_core::quantized::{GgmlDType, gguf_file};
+    for (dtype, backend, refused) in [
+        (GgmlDType::Q8_1, "cpu", true),
+        (GgmlDType::Q8_1, "metal", true),
+        (GgmlDType::Q8K, "metal", true),
+        (GgmlDType::Q8K, "cpu", false),
+        (GgmlDType::Q8_0, "cpu", false),
+        (GgmlDType::Q4K, "metal", false),
+        (GgmlDType::BF16, "metal", false),
+    ] {
+        let content = gguf_file::Content {
+            magic: gguf_file::VersionedMagic::GgufV3,
+            metadata: std::collections::HashMap::default(),
+            tensor_infos: [(
+                "blk.0.ffn_down_exps.weight".into(),
+                gguf_file::TensorInfo {
+                    ggml_dtype: dtype,
+                    shape: candle_core::Shape::from((256, 256)),
+                    offset: 0,
+                },
+            )]
+            .into(),
+            tensor_data_offset: 0,
+        };
+        let result = crate::runtime::preflight_tensor_dtypes(&content, backend);
+        assert_eq!(result.is_err(), refused, "{dtype:?} on {backend}");
+        if let Err(RuntimeError::LoadFailed(detail)) = result {
+            assert!(detail.contains("blk.0.ffn_down_exps.weight"));
+            assert!(detail.contains(backend));
+            assert!(detail.contains("no weights were mapped"));
+        }
+    }
+}

@@ -450,6 +450,51 @@ struct Scope {
     earlier: BTreeSet<String>,
 }
 
+fn validate_connector_fields(
+    value: Option<bool>,
+    has_env: bool,
+    at: &str,
+) -> Result<(), FlowError> {
+    if value.is_some() {
+        return Err(FlowError::invalid(
+            format!("{at}.expect_empty_output"),
+            "`expect_empty_output` belongs to a command step",
+        ));
+    }
+    if has_env {
+        return Err(FlowError::invalid(
+            format!("{at}.env"),
+            "`env` belongs to a command step",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_status(
+    value: Option<String>,
+    action: &Action,
+    at: &str,
+) -> Result<Option<String>, FlowError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = format!("{at}.expect_status");
+    if !matches!(action, Action::Connector { .. }) {
+        return Err(FlowError::invalid(
+            &path,
+            "`expect_status` belongs to a connector step",
+        ));
+    }
+    if value.is_empty() || value.len() > 64 || value.trim() != value {
+        return Err(FlowError::invalid(
+            &path,
+            "expected status must be 1–64 bytes without surrounding whitespace",
+        ));
+    }
+    check_secrets(&value, &path)?;
+    Ok(Some(value))
+}
+
 fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, FlowError> {
     let at = format!("steps[{index}]");
     check_id(&raw.id, &format!("{at}.id"), "a step id")?;
@@ -490,12 +535,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
             Action::Command { argv }
         }
         (None, Some(connector)) => {
-            if raw.env.is_some() {
-                return Err(FlowError::invalid(
-                    format!("{at}.env"),
-                    "`env` belongs to a command step",
-                ));
-            }
+            validate_connector_fields(raw.expect_empty_output, raw.env.is_some(), &at)?;
             validate_connector(&connector, raw.call.as_deref(), raw.with, &at, scope)?
         }
     };
@@ -544,12 +584,14 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
     let note = validate_note(raw.note.as_deref(), &at)?;
 
     Ok(Step {
+        expect_status: validate_expected_status(raw.expect_status, &action, &at)?,
         id: raw.id,
         action,
         timeout,
         effect,
         role,
         output: raw.output.unwrap_or_default(),
+        expect_empty_output: raw.expect_empty_output.unwrap_or_default(),
         needs,
         when,
         retry,

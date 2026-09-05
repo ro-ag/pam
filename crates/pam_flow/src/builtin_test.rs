@@ -6,7 +6,7 @@ use super::schema::{Action, ConnectorId, OutputPolicy, Role};
 use super::validate::parse;
 
 #[test]
-fn pam_ships_the_seven_starter_flows() {
+fn pam_ships_the_eight_starter_flows() {
     let ids: Vec<_> = builtin().iter().map(|flow| flow.id).collect();
     assert_eq!(
         ids,
@@ -14,6 +14,7 @@ fn pam_ships_the_seven_starter_flows() {
             "after-merge-checks",
             "ci-failure-triage",
             "dependency-audit",
+            "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
             "sonar-gate-check",
@@ -93,14 +94,26 @@ fn the_command_starters_match_the_spec_table() {
         argv("after-merge-checks"),
         [
             vec!["git", "fetch", "--prune"],
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "log", "--oneline", "-20"],
         ]
     );
     assert_eq!(
         argv("pr-readiness"),
         [
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "fetch", "--prune"],
             vec!["git", "log", "--oneline", "origin/main..HEAD"],
             vec!["cargo", "fmt", "--all", "--check"],
@@ -119,7 +132,13 @@ fn the_command_starters_match_the_spec_table() {
     assert_eq!(
         argv("release-readiness"),
         [
-            vec!["git", "status", "--short"],
+            vec![
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none"
+            ],
             vec!["git", "describe", "--tags", "--abbrev=0"],
             vec!["cargo", "test", "--workspace"],
             vec!["cargo", "package", "--list", "--allow-dirty"],
@@ -208,4 +227,73 @@ fn the_connector_starters_call_the_spec_table() {
     );
     assert_eq!(flow.steps[2].output, OutputPolicy::Summarize);
     assert!(flow.steps.iter().all(super::schema::Step::gated));
+}
+
+#[test]
+fn readiness_clean_tree_steps_assert_all_porcelain_output_is_empty() {
+    for id in ["after-merge-checks", "pr-readiness", "release-readiness"] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        let step = flow
+            .steps
+            .iter()
+            .find(|step| step.id == "clean-tree")
+            .unwrap();
+        assert!(step.expect_empty_output, "{id}");
+        assert_eq!(step.role, Role::Verify);
+        assert_eq!(
+            step.action,
+            Action::Command {
+                argv: [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none"
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            }
+        );
+    }
+}
+
+#[test]
+fn sonar_gate_has_an_explicit_passing_status_and_always_collects_issues() {
+    let flow = parse(builtin_yaml("sonar-gate-check").unwrap()).unwrap();
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("OK"));
+    assert_eq!(flow.steps[0].role, Role::Verify);
+    assert_eq!(flow.steps[1].when, super::schema::When::Always);
+}
+
+#[test]
+fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
+    let flow = parse(builtin_yaml("pam-pr-readiness").unwrap()).unwrap();
+    let required: Vec<Vec<String>> = include_str!("../../../tools/check.sh")
+        .lines()
+        .filter(|line| line.starts_with("cargo ") || line.starts_with("npm "))
+        .map(|line| line.split_whitespace().map(str::to_owned).collect())
+        .collect();
+    let actual: Vec<_> = flow
+        .steps
+        .iter()
+        .skip(1)
+        .map(|step| match &step.action {
+            Action::Command { argv } => argv.clone(),
+            Action::Connector { .. } => panic!("local gates must be commands"),
+        })
+        .collect();
+    assert_eq!(required.len(), 6);
+    assert_eq!(actual, required);
+    assert!(flow.steps[0].expect_empty_output);
+    for pair in flow.steps.windows(2) {
+        assert_eq!(pair[1].needs, [pair[0].id.clone()]);
+        assert_eq!(pair[1].role, Role::Verify);
+        assert_eq!(pair[1].when, super::schema::When::NeedsSucceeded);
+    }
+    let generic = parse(builtin_yaml("pr-readiness").unwrap()).unwrap();
+    assert!(generic.name.contains("Rust"));
+    assert!(generic.steps.iter().all(|step| match &step.action {
+        Action::Command { argv } => argv[0] != "npm",
+        Action::Connector { .. } => true,
+    }));
 }

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
@@ -35,10 +35,12 @@ function ListChip({
   value,
   label,
   onRemove,
+  disabled,
 }: {
   value: string;
   label: string;
   onRemove: () => void;
+  disabled: boolean;
 }) {
   return (
     <span className="inline-flex items-center gap-1.5 rounded-badge border border-line bg-surface px-2.5 py-0.5 font-data text-xs text-ink-muted">
@@ -46,7 +48,10 @@ function ListChip({
       <button
         type="button"
         aria-label={`${label} ${value}`}
-        onClick={onRemove}
+        disabled={disabled}
+        onClick={() => {
+          if (!disabled) onRemove();
+        }}
         className="text-ink-faint transition-colors duration-150 hover:text-danger"
       >
         <X aria-hidden="true" className="size-3" />
@@ -73,7 +78,7 @@ function ListEditor({
   placeholder: string;
   empty: string;
   busy: boolean;
-  onChange: (next: string[]) => void;
+  onChange: (next: string[]) => boolean;
 }) {
   const [draft, setDraft] = useState("");
   return (
@@ -88,6 +93,7 @@ function ListEditor({
               key={value}
               value={value}
               label={removeLabel}
+              disabled={busy}
               onRemove={() => onChange(values.filter((kept) => kept !== value))}
             />
           ))}
@@ -98,15 +104,17 @@ function ListEditor({
         onSubmit={(event) => {
           event.preventDefault();
           const value = draft.trim();
-          if (!value) return;
-          onChange(values.includes(value) ? values : [...values, value]);
-          setDraft("");
+          if (busy || !value) return;
+          if (onChange(values.includes(value) ? values : [...values, value])) setDraft("");
         }}
       >
         <input
           aria-label={addLabel}
           value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+          disabled={busy}
+          onChange={(event) => {
+            if (!busy) setDraft(event.target.value);
+          }}
           placeholder={placeholder}
           className={fieldClasses}
         />
@@ -122,14 +130,42 @@ export function SettingsFlowsSection() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: ["flow-settings"], queryFn: flowsSettingsGet });
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
+  const saving = useRef(false);
 
   const save = useMutation({
     mutationFn: (patch: Partial<FlowSettings>) => flowsSettingsSet(patch),
-    onMutate: () => setFailure(null),
+    onMutate: async () => {
+      setFailure(null);
+      await queryClient.cancelQueries({ queryKey: ["flow-settings"] });
+    },
     onSuccess: (next) => queryClient.setQueryData(["flow-settings"], next),
     onError: (error) => setFailure(toBridgeFailure(error)),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey: ["flow-settings"] }),
+    onSettled: async () => {
+      try {
+        await queryClient.invalidateQueries({ queryKey: ["flow-settings"] });
+      } finally {
+        saving.current = false;
+      }
+    },
   });
+
+  const busy = !settings.isSuccess || settings.isFetching || save.isPending;
+  function change(patch: Partial<FlowSettings>): boolean {
+    const current = queryClient.getQueryState<FlowSettings>(["flow-settings"]);
+    // The ref closes the gap before React renders mutation.isPending. Reject
+    // stale event closures as well as edits during a failed/pending refresh.
+    if (
+      saving.current ||
+      busy ||
+      current?.status !== "success" ||
+      current.fetchStatus !== "idle" ||
+      current.data !== settings.data
+    )
+      return false;
+    saving.current = true;
+    save.mutate(patch);
+    return true;
+  }
 
   const listFailure = settings.isError ? toBridgeFailure(settings.error) : null;
   const programs = settings.data?.allowed_programs ?? [];
@@ -137,7 +173,18 @@ export function SettingsFlowsSection() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      {listFailure && <FailureNote failure={listFailure} label="flow settings" />}
+      {listFailure && (
+        <>
+          <FailureNote failure={listFailure} label="flow settings" />
+          <Button
+            size="sm"
+            disabled={settings.isFetching}
+            onClick={() => void settings.refetch()}
+          >
+            Retry reading settings
+          </Button>
+        </>
+      )}
 
       <ListEditor
         title="allowed programs"
@@ -146,8 +193,8 @@ export function SettingsFlowsSection() {
         removeLabel="remove program"
         placeholder="program, e.g. cargo"
         empty="No program is allowed yet, so every command step would refuse."
-        busy={save.isPending}
-        onChange={(next) => save.mutate({ allowed_programs: next })}
+        busy={busy}
+        onChange={(next) => change({ allowed_programs: next })}
       />
 
       <div className="border-t border-line pt-4">
@@ -158,8 +205,8 @@ export function SettingsFlowsSection() {
           removeLabel="remove directory"
           placeholder="directory, e.g. /opt/homebrew/bin"
           empty="Nothing added — steps see only the daemon's own PATH."
-          busy={save.isPending}
-          onChange={(next) => save.mutate({ extra_path: next })}
+          busy={busy}
+          onChange={(next) => change({ extra_path: next })}
         />
       </div>
 

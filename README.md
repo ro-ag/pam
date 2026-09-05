@@ -25,7 +25,7 @@ raw-protocol escape hatch.
 pam status                  # client mode (default): talk to the daemon
 pam daemon                  # the local background service (started lazily by any command)
 pam gui                     # the desktop control center
-pam flow run pr-readiness   # run one flow and print its verdict
+pam flow run pr-readiness   # Rust-only starter; use pam-pr-readiness for PAM
 ```
 
 ## Install
@@ -91,6 +91,14 @@ tools/check.sh                       # the whole local gate: fmt, clippy, tests,
 npm --prefix frontend run gui:build  # embedded-frontend binary
 npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb, NSIS)
 ```
+
+For PAM contributors, `pam flow run pam-pr-readiness` from this repository
+runs a clean-tree assertion followed by all six gates in `tools/check.sh`.
+The same flow is listed as **PAM PR readiness** in the GUI. Install frontend
+dependencies first with `npm --prefix frontend ci`. Failed gates remain
+unresolved and stop dependent gates. The generic **Rust PR readiness** starter
+covers Rust checks only; customize it for another project's required gates.
+Both flows retain the configured program allowlist and approval policy.
 
 ## Releasing
 

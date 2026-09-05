@@ -1,6 +1,6 @@
 //! The starter flows, compiled into the binary.
 //!
-//! A fresh install has a working library on day one: these seven files ship
+//! A fresh install has a working library on day one: these eight files ship
 //! inside pam, are listed like any other flow, and are the templates a human
 //! clones and edits. Saving a library file with the same id shadows the
 //! builtin; deleting that file reveals it again, so a starter flow can never
@@ -27,6 +27,10 @@ const BUILTINS: &[BuiltinFlow] = &[
     BuiltinFlow {
         id: "dependency-audit",
         yaml: include_str!("../flows/dependency-audit.yaml"),
+    },
+    BuiltinFlow {
+        id: "pam-pr-readiness",
+        yaml: include_str!("../flows/pam-pr-readiness.yaml"),
     },
     BuiltinFlow {
         id: "pr-readiness",

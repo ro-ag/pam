@@ -581,3 +581,99 @@ async fn normalize_needs_exactly_one_of_yaml_or_flow() {
         assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS);
     }
 }
+
+#[tokio::test]
+async fn create_options_refuse_collisions_and_restore_only_an_absent_override() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let yaml = flow_yaml("fresh");
+    let args = json!({"id":"fresh", "yaml":yaml, "create_only":true});
+    body_of(
+        admin
+            .handle(&admin_envelope("create", OP_FLOWS_SAVE, args.clone()))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(
+        cause_of(
+            admin
+                .handle(&admin_envelope("collision", OP_FLOWS_SAVE, args))
+                .await
+        ),
+        CAUSE_ID_MISMATCH
+    );
+    for (index, options) in [
+        json!({"create_only":"yes"}),
+        json!({"allow_builtin_override":true}),
+        json!({"create_only":true,"allow_builtin_override":"yes"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut args = json!({"id":"fresh", "yaml":yaml});
+        args.as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        assert_eq!(
+            cause_of(
+                admin
+                    .handle(&admin_envelope(
+                        &format!("invalid{index}"),
+                        OP_FLOWS_SAVE,
+                        args
+                    ))
+                    .await
+            ),
+            CAUSE_INVALID_ADMIN_ARGS
+        );
+    }
+    let builtin = body_of(
+        admin
+            .handle(&admin_envelope(
+                "builtin",
+                OP_FLOWS_GET,
+                json!({"id":"after-merge-checks"}),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    let yaml = builtin["yaml"].as_str().unwrap();
+    let mut args = json!({"id":"after-merge-checks","yaml":yaml,"create_only":true});
+    assert_eq!(
+        cause_of(
+            admin
+                .handle(&admin_envelope(
+                    "builtin-collision",
+                    OP_FLOWS_SAVE,
+                    args.clone()
+                ))
+                .await
+        ),
+        CAUSE_ID_MISMATCH
+    );
+    args["allow_builtin_override"] = json!(true);
+    body_of(
+        admin
+            .handle(&admin_envelope("restore", OP_FLOWS_SAVE, args.clone()))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(
+        cause_of(
+            admin
+                .handle(&admin_envelope("restore-collision", OP_FLOWS_SAVE, args))
+                .await
+        ),
+        CAUSE_ID_MISMATCH
+    );
+    let deleted = body_of(
+        admin
+            .handle(&admin_envelope(
+                "delete",
+                OP_FLOWS_DELETE,
+                json!({"id":"after-merge-checks"}),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(deleted["revealed_builtin"], true);
+}

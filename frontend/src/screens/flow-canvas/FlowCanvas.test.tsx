@@ -32,10 +32,11 @@ interface CapturedProps {
   snapGrid: [number, number];
   proOptions: { hideAttribution: boolean };
   deleteKeyCode: string | null;
+  onViewportChange: (viewport: { x: number; y: number; zoom: number }) => void;
 }
 
 const captured = vi.hoisted(() => ({ props: null as CapturedProps | null }));
-const mocks = vi.hoisted(() => ({ autoLayout: vi.fn() }));
+const mocks = vi.hoisted(() => ({ autoLayout: vi.fn(), fitView: vi.fn() }));
 
 vi.mock("./layout", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./layout")>();
@@ -113,7 +114,9 @@ vi.mock("@xyflow/react", async (importOriginal) => {
     ...actual,
     ReactFlow: ReactFlowStub,
     Background: () => null,
-    MiniMap: () => null,
+    MiniMap: () => React.createElement("div", { "data-testid": "minimap" }),
+    useNodesInitialized: () => true,
+    useReactFlow: () => ({ ...actual.useReactFlow(), fitView: mocks.fitView }),
   };
 });
 
@@ -386,10 +389,10 @@ describe("FlowCanvas nodes", () => {
 });
 
 describe("FlowCanvas edges and frames", () => {
-  it("tints when edges with a pill label and fades the terminal edge", async () => {
+  it("tints conditional edges while keeping dependency and terminal strokes semantic", async () => {
     renderCanvas();
     await settle();
-    expect(edgePath("needs:a->b").classList.contains("stroke-line")).toBe(true);
+    expect(edgePath("needs:a->b").classList.contains("stroke-flow-edge")).toBe(true);
     const when = edgePath("succeeded:b->c");
     expect(when.classList.contains("stroke-success")).toBe(true);
     expect(
@@ -398,7 +401,9 @@ describe("FlowCanvas edges and frames", () => {
       ),
     ).toBeInTheDocument();
     const terminal = edgePath("terminal:c");
-    expect(terminal.classList.contains("opacity-40")).toBe(true);
+    expect(terminal.classList.contains("stroke-flow-edge")).toBe(true);
+    expect(terminal.classList.contains("opacity-40")).toBe(false);
+    expect(terminal.classList.contains("flow-edge-semantic")).toBe(true);
     expect(edgeVariants({ kind: "failed", running: false, selected: false })).toContain(
       "stroke-danger",
     );
@@ -441,9 +446,8 @@ describe("FlowCanvas edges and frames", () => {
     expect(hidden[0].className).toContain("pointer-events-none");
     expect(hidden[0].getAttribute("data-handleid")).toBe("note");
     for (const handle of handles.filter((handle) => !hidden.includes(handle))) {
-      expect(handle.className).toContain("size-2.5");
+      expect(handle.className).toContain("flow-connection-handle");
       expect(handle.className).toContain("rounded-pill");
-      expect(handle.className).toContain("bg-line");
     }
   });
 });
@@ -703,4 +707,59 @@ describe("FlowCanvas toolbar", () => {
     act(() => captured.props?.onNodesChange([{ type: "select", id: "b", selected: true }]));
     expect(props.onSelect).not.toHaveBeenCalled();
   });
+});
+
+it("keeps inverse-zoom handle sizing attached to the stable host through maximize and restore", async () => {
+  const { container } = renderCanvas();
+  await settle();
+  const host = container.querySelector<HTMLElement>(".canvas-host")!;
+  for (const zoom of [0.3, 0.5, 1, 1.5]) {
+    act(() => captured.props!.onViewportChange({ x: 0, y: 0, zoom }));
+    expect(Number(host.style.getPropertyValue("--flow-zoom"))).toBe(zoom);
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Maximize canvas" }));
+  expect(document.body).toContainElement(host);
+  expect(host.style.getPropertyValue("--flow-zoom")).toBe("1.5");
+  fireEvent.click(screen.getByRole("button", { name: "Restore canvas" }));
+  expect(container).toContainElement(host);
+});
+
+it("refits after canvas bounds settle and hides the minimap in compact viewports", async () => {
+  let resize: (() => void) | undefined;
+  let bounds = { width: 480, height: 264 };
+  const measure = vi
+    .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+    .mockImplementation(() => bounds as DOMRect);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(private callback: () => void) {}
+      observe(element: Element) {
+        if (element.classList.contains("canvas-viewport")) resize = this.callback;
+      }
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  try {
+    mocks.fitView.mockClear();
+    const rendered = renderCanvas();
+    await settle();
+    await waitFor(() => expect(mocks.fitView).toHaveBeenCalled());
+    expect(screen.queryByTestId("minimap")).not.toBeInTheDocument();
+    mocks.fitView.mockClear();
+    bounds = { width: 1000, height: 650 };
+    act(() => resize?.());
+    await waitFor(() => expect(mocks.fitView).toHaveBeenCalled());
+    expect(screen.getByTestId("minimap")).toBeInTheDocument();
+    mocks.fitView.mockClear();
+    bounds = { width: 480, height: 200 };
+    act(() => resize?.());
+    await waitFor(() => expect(mocks.fitView).toHaveBeenCalled());
+    expect(screen.queryByTestId("minimap")).not.toBeInTheDocument();
+    rendered.unmount();
+  } finally {
+    measure.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });

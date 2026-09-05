@@ -13,6 +13,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Serialize checks and mutations across Library handles in this process.
+static WRITES: Mutex<()> = Mutex::new(());
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 use serde::Serialize;
 
@@ -142,6 +148,34 @@ impl Library {
     /// own id is not `id` or the library is full, and [`FlowError::Io`] when
     /// the directory cannot be written.
     pub fn save(&self, id: &str, yaml: &str) -> Result<Entry, FlowError> {
+        self.write(id, yaml, false, false)
+    }
+
+    /// Creates a file without replacing one, including under concurrent writers.
+    /// `allow_builtin_override` permits restoring a deleted builtin override.
+    ///
+    /// # Errors
+    /// The same validation and IO errors as [`Self::save`], plus an ID collision.
+    pub fn create(
+        &self,
+        id: &str,
+        yaml: &str,
+        allow_builtin_override: bool,
+    ) -> Result<Entry, FlowError> {
+        self.write(id, yaml, true, allow_builtin_override)
+    }
+
+    fn write(
+        &self,
+        id: &str,
+        yaml: &str,
+        create_only: bool,
+        allow_builtin_override: bool,
+    ) -> Result<Entry, FlowError> {
+        let _guard = WRITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         if !is_flow_id(id) {
             return Err(FlowError::Invalid {
                 path: "id".to_string(),
@@ -161,7 +195,15 @@ impl Library {
             });
         }
 
+        self.check_name(id, &flow.name)?;
         let path = self.path_for(id);
+        if create_only && (path.exists() || (!allow_builtin_override && builtin_yaml(id).is_some()))
+        {
+            return Err(FlowError::Invalid {
+                path: "id".into(),
+                message: format!("a flow named `{id}` already exists; choose another ID"),
+            });
+        }
         if !path.is_file() && self.files()?.len() >= MAX_LIBRARY_ENTRIES {
             return Err(FlowError::Invalid {
                 path: "library".to_string(),
@@ -172,18 +214,36 @@ impl Library {
         }
 
         fs::create_dir_all(&self.dir).map_err(|error| io_error(&self.dir, &error))?;
-        let temporary = self
-            .dir
-            .join(format!("{id}.yaml.tmp-{}", std::process::id()));
+        let temporary = self.dir.join(format!(
+            "{id}.yaml.tmp-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         if let Err(error) = fs::write(&temporary, yaml) {
             drop(fs::remove_file(&temporary));
             return Err(io_error(&temporary, &error));
         }
-        if let Err(error) = fs::rename(&temporary, &path) {
+        let published = if create_only {
+            fs::hard_link(&temporary, &path)
+        } else {
+            fs::rename(&temporary, &path)
+        };
+        if let Err(error) = published {
             drop(fs::remove_file(&temporary));
+            if create_only && error.kind() == io::ErrorKind::AlreadyExists {
+                return Err(FlowError::Invalid {
+                    path: "id".into(),
+                    message: format!(
+                        "flow `{id}` was created by another writer; refresh and choose another ID"
+                    ),
+                });
+            }
             return Err(io_error(&path, &error));
         }
 
+        if create_only {
+            drop(fs::remove_file(&temporary));
+        }
         Ok(Entry {
             id: id.to_string(),
             source: Source::Library,
@@ -191,6 +251,35 @@ impl Library {
             yaml: yaml.to_string(),
             parsed: Ok(flow),
         })
+    }
+
+    fn check_name(&self, id: &str, name: &str) -> Result<(), FlowError> {
+        let key = name.trim().to_lowercase();
+        // Original builtin names stay reserved while an override hides them,
+        // so deleting the override cannot reveal a duplicate display name.
+        let mut entries = self.list()?;
+        entries.extend(
+            builtin()
+                .iter()
+                .map(|flow| entry(flow.id, Source::Builtin, None, flow.yaml.to_string())),
+        );
+        for entry in entries {
+            if entry.id != id
+                && entry
+                    .parsed
+                    .as_ref()
+                    .is_ok_and(|flow| flow.name.trim().to_lowercase() == key)
+            {
+                return Err(FlowError::Invalid {
+                    path: "name".into(),
+                    message: format!(
+                        "flow `{}` already uses that name; choose a unique display name",
+                        entry.id
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Removes a library file, answering whether a builtin is now visible
@@ -202,6 +291,9 @@ impl Library {
     /// builtin without a shadow is not the library's to delete — and
     /// [`FlowError::Io`] when the file cannot be removed.
     pub fn delete(&self, id: &str) -> Result<bool, FlowError> {
+        let _guard = WRITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.path_for(id);
         if !is_flow_id(id) || !path.is_file() {
             return Err(FlowError::Invalid {

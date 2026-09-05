@@ -885,8 +885,8 @@ export function SettingsScreen() {
   const navigate = useNavigate();
   const tabs = useRef<(HTMLButtonElement | null)[]>([]);
   const selected =
-    SETTINGS_CATEGORIES.find((category) => category.id === hash.replace(/^#/, ""))?.id ??
-    "appearance";
+    SETTINGS_CATEGORIES.find((category) => category.id === hash.replace(/^#/, "").split("/")[0])
+      ?.id ?? "appearance";
 
   const select = (id: SettingsCategory["id"]) => {
     void navigate({ to: "/settings", hash: id, resetScroll: false, hashScrollIntoView: false });
@@ -902,7 +902,7 @@ export function SettingsScreen() {
     ),
     models: <SettingsModelsSection />,
     flows: <SettingsFlowsSection />,
-    connectors: <SettingsConnectorsSection />,
+    connectors: <SettingsConnectorsSection targetId={hash.replace(/^#/, "").split("/")[1]} />,
     daemon: <DaemonPanel active={selected === "daemon"} />,
     retention: <RetentionPanel />,
     logs: <LogsPanel active={selected === "logs"} />,

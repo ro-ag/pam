@@ -248,3 +248,89 @@ fn the_library_is_capped() {
         other => panic!("expected Invalid, got {other:?}"),
     }
 }
+
+#[test]
+fn create_is_collision_safe_and_override_restore_never_replaces_a_file() {
+    let (_dir, library) = library();
+    library.create("demo", DEMO, false).unwrap();
+    assert!(
+        library
+            .create("demo", &DEMO.replace("Demo", "Changed"), false)
+            .is_err()
+    );
+    assert_eq!(library.get("demo").unwrap().unwrap().yaml, DEMO);
+    let builtin = library.get("after-merge-checks").unwrap().unwrap();
+    assert!(library.create(&builtin.id, &builtin.yaml, false).is_err());
+    library.create(&builtin.id, &builtin.yaml, true).unwrap();
+    assert!(library.create(&builtin.id, &builtin.yaml, true).is_err());
+    assert!(library.delete(&builtin.id).unwrap());
+    assert_eq!(
+        library.get(&builtin.id).unwrap().unwrap().source,
+        Source::Builtin
+    );
+    library.create(&builtin.id, &builtin.yaml, true).unwrap();
+}
+
+#[test]
+fn display_name_collision_refuses_creation_and_rename_without_changing_files() {
+    let (_dir, library) = library();
+    library.create("demo", DEMO, false).unwrap();
+    let other = DEMO
+        .replace("id: demo", "id: other")
+        .replace("name: Demo", "name: Other");
+    library.create("other", &other, false).unwrap();
+    let duplicate = other.replace("name: Other", "name: '  dEmO  '");
+    assert!(library.save("other", &duplicate).is_err());
+    assert_eq!(library.get("other").unwrap().unwrap().yaml, other);
+    let new = duplicate.replace("id: other", "id: new");
+    assert!(library.create("new", &new, false).is_err());
+    assert!(library.get("new").unwrap().is_none());
+}
+
+#[test]
+fn concurrent_creates_have_exactly_one_winner() {
+    let (_dir, library) = library();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = (0..2)
+        .map(|index| {
+            let library = library.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let yaml = DEMO.replace("Demo", &format!("Version {index}"));
+                barrier.wait();
+                library.create("demo", &yaml, false).map(|entry| entry.yaml)
+            })
+        })
+        .collect();
+    let wins: Vec<_> = threads
+        .into_iter()
+        .filter_map(|thread| thread.join().unwrap().ok())
+        .collect();
+    assert_eq!(wins.len(), 1);
+    assert_eq!(library.get("demo").unwrap().unwrap().yaml, wins[0]);
+}
+
+#[test]
+fn builtin_names_stay_reserved_while_a_renamed_override_hides_them() {
+    let (_dir, library) = library();
+    let builtin = library.get("pr-readiness").unwrap().unwrap();
+    let original_name = &builtin.parsed.as_ref().unwrap().name;
+    let renamed = builtin.yaml.replace(original_name, "My readiness override");
+    library.save(&builtin.id, &renamed).unwrap();
+    let copy = builtin
+        .yaml
+        .replace("id: pr-readiness", "id: custom-readiness");
+    assert!(library.create("custom-readiness", &copy, false).is_err());
+    assert!(library.get("custom-readiness").unwrap().is_none());
+    assert!(library.delete(&builtin.id).unwrap());
+    assert_eq!(
+        library
+            .get(&builtin.id)
+            .unwrap()
+            .unwrap()
+            .parsed
+            .unwrap()
+            .name,
+        *original_name
+    );
+}

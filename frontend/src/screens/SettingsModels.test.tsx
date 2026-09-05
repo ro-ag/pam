@@ -1,12 +1,13 @@
+import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory } from "@tanstack/react-router";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import App from "../App";
+import App, { createAppQueryClient } from "../App";
 import type { AgentCli, ModelEntry, ModelsStatus } from "../lib/ipc";
 import { applyTheme } from "../lib/theme";
 import { createAppRouter } from "../router";
 import { FLOOR_SENTENCE } from "./Models";
-import { CURATOR_AGENTS } from "./SettingsModels";
+import { CURATOR_AGENTS, SettingsModelsSection } from "./SettingsModels";
 
 /**
  * Settings → Models against a mocked bridge: the tier defaults (with the
@@ -262,4 +263,60 @@ it("opens Models as the only visible Settings category", async () => {
     .map((heading) => heading.textContent);
   expect(headings).toEqual(["Models"]);
   expect(screen.getByRole("tab", { name: "Models" })).toHaveAttribute("aria-selected", "true");
+});
+
+it("rejects a blank idle window even through form submission", async () => {
+  const section = await renderModelsSection();
+  const minutes = await section.findByLabelText("idle unload minutes");
+  await waitFor(() => expect(minutes).toHaveValue(10));
+  fireEvent.change(minutes, { target: { value: "" } });
+  expect(section.getAllByRole("button", { name: "Apply" })[1]).toBeDisabled();
+  fireEvent.submit(minutes.closest("form")!);
+  expect(mocks.modelsSettingsSet).not.toHaveBeenCalled();
+});
+
+it("preserves dirty storage drafts across refresh and locks rapid saves", async () => {
+  const client = createAppQueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <SettingsModelsSection />
+    </QueryClientProvider>,
+  );
+  const minutes = screen.getByLabelText("idle unload minutes");
+  const dir = screen.getByLabelText("models directory");
+  await waitFor(() => expect(minutes).toHaveValue(10));
+  fireEvent.change(minutes, { target: { value: "20" } });
+  fireEvent.change(dir, { target: { value: "/Volumes/draft" } });
+  mocks.modelsStatus.mockResolvedValue(
+    status({ idle_unload_min: 5, models_dir: "/Volumes/remote" }),
+  );
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: ["models", "status"] });
+  });
+  await waitFor(() => expect(minutes).toBeEnabled());
+  expect(minutes).toHaveValue(20);
+  expect(dir).toHaveValue("/Volumes/draft");
+  let finish!: (value: { models_dir: string; idle_unload_min: number }) => void;
+  mocks.modelsSettingsSet.mockReturnValue(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  act(() => {
+    fireEvent.submit(minutes.closest("form")!);
+    fireEvent.submit(minutes.closest("form")!);
+    fireEvent.submit(dir.closest("form")!);
+  });
+  await waitFor(() => expect(mocks.modelsSettingsSet).toHaveBeenCalledTimes(1));
+  expect(mocks.modelsSettingsSet).toHaveBeenCalledWith({ idle_unload_min: 20 });
+  expect(dir).toBeDisabled();
+  fireEvent.change(dir, { target: { value: "/Volumes/lost" } });
+  expect(dir).toHaveValue("/Volumes/draft");
+  mocks.modelsStatus.mockResolvedValue(
+    status({ idle_unload_min: 20, models_dir: "/Volumes/remote" }),
+  );
+  await act(async () => finish({ idle_unload_min: 20, models_dir: "/Volumes/remote" }));
+  await waitFor(() => expect(dir).toBeEnabled());
+  expect(dir).toHaveValue("/Volumes/draft");
+  expect(minutes).toHaveValue(20);
 });

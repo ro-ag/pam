@@ -308,3 +308,48 @@ async fn showing_a_flow_nothing_carries_refuses_with_the_list_recovery() {
     assert_eq!(refusal.cause, CAUSE_FLOW_NOT_FOUND);
     assert!(refusal.recovery.contains("pam flow list"));
 }
+
+#[test]
+fn connector_assertions_fail_closed_without_changing_observation_or_api_failure() {
+    use crate::flow_exec::{StepReport, StepStatus};
+    use crate::flow_service::{
+        CAUSE_STATUS_ASSERTION, CAUSE_STATUS_ASSERTION_REQUIRED, apply_connector_assertion,
+    };
+    let mut step = pam_flow::parse("schema: 1\nid: gate\nname: Gate\nsteps:\n  - id: gate\n    connector: sonarqube\n    call: quality_gate\n    with: { project: pam }\n    role: verify\n    expect_status: OK\n").unwrap().steps.remove(0);
+    for value in [
+        None,
+        Some(serde_json::json!({})),
+        Some(serde_json::json!({"status": 1})),
+        Some(serde_json::json!({"status": "UNKNOWN"})),
+    ] {
+        let mut report = StepReport::new("gate", "connector", StepStatus::Succeeded);
+        apply_connector_assertion(&step, value.as_ref(), &mut report);
+        assert_eq!(report.status, StepStatus::Failed);
+        assert_eq!(report.error.unwrap().cause, CAUSE_STATUS_ASSERTION);
+    }
+    step.expect_status = None;
+    let mut report = StepReport::new("gate", "connector", StepStatus::Succeeded);
+    apply_connector_assertion(
+        &step,
+        Some(&serde_json::json!({"status": "OK"})),
+        &mut report,
+    );
+    assert_eq!(report.error.unwrap().cause, CAUSE_STATUS_ASSERTION_REQUIRED);
+    step.role = pam_flow::Role::Observe;
+    let mut report = StepReport::new("gate", "connector", StepStatus::Succeeded);
+    apply_connector_assertion(
+        &step,
+        Some(&serde_json::json!({"status": "ERROR"})),
+        &mut report,
+    );
+    assert_eq!(report.status, StepStatus::Succeeded);
+    let mut report = StepReport::new("gate", "connector", StepStatus::Failed);
+    report.fail(
+        StepStatus::Failed,
+        "connector_bad_response",
+        "API error".to_owned(),
+        "retry".to_owned(),
+    );
+    apply_connector_assertion(&step, None, &mut report);
+    assert_eq!(report.error.unwrap().cause, "connector_bad_response");
+}

@@ -1,7 +1,9 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createAppQueryClient } from "../App";
+import App, { createAppQueryClient } from "../App";
+import { createMemoryHistory } from "@tanstack/react-router";
+import { createAppRouter } from "../router";
 import type {
   ActivityRow,
   EvidenceContent,
@@ -15,7 +17,6 @@ import type {
   RawFlow,
 } from "../lib/ipc";
 import { defaultStep, type CanvasNode } from "./flow-canvas/graph";
-import { withId } from "./FlowEditor";
 import { CANVAS_QUIET_MS, FlowsScreen, YAML_QUIET_MS } from "./Flows";
 import { flowIdOf } from "./FlowRuns";
 
@@ -27,6 +28,7 @@ import { flowIdOf } from "./FlowRuns";
  */
 
 const mocks = vi.hoisted(() => ({
+  connectorsList: vi.fn(),
   flowsList: vi.fn(),
   flowsGet: vi.fn(),
   flowsSave: vi.fn(),
@@ -382,47 +384,37 @@ describe("the YAML tab", () => {
     await renderFlows();
     await pick("mine");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByText(/flow · flow_invalid/)).toBeInTheDocument();
+    expect(await screen.findByText(/flow library · flow_invalid/)).toBeInTheDocument();
     expect(screen.getByText(/steps\[1\]\.connector/)).toBeInTheDocument();
   });
 
-  it("turns Save into Clone on a builtin and demands a new id", async () => {
+  it("puts duplication in the library actions and preserves built-in originals", async () => {
     await renderFlows();
-    await editorFor("pr-readiness");
-    const clone = screen.getByRole("button", { name: "Clone" });
-    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
-    expect(clone).toBeDisabled();
-
-    fireEvent.change(screen.getByLabelText("new flow id"), { target: { value: "my-prs" } });
-    fireEvent.click(screen.getByRole("button", { name: "Clone" }));
-    // The YAML's own id line follows the new name, or the daemon would
-    // refuse the pair with `id_mismatch`.
     await waitFor(() =>
-      expect(mocks.flowsSave).toHaveBeenCalledWith(
-        "my-prs",
-        "id: my-prs\nname: PR readiness\nsteps: []\n",
-      ),
+      expect(screen.getByRole("button", { name: "Duplicate" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    expect(screen.getByRole("dialog", { name: "Duplicate flow" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Flow ID"), { target: { value: "my-prs" } });
+    fireEvent.change(screen.getByLabelText("Flow name"), { target: { value: "My PR checks" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create flow" }));
+    await waitFor(() =>
+      expect(mocks.flowsSave).toHaveBeenCalledWith("my-prs", expect.any(String), {
+        create_only: true,
+      }),
     );
   });
 
   it("offers Delete on a library flow only, behind the two-tap confirm", async () => {
     await renderFlows();
     await editorFor("pr-readiness");
-    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeDisabled();
 
     await pick("mine");
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.flowsDelete).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "delete it?" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
     await waitFor(() => expect(mocks.flowsDelete).toHaveBeenCalledWith("mine"));
-  });
-
-  it("rewrites only the top-level id line when cloning", () => {
-    expect(withId("id: a\nname: A\n", "b")).toBe("id: b\nname: A\n");
-    expect(withId("name: A\n", "b")).toBe("id: b\nname: A\n");
-    expect(withId("id: a\nsteps:\n  - id: inner\n", "b")).toBe(
-      "id: b\nsteps:\n  - id: inner\n",
-    );
   });
 });
 
@@ -788,4 +780,111 @@ describe("the canvas tab", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     await waitFor(() => expect(rail("fmt").className).not.toContain("bg-danger"));
   });
+});
+
+it("links a saved flow prerequisite to that connector's exact setup form", async () => {
+  mocks.connectorsList.mockResolvedValue({
+    connectors: [
+      {
+        id: "sonarqube",
+        name: "SonarQube",
+        auth: "token_as_user",
+        enabled: false,
+        needs_base_url: true,
+        credential_present: false,
+        store_available: true,
+      },
+    ],
+  });
+  mocks.flowsGet.mockResolvedValue({
+    ...FLOWS[0],
+    yaml: "id: pr-readiness",
+    flow: {
+      ...SPEC,
+      steps: [
+        {
+          ...defaultStep("quality", "connector"),
+          action: { kind: "connector", connector: "sonarqube", call: "quality_gate", with: {} },
+        },
+      ],
+    },
+  });
+  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/flows"] }));
+  render(<App router={router} />);
+  fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+  const link = await screen.findByRole("link", { name: "Set up SonarQube" });
+  expect(link).toHaveAttribute("href", "/settings#connectors/sonarqube");
+  expect(screen.getByText(/SonarQube: Disabled/)).toBeInTheDocument();
+});
+
+it("guards dirty flow selection and editor-to-run navigation with cancel and discard", async () => {
+  await renderFlows();
+  const editor = await pick("mine");
+  fireEvent.change(editor, { target: { value: editor.value + "# unsaved change\n" } });
+  fireEvent.click(screen.getByRole("tab", { name: "Run flow" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Unsaved flow changes" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute("aria-selected", "true");
+  fireEvent.click(within(screen.getByLabelText("flow library")).getByTitle("pr-readiness"));
+  fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
+  await waitFor(() => expect(screen.getByLabelText("pr-readiness yaml")).toBeInTheDocument());
+  expect(mocks.flowsSave).not.toHaveBeenCalled();
+});
+it("guards real sidebar navigation, preserving cancel and saving before leaving", async () => {
+  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/flows?flow=mine"] }));
+  render(<App router={router} />);
+  const editor = await editorFor("mine");
+  fireEvent.change(editor, { target: { value: editor.value + "# keep this draft\n" } });
+  fireEvent.click(screen.getByRole("link", { name: "Home" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Unsaved flow changes" }),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(router.state.location.pathname).toBe("/flows");
+  expect((screen.getByLabelText("mine yaml") as HTMLTextAreaElement).value).toContain(
+    "keep this draft",
+  );
+  fireEvent.click(screen.getByRole("link", { name: "Home" }));
+  const dialog = await screen.findByRole("dialog", { name: "Unsaved flow changes" });
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "Save" })).toBeEnabled(),
+  );
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+  expect(mocks.flowsSave).toHaveBeenCalledWith(
+    "mine",
+    expect.stringContaining("keep this draft"),
+  );
+});
+
+it("waits for the newest canvas normalization before saving through navigation", async () => {
+  await renderFlows();
+  await pick("mine");
+  fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
+  let finish!: (reply: FlowNormalizeReply) => void;
+  mocks.flowsNormalize.mockImplementationOnce(
+    () =>
+      new Promise<FlowNormalizeReply>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Add command" }));
+  fireEvent.click(screen.getByRole("tab", { name: "Run flow" }));
+  const dialog = await screen.findByRole("dialog", { name: "Unsaved flow changes" });
+  const save = within(dialog).getByRole("button", { name: "Save" });
+  expect(save).toBeDisabled();
+  fireEvent.click(save);
+  expect(mocks.flowsSave).not.toHaveBeenCalled();
+  await waitFor(() => expect(mocks.flowsNormalize).toHaveBeenCalledTimes(1));
+  const raw = mocks.flowsNormalize.mock.calls[0][0].flow as RawFlow;
+  const newestYaml = canonical(raw);
+  await act(async () =>
+    finish({ valid: true, yaml: newestYaml, flow: resolve(raw), digest: "new-draft" }),
+  );
+  await waitFor(() => expect(save).toBeEnabled());
+  fireEvent.click(save);
+  await waitFor(() => expect(mocks.flowsSave).toHaveBeenCalledWith("mine", newestYaml));
+  expect(raw.steps.some((step) => step.id === "step-1")).toBe(true);
 });

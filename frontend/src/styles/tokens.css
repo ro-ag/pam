@@ -47,6 +47,8 @@
   --color-line: var(--pam-line);
   --color-edge: var(--pam-edge);
   --color-control-line: var(--pam-control-line);
+  /* Meaningful graph connections must not inherit decorative hairlines. */
+  --color-flow-edge: var(--pam-ink-muted);
   --color-inset: var(--pam-inset);
   --color-selection-ink: var(--pam-selection-ink);
   --color-separator: var(--pam-separator);
@@ -157,7 +159,7 @@
 .flow-canvas .react-flow {
   --xy-background-color: var(--color-chrome);
   --xy-background-pattern-color: var(--color-separator);
-  --xy-edge-stroke: var(--color-line);
+  --xy-edge-stroke: var(--color-flow-edge);
   --xy-edge-stroke-selected: var(--color-accent);
   --xy-edge-stroke-width: 1.5;
   --xy-edge-label-background-color: var(--color-surface-raised);
@@ -185,4 +187,44 @@
 .flow-canvas .flow-edge-tether {
   stroke-dasharray: 2 4;
   stroke-linecap: round;
+}
+
+/* Keep connection strokes legible at Fit zoom without changing their paths. */
+.flow-canvas .flow-edge-semantic {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 2;
+}
+
+/* The measured Handle stays 10px, preserving its connection anchor. Its
+   pseudo-elements follow the viewport scale: 24px hit area, 12px visible dot
+   in screen pixels, independent of graph zoom and UI density. */
+.flow-canvas .flow-connection-handle {
+  width: 10px;
+  height: 10px;
+  border: 0;
+  background: transparent;
+}
+.flow-canvas .flow-connection-handle::before,
+.flow-canvas .flow-connection-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+.flow-canvas .flow-connection-handle::before {
+  width: calc(24px / var(--flow-zoom, 1));
+  height: calc(24px / var(--flow-zoom, 1));
+  pointer-events: inherit;
+}
+.flow-canvas .flow-connection-handle::after {
+  width: calc(12px / var(--flow-zoom, 1));
+  height: calc(12px / var(--flow-zoom, 1));
+  border: calc(2px / var(--flow-zoom, 1)) solid var(--color-chrome);
+  border-radius: var(--radius-pill);
+  background: var(--color-flow-edge);
+  pointer-events: none;
+}
+.flow-canvas .flow-connection-handle:hover::after {
+  background: var(--color-accent);
 }

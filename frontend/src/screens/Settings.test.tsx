@@ -750,3 +750,26 @@ describe("logs", () => {
     expect(screen.getByText(/no Tauri bridge exists/)).toBeInTheDocument();
   });
 });
+
+it("opens and focuses an exact connector from a recovery link", async () => {
+  mocks.connectorsList.mockResolvedValue({
+    connectors: [
+      {
+        id: "sonarqube",
+        name: "SonarQube",
+        auth: "token_as_user",
+        needs_base_url: true,
+        enabled: false,
+        credential_present: false,
+        store_available: true,
+      },
+    ],
+  });
+  renderSettings("connectors/sonarqube");
+  const target = await screen.findByLabelText("connector SonarQube");
+  expect(screen.getByRole("tab", { name: "Connectors" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await waitFor(() => expect(target).toHaveFocus());
+});

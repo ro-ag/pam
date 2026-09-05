@@ -738,3 +738,22 @@ async fn curator_test_without_a_pick_says_there_is_no_curator() {
     .await
     .expect("test within deadline");
 }
+
+#[test]
+fn generation_failure_preserves_kernel_detail_and_requests_backend_evidence() {
+    let refusal = crate::admin_models::runtime_refusal(&pam_model::RuntimeError::GenerationFailed(
+        "unsupported test kernel".into(),
+    ));
+    assert_eq!(refusal.cause, "generation_failed");
+    assert!(refusal.detail.contains("unsupported test kernel"));
+    assert!(refusal.recovery.contains("model file"));
+    assert!(refusal.recovery.contains("backend"));
+}
+
+#[test]
+fn cancelled_generation_offers_normal_retry() {
+    let refusal = crate::admin_models::runtime_refusal(&pam_model::RuntimeError::Cancelled);
+    assert_eq!(refusal.cause, "cancelled");
+    assert!(refusal.recovery.contains("Try again"));
+    assert!(!refusal.recovery.contains("restart"));
+}

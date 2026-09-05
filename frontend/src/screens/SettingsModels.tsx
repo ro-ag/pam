@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -327,16 +327,19 @@ function StoragePanel() {
   const [minutes, setMinutes] = useState("");
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const saving = useRef(false);
+  const dirtyDir = useRef(false);
+  const dirtyMinutes = useRef(false);
 
   // The daemon owns both values; the inputs are drafts that start from
   // what it reports and only diverge once the human types.
   const liveDir = status.data?.models_dir;
   const liveMinutes = status.data?.idle_unload_min;
   useEffect(() => {
-    if (liveDir !== undefined) setDir(liveDir);
+    if (!dirtyDir.current && liveDir !== undefined) setDir(liveDir);
   }, [liveDir]);
   useEffect(() => {
-    if (liveMinutes !== undefined) setMinutes(String(liveMinutes));
+    if (!dirtyMinutes.current && liveMinutes !== undefined) setMinutes(String(liveMinutes));
   }, [liveMinutes]);
 
   const apply = useMutation({
@@ -346,10 +349,42 @@ function StoragePanel() {
       setFailure(null);
       setNote(null);
     },
-    onSuccess: () => setNote("saved"),
+    onSuccess: (next, patch) => {
+      if (patch.models_dir !== undefined) {
+        dirtyDir.current = false;
+        setDir(next.models_dir);
+      }
+      if (patch.idle_unload_min !== undefined) {
+        dirtyMinutes.current = false;
+        setMinutes(String(next.idle_unload_min));
+      }
+      setNote("saved");
+    },
     onError: (error) => setFailure(toBridgeFailure(error)),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey: ["models"] }),
+    onSettled: async () => {
+      try {
+        await queryClient.invalidateQueries({ queryKey: ["models"] });
+      } finally {
+        saving.current = false;
+      }
+    },
   });
+
+  const busy = !status.isSuccess || status.isFetching || apply.isPending;
+  const validMinutes =
+    minutes.trim() !== "" && Number.isSafeInteger(Number(minutes)) && Number(minutes) >= 0;
+  function change(patch: { models_dir?: string; idle_unload_min?: number }) {
+    const current = queryClient.getQueryState(["models", "status"]);
+    if (
+      saving.current ||
+      busy ||
+      current?.status !== "success" ||
+      current.fetchStatus !== "idle"
+    )
+      return;
+    saving.current = true;
+    apply.mutate(patch);
+  }
 
   const inputClasses =
     "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
@@ -357,13 +392,16 @@ function StoragePanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">storage &amp; residency</p>
+      {status.isError && (
+        <FailureNote failure={toBridgeFailure(status.error)} label="model settings" />
+      )}
 
       <form
         className="flex flex-wrap items-end gap-2"
         onSubmit={(event) => {
           event.preventDefault();
           const next = dir.trim();
-          if (next) apply.mutate({ models_dir: next });
+          if (next) change({ models_dir: next });
         }}
       >
         <label className="min-w-0 flex-1 space-y-1">
@@ -371,12 +409,17 @@ function StoragePanel() {
           <input
             aria-label="models directory"
             value={dir}
-            onChange={(event) => setDir(event.target.value)}
+            disabled={busy}
+            onChange={(event) => {
+              if (busy || saving.current) return;
+              dirtyDir.current = true;
+              setDir(event.target.value);
+            }}
             placeholder="~/llm"
             className={inputClasses}
           />
         </label>
-        <Button size="sm" type="submit" disabled={apply.isPending || !dir.trim()}>
+        <Button size="sm" type="submit" disabled={busy || !dir.trim()}>
           Apply
         </Button>
       </form>
@@ -385,10 +428,7 @@ function StoragePanel() {
         className="flex flex-wrap items-end gap-2 border-t border-line pt-4"
         onSubmit={(event) => {
           event.preventDefault();
-          const parsed = Number(minutes);
-          if (Number.isInteger(parsed) && parsed >= 0) {
-            apply.mutate({ idle_unload_min: parsed });
-          }
+          if (validMinutes) change({ idle_unload_min: Number(minutes) });
         }}
       >
         <label className="w-40 space-y-1">
@@ -398,11 +438,16 @@ function StoragePanel() {
             min={0}
             aria-label="idle unload minutes"
             value={minutes}
-            onChange={(event) => setMinutes(event.target.value)}
+            disabled={busy}
+            onChange={(event) => {
+              if (busy || saving.current) return;
+              dirtyMinutes.current = true;
+              setMinutes(event.target.value);
+            }}
             className={inputClasses}
           />
         </label>
-        <Button size="sm" type="submit" variant="ghost" disabled={apply.isPending}>
+        <Button size="sm" type="submit" variant="ghost" disabled={busy || !validMinutes}>
           Apply
         </Button>
         <span className="font-sans text-sm text-ink-muted">

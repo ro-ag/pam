@@ -63,7 +63,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::{GgmlDType, gguf_file};
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::quantized_qwen3;
@@ -243,6 +243,8 @@ enum Command {
     Load {
         /// The model to map.
         entry: Box<ModelEntry>,
+        /// Device requested for this load.
+        backend: Backend,
         /// Where the answer goes.
         reply: oneshot::Sender<Result<LoadedModel, RuntimeError>>,
     },
@@ -270,6 +272,18 @@ struct Inner {
     sender: Mutex<Option<Sender<Command>>>,
     /// What the thread last said about itself.
     snapshot: Arc<Mutex<RuntimeSnapshot>>,
+}
+
+/// Device selection for a model load. Explicit choices never silently fall back.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Backend {
+    /// Metal where available, otherwise CPU.
+    #[default]
+    Auto,
+    /// Execute on CPU even on a Metal-capable host.
+    Cpu,
+    /// Require Metal; report a load failure if it is unavailable.
+    Metal,
 }
 
 /// A handle to the model thread. Cheap to clone; every clone talks to the
@@ -316,6 +330,15 @@ impl Runtime {
     /// or candle is called at all. A file whose header never parsed reaches
     /// the thread and is refused there instead.
     pub async fn load(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
+        self.load_on_backend(entry, Backend::Auto).await
+    }
+
+    /// Loads real weights on the requested backend, without fallback for explicit choices.
+    pub async fn load_on_backend(
+        &self,
+        entry: &ModelEntry,
+        backend: Backend,
+    ) -> Result<LoadedModel, RuntimeError> {
         if let Some(info) = &entry.info
             && !SUPPORTED_ARCHITECTURES.contains(&info.architecture.as_str())
         {
@@ -326,6 +349,7 @@ impl Runtime {
         let (reply, answer) = oneshot::channel();
         let command = Command::Load {
             entry: Box::new(entry.clone()),
+            backend,
             reply,
         };
         if !self.send(command, true) {
@@ -517,11 +541,15 @@ fn thread_main(receiver: &Receiver<Command>, mirror: &Arc<Mutex<RuntimeSnapshot>
 /// the mirror exists to prevent, and the GUI polls it two seconds apart.
 fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeSnapshot>) {
     match command {
-        Command::Load { entry, reply } => {
+        Command::Load {
+            entry,
+            backend,
+            reply,
+        } => {
             // Free the old weights before mapping the new ones: two models in
             // memory at once is how a 32 GB machine dies.
             *loaded = None;
-            match load_model(&entry, mirror) {
+            match load_model(&entry, mirror, backend) {
                 Ok(model) => {
                     let meta = model.meta.clone();
                     *loaded = Some(model);
@@ -586,7 +614,11 @@ fn read_header(path: &PathBuf) -> Result<(gguf_file::Content, std::fs::File), St
 
 /// Reads the header, refuses unsupported architectures, then maps the
 /// tensors, reporting each phase into the mirror as it goes.
-fn load_model(entry: &ModelEntry, mirror: &Mutex<RuntimeSnapshot>) -> Result<Loaded, RuntimeError> {
+fn load_model(
+    entry: &ModelEntry,
+    mirror: &Mutex<RuntimeSnapshot>,
+    backend: Backend,
+) -> Result<Loaded, RuntimeError> {
     set_state(mirror, loading(&entry.id, "reading_header"));
     let (content, mut file) = read_header(&entry.path).map_err(RuntimeError::LoadFailed)?;
 
@@ -607,11 +639,17 @@ fn load_model(entry: &ModelEntry, mirror: &Mutex<RuntimeSnapshot>) -> Result<Loa
         .map_or(CONTEXT_TOKENS, |declared| {
             CONTEXT_TOKENS.min(declared as usize)
         });
+    let device = match backend {
+        Backend::Auto => select_device(),
+        Backend::Cpu => Device::Cpu,
+        Backend::Metal => Device::new_metal(0)
+            .map_err(|err| RuntimeError::LoadFailed(format!("Metal backend unavailable: {err}")))?,
+    };
+    preflight_tensor_dtypes(&content, device_label(&device))?;
     let tokenizer =
         tokenizer::from_gguf(&content).map_err(|err| RuntimeError::LoadFailed(err.to_string()))?;
 
     set_state(mirror, loading(&entry.id, "mapping_tensors"));
-    let device = select_device();
     let model = build_model(&architecture, content, &mut file, &device)?;
     set_state(mirror, loading(&entry.id, "ready"));
 
@@ -661,6 +699,43 @@ fn build_model<R: Read + Seek>(
             .map_err(|err| RuntimeError::LoadFailed(err.to_string())),
         other => Err(RuntimeError::UnsupportedArchitecture(other.to_string())),
     }
+}
+
+/// Reject known unsupported Candle 0.9.2 weight formats from the header,
+/// before reading any tensor payload. This is a compatibility gate, not a
+/// promise that every model using an accepted dtype has been qualified.
+pub(crate) fn preflight_tensor_dtypes(
+    content: &gguf_file::Content,
+    backend: &str,
+) -> Result<(), RuntimeError> {
+    for (name, tensor) in &content.tensor_infos {
+        let unsupported = match tensor.ggml_dtype {
+            // CPU vec_dot panics; Metal's matrix-matrix kernel rejects it.
+            GgmlDType::Q8_1 => true,
+            // CPU has a vec_dot implementation; Metal qmatmul rejects it.
+            GgmlDType::Q8K => backend == "metal",
+            GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K => false,
+        };
+        if unsupported {
+            return Err(RuntimeError::LoadFailed(format!(
+                "tensor {name:?} uses {:?}, unsupported by PAM's Candle 0.9.2 {backend} inference path; no weights were mapped. Choose a supported quantization/backend and retain this detail when reporting the model",
+                tensor.ggml_dtype,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Metal on macOS, CPU everywhere else — and CPU on macOS too when Metal

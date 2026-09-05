@@ -99,13 +99,22 @@ impl EventPublisher {
         (Self { tx }, rx)
     }
 
-    /// Publishes `event` under the topic `request_id`, so subscribers to
-    /// that request id receive it.
-    pub async fn publish(&self, request_id: &str, event: Event) -> Result<(), PublishError> {
-        self.tx
-            .send((request_id.to_owned(), event))
-            .await
-            .map_err(|_| PublishError)
+    /// Best-effort notification: queue the event or drop it when slow peers
+    /// have filled the bounded queue. Authoritative results remain in Store;
+    /// subscribers reconcile missed terminal events through `query`.
+    ///
+    /// The ready future preserves callers' awaitable API without letting a
+    /// notification delay request completion, cancellation or administration.
+    pub fn publish(
+        &self,
+        request_id: &str,
+        event: Event,
+    ) -> std::future::Ready<Result<(), PublishError>> {
+        let result = match self.tx.try_send((request_id.to_owned(), event)) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(PublishError),
+        };
+        std::future::ready(result)
     }
 }
 
@@ -204,7 +213,10 @@ async fn recv_loop(
             received = router.recv() => match received {
                 Ok(message) => message,
                 // `recv` only fails when the socket is torn down.
-                Err(_) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "router receive loop ended");
+                    break;
+                }
             },
         };
         handle_frames(message, &incoming, &reply_tx).await;
@@ -305,7 +317,14 @@ async fn reply_loop(
         message.push_back(payload.into());
         // A send failure means the peer already disconnected; it has no
         // address to be told at, so the response is dropped.
-        let _ = router.send(message).await;
+        let request_id = match &response {
+            Response::Result { id, .. }
+            | Response::Refusal { id, .. }
+            | Response::Ticket { id, .. } => id,
+        };
+        if let Err(error) = router.send(message).await {
+            tracing::debug!(request_id, %error, "router reply send failed");
+        }
     }
 }
 
@@ -327,7 +346,11 @@ async fn publish_loop(
         };
         let mut message = ZmqMessage::from(topic);
         message.push_back(payload.into());
-        // PUB drops for slow or absent subscribers by design.
-        let _ = pub_socket.send(message).await;
+        // zeromq's PUB send awaits slow peers. Notifications must not keep
+        // shutdown waiting for an abandoned subscriber to read its socket.
+        tokio::select! {
+            () = signalled(&mut shutdown) => break,
+            _ = pub_socket.send(message) => {}
+        }
     }
 }

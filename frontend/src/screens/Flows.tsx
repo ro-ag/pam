@@ -1,11 +1,14 @@
+import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn } from "../lib/cn";
 import { PageTabs } from "../components/ui/PageTabs";
+import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
+  connectorsList,
   flowsGet,
   flowsList,
   flowsNormalize,
@@ -18,6 +21,7 @@ import { FlowCanvas, type Selection } from "./flow-canvas/FlowCanvas";
 import { markerFor, toRaw, type RunStatus } from "./flow-canvas/graph";
 import { Inspector } from "./flow-canvas/Inspector";
 import { statusesFrom } from "./flow-canvas/notes";
+import { useFlowLibraryControls, type LibraryDraft } from "./FlowLibraryControls";
 import { FlowEditor } from "./FlowEditor";
 import { FlowRunCard, useFlowVerdict, type FlowRunState } from "./FlowRunCard";
 import { FlowRuns } from "./FlowRuns";
@@ -276,20 +280,88 @@ function useStableIssue(issue: FlowIssue | null): FlowIssue | null {
 
 // --- the detail pane ---------------------------------------------------------
 
+function ConnectorPrerequisites({ ids }: { ids: string[] }) {
+  const connectors = useQuery({
+    queryKey: ["connectors"],
+    queryFn: connectorsList,
+    enabled: ids.length > 0,
+  });
+  if (ids.length === 0) return null;
+  return (
+    <Panel ground="raised" className="space-y-2 p-4">
+      <p className="text-sm font-medium text-ink">Required connectors</p>
+      {ids.map((id) => {
+        const row = connectors.data?.connectors.find((item) => item.id === id);
+        const state =
+          !connectors.isSuccess || connectors.isFetching
+            ? "Readiness unavailable"
+            : !row
+              ? "Not configured"
+              : !row.enabled
+                ? "Disabled"
+                : row.needs_base_url && !row.base_url
+                  ? "Needs URL"
+                  : row.auth !== "aws_profile" && !row.store_available
+                    ? "Store unavailable"
+                    : row.auth !== "aws_profile" &&
+                        (!row.credential_present ||
+                          (row.auth === "basic_user_secret" && !row.username?.trim()))
+                      ? "Needs credentials"
+                      : row.last_test?.status === "passed"
+                        ? "Ready"
+                        : row.last_test?.status === "failed"
+                          ? "Test failed"
+                          : "Untested";
+        return (
+          <p key={id} className="text-sm text-ink-muted">
+            {row?.name ?? id}: {state}
+            {" · "}
+            <Link
+              to="/settings"
+              hash={`connectors/${id}`}
+              className="text-accent-strong underline"
+            >
+              Set up {row?.name ?? id}
+            </Link>
+          </p>
+        );
+      })}
+      <p className="text-sm text-ink-muted">
+        A connection test checks service access; the run still enforces each step's policy and
+        permissions.
+      </p>
+    </Panel>
+  );
+}
+
 function FlowDetailPane({
   entry,
   tab,
   onTab,
-  onSaved,
-  onDeleted,
+  onDraft,
+  busy,
+  onSave,
+  isLocked,
 }: {
   entry: FlowListEntry;
   tab: Tab;
   onTab: (tab: Tab) => void;
-  onSaved: (id: string) => void;
-  onDeleted: () => void;
+  onDraft: (draft: LibraryDraft) => void;
+  busy: boolean;
+  onSave: () => void;
+  isLocked: () => boolean;
 }) {
   const { detail, draft, normalizing, changeSpec, changeYaml, flush } = useFlowDraft(entry);
+  useEffect(
+    () =>
+      onDraft({
+        id: entry.id,
+        yaml: draft.yaml,
+        dirty: draft.dirty,
+        saveDisabled: normalizing || draft.error !== null || draft.spec === null,
+      }),
+    [entry.id, draft.yaml, draft.dirty, draft.error, draft.spec, normalizing, onDraft],
+  );
   const [selection, setSelection] = useState<Selection>({ kind: "none" });
   const [run, setRun] = useState<FlowRunState | null>(null);
   const { statuses, outcome } = useRunStatuses(run);
@@ -309,17 +381,19 @@ function FlowDetailPane({
   // Any edit says the flow the run was about no longer exists as drawn.
   const onCanvasChange = useCallback(
     (spec: FlowSpec) => {
+      if (busy || isLocked()) return;
       setRun(null);
       changeSpec(spec);
     },
-    [changeSpec],
+    [changeSpec, busy, isLocked],
   );
   const onYamlChange = useCallback(
     (yaml: string) => {
+      if (busy || isLocked()) return;
       setRun(null);
       changeYaml(yaml);
     },
-    [changeYaml],
+    [changeYaml, busy, isLocked],
   );
 
   const loadFailure = detail.isError ? toBridgeFailure(detail.error) : null;
@@ -369,10 +443,10 @@ function FlowDetailPane({
         role="tabpanel"
         aria-labelledby={`flow-tab-${tab}`}
         tabIndex={0}
-        className="page-content"
+        className={cn("page-content", tab === "canvas" && "flow-canvas-pane")}
       >
         {tab === "runs" && <FlowRuns flowId={entry.id} />}
-        <div className="space-y-4" hidden={tab === "run" || tab === "runs"}>
+        <div className="flow-editor-pane space-y-4" hidden={tab === "run" || tab === "runs"}>
           {loadFailure && <FailureNote failure={loadFailure} label="flow" />}
 
           {draft.dirty && (
@@ -390,7 +464,7 @@ function FlowDetailPane({
 
           {tab === "canvas" && (
             <div className="flow-workbench flex gap-4">
-              <div className="min-w-0 flex-1 space-y-3">
+              <div className="flow-canvas-column min-w-0 flex-1 space-y-3">
                 {flowIssue && (
                   <FailureNote
                     label="flow"
@@ -420,7 +494,7 @@ function FlowDetailPane({
                 ) : null}
               </div>
               {draft.spec && (
-                <div className="flow-inspector shrink-0">
+                <div className="flow-inspector">
                   <Inspector
                     spec={draft.spec}
                     selection={selection}
@@ -440,8 +514,8 @@ function FlowDetailPane({
             showYaml={tab === "yaml"}
             onYamlChange={onYamlChange}
             saveDisabled={saveDisabled}
-            onSaved={onSaved}
-            onDeleted={onDeleted}
+            onSave={onSave}
+            busy={busy}
           />
         </div>
         <div hidden={tab !== "run"} className="space-y-4">
@@ -451,6 +525,15 @@ function FlowDetailPane({
               You have unsaved changes. Save or clone them before running the updated flow.
             </p>
           )}
+          <ConnectorPrerequisites
+            ids={[
+              ...new Set(
+                (detail.data?.flow?.steps ?? []).flatMap((step) =>
+                  step.action.kind === "connector" ? [step.action.connector] : [],
+                ),
+              ),
+            ]}
+          />
           <FlowRunCard key={`run-${entry.id}`} flow={entry} onRun={setRun} />
         </div>
       </div>
@@ -460,32 +543,74 @@ function FlowDetailPane({
 
 // --- the screen ------------------------------------------------------------
 
-export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
+export function FlowsScreen({
+  initialFlow,
+  onDirtyChange,
+  navigation,
+}: {
+  initialFlow?: string;
+  onDirtyChange?: (dirty: boolean) => void;
+  navigation?: { pending: boolean; proceed?: () => void; cancel?: () => void };
+} = {}) {
   const flows = useQuery({ queryKey: ["flows"], queryFn: flowsList });
   const [picked, setPicked] = useState<string | null>(initialFlow ?? null);
   const [tab, setTab] = useState<Tab>("canvas");
+  const [draft, setDraft] = useState<LibraryDraft | null>(null);
+  const [revision, setRevision] = useState(0);
+  const discard = useCallback(() => {
+    setDraft(null);
+    setRevision((value) => value + 1);
+  }, []);
+  useEffect(() => {
+    onDirtyChange?.(draft?.dirty ?? false);
+  }, [draft?.dirty, onDirtyChange]);
 
   // `?flow=<id>` is a deep link (Ask Pam answers "run pr-readiness" with
   // one), so a second link to a different flow while the screen is
   // already mounted has to move the selection too. An id nobody has
   // falls through to the shelf's own fallback below.
-  useEffect(() => {
-    if (initialFlow) setPicked(initialFlow);
-  }, [initialFlow]);
 
   const entries = flows.data?.flows ?? [];
   // Nothing picked yet means the top of the shelf; a flow that just went
   // away (deleted, or renamed by a clone) falls back the same way.
   const selected = entries.find((entry) => entry.id === picked) ?? entries[0] ?? null;
   const failure = flows.isError ? toBridgeFailure(flows.error) : null;
+  const controls = useFlowLibraryControls({
+    entries,
+    selected,
+    draft,
+    ready: flows.isSuccess && !flows.isFetching,
+    onSelected: setPicked,
+    onDiscard: discard,
+  });
+  const handledNavigation = useRef<(() => void) | undefined>(undefined);
+  useEffect(() => {
+    if (!navigation?.pending) {
+      handledNavigation.current = undefined;
+      return;
+    }
+    if (handledNavigation.current !== navigation.proceed && navigation.proceed) {
+      handledNavigation.current = navigation.proceed;
+      controls.requestNavigation(navigation.proceed, navigation.cancel);
+    }
+  }, [navigation, controls.requestNavigation]);
+  const previousInitialFlow = useRef(initialFlow);
+  useEffect(() => {
+    if (initialFlow && initialFlow !== previousInitialFlow.current) {
+      previousInitialFlow.current = initialFlow;
+      controls.requestNavigation(() => setPicked(initialFlow));
+    }
+  }, [initialFlow, controls.requestNavigation]);
 
   return (
     <div className="page-workspace">
       <PageHeader>
         <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
         <p className="text-sm text-ink-muted">Reusable workflows and execution history.</p>
+        {controls.toolbar}
       </PageHeader>
 
+      {controls.dialogs}
       {failure && (
         <div className="max-w-xl pt-4">
           <FailureNote failure={failure} label="flows" />
@@ -513,7 +638,10 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
                   key={entry.id}
                   entry={entry}
                   active={entry.id === selected.id}
-                  onSelect={() => setPicked(entry.id)}
+                  onSelect={() => {
+                    if (entry.id !== selected.id)
+                      controls.requestNavigation(() => setPicked(entry.id));
+                  }}
                 />
               ))}
             </ul>
@@ -525,7 +653,10 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
               <select
                 aria-label="Choose flow"
                 value={selected.id}
-                onChange={(event) => setPicked(event.target.value)}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  controls.requestNavigation(() => setPicked(next));
+                }}
                 className="field-control h-8 w-full rounded-control border border-control-line bg-inset px-2 text-sm"
               >
                 {entries.map((entry) => (
@@ -548,12 +679,21 @@ export function FlowsScreen({ initialFlow }: { initialFlow?: string } = {}) {
             </div>
 
             <FlowDetailPane
-              key={selected.id}
+              key={`${selected.id}-${revision}`}
               entry={selected}
               tab={tab}
-              onTab={setTab}
-              onSaved={(id) => setPicked(id)}
-              onDeleted={() => setPicked(null)}
+              onTab={(next) => {
+                if (
+                  (tab === "canvas" || tab === "yaml") &&
+                  (next === "canvas" || next === "yaml")
+                )
+                  setTab(next);
+                else controls.requestNavigation(() => setTab(next));
+              }}
+              onDraft={setDraft}
+              busy={controls.busy}
+              onSave={controls.saveDraft}
+              isLocked={controls.isLocked}
             />
           </section>
         </div>

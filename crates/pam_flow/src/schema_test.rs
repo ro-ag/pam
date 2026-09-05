@@ -226,6 +226,8 @@ fn step_defaults() -> Step {
         effect: Effect::ReadOnly,
         role: Role::Observe,
         output: OutputPolicy::Compact,
+        expect_empty_output: false,
+        expect_status: None,
         needs: Vec::new(),
         when: When::NeedsSucceeded,
         retry: Retry::default(),
@@ -233,4 +235,10 @@ fn step_defaults() -> Step {
         env: BTreeMap::new(),
         note: String::new(),
     }
+}
+
+#[test]
+fn default_output_assertion_is_absent_from_resolved_json() {
+    let json = serde_json::to_value(step_defaults()).unwrap();
+    assert!(json.get("expect_empty_output").is_none());
 }

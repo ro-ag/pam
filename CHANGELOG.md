@@ -6,6 +6,42 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-04
+
+### Added
+
+- Discoverable New, Duplicate, Rename and Delete actions in the flow library,
+  blank and template creation, unsaved-change guards, and session undo for
+  deletion. Built-in flows remain recoverable after custom overrides.
+- A PAM-specific PR readiness flow that runs the complete local quality gate.
+
+### Fixed
+
+- Quantized Qwen3 MoE generation on CPU and Metal, with cancellation and
+  error recovery. Known unsupported tensor/backend combinations are refused
+  before weight mapping with actionable errors.
+- Clean-tree checks now fail on dirty tracked, untracked and submodule state.
+- Connector verification now checks explicit passing statuses instead of
+  treating successful retrieval as a passing check.
+- Unread event subscribers no longer block daemon request replies or shutdown.
+- Settings reject invalid input and protect against concurrent save races.
+  Connector tests use the current saved configuration and retire stale readiness.
+- Flow canvas connections have clearer contrast and zoom-independent targets.
+  The canvas fits the available space, refits after resizing, and keeps the
+  inspector independently scrollable.
+
+### Compatibility
+
+- Custom connector steps using `role: verify` must declare `expect_status`;
+  otherwise execution refuses verification. Use `role: observe` when the step
+  only retrieves data. Built-in verification flows include explicit predicates.
+- Flow saves now reject duplicate display names, including names reserved by
+  built-in flows. Existing flow IDs remain stable when renamed.
+- Real dense and MoE Q8_0 generation and recovery were verified on CPU and
+  Metal on a 64 GB host. This is compatibility evidence, not qualification of
+  approximately 16 GB models on the 32 GB hardware baseline; that evaluation
+  remains outstanding.
+
 ## [0.2.1] - 2026-09-04
 
 ### Changed

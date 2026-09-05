@@ -1,10 +1,11 @@
 schema: 1
 id: pr-readiness
-name: PR readiness
+name: Rust PR readiness
 description: >-
-  Everything this repository asks for before a pull request opens: a clean
-  tree, an up-to-date remote, the commits the branch adds, and the three
-  Rust gates (format, clippy, tests).
+  A Rust-only starting point: a clean tree, an up-to-date remote, the
+  commits the branch adds, and format, clippy and Rust tests. It does not
+  cover frontend or other project-specific gates. For PAM itself, use
+  pam-pr-readiness.
 steps:
   - id: clean-tree
     run: [git, status, --porcelain=v1, --untracked-files=all, --ignore-submodules=none]

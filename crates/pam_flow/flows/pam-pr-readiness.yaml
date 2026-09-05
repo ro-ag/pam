@@ -1,0 +1,42 @@
+schema: 1
+id: pam-pr-readiness
+name: PAM PR readiness
+description: >-
+  For the PAM repository only: prove the tree is clean, then run every
+  required gate from tools/check.sh, including frontend lint, TypeScript
+  and production build, and frontend tests. Requires the Rust toolchain
+  and installed frontend dependencies. Stops dependent gates on failure.
+steps:
+  - id: clean-tree
+    run: [git, status, --porcelain=v1, --untracked-files=all, --ignore-submodules=none]
+    expect_empty_output: true
+    role: verify
+  - id: fmt
+    run: [cargo, fmt, --all, --check]
+    role: verify
+    needs: [clean-tree]
+  - id: clippy
+    run: [cargo, clippy, --workspace, --all-targets, "--", "-D", warnings]
+    role: verify
+    needs: [fmt]
+    timeout: 20m
+  - id: tests
+    run: [cargo, test, --workspace]
+    role: verify
+    needs: [clippy]
+    timeout: 30m
+  - id: frontend-lint
+    run: [npm, --prefix, frontend, run, lint]
+    role: verify
+    needs: [tests]
+    timeout: 10m
+  - id: frontend-build
+    run: [npm, --prefix, frontend, run, build]
+    role: verify
+    needs: [frontend-lint]
+    timeout: 10m
+  - id: frontend-tests
+    run: [npm, --prefix, frontend, run, test]
+    role: verify
+    needs: [frontend-build]
+    timeout: 10m

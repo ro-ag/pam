@@ -1345,3 +1345,142 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
     })
     .await;
 }
+
+/// Substitute only child executables, keeping the shipped gate order, roles
+/// and dependency edges; this proves verdict propagation, not the gate tools.
+fn readiness_failure_fixture(fail_at: Option<usize>) -> String {
+    let mut flow = pam_flow::parse(pam_flow::builtin_yaml("pam-pr-readiness").unwrap()).unwrap();
+    for (index, step) in flow.steps.iter_mut().enumerate() {
+        step.action = pam_flow::Action::Command {
+            argv: [
+                "pam-flow-helper",
+                "exit",
+                if fail_at == Some(index) { "17" } else { "0" },
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        };
+    }
+    pam_flow::to_normalized_yaml(&flow)
+}
+
+#[tokio::test]
+async fn pam_readiness_any_gate_failure_prevents_verified_and_skips_dependents() {
+    for fail_at in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)] {
+        with_deadline(async {
+            let yaml = readiness_failure_fixture(fail_at);
+            let flows = FlowDaemon::spawn(&[("pam-pr-readiness", &yaml)]).await;
+            let mut client = flows.daemon.client().await;
+            let body = flows.run(&mut client, "req_run", "pam-pr-readiness").await;
+            assert_eq!(
+                body["outcome"],
+                if fail_at.is_none() {
+                    "verified"
+                } else {
+                    "unresolved"
+                },
+                "{body}"
+            );
+            for (index, step) in body["steps"].as_array().unwrap().iter().enumerate() {
+                let expected = match fail_at {
+                    Some(failed) if index == failed => "failed",
+                    Some(failed) if index > failed => "skipped",
+                    _ => "succeeded",
+                };
+                assert_eq!(step["status"], expected, "{body}");
+                if expected == "failed" {
+                    assert_eq!(step["exit_status"], 17);
+                    assert_eq!(step["error"]["cause"], "exit_status");
+                }
+            }
+            let evidence = flows.daemon.store().list_evidence("req_run").await.unwrap();
+            assert!(
+                evidence
+                    .iter()
+                    .any(|row| row.kind == EVIDENCE_KIND_FLOW_RESULT)
+            );
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+        })
+        .await;
+    }
+}
+
+/// Run the already-built integration-test executable directly with --ignored
+/// and `PAM_READINESS_REPO` set. Never invoke under an outer Cargo process: the
+/// actual shipped flow starts Cargo itself. No command substitution or mocks.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "explicit real PAM repository validation; run compiled test directly without outer Cargo"]
+async fn pam_readiness_runs_all_real_project_gates() {
+    let repo = std::env::var("PAM_READINESS_REPO")
+        .expect("PAM_READINESS_REPO must name the clean PAM checkout");
+    let tmp = short_tempdir();
+    seed_relaxed(&tmp).await;
+    seed_allowed_programs(&tmp, &["git", "cargo", "npm"]).await;
+    let daemon = TestDaemon::spawn_at(tmp).await;
+    let mut client = daemon.client().await;
+    let mut envelope = envelope_for_repo(
+        &repo,
+        "req_real_readiness",
+        CAP_FLOW_RUN,
+        serde_json::json!({"id": "pam-pr-readiness"}),
+        false,
+    );
+    envelope.deadline_ms = 7_200_000;
+    assert!(matches!(
+        client.request(&envelope).await,
+        Response::Ticket { .. }
+    ));
+    tokio::time::timeout(Duration::from_mins(10), async {
+        loop {
+            let row = daemon
+                .store()
+                .get_request("req_real_readiness")
+                .await
+                .unwrap()
+                .unwrap();
+            if row.state.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("actual readiness finishes within two hours");
+    let verdict = daemon
+        .store()
+        .list_evidence("req_real_readiness")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == EVIDENCE_KIND_FLOW_RESULT)
+        .expect("real flow retains its verdict");
+    let evidence = daemon
+        .store()
+        .get_evidence(&verdict.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&evidence.content).unwrap();
+    println!(
+        "PAM_READINESS_PROOF {}",
+        serde_json::to_string(&body).unwrap()
+    );
+    daemon.stop().await;
+    assert_eq!(body["outcome"], "verified", "{body}");
+    let steps = body["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 7);
+    for (step, id) in steps.iter().zip([
+        "clean-tree",
+        "fmt",
+        "clippy",
+        "tests",
+        "frontend-lint",
+        "frontend-build",
+        "frontend-tests",
+    ]) {
+        assert_eq!(step["id"], id);
+        assert_eq!(step["status"], "succeeded", "{body}");
+        assert_eq!(step["exit_status"], 0, "{body}");
+    }
+}

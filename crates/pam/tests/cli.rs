@@ -357,10 +357,11 @@ const FLOW_DEADLINE: Duration = Duration::from_mins(1);
 const EXIT_USAGE: i32 = 2;
 
 /// Every flow that ships in the binary.
-const BUILTIN_FLOWS: [&str; 7] = [
+const BUILTIN_FLOWS: [&str; 8] = [
     "after-merge-checks",
     "ci-failure-triage",
     "dependency-audit",
+    "pam-pr-readiness",
     "pr-readiness",
     "release-readiness",
     "sonar-gate-check",

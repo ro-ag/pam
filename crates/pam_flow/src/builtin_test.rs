@@ -6,7 +6,7 @@ use super::schema::{Action, ConnectorId, OutputPolicy, Role};
 use super::validate::parse;
 
 #[test]
-fn pam_ships_the_seven_starter_flows() {
+fn pam_ships_the_eight_starter_flows() {
     let ids: Vec<_> = builtin().iter().map(|flow| flow.id).collect();
     assert_eq!(
         ids,
@@ -14,6 +14,7 @@ fn pam_ships_the_seven_starter_flows() {
             "after-merge-checks",
             "ci-failure-triage",
             "dependency-audit",
+            "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
             "sonar-gate-check",
@@ -262,4 +263,37 @@ fn sonar_gate_has_an_explicit_passing_status_and_always_collects_issues() {
     assert_eq!(flow.steps[0].expect_status.as_deref(), Some("OK"));
     assert_eq!(flow.steps[0].role, Role::Verify);
     assert_eq!(flow.steps[1].when, super::schema::When::Always);
+}
+
+#[test]
+fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
+    let flow = parse(builtin_yaml("pam-pr-readiness").unwrap()).unwrap();
+    let required: Vec<Vec<String>> = include_str!("../../../tools/check.sh")
+        .lines()
+        .filter(|line| line.starts_with("cargo ") || line.starts_with("npm "))
+        .map(|line| line.split_whitespace().map(str::to_owned).collect())
+        .collect();
+    let actual: Vec<_> = flow
+        .steps
+        .iter()
+        .skip(1)
+        .map(|step| match &step.action {
+            Action::Command { argv } => argv.clone(),
+            Action::Connector { .. } => panic!("local gates must be commands"),
+        })
+        .collect();
+    assert_eq!(required.len(), 6);
+    assert_eq!(actual, required);
+    assert!(flow.steps[0].expect_empty_output);
+    for pair in flow.steps.windows(2) {
+        assert_eq!(pair[1].needs, [pair[0].id.clone()]);
+        assert_eq!(pair[1].role, Role::Verify);
+        assert_eq!(pair[1].when, super::schema::When::NeedsSucceeded);
+    }
+    let generic = parse(builtin_yaml("pr-readiness").unwrap()).unwrap();
+    assert!(generic.name.contains("Rust"));
+    assert!(generic.steps.iter().all(|step| match &step.action {
+        Action::Command { argv } => argv[0] != "npm",
+        Action::Connector { .. } => true,
+    }));
 }

@@ -1,7 +1,9 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createAppQueryClient } from "../App";
+import App, { createAppQueryClient } from "../App";
+import { createMemoryHistory } from "@tanstack/react-router";
+import { createAppRouter } from "../router";
 import type {
   ActivityRow,
   EvidenceContent,
@@ -27,6 +29,7 @@ import { flowIdOf } from "./FlowRuns";
  */
 
 const mocks = vi.hoisted(() => ({
+  connectorsList: vi.fn(),
   flowsList: vi.fn(),
   flowsGet: vi.fn(),
   flowsSave: vi.fn(),
@@ -788,4 +791,39 @@ describe("the canvas tab", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     await waitFor(() => expect(rail("fmt").className).not.toContain("bg-danger"));
   });
+});
+
+it("links a saved flow prerequisite to that connector's exact setup form", async () => {
+  mocks.connectorsList.mockResolvedValue({
+    connectors: [
+      {
+        id: "sonarqube",
+        name: "SonarQube",
+        auth: "token_as_user",
+        enabled: false,
+        needs_base_url: true,
+        credential_present: false,
+        store_available: true,
+      },
+    ],
+  });
+  mocks.flowsGet.mockResolvedValue({
+    ...FLOWS[0],
+    yaml: "id: pr-readiness",
+    flow: {
+      ...SPEC,
+      steps: [
+        {
+          ...defaultStep("quality", "connector"),
+          action: { kind: "connector", connector: "sonarqube", call: "quality_gate", with: {} },
+        },
+      ],
+    },
+  });
+  const router = createAppRouter(createMemoryHistory({ initialEntries: ["/flows"] }));
+  render(<App router={router} />);
+  fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+  const link = await screen.findByRole("link", { name: "Set up SonarQube" });
+  expect(link).toHaveAttribute("href", "/settings#connectors/sonarqube");
+  expect(screen.getByText(/SonarQube: Disabled/)).toBeInTheDocument();
 });

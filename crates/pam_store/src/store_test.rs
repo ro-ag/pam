@@ -1224,6 +1224,7 @@ async fn upsert_connector_creates_then_patches_only_given_fields() {
         .upsert_connector(
             "github",
             ConnectorPatch {
+                invalidate_test: false,
                 enabled: Some(true),
                 base_url: Some(Some("https://api.github.com")),
                 username: None,
@@ -1242,6 +1243,7 @@ async fn upsert_connector_creates_then_patches_only_given_fields() {
         .upsert_connector(
             "github",
             ConnectorPatch {
+                invalidate_test: false,
                 enabled: None,
                 base_url: None,
                 username: Some(Some("octocat")),
@@ -1259,6 +1261,7 @@ async fn upsert_connector_creates_then_patches_only_given_fields() {
         .upsert_connector(
             "github",
             ConnectorPatch {
+                invalidate_test: false,
                 enabled: None,
                 base_url: Some(None),
                 username: None,
@@ -1283,6 +1286,7 @@ async fn list_connectors_is_ordered_by_id() {
             .upsert_connector(
                 id,
                 ConnectorPatch {
+                    invalidate_test: false,
                     enabled: Some(false),
                     base_url: None,
                     username: None,
@@ -1318,6 +1322,7 @@ async fn record_connector_test_creates_row_when_absent_and_updates_it() {
         .upsert_connector(
             "github",
             ConnectorPatch {
+                invalidate_test: false,
                 enabled: Some(true),
                 base_url: None,
                 username: None,
@@ -1505,4 +1510,58 @@ async fn prune_requests_removes_the_whole_terminal_record_only() {
         .await,
         0
     );
+}
+
+#[tokio::test]
+async fn connector_identity_changes_invalidate_all_test_fields() {
+    let store = Store::open_in_memory().await.unwrap();
+    let identity = ConnectorPatch {
+        base_url: Some(Some("https://example.test")),
+        username: Some(Some("alice")),
+        ..ConnectorPatch::default()
+    };
+    store.upsert_connector("github", identity).await.unwrap();
+    for patch in [
+        ConnectorPatch {
+            base_url: Some(None),
+            ..ConnectorPatch::default()
+        },
+        identity,
+        ConnectorPatch {
+            username: Some(Some("bob")),
+            ..ConnectorPatch::default()
+        },
+        ConnectorPatch {
+            invalidate_test: true,
+            ..ConnectorPatch::default()
+        },
+    ] {
+        store
+            .record_connector_test("github", true, "passed")
+            .await
+            .unwrap();
+        let row = store.upsert_connector("github", patch).await.unwrap();
+        assert!(row.last_test_status.is_none());
+        assert!(row.last_test_detail.is_none());
+        assert!(row.last_test_ts.is_none());
+    }
+    store
+        .record_connector_test("github", true, "passed")
+        .await
+        .unwrap();
+    let row = store
+        .upsert_connector(
+            "github",
+            ConnectorPatch {
+                enabled: Some(true),
+                base_url: Some(Some("https://example.test")),
+                username: Some(Some("bob")),
+                ..ConnectorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.last_test_status.as_deref(), Some("passed"));
+    assert_eq!(row.last_test_detail.as_deref(), Some("passed"));
+    assert!(row.last_test_ts.is_some());
 }

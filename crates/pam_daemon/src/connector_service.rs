@@ -318,6 +318,8 @@ fn build_lines(id: ConnectorId) -> Recoveries {
 
 /// The connector host: rows, credentials, and the transport, in one place.
 pub struct ConnectorService {
+    /// A test verdict and its configuration must describe the same identity.
+    configuration_locks: BTreeMap<ConnectorId, tokio::sync::Mutex<()>>,
     store: Arc<Store>,
     secrets: Arc<SecretStore>,
     transport: Arc<dyn HttpTransport>,
@@ -349,6 +351,10 @@ impl ConnectorService {
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
         Self {
+            configuration_locks: ConnectorId::ALL
+                .into_iter()
+                .map(|id| (id, tokio::sync::Mutex::new(())))
+                .collect(),
             store,
             secrets,
             transport,
@@ -372,6 +378,10 @@ impl ConnectorService {
         let store_available = secrets.is_some();
         let curl_missing = transport.is_none();
         Self {
+            configuration_locks: ConnectorId::ALL
+                .into_iter()
+                .map(|id| (id, tokio::sync::Mutex::new(())))
+                .collect(),
             store,
             secrets: secrets
                 .unwrap_or_else(|| Arc::new(SecretStore::new(Arc::new(UnavailableBackend)))),
@@ -403,13 +413,14 @@ impl ConnectorService {
     ///
     /// The base URL is validated before anything is written, so a typo
     /// leaves the stored configuration exactly as it was. The credential
-    /// goes first and the row second: a keychain that refuses the write
-    /// must not leave a row claiming a credential that is not there.
+    /// mutation follows verdict invalidation and precedes configuration: a
+    /// failed secret write requires retesting but does not apply new settings.
     pub async fn configure(
         &self,
         id: ConnectorId,
         patch: ConfigurePatch,
     ) -> Result<ConnectorSummary, InvokeError> {
+        let _guard = self.configuration_locks[&id].lock().await;
         // A change to the base URL is checked before anything is written;
         // a value that trims to nothing clears the field.
         let base_url = match patch.base_url.as_ref() {
@@ -417,6 +428,21 @@ impl ConnectorService {
             Some(None) => Some(None),
             Some(Some(raw)) => Some(normalize_base_url(id, raw)?),
         };
+
+        // Retire the old proof before touching the separate secret store. If
+        // either store then fails, requiring a retest is safer than retaining
+        // a passed verdict for a credential that may already have changed.
+        if patch.credential.is_some() {
+            self.store
+                .upsert_connector(
+                    id.as_str(),
+                    ConnectorPatch {
+                        invalidate_test: true,
+                        ..ConnectorPatch::default()
+                    },
+                )
+                .await?;
+        }
 
         match patch.credential.as_ref() {
             Some(CredentialAction::Set(secret)) => self.secrets.set(id.as_str(), secret).await?,
@@ -434,6 +460,7 @@ impl ConnectorService {
             .upsert_connector(
                 id.as_str(),
                 ConnectorPatch {
+                    invalidate_test: patch.credential.is_some(),
                     enabled: patch.enabled,
                     base_url: base_url.as_ref().map(|value| value.as_deref()),
                     username,
@@ -450,6 +477,7 @@ impl ConnectorService {
     /// verdict is recorded whether it passed or failed, so the panel can
     /// show "failed, 401" without the human having to watch the call.
     pub async fn test(&self, id: ConnectorId) -> Result<(bool, String), InvokeError> {
+        let _guard = self.configuration_locks[&id].lock().await;
         let row = self.store.get_connector(id.as_str()).await?;
         let connection = self.connection(id, row.as_ref()).await?;
         self.ensure_transport(id)?;

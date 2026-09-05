@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -13,81 +13,183 @@ import {
   toBridgeFailure,
   type BridgeFailure,
   type ConnectorSummary,
-  type CredentialPatch,
 } from "../lib/ipc";
 import { exactTime, relativeTime } from "../lib/time";
 
-/**
- * Settings → Connectors: where a human hands pam a credential and points
- * it at a service.
- *
- * This screen is the only door. No agent, CLI, or MCP call builds one of
- * these envelopes — an agent that could configure a connector could grant
- * itself reach it does not have. What an agent *can* do is run a flow
- * step against a connector a human already enabled.
- *
- * Three states a credential can be in are three different sentences, and
- * pam-old taught us to keep them apart: "no credential stored" (the store
- * answered, and it holds nothing), "the store is unavailable" (nobody
- * asked pam anything; the keychain would not talk), and "access denied"
- * (the store answered, and said no). Collapsing them into one "failed"
- * is how an afternoon disappears.
- *
- * A typed secret is never echoed back. It travels once, over the unix
- * socket, into the OS keychain — the field is cleared the moment Set
- * succeeds, and nothing reads it out again.
- */
-
-/** The refusal cause the OS credential store raises when it says no. */
 export const CAUSE_STORE_DENIED = "store_denied";
-
-/** The one line the GUI says about a mute credential store. */
 export const STORE_UNAVAILABLE_COPY =
   "the OS credential store is unavailable; see the daemon log";
-
 const fieldClasses =
-  "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:opacity-50";
 
-/** AWS authenticates by named profile: there is no secret to store. */
-function usesProfile(connector: ConnectorSummary): boolean {
-  return connector.auth === "aws_profile";
-}
+// These examples follow PAM's actual adapter contracts, especially Jira's
+// bearer token and SharePoint's Microsoft Graph endpoint.
+const GUIDANCE: Record<string, { url?: string; help: string }> = {
+  github: {
+    url: "https://api.github.com",
+    help: "Use a GitHub access token with read access to the repositories and workflow runs your flows inspect. For Enterprise, use its API base URL.",
+  },
+  jenkins: {
+    url: "https://jenkins.example.com",
+    help: "Use your Jenkins user name and an API token from that user's configuration, with permission to read the required jobs and builds.",
+  },
+  sonarqube: {
+    url: "https://sonar.example.com",
+    help: "Use a SonarQube user token with permission to browse the projects and read their quality gates and issues.",
+  },
+  jira: {
+    url: "https://jira.example.com",
+    help: "This adapter uses a bearer personal access token, such as Jira Data Center provides. A Cloud email/API-token pair is not supported here. Grant only the issue and project read access your flows need.",
+  },
+  confluence: {
+    url: "https://your-team.atlassian.net/wiki",
+    help: "Use your account email and API token for this Confluence site, with permission to read the spaces and pages your flows use. Keep any site path, such as /wiki, in the URL.",
+  },
+  sharepoint: {
+    url: "https://graph.microsoft.com/v1.0",
+    help: "Use a Microsoft Graph bearer access token authorized to read the required SharePoint sites and files. This form does not sign in or renew expiring tokens.",
+  },
+  aws: {
+    help: "Use a named AWS profile already configured on this machine. Leave the profile blank for the default credential chain. The profile needs only the read permissions for your flow; there is no secret for PAM to store.",
+  },
+};
 
-function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
+type Action = { kind: "save-test" } | { kind: "enable"; enabled: boolean } | { kind: "clear" };
+
+function ConnectorRow({
+  connector,
+  blocked,
+  targeted,
+}: {
+  connector: ConnectorSummary;
+  blocked: boolean;
+  targeted: boolean;
+}) {
   const queryClient = useQueryClient();
+  const card = useRef<HTMLDivElement>(null);
+  const locked = useRef(false);
   const [baseUrl, setBaseUrl] = useState(connector.base_url ?? "");
   const [username, setUsername] = useState(connector.username ?? "");
   const [secret, setSecret] = useState("");
+  const [dirty, setDirty] = useState(false);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
-  const [verdict, setVerdict] = useState<ConnectorSummary["last_test"]>(connector.last_test);
+  const [verdict, setVerdict] = useState(connector.last_test);
+  const profile = connector.auth === "aws_profile";
+  const guidance = GUIDANCE[connector.id];
 
-  const settle = () => void queryClient.invalidateQueries({ queryKey: ["connectors"] });
+  useEffect(() => {
+    if (targeted) {
+      card.current?.focus();
+      card.current?.scrollIntoView?.({ block: "center" });
+    }
+  }, [targeted]);
 
-  const configure = useMutation({
-    mutationFn: (patch: {
-      enabled?: boolean;
-      base_url?: string | null;
-      username?: string | null;
-      credential?: CredentialPatch;
-    }) => connectorsConfigure(connector.id, patch),
-    onMutate: () => setFailure(null),
+  const save = useMutation({
+    // Only the action name is kept in React Query's mutation cache. A secret
+    // is sent directly to configure, then cleared as soon as storage succeeds.
+    mutationFn: async (action: Action) => {
+      setFailure(null);
+      await queryClient.cancelQueries({ queryKey: ["connectors"] });
+      const next = await connectorsConfigure(
+        connector.id,
+        action.kind === "enable"
+          ? { enabled: action.enabled }
+          : action.kind === "clear"
+            ? { credential: { clear: true } }
+            : {
+                ...(connector.needs_base_url ? { base_url: baseUrl.trim() || null } : {}),
+                ...(connector.username_label ? { username: username.trim() || null } : {}),
+                ...(!profile && secret ? { credential: { set: secret } } : {}),
+              },
+      );
+      if (action.kind !== "enable") {
+        setSecret("");
+        setDirty(false);
+        setVerdict(undefined);
+      }
+      queryClient.setQueryData<{ connectors: ConnectorSummary[] }>(
+        ["connectors"],
+        (previous) =>
+          previous
+            ? {
+                connectors: previous.connectors.map((row) => (row.id === next.id ? next : row)),
+              }
+            : previous,
+      );
+      if (action.kind === "save-test") setVerdict(await connectorsTest(connector.id));
+    },
     onError: (error) => setFailure(toBridgeFailure(error)),
-    onSettled: settle,
+    onSettled: async () => {
+      try {
+        await queryClient.invalidateQueries({ queryKey: ["connectors"] });
+      } finally {
+        locked.current = false;
+      }
+    },
   });
-
-  const test = useMutation({
-    mutationFn: () => connectorsTest(connector.id),
-    onMutate: () => setFailure(null),
-    onSuccess: (result) => setVerdict(result),
-    onError: (error) => setFailure(toBridgeFailure(error)),
-    onSettled: settle,
-  });
-
-  const profile = usesProfile(connector);
+  // A refetch may replace the persisted verdict while mutation callbacks
+  // still hold the lock. Reconcile again when the entire save settles.
+  useEffect(() => {
+    if (!dirty && !save.isPending) {
+      setBaseUrl(connector.base_url ?? "");
+      setUsername(connector.username ?? "");
+      setVerdict(connector.last_test);
+    }
+  }, [connector, dirty, save.isPending]);
+  const busy = blocked || save.isPending;
+  function act(action: Action) {
+    const current = queryClient.getQueryState(["connectors"]);
+    if (
+      locked.current ||
+      busy ||
+      current?.status !== "success" ||
+      current.fetchStatus !== "idle"
+    )
+      return;
+    locked.current = true;
+    if (action.kind !== "enable") setVerdict(undefined);
+    save.mutate(action);
+  }
+  function edit(update: () => void) {
+    if (locked.current || busy) return;
+    update();
+    setDirty(true);
+    setVerdict(undefined);
+    setFailure(null);
+  }
   const denied = failure?.cause === CAUSE_STORE_DENIED;
+  const unavailable =
+    !profile && (!connector.store_available || failure?.cause === "store_unavailable");
+  const needsUrl = connector.needs_base_url && !baseUrl.trim();
+  const needsCredentials =
+    !profile &&
+    ((!connector.credential_present && !secret) ||
+      (connector.auth === "basic_user_secret" && !username.trim()));
+  const state = blocked
+    ? "Readiness unavailable"
+    : unavailable
+      ? "Store unavailable"
+      : denied
+        ? "Store access denied"
+        : needsUrl
+          ? "Needs URL"
+          : needsCredentials || failure?.cause === "credential_missing"
+            ? "Needs credentials"
+            : verdict?.status === "failed" || failure
+              ? "Test failed"
+              : dirty || !verdict
+                ? "Untested"
+                : connector.enabled
+                  ? "Ready"
+                  : "Test passed";
+  const authRejected =
+    verdict?.status === "failed" && verdict.detail === "the stored credential was rejected";
 
   return (
     <div
+      ref={card}
+      id={`connector-${connector.id}`}
+      tabIndex={-1}
       aria-label={`connector ${connector.name}`}
       className="connector-card space-y-3 rounded-card border border-line bg-surface-raised p-4"
     >
@@ -96,22 +198,25 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
           type="checkbox"
           aria-label={`enable ${connector.name}`}
           checked={connector.enabled}
-          disabled={configure.isPending}
-          onChange={(event) => configure.mutate({ enabled: event.target.checked })}
+          disabled={busy}
+          onChange={(event) => act({ kind: "enable", enabled: event.target.checked })}
           className="size-3.5 cursor-pointer accent-accent-strong"
         />
         <span className="font-sans text-sm font-medium text-ink">{connector.name}</span>
-        <span className="font-data text-xs text-ink-faint">{connector.id}</span>
-        <span className="flex-1" />
+        {!connector.enabled && <Badge>Disabled</Badge>}
+        <Badge
+          tone={state === "Ready" ? "success" : state === "Test failed" ? "danger" : "neutral"}
+        >
+          {state}
+        </Badge>
         {connector.credential_present && <Badge tone="success">credential set</Badge>}
-        {!connector.store_available && <Badge tone="warning">store unavailable</Badge>}
-        {denied && <Badge tone="danger">access denied</Badge>}
       </div>
-
-      {!connector.store_available && (
+      <p className="font-sans text-sm text-ink-muted">
+        {guidance?.help ?? "Use a credential with only the read access needed by your flow."}
+      </p>
+      {unavailable && (
         <p className="font-data text-xs text-warning">{STORE_UNAVAILABLE_COPY}</p>
       )}
-
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {connector.needs_base_url && (
           <label className="space-y-1">
@@ -119,8 +224,9 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
             <input
               aria-label={`${connector.name} base URL`}
               value={baseUrl}
-              onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="https://…"
+              disabled={busy}
+              onChange={(event) => edit(() => setBaseUrl(event.target.value))}
+              placeholder={guidance?.url ?? "https://service.example.com"}
               className={fieldClasses}
             />
           </label>
@@ -133,21 +239,23 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
             <input
               aria-label={`${connector.name} ${connector.username_label}`}
               value={username}
-              onChange={(event) => setUsername(event.target.value)}
+              disabled={busy}
+              onChange={(event) => edit(() => setUsername(event.target.value))}
               className={fieldClasses}
             />
           </label>
         )}
       </div>
-
       {!profile && (
         <label className="block space-y-1">
           <span className="block font-data text-xs text-ink-faint">credential</span>
           <input
             type="password"
+            autoComplete="new-password"
             aria-label={`${connector.name} credential`}
             value={secret}
-            onChange={(event) => setSecret(event.target.value)}
+            disabled={busy}
+            onChange={(event) => edit(() => setSecret(event.target.value))}
             placeholder={
               connector.credential_present ? "stored · type to replace" : "paste it here"
             }
@@ -155,87 +263,52 @@ function ConnectorRow({ connector }: { connector: ConnectorSummary }) {
           />
         </label>
       )}
-
-      {profile && (
-        <p className="font-sans text-sm text-ink-muted">
-          This one signs with a named AWS profile from the machine&rsquo;s own credentials —
-          there is no secret for me to keep.
-        </p>
-      )}
-
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
-          variant="ghost"
-          disabled={configure.isPending}
-          onClick={() =>
-            configure.mutate({
-              ...(connector.needs_base_url ? { base_url: baseUrl.trim() || null } : {}),
-              ...(connector.username_label ? { username: username.trim() || null } : {}),
-            })
-          }
+          disabled={busy || needsUrl || needsCredentials}
+          onClick={() => act({ kind: "save-test" })}
         >
-          Save
-        </Button>
-        {!profile && (
-          <>
-            <Button
-              size="sm"
-              disabled={configure.isPending || secret.length === 0}
-              onClick={() =>
-                configure.mutate(
-                  { credential: { set: secret } },
-                  // The secret leaves the browser the moment it is
-                  // accepted; nothing echoes it back into the field.
-                  { onSuccess: () => setSecret("") },
-                )
-              }
-            >
-              Set
-            </Button>
-            <ConfirmButton
-              label="Clear"
-              confirmLabel="clear it?"
-              busy={configure.isPending}
-              disabled={!connector.credential_present}
-              onConfirm={() => configure.mutate({ credential: { clear: true } })}
-            />
-          </>
-        )}
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={test.isPending}
-          onClick={() => test.mutate()}
-        >
-          {test.isPending && (
+          {save.isPending && (
             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
           )}
-          Test
+          Save and test
         </Button>
-        {verdict && (
-          <span className="flex flex-wrap items-center gap-2">
-            <Badge tone={verdict.status === "passed" ? "success" : "danger"}>
-              {verdict.status}
-            </Badge>
-            <span className="font-data text-xs text-ink-muted">{verdict.detail}</span>
-            <span className="font-data text-xs text-ink-faint" title={exactTime(verdict.ts)}>
-              {relativeTime(verdict.ts)}
-            </span>
+        {!profile && (
+          <ConfirmButton
+            label="Clear"
+            confirmLabel="clear it?"
+            busy={busy}
+            disabled={!connector.credential_present}
+            onConfirm={() => act({ kind: "clear" })}
+          />
+        )}
+        {verdict && !dirty && (
+          <span className="font-data text-xs text-ink-muted">
+            {verdict.detail}{" "}
+            <span title={exactTime(verdict.ts)}>{relativeTime(verdict.ts)}</span>
           </span>
         )}
       </div>
-
+      <p className="font-sans text-sm text-ink-muted">
+        Save and test checks these edits without enabling flow access. Enable this connector
+        explicitly when you want flows to use it.
+      </p>
+      {authRejected && (
+        <p className="font-sans text-sm text-danger">
+          Authentication was rejected by the service. Replace the token or check the account;
+          the credential store was reached.
+        </p>
+      )}
       {failure && <FailureNote failure={failure} label={connector.id} />}
     </div>
   );
 }
 
-export function SettingsConnectorsSection() {
+export function SettingsConnectorsSection({ targetId }: { targetId?: string } = {}) {
   const connectors = useQuery({ queryKey: ["connectors"], queryFn: connectorsList });
   const failure = connectors.isError ? toBridgeFailure(connectors.error) : null;
   const rows = connectors.data?.connectors ?? [];
-
   return (
     <div className="settings-connectors">
       {failure && <FailureNote failure={failure} label="connectors" />}
@@ -244,7 +317,12 @@ export function SettingsConnectorsSection() {
       )}
       <div className="settings-grid connector-grid">
         {rows.map((connector) => (
-          <ConnectorRow key={connector.id} connector={connector} />
+          <ConnectorRow
+            key={connector.id}
+            connector={connector}
+            blocked={!connectors.isSuccess || connectors.isFetching}
+            targeted={connector.id === targetId}
+          />
         ))}
       </div>
       {!failure && !connectors.isPending && rows.length === 0 && (

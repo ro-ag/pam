@@ -579,3 +579,198 @@ async fn a_daemon_without_a_credential_store_still_lists() {
     assert!(!github.credential.store_available);
     assert!(!github.credential.present);
 }
+
+#[tokio::test]
+async fn configuration_changes_retire_the_old_verdict_and_test_current_credentials() {
+    let fixture = fixture_with(
+        FakeTransport::new()
+            .json(200, r#"{"login":"octocat"}"#)
+            .json(401, "{}"),
+    )
+    .await;
+    fixture.configure_github().await;
+    fixture.service.test(ConnectorId::Github).await.unwrap();
+    let summary = fixture
+        .service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                enabled: Some(false),
+                base_url: Some(Some(format!("  {BASE_URL}  "))),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.last_test.unwrap().status, "passed");
+    let replacement = "replacement-test-token";
+    let summary = fixture
+        .service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                base_url: Some(Some("https://replacement.github.test/".to_owned())),
+                credential: Some(CredentialAction::Set(replacement.to_owned())),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(summary.last_test.is_none());
+    assert!(!summary.enabled, "saving must not enable the connector");
+    let (passed, _) = fixture.service.test(ConnectorId::Github).await.unwrap();
+    assert!(!passed);
+    assert_eq!(
+        fixture.transport.url(1),
+        "https://replacement.github.test/user"
+    );
+    assert_eq!(
+        fixture.transport.header(1, "Authorization"),
+        Some(format!("Bearer {replacement}"))
+    );
+    let summary = fixture.service.get(ConnectorId::Github).await.unwrap();
+    assert_eq!(summary.last_test.unwrap().status, "failed");
+    let summary = fixture
+        .service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                credential: Some(CredentialAction::Clear),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(summary.last_test.is_none());
+    assert!(!summary.credential.present);
+}
+
+#[tokio::test]
+async fn failed_secret_replacement_retires_proof_without_applying_new_settings() {
+    let fixture = fixture_with(FakeTransport::new().json(200, r#"{"login":"octocat"}"#)).await;
+    fixture.configure_github().await;
+    fixture.service.test(ConnectorId::Github).await.unwrap();
+    *fixture.backend.fail_with.lock().unwrap() = Some(SecretError::Unavailable);
+    let result = fixture
+        .service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                enabled: Some(false),
+                base_url: Some(Some("https://replacement.github.test/".to_owned())),
+                credential: Some(CredentialAction::Set("replacement".to_owned())),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let summary = fixture.service.get(ConnectorId::Github).await.unwrap();
+    assert!(summary.last_test.is_none());
+    assert!(summary.enabled);
+    assert_eq!(summary.base_url.as_deref(), Some(BASE_URL));
+    assert!(!summary.credential.store_available);
+}
+
+struct DeferredVerification {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl pam_connectors::HttpTransport for DeferredVerification {
+    fn send<'a>(
+        &'a self,
+        _request: pam_connectors::HttpRequest,
+        _deadline: Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<pam_connectors::HttpResponse, pam_connectors::TransportError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(pam_connectors::HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"login":"old-identity"}"#.to_vec(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let backend = Arc::new(FakeSecretBackend::default());
+    let transport = Arc::new(DeferredVerification {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let service = ConnectorService::new(
+        store,
+        Arc::new(SecretStore::new(backend)),
+        transport.clone(),
+    );
+    service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                base_url: Some(Some(BASE_URL.to_owned())),
+                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let test = service.test(ConnectorId::Github);
+    tokio::pin!(test);
+    tokio::select! {
+        () = transport.entered.notified() => {},
+        result = &mut test => panic!("test completed before release: {result:?}"),
+    }
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service.configure(
+            ConnectorId::Aws,
+            ConfigurePatch {
+                enabled: Some(false),
+                ..ConfigurePatch::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let configure = service.configure(
+        ConnectorId::Github,
+        ConfigurePatch {
+            credential: Some(CredentialAction::Set("new-identity".to_owned())),
+            ..ConfigurePatch::default()
+        },
+    );
+    tokio::pin!(configure);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut configure)
+            .await
+            .is_err()
+    );
+    transport.release.notify_one();
+    let (tested, configured) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(test, configure)
+    })
+    .await
+    .unwrap();
+    assert!(tested.unwrap().0);
+    assert!(configured.unwrap().last_test.is_none());
+    assert!(
+        service
+            .get(ConnectorId::Github)
+            .await
+            .unwrap()
+            .last_test
+            .is_none()
+    );
+}

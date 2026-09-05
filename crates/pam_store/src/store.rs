@@ -472,6 +472,8 @@ pub struct ConnectorRow {
 /// "set it" (`Some(Some(value))`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConnectorPatch<'a> {
+    /// Invalidate a verdict around a credential mutation outside this database.
+    pub invalidate_test: bool,
     /// New `enabled` value, when given.
     pub enabled: Option<bool>,
     /// New `base_url`, when given; `Some(None)` clears it.
@@ -1819,6 +1821,19 @@ impl Store {
         }
         if patch.username.is_some() {
             set_clauses.push("username = excluded.username".to_owned());
+        }
+        let mut changed = vec![if patch.invalidate_test { "1" } else { "0" }];
+        if patch.base_url.is_some() {
+            changed.push("base_url IS NOT excluded.base_url");
+        }
+        if patch.username.is_some() {
+            changed.push("username IS NOT excluded.username");
+        }
+        let changed = changed.join(" OR ");
+        for column in ["last_test_status", "last_test_detail", "last_test_ts"] {
+            set_clauses.push(format!(
+                "{column} = CASE WHEN {changed} THEN NULL ELSE {column} END"
+            ));
         }
         let sql = format!(
             "INSERT INTO connector (id, enabled, base_url, username, updated_ts)

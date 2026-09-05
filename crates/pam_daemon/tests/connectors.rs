@@ -300,3 +300,119 @@ async fn an_unreachable_keychain_refuses_configure_and_still_lists() {
     })
     .await;
 }
+
+/// Only this fixture rewrites the fixed HTTPS test origin to loopback HTTP.
+/// Production URL validation and curl's HTTPS-only defaults remain in use.
+struct LocalConnectorTransport {
+    origin: String,
+    curl: pam_connectors::CurlTransport,
+}
+
+impl pam_connectors::HttpTransport for LocalConnectorTransport {
+    fn send<'a>(
+        &'a self,
+        mut request: pam_connectors::HttpRequest,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<pam_connectors::HttpResponse, pam_connectors::TransportError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        assert_eq!(request.url.host_str(), Some("api.github.test"));
+        request.url = format!("{}{}", self.origin, request.url.path())
+            .parse()
+            .unwrap();
+        self.curl.send(request, deadline)
+    }
+}
+
+async fn connector_http_origin() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        for (token, status, body) in [
+            (TOKEN, "200 OK", r#"{"login":"octocat"}"#),
+            ("replacement", "401 Unauthorized", "{}"),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /user HTTP/1.1\r\n"));
+            assert!(request.contains(&format!("Authorization: Bearer {token}\r\n")));
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    (origin, task)
+}
+
+#[tokio::test]
+async fn save_and_test_uses_current_credentials_against_a_local_http_service() {
+    with_deadline(async {
+        let (origin, server) = connector_http_origin().await;
+        let backend = Arc::new(FakeSecretBackend::default());
+        let daemon = TestDaemon::spawn_with(move |config| {
+            config.secret_backend = Some(backend);
+            config.http_transport = Some(Arc::new(LocalConnectorTransport {
+                origin,
+                curl: pam_connectors::CurlTransport::new("curl".into()).allow_http_for_tests(),
+            }));
+        })
+        .await;
+        let mut client = daemon.client().await;
+        for (index, token, expected) in [(0, TOKEN, "passed"), (1, "replacement", "failed")] {
+            let saved = body_of(
+                client
+                    .request(&admin_envelope(
+                        &format!("save{index}"),
+                        OP_CONNECTORS_CONFIGURE,
+                        serde_json::json!({"id":"github", "enabled":false,
+                    "base_url":BASE_URL, "credential":{"set":token}}),
+                    ))
+                    .await,
+                Outcome::Changed,
+            );
+            assert!(saved["last_test"].is_null());
+            assert_eq!(saved["enabled"], false);
+            let tested = body_of(
+                client
+                    .request(&admin_envelope(
+                        &format!("test{index}"),
+                        OP_CONNECTORS_TEST,
+                        serde_json::json!({"id":"github"}),
+                    ))
+                    .await,
+                Outcome::Verified,
+            );
+            assert_eq!(tested["status"], expected);
+            let listed = body_of(
+                client
+                    .request(&admin_envelope(
+                        &format!("list{index}"),
+                        OP_CONNECTORS_LIST,
+                        serde_json::json!({}),
+                    ))
+                    .await,
+                Outcome::Verified,
+            );
+            assert_eq!(listed["connectors"][0]["last_test"]["status"], expected);
+            assert_eq!(listed["connectors"][0]["credential_present"], true);
+            assert!(!listed.to_string().contains(token));
+        }
+        server.await.unwrap();
+        daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    })
+    .await;
+}

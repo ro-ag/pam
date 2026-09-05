@@ -1,11 +1,14 @@
+import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn } from "../lib/cn";
 import { PageTabs } from "../components/ui/PageTabs";
+import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
+  connectorsList,
   flowsGet,
   flowsList,
   flowsNormalize,
@@ -276,6 +279,60 @@ function useStableIssue(issue: FlowIssue | null): FlowIssue | null {
 
 // --- the detail pane ---------------------------------------------------------
 
+function ConnectorPrerequisites({ ids }: { ids: string[] }) {
+  const connectors = useQuery({
+    queryKey: ["connectors"],
+    queryFn: connectorsList,
+    enabled: ids.length > 0,
+  });
+  if (ids.length === 0) return null;
+  return (
+    <Panel ground="raised" className="space-y-2 p-4">
+      <p className="text-sm font-medium text-ink">Required connectors</p>
+      {ids.map((id) => {
+        const row = connectors.data?.connectors.find((item) => item.id === id);
+        const state =
+          !connectors.isSuccess || connectors.isFetching
+            ? "Readiness unavailable"
+            : !row
+              ? "Not configured"
+              : !row.enabled
+                ? "Disabled"
+                : row.needs_base_url && !row.base_url
+                  ? "Needs URL"
+                  : row.auth !== "aws_profile" && !row.store_available
+                    ? "Store unavailable"
+                    : row.auth !== "aws_profile" &&
+                        (!row.credential_present ||
+                          (row.auth === "basic_user_secret" && !row.username?.trim()))
+                      ? "Needs credentials"
+                      : row.last_test?.status === "passed"
+                        ? "Ready"
+                        : row.last_test?.status === "failed"
+                          ? "Test failed"
+                          : "Untested";
+        return (
+          <p key={id} className="text-sm text-ink-muted">
+            {row?.name ?? id}: {state}
+            {" · "}
+            <Link
+              to="/settings"
+              hash={`connectors/${id}`}
+              className="text-accent-strong underline"
+            >
+              Set up {row?.name ?? id}
+            </Link>
+          </p>
+        );
+      })}
+      <p className="text-sm text-ink-muted">
+        A connection test checks service access; the run still enforces each step's policy and
+        permissions.
+      </p>
+    </Panel>
+  );
+}
+
 function FlowDetailPane({
   entry,
   tab,
@@ -451,6 +508,15 @@ function FlowDetailPane({
               You have unsaved changes. Save or clone them before running the updated flow.
             </p>
           )}
+          <ConnectorPrerequisites
+            ids={[
+              ...new Set(
+                (detail.data?.flow?.steps ?? []).flatMap((step) =>
+                  step.action.kind === "connector" ? [step.action.connector] : [],
+                ),
+              ),
+            ]}
+          />
           <FlowRunCard key={`run-${entry.id}`} flow={entry} onRun={setRun} />
         </div>
       </div>

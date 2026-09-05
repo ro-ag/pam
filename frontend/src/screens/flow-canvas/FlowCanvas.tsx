@@ -7,9 +7,11 @@ import {
   applyEdgeChanges,
   applyNodeChanges,
   useReactFlow,
+  useNodesInitialized,
   type Connection,
   type EdgeChange,
   type NodeChange,
+  type Viewport,
 } from "@xyflow/react";
 import { Expand, Maximize2, Minimize2, Plug, Terminal, Wand2 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -181,7 +183,17 @@ function Canvas({
   const [maximized, setMaximized] = useState(false);
   // The portal target never changes. Moving its DOM host keeps ReactFlow's
   // viewport, node selection and in-flight edits alive outside CSS containment.
-  const [host] = useState(() => document.createElement("div"));
+  const [host] = useState(() => {
+    const element = document.createElement("div");
+    element.className = "canvas-host";
+    return element;
+  });
+  const onViewportChange = useCallback(
+    (viewport: Viewport) => {
+      host.style.setProperty("--flow-zoom", String(viewport.zoom));
+    },
+    [host],
+  );
   const dock = useRef<HTMLDivElement>(null);
   const dockHeight = useRef(0);
   useLayoutEffect(() => {
@@ -234,6 +246,35 @@ function Canvas({
   }, [host, maximized]);
 
   const { fitView } = useReactFlow<CanvasNode, CanvasEdge>();
+  const nodesInitialized = useNodesInitialized();
+  const viewport = useRef<HTMLDivElement>(null);
+  const [showMinimap, setShowMinimap] = useState(false);
+  useEffect(() => {
+    const element = viewport.current;
+    if (!element) return;
+    let frame = 0;
+    let settledFrame = 0;
+    const resize = () => {
+      const { width, height } = element.getBoundingClientRect();
+      setShowMinimap(width >= 600 && height >= 400);
+      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(settledFrame);
+      if (!nodesInitialized || width <= 0 || height <= 0) return;
+      // Let ReactFlow consume its ResizeObserver measurement before fitting.
+      // The portal may initially be measured before the dock's flex layout.
+      frame = window.requestAnimationFrame(() => {
+        settledFrame = window.requestAnimationFrame(() => void fitView(FIT));
+      });
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    resize();
+    return () => {
+      observer.disconnect();
+      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(settledFrame);
+    };
+  }, [fitView, nodesInitialized]);
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
   const [refused, setRefused] = useState<Refused | null>(null);
@@ -487,7 +528,10 @@ function Canvas({
             />
           )}
 
-          <div className="flow-canvas canvas-viewport w-full overflow-hidden rounded-card border border-edge">
+          <div
+            ref={viewport}
+            className="flow-canvas canvas-viewport w-full overflow-hidden rounded-card border border-edge"
+          >
             <ReactFlow<CanvasNode, CanvasEdge>
               nodes={nodes}
               edges={edges}
@@ -496,6 +540,7 @@ function Canvas({
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
+              onViewportChange={onViewportChange}
               snapToGrid
               snapGrid={SNAP_GRID}
               fitView
@@ -507,14 +552,16 @@ function Canvas({
               className="font-sans"
             >
               <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-              <MiniMap
-                pannable
-                zoomable
-                position="bottom-right"
-                nodeClassName={minimapClass}
-                style={MINIMAP_SIZE}
-                className="rounded-card border border-edge shadow-raise"
-              />
+              {showMinimap && (
+                <MiniMap
+                  pannable
+                  zoomable
+                  position="bottom-right"
+                  nodeClassName={minimapClass}
+                  style={MINIMAP_SIZE}
+                  className="rounded-card border border-edge shadow-raise"
+                />
+              )}
             </ReactFlow>
           </div>
         </div>,

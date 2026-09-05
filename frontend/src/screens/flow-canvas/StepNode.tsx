@@ -85,8 +85,8 @@ export const glyphVariants = cva("flex shrink-0", {
   defaultVariants: { kind: "command" },
 });
 
-/** Handles: 10 px pills in the line color, accent when the pointer finds them. */
-export const HANDLE_CLASSES = "size-2.5 rounded-pill bg-line hover:bg-accent";
+/** Fixed anchors; the token stylesheet expands hit/visible areas in screen pixels. */
+export const HANDLE_CLASSES = "flow-connection-handle rounded-pill";
 
 /** A validation marker outranks selection: the flow will not run until it is fixed. */
 export function ringFor(data: StepNodeData, selected: boolean): Ring {

@@ -5,8 +5,8 @@ import { cva } from "../../lib/cn";
 import type { StepEdge } from "./graph";
 
 /**
- * One edge, four kinds: `needs` in the hairline, `succeeded` / `failed`
- * tinted and labelled with a pill, the implicit terminal edge faint. A
+ * One edge, four kinds: `needs` in semantic ink, `succeeded` / `failed`
+ * tinted and labelled with a pill, the implicit terminal edge unlabelled. A
  * running edge marches its dashes toward the step that is running.
  *
  * The path is orthogonal with 8 px corners: on this canvas a square line
@@ -16,13 +16,13 @@ import type { StepEdge } from "./graph";
  * no inline transform: SVG `x`/`y` are geometry, not style.
  */
 
-export const edgeVariants = cva("fill-none transition-colors duration-150", {
+export const edgeVariants = cva("flow-edge-semantic fill-none transition-colors duration-150", {
   variants: {
     kind: {
-      needs: "stroke-line",
+      needs: "stroke-flow-edge",
       succeeded: "stroke-success",
       failed: "stroke-danger",
-      terminal: "stroke-line opacity-40",
+      terminal: "stroke-flow-edge",
     },
     running: {
       true: "flow-edge-running animate-dash stroke-accent",

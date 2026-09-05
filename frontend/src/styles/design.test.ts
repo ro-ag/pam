@@ -39,6 +39,7 @@ const SEMANTIC_COLORS = [
   "line",
   "edge",
   "control-line",
+  "flow-edge",
   "inset",
   "selection-ink",
   "separator",
@@ -310,4 +311,29 @@ describe("xyflow bindings", () => {
       /\.flow-canvas \.flow-edge-running\s*\{\s*stroke-dasharray:\s*6;?\s*\}/,
     );
   });
+});
+
+function luminance(hex: string): number {
+  const channels = hex.match(/^#([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})$/i);
+  if (!channels) throw new Error(`Expected opaque canvas color, got ${hex}`);
+  const linear = channels.slice(1).map((channel) => {
+    const value = parseInt(channel, 16) / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+}
+
+it("keeps every semantic flow edge above 3:1 on the actual opaque canvas in all themes", () => {
+  expect(tokensCss).toContain("--color-flow-edge: var(--pam-ink-muted)");
+  expect(tokensCss).toContain("--xy-background-color: var(--color-chrome)");
+  for (const theme of THEME_COMBOS) {
+    const palette = declarationsOf(blockOf(themesCss, theme));
+    const backdrop = luminance(palette["--pam-chrome"]);
+    for (const role of ["ink-muted", "success", "danger", "accent"]) {
+      const stroke = luminance(palette[`--pam-${role}`]);
+      const contrast =
+        (Math.max(stroke, backdrop) + 0.05) / (Math.min(stroke, backdrop) + 0.05);
+      expect(contrast, `${theme} ${role} canvas contrast`).toBeGreaterThanOrEqual(3);
+    }
+  }
 });

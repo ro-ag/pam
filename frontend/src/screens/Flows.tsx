@@ -443,10 +443,10 @@ function FlowDetailPane({
         role="tabpanel"
         aria-labelledby={`flow-tab-${tab}`}
         tabIndex={0}
-        className="page-content"
+        className={cn("page-content", tab === "canvas" && "flow-canvas-pane")}
       >
         {tab === "runs" && <FlowRuns flowId={entry.id} />}
-        <div className="space-y-4" hidden={tab === "run" || tab === "runs"}>
+        <div className="flow-editor-pane space-y-4" hidden={tab === "run" || tab === "runs"}>
           {loadFailure && <FailureNote failure={loadFailure} label="flow" />}
 
           {draft.dirty && (
@@ -464,7 +464,7 @@ function FlowDetailPane({
 
           {tab === "canvas" && (
             <div className="flow-workbench flex gap-4">
-              <div className="min-w-0 flex-1 space-y-3">
+              <div className="flow-canvas-column min-w-0 flex-1 space-y-3">
                 {flowIssue && (
                   <FailureNote
                     label="flow"
@@ -494,7 +494,7 @@ function FlowDetailPane({
                 ) : null}
               </div>
               {draft.spec && (
-                <div className="flow-inspector shrink-0">
+                <div className="flow-inspector">
                   <Inspector
                     spec={draft.spec}
                     selection={selection}

@@ -477,17 +477,21 @@
       margin-inline: auto;
     }
   }
-  .canvas-dock {
-    min-height: 564px;
+  .canvas-dock,
+  .canvas-host {
+    height: 100%;
+    min-height: 0;
   }
   .canvas-workspace {
+    height: 100%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
   .canvas-viewport {
-    height: 520px;
-    min-height: 520px;
+    flex: 1;
+    min-height: 0;
   }
   .canvas-workspace-maximized {
     position: fixed;
@@ -582,12 +586,24 @@
     padding: 14px 20px;
     overflow-wrap: anywhere;
   }
-  .flow-detail .canvas-dock {
+  .flow-canvas-pane {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .flow-canvas-pane .flow-editor-pane,
+  .flow-canvas-column {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
     min-height: 0;
   }
-  .flow-detail .canvas-viewport {
-    height: clamp(280px, 52vh, 520px);
-    min-height: 280px;
+  .flow-canvas-pane .flow-editor-pane > :not(.flow-workbench) {
+    flex-shrink: 0;
+  }
+  .flow-canvas-column > .canvas-dock {
+    flex: 1;
+    min-height: 0;
   }
   .flow-picker {
     padding: 12px 20px;
@@ -893,15 +909,27 @@
     container-type: inline-size;
   }
   .flow-workbench {
+    flex: 1;
+    min-height: 0;
     flex-direction: column;
   }
-  @container (min-width: 880px) {
+  .flow-inspector {
+    flex: 0 1 auto;
+    min-height: 72px;
+    max-height: 35%;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  @container (min-width: 640px) {
     .flow-workbench {
       flex-direction: row;
-      align-items: flex-start;
+      align-items: stretch;
     }
     .flow-inspector {
-      width: 380px;
+      width: clamp(240px, 35%, 380px);
+      flex-shrink: 0;
+      min-height: 0;
+      max-height: 100%;
     }
   }
 }

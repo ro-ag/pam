@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use pam_connectors::{CallResult, ConnectorId};
 use pam_flow::{
-    Action, ArgValue, Entry, Flow, Library, OutputPolicy, Retry, Step, Vars, When, digest,
+    Action, ArgValue, Entry, Flow, Library, OutputPolicy, Retry, Role, Step, Vars, When, digest,
     is_shell, references, substitute, to_normalized_yaml,
 };
 use pam_proto::Outcome;
@@ -137,6 +137,10 @@ pub const CAUSE_OUTPUT_LIMIT: &str = "output_limit";
 pub const CAUSE_EXIT_STATUS: &str = "exit_status";
 /// Refusal cause: a command expected to be silent emitted output.
 pub const CAUSE_OUTPUT_ASSERTION: &str = "output_assertion";
+/// A retrieved connector result did not meet the explicit status assertion.
+pub const CAUSE_STATUS_ASSERTION: &str = "status_assertion";
+/// A connector verifier did not declare what result establishes a pass.
+pub const CAUSE_STATUS_ASSERTION_REQUIRED: &str = "status_assertion_required";
 
 /// Step cause: the program could not be started at all.
 pub const CAUSE_SPAWN_FAILED: &str = "spawn_failed";
@@ -1109,6 +1113,69 @@ impl RunState<'_> {
     }
 }
 
+/// Retrieval and verification are distinct: preserve the successful response as
+/// evidence even when its status fails the flow's explicit assertion.
+pub(crate) fn apply_connector_assertion(
+    step: &Step,
+    result: Option<&Value>,
+    report: &mut StepReport,
+) {
+    if report.status != StepStatus::Succeeded || !matches!(step.action, Action::Connector { .. }) {
+        return;
+    }
+    let Some(expected) = &step.expect_status else {
+        if step.role == Role::Verify {
+            report.fail(StepStatus::Failed, CAUSE_STATUS_ASSERTION_REQUIRED,
+                format!("connector verification step {:?} has no passing-status assertion", step.id),
+                "edit the flow to declare `expect_status` for verification, or use `role: observe` for retrieval".to_owned());
+        }
+        return;
+    };
+    let actual = result
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    if actual != Some(expected.as_str()) {
+        report.fail(StepStatus::Failed, CAUSE_STATUS_ASSERTION,
+            format!("step {:?} expected status {expected:?}; inspect its retained connector evidence", step.id),
+            "resolve the reported gate conditions and re-run the flow; missing or unknown status never establishes a pass".to_owned());
+    }
+}
+
+fn assert_connector_attempt(step: &Step, attempt: Attempt) -> Attempt {
+    let Attempt::Succeeded {
+        exit_status,
+        output,
+        result,
+    } = attempt
+    else {
+        return attempt;
+    };
+    let mut report = StepReport::new(&step.id, "connector", StepStatus::Succeeded);
+    apply_connector_assertion(step, result.as_ref(), &mut report);
+    if let Some(error) = report.error {
+        Attempt::Failed {
+            exit_status,
+            output,
+            result,
+            status: StepStatus::Failed,
+            cause: if step.expect_status.is_some() {
+                CAUSE_STATUS_ASSERTION
+            } else {
+                CAUSE_STATUS_ASSERTION_REQUIRED
+            },
+            detail: error.detail,
+            recovery: error.recovery,
+            retry_after: None,
+        }
+    } else {
+        Attempt::Succeeded {
+            exit_status,
+            output,
+            result,
+        }
+    }
+}
+
 /// What one attempt of a step produced.
 enum Attempt {
     /// It ran and reported success.
@@ -1126,6 +1193,8 @@ enum Attempt {
         exit_status: Option<i32>,
         /// Whatever it wrote before failing.
         output: Vec<u8>,
+        /// Retrieved JSON retained even when its status assertion failed.
+        result: Option<Value>,
         /// `Failed`, or `Blocked` when only a human can clear it.
         status: StepStatus,
         /// Machine-readable cause.
@@ -1226,7 +1295,7 @@ impl RunState<'_> {
         match run_command(spec.clone(), &mut self.cancel).await {
             CommandOutcome::Exited { status: 0, output }
                 if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
-                    exit_status: Some(0),
+                result: None,                    exit_status: Some(0),
                     output,
                     status: StepStatus::Failed,
                     cause: CAUSE_OUTPUT_ASSERTION,
@@ -1240,7 +1309,7 @@ impl RunState<'_> {
                 result: None,
             }),
             CommandOutcome::Exited { status, output } => Some(Attempt::Failed {
-                exit_status: Some(status),
+                result: None,                exit_status: Some(status),
                 output,
                 status: StepStatus::Failed,
                 cause: CAUSE_EXIT_STATUS,
@@ -1250,7 +1319,7 @@ impl RunState<'_> {
                 retry_after: None,
             }),
             CommandOutcome::TimedOut { output } => Some(Attempt::Failed {
-                exit_status: None,
+                result: None,                exit_status: None,
                 output,
                 status: StepStatus::Failed,
                 cause: CAUSE_TIMEOUT,
@@ -1265,7 +1334,7 @@ impl RunState<'_> {
                 retry_after: None,
             }),
             CommandOutcome::OutputLimit { output } => Some(Attempt::Failed {
-                exit_status: None,
+                result: None,                exit_status: None,
                 output,
                 status: StepStatus::Failed,
                 cause: CAUSE_OUTPUT_LIMIT,
@@ -1279,7 +1348,7 @@ impl RunState<'_> {
                 retry_after: None,
             }),
             CommandOutcome::SpawnFailed(detail) => Some(Attempt::Failed {
-                exit_status: None,
+                result: None,                exit_status: None,
                 output: Vec::new(),
                 status: StepStatus::Failed,
                 cause: CAUSE_SPAWN_FAILED,
@@ -1365,49 +1434,54 @@ impl RunState<'_> {
                 self.service.connectors.invoke(connector, call, args, deadline),
             ) => called,
         };
-        Some(match called {
-            Err(_elapsed) => Attempt::Failed {
-                exit_status: None,
-                output: Vec::new(),
-                status: StepStatus::Failed,
-                cause: CAUSE_TIMEOUT,
-                detail: format!(
-                    "the {connector} call did not answer within step {:?}'s {} second timeout",
-                    step.id,
-                    step.timeout.as_secs()
-                ),
-                recovery: format!("open Pam → Settings → Connectors → {connector} → Test"),
-                retry_after: None,
-            },
-            Ok(Ok(CallResult::Json(value))) => Attempt::Succeeded {
-                exit_status: None,
-                output: Vec::new(),
-                result: Some(value),
-            },
-            Ok(Ok(CallResult::Log {
-                bytes, exit_status, ..
-            })) => Attempt::Succeeded {
-                exit_status,
-                output: bytes,
-                result: None,
-            },
-            Ok(Err(error)) => Attempt::Failed {
-                exit_status: None,
-                output: Vec::new(),
-                // A connector a human has not finished setting up is a
-                // block (somebody must open Settings); a service that
-                // answered badly is a failure — the step did run.
-                status: if blocks_the_run(&error) {
-                    StepStatus::Blocked
-                } else {
-                    StepStatus::Failed
+        Some(assert_connector_attempt(
+            step,
+            match called {
+                Err(_elapsed) => Attempt::Failed {
+                    result: None,
+                    exit_status: None,
+                    output: Vec::new(),
+                    status: StepStatus::Failed,
+                    cause: CAUSE_TIMEOUT,
+                    detail: format!(
+                        "the {connector} call did not answer within step {:?}'s {} second timeout",
+                        step.id,
+                        step.timeout.as_secs()
+                    ),
+                    recovery: format!("open Pam → Settings → Connectors → {connector} → Test"),
+                    retry_after: None,
                 },
-                cause: error.cause(),
-                detail: format!("the {connector} call failed: {}", error.detail()),
-                recovery: error.recovery(connector),
-                retry_after: rate_limit_wait(&error),
+                Ok(Ok(CallResult::Json(value))) => Attempt::Succeeded {
+                    exit_status: None,
+                    output: Vec::new(),
+                    result: Some(value),
+                },
+                Ok(Ok(CallResult::Log {
+                    bytes, exit_status, ..
+                })) => Attempt::Succeeded {
+                    exit_status,
+                    output: bytes,
+                    result: None,
+                },
+                Ok(Err(error)) => Attempt::Failed {
+                    result: None,
+                    exit_status: None,
+                    output: Vec::new(),
+                    // A connector a human has not finished setting up is a
+                    // block (somebody must open Settings); a service that
+                    // answered badly is a failure — the step did run.
+                    status: if blocks_the_run(&error) {
+                        StepStatus::Blocked
+                    } else {
+                        StepStatus::Failed
+                    },
+                    cause: error.cause(),
+                    detail: format!("the {connector} call failed: {}", error.detail()),
+                    recovery: error.recovery(connector),
+                    retry_after: rate_limit_wait(&error),
+                },
             },
-        })
+        ))
     }
 
     /// Files the last attempt's output and writes the step's verdict.
@@ -1436,6 +1510,7 @@ impl RunState<'_> {
             Attempt::Failed {
                 exit_status,
                 output,
+                result,
                 status,
                 cause,
                 detail,
@@ -1444,7 +1519,7 @@ impl RunState<'_> {
             } => {
                 report.exit_status = exit_status;
                 report.fail(status, cause, detail, recovery);
-                (exit_status, output, None)
+                (exit_status, output, result)
             }
         };
 

@@ -437,3 +437,8 @@ it("preserves command output assertions through designer serialization", () => {
   const raw = toRaw(spec({ a: { expect_empty_output: true } }));
   expect(raw.steps[0].expect_empty_output).toBe(true);
 });
+
+it("preserves connector status assertions through designer serialization", () => {
+  const raw = toRaw(spec({ a: { expect_status: "OK" } }));
+  expect(raw.steps[0].expect_status).toBe("OK");
+});

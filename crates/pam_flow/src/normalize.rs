@@ -111,6 +111,8 @@ struct NormalStep<'a> {
     output: Option<OutputPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expect_empty_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expect_status: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     needs: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +153,7 @@ impl<'a> From<&'a Step> for NormalStep<'a> {
             role: (step.role != Role::default_for(step.effect)).then_some(step.role),
             output: (step.output != OutputPolicy::default()).then_some(step.output),
             expect_empty_output: step.expect_empty_output.then_some(true),
+            expect_status: step.expect_status.as_deref(),
             needs: &step.needs,
             when: (step.when != When::default()).then_some(&step.when),
             retry: (step.retry != Retry::default()).then(|| NormalRetry {

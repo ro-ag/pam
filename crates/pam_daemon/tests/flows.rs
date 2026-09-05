@@ -1162,3 +1162,186 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
     })
     .await;
 }
+
+async fn sonar_test_daemon(yaml: &str, transport: Arc<FakeTransport>) -> FlowDaemon {
+    let flows = FlowDaemon::spawn_with(&[("sonar-gate-check", yaml)], move |config| {
+        config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
+        config.http_transport = Some(transport);
+    })
+    .await;
+    let mut client = flows.daemon.client().await;
+    let response = client
+        .request(&admin_envelope(
+            "req_conf",
+            "admin.connectors.configure",
+            serde_json::json!({
+                "id": "sonarqube", "enabled": true, "base_url": "https://sonar.test/",
+                "credential": { "set": "sonar_test_credential" }
+            }),
+        ))
+        .await;
+    assert!(matches!(response, Response::Result { .. }), "{response:?}");
+    for id in ["quality-gate", "open-issues"] {
+        flows.grant(&step_capability("sonar-gate-check", id)).await;
+    }
+    flows
+}
+
+async fn sonar_run(flows: &FlowDaemon) -> serde_json::Value {
+    let mut client = flows.daemon.client().await;
+    result_body(
+        client
+            .request(&flows.run_envelope(
+                "req_run",
+                "sonar-gate-check",
+                &serde_json::json!({"project": "pam"}),
+            ))
+            .await,
+    )
+}
+
+async fn assert_sonar_evidence(
+    flows: &FlowDaemon,
+    body: &serde_json::Value,
+    expected_status: Option<&str>,
+) {
+    let store = flows.daemon.store();
+    if let Some(status) = expected_status {
+        let id = step(body, "quality-gate")["evidence"][0].as_str().unwrap();
+        let evidence = store.get_evidence(id).await.unwrap().unwrap();
+        assert_eq!(evidence.kind, EVIDENCE_KIND_CONNECTOR_RESULT);
+        let saved: serde_json::Value = serde_json::from_slice(&evidence.content).unwrap();
+        assert_eq!(saved["status"], status);
+    }
+    let verdict = store
+        .list_evidence("req_run")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == EVIDENCE_KIND_FLOW_RESULT)
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(
+        &store
+            .get_evidence(&verdict.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert_eq!(saved["outcome"], body["outcome"]);
+    assert_eq!(
+        step(&saved, "quality-gate")["error"],
+        step(body, "quality-gate")["error"]
+    );
+    assert_eq!(step(&saved, "open-issues")["status"], "succeeded");
+}
+
+#[tokio::test]
+async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_evidence() {
+    for (http, response, status, cause) in [
+        (
+            200,
+            r#"{"projectStatus":{"status":"OK","conditions":[]}}"#,
+            Some("OK"),
+            None,
+        ),
+        (
+            200,
+            r#"{"projectStatus":{"status":"ERROR","conditions":[]}}"#,
+            Some("ERROR"),
+            Some("status_assertion"),
+        ),
+        (
+            200,
+            r#"{"projectStatus":{"status":"UNKNOWN","conditions":[]}}"#,
+            Some("UNKNOWN"),
+            Some("status_assertion"),
+        ),
+        (
+            200,
+            r#"{"projectStatus":{"conditions":[]}}"#,
+            None,
+            Some("connector_bad_response"),
+        ),
+        (
+            500,
+            r#"{"error":"service unavailable"}"#,
+            None,
+            Some("connector_remote"),
+        ),
+    ] {
+        with_deadline(async {
+            let transport = Arc::new(
+                FakeTransport::new()
+                    .json(http, response)
+                    .json(200, r#"{"issues":[],"total":0}"#),
+            );
+            let flows = sonar_test_daemon(
+                pam_flow::builtin_yaml("sonar-gate-check").unwrap(),
+                Arc::clone(&transport),
+            )
+            .await;
+            let body = sonar_run(&flows).await;
+            assert_eq!(
+                body["outcome"],
+                if cause.is_none() {
+                    "verified"
+                } else {
+                    "unresolved"
+                },
+                "{body}"
+            );
+            let gate = step(&body, "quality-gate");
+            assert_eq!(
+                gate["status"],
+                if cause.is_none() {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
+            if let Some(cause) = cause {
+                assert_eq!(gate["error"]["cause"], cause);
+            }
+            assert_eq!(step(&body, "open-issues")["status"], "succeeded");
+            assert!(transport.url(1).contains("/api/issues/search"));
+            assert_sonar_evidence(&flows, &body, status).await;
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn sonar_failed_status_assertion_retries_before_issues() {
+    with_deadline(async {
+        let transport = Arc::new(
+            FakeTransport::new()
+                .json(
+                    200,
+                    r#"{"projectStatus":{"status":"ERROR","conditions":[]}}"#,
+                )
+                .json(200, r#"{"projectStatus":{"status":"OK","conditions":[]}}"#)
+                .json(200, r#"{"issues":[],"total":0}"#),
+        );
+        let yaml = pam_flow::builtin_yaml("sonar-gate-check").unwrap().replace(
+            "    expect_status: OK",
+            "    expect_status: OK\n    retry: { attempts: 2, backoff: 1ms }",
+        );
+        let flows = sonar_test_daemon(&yaml, Arc::clone(&transport)).await;
+        let body = sonar_run(&flows).await;
+        assert_eq!(body["outcome"], "verified");
+        assert_eq!(step(&body, "quality-gate")["attempts"], 2);
+        assert!(
+            transport
+                .url(1)
+                .contains("/api/qualitygates/project_status")
+        );
+        assert!(transport.url(2).contains("/api/issues/search"));
+        assert_sonar_evidence(&flows, &body, Some("OK")).await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}

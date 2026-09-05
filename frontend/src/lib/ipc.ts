@@ -725,6 +725,7 @@ export interface FlowStep {
   output: FlowOutput;
   /** Fail when a command emits any stdout or stderr bytes. */
   expect_empty_output?: boolean;
+  expect_status?: string;
   needs: string[];
   when: FlowWhen;
   retry: { attempts: number; backoff: string };
@@ -759,6 +760,7 @@ export interface RawFlowStep {
   role?: FlowRole;
   output?: FlowOutput;
   expect_empty_output?: boolean;
+  expect_status?: string;
   needs?: string[];
   when?: FlowWhen;
   retry?: { attempts: number; backoff?: string };

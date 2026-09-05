@@ -255,3 +255,11 @@ fn readiness_clean_tree_steps_assert_all_porcelain_output_is_empty() {
         );
     }
 }
+
+#[test]
+fn sonar_gate_has_an_explicit_passing_status_and_always_collects_issues() {
+    let flow = parse(builtin_yaml("sonar-gate-check").unwrap()).unwrap();
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("OK"));
+    assert_eq!(flow.steps[0].role, Role::Verify);
+    assert_eq!(flow.steps[1].when, super::schema::When::Always);
+}

@@ -175,3 +175,15 @@ fn empty_output_assertion_survives_normalization_and_changes_digest() {
     assert_ne!(digest(&plain), digest(&asserted));
     assert!(!to_normalized_yaml(&plain).contains("expect_empty_output"));
 }
+
+#[test]
+fn connector_status_assertion_survives_normalization_and_changes_digest() {
+    let plain = parse("schema: 1\nid: gate\nname: Gate\nsteps:\n  - id: gate\n    connector: sonarqube\n    call: quality_gate\n    with: { project: pam }\n").unwrap();
+    let mut asserted = plain.clone();
+    asserted.steps[0].expect_status = Some("OK".to_owned());
+    let yaml = to_normalized_yaml(&asserted);
+    assert!(yaml.contains("expect_status: OK"));
+    assert_eq!(parse(&yaml).unwrap(), asserted);
+    assert_ne!(digest(&plain), digest(&asserted));
+    assert!(!to_normalized_yaml(&plain).contains("expect_status"));
+}

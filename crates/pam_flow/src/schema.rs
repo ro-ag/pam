@@ -291,6 +291,9 @@ pub struct Step {
     /// Require no stdout or stderr bytes, in addition to a zero command exit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub expect_empty_output: bool,
+    /// Exact top-level connector JSON status required for success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_status: Option<String>,
     /// What happens to the output.
     pub output: OutputPolicy,
     /// Earlier step ids this one waits for.
@@ -397,6 +400,8 @@ pub(crate) struct RawStep {
     pub(crate) output: Option<OutputPolicy>,
     #[serde(default)]
     pub(crate) expect_empty_output: Option<bool>,
+    #[serde(default)]
+    pub(crate) expect_status: Option<String>,
     #[serde(default)]
     pub(crate) needs: Option<Vec<String>>,
     #[serde(default)]

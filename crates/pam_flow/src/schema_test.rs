@@ -227,6 +227,7 @@ fn step_defaults() -> Step {
         role: Role::Observe,
         output: OutputPolicy::Compact,
         expect_empty_output: false,
+        expect_status: None,
         needs: Vec::new(),
         when: When::NeedsSucceeded,
         retry: Retry::default(),

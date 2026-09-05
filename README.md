@@ -53,6 +53,9 @@ not on the command line.
 
 ## Desktop workspace
 
+- Manage flows with the visible New, Duplicate, Rename and Delete actions.
+  Unsaved edits are guarded; deleted flows can be restored with session undo.
+  Canvas connections stay visible when zooming, and Fit uses the available pane.
 - Use Cmd/Ctrl+K to jump to pages, Settings categories, models or flows.
   Navigation never runs a flow automatically.
 - Choose Monitor, Build or Focus from Workspace, or save a layout and route

@@ -64,3 +64,6 @@ mod retention_test;
 mod runtime_dir_test;
 #[cfg(test)]
 mod secrets_test;
+
+#[cfg(test)]
+mod transport_test;

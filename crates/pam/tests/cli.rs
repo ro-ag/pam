@@ -801,3 +801,50 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
     .await
     .expect("clean-tree CLI cases complete within deadline");
 }
+
+async fn flow_admin(base: &Path, op: &str, args: serde_json::Value) -> serde_json::Value {
+    match client::send_admin(base, op, args, 5000).await.unwrap() {
+        Response::Result { body, .. } => body,
+        other => panic!("admin operation failed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        let base = daemon.base();
+        let yaml = "schema: 1\nid: fresh\nname: Fresh flow\nsteps:\n  - id: inspect\n    run: [git, status, --porcelain=v1]\n";
+        flow_admin(&base, "admin.flows.save", serde_json::json!({
+            "id":"fresh", "yaml":yaml, "create_only":true,
+        })).await;
+        let copy = yaml.replace("id: fresh", "id: copied").replace("Fresh flow", "Copied flow");
+        flow_admin(&base, "admin.flows.save", serde_json::json!({
+            "id":"copied", "yaml":copy, "create_only":true,
+        })).await;
+        let renamed = copy.replace("Copied flow", "Renamed flow");
+        flow_admin(&base, "admin.flows.save", serde_json::json!({
+            "id":"copied", "yaml":renamed,
+        })).await;
+        let collision = client::send_admin(&base, "admin.flows.save", serde_json::json!({
+            "id":"copied", "yaml":copy, "create_only":true,
+        }), 5000).await.unwrap();
+        assert!(matches!(collision, Response::Refusal { .. }));
+        let got = flow_admin(&base, "admin.flows.get", serde_json::json!({"id":"copied"})).await;
+        assert_eq!(got["flow"]["name"], "Renamed flow");
+        assert_eq!(got["flow"]["id"], "copied");
+        let repo = temp_git_repo();
+        let run = run_pam(&base, repo.path(), &["flow", "run", "copied", "--json"]).await;
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        let result: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(result["body"]["flow"]["source"], "library");
+        let deleted = flow_admin(&base, "admin.flows.delete", serde_json::json!({"id":"copied"})).await;
+        assert_eq!(deleted["revealed_builtin"], false);
+        flow_admin(&base, "admin.flows.save", serde_json::json!({
+            "id":"copied", "yaml":renamed, "create_only":true,
+        })).await;
+        let restored = flow_admin(&base, "admin.flows.get", serde_json::json!({"id":"copied"})).await;
+        assert_eq!(restored["flow"]["name"], "Renamed flow");
+        daemon.stop().await;
+    }).await.expect("admin CRUD and actual CLI finish before deadline");
+}

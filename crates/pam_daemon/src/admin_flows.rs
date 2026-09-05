@@ -223,11 +223,22 @@ impl AdminService {
     fn flows_save(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let id = required_str(args, "id", OP_FLOWS_SAVE)?;
         let yaml = required_str(args, "yaml", OP_FLOWS_SAVE)?;
-        let entry = self
-            .flows
-            .library()
-            .save(id, yaml)
-            .map_err(|error| save_refusal(id, &error))?;
+        let create_only = save_flag(args, "create_only")?;
+        let allow_builtin_override = save_flag(args, "allow_builtin_override")?;
+        if allow_builtin_override && !create_only {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: "allow_builtin_override requires create_only".into(),
+                recovery: RECOVERY_FIX_ARGS,
+            });
+        }
+        let library = self.flows.library();
+        let entry = if create_only {
+            library.create(id, yaml, allow_builtin_override)
+        } else {
+            library.save(id, yaml)
+        }
+        .map_err(|error| save_refusal(id, &error))?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
             body: admin_entry_json(&entry),
@@ -461,5 +472,17 @@ fn string_list(args: &Value, key: &str, op: &str) -> Result<Option<Vec<String>>,
             .collect::<Result<Vec<String>, AdminRefusal>>()
             .map(Some),
         Some(_) => Err(malformed()),
+    }
+}
+
+fn save_flag(args: &Value, key: &str) -> Result<bool, AdminRefusal> {
+    match args.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(AdminRefusal {
+            cause: CAUSE_INVALID_ADMIN_ARGS,
+            detail: format!("{OP_FLOWS_SAVE} needs {key} to be a boolean"),
+            recovery: RECOVERY_FIX_ARGS,
+        }),
     }
 }

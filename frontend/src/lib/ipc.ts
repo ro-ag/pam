@@ -951,8 +951,12 @@ export function flowsGet(id: string): Promise<FlowDetail> {
  * validator — an invalid flow comes back as a refusal naming the YAML
  * path, which is why the editor has no separate Validate button.
  */
-export function flowsSave(id: string, yaml: string): Promise<FlowListEntry> {
-  return adminCall("admin.flows.save", { id, yaml });
+export function flowsSave(
+  id: string,
+  yaml: string,
+  options: { create_only?: boolean; allow_builtin_override?: boolean } = {},
+): Promise<FlowListEntry> {
+  return adminCall("admin.flows.save", { id, yaml, ...options });
 }
 
 /** Removes one library file; deleting a shadow reveals its builtin. */

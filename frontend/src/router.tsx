@@ -1,7 +1,9 @@
+import { useCallback, useState } from "react";
 import {
   createRootRoute,
   createRoute,
   createRouter,
+  useBlocker,
   type RouterHistory,
 } from "@tanstack/react-router";
 import { Shell } from "./components/shell/Shell";
@@ -56,7 +58,24 @@ const flowsRoute = createRoute({
 
 function FlowsRoute() {
   const { flow } = flowsRoute.useSearch();
-  return <FlowsScreen initialFlow={flow} />;
+  const [dirty, setDirty] = useState(false);
+  const shouldBlock = useCallback(() => dirty, [dirty]);
+  const blocker = useBlocker({
+    shouldBlockFn: shouldBlock,
+    withResolver: true,
+    enableBeforeUnload: dirty,
+  });
+  return (
+    <FlowsScreen
+      initialFlow={flow}
+      onDirtyChange={setDirty}
+      navigation={{
+        pending: blocker.status === "blocked",
+        proceed: blocker.proceed,
+        cancel: blocker.reset,
+      }}
+    />
+  );
 }
 
 const modelsRoute = createRoute({

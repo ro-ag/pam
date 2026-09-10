@@ -715,16 +715,36 @@ impl RunState<'_> {
             )
             .await
             .map_err(|e| refused(e.cause(), e.detail()))?;
-        if observed.oid.as_deref() == Some(loaded.receipt.commit.as_str()) {
+        if has_intent(loaded, step, Op::Push)? {
+            let prepared: crate::landing_git::PushObservation = serde_json::from_value(
+                loaded
+                    .session
+                    .intent
+                    .as_ref()
+                    .ok_or_else(failure)?
+                    .expected
+                    .clone(),
+            )
+            .map_err(|_| failure())?;
+            if prepared.requested_commit != loaded.receipt.commit {
+                return Err(failure());
+            }
+            if crate::landing_git::reconcile(&observed, &prepared).map_err(checkout_error)?
+                != crate::landing_git::Reconciliation::Matched
+            {
+                return Err(refused(
+                    "landing_effect_uncertain",
+                    "The prepared push is not confirmed by the exact remote ref; PAM will not resend it",
+                ));
+            }
             return Ok(
                 json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
             );
         }
-        if has_intent(loaded, step, Op::Push)? {
-            return Err(refused(
-                "landing_effect_uncertain",
-                "The prepared push is not confirmed by the exact remote ref; PAM will not resend it",
-            ));
+        if observed.oid.as_deref() == Some(loaded.receipt.commit.as_str()) {
+            return Ok(
+                json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
+            );
         }
         target.expected_old = observed.oid.clone();
         self.intent(loaded,step,Op::Push,json!({"ref_name":observed.ref_name,"expected_old":target.expected_old,"requested_commit":loaded.receipt.commit,"state":"uncertain"})).await?;

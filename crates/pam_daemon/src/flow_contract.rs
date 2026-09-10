@@ -1,0 +1,218 @@
+//! Bounded public flow projections. Observations are data, never instructions.
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::executor::outcome_str;
+use crate::flow_exec::RunReport;
+
+/// Leaves room for the outer wire response and persisted metadata.
+pub const MAX_RESULT_BYTES: usize = 14 * 1024;
+/// Combined UTF-8 observation text ceiling.
+pub const MAX_OBSERVATION_BYTES: usize = 6000;
+
+/// A malformed or unrepresentable public contract.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ContractError(pub &'static str);
+
+/// The persisted public result; never a prefix of the full report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResult {
+    pub schema_version: u8,
+    pub ticket: String,
+    pub flow: FlowIdentity,
+    pub workflow: Workflow,
+    pub diagnosis: Diagnosis,
+    pub observations: Vec<Observation>,
+    pub evidence: Vec<String>,
+    pub omitted: Omissions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowIdentity {
+    pub id: String,
+    pub digest: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workflow {
+    pub outcome: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Diagnosis {
+    pub status: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductObservation {
+    pub connector: String,
+    pub status: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observation {
+    pub step: String,
+    pub status: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<ProductObservation>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Omissions {
+    pub observations: usize,
+    pub evidence: usize,
+    pub observation_bytes: usize,
+}
+
+/// Build a complete bounded projection, redacting whole strings before limiting them.
+/// Product status must come from the validated adapter, never prose inference.
+pub fn project_result(
+    ticket: &str,
+    flow_id: &str,
+    digest: &str,
+    report: &RunReport,
+    evidence: &[String],
+    products: &BTreeMap<String, ProductObservation>,
+) -> Result<AgentResult, ContractError> {
+    if ticket.len() > 128 || flow_id.len() > 128 || digest.len() > 128 {
+        return Err(ContractError("flow result identity exceeds its limit"));
+    }
+    let mut result = AgentResult {
+        schema_version: 1,
+        ticket: ticket.to_owned(),
+        flow: FlowIdentity {
+            id: flow_id.to_owned(),
+            digest: digest.to_owned(),
+        },
+        workflow: Workflow {
+            outcome: outcome_str(report.outcome).to_owned(),
+        },
+        diagnosis: Diagnosis {
+            status: "not_attempted".to_owned(),
+        },
+        observations: Vec::new(),
+        evidence: Vec::new(),
+        omitted: Omissions::default(),
+    };
+    let mut remaining = MAX_OBSERVATION_BYTES;
+    for step in &report.steps {
+        let source = step
+            .summary
+            .as_deref()
+            .or_else(|| step.error.as_ref().map(|error| error.detail.as_str()))
+            .unwrap_or("");
+        let view = crate::evidence_view::redact(source.as_bytes())
+            .map_err(|_| ContractError("observation redaction failed"))?;
+        let source = String::from_utf8(view.bytes)
+            .map_err(|_| ContractError("observation view is not UTF-8"))?;
+        if result.observations.len() == 64 {
+            result.omitted.observations += 1;
+            result.omitted.observation_bytes += source.len();
+            continue;
+        }
+        let text = bounded_text(&source, remaining);
+        remaining -= text.len();
+        result.omitted.observation_bytes += source.len().saturating_sub(text.len());
+        let status = serde_json::to_value(step.status)
+            .map_err(|_| ContractError("step status cannot serialize"))?;
+        result.observations.push(Observation {
+            step: step.id.clone(),
+            status: status.as_str().unwrap_or("unknown").to_owned(),
+            text,
+            product: products.get(&step.id).cloned(),
+        });
+    }
+    for id in evidence {
+        if id.len() > 128 || result.evidence.len() >= 64 {
+            result.omitted.evidence += 1;
+        } else {
+            result.evidence.push(id.clone());
+        }
+    }
+    while serialized_len(&result)? > MAX_RESULT_BYTES {
+        if let Some(observation) = result.observations.pop() {
+            result.omitted.observations += 1;
+            result.omitted.observation_bytes += observation.text.len();
+        } else if result.evidence.pop().is_some() {
+            result.omitted.evidence += 1;
+        } else {
+            return Err(ContractError("flow result cannot fit its identity"));
+        }
+    }
+    Ok(result)
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<usize, ContractError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|_| ContractError("flow contract cannot serialize"))
+}
+
+/// UTF-8 safe prefix; omissions are reported separately, never silently.
+pub(crate) fn bounded_text(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Strict discovery pagination. Invalid values are refused, not clamped.
+pub fn pagination(args: &Value) -> Result<(usize, usize), ContractError> {
+    if !args.is_object() {
+        return Err(ContractError("pagination must be an object"));
+    }
+    let number = |key, default| match args.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|number| usize::try_from(number).ok())
+            .ok_or(ContractError("offset/limit must be unsigned integers")),
+    };
+    let offset = number("offset", 0)?;
+    let limit = number("limit", 20)?;
+    if !(1..=50).contains(&limit) {
+        return Err(ContractError("limit must be between 1 and 50"));
+    }
+    Ok((offset, limit))
+}
+
+/// Resolve only local/input variables; never git, prior steps, or network state.
+pub(crate) fn inspect_vars(
+    flow: &pam_flow::Flow,
+    supplied: &BTreeMap<String, String>,
+    repo: &std::path::Path,
+) -> (pam_flow::Vars, Vec<String>) {
+    let mut vars = pam_flow::Vars::new();
+    vars.set("repo.path", repo.to_string_lossy().into_owned());
+    if let Some(name) = repo.file_name().and_then(|value| value.to_str()) {
+        vars.set("repo.name", name);
+    }
+    let mut missing = Vec::new();
+    for name in supplied
+        .keys()
+        .filter(|name| !flow.inputs.contains_key(*name))
+    {
+        missing.push(name.clone());
+    }
+    for (name, input) in &flow.inputs {
+        let value = supplied.get(name).cloned().or_else(|| {
+            input
+                .default
+                .as_ref()
+                .and_then(|value| pam_flow::substitute(value, &vars).ok())
+        });
+        if let Some(value) = value {
+            vars.set(&format!("inputs.{name}"), value);
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    (vars, missing)
+}

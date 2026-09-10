@@ -95,6 +95,9 @@ pub const CAP_FLOW_LIST: &str = "flow.list";
 /// Capability name: read one flow.
 pub const CAP_FLOW_SHOW: &str = "flow.show";
 
+/// Read-only readiness inspection; never executes the recipe.
+pub const CAP_FLOW_INSPECT: &str = "flow.inspect";
+
 /// Prefix of the per-step capability names the gate sees.
 pub const STEP_CAPABILITY_PREFIX: &str = "flow.step:";
 
@@ -513,16 +516,191 @@ impl FlowService {
         })
     }
 
-    /// `flow.list`: every flow with enough of its shape to choose one.
+    /// Default public discovery page. Private administration uses `entries`.
     pub fn list(&self) -> Result<CapabilityOutput, FlowRefusal> {
-        let flows: Vec<Value> = self
-            .entries()?
-            .iter()
-            .map(|entry| list_entry_json(entry, false))
-            .collect();
+        self.list_page(&json!({}))
+    }
+
+    /// Bounded public discovery; all list entries retain their historical shape.
+    pub fn list_page(&self, args: &Value) -> Result<CapabilityOutput, FlowRefusal> {
+        let (offset, limit) = crate::flow_contract::pagination(args).map_err(contract_refusal)?;
+        let entries = self.entries()?;
+        let total = entries.len();
+        let mut flows = Vec::new();
+        let mut bytes = 256;
+        for entry in entries.iter().skip(offset).take(limit) {
+            let mut value = list_entry_json(entry, false);
+            // Descriptions and defaults are untrusted, and can contain credentials.
+            value = crate::evidence_view::redact_json(&value).map_err(|_| {
+                contract_refusal(crate::flow_contract::ContractError(
+                    "flow discovery cannot be redacted",
+                ))
+            })?;
+            let size = serde_json::to_vec(&value)
+                .map_err(|_| {
+                    contract_refusal(crate::flow_contract::ContractError(
+                        "flow discovery cannot serialize",
+                    ))
+                })?
+                .len();
+            if bytes + size > crate::flow_contract::MAX_RESULT_BYTES {
+                if flows.is_empty() {
+                    return Err(contract_refusal(crate::flow_contract::ContractError(
+                        "flow entry exceeds discovery limit; inspect it by id",
+                    )));
+                }
+                break;
+            }
+            bytes += size + 1;
+            flows.push(value);
+        }
+        let next = offset.saturating_add(flows.len());
         Ok(CapabilityOutput {
             outcome: Outcome::Verified,
-            body: json!({ "flows": flows }),
+            body: json!({"schema_version": 1, "flows": flows, "offset": offset, "total": total,
+                "next_offset": (next < total).then_some(next)}),
+            evidence: Vec::new(),
+        })
+    }
+
+    /// Inspect local configuration only. This snapshot never grants admission.
+    #[allow(clippy::too_many_lines)] // One bounded read-only snapshot; never executes a step.
+    pub async fn inspect(
+        &self,
+        ctx: &ExecContext,
+        args: &Value,
+    ) -> Result<CapabilityOutput, FlowRefusal> {
+        if !args.is_object()
+            || args.get("inputs").is_some_and(|value| {
+                !value.is_object()
+                    || value
+                        .as_object()
+                        .is_some_and(|map| map.values().any(|value| scalar_text(value).is_none()))
+            })
+        {
+            return Err(contract_refusal(crate::flow_contract::ContractError(
+                "inspection inputs must be an object of scalar values",
+            )));
+        }
+        let args = RunArgs::from_value(args)?;
+        let entry = self.entry(&args.id)?;
+        let flow = entry.parsed.as_ref().map_err(|_| {
+            FlowRefusal::new(
+                CAUSE_FLOW_INVALID,
+                "flow does not validate".to_owned(),
+                RECOVERY_FLOW_EDIT,
+            )
+        })?;
+        let mut blockers = Vec::new();
+        let repo = PathBuf::from(&ctx.caller.repo);
+        if let Err(error) = self.approved_repo(&repo).await {
+            blockers.push(json!({"cause": error.cause, "recovery": RECOVERY_SCOPE}));
+        }
+        let (vars, missing) = crate::flow_contract::inspect_vars(flow, &args.inputs, &repo);
+        for name in missing {
+            blockers.push(json!({"cause": "input_unavailable", "input": name, "recovery": "supply the declared input; runtime-derived values require execution"}));
+        }
+        let configured = self
+            .store
+            .get_setting(SETTING_ALLOWED_PROGRAMS)
+            .await
+            .map_err(|error| store_note(&error))?;
+        let allowed: Vec<String> = match configured {
+            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                FlowRefusal::new(
+                    "flow_settings_invalid",
+                    "allowed program setting is malformed".to_owned(),
+                    RECOVERY_ALLOWED_PROGRAMS,
+                )
+            })?,
+            None => FlowSettings::platform_default().allowed_programs,
+        };
+        let mut steps = Vec::new();
+        for step in &flow.steps {
+            let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "live": "unknown"});
+            if step.gated() {
+                let granted = self
+                    .store
+                    .active_grant(&step_capability(&flow.id, &step.id))
+                    .await
+                    .map_err(|error| store_note(&error))?;
+                item["grant"] = json!(if granted { "present" } else { "missing" });
+                item["approval"] = json!("rechecked_at_execution");
+                if !granted {
+                    blockers.push(json!({"step": step.id, "cause": "step_not_granted", "recovery": "review this flow step in GUI Permissions"}));
+                }
+            }
+            match &step.action {
+                Action::Command { argv } => {
+                    let program = argv.first().and_then(|value| substitute(value, &vars).ok());
+                    item["program"] = json!(program);
+                    if !program.as_ref().is_some_and(|program| {
+                        check_allowed_program(program).is_ok() && allowed.contains(program)
+                    }) {
+                        blockers.push(json!({"step": step.id, "cause": "program_not_allowed_or_unresolved", "recovery": RECOVERY_ALLOWED_PROGRAMS}));
+                    }
+                }
+                Action::Connector {
+                    connector,
+                    call,
+                    with,
+                } => {
+                    item["product"] = json!(connector.as_str());
+                    item["operation"] = json!(call);
+                    item["credential"] = json!("unknown_not_probed");
+                    let row = self
+                        .store
+                        .get_connector(connector.as_str())
+                        .await
+                        .map_err(|error| store_note(&error))?;
+                    item["configured"] = json!(row.as_ref().is_some_and(|row| row.enabled));
+                    let resolved = with
+                        .iter()
+                        .map(|(name, value)| {
+                            let value = match value {
+                                ArgValue::Text(text) => ArgValue::Text(substitute(text, &vars)?),
+                                ArgValue::Int(number) => ArgValue::Int(*number),
+                            };
+                            Ok((name.clone(), value))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, pam_flow::VarError>>();
+                    match resolved {
+                        Ok(resolved) => if let Err(error) = self.connectors.authorize_scope(&repo, *connector, call, &resolved).await {
+                            blockers.push(json!({"step": step.id, "cause": error.cause(), "recovery": error.recovery(*connector)}));
+                        },
+                        Err(_) => blockers.push(json!({"step": step.id, "cause": "target_unresolved", "recovery": "supply declared inputs; prior-step targets are checked during execution"})),
+                    }
+                    let shape = pam_connectors::descriptor(*connector);
+                    if shape.username_label.is_some()
+                        && !row
+                            .as_ref()
+                            .and_then(|row| row.username.as_deref())
+                            .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        blockers.push(json!({"step": step.id, "cause": "connector_username_missing", "recovery": "configure the connector in GUI Connectors"}));
+                    }
+                }
+            }
+            steps.push(item);
+        }
+        let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
+            "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
+            "steps":steps, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
+            "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
+            "output_schema":"pam.flow.result.v1","admission_rechecked":true});
+        let body = crate::evidence_view::redact_json(&body).map_err(|_| {
+            contract_refusal(crate::flow_contract::ContractError(
+                "inspection cannot be redacted",
+            ))
+        })?;
+        if body.to_string().len() > crate::flow_contract::MAX_RESULT_BYTES {
+            return Err(contract_refusal(crate::flow_contract::ContractError(
+                "inspection exceeds its response limit",
+            )));
+        }
+        Ok(CapabilityOutput {
+            outcome: Outcome::Verified,
+            body,
             evidence: Vec::new(),
         })
     }
@@ -631,6 +809,43 @@ impl FlowService {
         };
         state.execute().await?;
 
+        let products = flow
+            .steps
+            .iter()
+            .filter_map(|step| {
+                if let Action::Connector {
+                    connector: ConnectorId::Jenkins,
+                    call,
+                    ..
+                } = &step.action
+                    && call == "investigate"
+                {
+                    let status = state
+                        .vars
+                        .resolve(&format!("steps.{}.result.status", step.id))?;
+                    if [
+                        "SUCCESS",
+                        "FAILURE",
+                        "UNSTABLE",
+                        "ABORTED",
+                        "NOT_BUILT",
+                        "RUNNING",
+                        "UNKNOWN",
+                    ]
+                    .contains(&status.as_str())
+                    {
+                        return Some((
+                            step.id.clone(),
+                            crate::flow_contract::ProductObservation {
+                                connector: "jenkins".to_owned(),
+                                status,
+                            },
+                        ));
+                    }
+                }
+                None
+            })
+            .collect::<BTreeMap<_, _>>();
         let report = RunReport {
             outcome: outcome_for(&state.reports, flow),
             summary: summary_for(&state.reports),
@@ -658,10 +873,18 @@ impl FlowService {
             },
         };
         let (verdict_id, body) = self
-            .file_verdict(ctx, flow, &report, &body, &capture)
+            .file_verdict(
+                ctx,
+                flow,
+                &report,
+                &body,
+                &capture,
+                &state.evidence,
+                &products,
+            )
             .await?;
-        let mut evidence = state.evidence;
-        evidence.push(verdict_id);
+        // The projection carries bounded references; the outer wire list names only the verdict.
+        let evidence = vec![verdict_id];
         Ok(CapabilityOutput {
             outcome: report.outcome,
             body,
@@ -669,6 +892,7 @@ impl FlowService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Full private report plus its bounded public projection inputs.
     async fn file_verdict(
         &self,
         ctx: &ExecContext,
@@ -676,6 +900,8 @@ impl FlowService {
         report: &RunReport,
         body: &Value,
         capture: &crate::evidence_service::CaptureScope,
+        evidence: &[String],
+        products: &BTreeMap<String, crate::flow_contract::ProductObservation>,
     ) -> Result<(String, Value), CapabilityFailure> {
         let failed = report
             .steps
@@ -683,12 +909,31 @@ impl FlowService {
             .filter(|step| step.status == StepStatus::Failed)
             .count();
         let verdict_id = new_evidence_id();
+        let mut public_evidence = vec![verdict_id.clone()];
+        public_evidence.extend(evidence.iter().cloned());
+        let projection = crate::flow_contract::project_result(
+            &ctx.request_id,
+            &flow.id,
+            &digest(flow),
+            report,
+            &public_evidence,
+            products,
+        )
+        .map_err(|error| CapabilityFailure::Failed {
+            detail: error.to_string(),
+        })?;
         let meta = json!({
+            "agent_result": projection,
             "flow": flow.id,
             "outcome": outcome_str(report.outcome),
             "steps": report.steps.len(),
             "failed": failed,
         });
+        if meta.to_string().len() > 16 * 1024 {
+            return Err(CapabilityFailure::Failed {
+                detail: "flow result metadata exceeds its limit".to_owned(),
+            });
+        }
         let bytes = serde_json::to_vec(body).map_err(|error| CapabilityFailure::Failed {
             detail: error.to_string(),
         })?;
@@ -703,8 +948,8 @@ impl FlowService {
             .await
             .map_err(failed_store)?;
 
-        let mut body =
-            crate::evidence_view::redact_json(body).map_err(|error| CapabilityFailure::Failed {
+        let public_body =
+            serde_json::to_value(projection).map_err(|error| CapabilityFailure::Failed {
                 detail: error.to_string(),
             })?;
         let published = match crate::evidence_service::prepare(bytes).await {
@@ -723,9 +968,9 @@ impl FlowService {
         };
         if let Err(error) = published {
             tracing::warn!(%error, "flow result view unavailable");
-            body["evidence_unavailable"] = json!([format!("{verdict_id}: view_unavailable")]);
+            // The persisted projection remains stable. Retrieval reports view_unavailable.
         }
-        Ok((verdict_id, body))
+        Ok((verdict_id, public_body))
     }
 
     /// Builds the `${…}` values a run starts with: `repo.*` first, then
@@ -1988,4 +2233,12 @@ fn budget_attempt(error: crate::request_budget::BudgetError) -> Attempt {
         recovery: crate::request_budget::RECOVERY_BUDGET.to_owned(),
         retry_after: None,
     }
+}
+
+fn contract_refusal(error: crate::flow_contract::ContractError) -> FlowRefusal {
+    FlowRefusal::new(
+        "flow_contract_invalid",
+        error.to_string(),
+        RECOVERY_FLOW_LIST,
+    )
 }

@@ -614,7 +614,8 @@ impl Store {
         .await
     }
 
-    /// Records pre-gate admission as running, with a durable absolute deadline.
+    /// Records pre-gate admission as running, with a durable absolute deadline
+    /// and the grant-revocation revision captured atomically with insertion.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_admitted_request(
         &self,
@@ -639,7 +640,9 @@ impl Store {
         .await
     }
 
-    /// Atomically records post-gate authorization without extending the deadline.
+    /// Atomically records post-gate authorization without extending the deadline
+    /// or refreshing the admission revision. Revocation during gating/approval
+    /// invalidates this admission even when the capability was later re-granted.
     pub async fn authorize_queued_request(
         &self,
         id: &str,
@@ -650,10 +653,10 @@ impl Store {
         let changed = self
             .conn
             .execute(
-                "UPDATE request SET state = 'queued', queue_authorized = 1, updated_ts = ?1,
-             authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+                "UPDATE request SET state = 'queued', queue_authorized = 1, updated_ts = ?1
              WHERE id = ?2 AND repo = ?3 AND queue_authorized = 0
-             AND state IN ('running','waiting_approval') AND expires_at_ms > ?4",
+             AND state IN ('running','waiting_approval') AND expires_at_ms > ?4
+             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)",
                 params![now_ts(), id, repo, now_ms],
             )
             .await?;
@@ -759,8 +762,12 @@ impl Store {
             .execute(
                 "INSERT INTO request
                      (id, capability, repo, caller_agent, args_json,
-                      idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9)",
+                      idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms,
+                      authorization_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9,
+                      CASE WHEN ?9 IS NOT NULL THEN
+                        (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+                      ELSE NULL END)",
                 params![
                     id,
                     capability,

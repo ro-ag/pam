@@ -1643,6 +1643,7 @@ async fn admitted_request_authorization_checks_state_scope_and_expiry() {
     let row = store.get_request("admitted").await.unwrap().unwrap();
     assert_eq!(row.state, RequestState::Queued);
     assert_eq!(row.expires_at_ms, Some(5000));
+    assert_eq!(row.authorization_revision, Some(0));
     assert!(row.queue_authorized);
     assert!(
         store
@@ -1659,6 +1660,68 @@ async fn admitted_request_authorization_checks_state_scope_and_expiry() {
             .is_none()
     );
     assert_eq!(store.admission_usage().await.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn revocation_between_admission_and_placement_invalidates_prior_gate_decision() {
+    let store = Store::open_in_memory().await.unwrap();
+    store.insert_grant("flow.run").await.unwrap();
+    for (id, state) in [
+        ("gating", RequestState::Running),
+        ("approval", RequestState::WaitingApproval),
+    ] {
+        store
+            .insert_admitted_request(id, "flow.run", "repo", "agent", "{}", None, 5000)
+            .await
+            .unwrap();
+        store.update_request_state(id, state, None).await.unwrap();
+        assert_eq!(
+            store
+                .get_request(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authorization_revision,
+            Some(0)
+        );
+    }
+    // The gate may have allowed both requests before this revocation.
+    store.revoke_grant("flow.run").await.unwrap();
+    // Re-granting cannot silently revive their earlier authorization.
+    store.insert_grant("flow.run").await.unwrap();
+    for id in ["gating", "approval"] {
+        assert!(
+            !store
+                .authorize_queued_request(id, "repo", 1000)
+                .await
+                .unwrap()
+        );
+        assert!(!store.start_queued_request(id, 1000).await.unwrap());
+        let row = store.get_request(id).await.unwrap().unwrap();
+        assert!(!row.queue_authorized);
+        assert_eq!(row.authorization_revision, Some(0));
+    }
+    assert!(store.list_queued_ordered().await.unwrap().is_empty());
+    store
+        .insert_admitted_request("fresh", "flow.run", "repo", "agent", "{}", None, 5000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_request("fresh")
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_revision,
+        Some(1)
+    );
+    assert!(
+        store
+            .authorize_queued_request("fresh", "repo", 1000)
+            .await
+            .unwrap()
+    );
+    assert!(store.start_queued_request("fresh", 1000).await.unwrap());
 }
 
 #[tokio::test]

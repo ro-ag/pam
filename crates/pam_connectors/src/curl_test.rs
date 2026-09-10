@@ -89,3 +89,102 @@ fn request() -> HttpRequest {
         follow_one_https_redirect_without_auth: false,
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn connector_command_uses_only_trusted_curl_without_argv_credentials() {
+    let Ok(path) = CurlTransport::trusted_path() else {
+        return;
+    };
+    let transport = CurlTransport::new(path.clone());
+    let command = transport.command(&request(), 12).unwrap();
+    let command = command.as_std();
+    assert_eq!(command.get_program(), path.as_os_str());
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args[0], "-q");
+    assert_eq!(args[1], "--config");
+    assert_eq!(args[2], "-");
+    assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
+    assert!(command.get_envs().next().is_none());
+    assert!(
+        args.iter()
+            .all(|arg| !arg.to_string_lossy().contains("ghp_secret"))
+    );
+    assert!(
+        args.iter()
+            .all(|arg| !arg.to_string_lossy().contains("api.github.com"))
+    );
+}
+
+#[test]
+fn caller_supplied_executable_cannot_replace_the_connector_bridge() {
+    let transport = CurlTransport::new("/agent-controlled/curl".into());
+    assert!(matches!(
+        transport.command(&request(), 1),
+        Err(crate::TransportError::Policy {
+            cause: "trusted_curl_unavailable",
+            ..
+        })
+    ));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn platforms_without_a_verified_system_binary_fail_closed() {
+    assert!(matches!(
+        CurlTransport::trusted_path(),
+        Err(crate::TransportError::Policy {
+            cause: "trusted_curl_unavailable",
+            ..
+        })
+    ));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn inherited_curl_home_cannot_enable_a_trace_file() {
+    if CurlTransport::trusted_path().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("forbidden-trace");
+    std::fs::write(
+        dir.path().join(".curlrc"),
+        format!("trace = \"{}\"\n", trace.display()),
+    )
+    .unwrap();
+    // A subprocess supplies hostile inherited variables without mutating this
+    // multithreaded test runner's environment.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "curl_test::hostile_environment_child"])
+        .env("PAM_CURL_ENV_PROBE", "1")
+        .env("CURL_HOME", dir.path())
+        .env("HOME", dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!trace.exists(), "inherited curlrc wrote a host trace file");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn hostile_environment_child() {
+    if std::env::var_os("PAM_CURL_ENV_PROBE").is_none() {
+        return;
+    }
+    let path = CurlTransport::trusted_path().unwrap();
+    let transport = CurlTransport::new(path);
+    let mut child = transport.command(&request(), 1).unwrap().spawn().unwrap();
+    use tokio::io::AsyncWriteExt;
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(b"url = \"https://127.0.0.1:1/\"\n")
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+}

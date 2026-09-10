@@ -10,7 +10,7 @@
 //! the audit log, and to anything that samples process arguments.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Instant;
@@ -20,6 +20,39 @@ use tokio::process::{Child, Command};
 use url::Url;
 
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError, excerpt};
+
+fn untrusted_curl() -> TransportError {
+    TransportError::Policy {
+        cause: "trusted_curl_unavailable",
+        detail: "A trusted operating-system curl is unavailable; no connector process was started."
+            .to_owned(),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn trusted_curl_path() -> Result<PathBuf, TransportError> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize("/usr/bin/curl").map_err(|_| untrusted_curl())?;
+    let binary = path.metadata().map_err(|_| untrusted_curl())?;
+    if !binary.is_file() || binary.mode() & 0o111 == 0 {
+        return Err(untrusted_curl());
+    }
+    // Canonical paths remove symlinks; every component must remain outside
+    // an ordinary same-user agent's write authority.
+    for ancestor in path.ancestors() {
+        let metadata = ancestor.symlink_metadata().map_err(|_| untrusted_curl())?;
+        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
+        {
+            return Err(untrusted_curl());
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn trusted_curl_path() -> Result<PathBuf, TransportError> {
+    Err(untrusted_curl())
+}
 
 /// How much room over `max_bytes` the status line and headers may take.
 const HEADER_HEADROOM: u64 = 64 * 1024;
@@ -33,8 +66,8 @@ const GRACE_SECS: u64 = 5;
 
 /// `curl` as an [`HttpTransport`].
 ///
-/// The path is injected rather than looked up here: the daemon resolves
-/// `curl` once at start-up and reports a missing one as its own refusal.
+/// Only the verified operating-system curl may execute. The constructor's
+/// path is checked against that binary; it cannot select a PATH substitute.
 #[derive(Debug, Clone)]
 pub struct CurlTransport {
     curl: PathBuf,
@@ -42,13 +75,55 @@ pub struct CurlTransport {
 }
 
 impl CurlTransport {
-    /// A transport that runs the `curl` at `curl`.
+    /// Selects the operating-system curl. A supplied path must resolve to the
+    /// trusted system binary; bare `curl` is an explicit system selector, never
+    /// a PATH lookup. Other executables fail closed before spawning.
     #[must_use]
     pub fn new(curl: PathBuf) -> Self {
         Self {
             curl,
             allow_http: false,
         }
+    }
+
+    /// The fixed trusted operating-system executable, without searching PATH.
+    /// Unsupported platforms or unsafe filesystem ownership fail closed.
+    pub fn trusted_path() -> Result<PathBuf, TransportError> {
+        trusted_curl_path()
+    }
+
+    pub(crate) fn command(
+        &self,
+        request: &HttpRequest,
+        deadline_secs: u64,
+    ) -> Result<Command, TransportError> {
+        let trusted = Self::trusted_path()?;
+        if self.curl != Path::new("curl")
+            && std::fs::canonicalize(&self.curl).map_err(|_| untrusted_curl())? != trusted
+        {
+            return Err(untrusted_curl());
+        }
+        let mut command = Command::new(trusted);
+        command
+            .arg("-q") // MUST be first: disables all implicit curlrc loading.
+            .arg("--config")
+            .arg("-")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("--include")
+            .arg("--max-time")
+            .arg(deadline_secs.to_string())
+            .arg("--max-filesize")
+            .arg(request.max_bytes.to_string())
+            .arg("--proto")
+            .arg(self.proto())
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Ok(command)
     }
 
     /// Lets this transport speak plain `http` as well as `https`.
@@ -95,23 +170,7 @@ impl CurlTransport {
         request: &HttpRequest,
         deadline_secs: u64,
     ) -> Result<HttpResponse, TransportError> {
-        let mut command = Command::new(&self.curl);
-        command
-            .arg("--config")
-            .arg("-")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--include")
-            .arg("--max-time")
-            .arg(deadline_secs.to_string())
-            .arg("--max-filesize")
-            .arg(request.max_bytes.to_string())
-            .arg("--proto")
-            .arg(self.proto())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = self.command(request, deadline_secs)?;
 
         let mut child = command
             .spawn()

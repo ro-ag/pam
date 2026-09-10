@@ -3,8 +3,9 @@
 //!
 //! The three calls are meant to be chained, and the `ci-failure-triage`
 //! starter flow chains them: `runs` finds the newest failed run, `run` lists
-//! that run's jobs failed-first so `jobs[0]` is the one to look at, and
-//! `job_log` fetches that job's log.
+//! one attempt's bounded jobs page. Failure ordering applies only within that
+//! page: a partial page cannot establish that the run has no failing jobs.
+//! `job_log` fetches a selected job's log. No call aggregates pages implicitly.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -40,6 +41,8 @@ const JOB_FIELDS: &[&str] = &["id", "name", "status", "conclusion"];
 
 /// The most jobs a `run` call reads back.
 const MAX_JOBS: i64 = 100;
+/// Explicit pagination is bounded even when the server reports more records.
+const MAX_PAGE: i64 = 10_000;
 
 /// Runs one GitHub call.
 pub(crate) async fn call(
@@ -67,20 +70,28 @@ async fn runs(
     let (owner, name) = repo(args)?;
     let status = opt_text_arg(args, "status")?.unwrap_or("failure");
     let limit = int_arg(args, "limit", 5, (1, 100))?;
+    let page = int_arg(args, "page", 1, (1, MAX_PAGE))?;
     let mut url = endpoint(&conn.base_url, &["repos", &owner, &name, "actions", "runs"])?;
     url.query_pairs_mut()
         .append_pair("status", status)
-        .append_pair("per_page", &limit.to_string());
+        .append_pair("per_page", &limit.to_string())
+        .append_pair("page", &page.to_string());
     let body = get_json(conn, ID, url, transport, deadline).await?;
-    let runs: Vec<Value> = array_field(&body, "workflow_runs")?
+    let received = array_field(&body, "workflow_runs")?;
+    let runs: Vec<Value> = received
         .iter()
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .map(|run| pick(run, RUN_FIELDS))
         .collect();
-    Ok(CallResult::Json(json!({ "runs": runs })))
+    let mut result = page_coverage(&body, page, limit, received.len());
+    result["runs"] = json!(runs);
+    Ok(CallResult::Json(result))
 }
 
-/// The run itself, plus its jobs with the failing ones first.
+/// A run attempt and one jobs page; never infer an attempt from missing data.
+/// Uses GitHub's documented attempt-specific run and jobs endpoints:
+/// <https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt>
+/// <https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt>
 async fn run(
     conn: &Connection,
     args: &BTreeMap<String, ArgValue>,
@@ -89,7 +100,17 @@ async fn run(
 ) -> Result<CallResult, ConnectorError> {
     let (owner, name) = repo(args)?;
     let run_id = id_arg(args, "run_id")?;
-    let run_url = endpoint(
+    let page = int_arg(args, "page", 1, (1, MAX_PAGE))?;
+    let pinned = args
+        .contains_key("run_attempt")
+        .then(|| int_arg(args, "run_attempt", 1, (1, i64::MAX)))
+        .transpose()?;
+    if page > 1 && pinned.is_none() {
+        return Err(ConnectorError::BadArgs(
+            "`run_attempt` is required after page 1; reuse the captured attempt".to_owned(),
+        ));
+    }
+    let mut run_url = endpoint(
         &conn.base_url,
         &[
             "repos",
@@ -100,13 +121,16 @@ async fn run(
             &run_id.to_string(),
         ],
     )?;
+    if let Some(attempt) = pinned {
+        run_url
+            .path_segments_mut()
+            .map_err(|()| {
+                ConnectorError::BadArgs("GitHub base URL cannot carry path segments".to_owned())
+            })?
+            .extend(["attempts", &attempt.to_string()]);
+    }
     let run = get_json(conn, ID, run_url, transport, deadline).await?;
-    let attempt = run
-        .get("run_attempt")
-        .and_then(Value::as_i64)
-        .filter(|attempt| *attempt > 0)
-        .unwrap_or(1);
-
+    let attempt = validated_attempt(&run, run_id, pinned, &format!("{owner}/{name}"))?;
     let mut jobs_url = endpoint(
         &conn.base_url,
         &[
@@ -123,21 +147,99 @@ async fn run(
     )?;
     jobs_url
         .query_pairs_mut()
-        .append_pair("per_page", &MAX_JOBS.to_string());
+        .append_pair("per_page", &MAX_JOBS.to_string())
+        .append_pair("page", &page.to_string());
     let jobs_body = get_json(conn, ID, jobs_url, transport, deadline).await?;
-
-    let mut jobs: Vec<Value> = array_field(&jobs_body, "jobs")?
+    let received = array_field(&jobs_body, "jobs")?;
+    let mut jobs: Vec<Value> = received
         .iter()
+        .take(usize::try_from(MAX_JOBS).expect("positive bounded job limit"))
         .map(|job| pick(job, JOB_FIELDS))
         .collect();
-    // Stable, so jobs that rank the same keep the order GitHub sent, and a
-    // flow's `jobs[0]` is the failing job rather than the first job.
+    // Stable ordering within this page only; unseen pages can contain failures.
     jobs.sort_by_key(|job| failure_rank(job.get("conclusion").and_then(Value::as_str)));
+    let mut result = page_coverage(&jobs_body, page, MAX_JOBS, received.len());
+    result["run"] = pick(&run, RUN_FIELDS);
+    result["run_id"] = json!(run_id);
+    result["run_attempt"] = json!(attempt);
+    result["jobs"] = json!(jobs);
+    result["ordering"] = json!("failure_first_within_page");
+    result["coverage"]["snapshot"] = json!("single_jobs_response");
+    Ok(CallResult::Json(result))
+}
 
-    Ok(CallResult::Json(json!({
-        "run": pick(&run, RUN_FIELDS),
-        "jobs": jobs,
-    })))
+fn validated_attempt(
+    run: &Value,
+    run_id: i64,
+    pinned: Option<i64>,
+    repository: &str,
+) -> Result<i64, ConnectorError> {
+    let attempt = run
+        .get("run_attempt")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ConnectorError::BadResponse(
+                "GitHub run metadata has no valid positive run_attempt".to_owned(),
+            )
+        })?;
+    if pinned.is_some_and(|pinned| pinned != attempt)
+        || run.get("id").is_some_and(|id| id.as_i64() != Some(run_id))
+        || run.pointer("/repository/full_name").is_some_and(|name| {
+            !name
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(repository))
+        })
+    {
+        return Err(ConnectorError::BadResponse(
+            "GitHub run metadata does not match the requested run, attempt, or repository"
+                .to_owned(),
+        ));
+    }
+    Ok(attempt)
+}
+
+/// Coverage is about this response's reported collection, not a pass verdict or
+/// a stable snapshot across requests. Missing/malformed totals never mean zero.
+fn page_coverage(body: &Value, page: i64, limit: i64, received: usize) -> Value {
+    let page = u64::try_from(page).expect("validated page");
+    let limit = u64::try_from(limit).expect("validated page size");
+    let received = u64::try_from(received).unwrap_or(u64::MAX);
+    let returned = received.min(limit);
+    let offset = (page - 1) * limit;
+    let total = body.get("total_count").and_then(Value::as_u64);
+    let has_more = total.map(|total| offset.saturating_add(returned) < total);
+    let next = (has_more == Some(true) || (has_more.is_none() && returned == limit))
+        .then_some(page + 1)
+        .filter(|next| *next <= u64::try_from(MAX_PAGE).unwrap());
+    let mut gaps = Vec::new();
+    if page > 1 {
+        gaps.push("previous_pages_not_included");
+    }
+    if total.is_none() {
+        gaps.push("total_count_unavailable");
+    }
+    if total.is_some_and(|total| received != total.saturating_sub(offset).min(limit)) {
+        gaps.push("total_count_inconsistent");
+    }
+    if has_more == Some(true) {
+        gaps.push("later_pages_not_included");
+    }
+    if received > limit {
+        gaps.push("response_array_truncated");
+    }
+    if next.is_none() && (has_more == Some(true) || (has_more.is_none() && returned == limit)) {
+        gaps.push("page_limit_reached");
+    }
+    json!({
+        "page": page, "per_page": limit, "total_count": total,
+        "next_page": next, "partial": !gaps.is_empty(),
+        "coverage": {
+            "complete": gaps.is_empty(), "basis": "single_response_reported_total",
+            "returned": returned, "received": received, "omitted": received.saturating_sub(returned),
+            "has_more": has_more, "gaps": gaps,
+        },
+    })
 }
 
 /// One job's log, with the exit status its conclusion implies.

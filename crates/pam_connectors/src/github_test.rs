@@ -119,6 +119,297 @@ async fn run_lists_the_failing_jobs_first() {
     assert_eq!(names, vec!["test", "docs", "lint", "bench"]);
 }
 
+fn successful_jobs(count: u64) -> Vec<serde_json::Value> {
+    (1..=count).map(|id| serde_json::json!({
+        "id": id, "name": format!("job-{id}"), "status": "completed", "conclusion": "success",
+    })).collect()
+}
+
+fn json_result(result: CallResult) -> serde_json::Value {
+    let CallResult::Json(value) = result else {
+        panic!("expected JSON")
+    };
+    value
+}
+
+#[tokio::test]
+async fn failure_on_page_two_never_makes_page_one_complete() {
+    let metadata = r#"{"id":9,"run_attempt":3,"status":"completed","conclusion":"failure"}"#;
+    let first = serde_json::json!({"total_count":101,"jobs":successful_jobs(100)});
+    let last = serde_json::json!({"total_count":101,"jobs":[{
+        "id":101,"name":"last-job","status":"completed","conclusion":"failure",
+    }]});
+    let transport = FakeTransport::new()
+        .json(200, metadata)
+        .json(200, &first.to_string())
+        .json(200, metadata)
+        .json(200, &last.to_string());
+    let first = json_result(
+        run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first["jobs"].as_array().unwrap().len(), 100);
+    assert_eq!(first["jobs"][0]["conclusion"], "success");
+    assert_eq!(
+        first["run"]["conclusion"], "failure",
+        "core run result survives page-local success"
+    );
+    assert_eq!(first["run_attempt"], 3);
+    assert_eq!(first["total_count"], 101);
+    assert_eq!(first["partial"], true);
+    assert_eq!(first["coverage"]["complete"], false);
+    assert_eq!(first["next_page"], 2);
+    assert_eq!(transport.requests().len(), 2, "no hidden pagination");
+    let last = json_result(
+        run_call(
+            "run",
+            &[
+                ("repo", "ro-ag/pam"),
+                ("run_id", "9"),
+                ("page", "2"),
+                ("run_attempt", "3"),
+            ],
+            &transport,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        transport.url(2),
+        "https://api.github.com/repos/ro-ag/pam/actions/runs/9/attempts/3"
+    );
+    assert!(
+        transport
+            .url(3)
+            .contains("/attempts/3/jobs?per_page=100&page=2")
+    );
+    assert_eq!(last["jobs"][0]["id"], 101);
+    assert_eq!(last["run_attempt"], 3);
+    assert_eq!(last["page"], 2);
+    assert_eq!(last["ordering"], "failure_first_within_page");
+    assert_eq!(
+        last["partial"], true,
+        "earlier pages are not in this response"
+    );
+    assert_eq!(last["coverage"]["has_more"], false);
+    assert!(last["next_page"].is_null());
+    assert_eq!(
+        last["coverage"]["gaps"],
+        serde_json::json!(["previous_pages_not_included"])
+    );
+}
+
+#[tokio::test]
+async fn absent_or_invalid_attempt_is_rejected_before_fetching_jobs() {
+    for attempt in [
+        None,
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!(-1)),
+        Some(serde_json::json!("3")),
+        Some(serde_json::json!(1.5)),
+    ] {
+        let mut metadata = serde_json::json!({"id":9});
+        if let Some(attempt) = attempt {
+            metadata["run_attempt"] = attempt;
+        }
+        let transport = FakeTransport::new().json(200, &metadata.to_string());
+        let result = run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport).await;
+        assert!(
+            matches!(result, Err(ConnectorError::BadResponse(_))),
+            "{result:?}"
+        );
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn mismatched_run_attempt_or_repository_is_rejected_before_jobs() {
+    for metadata in [
+        serde_json::json!({"id":10,"run_attempt":3}),
+        serde_json::json!({"id":9,"run_attempt":2}),
+        serde_json::json!({"id":9,"run_attempt":3,"repository":{"full_name":"other/private"}}),
+    ] {
+        let transport = FakeTransport::new().json(200, &metadata.to_string());
+        let result = run_call(
+            "run",
+            &[("repo", "ro-ag/pam"), ("run_id", "9"), ("run_attempt", "3")],
+            &transport,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ConnectorError::BadResponse(_))),
+            "{result:?}"
+        );
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn subsequent_pages_need_a_pinned_attempt_and_pages_are_bounded() {
+    for (page, attempt) in [
+        ("2", None),
+        ("0", Some("3")),
+        ("10001", Some("3")),
+        ("1", Some("0")),
+    ] {
+        let transport = FakeTransport::new();
+        let mut pairs = vec![("repo", "ro-ag/pam"), ("run_id", "9"), ("page", page)];
+        if let Some(attempt) = attempt {
+            pairs.push(("run_attempt", attempt));
+        }
+        let result = run_call("run", &pairs, &transport).await;
+        assert!(
+            matches!(result, Err(ConnectorError::BadArgs(_))),
+            "{result:?}"
+        );
+        assert!(transport.requests().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn oversized_jobs_are_capped_before_page_local_sorting() {
+    let mut jobs = successful_jobs(100);
+    jobs.push(serde_json::json!({"id":101,"conclusion":"failure"}));
+    let transport = FakeTransport::new()
+        .json(200, r#"{"id":9,"run_attempt":3}"#)
+        .json(
+            200,
+            &serde_json::json!({"total_count":101,"jobs":jobs}).to_string(),
+        );
+    let result = json_result(
+        run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["jobs"].as_array().unwrap().len(), 100);
+    assert_eq!(
+        result["jobs"][0]["id"], 1,
+        "discarded record cannot reorder this page"
+    );
+    assert_eq!(result["partial"], true);
+    assert_eq!(result["coverage"]["received"], 101);
+    assert_eq!(result["coverage"]["omitted"], 1);
+    assert!(
+        result["coverage"]["gaps"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("response_array_truncated"))
+    );
+}
+
+#[tokio::test]
+async fn missing_malformed_and_inconsistent_totals_never_claim_complete_coverage() {
+    for total in [
+        None,
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!(-1)),
+        Some(serde_json::json!("2")),
+        Some(serde_json::json!(3)),
+    ] {
+        let mut body = serde_json::json!({"jobs":successful_jobs(2)});
+        if let Some(total) = total {
+            body["total_count"] = total;
+        }
+        let transport = FakeTransport::new()
+            .json(200, r#"{"id":9,"run_attempt":3}"#)
+            .json(200, &body.to_string());
+        let result = json_result(
+            run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["partial"], true, "{result}");
+        assert_eq!(result["coverage"]["complete"], false);
+        assert!(!result["coverage"]["gaps"].as_array().unwrap().is_empty());
+    }
+    for count in [0, 2] {
+        let body = serde_json::json!({"total_count":count,"jobs":successful_jobs(count)});
+        let transport = FakeTransport::new()
+            .json(200, r#"{"id":9,"run_attempt":3}"#)
+            .json(200, &body.to_string());
+        let result = json_result(
+            run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["partial"], false);
+        assert_eq!(result["coverage"]["complete"], true);
+        assert!(result["next_page"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn runs_enforces_decoded_limit_and_reports_page_coverage() {
+    let transport = FakeTransport::new().json(
+        200,
+        &serde_json::json!({
+            "total_count":5,"workflow_runs":[{"id":1},{"id":2},{"id":3}],
+        })
+        .to_string(),
+    );
+    let result = json_result(
+        run_call(
+            "runs",
+            &[("repo", "ro-ag/pam"), ("limit", "2"), ("page", "2")],
+            &transport,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(transport.url(0).contains("per_page=2&page=2"));
+    assert_eq!(result["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(result["runs"][0]["id"], 1, "server order is retained");
+    assert_eq!(result["coverage"]["omitted"], 1);
+    assert_eq!(result["next_page"], 3);
+    assert_eq!(result["partial"], true);
+}
+
+#[tokio::test]
+async fn unknown_total_and_page_limit_are_explicit() {
+    let body = serde_json::json!({"jobs":successful_jobs(100)});
+    let transport = FakeTransport::new()
+        .json(200, r#"{"id":9,"run_attempt":3}"#)
+        .json(200, &body.to_string());
+    let result = json_result(
+        run_call("run", &[("repo", "ro-ag/pam"), ("run_id", "9")], &transport)
+            .await
+            .unwrap(),
+    );
+    assert!(result["total_count"].is_null());
+    assert!(result["coverage"]["has_more"].is_null());
+    assert_eq!(
+        result["next_page"], 2,
+        "a full page permits an explicit bounded probe"
+    );
+    let transport = FakeTransport::new()
+        .json(200, r#"{"id":9,"run_attempt":3}"#)
+        .json(200, r#"{"total_count":1000001,"jobs":[]}"#);
+    let result = json_result(
+        run_call(
+            "run",
+            &[
+                ("repo", "ro-ag/pam"),
+                ("run_id", "9"),
+                ("page", "10000"),
+                ("run_attempt", "3"),
+            ],
+            &transport,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(result["next_page"].is_null());
+    assert_eq!(result["partial"], true);
+    assert!(
+        result["coverage"]["gaps"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("page_limit_reached"))
+    );
+}
+
 #[tokio::test]
 async fn job_log_reads_the_conclusion_first_and_then_the_log() {
     let transport = FakeTransport::new()

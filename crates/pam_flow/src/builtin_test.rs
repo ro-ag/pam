@@ -6,7 +6,7 @@ use super::schema::{Action, ConnectorId, OutputPolicy, Role};
 use super::validate::parse;
 
 #[test]
-fn pam_ships_the_eight_starter_flows() {
+fn pam_ships_the_starter_flows() {
     let ids: Vec<_> = builtin().iter().map(|flow| flow.id).collect();
     assert_eq!(
         ids,
@@ -14,6 +14,7 @@ fn pam_ships_the_eight_starter_flows() {
             "after-merge-checks",
             "ci-failure-triage",
             "dependency-audit",
+            "jenkins-build-investigation",
             "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
@@ -296,4 +297,28 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
         Action::Command { argv } => argv[0] != "npm",
         Action::Connector { .. } => true,
     }));
+}
+
+#[test]
+fn jenkins_investigation_targets_one_build_and_checks_only_its_core_status() {
+    let flow = parse(builtin_yaml("jenkins-build-investigation").unwrap()).unwrap();
+    assert_eq!(flow.steps.len(), 1);
+    assert_eq!(flow.inputs.len(), 2);
+    assert!(flow.inputs.values().all(|input| input.default.is_none()));
+    let step = &flow.steps[0];
+    assert_eq!(step.role, Role::Verify);
+    assert_eq!(step.expect_status.as_deref(), Some("SUCCESS"));
+    assert_eq!(step.output, OutputPolicy::Compact);
+    let Action::Connector {
+        connector,
+        call,
+        with,
+    } = &step.action
+    else {
+        panic!("connector step")
+    };
+    assert_eq!(*connector, ConnectorId::Jenkins);
+    assert_eq!(call, "investigate");
+    assert_eq!(with["job"].to_string(), "${inputs.job}");
+    assert_eq!(with["build"].to_string(), "${inputs.build}");
 }

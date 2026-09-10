@@ -551,7 +551,10 @@ fn the_connector_call_table_matches_the_spec() {
             .collect::<Vec<_>>()
     };
     assert_eq!(names(ConnectorId::Github), ["runs", "run", "job_log"]);
-    assert_eq!(names(ConnectorId::Jenkins), ["jobs", "builds", "console"]);
+    assert_eq!(
+        names(ConnectorId::Jenkins),
+        ["jobs", "builds", "console", "investigate"]
+    );
     assert_eq!(names(ConnectorId::Sonarqube), ["quality_gate", "issues"]);
     assert_eq!(names(ConnectorId::Jira), ["search", "issue"]);
     assert_eq!(names(ConnectorId::Confluence), ["search", "page"]);

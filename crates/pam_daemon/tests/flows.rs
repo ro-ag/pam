@@ -1484,3 +1484,42 @@ async fn pam_readiness_runs_all_real_project_gates() {
         assert_eq!(step["exit_status"], 0, "{body}");
     }
 }
+
+#[tokio::test]
+async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_failed_build() {
+    with_deadline(async {
+        let transport = Arc::new(FakeTransport::new()
+            .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
+            .json(200, r##"{"name":"#41","status":"FAILED","stages":[{"id":"5","name":"Test","status":"FAILED"}]}"##)
+            .json(200, r#"{"id":"5","name":"Test","status":"FAILED","stageFlowNodes":[{"id":"6","name":"Shell Script","status":"FAILED","parentNodes":["5"],"error":{"type":"hudson.AbortException","message":"script returned exit code 1"},"_links":{"log":{"href":"/ignored"}}}]}"#)
+            .json(200, r#"{"nodeId":"6","nodeStatus":"FAILED","length":17,"hasMore":false,"text":"assertion failed\n"}"#));
+        let transport_arc = Arc::clone(&transport);
+        let flows = FlowDaemon::spawn_with(&[], move |config| {
+            config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
+            config.http_transport = Some(transport_arc);
+        }).await;
+        let mut client = flows.daemon.client().await;
+        let response = client.request(&admin_envelope("req_jenkins_config", "admin.connectors.configure",
+            serde_json::json!({"id":"jenkins","enabled":true,"base_url":"https://jenkins.test/",
+                "username":"ci-bot","credential":{"set":"test-jenkins-credential"}}))).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        flows.grant(&step_capability("jenkins-build-investigation", "investigate-build")).await;
+        let body = result_body(client.request(&flows.run_envelope("req_jenkins_investigate",
+            "jenkins-build-investigation", &serde_json::json!({"job":"service","build":"41"}))).await);
+        assert_ne!(body["outcome"], "solved");
+        let investigation = step(&body, "investigate-build");
+        assert_eq!(investigation["status"], "failed");
+        let evidence = investigation["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        let row = flows.daemon.store().get_evidence(evidence[0].as_str().unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.kind, EVIDENCE_KIND_CONNECTOR_RESULT);
+        let report:serde_json::Value = serde_json::from_slice(&row.content).unwrap();
+        assert_eq!(report["status"],"FAILURE");
+        assert_eq!(report["attribution"],"unresolved");
+        assert_eq!(report["node_logs"][0]["excerpts"][0]["text"],"assertion failed\n");
+        assert!(!String::from_utf8(row.content).unwrap().contains("test-jenkins-credential"));
+        assert_eq!(transport.requests().len(),4);
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }).await;
+}

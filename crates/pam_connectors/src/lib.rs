@@ -40,6 +40,7 @@ mod descriptor;
 mod error;
 mod github;
 mod jenkins;
+mod jenkins_investigation;
 mod jira;
 mod sharepoint;
 mod sonarqube;
@@ -69,6 +70,8 @@ mod descriptor_test;
 mod error_test;
 #[cfg(test)]
 mod github_test;
+#[cfg(test)]
+mod jenkins_investigation_test;
 #[cfg(test)]
 mod jenkins_test;
 #[cfg(test)]

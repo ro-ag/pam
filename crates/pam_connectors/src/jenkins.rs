@@ -40,6 +40,9 @@ pub(crate) async fn call(
         "jobs" => jobs(conn, args, transport, deadline).await,
         "builds" => builds(conn, args, transport, deadline).await,
         "console" => console(conn, args, transport, deadline).await,
+        "investigate" => {
+            crate::jenkins_investigation::investigate(conn, args, transport, deadline).await
+        }
         other => Err(unknown_call(ID, other)),
     }
 }
@@ -141,7 +144,7 @@ pub(crate) async fn verify(
 }
 
 /// Turns `platform/build` into `job/platform/job/build`.
-fn job_segments(raw: &str) -> Result<Vec<String>, ConnectorError> {
+pub(crate) fn job_segments(raw: &str) -> Result<Vec<String>, ConnectorError> {
     let parts: Vec<&str> = raw.trim_matches('/').split('/').collect();
     if parts.len() > 8
         || parts
@@ -161,7 +164,7 @@ fn job_segments(raw: &str) -> Result<Vec<String>, ConnectorError> {
 }
 
 /// Joins owned segments onto the base URL.
-fn job_url(base: &Url, segments: &[String]) -> Result<Url, ConnectorError> {
+pub(crate) fn job_url(base: &Url, segments: &[String]) -> Result<Url, ConnectorError> {
     let borrowed: Vec<&str> = segments.iter().map(String::as_str).collect();
     endpoint(base, &borrowed)
 }

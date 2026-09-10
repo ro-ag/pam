@@ -393,6 +393,13 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "run",
       "job_log",
     ]);
+    expect(FLOW_CONNECTOR_CALLS.jenkins.find((call) => call.name === "investigate")).toEqual({
+      name: "investigate",
+      args: [
+        { name: "job", required: true },
+        { name: "build", required: true },
+      ],
+    });
     expect(FLOW_CONNECTOR_CALLS.aws).toEqual([
       { name: "commands", args: [] },
       {

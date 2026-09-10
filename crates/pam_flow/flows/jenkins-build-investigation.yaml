@@ -1,0 +1,24 @@
+schema: 1
+id: jenkins-build-investigation
+name: Jenkins build investigation
+description: >-
+  Capture the exact build result, Pipeline stages, node errors and bounded
+  node logs. Requires the Pipeline REST API plugin. Caught errors, retries,
+  post actions and parallel aborts remain observations, not asserted causes.
+  Only the core build result decides whether this verification passes.
+inputs:
+  job:
+    description: Jenkins job path, including folders
+  build:
+    description: explicit positive build number; never latest
+steps:
+  - id: investigate-build
+    connector: jenkins
+    call: investigate
+    with:
+      job: "${inputs.job}"
+      build: "${inputs.build}"
+    timeout: 120s
+    role: verify
+    expect_status: SUCCESS
+    output: compact

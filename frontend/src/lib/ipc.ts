@@ -880,6 +880,13 @@ export const FLOW_CONNECTOR_CALLS: Record<FlowConnectorId, FlowCallSpec[]> = {
         { name: "build", required: true },
       ],
     },
+    {
+      name: "investigate",
+      args: [
+        { name: "job", required: true },
+        { name: "build", required: true },
+      ],
+    },
   ],
   sonarqube: [
     { name: "quality_gate", args: [{ name: "project", required: true }] },

@@ -150,7 +150,17 @@ async fn request_retention_removes_bindings_and_never_allows_orphans() {
         .await
         .unwrap();
     store
-        .update_request_state("r", crate::RequestState::Done, Some("ok"))
+        .finish_request(
+            "r",
+            crate::RequestState::Done,
+            Some("ok"),
+            crate::AuditEntry {
+                action: "finish",
+                decision: crate::Decision::Allow,
+                actor: crate::Actor::System,
+                detail: None,
+            },
+        )
         .await
         .unwrap();
     store.prune_requests_before(i64::MAX).await.unwrap();

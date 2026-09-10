@@ -73,7 +73,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 7
+            supported: 8
         }
     ));
     let message = err.to_string();

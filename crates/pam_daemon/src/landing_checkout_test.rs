@@ -287,3 +287,50 @@ async fn unsupported_host_never_spawns_git() {
     assert_eq!(refused.cause, "command_containment_unavailable");
     assert_eq!(fs::read_dir(checkouts).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn cancelled_caller_leaves_cleanup_owned_by_the_running_worker() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().canonicalize().unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (cleaned, cleanup) = tokio::sync::oneshot::channel();
+    let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        owned_worker(&mut cancel, move |worker_cancel| {
+            let workspace = Workspace::create(&root, &root)?;
+            std::fs::write(workspace.tree.join("fixture"), b"owned by worker").unwrap();
+            entered.send(workspace.root.clone()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let outcome = still_active(
+                &worker_cancel,
+                Instant::now() + std::time::Duration::from_secs(10),
+            );
+            drop(workspace);
+            cleaned.send(()).unwrap();
+            outcome
+        })
+        .await
+    });
+    let workspace = tokio::time::timeout(std::time::Duration::from_secs(10), started)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        workspace.join("tree/fixture").exists(),
+        "caller drop must not remove a running worker's workspace"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !workspace.exists(),
+        "worker cleans its workspace after cancellation"
+    );
+}

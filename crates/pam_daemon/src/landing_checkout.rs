@@ -387,6 +387,7 @@ impl Git<'_> {
         cap: usize,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Vec<u8>, CheckoutError> {
+        still_active(cancel, self.deadline)?;
         self.budget
             .attempt_persisted()
             .await
@@ -398,6 +399,7 @@ impl Git<'_> {
             .map_err(|e| error(e.cause, e.resource))?;
         let mut command = self.command()?;
         command.args(args);
+        still_active(cancel, self.deadline)?;
         let mut child = command.spawn().map_err(io_error)?;
         let mut stdin = child
             .stdin
@@ -716,12 +718,98 @@ fn export_blobs(
     Ok(())
 }
 
+/// The permit and local workspace stay owned by the blocking worker, even when
+/// its async caller disappears. This module never submits nested blocking jobs.
+struct CancelWorker(watch::Sender<bool>);
+impl Drop for CancelWorker {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
+async fn owned_worker<T, F>(
+    cancel: &mut watch::Receiver<bool>,
+    operation: F,
+) -> Result<T, CheckoutError>
+where
+    T: Send + 'static,
+    F: FnOnce(watch::Receiver<bool>) -> Result<T, CheckoutError> + Send + 'static,
+{
+    let (sender, receiver) = watch::channel(*cancel.borrow());
+    let _cancel_worker = CancelWorker(sender);
+    let work =
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+            operation(receiver)
+        });
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        () = crate::flow_exec::cancelled(cancel) => Err(error("cancelled", "checkout capture cancelled")),
+        result = &mut work => result.map_err(|failure| error(failure.cause(), "checkout worker did not complete"))?,
+    }
+}
+
 pub(crate) async fn capture(
     request: &CheckoutRequest,
     budget: Arc<RequestBudget>,
     cancel: &mut watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<CheckoutSnapshot, CheckoutError> {
+    let request = request.clone();
+    let runtime = tokio::runtime::Handle::current();
+    owned_worker(cancel, move |mut worker_cancel| {
+        runtime.block_on(capture_worker(
+            &request,
+            budget,
+            &mut worker_cancel,
+            deadline,
+        ))
+    })
+    .await
+}
+
+pub(crate) async fn revalidate(
+    request: &CheckoutRequest,
+    receipt: &CheckoutReceipt,
+    budget: Arc<RequestBudget>,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<(), CheckoutError> {
+    let request = request.clone();
+    let receipt = receipt.clone();
+    let runtime = tokio::runtime::Handle::current();
+    owned_worker(cancel, move |mut worker_cancel| {
+        runtime.block_on(revalidate_worker(
+            &request,
+            &receipt,
+            budget,
+            &mut worker_cancel,
+            deadline,
+        ))
+    })
+    .await
+}
+
+fn still_active(cancel: &watch::Receiver<bool>, deadline: Instant) -> Result<(), CheckoutError> {
+    if *cancel.borrow() || cancel.has_changed().is_err() {
+        return Err(error("cancelled", "checkout capture cancelled"));
+    }
+    if Instant::now() >= deadline {
+        return Err(error(
+            "deadline_exceeded",
+            "checkout capture deadline elapsed",
+        ));
+    }
+    Ok(())
+}
+
+async fn capture_worker(
+    request: &CheckoutRequest,
+    budget: Arc<RequestBudget>,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<CheckoutSnapshot, CheckoutError> {
+    still_active(cancel, deadline)?;
     validate_layout(request)?;
     let (branch, base_commit) = ref_state(request)?;
     let mut workspace = Workspace::create(&request.checkouts_root, &request.repository)?;
@@ -775,6 +863,7 @@ pub(crate) async fn capture(
         manifest,
         manifest_sha256: digest,
     };
+    still_active(cancel, deadline)?;
     workspace.keep = true;
     Ok(CheckoutSnapshot {
         receipt,
@@ -782,13 +871,14 @@ pub(crate) async fn capture(
     })
 }
 
-pub(crate) async fn revalidate(
+async fn revalidate_worker(
     request: &CheckoutRequest,
     receipt: &CheckoutReceipt,
     budget: Arc<RequestBudget>,
     cancel: &mut watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<(), CheckoutError> {
+    still_active(cancel, deadline)?;
     validate_layout(request)?;
     if receipt.repository != request.repository
         || receipt.remote_url != request.remote_url

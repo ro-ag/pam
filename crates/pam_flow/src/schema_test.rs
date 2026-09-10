@@ -180,6 +180,7 @@ fn a_flow_serializes_durations_as_strings() {
         name: "X".to_string(),
         description: String::new(),
         inputs: BTreeMap::new(),
+        correlation: None,
         steps: vec![Step {
             id: "a".to_string(),
             action: Action::Command {

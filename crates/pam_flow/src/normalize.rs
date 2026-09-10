@@ -54,6 +54,8 @@ struct NormalFlow<'a> {
     description: &'a str,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     inputs: BTreeMap<&'a str, NormalInput<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation: Option<&'a crate::correlation::Correlation>,
     steps: Vec<NormalStep<'a>>,
 }
 
@@ -77,6 +79,7 @@ impl<'a> From<&'a Flow> for NormalFlow<'a> {
                     )
                 })
                 .collect(),
+            correlation: flow.correlation.as_ref(),
             steps: flow.steps.iter().map(NormalStep::from).collect(),
         }
     }

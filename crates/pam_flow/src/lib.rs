@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod builtin;
+pub mod correlation;
 pub mod duration;
 pub mod library;
 pub mod normalize;
@@ -32,6 +33,10 @@ pub mod validate;
 pub mod vars;
 
 pub use builtin::{BuiltinFlow, builtin, builtin_yaml};
+pub use correlation::{
+    Correlation, CorrelationError, CorrelationTarget, canonical_repository_url,
+    validate_full_commit,
+};
 pub use duration::{DurationError, format_duration, parse_duration};
 pub use library::{Entry, Library, Source};
 pub use normalize::{digest, to_normalized_yaml};
@@ -49,6 +54,8 @@ pub use vars::{VarError, Vars, references, substitute};
 
 #[cfg(test)]
 mod builtin_test;
+#[cfg(test)]
+mod correlation_test;
 #[cfg(test)]
 mod duration_test;
 #[cfg(test)]

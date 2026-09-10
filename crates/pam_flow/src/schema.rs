@@ -344,6 +344,9 @@ pub struct Flow {
     pub description: String,
     /// Declared inputs, keyed by name.
     pub inputs: BTreeMap<String, Input>,
+    /// Optional revision expectation frozen before any collection starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::correlation::Correlation>,
     /// Steps in execution order.
     pub steps: Vec<Step>,
 }
@@ -363,6 +366,8 @@ pub(crate) struct RawFlow {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) inputs: BTreeMap<String, RawInput>,
+    #[serde(default)]
+    pub(crate) correlation: Option<crate::correlation::Correlation>,
     pub(crate) steps: Vec<RawStep>,
 }
 

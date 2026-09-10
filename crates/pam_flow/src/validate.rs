@@ -454,11 +454,19 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
         steps.push(step);
     }
 
+    let correlation = raw
+        .correlation
+        .map(|value| value.validated(&inputs))
+        .transpose()
+        .map_err(|error| {
+            FlowError::invalid(format!("correlation.{}", error.field), error.message)
+        })?;
     Ok(Flow {
         id: raw.id,
         name: raw.name,
         description: raw.description,
         inputs,
+        correlation,
         steps,
     })
 }

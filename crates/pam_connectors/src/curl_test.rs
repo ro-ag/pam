@@ -279,3 +279,115 @@ async fn mutation_invalid_body_or_redirect_policy_refuses_before_process_start()
         ));
     }
 }
+
+#[test]
+fn upload_pack_exception_accepts_only_the_fixed_read_only_packet() {
+    let mut request = request();
+    request.method = Method::Post;
+    request.url = Url::parse("https://git.example/team/repo.git/git-upload-pack").unwrap();
+    request.headers.push((
+        "Content-Type".into(),
+        "application/x-git-upload-pack-request".into(),
+    ));
+    let body = format!("0033want {} \n00000009done\n", "a".repeat(40)).into_bytes();
+    request.body = Some(body.clone());
+    assert!(crate::curl::validate_request_body(&request).is_ok());
+    assert_eq!(body.len(), 64);
+    for invalid in [
+        b"0032want short\n00000009done\n".to_vec(),
+        format!("0033want {} \n00000009done\n", "0".repeat(40)).into_bytes(),
+        [body.as_slice(), b"0000"].concat(),
+    ] {
+        request.body = Some(invalid);
+        assert!(crate::curl::validate_request_body(&request).is_err());
+    }
+    request.body = Some(body);
+    request.url.set_path("/team/repo.git/git-receive-pack");
+    assert!(crate::curl::validate_request_body(&request).is_err());
+    request.url.set_path("/team/repo.git/git-upload-pack");
+    request.follow_one_https_redirect_without_auth = true;
+    assert!(crate::curl::validate_request_body(&request).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn fixed_upload_pack_packet_is_accepted_by_real_local_git() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let directory = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(directory.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "local Git fixture failed");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&["init", "-q"]);
+    std::fs::write(directory.path().join("file"), b"bounded fixture\n").unwrap();
+    run(&["add", "file"]);
+    run(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    let sha = run(&["rev-parse", "HEAD"]);
+    let packet = format!("0033want {} \n00000009done\n", sha.trim());
+    let mut child = Command::new("/usr/bin/git")
+        .args(["upload-pack", "--stateless-rpc"])
+        .arg(directory.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(packet.as_bytes()).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"0008NAK\nPACK"));
+    assert!(output.stdout.len() < 64 * 1024);
+}
+
+#[test]
+fn upload_pack_packet_stays_exact_in_curl_stdin_config() {
+    let mut req = request();
+    req.method = Method::Post;
+    req.url = Url::parse("https://git.example/team/repo.git/git-upload-pack").unwrap();
+    req.headers.push((
+        "Content-Type".into(),
+        "application/x-git-upload-pack-request".into(),
+    ));
+    let sha = "a".repeat(40);
+    req.body = Some(format!("0033want {sha} \n00000009done\n").into_bytes());
+    let config = CurlTransport::config_for(&req, 5);
+    assert!(
+        config
+            .lines()
+            .any(|line| line == format!("data-binary = \"0033want {sha} \\n00000009done\\n\""))
+    );
+    for method in [Method::Put, Method::Get] {
+        req.method = method;
+        assert!(crate::curl::validate_request_body(&req).is_err());
+    }
+    req.method = Method::Post;
+    req.headers
+        .push(("content-type".into(), "application/json".into()));
+    assert!(crate::curl::validate_request_body(&req).is_err());
+}

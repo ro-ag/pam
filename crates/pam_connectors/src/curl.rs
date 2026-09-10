@@ -460,11 +460,12 @@ fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), TransportErro
     Ok((status, headers))
 }
 
-fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
+pub(crate) fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
     let valid = match (request.method, &request.body) {
         (Method::Get, None) => true,
         (Method::Post | Method::Put, Some(body)) if body.len() <= 16 * 1024 => {
-            serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
+            (serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
+                || exact_upload_pack(request, body))
                 && !request.follow_one_https_redirect_without_auth
         }
         _ => false,
@@ -477,4 +478,37 @@ fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
             detail: "HTTP mutation requires bounded JSON and disabled redirects.".to_owned(),
         })
     }
+}
+
+// The only non-JSON body admitted is a fixed read-only Git upload-pack request.
+// No arbitrary packet, capability, revision expression or remote mutation body.
+fn exact_upload_pack(request: &HttpRequest, body: &[u8]) -> bool {
+    let Some(sha) = body
+        .strip_prefix(b"0033want ")
+        .and_then(|tail| tail.strip_suffix(b" \n00000009done\n"))
+    else {
+        return false;
+    };
+    request.method == Method::Post
+        && request.url.scheme() == "https"
+        && request.url.username().is_empty()
+        && request.url.password().is_none()
+        && request.url.query().is_none()
+        && request.url.fragment().is_none()
+        && request.url.path().ends_with("/git-upload-pack")
+        && request
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .count()
+            == 1
+        && request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value == "application/x-git-upload-pack-request"
+        })
+        && sha.len() == 40
+        && sha
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        && sha.iter().any(|byte| *byte != b'0')
 }

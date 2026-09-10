@@ -110,3 +110,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## large-async-fixture-stack
+- kind: habit
+- scope: project
+- rule: Keep large nested daemon test fixture futures heap-pinned instead of accumulating them on the test thread stack.
+- fix: Box::pin the outer deadline future and nested fixture constructor; preserve the normal thread stack and real deadlines. Sonar integration fixture overflowed before boxing and passed all five cases after.
+- hits: 2026-09-10
+- cost: 0
+- status: watching
+

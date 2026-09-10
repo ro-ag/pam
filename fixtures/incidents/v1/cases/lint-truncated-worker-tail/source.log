@@ -1,0 +1,12 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=f6ef8fb36e1ea89ba730306db4971990514ba0d4
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+command launch receipt: cargo clippy --locked --all-targets
+Checking fixture-config v0.1.0
+Checking fixture-cache v0.1.0
+exporter boundary: source stream ended while the worker heartbeat was still active.
+coverage: tail_missing=true; exit_code=not-observed; worker_terminal_state=not-observed
+No authoritative completion response accompanied this log. The absence of an error line in the available prefix cannot prove a successful lint result.
+Next evidence should be the same worker invocation completion receipt, not a report from a later build.

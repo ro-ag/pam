@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "test-seeded-property-reproduction",
+  "family_id": "test/seeded-property-reproduction",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "proptest",
+    "cargo test"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "b7e4fdf028b0a84b3c2c02767f91de3c87317350"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Two explicitly controlled invocations reproduced the same minimized counterexample."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "fresh-process reproduction: same binary, seed, and minimized input; output again bytes [0].",
+      "runner=property attempt=1 exit=101; reproduction attempt=2 exit=101; failing_property=round_trip_record"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "Random generation by itself proves a flaky test.",
+      "The controlled reproduction passed."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

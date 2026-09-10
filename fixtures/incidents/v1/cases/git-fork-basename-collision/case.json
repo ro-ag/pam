@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "git-fork-basename-collision",
+  "family_id": "git/fork-basename-collision",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "GitHub"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "23933f2d68e5c4fc161740fcd52fa5183fc410af"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "The attachment checker rejected a success receipt from a different repository."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "identity verdict: exact repository URLs differ; commit equality and basename equality do not establish target association.",
+      "foreign receipt: remote-check exit=0; requested-repository receipt=missing"
+    ],
+    "unresolved_questions": [
+      "Where is the check receipt from the declared repository and attempt?"
+    ],
+    "forbidden_conclusions": [
+      "The declared repository passed.",
+      "Matching commit hashes prove the two remote targets are interchangeable."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

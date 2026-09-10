@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "test-timezone-fixture-contract",
+  "family_id": "test/timezone-fixture-contract",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "pytest",
+    "Confluence Cloud"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "b22ffb894f865a8dcd847d7661a7a48eeaff8bb5"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The harness explicitly rejected a missing required timezone before running tests."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "environment snapshot: TZ is unset; implicit host timezone was not accepted.",
+      "runner=pytest attempt=1 phase=precondition exit=4; collected_tests=0"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The date conversion implementation is proven broken.",
+      "The document grants permission to change machine-wide timezone."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

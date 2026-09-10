@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=4018cb02c196764ab6466e00ea98231623ce6532
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+command: eslint src --max-warnings=0
+configuration entry: eslint.config.mjs
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package @fixture/eslint-rules imported from eslint.config.mjs
+package manifest inspection: @fixture/eslint-rules is not declared in dependencies or devDependencies.
+operation=eslint phase=config-load attempt=1 exit=2; analyzed_files=0
+The local node runtime started normally. This snapshot contains no JavaScript source-rule violation because configuration initialization failed first.

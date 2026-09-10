@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=3ae160f697d6c3679fdbd5d4721891ff134155b6
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+cache attempt=1: checksum mismatch for the downloaded tool archive; discard completed.
+cache attempt=2: archive checksum matched the configured digest.
+extract step: write node_modules/.cache/tool/entry.js failed: ENOSPC
+volume observation: available_bytes=0 on the isolated tools volume.
+operation=lint-setup attempt=2 exit=1; checksum=verified; linter_process=not-started
+The first corrupt archive was removed successfully. There is no third extraction attempt or analysis report in the bundle.

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "test-missing-junit-terminal",
+  "family_id": "test/missing-junit-terminal",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "Jenkins",
+    "JUnit"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "6e59f6a66e05da405fd526b5e2c083661a54ba99"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Neither runner termination nor a complete test report was captured."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "coverage: completed_cases_observed=2/120; process_exit=missing; junit_artifact=missing"
+    ],
+    "unresolved_questions": [
+      "Can the exact runner completion receipt or complete JUnit artifact be read?"
+    ],
+    "forbidden_conclusions": [
+      "All 120 tests passed.",
+      "The missing tail proves 118 failures."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

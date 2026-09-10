@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=f74a96566a0549e5c0722da710d738aa7d1677ba
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+fixture download attempt=1: gateway timeout; no tests started.
+fixture download attempt=2: exit=0; downloaded bytes match the pinned fixture digest.
+case=render_loading_state: snapshot mismatch; expected aria-busy="true", received aria-busy="false".
+runner=jest attempt=1 exit=1; failed_case=render_loading_state; fixture_setup=successful
+The comparison uses the same pinned fixture digest named in the successful setup receipt. No later retry or accepted snapshot update is present.
+The older gateway timeout is retained to show recovery, not to replace the final assertion result.

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "git-push-response-lost",
+  "family_id": "git/push-response-lost",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "GitHub"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "71e33a117547c374d8e87938b78ec390aafdeeb9"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "The local connection ended without a terminal remote-ref receipt."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "client trace: request body completed; waiting for receive-pack status.",
+      "operation=push attempt=1 local_exit=128; remote_effect=unconfirmed; reconciliation=not-collected"
+    ],
+    "unresolved_questions": [
+      "What does a fresh authorized exact-ref observation show?"
+    ],
+    "forbidden_conclusions": [
+      "The server certainly rejected the write.",
+      "It is safe to resend the push immediately."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

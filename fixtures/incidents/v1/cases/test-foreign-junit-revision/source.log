@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=638dc82804298e0d8c25ab9e706d5261e3ffeab8
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+requested test target: workflow_run=920; attempt=2; commit from the capture header.
+JUnit producer metadata: workflow_run=920; attempt=1; commit=7777777777777777777777777777777777777777
+JUnit summary from that producer: tests=230; failures=0; errors=0.
+attachment verification: revision and attempt mismatch; report is not evidence for the requested target.
+coverage for requested attempt=2: completion receipt missing; no matching test artifact attached.
+A common workflow name and a shared artifact filename do not repair the missing association.

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "git-wrong-attempt-terminal",
+  "family_id": "git/wrong-attempt-terminal",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "0a594292aa74b436f37938d15cdcf630f202c3a1"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Only the first attempt was exported; the requested second attempt has no terminal receipt."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "comparison: exported attempt=1 does not match requested attempt=2; terminal attachment rejected.",
+      "capture index: no stdout, stderr, remote-ref observation, or completion record exists for attempt=2."
+    ],
+    "unresolved_questions": [
+      "Where is the terminal receipt or exact remote observation for attempt 2?"
+    ],
+    "forbidden_conclusions": [
+      "Attempt 2 succeeded.",
+      "Attempt 2 definitely failed."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

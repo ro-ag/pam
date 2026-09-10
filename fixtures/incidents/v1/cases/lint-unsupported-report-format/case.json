@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-unsupported-report-format",
+  "family_id": "lint/unsupported-report-format",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "custom lint service",
+    "Jira DC"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "a89bc9446170ed3d86023552033b722714fa799d"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "The adapter returned unsupported report schema version 7 without a normalized verdict."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "operation=lint-report-decode state=unsupported; normalized_findings=not-produced; tool_exit=not-exported"
+    ],
+    "unresolved_questions": [
+      "Is a supported report or exact linter terminal receipt available?"
+    ],
+    "forbidden_conclusions": [
+      "The opaque report has zero findings.",
+      "The lint service itself definitely failed."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

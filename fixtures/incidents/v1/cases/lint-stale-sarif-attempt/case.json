@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-stale-sarif-attempt",
+  "family_id": "lint/stale-sarif-attempt",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "GitHub Actions",
+    "SARIF"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "670ff0518c480830840def65ec884c07c344e9ff"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "The artifact attachment failed the attempt-identity check."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "attachment verdict: rejected; artifact attempt=2 and revision differ from requested attempt=3.",
+      "coverage for attempt=3: no SARIF file, lint exit code, or job completion receipt has been captured."
+    ],
+    "unresolved_questions": [
+      "Can the artifact and job receipt for run 410 attempt 3 be retrieved?"
+    ],
+    "forbidden_conclusions": [
+      "Attempt 3 failed with no-unused-vars.",
+      "Attempt 3 fixed the previous warning."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

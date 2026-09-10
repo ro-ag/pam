@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "test-controlled-repeat-intermittence",
+  "family_id": "test/controlled-repeat-intermittence",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "pytest",
+    "SharePoint 365"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "72d3f7e90f0904a39d0a77d3b09cfca148f97bfe"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The requested eighth invocation failed; eight controlled repetitions establish intermittent outcomes."
+  },
+  "expected": {
+    "diagnosis": "flake",
+    "decisive_quotes": [
+      "experiment controls: same immutable fixture image, binary, inputs, dependency stubs, and seed; each run starts a fresh isolated worker.",
+      "runner=repeatability invocation=8 exit=1; controlled_repetitions=8; passed=4; failed=4"
+    ],
+    "unresolved_questions": [
+      "Which scheduling or synchronization defect explains the intermittent completion flag?"
+    ],
+    "forbidden_conclusions": [
+      "A specific production-code race has been proven.",
+      "One successful rerun alone established this classification."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

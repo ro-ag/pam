@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "git-remote-policy-mapping",
+  "family_id": "git/remote-policy-mapping",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "Confluence Cloud"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "33033a10a55ab1af61fbae9a1f2c87e3114a25a0"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The admission receipt recorded a frozen-remote mismatch before spawning Git."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "preflight comparison: full canonical repository path differs; matching host alone is insufficient.",
+      "operation=remote-policy-check exit=1; cause=remote_mismatch; git_spawned=false"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The policy automatically authorized example-archive.",
+      "The remote server was down."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

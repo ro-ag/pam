@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=b8221f485b657a4b971055b7400ce3e15beba76b
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+remote intent: read refs/heads/feature/limits from the frozen HTTPS repository; authentication header omitted from fixture.
+git ls-remote --exit-code origin refs/heads/feature/limits
+curl diagnostic: Could not resolve host: git.fixture.invalid
+network probe: resolver returned EAI_AGAIN; no TCP connection was established.
+operation=remote-ref-read attempt=1 exit=128; response_bytes=0; write_admitted=false
+No subsequent attempt is present. The captured resolver result is local to this invocation, not a report of global GitHub availability.

@@ -1,0 +1,13 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=c40b48eae4c9bb06365a7f62077d050dc91a7e14
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+command: cargo clippy --locked --all-targets -- -D warnings
+Checking fixture-routing v0.1.0
+error: used unwrap() on a Result value
+  --> src/route.rs:48:19
+  route_map.insert(key, parse_route(raw).unwrap());
+note: requested deny level comes from the checked-in unwrap_used lint policy.
+operation=clippy stage=lint attempt=1 exit=101; diagnostic=clippy::unwrap_used; file=src/route.rs
+Compilation reached the lint pass. No registry download, filesystem error, or retry is recorded in this stage.

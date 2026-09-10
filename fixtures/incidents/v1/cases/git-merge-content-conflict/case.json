@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "git-merge-content-conflict",
+  "family_id": "git/merge-content-conflict",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1b1642310dc2b92d92063290f222f795ca5a370a"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The fixture supervisor recorded merge-check exit 1 and push not started."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "operation=merge-check attempt=1 exit=1; unresolved_paths=src/routing.rs; push=not-started",
+      "CONFLICT (content): Merge conflict in src/routing.rs"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The branch was pushed.",
+      "A network outage caused this merge conflict."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

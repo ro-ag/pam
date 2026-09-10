@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=23933f2d68e5c4fc161740fcd52fa5183fc410af
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+declared repository: https://github.com/pam-fixtures/example
+reported source clone URL: https://github.com/another-fixture/example
+reported commit equals the capture commit, and both repository basenames are example.
+identity verdict: exact repository URLs differ; commit equality and basename equality do not establish target association.
+foreign receipt: remote-check exit=0; requested-repository receipt=missing
+The retained URL was supplied by structured source metadata, not inferred from a log line. No authorized observation for the declared repository is included.

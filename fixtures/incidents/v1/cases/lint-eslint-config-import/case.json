@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-eslint-config-import",
+  "family_id": "lint/eslint-config-import",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "ESLint"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "4018cb02c196764ab6466e00ea98231623ce6532"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The supervisor recorded ESLint exit 2 during configuration load."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "operation=eslint phase=config-load attempt=1 exit=2; analyzed_files=0",
+      "package manifest inspection: @fixture/eslint-rules is not declared in dependencies or devDependencies."
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "Application code passed ESLint.",
+      "A source-rule violation caused the configuration import error."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

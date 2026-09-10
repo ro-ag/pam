@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-parallel-independent-failures",
+  "family_id": "lint/parallel-independent-failures",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "Jenkins",
+    "rustfmt",
+    "ESLint"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "ae47d54f3c46c0226250686ec9708b4d4678375d"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The stage supervisor reports two independently failed branches."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "graph receipt: node31 and node32 are siblings; neither depends on the other.",
+      "stage=lint result=failure; failed_branches=rust-format,web-lint; decisive_parent=parallel-join"
+    ],
+    "unresolved_questions": [
+      "Should the formatting branch or the tool-cache branch be investigated first?"
+    ],
+    "forbidden_conclusions": [
+      "The last printed branch caused the other branch to fail.",
+      "Only infrastructure or only code failed across the entire stage."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

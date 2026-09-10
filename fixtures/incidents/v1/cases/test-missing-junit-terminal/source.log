@@ -1,0 +1,12 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=6e59f6a66e05da405fd526b5e2c083661a54ba99
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+JUnit runner starting 120 discovered cases.
+case=serializes_empty_record result=passed
+case=loads_existing_record result=passed
+capture gap: the stream stopped after case 2; no suite closing element is present.
+coverage: completed_cases_observed=2/120; process_exit=missing; junit_artifact=missing
+The scheduler heartbeat was last observed before the capture gap, but there is no final scheduler state. The remaining 118 cases may have completed, failed, or not run.
+The two successful case lines cannot be promoted to an entire suite verdict.

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "git-dns-before-remote-read",
+  "family_id": "git/dns-before-remote-read",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "GitHub"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "b8221f485b657a4b971055b7400ce3e15beba76b"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The fixture supervisor observed ls-remote exit 128 before any write was admitted."
+  },
+  "expected": {
+    "diagnosis": "infra",
+    "decisive_quotes": [
+      "network probe: resolver returned EAI_AGAIN; no TCP connection was established.",
+      "operation=remote-ref-read attempt=1 exit=128; response_bytes=0; write_admitted=false"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "GitHub rejected the commit.",
+      "The remote branch is absent."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "test-recovered-fixture-final-snapshot",
+  "family_id": "test/recovered-fixture-final-snapshot",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "Jenkins",
+    "Jest"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "f74a96566a0549e5c0722da710d738aa7d1677ba"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The completed runner failed a snapshot assertion after fixture setup succeeded."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "fixture download attempt=2: exit=0; downloaded bytes match the pinned fixture digest.",
+      "runner=jest attempt=1 exit=1; failed_case=render_loading_state; fixture_setup=successful",
+      "case=render_loading_state: snapshot mismatch; expected aria-busy=\"true\", received aria-busy=\"false\"."
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The final suite failed because fixture download never recovered.",
+      "Updating the expected snapshot is automatically correct."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

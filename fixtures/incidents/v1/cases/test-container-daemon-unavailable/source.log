@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=8903f08bb7201750b2898b5486511a9d3c113c32
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+suite: database integration; container backend selected from the fixture environment.
+connect(/var/run/docker.sock): Connection refused (ECONNREFUSED).
+backend health receipt: daemon_running=false; socket path exists but has no listening service.
+runner=integration attempt=1 phase=setup exit=2; executed_tests=0; assertion_failures=0
+No image pull or database initialization request was sent. A failing harness setup is not evidence of a database query regression.
+The fixture does not authorize starting a container service or changing socket permissions.

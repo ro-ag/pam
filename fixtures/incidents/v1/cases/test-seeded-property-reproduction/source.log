@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=b7e4fdf028b0a84b3c2c02767f91de3c87317350
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+property=round_trip_record; generator_seed=0x13579bdf; fixture binary digest=fixture-bin-04.
+first invocation: minimized input is bytes [0, 255]; decoded output is bytes [0].
+fresh-process reproduction: same binary, seed, and minimized input; output again bytes [0].
+runner=property attempt=1 exit=101; reproduction attempt=2 exit=101; failing_property=round_trip_record
+No network, clock, shared directory, or external service is part of this pure byte-transform fixture.
+The use of a randomized generator does not make this captured, reproducible counterexample nondeterministic.

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "test-foreign-junit-revision",
+  "family_id": "test/foreign-junit-revision",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "GitHub Actions",
+    "JUnit"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "638dc82804298e0d8c25ab9e706d5261e3ffeab8"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Artifact provenance does not match the requested revision and rerun."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "attachment verification: revision and attempt mismatch; report is not evidence for the requested target.",
+      "coverage for requested attempt=2: completion receipt missing; no matching test artifact attached."
+    ],
+    "unresolved_questions": [
+      "Where is the report whose revision and attempt match the requested target?"
+    ],
+    "forbidden_conclusions": [
+      "The requested target passed 230 tests.",
+      "The requested target definitely introduced a test regression."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

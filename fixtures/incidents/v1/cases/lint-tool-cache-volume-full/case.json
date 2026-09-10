@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-tool-cache-volume-full",
+  "family_id": "lint/tool-cache-volume-full",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "Jenkins",
+    "ESLint"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "3ae160f697d6c3679fdbd5d4721891ff134155b6"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The supervisor observed cache setup exit 1 and lint never started."
+  },
+  "expected": {
+    "diagnosis": "infra",
+    "decisive_quotes": [
+      "cache attempt=2: archive checksum matched the configured digest.",
+      "operation=lint-setup attempt=2 exit=1; checksum=verified; linter_process=not-started",
+      "volume observation: available_bytes=0 on the isolated tools volume."
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The final blocker was still the recovered checksum mismatch.",
+      "ESLint found application defects."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

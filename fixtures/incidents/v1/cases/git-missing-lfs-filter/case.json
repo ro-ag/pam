@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "git-missing-lfs-filter",
+  "family_id": "git/missing-lfs-filter",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "Git LFS"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "3311887656806f14859e3d300a9a0c29b0161217"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The legacy-checkout supervisor recorded checkout exit 128 and no validation commands started."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "launcher diagnostic: git-lfs: executable not found in the configured tool installation.",
+      "operation=checkout attempt=1 exit=128; filter=lfs; lint=not-started; tests=not-started"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The LFS server lost the binary.",
+      "PAM should silently execute an unapproved filter."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=0f66cc6f768581797faef5a8c0054c0d64bec5fc
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+configured analyzer plugin: fixture-checkstyle-plugin version 6.
+java -version: runtime major=17; supported class-file maximum=61.
+UnsupportedClassVersionError: plugin entry class has class-file version 65.
+operation=analyzer-init attempt=1 exit=1; scanned_java_files=0
+[synthetic SharePoint 365 citation] https://tenant.fixture.invalid/sites/build/Shared%20Documents/toolchains.txt ; item_id=toolchain-6 ; etag=fixture-e6.
+cited text: Plugin release 6 was compiled for Java 21. This authored context is not a live SharePoint observation or authority to modify the host toolchain.

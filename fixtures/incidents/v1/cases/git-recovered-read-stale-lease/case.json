@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "git-recovered-read-stale-lease",
+  "family_id": "git/recovered-read-stale-lease",
+  "split": "screening",
+  "stage": "git",
+  "products": [
+    "git",
+    "GitHub"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "c748ca1635540ac17b7929bfb6fd153ee9c3d060"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The read retry succeeded; the independently observed push outcome was stale-lease rejection."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "attempt=2 operation=remote-ref-read exit=0; refs/heads/feature/limits=1111111111111111111111111111111111111111",
+      "operation=push attempt=1 exit=1; remote-reply=stale-lease; proposed commit not installed"
+    ],
+    "unresolved_questions": [
+      "Who advanced the branch, and is that revision the intended new base?"
+    ],
+    "forbidden_conclusions": [
+      "The recovered timeout was the decisive push failure.",
+      "Force-pushing without the lease is safe."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

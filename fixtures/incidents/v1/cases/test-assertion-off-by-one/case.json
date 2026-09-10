@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "test-assertion-off-by-one",
+  "family_id": "test/assertion-off-by-one",
+  "split": "screening",
+  "stage": "test",
+  "products": [
+    "cargo test"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1d7f0d4fde27e4128658e663ab4b89820631fdf3"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The test runner terminal receipt reports one failed unit test and exit 101."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "fixture parameters: start=10; count=3; no clock, network, or random input used.",
+      "runner=test-unit attempt=1 exit=101; passed=27; failed=1; failed_case=pagination::exclusive_upper_bound"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "All tests passed because compilation succeeded.",
+      "This single deterministic assertion proves a flaky test."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "status": "pending"
+  }
+}

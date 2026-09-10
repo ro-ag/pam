@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=cbbc4143408d15ced971a199c79c2fab84cc163a
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+attempt=1 case=cache_refresh result=failed; retained detail=timeout after 2s.
+attempt=2 case=cache_refresh result=passed; elapsed=43ms.
+comparison coverage: first-attempt host pressure, dependency state, and exact runner image digest were not recorded.
+requested rerun terminal: attempt=2 exit=0; passed=64; failed=0
+This pair establishes recovery on the rerun. It does not establish equivalent conditions or distinguish a test race from a transient unavailable dependency.
+No repeated controlled experiment, known flake record, or decisive failure trace is included.

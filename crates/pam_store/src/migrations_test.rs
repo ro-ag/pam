@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 5
+            supported: 6
         }
     ));
     let message = err.to_string();
@@ -99,11 +99,11 @@ async fn v1_database_upgrades_to_v2() {
     conn.execute("PRAGMA user_version = 1", ()).await.unwrap();
     drop((conn, db));
 
-    // Opening runs migrations 2 through 5: the idempotency column
+    // Opening runs migrations 2 through 6: the idempotency column
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -135,7 +135,7 @@ async fn v3_database_gains_meta_json() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
     assert!(
         evidence_columns(&store)
             .await
@@ -175,7 +175,7 @@ async fn v4_database_upgrades_to_v5() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
 
     let mut rows = store
         .conn
@@ -239,4 +239,25 @@ fn migrations_are_strictly_ordered() {
         assert!(migration.version > previous, "migrations out of order");
         previous = migration.version;
     }
+}
+
+#[tokio::test]
+async fn v5_queued_requests_upgrade_without_authorization_or_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite3");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    for migration in migrations::MIGRATIONS.iter().take(5) {
+        conn.execute_batch(migration.sql).await.unwrap();
+    }
+    conn.execute("INSERT INTO request(id,capability,repo,caller_agent,args_json,state,created_ts,updated_ts) VALUES ('old','echo','repo','agent','{}','queued',1,1)", ()).await.unwrap();
+    conn.execute("PRAGMA user_version = 5", ()).await.unwrap();
+    drop((conn, db));
+    let store = Store::open(&path).await.unwrap();
+    let row = store.get_request("old").await.unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, None);
+    assert!(!row.queue_authorized);
 }

@@ -177,6 +177,12 @@ pub struct RequestRow {
     pub created_ts: i64,
     /// Unix seconds of the last state change.
     pub updated_ts: i64,
+    /// Absolute admission deadline in Unix milliseconds; legacy/admin rows have none.
+    pub expires_at_ms: Option<i64>,
+    /// Whether the policy gate allowed queue placement.
+    pub queue_authorized: bool,
+    /// Monotonic retained grant-revocation count captured at authorization.
+    pub authorization_revision: Option<i64>,
 }
 
 /// How a pending approval was resolved.
@@ -576,6 +582,7 @@ impl Store {
             args_json,
             idempotency_key,
             RequestState::Queued,
+            None,
         )
         .await
     }
@@ -602,8 +609,135 @@ impl Store {
             args_json,
             idempotency_key,
             RequestState::Running,
+            None,
         )
         .await
+    }
+
+    /// Records pre-gate admission as running, with a durable absolute deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_admitted_request(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+        expires_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.insert_request_in_state(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            RequestState::Running,
+            Some(expires_at_ms),
+        )
+        .await
+    }
+
+    /// Atomically records post-gate authorization without extending the deadline.
+    pub async fn authorize_queued_request(
+        &self,
+        id: &str,
+        repo: &str,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE request SET state = 'queued', queue_authorized = 1, updated_ts = ?1,
+             authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+             WHERE id = ?2 AND repo = ?3 AND queue_authorized = 0
+             AND state IN ('running','waiting_approval') AND expires_at_ms > ?4",
+                params![now_ts(), id, repo, now_ms],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// Starts only a still-queued authorized request before its original expiry.
+    /// A cancellation or terminal transition cannot be resurrected by a stale lane.
+    pub async fn start_queued_request(&self, id: &str, now_ms: i64) -> Result<bool, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE request SET state = 'running', updated_ts = ?1 WHERE id = ?2
+             AND state = 'queued' AND queue_authorized = 1 AND expires_at_ms > ?3
+             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)",
+                params![now_ts(), id, now_ms],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// Monotonic revision while revoked grant rows are retained.
+    pub async fn grant_revocation_revision(&self) -> Result<i64, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| StoreError::NotFound {
+            table: "grant",
+            id: "revocation revision".into(),
+        })?;
+        Ok(row.get(0)?)
+    }
+
+    /// Count and UTF-8 bytes of retained identity/argument fields for active admissions.
+    pub async fn admission_usage(&self) -> Result<(u64, u64), StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self.conn.query(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(id AS BLOB)) + LENGTH(CAST(capability AS BLOB))
+             + LENGTH(CAST(repo AS BLOB)) + LENGTH(CAST(caller_agent AS BLOB))
+             + LENGTH(CAST(args_json AS BLOB)) + COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0)), 0)
+             FROM request WHERE expires_at_ms IS NOT NULL
+             AND state IN ('queued','running','waiting_approval')", (),
+        ).await?;
+        let row = rows.next().await?.ok_or_else(|| StoreError::NotFound {
+            table: "request",
+            id: "admission usage".into(),
+        })?;
+        Ok((
+            u64::try_from(row.get::<i64>(0)?).unwrap_or(u64::MAX),
+            u64::try_from(row.get::<i64>(1)?).unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// Scope a dedupe key to the entire authorized operation shape, including expiry.
+    pub async fn find_admitted_by_shape(
+        &self,
+        capability: &str,
+        repo: &str,
+        args_json: &str,
+        key: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<RequestRow>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows =
+            self.conn
+                .query(
+                    &format!(
+            "SELECT {} FROM request WHERE capability = ?1 AND repo = ?2 AND args_json = ?3
+             AND (?4 IS NULL OR idempotency_key = ?4) AND expires_at_ms > ?5
+             AND state IN ('queued','running','waiting_approval') ORDER BY created_ts, id LIMIT 1",
+            Self::REQUEST_COLUMNS),
+                    params![capability, repo, args_json, key, now_ms],
+                )
+                .await?;
+        rows.next()
+            .await?
+            .map(|row| Self::parse_request_row(&row))
+            .transpose()
     }
 
     // Keep the six public insertion fields intact; only the initial state differs.
@@ -617,6 +751,7 @@ impl Store {
         args_json: &str,
         idempotency_key: Option<&str>,
         state: RequestState,
+        expires_at_ms: Option<i64>,
     ) -> Result<(), StoreError> {
         let _guard = self.conn_lock.lock().await;
         let now = now_ts();
@@ -624,8 +759,8 @@ impl Store {
             .execute(
                 "INSERT INTO request
                      (id, capability, repo, caller_agent, args_json,
-                      idempotency_key, state, outcome, created_ts, updated_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8)",
+                      idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9)",
                 params![
                     id,
                     capability,
@@ -634,7 +769,8 @@ impl Store {
                     args_json,
                     idempotency_key,
                     state.as_str(),
-                    now
+                    now,
+                    expires_at_ms
                 ],
             )
             .await?;
@@ -644,7 +780,7 @@ impl Store {
     /// The `request` column list every row query selects, in the order
     /// [`Self::parse_request_row`] expects.
     const REQUEST_COLUMNS: &'static str = "id, capability, repo, caller_agent, args_json,
-         idempotency_key, state, outcome, created_ts, updated_ts";
+         idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision";
 
     /// Builds a [`RequestRow`] from a row selected with
     /// [`Self::REQUEST_COLUMNS`].
@@ -661,6 +797,9 @@ impl Store {
             outcome: row.get(7)?,
             created_ts: row.get(8)?,
             updated_ts: row.get(9)?,
+            expires_at_ms: row.get(10)?,
+            queue_authorized: row.get::<i64>(11)? == 1,
+            authorization_revision: row.get(12)?,
         })
     }
 

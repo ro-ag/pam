@@ -46,7 +46,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 6);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -1607,4 +1607,84 @@ async fn running_request_insertion_is_atomic_and_rejects_duplicate_ids() {
     assert_eq!(unchanged.capability, row.capability);
     assert_eq!(unchanged.args_json, row.args_json);
     assert_eq!(unchanged.idempotency_key, row.idempotency_key);
+}
+
+#[tokio::test]
+async fn admitted_request_authorization_checks_state_scope_and_expiry() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_admitted_request("admitted", "echo", "repo", "agent", "{}", Some("key"), 5000)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "other", 1000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "repo", 5000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .authorize_queued_request("admitted", "repo", 4999)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "repo", 4999)
+            .await
+            .unwrap()
+    );
+    let row = store.get_request("admitted").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert_eq!(row.expires_at_ms, Some(5000));
+    assert!(row.queue_authorized);
+    assert!(
+        store
+            .find_admitted_by_shape("echo", "repo", "{}", Some("key"), 4999)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .find_admitted_by_shape("echo", "repo", "{}", Some("key"), 5000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.admission_usage().await.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn stale_lane_cannot_restart_a_terminal_or_expired_request() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_admitted_request("done", "echo", "repo", "agent", "{}", None, 5000)
+        .await
+        .unwrap();
+    store
+        .authorize_queued_request("done", "repo", 1000)
+        .await
+        .unwrap();
+    assert!(!store.start_queued_request("done", 5000).await.unwrap());
+    store
+        .finish_request(
+            "done",
+            RequestState::Failed,
+            Some("cancelled"),
+            entry("cancel"),
+        )
+        .await
+        .unwrap();
+    assert!(!store.start_queued_request("done", 1000).await.unwrap());
+    assert_eq!(
+        store.get_request("done").await.unwrap().unwrap().state,
+        RequestState::Failed
+    );
 }

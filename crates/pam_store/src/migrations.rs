@@ -37,6 +37,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: SCHEMA_V5,
     },
+    Migration {
+        version: 6,
+        sql: SCHEMA_V6,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -231,4 +235,11 @@ CREATE TABLE connector (
   last_test_ts INTEGER,
   updated_ts INTEGER NOT NULL
 );
+";
+
+/// Durable expiry and post-gate queue authorization. Legacy rows default closed.
+const SCHEMA_V6: &str = "
+ALTER TABLE request ADD COLUMN expires_at_ms INTEGER;
+ALTER TABLE request ADD COLUMN authorization_revision INTEGER;
+ALTER TABLE request ADD COLUMN queue_authorized INTEGER NOT NULL DEFAULT 0 CHECK (queue_authorized IN (0, 1));
 ";

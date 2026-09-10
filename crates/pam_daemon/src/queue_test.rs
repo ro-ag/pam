@@ -65,6 +65,7 @@ async fn enqueue(queue: &QueueManager, envelope: &Envelope) -> usize {
     queue
         .place_in_lane(&envelope.id, &envelope.caller.repo, envelope.deadline_ms)
         .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -188,11 +189,11 @@ async fn dedupe_by_idempotency_key_attaches() {
         );
         assert_eq!(enqueue(&queue, &first).await, 0);
 
-        // Same key attaches even though the args differ.
+        // Same key attaches only when the complete operation shape matches.
         let dup = envelope(
             "req_2",
             REPO_A,
-            serde_json::json!({ "n": 2 }),
+            serde_json::json!({ "n": 1 }),
             Some("key-1"),
         );
         assert_eq!(
@@ -520,10 +521,11 @@ async fn rebuild_from_store_restores_lane_order() {
         // Rows straight in the store, as a previous daemon left them
         // (same-second inserts: the id tie-break keeps order).
         for (id, repo) in [("req_a1", REPO_A), ("req_b1", REPO_B), ("req_a2", REPO_A)] {
-            store
-                .insert_request(id, "echo", repo, "claude", "{}", None)
-                .await
-                .unwrap();
+            enqueue(
+                &queue,
+                &envelope(id, repo, serde_json::json!({"id": id}), None),
+            )
+            .await;
         }
         // One row already terminal must not be restored.
         store
@@ -551,4 +553,196 @@ async fn rebuild_from_store_restores_lane_order() {
     })
     .await
     .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn pre_gate_admission_is_not_recovered_and_legacy_queued_rows_fail_closed() {
+    let (store, queue) = manager().await;
+    let env = envelope("before_gate", REPO_A, serde_json::json!({}), None);
+    assert_eq!(admit(&queue, &env).await, AdmitOutcome::Admitted);
+    let admitted = store.get_request(&env.id).await.unwrap().unwrap();
+    assert_eq!(admitted.state, RequestState::Running);
+    assert!(!admitted.queue_authorized);
+    assert!(admitted.expires_at_ms.is_some());
+    store
+        .insert_request("legacy", "echo", REPO_A, "claude", "{}", None)
+        .await
+        .unwrap();
+    let restarted = QueueManager::new(Arc::clone(&store));
+    assert_eq!(restarted.rebuild_from_store().await.unwrap(), 0);
+    assert!(restarted.take_next(REPO_A).await.unwrap().is_none());
+    let legacy = store.get_request("legacy").await.unwrap().unwrap();
+    assert_eq!(legacy.state, RequestState::Failed);
+    assert_eq!(legacy.outcome.as_deref(), Some("admission_invalid"));
+}
+
+#[tokio::test]
+async fn idempotency_keys_never_attach_across_repository_capability_or_arguments() {
+    let (_store, queue) = manager().await;
+    enqueue(
+        &queue,
+        &envelope("base", REPO_A, serde_json::json!({"n":1}), Some("k")),
+    )
+    .await;
+    for (id, repo, args, capability) in [
+        ("other_repo", REPO_B, serde_json::json!({"n":1}), "echo"),
+        ("other_args", REPO_A, serde_json::json!({"n":2}), "echo"),
+        ("other_cap", REPO_A, serde_json::json!({"n":1}), "release"),
+    ] {
+        let mut request = envelope(id, repo, args, Some("k"));
+        request.capability = capability.into();
+        assert_eq!(admit(&queue, &request).await, AdmitOutcome::Admitted);
+    }
+}
+
+#[tokio::test]
+async fn placement_cannot_extend_expiry_or_change_admitted_repository() {
+    let (store, queue) = manager().await;
+    let env = envelope("bound", REPO_A, serde_json::json!({}), None);
+    admit(&queue, &env).await;
+    let expires = store
+        .get_request(&env.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .expires_at_ms;
+    assert!(matches!(
+        queue.place_in_lane(&env.id, REPO_B, u64::MAX).await,
+        Err(QueueError::NotAdmitted)
+    ));
+    queue
+        .place_in_lane(&env.id, REPO_A, u64::MAX)
+        .await
+        .unwrap();
+    let row = store.get_request(&env.id).await.unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, expires);
+    assert!(row.queue_authorized);
+    assert!(matches!(
+        queue.place_in_lane(&env.id, REPO_A, 60_000).await,
+        Err(QueueError::NotAdmitted)
+    ));
+}
+
+#[tokio::test]
+async fn restart_refuses_expired_authorized_work_without_refreshing_deadline() {
+    let (store, queue) = manager().await;
+    store
+        .insert_admitted_request("expired", "echo", REPO_A, "claude", "{}", None, 1)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .authorize_queued_request("expired", REPO_A, 0)
+            .await
+            .unwrap()
+    );
+    assert_eq!(queue.rebuild_from_store().await.unwrap(), 0);
+    let row = store.get_request("expired").await.unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, Some(1));
+    assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_waiting_in_a_lane_consumes_the_original_deadline() {
+    let (store, queue) = manager().await;
+    let mut env = envelope("waiting", REPO_A, serde_json::json!({}), None);
+    env.deadline_ms = 100;
+    enqueue(&queue, &env).await;
+    advance(Duration::from_millis(101)).await;
+    assert!(queue.take_next(REPO_A).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get_request(&env.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some(CAUSE_LEASE_EXPIRED)
+    );
+}
+
+#[tokio::test]
+async fn admission_count_and_byte_limits_refuse_before_retaining_work() {
+    let (store, queue) = manager().await;
+    for i in 0..crate::queue::MAX_ADMITTED_REQUESTS {
+        let env = envelope(
+            &format!("pending_{i}"),
+            REPO_A,
+            serde_json::json!({"i":i}),
+            None,
+        );
+        assert_eq!(admit(&queue, &env).await, AdmitOutcome::Admitted);
+    }
+    let extra = envelope("extra", REPO_A, serde_json::json!({}), None);
+    let error = queue
+        .admit(&extra, CapabilityClass::ReadOnly)
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause(), "queue_count_limit");
+    assert!(store.get_request("extra").await.unwrap().is_none());
+    let (store, queue) = manager().await;
+    let huge = envelope(
+        "huge",
+        REPO_A,
+        serde_json::json!({"body": "x".repeat(usize::try_from(crate::queue::MAX_ADMITTED_BYTES).unwrap())}),
+        None,
+    );
+    let error = queue
+        .admit(&huge, CapabilityClass::NonDestructive)
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause(), "queue_bytes_limit");
+    assert!(store.get_request("huge").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn grant_revocation_invalidates_queued_work_even_after_regrant_and_restart() {
+    let (store, queue) = manager().await;
+    enqueue(
+        &queue,
+        &envelope("old", REPO_A, serde_json::json!({}), None),
+    )
+    .await;
+    let revision = store
+        .get_request("old")
+        .await
+        .unwrap()
+        .unwrap()
+        .authorization_revision;
+    assert_eq!(revision, Some(0));
+    store.insert_grant("flow.example.run").await.unwrap();
+    store.revoke_grant("flow.example.run").await.unwrap();
+    store.insert_grant("flow.example.run").await.unwrap();
+    assert_eq!(store.grant_revocation_revision().await.unwrap(), 1);
+    assert!(queue.take_next(REPO_A).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get_request("old")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("authorization_changed")
+    );
+
+    enqueue(
+        &queue,
+        &envelope("restart", REPO_A, serde_json::json!({}), None),
+    )
+    .await;
+    store.revoke_grant("flow.example.run").await.unwrap();
+    let restarted = QueueManager::new(Arc::clone(&store));
+    assert_eq!(restarted.rebuild_from_store().await.unwrap(), 0);
+    assert_eq!(
+        store
+            .get_request("restart")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("authorization_changed")
+    );
 }

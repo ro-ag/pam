@@ -48,7 +48,8 @@ use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{EVIDENCE_KIND_LOG_COMPACT, RequestState};
 use pam_testkit::{
     FakeSecretBackend, FakeTransport, TestClient, TestDaemon, envelope_for_repo,
-    seed_allowed_programs, seed_extra_path, seed_flow, seed_relaxed, short_tempdir, with_deadline,
+    seed_allowed_programs, seed_extra_path, seed_flow, seed_relaxed, seed_repository_scope,
+    short_tempdir, with_deadline,
 };
 use tokio::sync::watch;
 
@@ -92,6 +93,16 @@ impl FlowDaemon {
             drop(seed_flow(&tmp, id, yaml));
         }
         let repo = short_tempdir();
+        seed_repository_scope(
+            &tmp,
+            repo.path(),
+            &[
+                ("github", "https://api.github.test/"),
+                ("sonarqube", "https://sonar.test/"),
+                ("jenkins", "https://jenkins.test/"),
+            ],
+        )
+        .await;
         Self {
             daemon: TestDaemon::spawn_at_with(tmp, mutate).await,
             repo,
@@ -100,7 +111,12 @@ impl FlowDaemon {
 
     /// The repo path a flow's command steps run in.
     fn repo(&self) -> String {
-        self.repo.path().display().to_string()
+        self.repo
+            .path()
+            .canonicalize()
+            .expect("fixture repo exists")
+            .display()
+            .to_string()
     }
 
     /// A `flow.run` envelope for `id`, waiting for the verdict.
@@ -610,6 +626,36 @@ async fn a_missing_repo_refuses_before_anything_runs() {
             [ACTION_EXECUTION_REFUSAL]
         );
 
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_existing_but_unapproved_repo_runs_no_steps() {
+    with_deadline(async {
+        let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
+        flows
+            .daemon
+            .store()
+            .set_setting("flows.scope_policy", r#"{"version":1,"repositories":[]}"#)
+            .await
+            .unwrap();
+        let mut client = flows.daemon.client().await;
+        let response = client
+            .request(&flows.run_envelope("req_unscoped", "two-step", &serde_json::json!({})))
+            .await;
+        assert_eq!(refusal_parts(response).0, "scope_denied");
+        assert!(
+            flows
+                .daemon
+                .store()
+                .list_evidence("req_unscoped")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
     })
@@ -1417,6 +1463,7 @@ async fn pam_readiness_runs_all_real_project_gates() {
     let tmp = short_tempdir();
     seed_relaxed(&tmp).await;
     seed_allowed_programs(&tmp, &["git", "cargo", "npm"]).await;
+    seed_repository_scope(&tmp, std::path::Path::new(&repo), &[]).await;
     let daemon = TestDaemon::spawn_at(tmp).await;
     let mut client = daemon.client().await;
     let mut envelope = envelope_for_repo(

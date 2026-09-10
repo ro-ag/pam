@@ -20,9 +20,22 @@ const TOKEN: &str = "ghp_secret_value_0123456789";
 
 const BASE_URL: &str = "https://api.github.test/";
 
+/// Fixture-only approvals for the concrete services exercised below.
+async fn approve_connector_repo(store: &Store, repo: &std::path::Path) {
+    let root = repo.canonicalize().expect("real fixture repo");
+    store.set_setting("flows.scope_policy", &serde_json::json!({
+        "version": 1, "repositories": [{"root": root, "connectors": [
+            {"connector":"github", "base_url":BASE_URL, "access":"connector_wide", "targets":[]},
+            {"connector":"jenkins", "base_url":"https://ci.example.test/", "access":"connector_wide", "targets":[]},
+            {"connector":"aws", "base_url":"https://aws.invalid/", "access":"connector_wide", "targets":[]}
+        ]}]
+    }).to_string()).await.expect("explicit test scope");
+}
+
 /// A service over an in-memory store, a fake keychain, and a scripted
 /// transport — the three seams the real service runs on.
 struct Fixture {
+    repo: tempfile::TempDir,
     store: Arc<Store>,
     backend: Arc<FakeSecretBackend>,
     transport: Arc<FakeTransport>,
@@ -35,6 +48,8 @@ async fn fixture() -> Fixture {
 
 async fn fixture_with(transport: FakeTransport) -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
+    let repo = tempfile::tempdir().expect("repo");
+    approve_connector_repo(&store, repo.path()).await;
     let backend = Arc::new(FakeSecretBackend::default());
     let transport = Arc::new(transport);
     let service = ConnectorService::new(
@@ -43,6 +58,7 @@ async fn fixture_with(transport: FakeTransport) -> Fixture {
         Arc::clone(&transport) as Arc<_>,
     );
     Fixture {
+        repo,
         store,
         backend,
         transport,
@@ -333,6 +349,7 @@ async fn invoke_refuses_a_disabled_connector_before_the_transport_sees_anything(
     let error = fixture
         .service
         .invoke(
+            fixture.repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -362,6 +379,7 @@ async fn invoke_refuses_an_unreachable_keychain_before_the_transport_sees_anythi
     let error = fixture
         .service
         .invoke(
+            fixture.repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -396,6 +414,7 @@ async fn invoke_refuses_a_missing_credential_before_the_transport_sees_anything(
     let error = fixture
         .service
         .invoke(
+            fixture.repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -426,6 +445,7 @@ async fn invoke_refuses_a_missing_base_url_before_the_transport_sees_anything() 
     let error = fixture
         .service
         .invoke(
+            fixture.repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -456,7 +476,13 @@ async fn invoke_refuses_a_connector_missing_the_user_name_its_auth_needs() {
 
     let error = fixture
         .service
-        .invoke(ConnectorId::Jenkins, "jobs", &BTreeMap::new(), deadline())
+        .invoke(
+            fixture.repo.path(),
+            ConnectorId::Jenkins,
+            "jobs",
+            &BTreeMap::new(),
+            deadline(),
+        )
         .await
         .expect_err("Jenkins without a user name is refused");
     assert_eq!(error.cause(), CAUSE_NOT_CONFIGURED);
@@ -480,6 +506,7 @@ async fn invoke_calls_the_connector_and_answers_its_json() {
     let result = fixture
         .service
         .invoke(
+            fixture.repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -507,8 +534,71 @@ async fn invoke_calls_the_connector_and_answers_its_json() {
 }
 
 #[tokio::test]
+async fn absent_or_invalid_scope_refuses_before_credentials_and_network() {
+    for raw in [r#"{"version":1,"repositories":[]}"#, "not-json"] {
+        let fixture = fixture().await;
+        fixture.configure_github().await;
+        fixture
+            .store
+            .set_setting("flows.scope_policy", raw)
+            .await
+            .unwrap();
+        *fixture.backend.fail_with.lock().unwrap() = Some(SecretError::Denied);
+        let error = fixture
+            .service
+            .invoke(
+                fixture.repo.path(),
+                ConnectorId::Github,
+                "runs",
+                &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
+                deadline(),
+            )
+            .await
+            .expect_err("scope must reject before secret access");
+        assert_eq!(
+            error.cause(),
+            if raw == "not-json" {
+                "scope_policy_invalid"
+            } else {
+                "scope_denied"
+            }
+        );
+        assert!(fixture.transport.requests().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_scope_setting_does_not_inherit_connector_permission() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let repo = tempfile::tempdir().unwrap();
+    let transport = Arc::new(FakeTransport::new());
+    let service = ConnectorService::from_parts(Arc::clone(&store), None, Some(transport.clone()));
+    assert!(
+        store
+            .get_setting("flows.scope_policy")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = service
+        .invoke(
+            repo.path(),
+            ConnectorId::Github,
+            "runs",
+            &BTreeMap::new(),
+            deadline(),
+        )
+        .await
+        .expect_err("absent policy must deny before connector or credentials");
+    assert_eq!(error.cause(), "scope_denied");
+    assert!(transport.requests().is_empty());
+}
+
+#[tokio::test]
 async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
+    let repo = tempfile::tempdir().expect("repo");
+    approve_connector_repo(&store, repo.path()).await;
     let backend = Arc::new(FakeSecretBackend::default());
     let service = ConnectorService::from_parts(
         Arc::clone(&store),
@@ -540,6 +630,7 @@ async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
 
     let error = service
         .invoke(
+            repo.path(),
             ConnectorId::Github,
             "runs",
             &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
@@ -562,7 +653,13 @@ async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
         .await
         .expect("aws needs no base URL and no credential");
     let result = service
-        .invoke(ConnectorId::Aws, "commands", &BTreeMap::new(), deadline())
+        .invoke(
+            repo.path(),
+            ConnectorId::Aws,
+            "commands",
+            &BTreeMap::new(),
+            deadline(),
+        )
         .await
         .expect("the AWS allowlist answers locally");
     assert!(matches!(result, CallResult::Json(_)));

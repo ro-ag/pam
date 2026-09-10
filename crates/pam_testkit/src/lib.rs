@@ -134,6 +134,34 @@ pub async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
     seed_string_list(tmp, SETTING_ALLOWED_PROGRAMS, programs).await;
 }
 
+/// Explicit fixture approval for one real repository and named service roots.
+/// This does not alter harness defaults; denial tests omit this helper.
+pub async fn seed_repository_scope(
+    tmp: &tempfile::TempDir,
+    repo: &std::path::Path,
+    connectors: &[(&str, &str)],
+) {
+    let root = repo.canonicalize().expect("fixture repository exists");
+    let connectors: Vec<_> = connectors
+        .iter()
+        .map(|(connector, base_url)| {
+            serde_json::json!({"connector": connector, "base_url": base_url,
+            "access": "connector_wide", "targets": []})
+        })
+        .collect();
+    open_store(tmp)
+        .await
+        .set_setting(
+            "flows.scope_policy",
+            &serde_json::json!({
+                "version": 1, "repositories": [{"root": root, "connectors": connectors}]
+            })
+            .to_string(),
+        )
+        .await
+        .expect("test repository scope persists");
+}
+
 /// Persists the directories a flow's command steps resolve programs on,
 /// before any daemon opens the store.
 ///

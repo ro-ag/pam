@@ -110,3 +110,38 @@ GGUF architecture/quantization and source revision of the PAM checkout with the
 results. A successful screen on a 64 GiB host remains a 64 GiB measurement, even
 when its workload is capped. Run the independent incident benchmark only after
 resource and template limitations have been adjudicated.
+
+## First screened artifact
+
+The pinned dense `Qwen3-14B-Q5_K_M` GGUF (10,514,569,568 bytes, SHA256
+`e7c9aba1…d08e3e31`, verified locally before the run) was screened twice per
+backend in release builds on an M4 Max with 64 GiB. Full measurements and the
+raw supervisor sample streams are in
+[the screening record](benchmarks/2026-09-10-model-screen/screen.json).
+
+Both backends exceeded the 16 GiB sampled ceiling and every run was terminated,
+so **no true peak working set was established for either backend** — each figure
+below is a lower bound taken mid-climb.
+
+Metal never finished loading. Two runs stopped at 25.9 s and 23.1 s with peak
+sampled resident sets of 17.53 GB and 18.35 GB, emitting no load time, prefill,
+decode or unload measurement at all. For a 10.51 GB artifact that is over 1.75×
+artifact bytes in host RSS alone, and resident set is not the Metal footprint.
+
+CPU loaded in 1.9 s and generated, which is the first actual Candle
+compatibility evidence for this artifact: it reports architecture `qwen3`,
+quantization `Q5_K_M` and context length 8192. Decoding is deterministic at
+temperature 0 — warm repeats and both independent processes produced identical
+output digests at 509 and 1019 framed tokens. Resident set was about 1.5×
+artifact bytes after load, then climbed monotonically from about 16.0 GB to
+about 17.2 GB across the 2048-token phase without returning, which is where both
+runs were terminated. Prefill is roughly linear at about 11.3 tokens per second:
+44 s at 509 framed tokens and 90 s at 1019, making a 512-token frame cost about
+54 s end to end. Pressure stayed normal and no swapout pages were added in any
+run on this host.
+
+What this does **not** establish: any 32 GB claim, the 2048-token envelope,
+cancellation, recovery or unload behaviour on either backend, answer quality
+under the correct non-thinking framing, or a p95 latency. The challenger
+`Qwen3-Coder-30B-A3B-Instruct-Q3_K_S` artifact has not been downloaded or
+screened.

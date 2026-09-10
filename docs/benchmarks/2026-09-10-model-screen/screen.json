@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "purpose": "capped_resource_screening_not_qualification",
+  "task": 137,
+  "pam_revision": "8488dcb",
+  "build_profile": "release",
+  "harness": "crates/pam_model/tests/resource_screen.rs supervised by tools/screen-model.py",
+  "host": {
+    "cpu": "Apple M4 Max",
+    "memory_bytes": 68719476736,
+    "memory_label": "64 GiB, NOT the 32 GB target hardware",
+    "macos_version": "26.6.2",
+    "workload": "ambient editor and browser activity; uncontrolled",
+    "baseline_swap_used_bytes": 1080672256
+  },
+  "artifact": {
+    "repository": "https://huggingface.co/Qwen/Qwen3-14B-GGUF",
+    "revision": "530227a7d994db8eca5ab5ced2fb692b614357fd",
+    "file": "Qwen3-14B-Q5_K_M.gguf",
+    "bytes": 10514569568,
+    "sha256": "e7c9aba1129ca2936be9eca01419d9f86af40e08caa01230d5574b34d08e3e31",
+    "sha256_verified_locally": true,
+    "license_sha256_declared": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+    "license_verified_by_harness": false
+  },
+  "supervisor": {
+    "sampled_rss_soft_stop_bytes": 17179869184,
+    "sample_interval_seconds": 0.5,
+    "deadline_seconds": 1200,
+    "stop_kind": "sampled soft stop, not an OS hard cap",
+    "rss_is_metal_total": false
+  },
+  "framing": {
+    "template": "production_chatml",
+    "template_qualified": false,
+    "note": "The runtime hardcodes generic ChatML. The pinned dense Qwen3 template requires an empty think prefix for enable_thinking=false, so these framed token counts are the production framing, not the upstream-equivalent framing.",
+    "temperature": 0,
+    "output_cap_tokens": 64
+  },
+  "metal": {
+    "outcome": "terminated_during_load_before_any_phase",
+    "runs": [
+      {"run": 1, "elapsed_seconds": 25.904, "peak_sampled_rss_bytes": 17528012800, "reason": "sampled_rss_limit", "samples": 50},
+      {"run": 2, "elapsed_seconds": 23.085, "peak_sampled_rss_bytes": 18354438144, "reason": "sampled_rss_limit", "samples": 45}
+    ],
+    "load_completed": false,
+    "prefill_measured": false,
+    "decode_measured": false,
+    "unload_measured": false,
+    "peak_is_lower_bound": true
+  },
+  "cpu": {
+    "outcome": "load_and_512_and_1024_phases_completed_then_terminated_during_2048_phase",
+    "model_reported": {
+      "id": "qwen/Qwen3-14B-Q5_K_M",
+      "architecture": "qwen3",
+      "quant": "Q5_K_M",
+      "device": "cpu",
+      "context_length": 8192,
+      "weight_bytes": 10514569568
+    },
+    "runs": [
+      {
+        "run": 1,
+        "load_wall_ms": 1935,
+        "rss_after_load_bytes": 15560000000,
+        "elapsed_seconds": 460.54,
+        "peak_sampled_rss_bytes": 17191075840,
+        "reason": "sampled_rss_limit",
+        "samples": 881,
+        "added_swapout_pages": 0,
+        "phases": [
+          {"phase": "first_at_length", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44159, "decode_ms": 9670, "completion_tokens": 64, "tokens_per_sec": 6.617898727764735, "wall_ms": 53830, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
+          {"phase": "warm_repeat", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44753, "decode_ms": 9420, "completion_tokens": 64, "tokens_per_sec": 6.793845478861928, "wall_ms": 54174, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
+          {"phase": "first_at_length", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 90085, "decode_ms": 11934, "completion_tokens": 64, "tokens_per_sec": 5.362636697839836, "wall_ms": 102020, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"},
+          {"phase": "warm_repeat", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 91342, "decode_ms": 11773, "completion_tokens": 64, "tokens_per_sec": 5.4361286386474985, "wall_ms": 103115, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"}
+        ]
+      },
+      {
+        "run": 2,
+        "load_wall_ms": 1901,
+        "rss_after_load_bytes": 15560000000,
+        "elapsed_seconds": 470.49,
+        "peak_sampled_rss_bytes": 17184079872,
+        "reason": "sampled_rss_limit",
+        "samples": 896,
+        "added_swapout_pages": 0,
+        "phases": [
+          {"phase": "first_at_length", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44292, "decode_ms": 9336, "completion_tokens": 64, "tokens_per_sec": 6.86, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
+          {"phase": "warm_repeat", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44210, "decode_ms": 9347, "completion_tokens": 64, "tokens_per_sec": 6.85, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
+          {"phase": "first_at_length", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 91060, "decode_ms": 12662, "completion_tokens": 64, "tokens_per_sec": 5.05, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"},
+          {"phase": "warm_repeat", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 101696, "decode_ms": 11706, "completion_tokens": 64, "tokens_per_sec": 5.47, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"}
+        ]
+      }
+    ],
+    "phases_never_reached": ["2048_token_prefill", "cancellation", "recovery", "unload"]
+  },
+  "findings": [
+    "The artifact is Candle-compatible on CPU: it loads reporting architecture qwen3, quant Q5_K_M and context_length 8192, and it generates.",
+    "Decoding is deterministic at temperature 0: warm repeats and both independent processes produced identical output digests at 509 and 1019 framed tokens.",
+    "Both backends exceeded the 16 GiB sampled screening ceiling. Metal exceeded it during load alone, in both runs, without producing any load time, prefill, decode or unload measurement.",
+    "CPU resident set was about 1.5x artifact bytes after load and then climbed monotonically from about 16.0 GB to about 17.2 GB across the 2048-token phase, never returning.",
+    "CPU prefill is roughly linear at about 11.3 tokens per second: 44 s at 509 framed tokens and 90 s at 1019.",
+    "Pressure remained normal and no swapout pages were added in any run on this 64 GiB host."
+  ],
+  "limitations": [
+    "This is capped resource screening on 64 GiB hardware. It is not a 32 GB qualification and no 32 GB claim follows from it.",
+    "Every peak is a lower bound: the supervisor terminated each run mid-climb at a sampled soft stop, so no true peak working set was established for either backend.",
+    "Resident set size is not the Metal footprint; the Metal figures bound host RSS only.",
+    "The 2048-token envelope, cancellation behaviour, recovery and unload were never measured, on either backend.",
+    "Framing is the production generic ChatML, which is not the upstream-equivalent framing for this artifact in non-thinking mode, so answer quality was neither measured nor compared.",
+    "One synthetic build-record fixture with a 64-token output cap and ambient host load. No task quality, incident, fidelity or benefit qualification.",
+    "The second pinned candidate, Qwen3-Coder-30B-A3B-Instruct-Q3_K_S, has not been downloaded or screened."
+  ]
+}

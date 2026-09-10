@@ -91,8 +91,11 @@ pub const JOB_CANCELLED: &str = "cancelled";
 /// `model_job.state` for a job still in flight.
 pub const JOB_RUNNING: &str = "running";
 
-/// Detail written on the jobs a dead daemon left `running`.
+/// Cause written on the jobs a dead daemon left `running`.
 pub const CAUSE_DAEMON_RESTART: &str = "daemon_restart";
+
+/// Cause written when a verification could not finish.
+pub const CAUSE_VERIFY_FAILED: &str = "verify_failed";
 
 /// How often a download's follower reads its handle and writes progress.
 pub const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
@@ -230,7 +233,12 @@ impl ModelService {
     /// Needs a tokio runtime.
     pub async fn new(store: Arc<Store>) -> Result<Arc<Self>, StoreError> {
         let models_dir = read_models_dir(&store).await?;
-        let recovered = store.fail_running_model_jobs(CAUSE_DAEMON_RESTART).await?;
+        let recovered = store
+            .fail_running_model_jobs(&job_failure_detail(
+                CAUSE_DAEMON_RESTART,
+                "the daemon restarted while this job was running",
+            ))
+            .await?;
         if recovered > 0 {
             tracing::info!(
                 count = recovered,
@@ -422,11 +430,11 @@ impl ModelService {
                 }
                 Ok(Err(err)) => (
                     JOB_FAILED,
-                    json!({ "cause": "verify_failed", "detail": err.to_string() }),
+                    job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
                 ),
                 Err(err) => (
                     JOB_FAILED,
-                    json!({ "cause": "verify_failed", "detail": err.to_string() }),
+                    job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
                 ),
             };
             let _ = store
@@ -598,10 +606,13 @@ async fn follow_download(
                 Some(json!({ "sha256": sha256, "size_bytes": size_bytes })),
             )
         }
-        DownloadState::Failed { cause, detail } => (
-            JOB_FAILED,
-            Some(json!({ "cause": cause, "detail": detail })),
-        ),
+        DownloadState::Failed { cause, detail } => {
+            // The cause and curl's own complaint go to the log as well as
+            // the row: a human reading daemon.log after a failed download
+            // should not have to open the GUI to learn what broke.
+            tracing::warn!(job = %job_id, cause = %cause, detail = %detail, "download failed");
+            (JOB_FAILED, Some(job_failure_value(&cause, &detail)))
+        }
         // `Running` cannot reach here; the loop only breaks on a terminal
         // state.
         DownloadState::Cancelled | DownloadState::Running(_) => (JOB_CANCELLED, None),
@@ -628,6 +639,22 @@ async fn idle_unload_loop(service: Weak<ModelService>) {
         };
         service.maybe_idle_unload().await;
     }
+}
+
+/// The `{cause, detail, recovery}` body a failed job carries, in the same
+/// shape as an admin refusal — one thing for the GUI to render, whatever
+/// went wrong.
+pub(crate) fn job_failure_value(cause: &str, detail: &str) -> serde_json::Value {
+    json!({
+        "cause": cause,
+        "detail": detail,
+        "recovery": pam_model::download::failure_recovery(cause),
+    })
+}
+
+/// [`job_failure_value`] as the string the store column holds.
+pub(crate) fn job_failure_detail(cause: &str, detail: &str) -> String {
+    job_failure_value(cause, detail).to_string()
 }
 
 /// One job row as the GUI reads it, with `detail` parsed back to JSON so

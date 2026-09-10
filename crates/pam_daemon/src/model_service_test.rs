@@ -211,7 +211,14 @@ async fn boot_fails_the_jobs_a_dead_daemon_left_running() {
     let job = &jobs["jobs"][0];
     assert_eq!(job["id"], "job_orphan");
     assert_eq!(job["state"], "failed");
-    assert_eq!(job["detail"], "daemon_restart");
+    let detail: serde_json::Value = serde_json::from_str(job["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(detail["cause"], "daemon_restart");
+    assert!(
+        detail["recovery"]
+            .as_str()
+            .is_some_and(|line| !line.is_empty()),
+        "an orphaned job tells the human what to do about it: {detail}"
+    );
 }
 
 #[test]

@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
-    curl_path, curl_recovery_line, sidecar_paths, start,
+    TransferLimits, curl_path, curl_recovery_line, failure_cause, failure_recovery, sidecar_paths,
+    start, start_with_limits,
 };
 use crate::registry::verified_sidecar_path;
 use crate::testing as origin;
@@ -181,7 +182,10 @@ async fn an_interrupted_transfer_resumes_from_its_part() {
     let DownloadState::Failed { cause, detail } = broken else {
         panic!("a dropped connection should fail the transfer, got {broken:?}");
     };
-    assert_eq!(cause, "download_failed");
+    assert_eq!(
+        cause, "transfer_interrupted",
+        "a dropped connection is named as one: {detail}"
+    );
     assert!(!detail.is_empty(), "curl's complaint should survive");
     assert_eq!(
         std::fs::metadata(&paths.part).unwrap().len(),
@@ -335,4 +339,111 @@ async fn an_existing_destination_is_refused() {
         "pam never overwrites weights, got {refused:?}"
     );
     assert_eq!(std::fs::read(&fixture.dest).unwrap(), b"already here");
+}
+
+/// Tight enough that a stalled transfer dies inside a test's patience:
+/// anything under 1 MB/s for a second counts as stopped.
+fn impatient() -> TransferLimits {
+    TransferLimits {
+        connect_timeout: Duration::from_secs(5),
+        stall_window: Duration::from_secs(1),
+        min_bytes_per_sec: 1_000_000,
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_transfer_is_abandoned_and_stays_resumable() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(4 * 1024 * 1024);
+    // ~13 KB/s: moving, but far under the floor the limits set.
+    let server =
+        origin::serve_slowly(bytes.clone(), "v1", 4 * 1024, Duration::from_millis(300)).await;
+
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    let handle = start_with_limits(request, impatient()).unwrap();
+
+    let state = settled(&handle).await;
+    let DownloadState::Failed { cause, detail } = state else {
+        panic!("a transfer under the rate floor must be abandoned, got {state:?}");
+    };
+    assert_eq!(
+        cause, "network_timeout",
+        "a stall is named as one, not as a generic failure: {detail}"
+    );
+    assert!(
+        detail.contains("curl exited 28"),
+        "the exit code survives: {detail}"
+    );
+
+    let paths = sidecar_paths(&fixture.dest);
+    assert!(
+        paths.part.exists(),
+        "the bytes that did arrive are kept, so the retry resumes"
+    );
+    assert!(paths.checkpoint.exists());
+    assert!(!fixture.dest.exists());
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_named_as_one() {
+    require_curl!();
+    let fixture = fixture();
+    let request = request_for(
+        "http://127.0.0.1:1/Qwen3.gguf".to_owned(),
+        &fixture.dest,
+        b"never sent",
+    );
+
+    let state = settled(&start_with_limits(request, impatient()).unwrap()).await;
+    let DownloadState::Failed { cause, detail } = state else {
+        panic!("a refused connection must fail the transfer, got {state:?}");
+    };
+    assert_eq!(cause, "connect_failed", "detail was {detail}");
+}
+
+#[test]
+fn curl_exit_codes_become_causes_a_human_can_act_on() {
+    assert_eq!(failure_cause(Some(6)), "dns_failed");
+    assert_eq!(failure_cause(Some(7)), "connect_failed");
+    assert_eq!(failure_cause(Some(28)), "network_timeout");
+    assert_eq!(failure_cause(Some(22)), "http_error");
+    assert_eq!(failure_cause(Some(23)), "disk_error");
+    assert_eq!(failure_cause(Some(18)), "transfer_interrupted");
+    assert_eq!(failure_cause(Some(33)), "resume_unsupported");
+    assert_eq!(failure_cause(Some(60)), "tls_error");
+    assert_eq!(failure_cause(Some(1)), "download_failed");
+    assert_eq!(
+        failure_cause(None),
+        "download_failed",
+        "a killed curl has no code to read"
+    );
+}
+
+#[test]
+fn every_cause_carries_its_own_recovery_sentence() {
+    let fallback = failure_recovery("something new");
+    for cause in [
+        "curl_missing",
+        "dns_failed",
+        "connect_failed",
+        "network_timeout",
+        "http_error",
+        "tls_error",
+        "transfer_interrupted",
+        "resume_unsupported",
+        "disk_error",
+        "io",
+        "digest_mismatch",
+        "size_mismatch",
+        "checkpoint_conflict",
+        "already_exists",
+        "locked",
+        "daemon_restart",
+        "verify_failed",
+    ] {
+        let line = failure_recovery(cause);
+        assert_ne!(line, fallback, "{cause} deserves better than the fallback");
+        assert!(!line.is_empty(), "{cause} has no recovery line");
+    }
 }

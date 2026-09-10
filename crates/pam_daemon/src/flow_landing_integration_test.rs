@@ -102,7 +102,11 @@ impl HttpTransport for Github {
                 panic!("unexpected request {:?} {path}", request.method)
             };
             Ok(HttpResponse {
-                status: 200,
+                status: if request.method == Method::Post {
+                    201
+                } else {
+                    200
+                },
                 headers: Vec::new(),
                 body: serde_json::to_vec(&body).unwrap(),
             })

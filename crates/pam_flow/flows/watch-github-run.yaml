@@ -1,0 +1,34 @@
+schema: 1
+id: watch-github-run
+name: Watch Github Run
+description: >-
+  Watch one explicitly selected product execution, then collect its evidence
+  and verify success against a declared source repository and commit. Polling
+  stops at its sampling or cumulative request budget; live compatibility and
+  completion within that budget are not guaranteed.
+inputs:
+  repository:
+    description: explicit repository; no inferred latest execution
+  commit:
+    description: explicit commit; no inferred latest execution
+  repo:
+    description: explicit repo; no inferred latest execution
+  run_id:
+    description: explicit run_id; no inferred latest execution
+  run_attempt:
+    description: explicit run_attempt; no inferred latest execution
+correlation:
+  repository: "${inputs.repository}"
+  commit: "${inputs.commit}"
+steps:
+  - id: watch-execution
+    connector: github
+    call: run
+    with:
+      repo: "${inputs.repo}"
+      run_id: "${inputs.run_id}"
+      run_attempt: "${inputs.run_attempt}"
+    watch: {}
+    role: verify
+    expect_status: success
+    output: compact

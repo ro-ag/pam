@@ -42,7 +42,7 @@ pub use library::{Entry, Library, Source};
 pub use normalize::{digest, to_normalized_yaml};
 pub use schema::{
     Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Retry, Role,
-    SCHEMA_VERSION, Step, When,
+    SCHEMA_VERSION, Step, Watch, When,
 };
 pub use validate::{
     CallSpec, DEFAULT_TIMEOUT, FlowError, MAX_ARG_BYTES, MAX_ARGS, MAX_ARGV_BYTES,
@@ -68,3 +68,7 @@ mod schema_test;
 mod validate_test;
 #[cfg(test)]
 mod vars_test;
+
+mod watch;
+#[cfg(test)]
+mod watch_test;

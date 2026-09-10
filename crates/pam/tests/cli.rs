@@ -425,7 +425,7 @@ const FLOW_DEADLINE: Duration = Duration::from_mins(1);
 const EXIT_USAGE: i32 = 2;
 
 /// Every flow that ships in the binary.
-const BUILTIN_FLOWS: [&str; 17] = [
+const BUILTIN_FLOWS: [&str; 20] = [
     "after-merge-checks",
     "ci-failure-triage",
     "jenkins-build-investigation",
@@ -443,6 +443,9 @@ const BUILTIN_FLOWS: [&str; 17] = [
     "sonar-analysis-evidence",
     "sonar-gate-check",
     "summarize-build-log",
+    "watch-github-run",
+    "watch-jenkins-build",
+    "watch-sonar-analysis",
 ];
 
 /// A library flow that declares one input and runs one allowed program,

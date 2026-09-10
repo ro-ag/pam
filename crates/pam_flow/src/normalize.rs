@@ -123,6 +123,8 @@ struct NormalStep<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry: Option<NormalRetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    watch: Option<crate::schema::Watch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<Approval>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     env: &'a BTreeMap<String, String>,
@@ -163,6 +165,7 @@ impl<'a> From<&'a Step> for NormalStep<'a> {
                 attempts: step.retry.attempts,
                 backoff: format_duration(step.retry.backoff),
             }),
+            watch: step.watch,
             approval: (step.approval != Approval::default()).then_some(step.approval),
             env: &step.env,
             note: &step.note,

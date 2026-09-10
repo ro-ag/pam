@@ -116,6 +116,11 @@ pub struct CallSpec {
 
 const GITHUB_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "run_status",
+        args: &[("repo", true), ("run_id", true), ("run_attempt", true)],
+        yields_log: false,
+    },
+    CallSpec {
         name: "runs",
         args: &[
             ("repo", true),
@@ -144,6 +149,11 @@ const GITHUB_CALLS: &[CallSpec] = &[
 
 const JENKINS_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "build_status",
+        args: &[("job", true), ("build", true)],
+        yields_log: false,
+    },
+    CallSpec {
         name: "jobs",
         args: &[("limit", false)],
         yields_log: false,
@@ -171,6 +181,16 @@ const JENKINS_CALLS: &[CallSpec] = &[
 ];
 
 const SONARQUBE_CALLS: &[CallSpec] = &[
+    CallSpec {
+        name: "ce_status",
+        args: &[
+            ("project", true),
+            ("ce_task", true),
+            ("branch", false),
+            ("pullRequest", false),
+        ],
+        yields_log: false,
+    },
     CallSpec {
         name: "analysis",
         args: &[
@@ -482,6 +502,16 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
         .map_err(|error| {
             FlowError::invalid(format!("correlation.{}", error.field), error.message)
         })?;
+    if correlation.is_none()
+        && steps
+            .iter()
+            .any(|step| step.watch.is_some() && step.role == Role::Verify)
+    {
+        return Err(FlowError::invalid(
+            "correlation",
+            "watch verification requires an explicit revision target",
+        ));
+    }
     Ok(Flow {
         id: raw.id,
         name: raw.name,
@@ -627,6 +657,8 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
 
     let retry = validate_retry(raw.retry, &at)?;
 
+    let watch = crate::watch::validate(raw.watch, &action, effect, retry, &at)?;
+
     let env = raw.env.unwrap_or_default();
     validate_env(&env, &at, scope)?;
 
@@ -644,6 +676,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         needs,
         when,
         retry,
+        watch,
         approval,
         env,
         note,

@@ -300,6 +300,9 @@ pub struct Step {
     pub needs: Vec<String>,
     /// The condition guarding the step.
     pub when: When,
+    /// Optional bounded polling; terminal meanings belong to the connector adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<Watch>,
     /// Retry policy.
     pub retry: Retry,
     /// Whether the step always asks a human.
@@ -414,6 +417,8 @@ pub(crate) struct RawStep {
     #[serde(default)]
     pub(crate) retry: Option<RawRetry>,
     #[serde(default)]
+    pub(crate) watch: Option<RawWatch>,
+    #[serde(default)]
     pub(crate) approval: Option<Approval>,
     #[serde(default)]
     pub(crate) env: Option<BTreeMap<String, String>>,
@@ -428,4 +433,33 @@ pub(crate) struct RawRetry {
     pub(crate) attempts: u8,
     #[serde(default)]
     pub(crate) backoff: Option<String>,
+}
+
+/// Bounded observation policy; cumulative request budgets may stop it earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Watch {
+    /// Maximum cheap status samples, including the first.
+    pub max_polls: u16,
+    /// Initial interval between samples.
+    #[serde(serialize_with = "serialize_duration")]
+    pub interval: Duration,
+    /// Maximum backoff interval.
+    #[serde(serialize_with = "serialize_duration")]
+    pub max_interval: Duration,
+}
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            max_polls: 60,
+            interval: Duration::from_secs(5),
+            max_interval: Duration::from_secs(30),
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawWatch {
+    pub max_polls: Option<u16>,
+    pub interval: Option<String>,
+    pub max_interval: Option<String>,
 }

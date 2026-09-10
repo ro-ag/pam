@@ -84,6 +84,18 @@ const BUILTINS: &[BuiltinFlow] = &[
         id: "summarize-build-log",
         yaml: include_str!("../flows/summarize-build-log.yaml"),
     },
+    BuiltinFlow {
+        id: "watch-github-run",
+        yaml: include_str!("../flows/watch-github-run.yaml"),
+    },
+    BuiltinFlow {
+        id: "watch-jenkins-build",
+        yaml: include_str!("../flows/watch-jenkins-build.yaml"),
+    },
+    BuiltinFlow {
+        id: "watch-sonar-analysis",
+        yaml: include_str!("../flows/watch-sonar-analysis.yaml"),
+    },
 ];
 
 /// Every starter flow, sorted by id.

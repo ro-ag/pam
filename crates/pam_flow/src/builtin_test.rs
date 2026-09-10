@@ -28,6 +28,9 @@ fn pam_ships_the_starter_flows() {
             "sonar-analysis-evidence",
             "sonar-gate-check",
             "summarize-build-log",
+            "watch-github-run",
+            "watch-jenkins-build",
+            "watch-sonar-analysis",
         ]
     );
     let mut sorted = ids.clone();
@@ -480,6 +483,31 @@ fn document_context_starters_require_exact_identifiers_and_only_observe() {
         assert_eq!(with.len(), required.len());
         for key in required {
             assert!(flow.inputs.contains_key(key));
+            assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+        }
+    }
+}
+
+#[test]
+fn watches_require_explicit_revision_and_product_inputs() {
+    for (id, required) in [
+        ("watch-github-run", vec!["repo", "run_id", "run_attempt"]),
+        ("watch-jenkins-build", vec!["job", "build"]),
+        ("watch-sonar-analysis", vec!["project", "ce_task"]),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert!(flow.correlation.is_some());
+        assert!(flow.inputs.values().all(|input| input.default.is_none()));
+        assert!(flow.inputs.contains_key("repository"));
+        assert!(flow.inputs.contains_key("commit"));
+        let step = &flow.steps[0];
+        assert_eq!(step.role, Role::Verify);
+        assert_eq!(step.output, OutputPolicy::Compact);
+        assert!(step.watch.is_some());
+        let Action::Connector { with, .. } = &step.action else {
+            panic!("collector")
+        };
+        for key in required {
             assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
         }
     }

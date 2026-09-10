@@ -232,6 +232,7 @@ fn step_defaults() -> Step {
         needs: Vec::new(),
         when: When::NeedsSucceeded,
         retry: Retry::default(),
+        watch: None,
         approval: Approval::None,
         env: BTreeMap::new(),
         note: String::new(),

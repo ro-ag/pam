@@ -20,10 +20,15 @@ steps:
     role: verify
     needs: [fmt]
     timeout: 20m
+  - id: transport-tests
+    run: [cargo, test, --manifest-path, vendor/zeromq/Cargo.toml, --lib, --offline]
+    role: verify
+    needs: [clippy]
+    timeout: 10m
   - id: tests
     run: [cargo, test, --workspace]
     role: verify
-    needs: [clippy]
+    needs: [transport-tests]
     timeout: 30m
   - id: frontend-lint
     run: [npm, --prefix, frontend, run, lint]

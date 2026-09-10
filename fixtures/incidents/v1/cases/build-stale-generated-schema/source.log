@@ -1,0 +1,16 @@
+PAM synthetic offline incident snapshot v1
+Case: build-stale-generated-schema
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins build=412 attempt=1 revision=1234567890abcdef1234567890abcdef12345678
+Confluence Cloud synthetic page=800 version=9: this branch requires schema generator 6.2
+workspace generator reports version 5.8
+stage=generate exit=2: configured generator version 5.8 does not satisfy required version 6.2
+stage=compile state=NOT_EXECUTED
+The cited page is synthetic supporting context; the executable assertion is the failure observation.
+Final build result: FAILURE

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "case_id": "build-stale-generated-schema",
+  "family_id": "v1-build-stale-generated-schema",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins",
+    "confluence"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for build-stale-generated-schema; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Jenkins build 412 failed its declared schema generator version assertion."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "configured generator version 5.8 does not satisfy required version 6.2"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "A Confluence page independently proves the build succeeded."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

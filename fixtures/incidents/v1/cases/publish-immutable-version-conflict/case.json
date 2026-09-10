@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "publish-immutable-version-conflict",
+  "family_id": "v1-publish-immutable-version-conflict",
+  "split": "screening",
+  "stage": "publish",
+  "products": [
+    "jfrog"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for publish-immutable-version-conflict; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "Synthetic JFrog observations show version conflict; PAM has no live publishing adapter."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "HTTP 409; immutable version 2.4.0 already exists"
+    ],
+    "unresolved_questions": [
+      "Is a new version required by the approved release policy?"
+    ],
+    "forbidden_conclusions": [
+      "PAM can overwrite the existing release through a live JFrog connector."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

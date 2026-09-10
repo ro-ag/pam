@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "publish-checksum-disagreement",
+  "family_id": "v1-publish-checksum-disagreement",
+  "split": "screening",
+  "stage": "publish",
+  "products": [
+    "jfrog"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for publish-checksum-disagreement; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "Synthetic upload integrity check disagrees with the local receipt; live publishing is unsupported."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "integrity comparison: mismatch"
+    ],
+    "unresolved_questions": [
+      "Did the uploader send different bytes, or was the server receipt associated with another object?"
+    ],
+    "forbidden_conclusions": [
+      "The server is definitely corrupt merely because these receipts disagree."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

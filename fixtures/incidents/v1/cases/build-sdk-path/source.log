@@ -1,0 +1,17 @@
+PAM synthetic offline incident snapshot v1
+Case: build-sdk-path
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins build=415 attempt=1 revision=1234567890abcdef1234567890abcdef12345678
+stage=toolchain node=101 state=FAILED exit=2
+configured SDK_ROOT=/opt/company/sdk/17
+preflight: required SDK directory /opt/company/sdk/17 does not exist
+installed SDK inventory: /opt/company/sdk/18
+compile stage: NOT_EXECUTED
+No automatic version substitution was attempted; compatibility with SDK 18 is unknown.
+Final build result: FAILURE

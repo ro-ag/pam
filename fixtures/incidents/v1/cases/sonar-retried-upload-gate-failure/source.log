@@ -1,0 +1,16 @@
+PAM synthetic offline incident snapshot v1
+Case: sonar-retried-upload-gate-failure
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins scanner stage build=530 revision=1234567890abcdef1234567890abcdef12345678
+upload attempt 1: HTTP 503; no task ID
+upload attempt 2: accepted ce_task=ce-510
+ce_task=ce-510 status=SUCCESS analysisId=a-510 revision=1234567890abcdef1234567890abcdef12345678
+qualitygate analysisId=a-510 status=ERROR
+condition metric=new_security_rating threshold=1 actual=3 status=ERROR
+The earlier upload error was handled; the current analysis gate is the unresolved failure.

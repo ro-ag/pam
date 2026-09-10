@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-retried-upload-gate-failure",
+  "family_id": "v1-sonar-retried-upload-gate-failure",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube",
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-retried-upload-gate-failure; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Scanner recovered its upload error; exact resulting analysis a-510 failed the security gate."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "upload attempt 2: accepted ce_task=ce-510",
+      "metric=new_security_rating threshold=1 actual=3 status=ERROR"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The handled upload error is the final failure cause."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

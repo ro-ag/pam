@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-pr-revision-unavailable",
+  "family_id": "v1-sonar-pr-revision-unavailable",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-pr-revision-unavailable; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Exact PR gate exists, but captured APIs supply no authenticated commit association."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "revision_basis=pull_request_unsupported",
+      "revision=null"
+    ],
+    "unresolved_questions": [
+      "What authenticated evidence binds this PR analysis to the exact head commit?"
+    ],
+    "forbidden_conclusions": [
+      "A PR number alone establishes exact revision identity."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

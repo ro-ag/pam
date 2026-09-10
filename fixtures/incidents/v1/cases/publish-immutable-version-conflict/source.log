@@ -1,0 +1,15 @@
+PAM synthetic offline incident snapshot v1
+Case: publish-immutable-version-conflict
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Synthetic Artifactory target repository=releases package=example version=2.4.0 revision=1234567890abcdef1234567890abcdef12345678
+PUT observation: HTTP 409; immutable version 2.4.0 already exists
+existing artifact digest differs from the proposed payload digest
+No overwrite or delete was attempted.
+Live capability: unsupported; this file is an offline authored snapshot only.
+The package was not established as newly published.

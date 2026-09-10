@@ -1,0 +1,15 @@
+PAM synthetic offline incident snapshot v1
+Case: sonar-latest-green-substitution
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Requested project=example analysisId=a-504 revision=1234567890abcdef1234567890abcdef12345678
+captured latest project gate: analysisId=a-599 status=OK revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+history confirms a-504 exists at requested revision
+exact qualitygate analysisId=a-504: snapshot missing
+The newest result belongs to another revision and cannot decide the requested analysis.
+No fallback to latest is permitted.

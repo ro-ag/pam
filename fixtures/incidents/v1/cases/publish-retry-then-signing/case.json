@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "publish-retry-then-signing",
+  "family_id": "v1-publish-retry-then-signing",
+  "split": "screening",
+  "stage": "publish",
+  "products": [
+    "jfrog",
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for publish-retry-then-signing; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "Synthetic staging retry succeeded; required signing configuration then failed. Live publishing unsupported."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "staging upload attempt 2: HTTP 201; staging digest matched",
+      "configured key alias release-signing-v3 was not found"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The recovered staging error is the final blocker.",
+      "Staging acceptance proves final release publication."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,15 @@
+PAM synthetic offline incident snapshot v1
+Case: sonar-scanner-project-permission
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins scanner stage build=520 revision=1234567890abcdef1234567890abcdef12345678 exit=3
+scanner server response: HTTP 403; account is not authorized to analyze project example
+report upload: refused before compute-engine task creation
+ce_task: absent
+project creation mode: disabled by administrator
+The fixture contains no credential values and no evidence of a server outage.

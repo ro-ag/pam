@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-baseline-scope-ambiguity",
+  "family_id": "v1-sonar-baseline-scope-ambiguity",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube",
+    "confluence"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-baseline-scope-ambiguity; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Exact analysis a-509 gate ERROR is known, but the expected new-code baseline is disputed."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "metric=new_duplicated_lines_density threshold=3 actual=12 status=ERROR",
+      "The bundle does not contain the effective approved baseline policy for feature/work."
+    ],
+    "unresolved_questions": [
+      "Which baseline policy is approved for this branch?"
+    ],
+    "forbidden_conclusions": [
+      "The gate failure must be a source defect regardless of baseline configuration."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "build-wrong-attempt-artifact",
+  "family_id": "v1-build-wrong-attempt-artifact",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "github"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for build-wrong-attempt-artifact; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "No build result was captured for requested attempt 2; attached log belongs to attempt 1."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "Attached log metadata: run=9001 run_attempt=1",
+      "requested attempt 2 detail endpoint: capture absent"
+    ],
+    "unresolved_questions": [
+      "What is the authoritative status and log of run 9001 attempt 2?"
+    ],
+    "forbidden_conclusions": [
+      "A matching commit makes attempt 1 evidence valid for attempt 2."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

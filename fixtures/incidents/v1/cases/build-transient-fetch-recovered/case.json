@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "build-transient-fetch-recovered",
+  "family_id": "v1-build-transient-fetch-recovered",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for build-transient-fetch-recovered; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "success",
+    "basis": "Jenkins build 419 result SUCCESS follows a recorded transient repository response and successful retry."
+  },
+  "expected": {
+    "diagnosis": "flake",
+    "decisive_quotes": [
+      "retry=1: repository returned HTTP 502, no object downloaded",
+      "retry=2: identical URL returned HTTP 200; expected digest matched",
+      "Final build result: SUCCESS"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The recovered dependency error means the final build failed."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

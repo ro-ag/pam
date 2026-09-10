@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-scanner-project-permission",
+  "family_id": "v1-sonar-scanner-project-permission",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube",
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-scanner-project-permission; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "CI scanner step failed with a project authorization rejection; no CE task was created."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "HTTP 403; account is not authorized to analyze project example"
+    ],
+    "unresolved_questions": [
+      "Does the configured scanner account have analysis permission for this project?"
+    ],
+    "forbidden_conclusions": [
+      "The project quality gate failed on source-code metrics."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-history-page-gap",
+  "family_id": "v1-sonar-history-page-gap",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-history-page-gap; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Bounded history page does not contain requested analysis; captured gate is not revision-associated."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "history pages 2 and 3 were not captured"
+    ],
+    "unresolved_questions": [
+      "Which bounded history page contains a-508 and its revision?"
+    ],
+    "forbidden_conclusions": [
+      "Absence from page 1 proves the analysis does not exist."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

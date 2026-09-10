@@ -1,0 +1,15 @@
+PAM synthetic offline incident snapshot v1
+Case: sonar-pr-revision-unavailable
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+project=example pullRequest=72 ce_task=ce-506 status=SUCCESS analysisId=a-506
+qualitygate analysisId=a-506 status=OK
+revision_basis=pull_request_unsupported
+revision=null
+PR number is known, but its head can change between analyses.
+No authenticated CI artifact or history row linking this analysis to 1234567890abcdef1234567890abcdef12345678 is included.

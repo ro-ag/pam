@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "publish-timeout-after-put",
+  "family_id": "v1-publish-timeout-after-put",
+  "split": "screening",
+  "stage": "publish",
+  "products": [
+    "jfrog"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for publish-timeout-after-put; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "Synthetic upload timed out after bytes were sent; acceptance is unknown and live publishing unsupported."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "client timeout while awaiting final HTTP response",
+      "upload acceptance receipt: missing"
+    ],
+    "unresolved_questions": [
+      "Does the exact artifact path already contain the expected digest?"
+    ],
+    "forbidden_conclusions": [
+      "Timeout proves the upload had no effect and can safely be retried."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

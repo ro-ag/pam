@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "publish-wrong-build-receipt",
+  "family_id": "v1-publish-wrong-build-receipt",
+  "split": "screening",
+  "stage": "publish",
+  "products": [
+    "jfrog",
+    "github"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for publish-wrong-build-receipt; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unsupported",
+    "basis": "Synthetic receipt belongs to a previous attempt; requested publication unknown and live publishing unsupported."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "artifact receipt provenance: run=8200 attempt=2",
+      "attempt 3 upload response: missing"
+    ],
+    "unresolved_questions": [
+      "What receipt or exact-object read establishes the outcome of attempt 3?"
+    ],
+    "forbidden_conclusions": [
+      "Attempt 2 acceptance proves attempt 3 publication succeeded."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

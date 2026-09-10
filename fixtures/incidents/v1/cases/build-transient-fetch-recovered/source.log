@@ -1,0 +1,16 @@
+PAM synthetic offline incident snapshot v1
+Case: build-transient-fetch-recovered
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins build=419 attempt=1 revision=1234567890abcdef1234567890abcdef12345678
+stage=dependencies retry=1: repository returned HTTP 502, no object downloaded
+stage=dependencies retry=2: identical URL returned HTTP 200; expected digest matched
+stage=compile node=145 status=SUCCESS exit=0
+stage=package node=146 status=SUCCESS artifact digest recorded
+No failed required stage remains after retry resolution.
+Final build result: SUCCESS

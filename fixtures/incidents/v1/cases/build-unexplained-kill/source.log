@@ -1,0 +1,16 @@
+PAM synthetic offline incident snapshot v1
+Case: build-unexplained-kill
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins build=414 attempt=1 revision=1234567890abcdef1234567890abcdef12345678
+stage=compile node=90 compiler terminated by signal 9
+runner memory telemetry: unavailable
+scheduler eviction reason: unavailable
+No kernel event excerpt was captured for the termination interval.
+A wrapper printed 'probably OOM'; this is a guess, not a kernel or scheduler observation.
+Final build result: FAILURE

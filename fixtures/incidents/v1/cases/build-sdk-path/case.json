@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "build-sdk-path",
+  "family_id": "v1-build-sdk-path",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for build-sdk-path; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Jenkins build 415 failed the SDK directory preflight before compilation."
+  },
+  "expected": {
+    "diagnosis": "config",
+    "decisive_quotes": [
+      "required SDK directory /opt/company/sdk/17 does not exist"
+    ],
+    "unresolved_questions": [
+      "Is SDK 18 approved for this branch?"
+    ],
+    "forbidden_conclusions": [
+      "SDK 18 is necessarily a compatible replacement."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

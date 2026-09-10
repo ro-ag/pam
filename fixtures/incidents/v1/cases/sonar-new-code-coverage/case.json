@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-new-code-coverage",
+  "family_id": "v1-sonar-new-code-coverage",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-new-code-coverage; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Exact analysis a-501 has quality gate ERROR for new-code coverage at the requested commit."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "metric=new_coverage comparator=LT threshold=80 actual=54 status=ERROR"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "Compute-engine SUCCESS means quality gate OK."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

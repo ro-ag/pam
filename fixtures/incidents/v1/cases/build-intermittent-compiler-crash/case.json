@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_id": "build-intermittent-compiler-crash",
+  "family_id": "v1-build-intermittent-compiler-crash",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for build-intermittent-compiler-crash; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Jenkins build 418 failed with an internal compiler exception; no comparable replay exists."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "compiler internal exception: invariant block_owner != null",
+      "No successful run with the same inputs, flags, toolchain and environment is included."
+    ],
+    "unresolved_questions": [
+      "Does an identical replay reproduce the compiler exception?"
+    ],
+    "forbidden_conclusions": [
+      "An internal compiler exception alone establishes a flake."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-latest-green-substitution",
+  "family_id": "v1-sonar-latest-green-substitution",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Determine the bounded diagnosis and decisive evidence for sonar-latest-green-substitution; preserve the requested execution identity and state any unresolved question.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Only latest analysis a-599 was captured; requested a-504 gate is unavailable."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "exact qualitygate analysisId=a-504: snapshot missing"
+    ],
+    "unresolved_questions": [
+      "What gate did exact analysis a-504 report?"
+    ],
+    "forbidden_conclusions": [
+      "The latest green gate proves a-504 passed."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "status": "pending"
+  }
+}

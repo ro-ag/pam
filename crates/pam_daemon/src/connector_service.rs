@@ -33,6 +33,18 @@
 //! its credential helpers have qualified containment.
 
 use std::collections::BTreeMap;
+
+#[path = "connector_landing.rs"]
+mod landing;
+pub(crate) use landing::LandingGithubOp;
+#[path = "connector_landing_git.rs"]
+mod landing_git_broker;
+#[cfg(test)]
+#[path = "connector_landing_git_test.rs"]
+mod landing_git_broker_test;
+#[cfg(test)]
+#[path = "connector_landing_test.rs"]
+mod landing_test;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;

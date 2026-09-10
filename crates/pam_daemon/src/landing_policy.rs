@@ -126,11 +126,10 @@ impl Repository {
             directory(cache)?;
             if cache.starts_with(&self.workspace_root)
                 || self.workspace_root.starts_with(cache)
-                || cache.starts_with(&self.root)
                 || self.root.starts_with(cache)
                 || cache
                     .components()
-                    .any(|part| part.as_os_str() == "Keychains")
+                    .any(|part| part.as_os_str() == "Keychains" || part.as_os_str() == ".git")
             {
                 return Err(invalid());
             }

@@ -71,6 +71,7 @@ function CheckEditor({
         }
       />
       <label className="block space-y-1 text-xs text-ink-muted">
+        <span className="block">Use {"${artifacts}"} for writable output and {"${source}"} for the sealed source. Arguments are literal; shell expansion is unavailable.</span>
         {label} timeout (seconds)
         <input
           type="number"

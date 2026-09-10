@@ -135,6 +135,7 @@ mod correlation_test;
 mod watch_integration_test;
 
 mod landing_checkout;
+mod landing_git;
 mod landing_policy;
 #[cfg(test)]
 mod landing_policy_test;

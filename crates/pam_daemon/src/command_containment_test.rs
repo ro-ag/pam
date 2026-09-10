@@ -91,6 +91,71 @@ fn overlapping_private_or_trusted_paths_fail_closed() {
 }
 
 #[test]
+fn artifact_writes_cannot_overlap_source_private_data_or_toolchains() {
+    let fixture = fixture();
+    for forbidden in [
+        &fixture.config.repository,
+        &fixture.config.protected_base,
+        &fixture.config.read_only_roots[0],
+    ] {
+        let mut config = fixture.config.clone();
+        config.artifact_roots.push(forbidden.clone());
+        assert!(profile(&config, &fixture.program, &config.repository).is_err());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn actual_artifact_writes_leave_source_and_private_data_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = fixture();
+    let output = fixture
+        .config
+        .repository
+        .parent()
+        .unwrap()
+        .join("artifacts");
+    std::fs::create_dir(&output).unwrap();
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.config.artifact_roots.push(output.clone());
+    fixture.config.read_only_roots.push(PathBuf::from("/bin"));
+    let source = fixture.config.repository.join("tracked.txt");
+    let secret = fixture.config.protected_base.join("secret");
+    std::fs::write(&source, "original").unwrap();
+    std::fs::write(&secret, "private").unwrap();
+    let prepared = fixture
+        .config
+        .prepare(
+            std::path::Path::new("/bin/sh"),
+            &fixture.config.repository,
+            &[],
+        )
+        .unwrap();
+    let status = std::process::Command::new(prepared.program)
+        .args(prepared.argv)
+        .args([
+            "-c",
+            "printf built > \"$1/result\" && ! (printf changed > \"$2\") && ! /bin/cat \"$3\"",
+            "check",
+        ])
+        .arg(&output)
+        .arg(&source)
+        .arg(&secret)
+        .current_dir(&fixture.config.repository)
+        .env_clear()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(output.join("result")).unwrap(),
+        "built"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
+}
+
+#[test]
 fn missing_paths_unapproved_program_and_excess_roots_are_refused() {
     let fixture = fixture();
     assert!(

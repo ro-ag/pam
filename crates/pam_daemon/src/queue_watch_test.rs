@@ -198,6 +198,18 @@ async fn parked_cancel_expiry_and_revocation_do_not_resume() {
             _ => "authorization_changed",
         };
         assert_eq!(row.outcome.as_deref(), Some(cause));
+        let notices = queue.take_parked_terminals().await;
+        if mode == "cancel" {
+            assert!(
+                notices.is_empty(),
+                "explicit cancellation has its own router completion"
+            );
+        } else {
+            assert_eq!(notices, [mode]);
+        }
+        assert!(queue.take_parked_terminals().await.is_empty());
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 0);
+        assert!(queue.take_parked_terminals().await.is_empty());
         assert_eq!(store.admission_usage().await.unwrap().0, 0);
     }
 }
@@ -256,5 +268,68 @@ async fn failed_park_keeps_the_existing_lease_and_lane() {
     assert_eq!(
         store.get_request("watch").await.unwrap().unwrap().state,
         RequestState::Running
+    );
+}
+
+async fn park_for_notice(queue: &QueueManager, store: &Store, id: &str) -> (Instant, i64) {
+    enqueue(queue, id).await;
+    let lease = queue.take_next("/repo").await.unwrap().unwrap();
+    ready_checkpoint(store, id).await;
+    let resume = now_ms() + 10_000;
+    assert!(queue.park(id, resume).await.unwrap());
+    // Consume the lane-release notification so the terminal notification below
+    // must be produced by the sweep itself.
+    tokio::time::timeout(Duration::from_millis(100), queue.work_available())
+        .await
+        .unwrap();
+    (lease.lease_deadline, resume)
+}
+
+#[tokio::test]
+async fn full_terminal_notice_buffer_retains_new_parked_admissions_until_drain() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    let mut expected = Vec::new();
+    for index in 0..crate::queue::MAX_PARKED_TERMINALS {
+        let id = format!("expired-{index}");
+        let (deadline, resume) = park_for_notice(&queue, &store, &id).await;
+        assert_eq!(queue.wake_due(deadline, resume).await.unwrap(), 0);
+        tokio::time::timeout(Duration::from_millis(100), queue.work_available())
+            .await
+            .unwrap();
+        expected.push(id);
+    }
+    assert_eq!(store.admission_usage().await.unwrap().0, 0);
+    let (deadline, resume) = park_for_notice(&queue, &store, "pending-notice").await;
+    assert_eq!(queue.wake_due(deadline, resume).await.unwrap(), 0);
+    tokio::time::timeout(Duration::from_millis(100), queue.work_available())
+        .await
+        .unwrap();
+    let pending = store.get_request("pending-notice").await.unwrap().unwrap();
+    assert_eq!(pending.state, RequestState::Queued);
+    assert_eq!(pending.resume_at_ms, Some(resume));
+    assert_eq!(store.admission_usage().await.unwrap().0, 1);
+    assert!(
+        store
+            .audit_for_request("pending-notice")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(queue.take_parked_terminals().await, expected);
+    assert!(queue.take_parked_terminals().await.is_empty());
+    assert_eq!(queue.wake_due(deadline, resume).await.unwrap(), 0);
+    assert_eq!(queue.take_parked_terminals().await, ["pending-notice"]);
+    assert!(queue.take_parked_terminals().await.is_empty());
+    assert_eq!(store.admission_usage().await.unwrap().0, 0);
+    assert_eq!(
+        store
+            .get_request("pending-notice")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("lease_expired")
     );
 }

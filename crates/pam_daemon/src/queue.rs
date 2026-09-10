@@ -120,6 +120,8 @@ pub const MAX_LEASE: Duration = Duration::from_hours(1);
 pub const MAX_ADMITTED_REQUESTS: u64 = 128;
 /// Maximum cumulative persisted identity and argument bytes for active admissions.
 pub const MAX_ADMITTED_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum parked terminal tickets waiting for executor/router notification.
+pub const MAX_PARKED_TERMINALS: usize = 128;
 
 /// `request.outcome` recorded when a queued request is cancelled.
 pub const CAUSE_CANCELLED: &str = "cancelled";
@@ -269,6 +271,8 @@ struct Inner {
     busy: HashMap<String, String>,
     /// Original request id → durable watch waiting for its next poll.
     parked: HashMap<String, ParkedEntry>,
+    /// Terminal parked tickets whose original waiting caller must be finished.
+    parked_terminals: Vec<String>,
 }
 
 /// The queue manager service. See the module docs for the design.
@@ -522,6 +526,13 @@ impl QueueManager {
         self.work.notified().await;
     }
 
+    /// Drain bounded terminal notices for the executor to publish and finish
+    /// through the original ticket's router. Explicit cancellation is separate.
+    pub async fn take_parked_terminals(&self) -> Vec<String> {
+        let mut inner = self.inner.lock().await;
+        std::mem::take(&mut inner.parked_terminals)
+    }
+
     /// Persist a future poll before releasing the current lease. Failure leaves
     /// lease ownership intact; parked admissions still count against store caps.
     pub async fn park(&self, request_id: &str, resume_at_ms: i64) -> Result<bool, QueueError> {
@@ -571,11 +582,20 @@ impl QueueManager {
         due.sort();
         let mut ready = 0;
         for (_, id) in due {
+            // Retain admissions until the executor has consumed older notices.
+            // Never terminalize a parked request whose notification cannot fit.
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                break;
+            }
             let Some(parked) = inner.parked.get(&id) else {
                 continue;
             };
             if parked.entry.deadline <= now {
-                self.expire_locked(&mut inner, &id).await?;
+                if self.expire_locked(&mut inner, &id).await? {
+                    inner.parked_terminals.push(id);
+                    self.work.notify_one();
+                }
                 continue;
             }
             if !self.store.wake_parked_flow_request(&id, now_ms).await? {
@@ -584,8 +604,12 @@ impl QueueManager {
                 } else {
                     "authorization_changed"
                 };
-                self.fail_recovered(&id, cause).await?;
+                let finished = self.fail_recovered(&id, cause).await?;
                 inner.parked.remove(&id);
+                if finished {
+                    inner.parked_terminals.push(id);
+                    self.work.notify_one();
+                }
                 continue;
             }
             let Some(parked) = inner.parked.remove(&id) else {
@@ -843,7 +867,7 @@ impl QueueManager {
         Ok(usize::try_from(restored).unwrap_or(usize::MAX))
     }
 
-    async fn fail_recovered(&self, id: &str, cause: &str) -> Result<(), StoreError> {
+    async fn fail_recovered(&self, id: &str, cause: &str) -> Result<bool, StoreError> {
         self.store
             .finish_request(
                 id,
@@ -856,8 +880,7 @@ impl QueueManager {
                     detail: Some(cause),
                 },
             )
-            .await?;
-        Ok(())
+            .await
     }
 }
 

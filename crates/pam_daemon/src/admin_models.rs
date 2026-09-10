@@ -65,6 +65,10 @@ pub const OP_MODELS_DOWNLOAD: &str = "admin.models.download";
 /// `admin.models.download.cancel { job_id }` → stops the transfer.
 pub const OP_MODELS_DOWNLOAD_CANCEL: &str = "admin.models.download.cancel";
 
+/// `admin.models.download.discard { preset_id } | { url, vendor }` →
+/// deletes the partial download so the next one starts from zero.
+pub const OP_MODELS_DOWNLOAD_DISCARD: &str = "admin.models.download.discard";
+
 /// `admin.models.delete { model_id }` → removes the weights from disk.
 pub const OP_MODELS_DELETE: &str = "admin.models.delete";
 
@@ -105,6 +109,7 @@ pub const MODEL_ADMIN_OPS: &[&str] = &[
     OP_MODELS_CATALOG,
     OP_MODELS_DOWNLOAD,
     OP_MODELS_DOWNLOAD_CANCEL,
+    OP_MODELS_DOWNLOAD_DISCARD,
     OP_MODELS_DELETE,
     OP_MODELS_VERIFY,
     OP_MODELS_LOAD,
@@ -237,6 +242,7 @@ impl AdminService {
             OP_MODELS_CATALOG => self.models_catalog().await,
             OP_MODELS_DOWNLOAD => self.models_download(args).await,
             OP_MODELS_DOWNLOAD_CANCEL => self.models_download_cancel(args).await,
+            OP_MODELS_DOWNLOAD_DISCARD => self.models_download_discard(args).await,
             OP_MODELS_DELETE => self.models_delete(args).await,
             OP_MODELS_VERIFY => self.models_verify(args).await,
             OP_MODELS_LOAD => self.models_load(args).await,
@@ -270,9 +276,30 @@ impl AdminService {
     async fn models_catalog(&self) -> Result<AdminOk, AdminRefusal> {
         let installed = self.models.scan().await.map_err(registry_refusal)?;
         let host_ram = self.models.host_ram_bytes();
+        // A partial download is invisible to a registry scan — the
+        // sidecars are dotfiles — so the catalog reads them directly.
+        // Without this the GUI can only infer a resumable transfer from a
+        // job row, and job rows age out of the status window.
+        let registry = self.models.registry();
+        let partials = tokio::task::spawn_blocking(move || {
+            CATALOG
+                .iter()
+                .map(|preset| {
+                    let dest = registry.dest_for(preset.vendor, preset.file_name);
+                    pam_model::download::inspect_partial(&dest)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|err| AdminRefusal {
+            cause: CAUSE_INTERNAL_ERROR,
+            detail: format!("the partial-download scan did not finish: {err}"),
+            recovery: RECOVERY_INTERNAL,
+        })?;
         let presets: Vec<Value> = CATALOG
             .iter()
-            .map(|preset| {
+            .zip(partials)
+            .map(|(preset, partial)| {
                 let mut value = serde_json::to_value(preset).unwrap_or_else(|_| json!({}));
                 let model_id = preset.model_id();
                 if let Some(object) = value.as_object_mut() {
@@ -280,6 +307,10 @@ impl AdminService {
                     object.insert(
                         "installed".to_owned(),
                         json!(installed.iter().any(|entry| entry.id == model_id)),
+                    );
+                    object.insert(
+                        "partial_bytes".to_owned(),
+                        json!(partial.as_ref().map(|found| found.bytes)),
                     );
                 }
                 value
@@ -298,6 +329,56 @@ impl AdminService {
 
     /// Starts a transfer, from a catalog preset or a pasted URL.
     async fn models_download(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let (request, model_id) = self.download_request(args, OP_MODELS_DOWNLOAD)?;
+
+        let source = request.url.clone();
+        let job_id = self
+            .models
+            .start_download(request, &model_id)
+            .await
+            .map_err(download_refusal)?;
+        Ok(AdminOk {
+            outcome: Outcome::Changed,
+            body: json!({ "job_id": job_id }),
+            audit: json!({
+                "op": OP_MODELS_DOWNLOAD,
+                "job_id": job_id,
+                "model_id": model_id,
+                "source": source,
+            }),
+        })
+    }
+
+    /// Throws away a partial download so the next attempt starts over.
+    ///
+    /// Takes the same arguments as the download it undoes: the human is
+    /// discarding *that* fetch, and asking them for a file path the GUI
+    /// never showed them would be absurd.
+    async fn models_download_discard(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let (request, model_id) = self.download_request(args, OP_MODELS_DOWNLOAD_DISCARD)?;
+        let discarded = self
+            .models
+            .discard_partial(&request.dest, &model_id)
+            .await
+            .map_err(download_refusal)?;
+        Ok(AdminOk {
+            outcome: Outcome::Changed,
+            body: json!({ "model_id": model_id, "discarded_bytes": discarded }),
+            audit: json!({
+                "op": OP_MODELS_DOWNLOAD_DISCARD,
+                "model_id": model_id,
+                "discarded_bytes": discarded,
+            }),
+        })
+    }
+
+    /// The transfer a `{ preset_id }` or `{ url, vendor }` argument names,
+    /// and the registry id it installs as.
+    fn download_request(
+        &self,
+        args: &Value,
+        op: &'static str,
+    ) -> Result<(DownloadRequest, String), AdminRefusal> {
         let registry = self.models.registry();
         let (request, model_id) =
             if let Some(preset_id) = args.get("preset_id").and_then(Value::as_str) {
@@ -317,8 +398,8 @@ impl AdminService {
                     preset.model_id(),
                 )
             } else {
-                let url = required_str(args, "url", OP_MODELS_DOWNLOAD)?;
-                let vendor = required_str(args, "vendor", OP_MODELS_DOWNLOAD)?;
+                let url = required_str(args, "url", op)?;
+                let vendor = required_str(args, "vendor", op)?;
                 let file_name = file_name_from_url(url).ok_or_else(|| AdminRefusal {
                     cause: CAUSE_INVALID_ADMIN_ARGS,
                     detail: format!("{url:?} does not end in a .gguf file name"),
@@ -336,23 +417,7 @@ impl AdminService {
                     format!("{vendor}/{stem}"),
                 )
             };
-
-        let source = request.url.clone();
-        let job_id = self
-            .models
-            .start_download(request, &model_id)
-            .await
-            .map_err(download_refusal)?;
-        Ok(AdminOk {
-            outcome: Outcome::Changed,
-            body: json!({ "job_id": job_id }),
-            audit: json!({
-                "op": OP_MODELS_DOWNLOAD,
-                "job_id": job_id,
-                "model_id": model_id,
-                "source": source,
-            }),
-        })
+        Ok((request, model_id))
     }
 
     /// Stops a running transfer; the part file stays for a resume.

@@ -278,9 +278,10 @@ audit rules. Bodies are JSON; refusals carry `cause` + `recovery`.
 | op | args | body |
 | --- | --- | --- |
 | `admin.models.list` | — | `{ models: [ModelEntry…], models_dir }` (registry scan) |
-| `admin.models.catalog` | — | `{ presets: [Preset + fits_host + installed…], host_ram_bytes, floor_bytes }` |
+| `admin.models.catalog` | — | `{ presets: [Preset + fits_host + installed + partial_bytes…], host_ram_bytes, floor_bytes }` |
 | `admin.models.download` | `{ preset_id }` or `{ url, vendor }` | `{ job_id }`; refuses `already_downloading`, `already_installed`, `curl_missing`, `below_floor_url` never (URL downloads are allowed; class decides) |
 | `admin.models.download.cancel` | `{ job_id }` | `{ job_id, cancelled: true }` |
+| `admin.models.download.discard` | `{ preset_id }` or `{ url, vendor }` | `{ model_id, discarded_bytes }`; deletes the part file, checkpoint and lock so the next download starts from zero. Refuses `already_downloading` while a transfer holds the file; discarding nothing is `0` bytes, not an error |
 | `admin.models.delete` | `{ model_id }` | `{ deleted: true }`; refuses `model_loaded`, `outside_models_dir`, `download_in_progress`; clears a tier default that pointed at it |
 | `admin.models.verify` | `{ model_id }` | `{ job_id }` (streams SHA-256 in the service; result on the job row and the entry) |
 | `admin.models.load` | `{ model_id }` | `{ state }`; refuses `unsupported_architecture`, `load_failed`, `unknown_model` |

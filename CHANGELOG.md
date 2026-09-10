@@ -6,6 +6,17 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Partial downloads can be thrown away from the Models screen: a preset
+  card that has bytes on disk offers Resume and Start over, says how much
+  is already here, and confirms before discarding. New admin op
+  `admin.models.download.discard`, and `admin.models.catalog` now reports
+  `partial_bytes` per preset — a part file is a dotfile a registry scan
+  cannot see, so a resumable transfer no longer depends on a job row that
+  may have aged out. This is also the way out of a checkpoint conflict,
+  which previously needed a manual `rm`.
+
 ## [0.3.1] - 2026-09-09
 
 ### Fixed

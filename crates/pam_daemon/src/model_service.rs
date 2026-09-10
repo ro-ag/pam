@@ -384,6 +384,32 @@ impl ModelService {
         Ok(job_id)
     }
 
+    /// Throws away the partial download beside `dest`, returning the
+    /// bytes discarded.
+    ///
+    /// The in-flight check comes first so a running transfer is refused
+    /// as [`ModelServiceError::AlreadyDownloading`] — the name of the
+    /// thing to cancel — rather than as a lock error the human cannot
+    /// map to an action.
+    pub async fn discard_partial(
+        &self,
+        dest: &Path,
+        model_id: &str,
+    ) -> Result<u64, ModelServiceError> {
+        if self.is_downloading(dest).await {
+            return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
+        }
+        let target = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || pam_model::download::discard_partial(&target))
+            .await
+            .map_err(|err| {
+                ModelServiceError::Download(DownloadError::Io(std::io::Error::other(
+                    err.to_string(),
+                )))
+            })?
+            .map_err(ModelServiceError::Download)
+    }
+
     /// Stops a running transfer, keeping its part file for a resume.
     /// `false` means no such job is in flight.
     pub async fn cancel_download(&self, job_id: &str) -> bool {

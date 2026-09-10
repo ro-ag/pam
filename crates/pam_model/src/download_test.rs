@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
-    TransferLimits, curl_path, curl_recovery_line, failure_cause, failure_recovery, sidecar_paths,
-    start, start_with_limits,
+    TransferLimits, curl_path, curl_recovery_line, discard_partial, failure_cause,
+    failure_recovery, inspect_partial, sidecar_paths, start, start_with_limits,
 };
 use crate::registry::verified_sidecar_path;
 use crate::testing as origin;
@@ -446,4 +446,116 @@ fn every_cause_carries_its_own_recovery_sentence() {
         assert_ne!(line, fallback, "{cause} deserves better than the fallback");
         assert!(!line.is_empty(), "{cause} has no recovery line");
     }
+}
+
+#[tokio::test]
+async fn a_partial_can_be_inspected_and_thrown_away() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(256 * 1024);
+    let server = origin::serve_interrupting(bytes.clone(), "v1", 64 * 1024).await;
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    let paths = sidecar_paths(&fixture.dest);
+
+    assert_eq!(
+        inspect_partial(&fixture.dest),
+        None,
+        "nothing downloaded yet is not a partial"
+    );
+
+    settled(&start(request.clone()).unwrap()).await;
+    let partial = inspect_partial(&fixture.dest).expect("the interrupted transfer left bytes");
+    assert_eq!(partial.bytes, 64 * 1024);
+    assert_eq!(partial.source.as_deref(), Some(request.url.as_str()));
+    assert_eq!(
+        partial.expected_digest.as_deref(),
+        Some(format!("sha256:{}", sha256_of(&bytes)).as_str())
+    );
+    assert!(
+        !partial.locked,
+        "the transfer is over, nothing holds the lock"
+    );
+
+    assert_eq!(discard_partial(&fixture.dest).unwrap(), 64 * 1024);
+    assert_eq!(inspect_partial(&fixture.dest), None);
+    assert!(!paths.part.exists());
+    assert!(!paths.checkpoint.exists());
+    assert!(
+        !paths.lock.exists(),
+        "the lock is not state; discarding takes it with the rest"
+    );
+    assert_eq!(
+        dir_entries(fixture.dest.parent().unwrap()),
+        Vec::<String>::new(),
+        "a discarded download leaves nothing behind"
+    );
+}
+
+#[tokio::test]
+async fn a_running_transfer_keeps_its_partial() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(512 * 1024);
+    let server =
+        origin::serve_slowly(bytes.clone(), "v1", 64 * 1024, Duration::from_millis(200)).await;
+    let handle = start(request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes)).unwrap();
+    let paths = sidecar_paths(&fixture.dest);
+    assert!(wait_for_path(&paths.part).await);
+
+    let refused = discard_partial(&fixture.dest);
+    assert!(
+        matches!(refused, Err(DownloadError::Locked(_))),
+        "bytes are never deleted from under a running transfer, got {refused:?}"
+    );
+    assert!(
+        inspect_partial(&fixture.dest).is_some_and(|partial| partial.locked),
+        "a partial being written says so"
+    );
+
+    handle.cancel();
+    settled(&handle).await;
+    assert!(paths.part.exists(), "the refusal changed nothing");
+    assert!(discard_partial(&fixture.dest).unwrap() > 0);
+}
+
+#[tokio::test]
+async fn discarding_clears_a_checkpoint_conflict() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(4 * 1024);
+    let paths = sidecar_paths(&fixture.dest);
+    std::fs::write(&paths.part, &bytes[..1024]).unwrap();
+    std::fs::write(
+        &paths.checkpoint,
+        serde_json::to_vec(&Checkpoint {
+            schema_version: 1,
+            canonical_source: "http://127.0.0.1:1/somewhere-else.gguf".to_owned(),
+            expected_digest: format!("sha256:{}", sha256_of(&bytes)),
+            expected_size_bytes: size_of(&bytes),
+            license_digest: String::new(),
+            etag: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    assert!(
+        matches!(
+            start(request.clone()),
+            Err(DownloadError::CheckpointConflict(_))
+        ),
+        "the fixture must start from the conflict this test is about"
+    );
+
+    assert_eq!(discard_partial(&fixture.dest).unwrap(), 1024);
+    assert_eq!(
+        settled(&start(request).unwrap()).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes),
+        },
+        "with the foreign bytes gone the download starts over cleanly"
+    );
 }

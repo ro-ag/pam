@@ -138,6 +138,7 @@ export type AdminOp =
   | "admin.models.catalog"
   | "admin.models.download"
   | "admin.models.download.cancel"
+  | "admin.models.download.discard"
   | "admin.models.delete"
   | "admin.models.verify"
   | "admin.models.load"
@@ -377,6 +378,12 @@ export interface CatalogPreset {
   /** False when this machine has too little RAM; such cards are hidden. */
   fits_host: boolean;
   installed: boolean;
+  /**
+   * Bytes of this model already on disk from a transfer that never
+   * finished, or null when there is no partial. A registry scan cannot
+   * see these — the part file is a dotfile — so the catalog reports them.
+   */
+  partial_bytes: number | null;
 }
 
 /** Where the runtime is; `state` is the discriminant the daemon tags on. */
@@ -464,6 +471,17 @@ export function modelsDownloadCancel(
   jobId: string,
 ): Promise<{ job_id: string; cancelled: true }> {
   return adminCall("admin.models.download.cancel", { job_id: jobId });
+}
+
+/**
+ * Throws away a partial download so the next one starts from zero. Takes
+ * the same argument as the download it undoes; refused while a transfer
+ * of that file is running.
+ */
+export function modelsDownloadDiscard(
+  source: { preset_id: string } | { url: string; vendor: string },
+): Promise<{ model_id: string; discarded_bytes: number }> {
+  return adminCall("admin.models.download.discard", { ...source });
 }
 
 export function modelsDelete(modelId: string): Promise<{ deleted: true }> {

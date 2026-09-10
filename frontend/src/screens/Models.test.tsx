@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   modelsUnload: vi.fn(),
   modelsDownload: vi.fn(),
   modelsDownloadCancel: vi.fn(),
+  modelsDownloadDiscard: vi.fn(),
   modelsDelete: vi.fn(),
   modelsVerify: vi.fn(),
   modelsDefaultsSet: vi.fn(),
@@ -146,6 +147,7 @@ function preset(overrides: Partial<CatalogPreset> = {}): CatalogPreset {
     min_host_ram_bytes: 32_000_000_000,
     fits_host: true,
     installed: false,
+    partial_bytes: null,
     ...overrides,
   };
 }
@@ -181,6 +183,10 @@ beforeEach(() => {
   mocks.modelsUnload.mockResolvedValue({ state: { state: "idle" } });
   mocks.modelsDownload.mockResolvedValue({ job_id: "job_01" });
   mocks.modelsDownloadCancel.mockResolvedValue({ job_id: "job_01", cancelled: true });
+  mocks.modelsDownloadDiscard.mockResolvedValue({
+    model_id: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+    discarded_bytes: 9_278_344_784,
+  });
   mocks.modelsDelete.mockResolvedValue({ deleted: true });
   mocks.modelsVerify.mockResolvedValue({ job_id: "job_02" });
   mocks.modelsDefaultsSet.mockResolvedValue({ tier: "heavy", model_id: null });
@@ -398,6 +404,13 @@ describe("catalog", () => {
   });
 
   it("shows why a download failed, with its recovery, and offers a resume", async () => {
+    // A failed transfer leaves its part file behind, and that is what the
+    // catalog reports back.
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [preset({ partial_bytes: 9_278_344_784 })],
+      host_ram_bytes: 64_000_000_000,
+      floor_bytes: 18_000_000_000,
+    });
     mocks.modelsStatus.mockResolvedValue(
       idleStatus({
         jobs: [
@@ -450,6 +463,39 @@ describe("catalog", () => {
     expect(
       latestDownload([job({ kind: "verify", state: "failed" })], presetModelId(preset())),
     ).toBeUndefined();
+  });
+
+  it("offers Resume and Start over when a partial is on disk, and discards on confirm", async () => {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [preset({ partial_bytes: 9_278_344_784 })],
+      host_ram_bytes: 64_000_000_000,
+      floor_bytes: 18_000_000_000,
+    });
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+
+    expect(await catalog.findByRole("button", { name: "Resume" })).toBeInTheDocument();
+    expect(catalog.queryByRole("button", { name: "Download" })).not.toBeInTheDocument();
+    expect(catalog.getByText(/9\.3 GB of 18\.6 GB already here/)).toBeInTheDocument();
+
+    // Destructive, so it arms first (memento law).
+    fireEvent.click(catalog.getByRole("button", { name: "Start over" }));
+    expect(mocks.modelsDownloadDiscard).not.toHaveBeenCalled();
+    fireEvent.click(catalog.getByRole("button", { name: "Discard and start over?" }));
+    await waitFor(() =>
+      expect(mocks.modelsDownloadDiscard).toHaveBeenCalledWith({
+        preset_id: "qwen3-coder-30b-a3b-q4_k_m",
+      }),
+    );
+  });
+
+  it("offers a plain Download when nothing partial is on disk", async () => {
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+    expect(await catalog.findByRole("button", { name: "Download" })).toBeInTheDocument();
+    expect(catalog.queryByRole("button", { name: "Start over" })).not.toBeInTheDocument();
   });
 
   it("sends a pasted URL with its vendor, and says pasted files stay unverified", async () => {

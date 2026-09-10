@@ -15,8 +15,8 @@ use crate::admin_models::{
     CAUSE_ALREADY_INSTALLED, CAUSE_BELOW_FLOOR, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED,
     CAUSE_UNKNOWN_MODEL, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET, OP_CURATOR_TEST,
     OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE, OP_MODELS_DOWNLOAD,
-    OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_LIST, OP_MODELS_LOAD, OP_MODELS_SETTINGS_SET,
-    OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD, OP_MODELS_VERIFY,
+    OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST, OP_MODELS_LOAD,
+    OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD, OP_MODELS_VERIFY,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
@@ -261,7 +261,7 @@ fn tiny_gguf() -> Vec<u8> {
 async fn every_model_op_is_dispatched_and_none_is_unknown() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        assert_eq!(MODEL_ADMIN_OPS.len(), 15, "the spec's fifteen ops");
+        assert_eq!(MODEL_ADMIN_OPS.len(), 16, "the spec's sixteen ops");
         for op in MODEL_ADMIN_OPS {
             assert!(op.starts_with("admin."), "{op} is under the admin prefix");
             // Called with no arguments: whatever comes back, it must not
@@ -331,6 +331,11 @@ async fn catalog_flags_every_preset_for_this_host() {
             assert_eq!(value["quant"], preset.quant);
             assert_eq!(value["fits_host"], preset.fits_host(host_ram));
             assert_eq!(value["installed"], preset.id == first.id);
+            assert_eq!(
+                value["partial_bytes"],
+                Value::Null,
+                "nothing half-downloaded yet"
+            );
         }
     })
     .await
@@ -756,4 +761,76 @@ fn cancelled_generation_offers_normal_retry() {
     assert_eq!(refusal.cause, "cancelled");
     assert!(refusal.recovery.contains("Try again"));
     assert!(!refusal.recovery.contains("restart"));
+}
+
+#[tokio::test]
+async fn the_catalog_reports_a_partial_and_discarding_clears_it() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let preset = CATALOG.first().expect("a catalog entry");
+        // What an abandoned transfer leaves behind: hidden sidecars a
+        // registry scan never sees.
+        let vendor_dir = fx.models_dir().join(preset.vendor);
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let dest = vendor_dir.join(preset.file_name);
+        let paths = pam_model::download::sidecar_paths(&dest);
+        std::fs::write(&paths.part, vec![7u8; 2048]).unwrap();
+
+        let body = expect_result(
+            fx.run(OP_MODELS_CATALOG, json!({})).await,
+            Outcome::Verified,
+        );
+        assert_eq!(body["presets"][0]["partial_bytes"], 2048);
+
+        let discarded = expect_result(
+            fx.run(
+                OP_MODELS_DOWNLOAD_DISCARD,
+                json!({ "preset_id": preset.id }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(discarded["discarded_bytes"], 2048);
+        assert_eq!(discarded["model_id"], preset.model_id());
+        assert!(!paths.part.exists(), "the bytes are gone");
+        assert!(!paths.lock.exists(), "and so is the lock they were under");
+
+        let after = expect_result(
+            fx.run(OP_MODELS_CATALOG, json!({})).await,
+            Outcome::Verified,
+        );
+        assert_eq!(after["presets"][0]["partial_bytes"], Value::Null);
+
+        // Discarding what is not there is not an error: the human asked
+        // for an empty slate and an empty slate is what they have.
+        let again = expect_result(
+            fx.run(
+                OP_MODELS_DOWNLOAD_DISCARD,
+                json!({ "preset_id": preset.id }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(again["discarded_bytes"], 0);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn discarding_an_unknown_preset_is_an_argument_refusal() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let detail = expect_refusal(
+            fx.run(
+                OP_MODELS_DOWNLOAD_DISCARD,
+                json!({ "preset_id": "not-a-preset" }),
+            )
+            .await,
+            CAUSE_INVALID_ADMIN_ARGS,
+        );
+        assert!(detail.contains("not-a-preset"), "detail: {detail}");
+    })
+    .await
+    .expect("test within deadline");
 }

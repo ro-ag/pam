@@ -290,3 +290,72 @@ async fn refused_follow_queries_once_and_never_subscribes_to_events() {
     server.abort();
     let _ = server.await;
 }
+
+#[test]
+fn probe_and_exit_wait_leave_absent_runtime_directory_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(probe_daemon(tmp.path()).unwrap(), DaemonStatus::NotRunning);
+    assert!(wait_for_daemon_exit(tmp.path(), WAIT).unwrap());
+    assert!(!tmp.path().join("run").exists());
+}
+
+#[test]
+fn daemon_autostart_is_responsible_for_creating_runtime_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut daemon = None;
+    let result = ensure_daemon_with(
+        tmp.path(),
+        &mut || {
+            assert!(!tmp.path().join("run").exists());
+            daemon = Some(start_fake_daemon(tmp.path()));
+            Ok(())
+        },
+        WAIT,
+        POLL,
+    )
+    .unwrap();
+    assert_eq!(result, EnsureOutcome::Started);
+    assert!(daemon.is_some());
+}
+
+#[test]
+fn another_shared_probe_is_not_mistaken_for_the_exclusive_daemon_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = RuntimeDir::at_base(tmp.path()).unwrap();
+    let path = dirs.run_dir().join(pam_daemon::lifecycle::LOCK_FILE);
+    std::fs::write(&path, "stale").unwrap();
+    let reader = File::open(&path).unwrap();
+    reader.try_lock_shared().unwrap();
+    assert_eq!(probe_daemon(tmp.path()).unwrap(), DaemonStatus::NotRunning);
+    reader.unlock().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale");
+    // The probe released its lock before returning, so a daemon can acquire it.
+    let _daemon = acquire_instance_lock(dirs.run_dir()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn connecting_to_running_daemon_preserves_read_only_runtime_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let _daemon = start_fake_daemon(tmp.path());
+    let dirs = RuntimeDir::paths_at_base(tmp.path()).unwrap();
+    let lock = dirs.run_dir().join(pam_daemon::lifecycle::LOCK_FILE);
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(dirs.run_dir(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut spawn = || panic!("running daemon must not spawn another process");
+    let ready = ensure_daemon_with(tmp.path(), &mut spawn, WAIT, POLL);
+    let status = probe_daemon(tmp.path());
+    let run_mode = std::fs::metadata(dirs.run_dir())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(dirs.run_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(ready.unwrap(), EnsureOutcome::AlreadyRunning);
+    assert!(matches!(status.unwrap(), DaemonStatus::Running { .. }));
+    assert_eq!(run_mode, 0o500);
+    assert_eq!(lock_mode, 0o400);
+}

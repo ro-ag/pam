@@ -69,15 +69,23 @@ impl RuntimeDir {
     /// the socket paths, validating both against the 104-byte limit before
     /// creating anything.
     pub fn at_base(base: &Path) -> Result<Self, RuntimeDirError> {
+        let dirs = Self::paths_at_base(base)?;
+        create_private_dir(&dirs.run).map_err(|source| RuntimeDirError::Create {
+            path: dirs.run.clone(),
+            source,
+        })?;
+        Ok(dirs)
+    }
+
+    /// Resolve and validate endpoint paths without touching the filesystem.
+    /// Clients use this while the daemon alone creates and protects its runtime
+    /// directory. Connecting to a running daemon requires no directory writes.
+    pub fn paths_at_base(base: &Path) -> Result<Self, RuntimeDirError> {
         let run = base.join("run");
         let router = run.join("pam.sock");
         let events = run.join("events.sock");
         validate_socket_path(&router)?;
         validate_socket_path(&events)?;
-        create_private_dir(&run).map_err(|source| RuntimeDirError::Create {
-            path: run.clone(),
-            source,
-        })?;
         Ok(Self {
             run,
             router,

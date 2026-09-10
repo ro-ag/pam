@@ -205,3 +205,34 @@ fn zero_attempts_still_tries_once() {
     result.expect("attempts == 0 behaves as one attempt");
     assert_eq!(calls.get(), 1);
 }
+
+#[test]
+fn client_path_resolution_does_not_create_runtime_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dirs = RuntimeDir::paths_at_base(tmp.path()).expect("paths resolve");
+    assert!(!dirs.run_dir().exists());
+    let prepared = RuntimeDir::at_base(tmp.path()).expect("daemon prepares paths");
+    assert_eq!(dirs.router_socket(), prepared.router_socket());
+    assert_eq!(dirs.events_socket(), prepared.events_socket());
+    let excessive = PathBuf::from(format!("/tmp/{}", "x".repeat(MAX_SOCKET_PATH_BYTES)));
+    assert!(matches!(
+        RuntimeDir::paths_at_base(&excessive),
+        Err(RuntimeDirError::SocketPathTooLong { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn client_path_resolution_does_not_change_existing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run = tmp.path().join("run");
+    std::fs::create_dir(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
+    RuntimeDir::paths_at_base(tmp.path()).unwrap();
+    assert_eq!(
+        std::fs::metadata(&run).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+}

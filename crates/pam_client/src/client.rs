@@ -9,14 +9,14 @@
 //! # Probe
 //!
 //! "A daemon is running" is read from the same facts the daemon
-//! maintains: the `daemon.lock` file is **held** (the probe tries the
-//! advisory lock itself — winning it proves nobody else holds it, and
-//! the probe releases it immediately) and the `pam.sock` file exists.
+//! maintains: the `daemon.lock` file has an **exclusive holder** (a
+//! read-only shared-lock probe conflicts with the daemon's exclusive lock)
+//! and the `pam.sock` file exists. A successful probe unlocks explicitly.
 //! A stale socket with no lock holder therefore reads as *no daemon*,
 //! and the spawned daemon removes and rebinds it under the lock. The
-//! lock probe is authoritative in a way pinging the socket is not: it
-//! cannot be fooled by a leftover socket file, needs no timeout, and
-//! costs one syscall.
+//! probe uses a nonblocking OS lock operation and cannot be fooled by a
+//! leftover socket file. Client path resolution never creates or chmods
+//! the runtime directory; only daemon startup prepares that directory.
 //!
 //! # Request flow
 //!
@@ -41,7 +41,7 @@
 //! quietly; `pam subscribe` prints each event — one code path, the
 //! callback decides.
 
-use std::fs::{OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -134,7 +134,7 @@ pub(crate) fn ensure_daemon_with(
     wait: Duration,
     poll: Duration,
 ) -> Result<EnsureOutcome, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     if daemon_ready(&dirs)? {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -165,23 +165,31 @@ fn daemon_ready(dirs: &RuntimeDir) -> Result<bool, ClientError> {
     lock_is_held(&dirs.run_dir().join(LOCK_FILE))
 }
 
-/// Probes the advisory lock on `path`: `true` when someone else holds
-/// it. Winning the lock proves nobody does; it is released immediately
-/// (the handle drops at return).
+/// Probe the daemon's exclusive instance lock through a read-only handle.
+/// A shared probe conflicts with that exclusive lock on both Unix and Windows,
+/// but concurrent probes do not mistake each other for a running daemon.
+/// Missing files mean no holder; access/locking errors never imply readiness.
 fn lock_is_held(path: &Path) -> Result<bool, ClientError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        // Never truncate: a live daemon's pid lives in this file.
-        .truncate(false)
-        .open(path)
-        .map_err(|source| ClientError::Probe {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    match file.try_lock() {
-        Ok(()) => Ok(false),
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ClientError::Probe {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            // Explicitly release before promising no holder: a concurrent fork
+            // can retain a duplicate handle after this local File drops.
+            file.unlock().map_err(|source| ClientError::Probe {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(false)
+        }
         Err(TryLockError::WouldBlock) => Ok(true),
         Err(TryLockError::Error(source)) => Err(ClientError::Probe {
             path: path.to_path_buf(),
@@ -400,7 +408,7 @@ async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response,
     let mut retried = false;
     loop {
         ensure_daemon(base_dir)?;
-        let dirs = RuntimeDir::at_base(base_dir)?;
+        let dirs = RuntimeDir::paths_at_base(base_dir)?;
         let response = exchange(&dirs, envelope).await?;
         if should_retry(&response) && !retried {
             retried = true;
@@ -510,7 +518,7 @@ pub async fn follow_ticket(
         on_event(&event);
         return Ok(event);
     }
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let endpoint = dirs.events_endpoint();
     let mut sub = SubSocket::new();
     sub.connect(&endpoint)
@@ -623,7 +631,7 @@ pub enum DaemonStatus {
 /// Probes whether a daemon holds the instance lock under `base_dir`,
 /// reporting its pid (from the lock file) when it does.
 pub fn probe_daemon(base_dir: &Path) -> Result<DaemonStatus, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let path = dirs.run_dir().join(LOCK_FILE);
     if !lock_is_held(&path)? {
         return Ok(DaemonStatus::NotRunning);
@@ -728,7 +736,7 @@ fn signal_terminate(_pid: u32) -> Result<(), StopError> {
 /// Waits (bounded) for the daemon lock under `base_dir` to be released:
 /// `true` when it was released within `timeout`.
 pub fn wait_for_daemon_exit(base_dir: &Path, timeout: Duration) -> Result<bool, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let path = dirs.run_dir().join(LOCK_FILE);
     let deadline = Instant::now() + timeout;
     loop {

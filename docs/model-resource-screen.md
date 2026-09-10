@@ -43,35 +43,42 @@ vm_stat
 sysctl vm.swapusage
 ```
 
-Put an external wall-time/process supervisor around this invocation. For example,
-a stdlib Python supervisor can enforce a 20-minute process limit:
+The macOS stdlib-only supervisor is the supported bounded measurement wrapper:
 
 ```sh
-python3 - <<'PY'
-import os, subprocess
-process = subprocess.Popen([os.environ['PAM_SCREEN_BIN'], '--ignored', '--nocapture', '--test-threads=1'])
-try:
-    raise SystemExit(process.wait(timeout=1200))
-except subprocess.TimeoutExpired:
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    raise SystemExit('screen process exceeded external time limit')
-PY
+python3 tools/screen-model.py --binary "$PAM_SCREEN_BIN" --output-dir /absolute/new/screen-run
+python3 tools/screen_model_test.py
 ```
 
-For detailed memory supervision, sample the printed PID with macOS `ps -o rss=`
-throughout the run and correlate timestamps with the JSON phase markers. Record
-Activity Monitor memory pressure and interval `vm_stat` swapout deltas alongside
-it. RSS/max RSS is not total Metal/unified-memory allocation; VM size is not
-resident usage. The two-second identity and post-unload windows allow sampling
-before loading and after unloading. Before/after swap totals alone cannot prove
-that pressure remained normal throughout the run. No memory or slowdown claim is
-made by the harness itself. Collect paired timings of the same representative
-developer workload with and without the model under the same conditions.
+The output directory must not already exist. It contains `measurements.jsonl`,
+`stdout.log` and `stderr.log`; each stream is capped at 16 MiB. The wrapper accepts
+only an already-built executable named `resource_screen-<hex>` and supplies the
+fixed ignored-test arguments. Filename validation is a misuse guard, not proof
+that the executable is trustworthy. Use the binary from the preceding build.
+Required artifact environment variables are inherited; the supervisor does not
+print them or download weights.
+
+It samples child RSS (`ps`, KiB converted to bytes), system pressure
+(`kern.memorystatus_vm_pressure_level`) and cumulative `vm_stat` swapouts at a
+0.5-second target cadence. Probe latency adds to that interval; timestamps record
+the actual cadence. It terminates on sampled RSS above 16 GiB, pressure other than
+normal (`1`), additional system swapout pages, unavailable measurements or a
+20-minute deadline. After termination it waits up to five seconds before killing
+and reaping the child. These are **sampled soft stops**, not OS hard memory caps;
+a rapid allocation spike can occur between samples. An existing 1 GiB swap
+allocation is not an added-swapout failure. Swapouts and pressure include ambient
+activity and cannot be attributed exclusively to PAM.
+
+Final measurements include maximum sampled RSS, child exit code, stop reason and
+native `getrusage(RUSAGE_CHILDREN).ru_maxrss`, explicitly in macOS bytes. That
+native high-water value includes measurement subprocesses and is not a delta or
+sum. RSS is not total Metal/unified-memory allocation; virtual size is not resident
+usage. The two-second identity and post-unload windows support phase comparison.
+A successful process exit does not establish returned GPU memory, normal pressure
+between samples, p95 latency or model quality. Collect paired timings of the same
+representative developer workload with and without the model. A 64 GiB host
+remains a 64 GiB measurement; the 16 GiB RSS threshold does not emulate a 32 GiB
+machine or qualify its memory fit.
 
 ## Interpretation
 

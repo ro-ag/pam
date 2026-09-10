@@ -140,7 +140,7 @@ impl Store {
     }
 
     /// Commit intent before I/O. False means stale ownership or a non-ready
-    /// phase; the caller must not execute the operation in that case.
+    /// phase or a terminal request; the caller must not execute in that case.
     pub async fn prepare_flow_attempt(
         &self,
         request_id: &str,
@@ -156,13 +156,13 @@ impl Store {
         }
         let _guard = self.conn_lock.lock().await;
         Ok(self.conn.execute(
-            "UPDATE flow_journal SET revision=revision+1,state='prepared',step_id=?3,attempt=?4,effectful=?5 WHERE request_id=?1 AND revision=?2 AND state='ready'",
+            "UPDATE flow_journal SET revision=revision+1,state='prepared',step_id=?3,attempt=?4,effectful=?5 WHERE request_id=?1 AND revision=?2 AND state='ready' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
             params![request_id,expected_revision,step_id,i64::from(attempt),i64::from(effectful)],
         ).await? == 1)
     }
 
     /// Atomically settle the owned prepared attempt and publish its checkpoint.
-    /// Completed and uncertain journals cannot be modified, even with a fresh CAS.
+    /// Completed and uncertain journals, and terminal requests, reject settlement.
     pub async fn settle_flow_attempt(
         &self,
         request_id: &str,
@@ -177,7 +177,7 @@ impl Store {
         let state = if completed { "completed" } else { "ready" };
         let _guard = self.conn_lock.lock().await;
         Ok(self.conn.execute(
-            "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared'",
+            "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
             params![request_id,expected_revision,state,checkpoint_json,refs],
         ).await? == 1)
     }

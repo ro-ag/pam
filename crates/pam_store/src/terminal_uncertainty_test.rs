@@ -144,3 +144,60 @@ async fn prepared_read_keeps_requested_terminal_outcome_and_audit() {
     assert_eq!(rows[0].decision, Decision::Allow);
     assert_eq!(rows[0].detail.as_deref(), audit().detail);
 }
+
+#[tokio::test]
+async fn terminal_request_cannot_prepare_a_ready_journal() {
+    let store = Store::open_in_memory().await.unwrap();
+    prepared(&store, "ready", false).await;
+    assert!(store.abandon_read_attempt("ready", 1).await.unwrap());
+    let journal = store.read_flow_journal("ready").await.unwrap().unwrap();
+    assert_eq!(journal.state, FlowJournalState::Ready);
+    assert!(
+        store
+            .finish_request(
+                "ready",
+                RequestState::Failed,
+                Some("lease_expired"),
+                audit()
+            )
+            .await
+            .unwrap()
+    );
+    for effectful in [false, true] {
+        assert!(
+            !store
+                .prepare_flow_attempt("ready", journal.revision, "late", 1, effectful)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.read_flow_journal("ready").await.unwrap().unwrap(),
+        journal
+    );
+}
+
+#[tokio::test]
+async fn terminal_request_cannot_settle_a_prepared_read() {
+    let store = Store::open_in_memory().await.unwrap();
+    prepared(&store, "read", false).await;
+    assert!(
+        store
+            .finish_request("read", RequestState::Failed, Some("lease_expired"), audit())
+            .await
+            .unwrap()
+    );
+    let journal = store.read_flow_journal("read").await.unwrap().unwrap();
+    for completed in [false, true] {
+        assert!(
+            !store
+                .settle_flow_attempt("read", journal.revision, "{}", &[], completed)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.read_flow_journal("read").await.unwrap().unwrap(),
+        journal
+    );
+}

@@ -15,6 +15,7 @@ fn pam_ships_the_starter_flows() {
             "ci-failure-triage",
             "dependency-audit",
             "jenkins-build-investigation",
+            "jenkins-node-evidence",
             "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
@@ -385,4 +386,33 @@ fn revision_starters_require_explicit_source_and_run_identity() {
         panic!("job log");
     };
     assert_eq!(with["job_id"].to_string(), "${inputs.job_id}");
+}
+
+#[test]
+fn jenkins_node_evidence_requires_exact_inputs_and_only_observes() {
+    let flow = parse(builtin_yaml("jenkins-node-evidence").unwrap()).unwrap();
+    assert_eq!(
+        flow.inputs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["build", "job", "node_id"]
+    );
+    assert!(flow.inputs.values().all(|input| input.default.is_none()));
+    assert_eq!(flow.steps.len(), 1);
+    let step = &flow.steps[0];
+    assert_eq!(step.role, Role::Observe);
+    assert_eq!(step.output, OutputPolicy::Compact);
+    assert!(step.expect_status.is_none());
+    let Action::Connector {
+        connector,
+        call,
+        with,
+    } = &step.action
+    else {
+        panic!("connector step")
+    };
+    assert_eq!(*connector, ConnectorId::Jenkins);
+    assert_eq!(call, "node_evidence");
+    assert_eq!(with.len(), 3);
+    for key in ["job", "build", "node_id"] {
+        assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+    }
 }

@@ -2145,6 +2145,11 @@ impl RunState<'_> {
         else {
             return;
         };
+        if let Some(summary) = crate::context_summary::summarize(*connector, call, result) {
+            report.summary = crate::evidence_view::redact(summary.as_bytes())
+                .ok()
+                .and_then(|view| String::from_utf8(view.bytes).ok());
+        }
         if (*connector == ConnectorId::Jenkins
             && matches!(call.as_str(), "investigate" | "node_evidence"))
             || (*connector == ConnectorId::Sonarqube && call == "analysis")

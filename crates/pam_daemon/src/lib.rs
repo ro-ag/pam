@@ -15,6 +15,9 @@ pub mod command_containment;
 #[cfg(test)]
 mod command_containment_test;
 pub mod connector_service;
+mod context_summary;
+#[cfg(test)]
+mod context_summary_test;
 mod correlation;
 mod correlation_eval;
 #[cfg(test)]

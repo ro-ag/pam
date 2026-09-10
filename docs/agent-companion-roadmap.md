@@ -95,6 +95,10 @@ identity blocks downstream use while retaining evidence. The separate
 GUI-owned repository mapping. Durable watches and guarded local verification
 remain separate work.
 
+Explicit issue/page/document flows provide [cited enterprise context](enterprise-context.md)
+with bounded excerpts and clear unsupported or partial states. SharePoint text
+capture checks site membership, download origin and metadata consistency.
+
 ### Plan #32 — Correlate enterprise products and collect decisive evidence
 
 The [enterprise connector contracts](enterprise-connector-contracts.md) record supported deployment/auth modes, bounded coverage, and the distinction between fixtures and live qualification.

@@ -227,6 +227,11 @@ const CONFLUENCE_CALLS: &[CallSpec] = &[
 
 const SHAREPOINT_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "document",
+        args: &[("site", true), ("drive", true), ("item", true)],
+        yields_log: false,
+    },
+    CallSpec {
         name: "documents",
         args: &[("site", true), ("query", true), ("limit", false)],
         yields_log: false,

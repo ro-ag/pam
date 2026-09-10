@@ -3978,10 +3978,12 @@ version = "0.3.1"
 dependencies = [
  "clap",
  "pam_client",
+ "pam_connectors",
  "pam_daemon",
  "pam_gui",
  "pam_proto",
  "pam_store",
+ "pam_testkit",
  "serde_json",
  "tauri",
  "tauri-build",

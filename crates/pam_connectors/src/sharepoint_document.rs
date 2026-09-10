@@ -1,5 +1,5 @@
 //! Bounded Graph text capture. A metadata recheck is not immutable remote-version proof.
-//! Graph content: https://learn.microsoft.com/graph/api/driveitem-get-content
+//! Graph content: <https://learn.microsoft.com/graph/api/driveitem-get-content>
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -30,9 +30,9 @@ pub(crate) async fn document(
     let item_url = endpoint(&conn.base_url, &["drives", &drive, "items", &item])?;
     let before = get_json(conn, ID, item_url.clone(), transport, deadline).await?;
     let metadata = project_metadata(&before, &item, &drive, &site_url)?;
-    let mut output = json!({"schema_version":1,"site":resolved,"drive":drive,"item":item,"citation":metadata["webUrl"],"metadata":metadata,"content":{"state":"unavailable","consistency":"not_checked","source_bytes":metadata["size"],"retained_bytes":0,"text":null},"partial":true,"limitations":[]});
-    let size = metadata["size"].as_u64().expect("validated size");
-    if size > MAX_TEXT {
+    let mut output = json!({"schema_version":1,"site":resolved,"drive":drive,"item":item,"citation":{"provider":"sharepoint_365","id":item,"site_id":resolved,"drive_id":drive,"source_url":metadata["webUrl"],"revision_basis":"metadata_change_tags","etag":metadata["eTag"],"ctag":metadata["cTag"],"updated":metadata["lastModifiedDateTime"]},"metadata":metadata,"content":{"state":"unavailable","consistency":"not_checked","source_bytes":metadata["size"],"retained_bytes":0,"text":null},"partial":true,"limitations":[]});
+    let byte_count = metadata["size"].as_u64().expect("validated size");
+    if byte_count > MAX_TEXT {
         return Ok(state(
             output,
             "too_large",
@@ -62,14 +62,14 @@ pub(crate) async fn document(
     let unchanged = ["id", "eTag", "cTag", "size", "mime_type", "webUrl"]
         .iter()
         .all(|key| metadata[*key] == after[*key]);
-    if !unchanged || text.len() as u64 != size {
+    if !unchanged || text.len() as u64 != byte_count {
         return Ok(state(
             output,
             "changed_during_read",
             "document identity, version metadata, or byte count changed during capture",
         ));
     }
-    output["content"] = json!({"state":"available","consistency":"metadata_rechecked","source_bytes":size,"retained_bytes":text.len(),"text":text});
+    output["content"] = json!({"state":"available","consistency":"metadata_rechecked","source_bytes":byte_count,"retained_bytes":text.len(),"text":text});
     output["partial"] = json!(false);
     output["limitations"] = json!([
         "metadata recheck does not prove an immutable remote version; evidence digest identifies captured bytes"
@@ -226,13 +226,13 @@ fn project_metadata(
     if citation_url(web)?.host_str() != site.host_str() {
         return Err(bad("Graph item citation belongs to another host"));
     }
-    let size = body["size"]
+    let byte_count = body["size"]
         .as_u64()
         .ok_or_else(|| bad("Graph item size was invalid"))?;
     let etag = field(body, "eTag", 1024)?;
     let ctag = field(body, "cTag", 1024)?;
     Ok(
-        json!({"id":item,"name":field(body,"name",1024)?,"webUrl":web,"size":size,"lastModifiedDateTime":field(body,"lastModifiedDateTime",128)?,"eTag":etag,"cTag":ctag,"mime_type":field(&body["file"],"mimeType",128)?}),
+        json!({"id":item,"name":field(body,"name",1024)?,"webUrl":web,"size":byte_count,"lastModifiedDateTime":field(body,"lastModifiedDateTime",128)?,"eTag":etag,"cTag":ctag,"mime_type":field(&body["file"],"mimeType",128)?}),
     )
 }
 

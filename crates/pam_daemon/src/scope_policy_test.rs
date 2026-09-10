@@ -605,3 +605,51 @@ async fn invalid_redirect_targets_and_a_second_redirect_are_not_followed() {
         );
     }
 }
+
+#[tokio::test]
+async fn sharepoint_scope_revocation_after_membership_blocks_item_download() {
+    let root = tempfile::tempdir().unwrap();
+    let store = configured_store().await;
+    store
+        .upsert_connector(
+            "sharepoint",
+            ConnectorPatch {
+                enabled: Some(true),
+                base_url: Some(Some(BASE)),
+                ..ConnectorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let site = "tenant.sharepoint.com,site,web";
+    policy(root.path(), ConnectorId::Sharepoint, &[site])
+        .save(&store)
+        .await
+        .unwrap();
+    let transport = Arc::new(RevokingTransport {
+        store: Arc::clone(&store),
+        inner: FakeTransport::new()
+            .json(200, &serde_json::json!({"id":site,"webUrl":"https://tenant.sharepoint.com/sites/project"}).to_string())
+            .json(200, r#"{"value":[{"id":"drive-1"}]}"#),
+        calls: AtomicUsize::new(0), revoke_after: 2, change_url: false,
+    });
+    let backend = Arc::new(CountingSecrets::default());
+    let service = service(&store, &backend, Arc::clone(&transport) as Arc<_>);
+    let arguments = BTreeMap::from([
+        ("site".to_owned(), ArgValue::Text(site.to_owned())),
+        ("drive".to_owned(), ArgValue::Text("drive-1".to_owned())),
+        ("item".to_owned(), ArgValue::Text("item-1".to_owned())),
+    ]);
+    let error = service
+        .invoke(
+            root.path(),
+            ConnectorId::Sharepoint,
+            "document",
+            &arguments,
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause(), CAUSE_SCOPE_DENIED);
+    assert_eq!(transport.inner.requests().len(), 2);
+}

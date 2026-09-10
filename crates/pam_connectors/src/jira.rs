@@ -116,7 +116,7 @@ async fn issue(
         .map(str::len);
     let content = content_metadata(&description, source_bytes, cut);
     let updated = citation_text(fields.get("updated"), 128)?;
-    let source_url = citation_url(endpoint(&conn.base_url, &["browse", &key])?)?;
+    let source_url = citation_url(&endpoint(&conn.base_url, &["browse", &key])?)?;
     let citation = json!({
         "provider": "jira_dc", "key": key, "source_url": source_url,
         "url_basis": "configured_site", "revision_basis": "provider_updated",
@@ -232,7 +232,7 @@ pub(crate) fn citation_text(
 }
 
 /// Reconstructed from configured site and validated identity, never `_links`.
-pub(crate) fn citation_url(url: url::Url) -> Result<String, ConnectorError> {
+pub(crate) fn citation_url(url: &url::Url) -> Result<String, ConnectorError> {
     if url.as_str().len() > 4096
         || !url.username().is_empty()
         || url.password().is_some()

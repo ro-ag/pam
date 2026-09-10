@@ -63,6 +63,9 @@ async fn captures_text_after_site_membership_and_version_recheck_without_leaking
     assert_eq!(result["content"]["consistency"], "metadata_rechecked");
     assert_eq!(result["content"]["retained_bytes"], 5);
     assert_eq!(result["partial"], false);
+    assert_eq!(result["citation"]["source_url"], meta()["webUrl"]);
+    assert_eq!(result["citation"]["etag"], meta()["eTag"]);
+    assert_eq!(result["citation"]["id"], "item");
     assert!(!result.to_string().contains("do-not-persist"));
     assert_eq!(t.requests().len(), 6);
     assert!(

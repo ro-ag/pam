@@ -1,6 +1,7 @@
 //! Bounded plain-text context projections; source JSON remains the evidence.
 use pam_flow::ConnectorId;
 use serde_json::Value;
+use std::fmt::Write as _;
 
 const MAX_SUMMARY: usize = 4000;
 const MAX_EXCERPT: usize = 2000;
@@ -53,7 +54,7 @@ pub(crate) fn summarize(connector: ConnectorId, call: &str, result: &Value) -> O
         Some(Value::Null) => summary.push_str("[content is null; unavailable, not empty]\n"),
         None => summary.push_str("[content is missing; unavailable, not empty]\n"),
         Some(_) => {
-            summary.push_str("[content representation unsupported; inspect cited evidence]\n")
+            summary.push_str("[content representation unsupported; inspect cited evidence]\n");
         }
     }
     debug_assert!(summary.len() <= MAX_SUMMARY);
@@ -69,10 +70,10 @@ fn metadata(value: Option<&Value>, limit: usize) -> String {
         _ => return "[not provided]".to_owned(),
     };
     let (escaped, consumed) = escaped_prefix(&raw, raw.len(), limit);
-    if consumed != raw.len() {
-        "[oversized escaped value; inspect evidence]".to_owned()
-    } else {
+    if consumed == raw.len() {
         escaped
+    } else {
+        "[oversized escaped value; inspect evidence]".to_owned()
     }
 }
 
@@ -87,10 +88,12 @@ fn append_excerpt(summary: &mut String, text: &str) {
     summary.push('"');
     summary.push_str(&excerpt);
     summary.push_str("\"\n");
-    summary.push_str(&format!(
-        "Excerpt source bytes: {consumed}/{}; omitted bytes: {}. Counts refer to returned text; provider omissions are separate.\n",
-        text.len(), text.len() - consumed
-    ));
+    let _ = writeln!(
+        summary,
+        "Excerpt source bytes: {consumed}/{}; omitted bytes: {}. Counts refer to returned text; provider omissions are separate.",
+        text.len(),
+        text.len() - consumed
+    );
 }
 
 /// Preserve Unicode boundaries and reversible escapes for controls, quotes and slashes.

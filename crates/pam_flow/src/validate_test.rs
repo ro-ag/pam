@@ -561,7 +561,10 @@ fn the_connector_call_table_matches_the_spec() {
     );
     assert_eq!(names(ConnectorId::Jira), ["search", "issue"]);
     assert_eq!(names(ConnectorId::Confluence), ["search", "page"]);
-    assert_eq!(names(ConnectorId::Sharepoint), ["documents", "lists"]);
+    assert_eq!(
+        names(ConnectorId::Sharepoint),
+        ["document", "documents", "lists"]
+    );
     assert_eq!(names(ConnectorId::Aws), ["commands", "cli"]);
 
     let spec = |id, call: &str| {

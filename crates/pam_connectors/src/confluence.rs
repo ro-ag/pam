@@ -211,7 +211,7 @@ fn page_citation(conn: &Connection, id: &str, response: &Value) -> Result<Value,
         },
     };
     Ok(json!({
-        "provider":"confluence_cloud", "id":id, "source_url":citation_url(url)?,
+        "provider":"confluence_cloud", "id":id, "source_url":citation_url(&url)?,
         "url_basis":"configured_site", "revision_basis":"provider_version",
         "version":version, "space_id":citation_text(response.get("spaceId"),128)?,
         "representation":"storage",

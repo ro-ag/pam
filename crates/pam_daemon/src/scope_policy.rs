@@ -285,7 +285,7 @@ fn call_target<'a>(
         (ConnectorId::Sonarqube, "quality_gate" | "issues" | "analysis") => "project",
         (ConnectorId::Jira, "issue") => "key",
         (ConnectorId::Confluence, "page") => "id",
-        (ConnectorId::Sharepoint, "documents" | "lists") => "site",
+        (ConnectorId::Sharepoint, "document" | "documents" | "lists") => "site",
         _ => return None,
     };
     let ArgValue::Text(raw) = args.get(name)? else {

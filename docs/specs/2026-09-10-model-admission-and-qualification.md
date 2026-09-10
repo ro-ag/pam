@@ -1,6 +1,10 @@
 # Bounded evidence and local-model qualification
 
-Status: proposed implementation contract · 2026-09-10 · plan 30, task 118
+Status: target qualification contract · updated 2026-09-10 · plans 31–35
+
+Implementation tracking: [delivery roadmap](../agent-companion-roadmap.md).
+Task #119 added experimental Microsoft record selection and initial summary
+limits; it did not establish qualification or complete every admission boundary.
 
 Companion to [agent investigation](2026-09-09-local-model-triage.md) and
 [model prompts](2026-09-09-local-model-prompts.md). This defines admission and
@@ -62,8 +66,10 @@ dropping them. No failure visible in a slice establishes only that observation.
 ## Microsoft semantic compression
 
 Pipeline: deterministic source-preserving reduction, optional qualified
-LLMLingua-2 extraction, then bounded local investigation. Microsoft compression
-is an experiment to qualify, not an existing Rust log-compression capability.
+LLMLingua-2 extraction, then bounded local investigation. Task #119 implemented
+an experimental pure-Rust scorer with PAM whole-record retention and source maps.
+It defaults off and remains unqualified for logs; see
+[implementation and measured smoke limits](../microsoft-compression.md).
 
 `pam-old` considered the approximately 713 MB LLMLingua-2 mBERT candidate, but its
 later task-25 decision restricted proposed use to prose and explicitly excluded

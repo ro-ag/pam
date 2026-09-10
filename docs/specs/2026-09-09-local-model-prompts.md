@@ -4,6 +4,10 @@ Status: proposed templates, revised 2026-09-10. Supersedes the previous
 `digest`/`classify`/model-owned `check` prompts. Companion to
 [local investigation](2026-09-09-local-model-triage.md).
 
+Implementation tracking: [delivery roadmap](../agent-companion-roadmap.md),
+especially task #139. The existing prose summarizer is not this validated JSON
+investigator; its smoke results do not satisfy this contract.
+
 ## One bounded call
 
 The daemon supplies a versioned task, exact correlated target, authoritative

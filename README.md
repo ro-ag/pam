@@ -103,6 +103,13 @@ unresolved and stop dependent gates. The generic **Rust PR readiness** starter
 covers Rust checks only; customize it for another project's required gates.
 Both flows retain the configured program allowlist and approval policy.
 
+## Agent-companion roadmap
+
+The [delivery roadmap](docs/agent-companion-roadmap.md) maps remaining work to
+ptrack plans and acceptance gates. The [agent workflow contract](docs/agent-workflow-contract.md)
+defines what PAM should do for a sandboxed caller, what works today, and how to
+continue implementation.
+
 ## Releasing
 
 1. Bump the version in `Cargo.toml` (`[workspace.package]`),

@@ -1,6 +1,13 @@
 # PAM v2 — rewrite plan (new repository)
 
-Status: draft. Repo: `ro-ag/pam` (fresh). The old codebase lives archived at
+Status: historical rewrite proposal; not the current implementation guide.
+The [agent-companion roadmap](agent-companion-roadmap.md) and its linked specs
+supersede this document on model priority/eligibility, Candle-only Rust runtime,
+CLI-only agent access (no MCP), sandbox/admin trust, and model authority. Old
+llama.cpp, size-floor, chatbot and model-controlled retry proposals below are
+retained as history, not instructions to implement.
+
+Original status: draft. Repo: `ro-ag/pam` (fresh). The old codebase lives archived at
 `ro-ag/pam-old`.
 
 ## North star

@@ -5,6 +5,9 @@ credential-holding worker, model gate, and verdict-driven effect design.
 Companions: [prompt contract](2026-09-09-local-model-prompts.md) and
 [admission and qualification](2026-09-10-model-admission-and-qualification.md).
 
+Implementation tracking: [delivery roadmap](../agent-companion-roadmap.md) and
+[agent workflow contract](../agent-workflow-contract.md).
+
 ## Product and boundary
 
 Enterprise Codex sessions waste time and tokens retrying blocked git/network
@@ -40,8 +43,11 @@ are prose with `model_skipped` reporting. Jenkins/Sonar connector reads are
 wired. There is no JFrog connector. Legacy diagnosis helpers or their tests
 do not establish a working investigation flow.
 
-Bounded investigation, correlated polling, durable resume, structured diagnosis,
-and validated diagnostic routing below are proposed. Existing latest-run
+Task #119 added deterministic Jenkins stage/node investigation and a bounded
+CLI observation summary, plus experimental Microsoft record selection for log
+summaries. It does not assert root cause or provide CLI evidence retrieval.
+Qualified model investigation, correlated polling, durable resume, structured
+diagnosis and validated diagnostic routing below remain proposed. Existing latest-run
 starter flows do not satisfy this contract. Neither old model smoke results nor
 the current summarizer establish investigation quality.
 

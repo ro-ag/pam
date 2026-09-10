@@ -62,3 +62,14 @@ CPU build. `/usr/bin/time` reported approximately 1.61 GB maximum resident
 set size for the test command. This exceeds the runtime's 30-second caller
 budget; optimized latency has not been qualified. The smoke intentionally
 calls the classifier directly to prove inference and source mapping.
+
+## Optimized follow-up smoke
+
+Three release-build runs on the 64 GiB M4 Max took 2.501, 2.412 and 2.383
+seconds for the same synthetic fixture, retaining its required facts and reducing
+1,017 tokens to 459. Maximum RSS ranged from 1.589 to 1.604 decimal GB.
+The earlier 70.88-second debug timing is not a release latency estimate.
+[Recorded measurements](benchmarks/2026-09-10-compressor/release-smoke.json)
+include the source revision and limitations. This supports further evaluation,
+not default enablement: one protected-fact fixture, three ambient-load runs and
+warmed file caches cannot establish log fidelity, p95 latency or frontier savings.

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "purpose": "synthetic_smoke_not_qualification",
+  "pam_revision": "8085008",
+  "build_profile": "release",
+  "cpu": "Apple M4 Max",
+  "memory_bytes": 68719476736,
+  "backend": "cpu",
+  "workload": "ambient IDE/browser plus concurrent public weight download; uncontrolled",
+  "model": "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+  "model_revision": "5f0c82792b7ea14c6484e015b6a072009496b7f2",
+  "source_bytes": 4350,
+  "output_bytes": 1753,
+  "input_tokens": 1017,
+  "output_tokens": 459,
+  "runs": [
+    {
+      "run": 1,
+      "preparation_seconds": 2.50146525,
+      "maximum_rss_bytes": 1589133312,
+      "peak_memory_footprint_bytes": 1583285976,
+      "test_passed": true
+    },
+    {
+      "run": 2,
+      "preparation_seconds": 2.411841542,
+      "maximum_rss_bytes": 1603829760,
+      "peak_memory_footprint_bytes": 1597982424,
+      "test_passed": true
+    },
+    {
+      "run": 3,
+      "preparation_seconds": 2.382928333,
+      "maximum_rss_bytes": 1592098816,
+      "peak_memory_footprint_bytes": 1586235072,
+      "test_passed": true
+    }
+  ],
+  "limitations": [
+    "Single synthetic fixture with deterministic protected facts, not independent incident qualification.",
+    "Three fresh processes with warmed filesystem caches; not cold-cache or p95 measurements.",
+    "No paired frontier token or developer workload slowdown measurement.",
+    "64 GiB host is not the 32 GB target."
+  ],
+  "harness_sha256": "7fe45a7a2da294b51f4323fc151881f43dd229cc410e6576d45ec912cb552f2f"
+}

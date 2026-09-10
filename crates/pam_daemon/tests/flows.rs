@@ -320,7 +320,7 @@ async fn flow_list_and_show_answer_for_the_builtins() {
                 .request(&read_envelope(
                     "req_list",
                     CAP_FLOW_LIST,
-                    serde_json::json!({}),
+                    serde_json::json!({"limit":50}),
                 ))
                 .await,
         );
@@ -382,7 +382,7 @@ async fn a_library_flow_shadows_a_builtin_of_the_same_id() {
                 .request(&read_envelope(
                     "req_list",
                     CAP_FLOW_LIST,
-                    serde_json::json!({}),
+                    serde_json::json!({"limit":50}),
                 ))
                 .await,
         );

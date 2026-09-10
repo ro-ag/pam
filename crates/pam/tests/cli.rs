@@ -913,6 +913,10 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
     .expect("clean-tree CLI cases complete within deadline");
 }
 
+// The private administration adapter is validated only for macOS and Linux;
+// elsewhere send_admin refuses with admin_transport_unsupported. Both the
+// helper and its only caller carry that gate, so neither becomes dead code.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn flow_admin(base: &Path, op: &str, args: serde_json::Value) -> serde_json::Value {
     match client::send_admin(base, op, args, 5000).await.unwrap() {
         Response::Result { body, .. } => body,
@@ -920,6 +924,7 @@ async fn flow_admin(base: &Path, op: &str, args: serde_json::Value) -> serde_jso
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
     timeout(DEADLINE, async {

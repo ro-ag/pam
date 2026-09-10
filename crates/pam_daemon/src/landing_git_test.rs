@@ -236,7 +236,7 @@ fn outbound_preflight_requires_exact_bounded_object_identity_and_size() {
         .cause,
         "landing_git_outbound_limit"
     );
-    let ids = (1..=13).map(|n| format!("{n:040x}")).collect::<Vec<_>>();
+    let ids = (1..=17).map(|n| format!("{n:040x}")).collect::<Vec<_>>();
     let output = ids
         .iter()
         .map(|id| format!("{id} blob {}\n", 4 * 1024 * 1024))
@@ -324,6 +324,22 @@ async fn fresh_authorization_refuses_before_any_network_process_can_spawn() {
     assert_eq!(refused.cause, "landing_authorization_changed");
     assert!(guard.0.load(Ordering::SeqCst));
     assert!(!started.load(Ordering::SeqCst));
+    // Earlier reads consume the original allowance; a later push cannot reset it.
+    drop(
+        session
+            .budget
+            .http_persisted(60 * 1024 * 1024)
+            .await
+            .unwrap(),
+    );
+    guard.0.store(false, Ordering::SeqCst);
+    let refused = session
+        .authorize_network(true, &mut cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.cause, "request_budget_exhausted");
+    assert!(!guard.0.load(Ordering::SeqCst));
+    assert!(!started.load(Ordering::SeqCst));
 }
 
 #[cfg(target_os = "macos")]
@@ -393,7 +409,7 @@ async fn local_preflight_copies_a_verified_pack_and_disconnects_source_objects()
             authorization: Arc::new(Allow),
         };
         runtime.block_on(async {
-            session.isolate_objects(&mut cancelled).await?;
+            session.isolate_objects(None, &mut cancelled).await?;
             assert!(
                 !session
                     .workspace
@@ -423,6 +439,184 @@ async fn local_preflight_copies_a_verified_pack_and_disconnects_source_objects()
                 budget.usage().http_calls,
                 0,
                 "local preparation never opens a network transaction"
+            );
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn projection_boundary_parser_requires_complete_bounded_commit_identities() {
+    let old = "a".repeat(40);
+    let new = "b".repeat(40);
+    let second = "c".repeat(40);
+    let capture = |text: String| Capture {
+        code: Some(0),
+        output: text.into_bytes(),
+        diagnostics: 0,
+    };
+    assert_eq!(
+        projection_boundaries(&capture(format!("{new}\n-{old}\n-{second}\n")), &old, &new).unwrap(),
+        vec![old.clone(), second]
+    );
+    assert_eq!(
+        projection_boundaries(&capture(String::new()), &old, &old).unwrap(),
+        vec![old.clone()]
+    );
+    for text in [
+        format!("{new}\n"),
+        format!("-{old}\n"),
+        format!("{new}\n-{old}\n-{old}\n"),
+        format!("{new}\n-malformed\n"),
+    ] {
+        assert!(projection_boundaries(&capture(text), &old, &new).is_err());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn projection_git(path: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .current_dir(path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+#[cfg(target_os = "macos")]
+fn projection_git_ok(path: &Path, args: &[&str]) -> String {
+    let output = projection_git(path, args);
+    assert!(
+        output.status.success(),
+        "local fixture Git failed: {args:?}"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn merge_projection_fixture(parent: &Path) -> (CheckoutRequest, String, String, PathBuf) {
+    let mut request = local_object_fixture(parent);
+    let repo = &request.repository;
+    let ancestor = request.expected_commit.clone();
+    for index in 0..5 {
+        fs::write(repo.join("file"), format!("history{index}")).unwrap();
+        projection_git_ok(repo, &["add", "."]);
+        projection_git_ok(repo, &["commit", "-qm", "history"]);
+    }
+    let old = projection_git_ok(repo, &["rev-parse", "HEAD"]);
+    let remote = parent.join("remote.git");
+    projection_git_ok(
+        parent,
+        &[
+            "clone",
+            "--bare",
+            "--no-hardlinks",
+            repo.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    projection_git_ok(repo, &["checkout", "-qb", "side", &ancestor]);
+    fs::write(repo.join("side"), "side content").unwrap();
+    projection_git_ok(repo, &["add", "."]);
+    projection_git_ok(repo, &["commit", "-qm", "side"]);
+    projection_git_ok(repo, &["checkout", "-q", "main"]);
+    projection_git_ok(repo, &["merge", "--no-ff", "-qm", "merge side", "side"]);
+    request.expected_commit = projection_git_ok(repo, &["rev-parse", "HEAD"]);
+    (request, old, ancestor, remote)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn incremental_projection_cuts_history_preserves_merge_trees_and_exact_lease() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let (request, old, ancestor, remote) = merge_projection_fixture(&parent);
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let budget = RequestBudget::new(deadline);
+    let (_sender, mut cancel) = watch::channel(false);
+    let config = GitTransport::resolve(&request, budget.clone(), &mut cancel, deadline)
+        .await
+        .unwrap();
+    let runtime = tokio::runtime::Handle::current();
+    landing_checkout::owned_worker(&mut cancel, move |mut cancelled| {
+        let session = Session {
+            config: &config,
+            request: &request,
+            workspace: Workspace::create(&request.checkouts_root, &request.repository)?,
+            credential: Secret::new("unused".into()),
+            budget: budget.clone(),
+            deadline,
+            started: Arc::new(AtomicBool::new(false)),
+            authorization: Arc::new(Allow),
+        };
+        runtime.block_on(async {
+            session.isolate_objects(Some(&old), &mut cancelled).await?;
+            let metadata = session.workspace.root.join("metadata");
+            let shallow = fs::read_to_string(metadata.join("shallow")).unwrap();
+            assert_eq!(
+                shallow.lines().count(),
+                2,
+                "both merge boundaries must be retained"
+            );
+            assert!(shallow.lines().any(|id| id == old));
+            assert!(shallow.lines().any(|id| id == ancestor));
+            assert!(!metadata.join("objects/info/alternates").exists());
+            fs::rename(
+                request.repository.join(".git/objects"),
+                request.repository.join(".git/disconnected"),
+            )
+            .unwrap();
+            projection_git_ok(
+                &metadata,
+                &["fsck", "--strict", "--no-reflogs", &request.expected_commit],
+            );
+            let lease = format!("--force-with-lease=refs/heads/main:{old}");
+            let refspec = format!("{}:refs/heads/main", request.expected_commit);
+            projection_git_ok(
+                &metadata,
+                &[
+                    "push",
+                    "--porcelain",
+                    &lease,
+                    remote.to_str().unwrap(),
+                    &refspec,
+                ],
+            );
+            assert_eq!(
+                projection_git_ok(&remote, &["rev-parse", "refs/heads/main"]),
+                request.expected_commit
+            );
+            let stale = projection_git(
+                &metadata,
+                &[
+                    "push",
+                    "--porcelain",
+                    &lease,
+                    remote.to_str().unwrap(),
+                    &format!("{old}:refs/heads/main"),
+                ],
+            );
+            assert!(!stale.status.success());
+            assert_eq!(
+                projection_git_ok(&remote, &["rev-parse", "refs/heads/main"]),
+                request.expected_commit
+            );
+            assert_eq!(
+                budget.usage().http_calls,
+                0,
+                "projection itself is network-free"
             );
             Ok(())
         })

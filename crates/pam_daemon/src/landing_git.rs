@@ -24,8 +24,9 @@ use tokio::{
 };
 
 const PIPE_LIMIT: usize = 32 * 1024;
-const MAX_OUTBOUND_OBJECTS: usize = 512;
-const MAX_OUTBOUND_BYTES: u64 = 48 * 1024 * 1024;
+const MAX_OUTBOUND_OBJECTS: usize = 16_384;
+const METADATA_LIMIT: usize = 1024 * 1024;
+const MAX_OUTBOUND_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(crate) type GitError = CheckoutError;
 pub(crate) trait GitAuthorization: Send + Sync {
@@ -344,14 +345,14 @@ impl Session<'_> {
         // Conservative transaction admission, not physical HTTP metering: Git
         // does not expose exact wire bytes or authentication round trips.
         let maximum = if mutation {
-            64 * 1024 * 1024
+            80 * 1024 * 1024
         } else {
             4 * 1024 * 1024
         };
-        for index in 0..4 {
+        for _ in 0..4 {
             let reservation = self
                 .budget
-                .http_persisted(if index == 0 { maximum } else { 0 })
+                .http_persisted(maximum / 4)
                 .await
                 .map_err(|e| error(e.cause, e.resource))?;
             // Fully charged on success, cancellation, and transport ambiguity.
@@ -396,9 +397,18 @@ impl Session<'_> {
             .attempt_persisted()
             .await
             .map_err(|e| error(e.cause, e.resource))?;
+        let output_limit = if !network
+            && matches!(
+                args.first().map(String::as_str),
+                Some("rev-list" | "cat-file")
+            ) {
+            METADATA_LIMIT
+        } else {
+            PIPE_LIMIT
+        };
         let reservation = self
             .budget
-            .command_persisted((PIPE_LIMIT * 2) as u64)
+            .command_persisted((output_limit + PIPE_LIMIT) as u64)
             .await
             .map_err(|e| error(e.cause, e.resource))?;
         if network {
@@ -426,15 +436,17 @@ impl Session<'_> {
             .take()
             .ok_or_else(|| invalid("Git diagnostic pipe unavailable"))?;
         let collect = async {
-            let (_, output, diagnostics) =
-                tokio::try_join!(send_input(stdin, input), pipe(stdout), pipe(stderr)).map_err(
-                    |_| {
-                        error(
-                            "landing_git_output_limit",
-                            "Git output exceeded its bounded capture",
-                        )
-                    },
-                )?;
+            let (_, output, diagnostics) = tokio::try_join!(
+                send_input(stdin, input),
+                bounded_pipe(stdout, output_limit),
+                pipe(stderr)
+            )
+            .map_err(|_| {
+                error(
+                    "landing_git_output_limit",
+                    "Git output exceeded its bounded capture",
+                )
+            })?;
             let code = child
                 .wait()
                 .await
@@ -516,10 +528,43 @@ fn outbound_ids(output: &Capture) -> Result<Vec<String>, CheckoutError> {
     {
         return Err(error(
             "landing_git_outbound_limit",
-            "outbound object count exceeds512 or contains invalid identities",
+            "outbound object count exceeds16384 or contains invalid identities",
         ));
     }
     Ok(ids)
+}
+fn projection_boundaries(
+    output: &Capture,
+    old: &str,
+    new: &str,
+) -> Result<Vec<String>, CheckoutError> {
+    if !oid(old) || !oid(new) || output.code != Some(0) || output.output.len() > METADATA_LIMIT {
+        return Err(invalid("private projection ancestry is unproven"));
+    }
+    let text = std::str::from_utf8(&output.output)
+        .map_err(|_| invalid("private projection ancestry is malformed"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut boundaries = Vec::new();
+    for line in text.lines() {
+        let id = line.strip_prefix('-').unwrap_or(line);
+        if !oid(id) || !seen.insert(id) || seen.len() > MAX_OUTBOUND_OBJECTS {
+            return Err(invalid(
+                "private projection ancestry exceeds its identity bound",
+            ));
+        }
+        if line.starts_with('-') {
+            boundaries.push(id.to_owned());
+        }
+    }
+    // A no-op push has an empty range; old itself is a complete shallow root.
+    if old == new && seen.is_empty() {
+        boundaries.push(old.to_owned());
+    }
+    if boundaries.is_empty() || (old != new && !seen.contains(new)) {
+        return Err(invalid("private projection has no proven boundary"));
+    }
+    boundaries.sort();
+    Ok(boundaries)
 }
 fn outbound_sizes(ids: &[String], output: &Capture) -> Result<u64, CheckoutError> {
     if output.code != Some(0) {
@@ -550,19 +595,25 @@ fn outbound_sizes(ids: &[String], output: &Capture) -> Result<u64, CheckoutError
         if size > 4 * 1024 * 1024 || total > MAX_OUTBOUND_BYTES {
             return Err(error(
                 "landing_git_outbound_limit",
-                "outbound objects exceed the4MiB individual or48MiB total limit",
+                "outbound objects exceed the4MiB individual or64MiB total limit",
             ));
         }
     }
     Ok(total)
 }
 async fn pipe(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    bounded_pipe(reader, PIPE_LIMIT).await
+}
+async fn bounded_pipe(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     reader
-        .take((PIPE_LIMIT + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut output)
         .await?;
-    if output.len() > PIPE_LIMIT {
+    if output.len() > limit {
         return Err(std::io::Error::other("Git pipe limit"));
     }
     Ok(output)
@@ -832,12 +883,44 @@ impl GitTransport {
     }
 }
 impl Session<'_> {
-    async fn isolate_objects(
+    async fn project_history(
         &self,
+        old: Option<&str>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(), CheckoutError> {
-        // A complete bounded closure avoids all source-object access during
-        // network Git traversal. Large histories are explicitly unsupported.
+        let Some(old) = old else {
+            return Ok(());
+        };
+        let captured = self
+            .run(
+                &[
+                    "rev-list".into(),
+                    "--boundary".into(),
+                    self.request.expected_commit.clone(),
+                    format!("^{old}"),
+                    "--".into(),
+                ],
+                false,
+                false,
+                cancel,
+            )
+            .await?;
+        let boundaries = projection_boundaries(&captured, old, &self.request.expected_commit)?;
+        fs::write(
+            self.workspace.root.join("metadata/shallow"),
+            boundaries.join("\n") + "\n",
+        )
+        .map_err(|_| invalid("private shallow boundary could not be written"))
+    }
+    async fn isolate_objects(
+        &self,
+        old: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(), CheckoutError> {
+        self.project_history(old, cancel).await?;
+        // Git traverses all trees but stops commit ancestry at the verified
+        // private shallow boundaries. Without an old ref, full closure remains
+        // bounded: new branches with oversized history are explicitly refused.
         let args = vec![
             "rev-list".into(),
             "--objects".into(),
@@ -900,10 +983,10 @@ impl Session<'_> {
             stored = stored
                 .checked_add(meta.len())
                 .ok_or_else(|| invalid("private pack size overflow"))?;
-            if !meta.is_file() || stored > 64 * 1024 * 1024 {
+            if !meta.is_file() || stored > 80 * 1024 * 1024 {
                 return Err(error(
                     "landing_git_outbound_limit",
-                    "private pack exceeds its64MiB disk bound",
+                    "private pack exceeds its80MiB disk bound",
                 ));
             }
         }
@@ -1011,7 +1094,7 @@ impl Session<'_> {
                 ));
             }
         }
-        self.isolate_objects(cancel).await?;
+        self.isolate_objects(old.as_deref(), cancel).await?;
         self.recheck_source(reference, expected_base, cancel)
             .await?;
         let result = self

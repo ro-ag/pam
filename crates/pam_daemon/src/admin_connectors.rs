@@ -67,12 +67,12 @@ pub const OP_SONAR_MAPPINGS_GET: &str = "admin.connectors.sonar_mappings.get";
 pub const OP_SONAR_MAPPINGS_SET: &str = "admin.connectors.sonar_mappings.set";
 
 pub const CONNECTOR_ADMIN_OPS: &[&str] = &[
-    OP_SONAR_MAPPINGS_GET,
-    OP_SONAR_MAPPINGS_SET,
     OP_CONNECTORS_LIST,
     OP_CONNECTORS_CONFIGURE,
     OP_CONNECTORS_TEST,
     OP_CONNECTORS_KEYRING,
+    OP_SONAR_MAPPINGS_GET,
+    OP_SONAR_MAPPINGS_SET,
 ];
 
 /// `audit.action` recording a connector's configuration change.

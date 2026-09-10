@@ -465,7 +465,9 @@ fn the_op_list_names_every_connector_op() {
             OP_CONNECTORS_LIST,
             OP_CONNECTORS_CONFIGURE,
             OP_CONNECTORS_TEST,
-            OP_CONNECTORS_KEYRING
+            OP_CONNECTORS_KEYRING,
+            "admin.connectors.sonar_mappings.get",
+            "admin.connectors.sonar_mappings.set",
         ]
     );
     for op in CONNECTOR_ADMIN_OPS {

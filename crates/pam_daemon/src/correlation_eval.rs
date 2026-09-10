@@ -74,7 +74,9 @@ pub(crate) fn evaluate(
     }
     if !matches!(
         (connector, call),
-        (ConnectorId::Github, "run") | (ConnectorId::Jenkins, "investigate" | "node_evidence")
+        (ConnectorId::Github, "run")
+            | (ConnectorId::Jenkins, "investigate" | "node_evidence")
+            | (ConnectorId::Sonarqube, "analysis")
     ) {
         return decision(
             Status::Unbound,
@@ -87,6 +89,16 @@ pub(crate) fn evaluate(
     let Some(result) = result else {
         return missing();
     };
+    if connector == ConnectorId::Sonarqube
+        && (result["analysis_basis"] != "exact_analysis"
+            || result["revision_basis"] != "analysis_history"
+            || result
+                .get("analysis_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty))
+    {
+        return missing();
+    }
     let Some(source) = result.get("source_identity") else {
         return missing();
     };
@@ -236,6 +248,15 @@ pub(crate) fn product_identity(
         identity["build"] = positive_id(result.get("build"));
         if call == "node_evidence" {
             identity["node_id"] = result.get("node_id").cloned().unwrap_or(Value::Null);
+        }
+    }
+    if connector == ConnectorId::Sonarqube && call == "analysis" {
+        for key in ["project", "ce_task", "analysis_id", "revision"] {
+            identity[key] = result
+                .get(key)
+                .filter(|value| value.as_str().is_some_and(|text| text.len() <= 1024))
+                .cloned()
+                .unwrap_or(Value::Null);
         }
     }
     if let Some(source) = result.get("source_identity") {

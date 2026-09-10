@@ -1,6 +1,6 @@
 //! Exact CE task → stored analysis gate, with independently reported revision.
 //!
-//! Source contracts: SonarSource `ws-ce.proto`, `projectanalysis/ws/SearchAction`,
+//! Source contracts: `SonarSource` `ws-ce.proto`, `projectanalysis/ws/SearchAction`,
 //! and `qualitygate/ws/ProjectStatusAction`. History has no advertised PR selector.
 //! A reported revision can be overridden by the scanner; this is association,
 //! not attestation of analyzed bytes. Repository identity belongs to GUI policy.
@@ -111,7 +111,7 @@ pub(crate) async fn call(
     } else {
         match read_history(&request, conn, &catalog, transport, deadline).await? {
             History::Page(history) => {
-                apply_history(&mut report, &history, &analysis, request.page)?
+                apply_history(&mut report, &history, &analysis, request.page)?;
             }
             History::Unavailable(cause) => {
                 report["revision_basis"] = json!("missing");

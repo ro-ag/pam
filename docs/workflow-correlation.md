@@ -44,9 +44,10 @@ invalid, partial or multiple SCM identities remain unresolved. Log text cannot
 supply missing authority. The build's authoritative result remains separate from
 SCM association and from uncertain failure attribution.
 
-Current live Sonar project/branch measurements do not prove the requested commit;
-revision-bound verification refuses them until exact analysis association is
-implemented. Documentation and issue reads may supply unbound supporting context;
+Live Sonar project/branch measurements do not prove the requested commit.
+The separate [exact analysis operation](sonar-analysis.md) joins an explicit
+compute task, historical analysis and reported revision with a GUI-owned
+repository mapping. Documentation and issue reads may supply unbound supporting context;
 they cannot certify a revision. Artifact publication has no association contract
 until a supported adapter provides immutable artifact identity.
 

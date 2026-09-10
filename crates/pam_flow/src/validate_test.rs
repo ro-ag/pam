@@ -555,7 +555,10 @@ fn the_connector_call_table_matches_the_spec() {
         names(ConnectorId::Jenkins),
         ["jobs", "builds", "console", "investigate", "node_evidence"]
     );
-    assert_eq!(names(ConnectorId::Sonarqube), ["quality_gate", "issues"]);
+    assert_eq!(
+        names(ConnectorId::Sonarqube),
+        ["analysis", "quality_gate", "issues"]
+    );
     assert_eq!(names(ConnectorId::Jira), ["search", "issue"]);
     assert_eq!(names(ConnectorId::Confluence), ["search", "page"]);
     assert_eq!(names(ConnectorId::Sharepoint), ["documents", "lists"]);

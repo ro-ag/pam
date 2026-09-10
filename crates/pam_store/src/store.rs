@@ -1637,7 +1637,7 @@ impl Store {
         key: &str,
         maximum: usize,
     ) -> Result<Option<String>, StoreError> {
-        let maximum = i64::try_from(maximum).unwrap_or(i64::MAX).min(32768);
+        let maximum = i64::try_from(maximum).unwrap_or(i64::MAX).min(32_768);
         let _guard = self.conn_lock.lock().await;
         let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=?2 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key,maximum]).await?;
         let Some(row) = rows.next().await? else {
@@ -1659,7 +1659,7 @@ impl Store {
         expected: Option<&str>,
         value: &str,
     ) -> Result<bool, StoreError> {
-        if value.len() > 32768 || expected.is_some_and(|prior| prior.len() > 32768) {
+        if value.len() > 32_768 || expected.is_some_and(|prior| prior.len() > 32_768) {
             return Err(StoreError::UnexpectedValue {
                 column: "setting",
                 value: "CAS value exceeds 32 KiB".to_owned(),

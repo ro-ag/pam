@@ -60,7 +60,9 @@ async fn run(
     let connection = Connection {
         base_url: Url::parse("https://sonar.example/").unwrap(),
         username: None,
-        secret: None,
+        secret: Some(crate::transport::Secret::new(
+            "fixture-sonar-token".to_owned(),
+        )),
     };
     match call(
         ConnectorId::Sonarqube,

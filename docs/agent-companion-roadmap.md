@@ -90,8 +90,10 @@ Hiding a socket pathname is not isolation.
 
 Explicit revision-bound GitHub and Jenkins flows now use immutable
 [workflow correlation](workflow-correlation.md). Missing or conflicting source
-identity blocks downstream use while retaining evidence. Exact Sonar analysis,
-durable watches and guarded local verification remain separate work.
+identity blocks downstream use while retaining evidence. The separate
+[Sonar analysis flow](sonar-analysis.md) adds an exact historical gate and
+GUI-owned repository mapping. Durable watches and guarded local verification
+remain separate work.
 
 ### Plan #32 — Correlate enterprise products and collect decisive evidence
 

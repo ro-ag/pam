@@ -23,7 +23,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(transport: Arc<dyn HttpTransport>) -> Self {
-        Self::with_flow(transport, FLOW).await
+        Box::pin(Self::with_flow(transport, FLOW)).await
     }
     async fn with_flow(transport: Arc<dyn HttpTransport>, yaml: &str) -> Self {
         let tmp = short_tempdir();
@@ -159,7 +159,7 @@ fn metadata() -> Value {
 
 #[tokio::test]
 async fn exact_mapping_verifies_and_historical_result_keeps_frozen_provenance() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let fx = Fixture::new(Arc::new(Sonar {
             entered: None,
             release: None,
@@ -183,13 +183,13 @@ async fn exact_mapping_verifies_and_historical_result_keeps_frozen_provenance() 
             body["correlation"]
         );
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn wrong_revision_or_missing_mapping_blocks_but_retains_product_evidence() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         for mapped in [false, true] {
             let fx = Fixture::new(Arc::new(Sonar {
                 entered: None,
@@ -205,13 +205,13 @@ async fn wrong_revision_or_missing_mapping_blocks_but_retains_product_evidence()
             fx.retained("blocked").await;
             fx.finish().await;
         }
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn public_mapping_admin_is_denied_even_with_gui_label() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let fx = Fixture::new(Arc::new(Sonar {
             entered: None,
             release: None,
@@ -229,13 +229,13 @@ async fn public_mapping_admin_is_denied_even_with_gui_label() {
         client.send_public(&forged).await;
         assert!(matches!(client.recv().await, Response::Refusal { .. }));
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn mapping_change_during_collection_cannot_publish_verified() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let fx = Fixture::new(Arc::new(Sonar {
@@ -257,7 +257,7 @@ async fn mapping_change_during_collection_cannot_publish_verified() {
         assert_ne!(outcome, Outcome::Verified, "{body}");
         fx.retained("changed").await;
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
@@ -291,7 +291,7 @@ impl HttpTransport for LaterGithub {
 
 #[tokio::test]
 async fn mapping_change_after_sonar_association_invalidates_final_publication() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let entered=Arc::new(tokio::sync::Notify::new());
         let release=Arc::new(tokio::sync::Notify::new());
         let transport=Arc::new(LaterGithub { sonar:Sonar {entered:None,release:None},entered:entered.clone(),release:release.clone() });
@@ -316,5 +316,5 @@ async fn mapping_change_after_sonar_association_invalidates_final_publication() 
         assert_eq!(body["correlation"]["status"],"conflicting");
         fx.retained("late_change").await;
         fx.finish().await;
-    }).await;
+    })).await;
 }

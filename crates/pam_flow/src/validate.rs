@@ -172,6 +172,17 @@ const JENKINS_CALLS: &[CallSpec] = &[
 
 const SONARQUBE_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "analysis",
+        args: &[
+            ("project", true),
+            ("ce_task", true),
+            ("branch", false),
+            ("pullRequest", false),
+            ("page", false),
+        ],
+        yields_log: false,
+    },
+    CallSpec {
         name: "quality_gate",
         args: &[("project", true), ("branch", false), ("pullRequest", false)],
         yields_log: false,

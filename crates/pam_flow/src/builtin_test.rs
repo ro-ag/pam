@@ -21,6 +21,8 @@ fn pam_ships_the_starter_flows() {
             "release-readiness",
             "revision-ci-triage",
             "revision-jenkins-check",
+            "revision-sonar-check",
+            "sonar-analysis-evidence",
             "sonar-gate-check",
             "summarize-build-log",
         ]
@@ -415,4 +417,19 @@ fn jenkins_node_evidence_requires_exact_inputs_and_only_observes() {
     for key in ["job", "build", "node_id"] {
         assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
     }
+}
+
+#[test]
+fn sonar_revision_starter_requires_exact_inputs_and_separate_gate_verification() {
+    let flow = crate::parse(crate::builtin_yaml("revision-sonar-check").unwrap()).unwrap();
+    for key in ["repository", "commit", "project", "ce_task", "branch"] {
+        assert!(flow.inputs[key].default.is_none());
+    }
+    assert!(flow.correlation.is_some());
+    assert_eq!(flow.steps[0].role, crate::Role::Verify);
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("OK"));
+    let discovery = crate::parse(crate::builtin_yaml("sonar-analysis-evidence").unwrap()).unwrap();
+    assert!(discovery.correlation.is_none());
+    assert_eq!(discovery.steps[0].role, crate::Role::Observe);
+    assert!(discovery.steps[0].expect_status.is_none());
 }

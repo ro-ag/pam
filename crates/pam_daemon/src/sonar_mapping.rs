@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 const KEY: &str = "sonar.repository_mappings";
-const MAX_BYTES: usize = 32768;
+const MAX_BYTES: usize = 32_768;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

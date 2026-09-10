@@ -25,6 +25,7 @@ pub(crate) struct Frozen {
     target_id: String,
     decisions: BTreeMap<String, Value>,
     jobs: BTreeSet<String>,
+    sonar_mapping: Option<crate::sonar_mapping::Snapshot>,
 }
 
 impl Frozen {
@@ -52,7 +53,12 @@ impl Frozen {
                 cause: INVALID,
                 detail: error.to_string(),
             })?;
-        let record = json!({"schema_version":1,"local_repository":repository,"flow_digest":pam_flow::digest(flow),"target":target});
+        let sonar_mapping = if flow.steps.iter().any(|step| matches!(&step.action,
+            pam_flow::Action::Connector { connector: ConnectorId::Sonarqube, call, .. } if call == "analysis")) {
+            Some(crate::sonar_mapping::Snapshot::load(store).await.map_err(storage)?)
+        } else { None };
+        let record = json!({"schema_version":1,"local_repository":repository,"flow_digest":pam_flow::digest(flow),"target":target,
+            "sonar_mapping_revision":sonar_mapping.as_ref().map(crate::sonar_mapping::Snapshot::revision)});
         let encoded = record.to_string();
         if store
             .bind_correlation_target(ticket, &encoded)
@@ -73,6 +79,7 @@ impl Frozen {
             target,
             decisions: BTreeMap::new(),
             jobs: BTreeSet::new(),
+            sonar_mapping,
         };
         for row in store
             .read_correlation_steps(ticket)
@@ -83,6 +90,63 @@ impl Frozen {
             frozen.remember_jobs(&binding);
         }
         Ok(frozen)
+    }
+
+    pub async fn check_mapping(&self, store: &Store) -> Result<(), Failure> {
+        if let Some(mapping) = &self.sonar_mapping
+            && crate::sonar_mapping::Snapshot::load(store)
+                .await
+                .map_err(storage)?
+                .revision()
+                != mapping.revision()
+        {
+            return Err(Failure {
+                cause: CONFLICT,
+                detail: "Sonar repository mapping changed during collection; start a new request"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn invalidate(&mut self, error: &Failure) {
+        self.decisions.insert(
+            "mapping_check".to_owned(),
+            json!({"status":"conflicting","detail":error.detail}),
+        );
+    }
+
+    /// Repository identity comes only from the GUI-owned mapping snapshot.
+    pub async fn enrich(
+        &self,
+        store: &Store,
+        origin: &ConnectorTarget,
+        result: Option<&mut Value>,
+    ) -> Result<(), Failure> {
+        if origin.connector != ConnectorId::Sonarqube || origin.call != "analysis" {
+            return Ok(());
+        }
+        let mapping = self.sonar_mapping.as_ref().ok_or_else(|| Failure {
+            cause: MISSING,
+            detail: "Sonar mapping snapshot unavailable".to_owned(),
+        })?;
+        self.check_mapping(store).await?;
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let project = result.get("project").and_then(Value::as_str).unwrap_or("");
+        let repository = mapping.repository(&origin.base_url, project);
+        let revision = result
+            .get("revision")
+            .and_then(Value::as_str)
+            .filter(|_| result["revision_basis"] == "analysis_history")
+            .and_then(|value| pam_flow::validate_full_commit(value).ok());
+        let matched = repository.is_some() && revision.is_some();
+        result["source_identity"] = json!({"status":if matched {"unambiguous"} else {"missing"},
+            "repository_urls":repository.into_iter().collect::<Vec<_>>(),"revisions":revision.into_iter().collect::<Vec<_>>(),
+            "partial":!matched,"invalid_metadata":false,"repository_basis":"gui_mapping","mapping_revision":mapping.revision(),
+            "revision_basis":"sonar_reported_analysis_history"});
+        Ok(())
     }
 
     /// Product outcomes are deliberately excluded from the identity binding.

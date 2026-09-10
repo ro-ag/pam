@@ -282,7 +282,7 @@ fn call_target<'a>(
     let name = match (connector, call) {
         (ConnectorId::Github, "runs" | "run" | "job_log") => "repo",
         (ConnectorId::Jenkins, "builds" | "console" | "investigate" | "node_evidence") => "job",
-        (ConnectorId::Sonarqube, "quality_gate" | "issues") => "project",
+        (ConnectorId::Sonarqube, "quality_gate" | "issues" | "analysis") => "project",
         (ConnectorId::Jira, "issue") => "key",
         (ConnectorId::Confluence, "page") => "id",
         (ConnectorId::Sharepoint, "documents" | "lists") => "site",

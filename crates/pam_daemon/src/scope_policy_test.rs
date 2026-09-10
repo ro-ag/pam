@@ -116,6 +116,13 @@ fn product_targets_and_broad_searches_have_explicit_boundaries() {
     for (connector, call, key, value, target) in [
         (ConnectorId::Github, "run", "repo", "team/app", "team/app"),
         (
+            ConnectorId::Sonarqube,
+            "analysis",
+            "project",
+            "team:app",
+            "team:app",
+        ),
+        (
             ConnectorId::Jenkins,
             "node_evidence",
             "job",

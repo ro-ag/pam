@@ -1,0 +1,27 @@
+schema: 1
+id: revision-sonar-check
+name: Revision Sonar check
+description: Verify the historical gate and reported revision of an exact branch analysis, using a GUI-owned repository mapping.
+inputs:
+  repository: { description: Exact HTTPS repository URL in the GUI mapping }
+  commit: { description: Full expected source commit }
+  project: { description: Exact Sonar project key }
+  ce_task: { description: Exact compute task ID }
+  branch: { description: Explicit analyzed branch }
+  page: { default: "1", description: Explicit analysis history page }
+correlation:
+  repository: "${inputs.repository}"
+  commit: "${inputs.commit}"
+steps:
+  - id: analysis
+    connector: sonarqube
+    call: analysis
+    with:
+      project: "${inputs.project}"
+      ce_task: "${inputs.ce_task}"
+      branch: "${inputs.branch}"
+      page: "${inputs.page}"
+    role: verify
+    expect_status: OK
+    output: compact
+    timeout: 120s

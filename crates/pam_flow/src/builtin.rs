@@ -57,6 +57,14 @@ const BUILTINS: &[BuiltinFlow] = &[
         yaml: include_str!("../flows/revision-jenkins-check.yaml"),
     },
     BuiltinFlow {
+        id: "revision-sonar-check",
+        yaml: include_str!("../flows/revision-sonar-check.yaml"),
+    },
+    BuiltinFlow {
+        id: "sonar-analysis-evidence",
+        yaml: include_str!("../flows/sonar-analysis-evidence.yaml"),
+    },
+    BuiltinFlow {
         id: "sonar-gate-check",
         yaml: include_str!("../flows/sonar-gate-check.yaml"),
     },

@@ -858,6 +858,10 @@ impl FlowService {
         };
         state.execute().await?;
 
+        if let Err(error) = state.correlation.check_mapping(&self.store).await {
+            state.correlation.invalidate(&error);
+        }
+
         let products = product_observations(flow, &state.observed);
         let report = RunReport {
             outcome: state.correlation.outcome(outcome_for(&state.reports, flow)),
@@ -1978,21 +1982,30 @@ impl RunState<'_> {
         let Attempt::Succeeded {
             exit_status,
             output,
-            result,
+            mut result,
         } = attempt
         else {
             return attempt;
         };
         let correlated = if let Some(origin) = self.origins.get(&step.id) {
-            self.correlation
-                .associate(
-                    &self.service.store,
-                    &self.ctx.request_id,
-                    step,
-                    origin,
-                    result.as_ref(),
-                )
+            match self
+                .correlation
+                .enrich(&self.service.store, origin, result.as_mut())
                 .await
+            {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    self.correlation
+                        .associate(
+                            &self.service.store,
+                            &self.ctx.request_id,
+                            step,
+                            origin,
+                            result.as_ref(),
+                        )
+                        .await
+                }
+            }
         } else {
             Err(crate::correlation::Failure {
                 cause: crate::correlation::MISSING,
@@ -2132,8 +2145,9 @@ impl RunState<'_> {
         else {
             return;
         };
-        if *connector == ConnectorId::Jenkins
-            && matches!(call.as_str(), "investigate" | "node_evidence")
+        if (*connector == ConnectorId::Jenkins
+            && matches!(call.as_str(), "investigate" | "node_evidence"))
+            || (*connector == ConnectorId::Sonarqube && call == "analysis")
         {
             report.summary = result
                 .get("summary")
@@ -2412,15 +2426,14 @@ fn product_observations(
     flow.steps
         .iter()
         .filter_map(|step| {
-            if let Action::Connector {
-                connector: ConnectorId::Jenkins,
-                call,
-                ..
+            let Action::Connector {
+                connector, call, ..
             } = &step.action
-                && matches!(call.as_str(), "investigate" | "node_evidence")
-            {
-                let status = vars.resolve(&format!("steps.{}.result.status", step.id))?;
-                if [
+            else {
+                return None;
+            };
+            let statuses: &[&str] = match (connector, call.as_str()) {
+                (ConnectorId::Jenkins, "investigate" | "node_evidence") => &[
                     "SUCCESS",
                     "FAILURE",
                     "UNSTABLE",
@@ -2428,19 +2441,29 @@ fn product_observations(
                     "NOT_BUILT",
                     "RUNNING",
                     "UNKNOWN",
-                ]
-                .contains(&status.as_str())
-                {
-                    return Some((
-                        step.id.clone(),
-                        crate::flow_contract::ProductObservation {
-                            connector: "jenkins".to_owned(),
-                            status,
-                        },
-                    ));
-                }
-            }
-            None
+                ],
+                (ConnectorId::Sonarqube, "analysis") => &[
+                    "OK",
+                    "ERROR",
+                    "WARN",
+                    "NONE",
+                    "PENDING",
+                    "IN_PROGRESS",
+                    "FAILED",
+                    "CANCELED",
+                ],
+                _ => return None,
+            };
+            let status = vars.resolve(&format!("steps.{}.result.status", step.id))?;
+            statuses.contains(&status.as_str()).then(|| {
+                (
+                    step.id.clone(),
+                    crate::flow_contract::ProductObservation {
+                        connector: connector.as_str().to_owned(),
+                        status,
+                    },
+                )
+            })
         })
         .collect()
 }

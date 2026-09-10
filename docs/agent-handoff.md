@@ -35,5 +35,11 @@ vendor CLI or hosted request, and handles no additional credentials.
 
 Old persisted projections without handoff fields remain readable. Complete result
 size stays bounded by the existing 14 KiB projection and 16 KiB wire limits; omitted
-observations and evidence counts remain explicit. Text CLI output uses JSON escaping
+observations and evidence counts remain explicit. The optional sections never cost
+the primary result: when the projection plus watch plus accounting would exceed the
+16 KiB wire limit, `read_availability` collapses first to `{"omitted":"response_limit"}`
+and only then does `watch` collapse to the same marker. The projection itself is never
+dropped, the collapse is measured against the real serialized response rather than a
+guessed reserve, and an omitted section is always marked, never silently absent or
+reported as null. Text CLI output uses JSON escaping
 for untrusted content and preserves the additional availability metadata.

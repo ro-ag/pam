@@ -44,25 +44,76 @@ async fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
     let (status, result) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
-    let mut output = result_output(&ctx.request_id, &ticket, &status, result.as_ref())?;
-    if let Some(progress) = ctx
+    let output = result_output(&ctx.request_id, &ticket, &status, result.as_ref())?;
+    let watch = match ctx
         .store
         .flow_watch_progress(&ticket, &status.repository)
         .await
         .map_err(|_| unavailable())?
     {
-        output.body["watch"] = serde_json::from_str(&progress).map_err(|_| unavailable())?;
-        // Progress may have been published after the first origin snapshot.
-        authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
-    }
-    output.body["read_availability"] = ctx
+        Some(progress) => {
+            let watch: Value = serde_json::from_str(&progress).map_err(|_| unavailable())?;
+            // Progress may have been published after the first origin snapshot.
+            authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+            Some(watch)
+        }
+        None => None,
+    };
+    let availability = ctx
         .store
         .request_budget_report(&ticket, &status.repository)
         .await
         .map_err(|_| unavailable())?
         .unwrap_or(Value::Null);
     authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
-    bounded_output(&ctx.request_id, output.outcome, output.body)
+    fit_optional(
+        &ctx.request_id,
+        output.outcome,
+        &output.body,
+        watch.as_ref(),
+        &availability,
+    )
+}
+
+/// Explicit stand-in for an optional section dropped to keep the primary
+/// result readable; never a silent removal and never a null.
+fn omitted_for_response_limit() -> Value {
+    json!({"omitted":"response_limit"})
+}
+
+/// Attach the optional watch and read accounting without ever sacrificing the
+/// primary agent result, which is already bounded by its own smaller envelope.
+/// Accounting collapses to an explicit marker first, then the watch
+/// projection; each step is measured against the real serialized response, so
+/// marker headroom never has to be guessed.
+pub(crate) fn fit_optional(
+    id: &str,
+    outcome: Outcome,
+    body: &Value,
+    watch: Option<&Value>,
+    availability: &Value,
+) -> Result<CapabilityOutput, CapabilityFailure> {
+    let degradations = [
+        (watch.cloned(), availability.clone()),
+        (watch.cloned(), omitted_for_response_limit()),
+        (
+            watch.map(|_| omitted_for_response_limit()),
+            omitted_for_response_limit(),
+        ),
+    ];
+    let mut refusal = None;
+    for (watch, availability) in degradations {
+        let mut candidate = body.clone();
+        if let Some(watch) = watch {
+            candidate["watch"] = watch;
+        }
+        candidate["read_availability"] = availability;
+        match bounded_output(id, outcome, candidate) {
+            Ok(output) => return Ok(output),
+            Err(failure) => refusal = Some(failure),
+        }
+    }
+    Err(refusal.unwrap_or_else(unavailable))
 }
 
 /// Preserve lifecycle state even when no final agent projection exists yet.

@@ -2,7 +2,9 @@ use pam_proto::Outcome;
 use pam_store::Store;
 use serde_json::json;
 
-use crate::flow_result_service::{authorized_metadata, bounded_output, validated_projection};
+use crate::flow_result_service::{
+    authorized_metadata, bounded_output, fit_optional, validated_projection,
+};
 
 async fn fixture() -> (tempfile::TempDir, Store, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -138,4 +140,65 @@ async fn admitted_flow_lifecycle_survives_missing_final_projection() {
     );
     assert!(output.body["agent_result"].is_null());
     assert_eq!(output.outcome, Outcome::Blocked);
+}
+
+#[test]
+fn near_cap_result_drops_optional_sections_before_refusing_the_primary_result() {
+    // A primary projection that fits its own 14 KiB envelope must stay
+    // readable even when the optional watch and accounting no longer fit the
+    // 16 KiB response cap; omissions are marked, never silent.
+    let primary = json!({"schema_version":1,"ticket":"r","state":"succeeded",
+        "agent_result":{"schema_version":1,"ticket":"r","text":"x".repeat(13 * 1024)}});
+    assert!(bounded_output("r", Outcome::Verified, primary.clone()).is_ok());
+    let watch = json!({"observations":"w".repeat(2 * 1024)});
+    let availability = json!({"evidence_reads":{"state":"active","detail":"a".repeat(2 * 1024)}});
+
+    let both = fit_optional(
+        "r",
+        Outcome::Verified,
+        &primary,
+        Some(&watch),
+        &json!({"evidence_reads":{"state":"active"}}),
+    )
+    .unwrap();
+    assert_eq!(both.body["watch"], watch);
+    assert_eq!(
+        both.body["read_availability"]["evidence_reads"]["state"],
+        "active"
+    );
+
+    // Accounting is the first section to collapse.
+    let accounting_dropped = fit_optional(
+        "r",
+        Outcome::Verified,
+        &primary,
+        Some(&watch),
+        &availability,
+    )
+    .unwrap();
+    assert_eq!(accounting_dropped.body["watch"], watch);
+    assert_eq!(
+        accounting_dropped.body["read_availability"]["omitted"],
+        "response_limit"
+    );
+
+    // The watch collapses only after the accounting marker is not enough.
+    let wide_watch = json!({"observations":"w".repeat(15 * 1024)});
+    let watch_dropped = fit_optional(
+        "r",
+        Outcome::Verified,
+        &primary,
+        Some(&wide_watch),
+        &availability,
+    )
+    .unwrap();
+    assert_eq!(watch_dropped.body["watch"]["omitted"], "response_limit");
+    assert_eq!(
+        watch_dropped.body["read_availability"]["omitted"],
+        "response_limit"
+    );
+    assert_eq!(
+        watch_dropped.body["agent_result"]["ticket"], "r",
+        "the primary projection must survive every degradation"
+    );
 }

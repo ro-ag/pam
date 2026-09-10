@@ -59,7 +59,7 @@ impl Store {
             "attempt_slots_charged":u.attempts,"http_call_slots_charged":u.http_calls,
             "http_bytes_charged":u.http_bytes,"command_bytes_charged":u.command_bytes,
             "attempt_slots_remaining":256-u.attempts,"http_call_slots_remaining":128-u.http_calls,
-            "http_bytes_remaining":134217728-u.http_bytes,"command_bytes_remaining":134217728-u.command_bytes,
+            "http_bytes_remaining":134_217_728-u.http_bytes,"command_bytes_remaining":134_217_728-u.command_bytes,
             "accounting":"completed_captures_plus_unsettled_reservations_not_physical_network_traffic"
         }));
         Ok(Some(

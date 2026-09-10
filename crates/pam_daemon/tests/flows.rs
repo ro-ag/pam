@@ -1592,7 +1592,8 @@ async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() 
         let mut client = flows.daemon.client().await;
         let mut request = flows.run_envelope("req_retained_retry", "retained-retry", &serde_json::json!({}));
         request.deadline_ms = 2_000;
-        assert!(matches!(client.request(&request).await, Response::Refusal { cause, .. } if cause == "deadline_exceeded"));
+        let response = client.request(&request).await;
+        assert!(matches!(&response, Response::Refusal { cause, .. } if cause == "deadline_exceeded"), "{response:?}");
         let evidence = flows.daemon.store().list_evidence(&request.id).await.unwrap();
         let source = evidence.iter().find(|row| row.kind == EVIDENCE_KIND_LOG_SOURCE).expect("completed failure survives timeout during backoff");
         let source = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();

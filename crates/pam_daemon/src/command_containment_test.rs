@@ -159,6 +159,10 @@ fn caller_environment_is_applied_after_the_sandbox_launcher() {
         .config
         .prepare(&fixture.program, &fixture.config.repository, &env)
         .unwrap();
+    assert!(fixture.config.prepare(
+        &fixture.program, &fixture.config.repository,
+        &[("CARGO_BIN_EXE_pam-test-helper".to_owned(), "fixture".to_owned())]
+    ).is_ok());
     assert_eq!(prepared.program, PathBuf::from("/usr/bin/sandbox-exec"));
     assert_eq!(prepared.argv[0], "-p");
     assert_eq!(prepared.argv[2], "/usr/bin/env");

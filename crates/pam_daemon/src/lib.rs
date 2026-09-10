@@ -12,6 +12,9 @@ pub mod admin_retention;
 pub mod admin_transport;
 pub mod approval;
 pub mod connector_service;
+pub mod command_containment;
+#[cfg(test)]
+mod command_containment_test;
 pub mod daemon;
 mod evidence_service;
 mod evidence_view;

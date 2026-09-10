@@ -81,6 +81,10 @@ private transport fails closed, and the client does not use public fallback or
 automatic replay. Test fixtures representing a trusted native client are not
 proof that an arbitrary same-user process is isolated.
 
+The [macOS sandbox fixture](macos-sandbox-acceptance.md) exercises a real
+default-deny profile with the compiled CLI and temporary daemon. It records
+precisely which positive and negative operations are tested.
+
 Those tests do not establish the deployed sandbox's filesystem, process, or
 credential restrictions. Deployment verification must separately confirm that
 an agent can reach its permitted public operations while it cannot reach or

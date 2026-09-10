@@ -733,12 +733,12 @@ fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<d
     if injected.is_some() {
         return injected;
     }
-    match pam_model::download::curl_path() {
+    match CurlTransport::trusted_path() {
         Ok(curl) => Some(Arc::new(CurlTransport::new(curl))),
         Err(error) => {
             tracing::warn!(
                 %error,
-                recovery = pam_model::download::curl_recovery_line(),
+                recovery = "Use the trusted OS curl on a qualified platform; PATH overrides and inherited proxy configuration are not accepted.",
                 "curl was not found; connector calls over HTTP will refuse"
             );
             None

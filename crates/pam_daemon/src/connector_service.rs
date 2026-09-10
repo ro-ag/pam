@@ -211,7 +211,7 @@ pub enum InvokeError {
     #[error("{0}")]
     Connector(#[from] ConnectorError),
     /// This daemon has no `curl`, so no HTTP connector can run.
-    #[error("curl is not installed, or not on the daemon's PATH")]
+    #[error("trusted OS curl is unavailable on this platform")]
     CurlMissing,
     /// The daemon's own bookkeeping failed.
     #[error("connector bookkeeping failed: {0}")]
@@ -501,6 +501,7 @@ impl ConnectorService {
     pub async fn test(&self, id: ConnectorId) -> Result<(bool, String), InvokeError> {
         let _guard = self.configuration_locks[&id].lock().await;
         let row = self.store.get_connector(id.as_str()).await?;
+        refuse_uncontained_cli(id)?;
         let connection = self.connection(id, row.as_ref()).await?;
         self.ensure_transport(id)?;
 
@@ -583,6 +584,7 @@ impl ConnectorService {
             })
         })?;
         let row = self.scoped_row(repo, id, call, args).await?;
+        refuse_uncontained_cli(id)?;
         // The AWS adapter captures its own child pipes, outside HTTP. Keep the
         // full reservation because it does not return an exact stderr byte count.
         let _aws_capture = if id == ConnectorId::Aws {
@@ -940,4 +942,14 @@ impl HttpTransport for MissingCurl {
             ))
         })
     }
+}
+
+fn refuse_uncontained_cli(id: ConnectorId) -> Result<(), InvokeError> {
+    if id == ConnectorId::Aws {
+        return Err(InvokeError::Connector(ConnectorError::Policy {
+            cause: "command_containment_unavailable",
+            detail: "AWS CLI execution is unavailable until its credential and helper processes have qualified containment; no credential was read or process started.".to_owned(),
+        }));
+    }
+    Ok(())
 }

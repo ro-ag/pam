@@ -375,6 +375,7 @@ fn scalar_text(value: &Value) -> Option<String> {
 /// The flow engine (see the module docs).
 #[derive(Debug)]
 pub struct FlowService {
+    protected_base: PathBuf,
     library: Library,
     store: Arc<Store>,
     approvals: Arc<ApprovalService>,
@@ -395,6 +396,7 @@ impl FlowService {
         gate: Arc<PolicyGate>,
     ) -> Self {
         Self {
+            protected_base: base_dir.to_path_buf(),
             library: Library::new(base_dir.join("flows")),
             store,
             approvals,
@@ -672,6 +674,10 @@ impl FlowService {
             }
             match &step.action {
                 Action::Command { argv } => {
+                    item["containment"] = json!(if cfg!(target_os = "macos") { "checked_before_execution" } else { "unavailable" });
+                    if !cfg!(target_os = "macos") {
+                        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
+                    }
                     let program = argv.first().and_then(|value| substitute(value, vars).ok());
                     item["program"] = json!(program);
                     if !program.as_ref().is_some_and(|program| {
@@ -686,6 +692,9 @@ impl FlowService {
                     with,
                 } => {
                     item["product"] = json!(connector.as_str());
+                    if *connector == pam_connectors::ConnectorId::Aws {
+                        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "AWS CLI helper containment is not qualified"}));
+                    }
                     item["operation"] = json!(call);
                     item["credential"] = json!("unknown_not_probed");
                     let row = self
@@ -977,7 +986,7 @@ impl FlowService {
         // `git remote get-url origin` costs a child process, so it runs
         // only when the flow actually mentions the variable.
         if flow_references(flow).iter().any(|key| key == "repo.origin")
-            && let Some(origin) = repo_origin(repo, settings, cancel, budget)
+            && let Some(origin) = repo_origin(repo, &self.protected_base, settings, cancel, budget)
                 .await
                 .map_err(budget_refusal)?
         {
@@ -1084,6 +1093,7 @@ fn flow_references(flow: &Flow) -> Vec<String> {
 /// GitHub about the wrong repository.
 async fn repo_origin(
     repo: &Path,
+    protected_base: &Path,
     settings: &FlowSettings,
     cancel: &mut watch::Receiver<bool>,
     budget: &Arc<crate::request_budget::RequestBudget>,
@@ -1094,6 +1104,7 @@ async fn repo_origin(
     };
     let outcome = run_command_budgeted(
         CommandSpec {
+            containment: command_boundary(protected_base, repo, &program, false),
             program,
             argv: vec![
                 "remote".to_owned(),
@@ -1613,6 +1624,7 @@ impl RunState<'_> {
         env.push(("PAM_FLOW".to_owned(), self.flow.id.clone()));
         env.push(("PAM_STEP".to_owned(), step.id.clone()));
         let spec = CommandSpec {
+            containment: command_boundary(&self.service.protected_base, &self.repo, &resolved, step.effect == pam_flow::Effect::Stateful),
             program: resolved,
             argv: argv[1..].to_vec(),
             cwd: self.repo.clone(),
@@ -1720,6 +1732,16 @@ impl RunState<'_> {
                 ),
                 recovery: "make the step quieter, or send its output to a file the flow reads back"
                     .to_owned(),
+                retry_after: None,
+            }),
+            CommandOutcome::ContainmentUnavailable { detail } => Some(Attempt::Failed {
+                result: None,
+                exit_status: None,
+                output: Vec::new(),
+                status: StepStatus::Blocked,
+                cause: crate::command_containment::CAUSE_UNAVAILABLE,
+                detail,
+                recovery: "Use a qualified command-containment platform and a repository outside PAM's protected files; no uncontained fallback is available.".to_owned(),
                 retry_after: None,
             }),
             CommandOutcome::SpawnFailed(detail) => Some(Attempt::Failed {
@@ -2284,4 +2306,38 @@ fn product_observations(
             None
         })
         .collect()
+}
+
+/// Read grants come from daemon-owned tool locations, never broad HOME access.
+fn command_boundary(
+    protected_base: &Path,
+    repo: &Path,
+    program: &Path,
+    allow_repository_writes: bool,
+) -> crate::command_containment::CommandContainment {
+    let mut roots: Vec<PathBuf> = ["/System", "/usr", "/bin", "/sbin", "/Library/Developer"]
+        .into_iter().map(PathBuf::from).filter(|path| path.is_dir()).collect();
+    if let Ok(executable) = program.canonicalize()
+        && let Some(parent) = executable.parent()
+        && !parent.starts_with(repo)
+    {
+        roots.push(parent.to_path_buf());
+    }
+    if let Ok(executable) = std::env::current_exe().and_then(|path| path.canonicalize())
+        && let Some(parent) = executable.parent()
+    {
+        roots.push(parent.to_path_buf());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let toolchain = PathBuf::from(home).join(".rustup");
+        if toolchain.is_dir() { roots.push(toolchain); }
+    }
+    roots.sort();
+    roots.dedup();
+    crate::command_containment::CommandContainment {
+        protected_base: protected_base.to_path_buf(),
+        repository: repo.to_path_buf(),
+        read_only_roots: roots,
+        allow_repository_writes,
+    }
 }

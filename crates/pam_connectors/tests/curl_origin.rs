@@ -7,11 +7,10 @@
 //! wire — including the `Authorization` header that never appears in the
 //! child's argument vector.
 //!
-//! The whole file is skipped, with a printed line, when `curl` is not on
-//! `PATH`.
+//! The whole file is skipped, with a printed line, when the trusted OS `curl` is unavailable.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -220,30 +219,7 @@ fn deadline(seconds: u64) -> Instant {
     Instant::now() + Duration::from_secs(seconds)
 }
 
-/// The first executable `curl` on `PATH`.
+/// The qualified OS curl, independent of the test process PATH.
 fn curl_on_path() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "curl.exe" } else { "curl" };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-/// Whether a path is an executable file.
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    CurlTransport::trusted_path().ok()
 }

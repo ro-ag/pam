@@ -266,7 +266,7 @@ fn handoff(report: &RunReport, result: &AgentResult) -> Handoff {
             |id| {
                 serde_json::json!({"kind":"evidence_read","capability":"evidence.read",
                 "args":{"request_id":result.ticket,"evidence_id":id,"offset":0,"length":16384},
-                "authorization":"rechecked_per_read","automatic":false})
+                "authorization_state":"rechecked_per_read","automatic":false})
             },
         ),
         measurements: serde_json::json!({"frontier_tokens":null,"correction_turns":null,

@@ -312,3 +312,30 @@ fn handoff_exact_target_is_supplied_only_from_validated_structured_identity() {
     let restored: crate::flow_contract::AgentResult = serde_json::from_value(legacy).unwrap();
     assert!(restored.handoff.is_none());
 }
+
+#[test]
+fn handoff_projection_survives_the_credential_redaction_pass_unchanged() {
+    // Durable reads run the projection through the credential mask, so any
+    // handoff key that collides with a sensitive name would make a re-read
+    // silently differ from the response the caller already received.
+    let report = report(StepStatus::Succeeded, Outcome::Solved, "inspected");
+    let result = project_result(
+        "ticket",
+        "flow",
+        "digest",
+        &report,
+        &["verdict".into()],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let projected = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        crate::evidence_view::redact_json(&projected).unwrap(),
+        projected,
+        "a handoff field name must not be masked as a credential"
+    );
+    assert_eq!(
+        projected["handoff"]["next_action"]["authorization_state"],
+        "rechecked_per_read"
+    );
+}

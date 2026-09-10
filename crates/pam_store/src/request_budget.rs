@@ -66,7 +66,7 @@ impl Store {
             serde_json::json!({"execution_expires_at_ms":expiry,"work":work,
             "evidence_reads":{"state":allowance_state,
                 "expires_at":evidence_expiry,"remaining_bytes":evidence_bytes,"remaining_pages":evidence_pages,
-                "authorization":"rechecked_per_read","availability":"not_guaranteed"}}),
+                "authorization_state":"rechecked_per_read","availability":"not_guaranteed"}}),
         ))
     }
 

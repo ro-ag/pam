@@ -287,21 +287,22 @@ impl AdminService {
         // Without this the GUI can only infer a resumable transfer from a
         // job row, and job rows age out of the status window.
         let registry = self.models.registry();
-        let partials = tokio::task::spawn_blocking(move || {
-            CATALOG
-                .iter()
-                .map(|preset| {
-                    let dest = registry.dest_for(preset.vendor, preset.file_name);
-                    pam_model::download::inspect_partial(&dest)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|err| AdminRefusal {
-            cause: CAUSE_INTERNAL_ERROR,
-            detail: format!("the partial-download scan did not finish: {err}"),
-            recovery: RECOVERY_INTERNAL,
-        })?;
+        let partials =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                CATALOG
+                    .iter()
+                    .map(|preset| {
+                        let dest = registry.dest_for(preset.vendor, preset.file_name);
+                        pam_model::download::inspect_partial(&dest)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|err| AdminRefusal {
+                cause: CAUSE_INTERNAL_ERROR,
+                detail: format!("the partial-download scan did not finish: {err}"),
+                recovery: RECOVERY_INTERNAL,
+            })?;
         let presets: Vec<Value> = CATALOG
             .iter()
             .zip(partials)
@@ -465,7 +466,10 @@ impl AdminService {
 
         let registry = self.models.registry();
         let target = entry.clone();
-        let deleted = tokio::task::spawn_blocking(move || registry.delete(&target))
+        let deleted =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                registry.delete(&target)
+            })
             .await
             .map_err(|err| AdminRefusal {
                 cause: CAUSE_INTERNAL_ERROR,
@@ -824,13 +828,15 @@ impl AdminService {
 /// threads (detection stats the filesystem and waits on children).
 async fn detect_agents() -> Result<Vec<AgentCli>, AdminRefusal> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    tokio::task::spawn_blocking(move || pam_model::curator::detect(&path, DETECT_DEADLINE))
-        .await
-        .map_err(|err| AdminRefusal {
-            cause: CAUSE_INTERNAL_ERROR,
-            detail: format!("agent detection did not finish: {err}"),
-            recovery: RECOVERY_INTERNAL,
-        })
+    crate::blocking_jobs::run(crate::blocking_jobs::Kind::AgentDetection, move || {
+        pam_model::curator::detect(&path, DETECT_DEADLINE)
+    })
+    .await
+    .map_err(|err| AdminRefusal {
+        cause: CAUSE_INTERNAL_ERROR,
+        detail: format!("agent detection did not finish: {err}"),
+        recovery: RECOVERY_INTERNAL,
+    })
 }
 
 /// The `.gguf` file name a pasted URL ends in.

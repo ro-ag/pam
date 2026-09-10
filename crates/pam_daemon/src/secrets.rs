@@ -597,14 +597,15 @@ impl SecretStore {
     }
 }
 
-/// Runs a blocking backend call on the blocking pool, folding a join
-/// failure (the task panicked or was cancelled) into [`SecretError::Unavailable`].
+/// Runs a backend call through the process-owned bounded keychain lane.
+/// Dropping a waiter cannot release the running call's lane or permit. Admission
+/// and join failures become [`SecretError::Unavailable`]; they never trigger retry.
 async fn run_blocking<F, T>(call: F) -> Result<T, SecretError>
 where
     F: FnOnce() -> Result<T, SecretError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(call).await {
+    match crate::blocking_jobs::run(crate::blocking_jobs::Kind::Keychain, call).await {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "the secret store's blocking task did not finish");

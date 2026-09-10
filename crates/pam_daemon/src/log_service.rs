@@ -261,12 +261,13 @@ impl LogService {
         // on a runtime thread that is also serving the socket. The bytes
         // travel with the closure and come back so the source row can be
         // written from them without a second copy.
-        let (bytes, compacted) = tokio::task::spawn_blocking(move || {
-            let compacted = compact(&bytes, exit_status, &Policy::default());
-            (bytes, compacted)
-        })
-        .await
-        .map_err(|err| LogError::Join(err.to_string()))?;
+        let (bytes, compacted) =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
+                let compacted = compact(&bytes, exit_status, &Policy::default());
+                (bytes, compacted)
+            })
+            .await
+            .map_err(|err| LogError::Join(err.to_string()))?;
         let compacted = compacted?;
 
         let stats = CompressStats::of(&compacted);

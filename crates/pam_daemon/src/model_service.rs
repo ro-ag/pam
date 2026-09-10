@@ -422,14 +422,14 @@ impl ModelService {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
         let target = dest.to_path_buf();
-        tokio::task::spawn_blocking(move || pam_model::download::discard_partial(&target))
-            .await
-            .map_err(|err| {
-                ModelServiceError::Download(DownloadError::Io(std::io::Error::other(
-                    err.to_string(),
-                )))
-            })?
-            .map_err(ModelServiceError::Download)
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            pam_model::download::discard_partial(&target)
+        })
+        .await
+        .map_err(|err| {
+            ModelServiceError::Download(DownloadError::Io(std::io::Error::other(err.to_string())))
+        })?
+        .map_err(ModelServiceError::Download)
     }
 
     /// Stops a running transfer, keeping its part file for a resume.
@@ -461,7 +461,11 @@ impl ModelService {
         let registry = self.registry();
         let id = job_id.clone();
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || registry.verify(&entry)).await;
+            let outcome =
+                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                    registry.verify(&entry)
+                })
+                .await;
             let (state, detail) = match outcome {
                 Ok(Ok(verified)) => {
                     if let Ok(done) = i64::try_from(verified.size_bytes) {
@@ -519,7 +523,11 @@ impl ModelService {
     pub(crate) async fn find(&self, id: &str) -> Option<ModelEntry> {
         let registry = self.registry();
         let wanted = id.to_owned();
-        match tokio::task::spawn_blocking(move || registry.find(&wanted)).await {
+        match crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            registry.find(&wanted)
+        })
+        .await
+        {
             Ok(Ok(entry)) => entry,
             Ok(Err(err)) => {
                 tracing::warn!(model = id, error = %err, "models directory unreadable");
@@ -535,7 +543,11 @@ impl ModelService {
     /// Every entry in the models directory, sorted by id.
     pub(crate) async fn scan(&self) -> Result<Vec<ModelEntry>, RegistryError> {
         let registry = self.registry();
-        match tokio::task::spawn_blocking(move || registry.scan()).await {
+        match crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            registry.scan()
+        })
+        .await
+        {
             Ok(result) => result,
             Err(err) => Err(RegistryError::Io(std::io::Error::other(err))),
         }

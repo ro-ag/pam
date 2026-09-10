@@ -245,7 +245,7 @@ async fn malformed_history_gate_and_arguments_fail_before_fallback() {
     let transport = FakeTransport::new();
     let mut args = args();
     args.insert("ce_task".to_owned(), ArgValue::Text("../evil".to_owned()));
-    assert!(run(&args(), &transport).await.is_err());
+    assert!(run(&args, &transport).await.is_err());
     assert!(transport.requests().is_empty());
 }
 

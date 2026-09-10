@@ -315,3 +315,76 @@ async fn history_permissions_and_transport_failures_retain_exact_gate_evidence()
     assert_eq!(result["status"], "ERROR");
     assert_eq!(result["gaps"], json!(["history_connector_network"]));
 }
+
+async fn poll_ce(t: &FakeTransport) -> Result<Value, ConnectorError> {
+    let conn = Connection {
+        base_url: Url::parse("https://sonar.example/").unwrap(),
+        username: None,
+        secret: Some(crate::transport::Secret::new("token".to_owned())),
+    };
+    let CallResult::Json(v) = call(
+        ConnectorId::Sonarqube,
+        &conn,
+        "ce_status",
+        &args(),
+        t,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await?
+    else {
+        panic!("JSON")
+    };
+    Ok(v)
+}
+
+#[tokio::test]
+async fn ce_status_validates_exact_task_without_history_gate_or_catalog_reads() {
+    for status in ["PENDING", "IN_PROGRESS", "SUCCESS", "FAILED", "CANCELED"] {
+        let t = FakeTransport::new().json(200, &task(status).to_string());
+        let v = poll_ce(&t).await.unwrap();
+        assert_eq!(
+            v["watch_state"],
+            if matches!(status, "PENDING" | "IN_PROGRESS") {
+                "pending"
+            } else {
+                "terminal"
+            }
+        );
+        assert_eq!(v["status"], status);
+        assert_eq!(
+            v["analysis_id"],
+            if status == "SUCCESS" {
+                json!("analysis-1")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(t.requests().len(), 1);
+        assert_eq!(t.url(0), "https://sonar.example/api/ce/task?id=task-1");
+    }
+}
+
+#[tokio::test]
+async fn ce_status_refuses_selector_identity_and_status_conflicts() {
+    for (key, value) in [
+        ("id", json!("other")),
+        ("componentKey", json!("other")),
+        ("type", json!("OTHER")),
+        ("branch", json!("other")),
+        ("status", json!("UNKNOWN")),
+        ("analysisId", json!("not-ready")),
+    ] {
+        let mut body = task("PENDING");
+        body["task"][key] = value;
+        let t = FakeTransport::new().json(200, &body.to_string());
+        assert!(poll_ce(&t).await.is_err(), "{key}");
+        assert_eq!(t.requests().len(), 1);
+    }
+    let mut body = task("SUCCESS");
+    body["task"]["analysisId"] = Value::Null;
+    assert!(
+        poll_ce(&FakeTransport::new().json(200, &body.to_string()))
+            .await
+            .is_err()
+    );
+}

@@ -526,3 +526,29 @@ fn short(text: &str, limit: usize) -> String {
     }
     format!("{}{marker}", &text[..end])
 }
+
+/// Cheap exact CE identity/status read. No history or gate fetch while polling.
+pub(crate) async fn ce_status(
+    conn: &Connection,
+    args: &BTreeMap<String, ArgValue>,
+    transport: &dyn HttpTransport,
+    deadline: Instant,
+) -> Result<CallResult, ConnectorError> {
+    let request = Request::parse(args)?;
+    let mut url = endpoint(&conn.base_url, &["api", "ce", "task"])?;
+    url.query_pairs_mut().append_pair("id", request.task);
+    let body = get_json(conn, ID, url, transport, deadline).await?;
+    let task = body.get("task").ok_or_else(|| bad("missing CE task"))?;
+    let report = task_report(&request, task)?;
+    let status = report["ce_status"]
+        .as_str()
+        .ok_or_else(|| bad("missing CE status"))?;
+    let watch_state = if matches!(status, "PENDING" | "IN_PROGRESS") {
+        "pending"
+    } else {
+        "terminal"
+    };
+    Ok(CallResult::Json(
+        json!({"schema_version":1,"watch_state":watch_state,"status":status,"ce_status":status,"project":request.project,"ce_task":request.task,"analysis_id":report["analysis_id"],"identity":report["identity"],"requested":report["requested"],"ce_error":report["ce_error"],"revision":null,"revision_basis":"not_collected","coverage":{"requests":1,"history_collected":false,"gate_collected":false}}),
+    ))
+}

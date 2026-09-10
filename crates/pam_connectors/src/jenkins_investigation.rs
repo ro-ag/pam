@@ -656,7 +656,7 @@ pub(crate) fn source_identity(urls: Vec<Value>, revisions: Vec<Value>, mut parti
         "partial":partial,"invalid_metadata":invalid,"reported_revisions":reported_revisions})
 }
 
-fn scm_identity(core: &Value) -> Value {
+pub(crate) fn scm_identity(core: &Value) -> Value {
     let mut urls = Vec::new();
     let mut revisions = Vec::new();
     let actions = core.get("actions").and_then(Value::as_array);

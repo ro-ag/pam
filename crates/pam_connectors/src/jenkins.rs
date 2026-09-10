@@ -37,6 +37,7 @@ pub(crate) async fn call(
     deadline: Instant,
 ) -> Result<CallResult, ConnectorError> {
     match call {
+        "build_status" => build_status(conn, args, transport, deadline).await,
         "jobs" => jobs(conn, args, transport, deadline).await,
         "builds" => builds(conn, args, transport, deadline).await,
         "console" => console(conn, args, transport, deadline).await,
@@ -186,4 +187,30 @@ fn exit_status(result: Option<&str>) -> Option<i32> {
         Some("FAILURE" | "ABORTED" | "UNSTABLE") => Some(1),
         _ => None,
     }
+}
+
+/// One exact build core status; never fetch Pipeline graph or console content.
+async fn build_status(
+    conn: &Connection,
+    args: &BTreeMap<String, ArgValue>,
+    transport: &dyn HttpTransport,
+    deadline: Instant,
+) -> Result<CallResult, ConnectorError> {
+    let job = text_arg(args, "job")?;
+    let build = id_arg(args, "build")?;
+    let mut segments = job_segments(job)?;
+    segments.push(build.to_string());
+    let base = job_url(&conn.base_url, &segments)?;
+    let mut url = endpoint(&base, &["api", "json"])?;
+    url.query_pairs_mut().append_pair("tree","number,result,building,actions[remoteUrls,lastBuiltRevision[SHA1],revision[hash,pullHash,baseHash]]");
+    let core = get_json(conn, ID, url, transport, deadline).await?;
+    let status = crate::jenkins_investigation::core_status(&core, build)?;
+    let watch_state = match status {
+        "RUNNING" => "pending",
+        "UNKNOWN" => "unavailable",
+        _ => "terminal",
+    };
+    Ok(CallResult::Json(
+        json!({"schema_version":1,"watch_state":watch_state,"job":job,"build":build,"status":status,"building":core["building"],"source_identity":crate::jenkins_investigation::scm_identity(&core),"coverage":{"requests":1,"graph_collected":false,"logs_collected":false}}),
+    ))
 }

@@ -53,6 +53,7 @@ pub(crate) async fn call(
     deadline: Instant,
 ) -> Result<CallResult, ConnectorError> {
     match call {
+        "run_status" => run_status(conn, args, transport, deadline).await,
         "runs" => runs(conn, args, transport, deadline).await,
         "run" => run(conn, args, transport, deadline).await,
         "job_log" => job_log(conn, args, transport, deadline).await,
@@ -400,4 +401,90 @@ fn github_identity(run: &Value) -> Value {
         run.get("head_sha").into_iter().cloned().collect(),
         false,
     )
+}
+
+/// One exact-attempt status read, without job enumeration or logs.
+async fn run_status(
+    conn: &Connection,
+    args: &BTreeMap<String, ArgValue>,
+    transport: &dyn HttpTransport,
+    deadline: Instant,
+) -> Result<CallResult, ConnectorError> {
+    let (owner, name) = repo(args)?;
+    let run_id = id_arg(args, "run_id")?;
+    let attempt = id_arg(args, "run_attempt")?;
+    let url = endpoint(
+        &conn.base_url,
+        &[
+            "repos",
+            &owner,
+            &name,
+            "actions",
+            "runs",
+            &run_id.to_string(),
+            "attempts",
+            &attempt.to_string(),
+        ],
+    )?;
+    let run = get_json(conn, ID, url, transport, deadline).await?;
+    if run["id"].as_i64() != Some(run_id)
+        || run
+            .pointer("/repository/full_name")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(ConnectorError::BadResponse(
+            "GitHub status omitted run or repository identity".to_owned(),
+        ));
+    }
+    validated_attempt(&run, run_id, Some(attempt), &format!("{owner}/{name}"))?;
+    let status = run["status"]
+        .as_str()
+        .ok_or_else(|| ConnectorError::BadResponse("GitHub status is missing".to_owned()))?;
+    let watch_state = match status {
+        "queued" | "requested" | "waiting" | "pending" | "in_progress"
+            if run.get("conclusion") == Some(&Value::Null) =>
+        {
+            "pending"
+        }
+        "completed"
+            if run["conclusion"].as_str().is_some_and(|v| {
+                matches!(
+                    v,
+                    "success"
+                        | "failure"
+                        | "neutral"
+                        | "cancelled"
+                        | "skipped"
+                        | "timed_out"
+                        | "action_required"
+                        | "stale"
+                        | "startup_failure"
+                )
+            }) =>
+        {
+            "terminal"
+        }
+        _ => {
+            return Err(ConnectorError::BadResponse(
+                "GitHub status or conclusion is unknown or inconsistent".to_owned(),
+            ));
+        }
+    };
+    let mut observed = reported_run(&run);
+    // Watch observations retain bounded reported identity, never arbitrary run fields.
+    for key in ["name", "html_url", "head_sha", "created_at"] {
+        if !observed[key]
+            .as_str()
+            .is_some_and(|text| text.len() <= 2048)
+        {
+            observed
+                .as_object_mut()
+                .expect("run projection")
+                .remove(key);
+        }
+    }
+    Ok(CallResult::Json(
+        json!({"schema_version":1,"watch_state":watch_state,"status":status,"conclusion":run["conclusion"],"run_id":run_id,"run_attempt":attempt,"run":observed,"source_identity":github_identity(&run),"coverage":{"requests":1,"jobs_collected":false,"logs_collected":false}}),
+    ))
 }

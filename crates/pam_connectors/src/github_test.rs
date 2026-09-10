@@ -675,3 +675,83 @@ async fn fork_head_identity_remains_distinct_from_same_named_workflow_repository
         "base repository never substitutes for fork head"
     );
 }
+
+#[tokio::test]
+async fn run_status_polls_only_exact_attempt_and_keeps_fork_source() {
+    for (status, conclusion, state) in [
+        ("queued", serde_json::Value::Null, "pending"),
+        ("completed", serde_json::json!("failure"), "terminal"),
+    ] {
+        let t=FakeTransport::new().json(200,&serde_json::json!({"id":17,"run_attempt":2,"repository":{"full_name":"team/repo"},"head_repository":{"clone_url":"https://github.com/fork/repo.git"},"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":status,"conclusion":conclusion}).to_string());
+        let CallResult::Json(v) = run_call(
+            "run_status",
+            &[
+                ("repo", "team/repo"),
+                ("run_id", "17"),
+                ("run_attempt", "2"),
+            ],
+            &t,
+        )
+        .await
+        .unwrap() else {
+            panic!("JSON")
+        };
+        assert_eq!(v["watch_state"], state);
+        assert_eq!(
+            v["source_identity"]["repository_urls"][0],
+            "https://github.com/fork/repo.git"
+        );
+        assert_eq!(t.requests().len(), 1);
+        assert!(
+            t.url(0)
+                .ends_with("/repos/team/repo/actions/runs/17/attempts/2")
+        );
+        assert!(v.get("jobs").is_none());
+    }
+}
+
+#[tokio::test]
+async fn run_status_refuses_substitutions_and_unknown_or_conflicting_state() {
+    for (key, value) in [
+        ("id", serde_json::json!(18)),
+        ("id", serde_json::Value::Null),
+        ("run_attempt", serde_json::json!(3)),
+        ("repository", serde_json::json!({"full_name":"other/repo"})),
+        ("status", serde_json::json!("new_status")),
+        ("status", serde_json::json!("completed")),
+        ("conclusion", serde_json::json!("success")),
+    ] {
+        let mut body = serde_json::json!({"id":17,"run_attempt":2,"repository":{"full_name":"team/repo"},"status":"queued","conclusion":null});
+        body[key] = value;
+        let t = FakeTransport::new().json(200, &body.to_string());
+        assert!(
+            run_call(
+                "run_status",
+                &[
+                    ("repo", "team/repo"),
+                    ("run_id", "17"),
+                    ("run_attempt", "2")
+                ],
+                &t
+            )
+            .await
+            .is_err(),
+            "{key}"
+        );
+        assert_eq!(t.requests().len(), 1);
+    }
+    let t = FakeTransport::new().json(503, "{}");
+    assert!(
+        run_call(
+            "run_status",
+            &[
+                ("repo", "team/repo"),
+                ("run_id", "17"),
+                ("run_attempt", "2")
+            ],
+            &t
+        )
+        .await
+        .is_err()
+    );
+}

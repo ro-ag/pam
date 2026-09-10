@@ -17,7 +17,7 @@ use std::time::Duration;
 use pam::client;
 use pam::render;
 use pam_daemon::daemon::{DaemonHandle, run_daemon};
-use pam_daemon::flow_service::SETTING_ALLOWED_PROGRAMS;
+use pam_daemon::flow_service::{SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_proto::{Event, Outcome, Response};
 use pam_store::{RequestRow, RequestState, Store};
@@ -65,6 +65,7 @@ impl TestDaemon {
         seed_relaxed(&tmp).await;
         if !programs.is_empty() {
             seed_allowed_programs(&tmp, programs).await;
+            seed_toolchain_path(&tmp).await;
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
@@ -120,6 +121,55 @@ async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
         .set_setting(SETTING_ALLOWED_PROGRAMS, &raw)
         .await
         .expect("the allowlist persists");
+}
+
+/// Use the real Apple Git binary; /usr/bin/git's xcrun cache writes are denied.
+async fn seed_toolchain_path(tmp: &tempfile::TempDir) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for directory in [
+        "/Library/Developer/CommandLineTools/usr/bin",
+        "/Applications/Xcode.app/Contents/Developer/usr/bin",
+    ] {
+        if Path::new(directory).join("git").is_file() {
+            Store::open(&base_of(tmp).join("state.sqlite3"))
+                .await
+                .unwrap()
+                .set_setting(
+                    SETTING_EXTRA_PATH,
+                    &serde_json::json!([directory]).to_string(),
+                )
+                .await
+                .unwrap();
+            break;
+        }
+    }
+}
+
+fn command_exit(supported: u8) -> i32 {
+    i32::from(if cfg!(target_os = "macos") {
+        supported
+    } else {
+        render::EXIT_BLOCKED
+    })
+}
+
+/// No unsupported host may substitute an uncontained command or fabricated log.
+fn assert_unsupported_report(report: &serde_json::Value) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+    assert_eq!(report["outcome"], "blocked", "{report}");
+    let step = &report["steps"][0];
+    assert_eq!(
+        step["error"]["cause"], "command_containment_unavailable",
+        "{report}"
+    );
+    assert_eq!(step["attempts"], 1);
+    assert!(step["exit_status"].is_null());
+    assert!(step["evidence"].as_array().unwrap().is_empty());
+    true
 }
 
 /// Approves only the real repository named by this CLI fixture; no remote scope.
@@ -452,8 +502,8 @@ async fn run_pam(base: &Path, cwd: &Path, args: &[&str]) -> CliRun {
     .expect("the pam exec joins")
 }
 
-/// A git repository with one commit and an `origin` remote pointing at
-/// itself, so the builtin's `git fetch --prune` succeeds with no network.
+/// A git repository with one commit and a local origin. Fetch still requires
+/// repository writes, which the shipped read-only fetch step is denied.
 fn temp_git_repo() -> tempfile::TempDir {
     let tmp = short_tempdir();
     let repo = tmp.path().to_path_buf();
@@ -581,7 +631,7 @@ async fn an_unknown_flow_id_is_refused_on_stderr_and_exits_three() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
+async fn flow_run_preserves_unresolved_after_merge_fetch_under_containment() {
     warm_binary();
     timeout(FLOW_DEADLINE, async {
         let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
@@ -596,11 +646,21 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
         .await;
 
         assert_eq!(
-            run.code, 0,
+            run.code,
+            command_exit(render::EXIT_UNRESOLVED),
             "stdout: {}\nstderr: {}",
-            run.stdout, run.stderr
+            run.stdout,
+            run.stderr
         );
-        assert!(run.stdout.contains("succeeded"), "stdout: {}", run.stdout);
+        assert!(
+            run.stdout.contains(if cfg!(target_os = "macos") {
+                "failed"
+            } else {
+                "blocked"
+            }),
+            "stdout: {}",
+            run.stdout
+        );
         assert!(
             run.stdout.contains("not_attempted"),
             "stdout: {}",
@@ -615,12 +675,22 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
         )
         .await;
 
-        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        assert_eq!(
+            run.code,
+            command_exit(render::EXIT_UNRESOLVED),
+            "stderr: {}",
+            run.stderr
+        );
         let response: serde_json::Value =
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
-        assert_eq!(response["outcome"], "verified", "response: {response}");
+        let expected = if cfg!(target_os = "macos") {
+            "unresolved"
+        } else {
+            "blocked"
+        };
+        assert_eq!(response["outcome"], expected, "response: {response}");
         assert_eq!(
-            response["body"]["workflow"]["outcome"], "verified",
+            response["body"]["workflow"]["outcome"], expected,
             "response: {response}"
         );
         assert_eq!(
@@ -628,6 +698,18 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
             "response: {response}"
         );
 
+        let report = protected_flow_report(&daemon.handle.store(), &response).await;
+        if !assert_unsupported_report(&report) {
+            let steps = report["steps"].as_array().unwrap();
+            let fetch = steps.iter().find(|step| step["id"] == "fetch").unwrap();
+            assert_eq!(fetch["status"], "failed", "{report}");
+            assert_eq!(fetch["error"]["cause"], "exit_status", "{report}");
+            let clean = steps
+                .iter()
+                .find(|step| step["id"] == "clean-tree")
+                .unwrap();
+            assert_eq!(clean["status"], "succeeded", "{report}");
+        }
         daemon.stop().await;
     })
     .await
@@ -650,10 +732,11 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
         )
         .await;
 
-        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        assert_eq!(run.code, command_exit(0), "stderr: {}", run.stderr);
         let response: serde_json::Value =
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
         let report = protected_flow_report(&daemon.handle.store(), &response).await;
+        assert_unsupported_report(&report);
         assert_eq!(report["inputs"]["label"], "carried", "response: {response}");
         assert_eq!(report["flow"]["source"], "library", "response: {response}");
 
@@ -665,10 +748,11 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
         )
         .await;
 
-        assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+        assert_eq!(run.code, command_exit(0), "stderr: {}", run.stderr);
         let response: serde_json::Value =
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
         let report = protected_flow_report(&daemon.handle.store(), &response).await;
+        assert_unsupported_report(&report);
         assert_eq!(report["inputs"]["label"], "unset", "response: {response}");
 
         daemon.stop().await;
@@ -737,6 +821,7 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
     warm_binary();
     timeout(FLOW_DEADLINE, async {
         let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        seed_flow(&daemon.tmp, "clean-check", "schema: 1\nid: clean-check\nname: Clean check\nsteps:\n  - id: clean-tree\n    run: [git, status, --porcelain=v1, --untracked-files=all, --ignore-submodules=none]\n    expect_empty_output: true\n    role: verify\n");
         let store = Store::open(&daemon.base().join("state.sqlite3"))
             .await
             .unwrap();
@@ -746,27 +831,24 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
             let run = run_pam(
                 &daemon.base(),
                 repo.path(),
-                &["flow", "run", "after-merge-checks", "--json"],
+                &["flow", "run", "clean-check", "--json"],
             )
             .await;
-            let expected_code = if state == "clean" {
-                0
-            } else {
-                i32::from(render::EXIT_UNRESOLVED)
-            };
+            let expected_code = command_exit(if state == "clean" { 0 } else { render::EXIT_UNRESOLVED });
             assert_eq!(
                 run.code, expected_code,
                 "{state}: {} {}",
                 run.stdout, run.stderr
             );
             let response: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            let report = protected_flow_report(&store, &response).await;
+            if assert_unsupported_report(&report) { continue; }
             let outcome = if state == "clean" {
                 "verified"
             } else {
                 "unresolved"
             };
             assert_eq!(response["outcome"], outcome, "{state}: {response}");
-            let report = protected_flow_report(&store, &response).await;
             let step = report["steps"]
                 .as_array()
                 .unwrap()
@@ -848,9 +930,11 @@ async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
         let repo = temp_git_repo();
         seed_repository_scope(&daemon, repo.path()).await;
         let run = run_pam(&base, repo.path(), &["flow", "run", "copied", "--json"]).await;
-        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(run.code, command_exit(0), "{}", run.stderr);
         let result: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         assert_eq!(result["body"]["flow"]["id"], "copied");
+        let report = protected_flow_report(&daemon.handle.store(), &result).await;
+        assert_unsupported_report(&report);
         let deleted = flow_admin(&base, "admin.flows.delete", serde_json::json!({"id":"copied"})).await;
         assert_eq!(deleted["revealed_builtin"], false);
         flow_admin(&base, "admin.flows.save", serde_json::json!({
@@ -1036,7 +1120,13 @@ async fn workflow_discovery_wait_and_durable_result_use_the_actual_binary() {
         let started: serde_json::Value = serde_json::from_str(&started.stdout).unwrap();
         let ticket = started["ticket"].as_str().unwrap();
         let waited = run_pam(&daemon.base(), repo.path(), &["wait", ticket, "--json"]).await;
-        assert_eq!(waited.code, 4, "{} {}", waited.stdout, waited.stderr);
+        assert_eq!(
+            waited.code,
+            command_exit(render::EXIT_UNRESOLVED),
+            "{} {}",
+            waited.stdout,
+            waited.stderr
+        );
         let waited: serde_json::Value = serde_json::from_str(&waited.stdout).unwrap();
         let fetched = run_pam(
             &daemon.base(),
@@ -1044,12 +1134,22 @@ async fn workflow_discovery_wait_and_durable_result_use_the_actual_binary() {
             &["flow", "result", ticket, "--json"],
         )
         .await;
-        assert_eq!(fetched.code, 4, "{} {}", fetched.stdout, fetched.stderr);
+        assert_eq!(
+            fetched.code,
+            command_exit(render::EXIT_UNRESOLVED),
+            "{} {}",
+            fetched.stdout,
+            fetched.stderr
+        );
         let fetched: serde_json::Value = serde_json::from_str(&fetched.stdout).unwrap();
         assert_eq!(waited["body"], fetched["body"]);
         assert_eq!(
             fetched["body"]["agent_result"]["workflow"]["outcome"],
-            "unresolved"
+            if cfg!(target_os = "macos") {
+                "unresolved"
+            } else {
+                "blocked"
+            }
         );
         assert_eq!(
             fetched["body"]["agent_result"]["diagnosis"]["status"],

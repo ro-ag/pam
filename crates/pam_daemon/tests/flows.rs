@@ -70,6 +70,24 @@ fn helper_dir() -> String {
         .to_string()
 }
 
+/// Pin fixture Git to Apple's installed toolchain, avoiding the xcrun shim
+/// selected by /usr/bin/git and its denied cache writes.
+fn fixture_extra_path() -> Vec<String> {
+    let mut paths = vec![helper_dir()];
+    if cfg!(target_os = "macos") {
+        for directory in [
+            "/Library/Developer/CommandLineTools/usr/bin",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin",
+        ] {
+            if PathBuf::from(directory).join("git").is_file() {
+                paths.push(directory.to_owned());
+                break;
+            }
+        }
+    }
+    paths
+}
+
 /// A daemon whose flow settings allow `git` and the helper, on a repo
 /// directory that exists.
 struct FlowDaemon {
@@ -89,7 +107,9 @@ impl FlowDaemon {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
         seed_allowed_programs(&tmp, &["git", "pam-flow-helper"]).await;
-        seed_extra_path(&tmp, &[&helper_dir()]).await;
+        let extra_path = fixture_extra_path();
+        let extra_path: Vec<&str> = extra_path.iter().map(String::as_str).collect();
+        seed_extra_path(&tmp, &extra_path).await;
         for (id, yaml) in flows {
             drop(seed_flow(&tmp, id, yaml));
         }
@@ -410,7 +430,7 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             flows.daemon.stop().await;
             return;
         }
-        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(outcome, Outcome::Verified, "{body}");
         assert_eq!(body["outcome"], "verified");
         assert_eq!(body["flow"]["id"], "two-step");
         assert_eq!(body["flow"]["source"], "library");

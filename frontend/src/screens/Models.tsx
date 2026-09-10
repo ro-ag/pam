@@ -87,6 +87,37 @@ export function runningDownload(jobs: ModelJob[], modelId: string): ModelJob | u
   );
 }
 
+/** The newest download job for `modelId`, whatever state it reached. */
+export function latestDownload(jobs: ModelJob[], modelId: string): ModelJob | undefined {
+  return jobs.find((job) => job.kind === "download" && job.model_id === modelId);
+}
+
+/** What a settled download says went wrong, or `null` when it did not fail. */
+export function downloadFailure(job: ModelJob | undefined): BridgeFailure | null {
+  if (!job || job.state !== "failed") return null;
+  // The daemon writes `{cause, detail, recovery}`; a row from an older
+  // build, or one truncated somehow, still has to say something rather
+  // than render an empty box.
+  const fallback: BridgeFailure = {
+    cause: "download_failed",
+    detail: job.detail ?? "the transfer ended without saying why",
+    recovery: "Download again — the partial file is kept, so it resumes.",
+  };
+  if (!job.detail) return fallback;
+  try {
+    const parsed: unknown = JSON.parse(job.detail);
+    if (typeof parsed !== "object" || parsed === null) return fallback;
+    const body = parsed as Record<string, unknown>;
+    return {
+      cause: typeof body.cause === "string" ? body.cause : fallback.cause,
+      detail: typeof body.detail === "string" ? body.detail : fallback.detail,
+      recovery: typeof body.recovery === "string" ? body.recovery : fallback.recovery,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 /** How often the status query should tick, given what it last saw. */
 export function pollInterval(status: ModelsStatus | undefined): number {
   if (!status) return POLL_IDLE_MS;
@@ -492,6 +523,11 @@ function PresetCard({
   onDownload: () => void;
   onCancel: () => void;
 }) {
+  const running = job?.state === "running" ? job : undefined;
+  const failure = downloadFailure(job);
+  // A failed or cancelled transfer left its part file behind, so the
+  // button that follows it is a resume, and says so.
+  const resumable = !running && (failure !== null || job?.state === "cancelled");
   return (
     <div className="space-y-3 rounded-card border border-line p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -507,14 +543,23 @@ function PresetCard({
             <Check aria-hidden="true" className="size-4" />
             installed
           </span>
-        ) : job ? null : (
+        ) : running ? null : (
           <Button size="sm" disabled={busy} onClick={onDownload}>
-            Download
+            {resumable ? "Resume" : "Download"}
           </Button>
         )}
       </div>
 
-      {job && <DownloadProgress job={job} onCancel={onCancel} />}
+      {running && <DownloadProgress job={running} onCancel={onCancel} />}
+
+      {failure && <FailureNote failure={failure} label="download" />}
+
+      {job?.state === "cancelled" && (
+        <p className="font-sans text-sm text-ink-muted">
+          You stopped this one. The bytes so far are still on disk — Resume picks up where it
+          left off.
+        </p>
+      )}
 
       <a
         href={preset.license_url}
@@ -585,7 +630,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           <PresetCard
             key={preset.id}
             preset={preset}
-            job={runningDownload(jobs, presetModelId(preset))}
+            job={latestDownload(jobs, presetModelId(preset))}
             busy={download.isPending}
             onDownload={() => download.mutate({ preset_id: preset.id })}
             onCancel={() => {

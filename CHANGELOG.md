@@ -6,6 +6,21 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Model downloads no longer hang on a dead connection: curl now carries a
+  connect deadline and a minimum sustained rate, so a stalled transfer fails
+  with a cause instead of a progress bar that never moves. The partial file
+  is kept, so the next attempt resumes.
+- Download failures say what actually broke. curl's exit code becomes a named
+  cause — `dns_failed`, `connect_failed`, `network_timeout`, `http_error`,
+  `tls_error`, `transfer_interrupted`, `resume_unsupported`, `disk_error` —
+  each with its own recovery sentence, written to the job row and logged at
+  WARN with curl's own complaint.
+- The Models screen shows failed and cancelled downloads instead of silently
+  dropping them, with cause, detail and recovery, and a Resume button when a
+  partial file is waiting.
+
 ## [0.3.0] - 2026-09-04
 
 ### Added

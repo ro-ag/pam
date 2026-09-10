@@ -11,6 +11,8 @@ import {
   IDLE_RUNTIME_SENTENCE,
   POLL_BUSY_MS,
   POLL_IDLE_MS,
+  downloadFailure,
+  latestDownload,
   pollInterval,
   presetModelId,
   runningDownload,
@@ -393,6 +395,61 @@ describe("catalog", () => {
     expect(runningDownload([job()], presetModelId(preset()))?.id).toBe("job_01");
     expect(runningDownload([job({ state: "done" })], presetModelId(preset()))).toBeUndefined();
     expect(runningDownload([job()], "qwen/other")).toBeUndefined();
+  });
+
+  it("shows why a download failed, with its recovery, and offers a resume", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({
+        jobs: [
+          job({
+            state: "failed",
+            detail: JSON.stringify({
+              cause: "network_timeout",
+              detail: "curl exited 28: Operation too slow",
+              recovery: "The transfer stopped moving; download again to resume.",
+            }),
+          }),
+        ],
+      }),
+    );
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+    expect(await catalog.findByText("download · network_timeout")).toBeInTheDocument();
+    expect(catalog.getByText(/Operation too slow/)).toBeInTheDocument();
+    expect(catalog.getByText(/download again to resume/)).toBeInTheDocument();
+    // A failed transfer left its part file: the button says what it does.
+    expect(catalog.getByRole("button", { name: "Resume" })).toBeInTheDocument();
+    expect(catalog.queryByLabelText("download progress")).not.toBeInTheDocument();
+  });
+
+  it("reads a failure body, and still says something when the row is old or broken", () => {
+    expect(downloadFailure(job())).toBeNull();
+    expect(downloadFailure(job({ state: "done" }))).toBeNull();
+    expect(
+      downloadFailure(
+        job({
+          state: "failed",
+          detail: JSON.stringify({ cause: "tls_error", detail: "bad cert", recovery: "Fix it." }),
+        }),
+      ),
+    ).toEqual({ cause: "tls_error", detail: "bad cert", recovery: "Fix it." });
+
+    const legacy = downloadFailure(job({ state: "failed", detail: "daemon_restart" }));
+    expect(legacy?.cause).toBe("download_failed");
+    expect(legacy?.detail).toBe("daemon_restart");
+    expect(legacy?.recovery).not.toBe("");
+
+    const empty = downloadFailure(job({ state: "failed", detail: null }));
+    expect(empty?.detail).toBe("the transfer ended without saying why");
+  });
+
+  it("follows a model's latest download whatever state it reached", () => {
+    expect(latestDownload([job({ state: "failed" })], presetModelId(preset()))?.id).toBe("job_01");
+    expect(latestDownload([job()], "qwen/other")).toBeUndefined();
+    expect(
+      latestDownload([job({ kind: "verify", state: "failed" })], presetModelId(preset())),
+    ).toBeUndefined();
   });
 
   it("sends a pasted URL with its vendor, and says pasted files stay unverified", async () => {

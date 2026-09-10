@@ -10,8 +10,9 @@
 //! Windows). The holder writes its pid into the file so a losing
 //! contender can name who beat it. The lock is held for the daemon's
 //! whole lifetime — [`InstanceLock`] keeps the file handle open and the
-//! OS releases the lock when the handle drops (daemon exit included, so
-//! a crashed daemon never wedges the next one).
+//! guard explicitly unlocks on drop, including when a subprocess temporarily
+//! inherited the open file description. Process exit also releases the lock
+//! once the OS closes the last inherited handle.
 //!
 //! # Lock-first ordering
 //!
@@ -127,11 +128,23 @@ pub enum LifecycleError {
 #[derive(Debug)]
 pub struct InstanceLock {
     /// The open, locked handle. Held only for the lock it carries.
-    _file: File,
+    file: File,
     path: PathBuf,
 }
 
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing only this descriptor is insufficient while a forked child
+        // retains the shared open file description before exec closes it.
+        let _ = self.file.unlock();
+    }
+}
+
 impl InstanceLock {
+    #[cfg(test)]
+    pub(crate) fn duplicate_handle_for_test(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
     /// Path of the held lock file.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -165,7 +178,7 @@ pub fn acquire_instance_lock(run_dir: &Path) -> Result<InstanceLock, LifecycleEr
             file.seek(SeekFrom::Start(0)).map_err(io_err)?;
             write!(file, "{}", std::process::id()).map_err(io_err)?;
             file.flush().map_err(io_err)?;
-            Ok(InstanceLock { _file: file, path })
+            Ok(InstanceLock { file, path })
         }
         Err(TryLockError::WouldBlock) => {
             let pid = std::fs::read_to_string(&path)

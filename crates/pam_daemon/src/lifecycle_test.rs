@@ -46,6 +46,27 @@ fn lock_is_exclusive_and_released_on_drop() {
     drop(again);
 }
 
+// Unix flock follows the open file description, shared by dup and fork.
+// Windows byte-range locks have different duplicate-handle semantics; the
+// portable lifecycle test above continues to cover that platform.
+#[cfg(unix)]
+#[test]
+fn explicit_drop_unlocks_even_while_an_inherited_description_remains_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = acquire_instance_lock(tmp.path()).expect("initial lock");
+    let inherited = first
+        .duplicate_handle_for_test()
+        .expect("duplicate descriptor");
+    assert!(acquire_instance_lock(tmp.path()).is_err());
+    drop(first);
+    let second = acquire_instance_lock(tmp.path()).expect("explicit unlock releases shared lock");
+    // Closing the old duplicate must not unlock the independently acquired lock.
+    drop(inherited);
+    assert!(acquire_instance_lock(tmp.path()).is_err());
+    drop(second);
+    assert!(acquire_instance_lock(tmp.path()).is_ok());
+}
+
 /// Seeds one request row in `state` (via the non-terminal transition
 /// helper, since rows are born `queued`).
 async fn seed_request(store: &Store, id: &str, state: RequestState) {

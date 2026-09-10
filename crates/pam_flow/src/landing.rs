@@ -122,7 +122,7 @@ pub(crate) fn step(raw: RawStep, at: &str, earlier: &BTreeSet<String>) -> Result
         } else {
             raw.approval.unwrap_or_default()
         },
-        env: Default::default(),
+        env: std::collections::BTreeMap::default(),
         note: crate::validate::validate_note(raw.note.as_deref(), at)?,
     })
 }

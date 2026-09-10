@@ -7,8 +7,9 @@ use crate::{command_containment::CommandContainment, request_budget::RequestBudg
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -65,7 +66,7 @@ pub(crate) struct CheckoutSnapshot {
     pub checktree: PathBuf,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{cause}: {detail}")]
 pub(crate) struct CheckoutError {
     pub cause: &'static str,
@@ -103,6 +104,7 @@ fn bounded_read(path: &Path, max: usize) -> Result<Vec<u8>, CheckoutError> {
 fn text(bytes: &[u8]) -> Result<&str, CheckoutError> {
     std::str::from_utf8(bytes).map_err(|_| invalid("Git metadata is not UTF-8"))
 }
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Literal Git ref grammar, not a filename extension.
 fn valid_ref(value: &str) -> bool {
     value.starts_with("refs/")
         && value.len() <= 256
@@ -419,7 +421,7 @@ impl Git<'_> {
             let send = write_input(stdin, input);
             let read_out = read_pipe(stdout, cap);
             let read_err = read_pipe(stderr, MAX_STDERR);
-            let (_, output, diagnostics) =
+            let ((), output, diagnostics) =
                 tokio::try_join!(send, read_out, read_err).map_err(io_error)?;
             let status = child.wait().await.map_err(io_error)?;
             Ok::<_, CheckoutError>((status.success(), output, diagnostics.len()))
@@ -518,10 +520,10 @@ impl Git<'_> {
         tree: &str,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<(), CheckoutError> {
-        let paths = manifest
-            .iter()
-            .map(|entry| format!("tree/{}\n", entry.path))
-            .collect::<String>();
+        let mut paths = String::new();
+        for entry in manifest {
+            let _ = writeln!(paths, "tree/{}", entry.path);
+        }
         let hashes = self
             .run(
                 &["hash-object", "--no-filters", "--stdin-paths"],
@@ -539,17 +541,16 @@ impl Git<'_> {
         // Rebuild a fresh index, without read-tree's cached subtree identities.
         self.run(&["read-tree", "--empty"], &[], 1024, cancel)
             .await?;
-        let records = manifest
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{:o} {}\t{}\0",
-                    entry.mode | 0o100000,
-                    entry.oid,
-                    entry.path
-                )
-            })
-            .collect::<String>();
+        let mut records = String::new();
+        for entry in manifest {
+            let _ = write!(
+                records,
+                "{:o} {}\t{}\0",
+                entry.mode | 0o100_000,
+                entry.oid,
+                entry.path
+            );
+        }
         self.run(
             &["update-index", "-z", "--index-info"],
             records.as_bytes(),
@@ -715,7 +716,6 @@ fn export_blobs(
                 .ok_or_else(|| invalid("missing tracked parent"))?,
         )
         .map_err(io_error)?;
-        use std::io::Write;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -850,10 +850,10 @@ async fn capture_worker(
         )
         .await?;
     let mut manifest = parse_manifest(&raw)?;
-    let input = manifest
-        .iter()
-        .map(|e| format!("{}\n", e.oid))
-        .collect::<String>();
+    let mut input = String::new();
+    for entry in &manifest {
+        let _ = writeln!(input, "{}", entry.oid);
+    }
     let cap = manifest.iter().map(|e| e.bytes + 128).sum::<usize>();
     let data = git
         .run(&["cat-file", "--batch"], input.as_bytes(), cap, cancel)

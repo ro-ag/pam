@@ -20,6 +20,7 @@ pub(crate) struct Check {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Independent GUI grants; no mutually exclusive states.
 pub(crate) struct Permissions {
     pub push: bool,
     pub create_pr: bool,
@@ -29,6 +30,7 @@ pub(crate) struct Permissions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)] // Serialized names distinguish source and provider identities.
 pub(crate) struct Repository {
     pub root: PathBuf,
     pub repository: String,
@@ -78,6 +80,7 @@ fn conflict() -> Error {
     }
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Literal Git ref grammar.
 pub(crate) fn valid_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200

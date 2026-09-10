@@ -118,37 +118,7 @@ fn prepare_sync(
     containment.read_only_roots.sort();
     containment.read_only_roots.dedup();
     containment.artifact_roots.push(artifacts.clone());
-    let mut env = base_env(settings);
-    let outputs = [
-        ("HOME", "home"),
-        ("CARGO_HOME", "cargo"),
-        ("CARGO_TARGET_DIR", "target"),
-        ("TMPDIR", "tmp"),
-        ("TMP", "tmp"),
-        ("TEMP", "tmp"),
-        ("npm_config_cache", "npm"),
-    ];
-    env.retain(|(name, _)| {
-        !outputs.iter().any(|(key, _)| key == name)
-            && name != "PAM_ARTIFACTS"
-            && name != "RUSTUP_HOME"
-    });
-    for (name, suffix) in outputs {
-        env.push((
-            name.to_owned(),
-            artifacts.join(suffix).to_string_lossy().into_owned(),
-        ));
-    }
-    env.push((
-        "PAM_ARTIFACTS".to_owned(),
-        artifacts.to_string_lossy().into_owned(),
-    ));
-    if let Some(home) = std::env::home_dir() {
-        env.push((
-            "RUSTUP_HOME".to_owned(),
-            home.join(".rustup").to_string_lossy().into_owned(),
-        ));
-    }
+    let env = build_env(settings, &artifacts);
     let argv = check.argv[1..]
         .iter()
         .map(|arg| {
@@ -182,4 +152,39 @@ pub(super) async fn prepare(
     })
     .await
     .map_err(|error| invalid(&error.to_string()))?
+}
+
+fn build_env(settings: &FlowSettings, artifacts: &Path) -> Vec<(String, String)> {
+    let mut env = base_env(settings);
+    let outputs = [
+        ("HOME", "home"),
+        ("CARGO_HOME", "cargo"),
+        ("CARGO_TARGET_DIR", "target"),
+        ("TMPDIR", "tmp"),
+        ("TMP", "tmp"),
+        ("TEMP", "tmp"),
+        ("npm_config_cache", "npm"),
+    ];
+    env.retain(|(name, _)| {
+        !outputs.iter().any(|(key, _)| key == name)
+            && name != "PAM_ARTIFACTS"
+            && name != "RUSTUP_HOME"
+    });
+    for (name, suffix) in outputs {
+        env.push((
+            name.to_owned(),
+            artifacts.join(suffix).to_string_lossy().into_owned(),
+        ));
+    }
+    env.push((
+        "PAM_ARTIFACTS".to_owned(),
+        artifacts.to_string_lossy().into_owned(),
+    ));
+    if let Some(home) = std::env::home_dir() {
+        env.push((
+            "RUSTUP_HOME".to_owned(),
+            home.join(".rustup").to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }

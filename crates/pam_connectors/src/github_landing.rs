@@ -95,6 +95,7 @@ fn sha(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Git ref grammar reserves the literal .lock suffix.
 fn branch(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256

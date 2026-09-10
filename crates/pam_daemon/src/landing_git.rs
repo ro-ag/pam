@@ -86,6 +86,7 @@ fn oid(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && value.bytes().any(|b| b != b'0')
 }
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Literal Git ref grammar.
 fn reference(branch: &str) -> Result<String, CheckoutError> {
     if branch.is_empty()
         || branch.len() > 240
@@ -277,11 +278,11 @@ impl Session<'_> {
             return Ok(command);
         }
         command.env("GIT_WORK_TREE", &self.request.repository);
-        self.contain_local(command)
+        self.contain_local(&command)
     }
     fn contain_local(
         &self,
-        command: tokio::process::Command,
+        command: &tokio::process::Command,
     ) -> Result<tokio::process::Command, CheckoutError> {
         let env = command
             .as_std()
@@ -436,7 +437,7 @@ impl Session<'_> {
             .take()
             .ok_or_else(|| invalid("Git diagnostic pipe unavailable"))?;
         let collect = async {
-            let (_, output, diagnostics) = tokio::try_join!(
+            let ((), output, diagnostics) = tokio::try_join!(
                 send_input(stdin, input),
                 bounded_pipe(stdout, output_limit),
                 pipe(stderr)

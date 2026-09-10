@@ -1,5 +1,9 @@
 //! Private typed landing bridge; ordinary connector scopes cannot mutate.
-use super::*;
+use super::{
+    Arc, ArgValue, BTreeMap, Connection, ConnectorError, ConnectorId, ConnectorRow,
+    ConnectorService, Future, HttpRequest, HttpResponse, HttpTransport, Instant, InvokeError, Path,
+    Pin, TransportError, configured_url,
+};
 use pam_connectors::{
     Method,
     github_landing::{self, Target},

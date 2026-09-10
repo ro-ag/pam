@@ -1,6 +1,9 @@
 //! Credentials remain inside the typed Git broker. Every network spawn calls
 //! an owned current-authority guard after local preflight and budget reservation.
-use super::*;
+use super::{
+    Arc, ArgValue, BTreeMap, CallSecret, ConnectorError, ConnectorId, ConnectorRow,
+    ConnectorService, Future, Instant, InvokeError, Path, Pin, ScopePolicy, Store, configured_url,
+};
 use crate::{
     landing_checkout::CheckoutError,
     landing_git::{GitAuthorization, GitTarget, GitTransport, PushObservation, RemoteRef},
@@ -44,6 +47,11 @@ impl GitGuard {
         target: &GitTarget,
         push: bool,
     ) -> Result<Self, InvokeError> {
+        let source_branch = target
+            .receipt
+            .branch
+            .strip_prefix("refs/heads/")
+            .ok_or_else(denied)?;
         if target.request.repository != repo
             || target.receipt.repository != repo
             || target.request.remote_url != target.receipt.remote_url
@@ -51,7 +59,7 @@ impl GitGuard {
             || target.request.expected_commit != target.receipt.commit
             || !sha(&target.receipt.commit)
             || target.expected_old.as_ref().is_some_and(|oid| !sha(oid))
-            || (push && target.branch != target.receipt.branch)
+            || (push && target.branch != source_branch)
         {
             return Err(denied());
         }
@@ -63,7 +71,7 @@ impl GitGuard {
             remote: target.request.remote_url.clone(),
             base: target.request.base_ref.clone(),
             branch: target.branch.clone(),
-            source_branch: target.receipt.branch.clone(),
+            source_branch: source_branch.to_owned(),
             workspace: target.request.checkouts_root.clone(),
             push,
         })

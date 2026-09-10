@@ -182,17 +182,7 @@ pub(crate) fn profile(
                     .to_owned(),
             );
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata =
-                std::fs::metadata(&root).map_err(|_| "artifact directory unavailable")?;
-            let private =
-                std::fs::metadata(&protected).map_err(|_| "private directory unavailable")?;
-            if metadata.uid() != private.uid() || metadata.mode() & 0o077 != 0 {
-                return Err("artifact directory must be private and owned by PAM's user".to_owned());
-            }
-        }
+        validate_artifact_owner(&root, &protected)?;
         artifacts.push(root);
     }
     // Do not import system/app profiles: they grant services beyond this contract.
@@ -238,4 +228,20 @@ pub(crate) fn profile(
         return Err("command containment profile exceeds its limit".to_owned());
     }
     Ok((text, program))
+}
+
+fn validate_artifact_owner(
+    root: &std::path::Path,
+    protected: &std::path::Path,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(root).map_err(|_| "artifact directory unavailable")?;
+        let private = std::fs::metadata(protected).map_err(|_| "private directory unavailable")?;
+        if metadata.uid() != private.uid() || metadata.mode() & 0o077 != 0 {
+            return Err("artifact directory must be private and owned by PAM's user".to_owned());
+        }
+    }
+    Ok(())
 }

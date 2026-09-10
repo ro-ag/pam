@@ -591,7 +591,7 @@ pub async fn run_command_budgeted(
             reservation.finish(u64::try_from(output.len()).unwrap_or(u64::MAX))?;
         }
         CommandOutcome::SpawnFailed(_) | CommandOutcome::ContainmentUnavailable { .. } => {
-            reservation.finish(0)?
+            reservation.finish(0)?;
         }
         CommandOutcome::Cancelled => {}
     }

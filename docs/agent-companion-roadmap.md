@@ -73,11 +73,14 @@ Every task carries its own caller/integration and acceptance note in ptrack.
 | #126 | Scoped daemon admission and cumulative budgets | Denied, oversized, expired, redirected and revoked requests cannot exceed authority or resource bounds |
 | #127 | Evidence identity and bounded retrieval | Agent can retrieve cited bytes with digest, offset basis, omissions and expiry; cross-scope handles fail |
 | #103 | Discoverable CLI task/result contract | Configured operations and actionable refusals are usable without a model; no agent-facing admin API |
+| #143 | Broker child-process containment | Repository code and descendants cannot reach private authority; unsupported execution refuses before workload spawn |
 | #120 | End-to-end checkpoint | Sandboxed CLI runs one investigation and retrieves its decisive evidence without GUI-only data access |
 
 The administration boundary, scoped budgets and evidence retrieval are implemented;
 see [administration](admin-boundary.md), [budgets](scoped-admission-and-budgets.md)
-and [flow CLI contracts](flow-cli-contract.md). Use ptrack for current task status.
+and [flow CLI contracts](flow-cli-contract.md). Broker commands additionally require
+[child-process containment](command-containment.md), whose network and artifact-write
+limits must be addressed by the guarded landing workstream. Use ptrack for current task status.
 Checkpoint #120 must still validate the declared enterprise OS boundary and event
 confidentiality. The [native build audit](native-build-dependencies.md) also records
 the unresolved GUI compiler conflict. Hiding a socket pathname is not isolation.

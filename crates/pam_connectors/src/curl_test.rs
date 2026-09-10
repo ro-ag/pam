@@ -169,13 +169,13 @@ fn inherited_curl_home_cannot_enable_a_trace_file() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn hostile_environment_child() {
+    use tokio::io::AsyncWriteExt;
     if std::env::var_os("PAM_CURL_ENV_PROBE").is_none() {
         return;
     }
     let path = CurlTransport::trusted_path().unwrap();
     let transport = CurlTransport::new(path);
     let mut child = transport.command(&request(), 1).unwrap().spawn().unwrap();
-    use tokio::io::AsyncWriteExt;
     let mut input = child.stdin.take().unwrap();
     input
         .write_all(b"url = \"https://127.0.0.1:1/\"\n")

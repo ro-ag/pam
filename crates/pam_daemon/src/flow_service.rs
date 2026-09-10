@@ -674,7 +674,11 @@ impl FlowService {
             }
             match &step.action {
                 Action::Command { argv } => {
-                    item["containment"] = json!(if cfg!(target_os = "macos") { "checked_before_execution" } else { "unavailable" });
+                    item["containment"] = json!(if cfg!(target_os = "macos") {
+                        "checked_before_execution"
+                    } else {
+                        "unavailable"
+                    });
                     if !cfg!(target_os = "macos") {
                         blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
                     }
@@ -1161,6 +1165,11 @@ fn base_env(settings: &FlowSettings) -> Vec<(String, String)> {
     env.push(("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()));
     env.push(("GIT_ASKPASS".to_owned(), no_askpass.clone()));
     env.push(("SSH_ASKPASS".to_owned(), no_askpass));
+    // Personal configuration is outside command authority. Git otherwise treats
+    // the sandbox denial as fatal even for --version. Repository config remains
+    // readable within the approved root; any helpers still inherit containment.
+    env.push(("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()));
+    env.push(("GIT_CONFIG_SYSTEM".to_owned(), "/dev/null".to_owned()));
     env
 }
 
@@ -1624,7 +1633,12 @@ impl RunState<'_> {
         env.push(("PAM_FLOW".to_owned(), self.flow.id.clone()));
         env.push(("PAM_STEP".to_owned(), step.id.clone()));
         let spec = CommandSpec {
-            containment: command_boundary(&self.service.protected_base, &self.repo, &resolved, step.effect == pam_flow::Effect::Stateful),
+            containment: command_boundary(
+                &self.service.protected_base,
+                &self.repo,
+                &resolved,
+                step.effect == pam_flow::Effect::Stateful,
+            ),
             program: resolved,
             argv: argv[1..].to_vec(),
             cwd: self.repo.clone(),
@@ -2316,7 +2330,10 @@ fn command_boundary(
     allow_repository_writes: bool,
 ) -> crate::command_containment::CommandContainment {
     let mut roots: Vec<PathBuf> = ["/System", "/usr", "/bin", "/sbin", "/Library/Developer"]
-        .into_iter().map(PathBuf::from).filter(|path| path.is_dir()).collect();
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .collect();
     if let Ok(executable) = program.canonicalize()
         && let Some(parent) = executable.parent()
         && !parent.starts_with(repo)
@@ -2330,7 +2347,9 @@ fn command_boundary(
     }
     if let Some(home) = std::env::var_os("HOME") {
         let toolchain = PathBuf::from(home).join(".rustup");
-        if toolchain.is_dir() { roots.push(toolchain); }
+        if toolchain.is_dir() {
+            roots.push(toolchain);
+        }
     }
     roots.sort();
     roots.dedup();

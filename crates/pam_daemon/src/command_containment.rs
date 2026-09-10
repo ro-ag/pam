@@ -74,10 +74,7 @@ impl CommandContainment {
             for (name, value) in env {
                 // env receives operands after `--`; any nonempty name without
                 // '=' or NUL is representable, including Cargo's hyphenated names.
-                if name.is_empty()
-                    || name.contains(['=', '\0'])
-                    || value.contains('\0')
-                {
+                if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
                     return Err("command environment cannot be represented safely".to_owned());
                 }
                 argv.push(format!("{name}={value}").into());

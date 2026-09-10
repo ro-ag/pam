@@ -16,6 +16,8 @@ HTTP transport uses the trusted system curl on macOS/Linux with `-q` first, an e
 
 Network commands such as `git fetch`, push, and publishing cannot run inside this profile. Existing network command recipes are not thereby qualified for landing. Future remote operations require a separately scoped broker implementation and acceptance tests; granting a program cannot loosen containment.
 
+Command environments default Git global and system configuration to `/dev/null`; repository configuration remains subject to repository access and helper containment. Personal identity and remote credentials need explicit scoped handling in later landing support.
+
 There are no implicit HOME, cache, temporary-directory, or build-output write allowances. A read-only step that runs a tool which writes artifacts can fail. A later build capability must declare and validate artifact roots explicitly. Stateful execution in a checkout containing the running PAM executable is refused: install trusted PAM assets outside the writable repository.
 
 Deployment must exclude pre-existing aliases or hardlinks to protected files from writable roots and keep trusted binaries, toolchains, profiles, and the GUI frontend immutable to the agent. This profile is not protection against an otherwise unrestricted process of the same user changing those assets. Process-group cleanup is not a claim that all independently daemonized descendants are reaped.

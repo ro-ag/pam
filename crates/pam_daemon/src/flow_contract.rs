@@ -13,7 +13,7 @@ pub const MAX_RESULT_BYTES: usize = 14 * 1024;
 pub const MAX_OBSERVATION_BYTES: usize = 6000;
 
 /// A malformed or unrepresentable public contract.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{0}")]
 pub struct ContractError(pub &'static str);
 
@@ -217,7 +217,7 @@ pub(crate) fn inspect_vars(
     (vars, missing)
 }
 
-/// Read-only preview of PolicyGate's classification rules; does not auto-grant.
+/// Read-only preview of `PolicyGate`'s classification rules; does not auto-grant.
 /// This snapshot never substitutes for the execution-time gate.
 pub(crate) fn inspect_gate(
     profile: crate::policy::Profile,

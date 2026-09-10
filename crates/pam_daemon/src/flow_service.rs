@@ -564,25 +564,12 @@ impl FlowService {
     }
 
     /// Inspect local configuration only. This snapshot never grants admission.
-    #[allow(clippy::too_many_lines)] // One bounded read-only snapshot; never executes a step.
     pub async fn inspect(
         &self,
         ctx: &ExecContext,
         args: &Value,
     ) -> Result<CapabilityOutput, FlowRefusal> {
-        if !args.is_object()
-            || args.get("inputs").is_some_and(|value| {
-                !value.is_object()
-                    || value
-                        .as_object()
-                        .is_some_and(|map| map.values().any(|value| scalar_text(value).is_none()))
-            })
-        {
-            return Err(contract_refusal(crate::flow_contract::ContractError(
-                "inspection inputs must be an object of scalar values",
-            )));
-        }
-        let args = RunArgs::from_value(args)?;
+        let args = inspect_args(args)?;
         let entry = self.entry(&args.id)?;
         let flow = entry.parsed.as_ref().map_err(|_| {
             FlowRefusal::new(
@@ -628,6 +615,39 @@ impl FlowService {
             })?,
             None => FlowSettings::platform_default().allowed_programs,
         };
+        let (steps, step_blockers) = self.inspect_steps(flow, &vars, &repo, &allowed).await?;
+        blockers.extend(step_blockers);
+        let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
+            "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
+            "steps":steps, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
+            "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
+            "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
+        let body = crate::evidence_view::redact_json(&body).map_err(|_| {
+            contract_refusal(crate::flow_contract::ContractError(
+                "inspection cannot be redacted",
+            ))
+        })?;
+        if body.to_string().len() > crate::flow_contract::MAX_RESULT_BYTES {
+            return Err(contract_refusal(crate::flow_contract::ContractError(
+                "inspection exceeds its response limit",
+            )));
+        }
+        Ok(CapabilityOutput {
+            outcome: Outcome::Verified,
+            body,
+            evidence: Vec::new(),
+        })
+    }
+
+    /// Read a recipe's step gates and local connector configuration without execution.
+    async fn inspect_steps(
+        &self,
+        flow: &Flow,
+        vars: &Vars,
+        repo: &Path,
+        allowed: &[String],
+    ) -> Result<(Vec<Value>, Vec<Value>), FlowRefusal> {
+        let mut blockers = Vec::new();
         let mut steps = Vec::new();
         for step in &flow.steps {
             let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "live": "unknown"});
@@ -652,7 +672,7 @@ impl FlowService {
             }
             match &step.action {
                 Action::Command { argv } => {
-                    let program = argv.first().and_then(|value| substitute(value, &vars).ok());
+                    let program = argv.first().and_then(|value| substitute(value, vars).ok());
                     item["program"] = json!(program);
                     if !program.as_ref().is_some_and(|program| {
                         check_allowed_program(program).is_ok() && allowed.contains(program)
@@ -678,24 +698,24 @@ impl FlowService {
                         .iter()
                         .map(|(name, value)| {
                             let value = match value {
-                                ArgValue::Text(text) => ArgValue::Text(substitute(text, &vars)?),
+                                ArgValue::Text(text) => ArgValue::Text(substitute(text, vars)?),
                                 ArgValue::Int(number) => ArgValue::Int(*number),
                             };
                             Ok((name.clone(), value))
                         })
                         .collect::<Result<BTreeMap<_, _>, pam_flow::VarError>>();
                     match resolved {
-                        Ok(resolved) => if let Err(error) = self.connectors.authorize_scope(&repo, *connector, call, &resolved).await {
+                        Ok(resolved) => if let Err(error) = self.connectors.authorize_scope(repo, *connector, call, &resolved).await {
                             blockers.push(json!({"step": step.id, "cause": error.cause(), "recovery": error.recovery(*connector)}));
                         },
                         Err(_) => blockers.push(json!({"step": step.id, "cause": "target_unresolved", "recovery": "supply declared inputs; prior-step targets are checked during execution"})),
                     }
                     let shape = pam_connectors::descriptor(*connector);
                     if shape.username_label.is_some()
-                        && !row
+                        && row
                             .as_ref()
                             .and_then(|row| row.username.as_deref())
-                            .is_some_and(|value| !value.trim().is_empty())
+                            .is_none_or(|value| value.trim().is_empty())
                     {
                         blockers.push(json!({"step": step.id, "cause": "connector_username_missing", "recovery": "configure the connector in GUI Connectors"}));
                     }
@@ -703,26 +723,7 @@ impl FlowService {
             }
             steps.push(item);
         }
-        let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
-            "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
-            "steps":steps, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
-            "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
-            "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
-        let body = crate::evidence_view::redact_json(&body).map_err(|_| {
-            contract_refusal(crate::flow_contract::ContractError(
-                "inspection cannot be redacted",
-            ))
-        })?;
-        if body.to_string().len() > crate::flow_contract::MAX_RESULT_BYTES {
-            return Err(contract_refusal(crate::flow_contract::ContractError(
-                "inspection exceeds its response limit",
-            )));
-        }
-        Ok(CapabilityOutput {
-            outcome: Outcome::Verified,
-            body,
-            evidence: Vec::new(),
-        })
+        Ok((steps, blockers))
     }
 
     /// `flow.show`: one flow's text, its canonical rendering, and its
@@ -829,43 +830,7 @@ impl FlowService {
         };
         state.execute().await?;
 
-        let products = flow
-            .steps
-            .iter()
-            .filter_map(|step| {
-                if let Action::Connector {
-                    connector: ConnectorId::Jenkins,
-                    call,
-                    ..
-                } = &step.action
-                    && call == "investigate"
-                {
-                    let status = state
-                        .vars
-                        .resolve(&format!("steps.{}.result.status", step.id))?;
-                    if [
-                        "SUCCESS",
-                        "FAILURE",
-                        "UNSTABLE",
-                        "ABORTED",
-                        "NOT_BUILT",
-                        "RUNNING",
-                        "UNKNOWN",
-                    ]
-                    .contains(&status.as_str())
-                    {
-                        return Some((
-                            step.id.clone(),
-                            crate::flow_contract::ProductObservation {
-                                connector: "jenkins".to_owned(),
-                                status,
-                            },
-                        ));
-                    }
-                }
-                None
-            })
-            .collect::<BTreeMap<_, _>>();
+        let products = product_observations(flow, &state.vars);
         let report = RunReport {
             outcome: outcome_for(&state.reports, flow),
             summary: summary_for(&state.reports),
@@ -2261,4 +2226,62 @@ fn contract_refusal(error: crate::flow_contract::ContractError) -> FlowRefusal {
         error.to_string(),
         RECOVERY_FLOW_LIST,
     )
+}
+
+/// Validate the inspection request without reading configuration or evaluating gates.
+fn inspect_args(args: &Value) -> Result<RunArgs, FlowRefusal> {
+    if !args.is_object()
+        || args.get("inputs").is_some_and(|value| {
+            !value.is_object()
+                || value
+                    .as_object()
+                    .is_some_and(|map| map.values().any(|value| scalar_text(value).is_none()))
+        })
+    {
+        return Err(contract_refusal(crate::flow_contract::ContractError(
+            "inspection inputs must be an object of scalar values",
+        )));
+    }
+    RunArgs::from_value(args)
+}
+
+/// Adapter-originated product status remains distinct from step retrieval success.
+fn product_observations(
+    flow: &Flow,
+    vars: &Vars,
+) -> BTreeMap<String, crate::flow_contract::ProductObservation> {
+    flow.steps
+        .iter()
+        .filter_map(|step| {
+            if let Action::Connector {
+                connector: ConnectorId::Jenkins,
+                call,
+                ..
+            } = &step.action
+                && call == "investigate"
+            {
+                let status = vars.resolve(&format!("steps.{}.result.status", step.id))?;
+                if [
+                    "SUCCESS",
+                    "FAILURE",
+                    "UNSTABLE",
+                    "ABORTED",
+                    "NOT_BUILT",
+                    "RUNNING",
+                    "UNKNOWN",
+                ]
+                .contains(&status.as_str())
+                {
+                    return Some((
+                        step.id.clone(),
+                        crate::flow_contract::ProductObservation {
+                            connector: "jenkins".to_owned(),
+                            status,
+                        },
+                    ));
+                }
+            }
+            None
+        })
+        .collect()
 }

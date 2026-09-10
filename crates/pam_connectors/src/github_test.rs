@@ -629,3 +629,49 @@ fn connection() -> Connection {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
+
+#[tokio::test]
+async fn fork_head_identity_remains_distinct_from_same_named_workflow_repository() {
+    let sha = "a".repeat(40);
+    let run = serde_json::json!({"id":9,"run_attempt":1,"head_sha":sha,
+        "repository":{"id":1,"full_name":"base/app","html_url":"https://github.com/base/app","clone_url":"https://github.com/base/app.git"},
+        "head_repository":{"id":2,"full_name":"fork/app","html_url":"https://github.com/fork/app","clone_url":"https://github.com/fork/app.git"},
+        "pull_requests":[{"number":7,"head":{"sha":sha,"ref":"fix","repo":{"id":2,"full_name":"fork/app","url":"https://api.github.com/repos/fork/app"}}}]});
+    let transport = FakeTransport::new()
+        .json(200, &run.to_string())
+        .json(200, r#"{"total_count":0,"jobs":[]}"#);
+    let CallResult::Json(result) =
+        run_call("run", &[("repo", "base/app"), ("run_id", "9")], &transport)
+            .await
+            .unwrap()
+    else {
+        panic!("JSON");
+    };
+    assert_eq!(result["source_identity"]["status"], "unambiguous");
+    assert_eq!(
+        result["source_identity"]["repository_urls"],
+        serde_json::json!(["https://github.com/fork/app.git"])
+    );
+    assert_eq!(result["run"]["repository"]["full_name"], "base/app");
+    assert_eq!(
+        result["run"]["pull_requests"][0]["head"]["repo"]["full_name"],
+        "fork/app"
+    );
+    assert_eq!(result["run"]["pull_requests"][0]["number"], 7);
+    let mut absent = run;
+    absent.as_object_mut().unwrap().remove("head_repository");
+    let transport = FakeTransport::new()
+        .json(200, &absent.to_string())
+        .json(200, r#"{"total_count":0,"jobs":[]}"#);
+    let CallResult::Json(result) =
+        run_call("run", &[("repo", "base/app"), ("run_id", "9")], &transport)
+            .await
+            .unwrap()
+    else {
+        panic!("JSON");
+    };
+    assert_eq!(
+        result["source_identity"]["status"], "missing",
+        "base repository never substitutes for fork head"
+    );
+}

@@ -555,3 +555,58 @@ fn empty_investigation_summary_retains_core_failure_and_missing_api() {
     assert!(summary.contains("connector_not_found"));
     assert!(summary.contains("Graph coverage is unverified"));
 }
+
+#[tokio::test]
+async fn structured_scm_identity_is_bounded_and_never_guesses_one_checkout() {
+    let sha = "A".repeat(40);
+    for (actions, expected) in [
+        (json!([]), "missing"),
+        (
+            json!([{"remoteUrls":["https://git.example/team/app.git"],"lastBuiltRevision":{"SHA1":sha}}]),
+            "unambiguous",
+        ),
+        (
+            json!([{"remoteUrls":["https://git.example/team/app.git"],"lastBuiltRevision":{"SHA1":sha}},
+            {"remoteUrls":["https://git.example/other/app.git"],"revision":{"hash":"b".repeat(40)}}]),
+            "ambiguous",
+        ),
+        (
+            json!([{"remoteUrls":["https://git.example/team/app.git"],"lastBuiltRevision":{"SHA1":"abc123"}}]),
+            "ambiguous",
+        ),
+    ] {
+        let mut build = core("SUCCESS");
+        build["actions"] = actions.clone();
+        let transport = FakeTransport::new()
+            .json(200, &build.to_string())
+            .json(200, r#"{"status":"SUCCESS","stages":[]}"#);
+        let report = invoke(&transport).await.unwrap();
+        assert_eq!(report["source_identity"]["status"], expected);
+        assert_eq!(transport.requests().len(), 2, "SCM does not add HTTP reads");
+        if expected == "unambiguous" {
+            assert_eq!(
+                report["source_identity"]["revisions"],
+                json!(["a".repeat(40)])
+            );
+        }
+        if actions.to_string().contains("abc123") {
+            assert_eq!(report["source_identity"]["revisions"], json!([]));
+            assert_eq!(
+                report["source_identity"]["reported_revisions"],
+                json!(["abc123"])
+            );
+        }
+    }
+    let actions: Vec<_> = (0..70).map(|n|json!({"remoteUrls":[format!("https://git.example/{n}/app.git")],"revision":{"hash":format!("{n:040x}")}})).collect();
+    let mut build = core("SUCCESS");
+    build["actions"] = json!(actions);
+    let transport = FakeTransport::new()
+        .json(200, &build.to_string())
+        .json(200, r#"{"status":"SUCCESS","stages":[]}"#);
+    let report = invoke(&transport).await.unwrap();
+    let identity = &report["source_identity"];
+    assert_eq!(identity["status"], "ambiguous");
+    assert_eq!(identity["partial"], true);
+    assert_eq!(identity["repository_urls"].as_array().unwrap().len(), 16);
+    assert_eq!(identity["revisions"].as_array().unwrap().len(), 16);
+}

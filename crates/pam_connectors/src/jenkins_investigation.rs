@@ -216,7 +216,7 @@ pub(crate) async fn investigate(
     };
     let mut url = collection.url(&["api", "json"])?;
     url.query_pairs_mut()
-        .append_pair("tree", "number,result,building,timestamp,duration");
+        .append_pair("tree", "number,result,building,timestamp,duration,actions[remoteUrls,lastBuiltRevision[SHA1],revision[hash,pullHash,baseHash]]");
     let core = collection.fetch(url).await?;
     let status = core_status(&core, build)?;
     if status == "RUNNING" || status == "UNKNOWN" {
@@ -238,6 +238,7 @@ pub(crate) async fn investigate(
         "job": job,
         "build": build,
         "status": status,
+        "source_identity": scm_identity(&core),
         "build_result": crate::transport::pick(&core, &["number", "result", "building", "timestamp", "duration"]),
         "pipeline_status": pipeline_status,
         "summary": summary,
@@ -573,4 +574,96 @@ fn node_id(id: &str) -> bool {
 
 fn bad_response(message: &str) -> ConnectorError {
     ConnectorError::BadResponse(message.to_owned())
+}
+
+/// Bounded reported identities shared by structured SCM adapters. This never
+/// asserts that a remote build belongs to the caller's declared repository.
+pub(crate) fn source_identity(urls: Vec<Value>, revisions: Vec<Value>, mut partial: bool) -> Value {
+    let reported_revisions: Vec<Value> = revisions
+        .iter()
+        .take(16)
+        .map(|value| {
+            value.as_str().map_or(Value::Null, |text| {
+                let (text, cut) = crate::jira::cut_at(text, 256);
+                partial |= cut;
+                Value::String(text)
+            })
+        })
+        .collect();
+    partial |= revisions.len() > 16;
+    let mut invalid = false;
+    let mut collect = |values: Vec<Value>, revision: bool| {
+        let mut retained = BTreeSet::new();
+        for value in values {
+            let Some(text) = value.as_str() else {
+                invalid = true;
+                continue;
+            };
+            let valid = if revision {
+                matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+            } else {
+                !text.is_empty() && text.len() <= 2048 && !text.chars().any(char::is_control)
+            };
+            if !valid {
+                invalid = true;
+                continue;
+            }
+            let text = if revision {
+                text.to_ascii_lowercase()
+            } else {
+                text.to_owned()
+            };
+            if retained.len() == 16 && !retained.contains(&text) {
+                partial = true;
+                continue;
+            }
+            retained.insert(text);
+        }
+        retained.into_iter().collect::<Vec<_>>()
+    };
+    let repository_urls = collect(urls, false);
+    let revisions = collect(revisions, true);
+    let status = if partial || invalid || repository_urls.len() > 1 || revisions.len() > 1 {
+        "ambiguous"
+    } else if repository_urls.len() == 1 && revisions.len() == 1 {
+        "unambiguous"
+    } else {
+        "missing"
+    };
+    json!({"status":status,"repository_urls":repository_urls,"revisions":revisions,
+        "partial":partial,"invalid_metadata":invalid,"reported_revisions":reported_revisions})
+}
+
+fn scm_identity(core: &Value) -> Value {
+    let mut urls = Vec::new();
+    let mut revisions = Vec::new();
+    let actions = core.get("actions").and_then(Value::as_array);
+    let mut partial = actions.is_some_and(|actions| actions.len() > 64);
+    if core
+        .get("actions")
+        .is_some_and(|actions| !actions.is_array())
+    {
+        revisions.push(Value::Null);
+    }
+    for action in actions.into_iter().flatten().take(64) {
+        if let Some(remote_urls) = action.get("remoteUrls") {
+            if let Some(remote_urls) = remote_urls.as_array() {
+                partial |= remote_urls.len() > 32;
+                urls.extend(remote_urls.iter().take(32).cloned());
+            } else {
+                urls.push(Value::Null);
+            }
+        }
+        for pointer in [
+            "/lastBuiltRevision/SHA1",
+            "/revision/hash",
+            "/revision/pullHash",
+            "/revision/baseHash",
+        ] {
+            if let Some(revision) = action.pointer(pointer) {
+                revisions.push(revision.clone());
+            }
+        }
+    }
+    source_identity(urls, revisions, partial)
 }

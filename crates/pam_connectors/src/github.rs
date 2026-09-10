@@ -159,7 +159,8 @@ async fn run(
     // Stable ordering within this page only; unseen pages can contain failures.
     jobs.sort_by_key(|job| failure_rank(job.get("conclusion").and_then(Value::as_str)));
     let mut result = page_coverage(&jobs_body, page, MAX_JOBS, received.len());
-    result["run"] = pick(&run, RUN_FIELDS);
+    result["run"] = reported_run(&run);
+    result["source_identity"] = github_identity(&run);
     result["run_id"] = json!(run_id);
     result["run_attempt"] = json!(attempt);
     result["jobs"] = json!(jobs);
@@ -341,4 +342,62 @@ fn exit_status(conclusion: Option<&str>) -> Option<i32> {
         Some("success") => Some(0),
         _ => None,
     }
+}
+
+fn bounded_repository(repository: &Value) -> Value {
+    let mut value = serde_json::Map::new();
+    if let Some(id) = repository.get("id").and_then(Value::as_u64) {
+        value.insert("id".into(), json!(id));
+    }
+    for key in ["full_name", "html_url", "clone_url", "url"] {
+        if let Some(text) = repository
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| text.len() <= 2048 && !text.chars().any(char::is_control))
+        {
+            value.insert(key.into(), json!(text));
+        }
+    }
+    Value::Object(value)
+}
+
+fn reported_run(run: &Value) -> Value {
+    let mut result = pick(run, RUN_FIELDS);
+    result["repository"] = bounded_repository(&run["repository"]);
+    result["head_repository"] = bounded_repository(&run["head_repository"]);
+    let prs = run.get("pull_requests").and_then(Value::as_array);
+    result["pull_requests_partial"] = json!(prs.is_some_and(|prs| prs.len() > 16));
+    result["pull_requests"] = Value::Array(
+        prs.into_iter()
+            .flatten()
+            .take(16)
+            .map(|pr| {
+                let mut head = serde_json::Map::new();
+                for key in ["sha", "ref"] {
+                    if let Some(text) = pr["head"]
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .filter(|text| text.len() <= 2048 && !text.chars().any(char::is_control))
+                    {
+                        head.insert(key.into(), json!(text));
+                    }
+                }
+                head.insert("repo".into(), bounded_repository(&pr["head"]["repo"]));
+                json!({"number":pr.get("number").and_then(Value::as_u64),"head":head})
+            })
+            .collect(),
+    );
+    result
+}
+
+fn github_identity(run: &Value) -> Value {
+    // head_repository is the source of the reported head; repository is the
+    // workflow owner and can differ for fork PRs. Never collapse their names.
+    let repository = run.get("head_repository");
+    let url = repository.and_then(|repo| repo.get("clone_url").or_else(|| repo.get("html_url")));
+    crate::jenkins_investigation::source_identity(
+        url.into_iter().cloned().collect(),
+        run.get("head_sha").into_iter().cloned().collect(),
+        false,
+    )
 }

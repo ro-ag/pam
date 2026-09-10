@@ -31,6 +31,23 @@ pub struct AgentResult {
     pub observations: Vec<Observation>,
     pub evidence: Vec<String>,
     pub omitted: Omissions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// Reusable evidence handoff, with no generated diagnosis or inferred target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Handoff {
+    pub state: String,
+    pub reason: String,
+    pub target: Option<pam_flow::CorrelationTarget>,
+    pub target_state: String,
+    pub decisive_citations: Vec<String>,
+    pub citation_state: String,
+    pub missing_facts: Vec<String>,
+    pub next_action: Value,
+    pub measurements: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +59,28 @@ pub struct CorrelationSummary {
 }
 
 impl AgentResult {
+    pub fn with_handoff_target(
+        mut self,
+        target: Option<pam_flow::CorrelationTarget>,
+    ) -> Result<Self, ContractError> {
+        if let Some(target) = &target {
+            target
+                .validate()
+                .map_err(|_| ContractError("invalid frozen handoff target"))?;
+        }
+        if let Some(handoff) = &mut self.handoff {
+            handoff.target_state = if target.is_some() {
+                "frozen"
+            } else {
+                "not_declared"
+            }
+            .into();
+            handoff.target = target;
+        }
+        fit_result(&mut self)?;
+        Ok(self)
+    }
+
     pub fn with_correlation(
         mut self,
         correlation: CorrelationSummary,
@@ -82,6 +121,10 @@ pub struct Observation {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<ProductObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs_omitted: usize,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +164,7 @@ pub fn project_result(
         observations: Vec::new(),
         evidence: Vec::new(),
         omitted: Omissions::default(),
+        handoff: None,
     };
     let mut remaining = MAX_OBSERVATION_BYTES;
     for step in &report.steps {
@@ -148,6 +192,20 @@ pub fn project_result(
             status: status.as_str().unwrap_or("unknown").to_owned(),
             text,
             product: products.get(&step.id).cloned(),
+            evidence_refs: step
+                .evidence
+                .iter()
+                .filter(|id| id.len() <= 128)
+                .take(4)
+                .cloned()
+                .collect(),
+            evidence_refs_omitted: step.evidence.len().saturating_sub(
+                step.evidence
+                    .iter()
+                    .filter(|id| id.len() <= 128)
+                    .take(4)
+                    .count(),
+            ),
         });
     }
     for id in evidence {
@@ -157,8 +215,63 @@ pub fn project_result(
             result.evidence.push(id.clone());
         }
     }
+    result.handoff = Some(handoff(report, &result));
     fit_result(&mut result)?;
     Ok(result)
+}
+
+fn handoff(report: &RunReport, result: &AgentResult) -> Handoff {
+    let completed = matches!(
+        report.outcome,
+        pam_proto::Outcome::Solved | pam_proto::Outcome::Verified | pam_proto::Outcome::Changed
+    );
+    let mut missing = vec![
+        "decisive_quote_attribution_not_recorded".to_owned(),
+        "product_execution_identity_requires_evidence_read".to_owned(),
+    ];
+    if report
+        .steps
+        .iter()
+        .any(|step| !step.evidence_unavailable.is_empty())
+    {
+        missing.push("one_or_more_evidence_views_unavailable".to_owned());
+    }
+    if report
+        .steps
+        .iter()
+        .any(|step| step.status == crate::flow_exec::StepStatus::Skipped)
+    {
+        missing.push("one_or_more_steps_not_executed".to_owned());
+    }
+    Handoff {
+        state: if completed {
+            "local_workflow_completed"
+        } else {
+            "escalation_required"
+        }
+        .into(),
+        reason: if completed {
+            "workflow_outcome_recorded_diagnosis_not_attempted"
+        } else {
+            "workflow_not_completed"
+        }
+        .into(),
+        target: None,
+        target_state: "not_declared".into(),
+        decisive_citations: Vec::new(),
+        citation_state: "not_attributed_use_retained_evidence".into(),
+        missing_facts: missing,
+        next_action: result.evidence.first().map_or_else(
+            || serde_json::json!({"kind":"review_missing_evidence","automatic":false}),
+            |id| {
+                serde_json::json!({"kind":"evidence_read","capability":"evidence.read",
+                "args":{"request_id":result.ticket,"evidence_id":id,"offset":0,"length":16384},
+                "authorization":"rechecked_per_read","automatic":false})
+            },
+        ),
+        measurements: serde_json::json!({"frontier_tokens":null,"correction_turns":null,
+            "realized_token_savings":null,"benefit_status":"not_measured_requires_paired_experiment"}),
+    }
 }
 
 fn fit_result(result: &mut AgentResult) -> Result<(), ContractError> {

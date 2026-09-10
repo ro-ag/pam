@@ -161,3 +161,46 @@ async fn refund_preserves_counts_and_failure_is_not_reported_as_success() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn reporting_never_initializes_or_refunds_budget_or_evidence_allowance() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("unstarted", "flow.run", "/repo", "test", "{}", None)
+        .await
+        .unwrap();
+    let before = store
+        .request_budget_report("unstarted", "/repo")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(before["work"].is_null());
+    assert_eq!(before["evidence_reads"]["state"], "not_initialized");
+    assert!(
+        store
+            .request_budget_report("unstarted", "/other")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.load_request_budget("unstarted").await.unwrap();
+    store
+        .reserve_request_budget("unstarted", RequestBudgetCharge::Http(100))
+        .await
+        .unwrap()
+        .unwrap();
+    let first = store
+        .request_budget_report("unstarted", "/repo")
+        .await
+        .unwrap()
+        .unwrap();
+    let second = store
+        .request_budget_report("unstarted", "/repo")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first["work"]["http_call_slots_charged"], 1);
+    assert_eq!(first["work"]["http_bytes_charged"], 100);
+    assert!(first["evidence_reads"]["remaining_pages"].is_null());
+}

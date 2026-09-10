@@ -27,6 +27,49 @@ pub enum RequestBudgetCharge {
 }
 
 impl Store {
+    /// Read existing counters and evidence allowance without creating or renewing either.
+    /// The caller must authorize the original request before exposing this metadata.
+    pub async fn request_budget_report(
+        &self,
+        id: &str,
+        repository: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self.conn.query(
+            "SELECT r.expires_at_ms,a.expires_at,a.remaining_bytes,a.remaining_pages FROM request r LEFT JOIN evidence_read_allowance a ON a.request_id=r.id AND a.repository=r.repo WHERE r.id=?1 AND r.repo=?2",
+            params![id,repository]).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let expiry: Option<i64> = row.get(0)?;
+        let evidence_expiry: Option<i64> = row.get(1)?;
+        let evidence_bytes: Option<i64> = row.get(2)?;
+        let evidence_pages: Option<i64> = row.get(3)?;
+        drop(rows);
+        let allowance_state = match evidence_expiry {
+            None => "not_initialized",
+            Some(expiry) if expiry <= super::now_ts() => "expired",
+            Some(_) if evidence_bytes.unwrap_or(0) <= 0 || evidence_pages.unwrap_or(0) <= 0 => {
+                "exhausted"
+            }
+            Some(_) => "existing_allowance",
+        };
+        let usage = self.budget_usage_locked(id).await?;
+        let work = usage.map(|u| serde_json::json!({
+            "attempt_slots_charged":u.attempts,"http_call_slots_charged":u.http_calls,
+            "http_bytes_charged":u.http_bytes,"command_bytes_charged":u.command_bytes,
+            "attempt_slots_remaining":256-u.attempts,"http_call_slots_remaining":128-u.http_calls,
+            "http_bytes_remaining":134217728-u.http_bytes,"command_bytes_remaining":134217728-u.command_bytes,
+            "accounting":"completed_captures_plus_unsettled_reservations_not_physical_network_traffic"
+        }));
+        Ok(Some(
+            serde_json::json!({"execution_expires_at_ms":expiry,"work":work,
+            "evidence_reads":{"state":allowance_state,
+                "expires_at":evidence_expiry,"remaining_bytes":evidence_bytes,"remaining_pages":evidence_pages,
+                "authorization":"rechecked_per_read","availability":"not_guaranteed"}}),
+        ))
+    }
+
     /// Initialize once for an existing request, or restore its spent allowance.
     pub async fn load_request_budget(&self, id: &str) -> Result<RequestBudgetUsage, StoreError> {
         let _guard = self.conn_lock.lock().await;

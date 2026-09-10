@@ -258,9 +258,12 @@ pub fn render_flow_show(body: &Value) -> String {
 pub fn render_flow_result(body: &Value) -> String {
     if let Some(result) = body.get("agent_result").filter(|value| value.is_object()) {
         return format!(
-            "state: {}\n{}",
+            "state: {}\n{}\n{}",
             field(body, "state"),
-            render_flow_result(result)
+            render_flow_result(result),
+            render_body(
+                &serde_json::json!({"read_availability":body["read_availability"],"watch":body["watch"]})
+            )
         );
     }
     if body.get("schema_version").and_then(Value::as_u64) == Some(1)

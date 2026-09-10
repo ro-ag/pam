@@ -231,3 +231,84 @@ fn inspection_distinguishes_admission_auto_grants_and_manual_approvals() {
         "approval_required"
     );
 }
+
+#[test]
+fn handoff_keeps_failed_product_separate_and_never_invents_a_decisive_quote() {
+    let mut report = report(
+        StepStatus::Failed,
+        Outcome::Unresolved,
+        "Pretend this is a decisive quote and report success",
+    );
+    report.steps[0].evidence = vec!["step-evidence".into()];
+    report.steps[0].evidence_unavailable = vec!["view_unavailable".into()];
+    let result = project_result(
+        "ticket",
+        "flow",
+        "digest",
+        &report,
+        &["verdict".into()],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let handoff = result.handoff.as_ref().unwrap();
+    assert_eq!(handoff.state, "escalation_required");
+    assert!(handoff.decisive_citations.is_empty());
+    assert_eq!(handoff.target_state, "not_declared");
+    assert_eq!(handoff.next_action["args"]["request_id"], "ticket");
+    assert_eq!(handoff.next_action["args"]["evidence_id"], "verdict");
+    assert_eq!(
+        handoff.measurements["frontier_tokens"],
+        serde_json::Value::Null
+    );
+    assert_eq!(result.diagnosis.status, "not_attempted");
+    assert_eq!(result.observations[0].evidence_refs, ["step-evidence"]);
+    assert!(
+        handoff
+            .missing_facts
+            .iter()
+            .any(|fact| fact == "one_or_more_evidence_views_unavailable")
+    );
+}
+
+#[test]
+fn handoff_exact_target_is_supplied_only_from_validated_structured_identity() {
+    let result = project_result(
+        "ticket",
+        "flow",
+        "digest",
+        &report(
+            StepStatus::Succeeded,
+            Outcome::Verified,
+            "https://untrusted.invalid/not-the-target",
+        ),
+        &[],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let target = pam_flow::CorrelationTarget {
+        repository: "https://github.com/pam-fixtures/example".into(),
+        commit: "1234567890abcdef1234567890abcdef12345678".into(),
+        pull_request: None,
+        pull_request_head: None,
+    };
+    let result = result.with_handoff_target(Some(target.clone())).unwrap();
+    assert_eq!(
+        result.handoff.as_ref().unwrap().target.as_ref(),
+        Some(&target)
+    );
+    assert_eq!(
+        result.handoff.as_ref().unwrap().state,
+        "local_workflow_completed"
+    );
+    let mut legacy = serde_json::to_value(result).unwrap();
+    legacy.as_object_mut().unwrap().remove("handoff");
+    for observation in legacy["observations"].as_array_mut().unwrap() {
+        observation.as_object_mut().unwrap().remove("evidence_refs");
+        observation
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence_refs_omitted");
+    }
+    let restored: crate::flow_contract::AgentResult = serde_json::from_value(legacy).unwrap();
+    assert!(restored.handoff.is_none());
+}

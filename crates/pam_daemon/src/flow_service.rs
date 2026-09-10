@@ -927,6 +927,7 @@ impl FlowService {
                 &state.evidence,
                 &products,
                 state.correlation.summary(),
+                state.correlation.target().cloned(),
             )
             .await?;
         // The projection carries bounded references; the outer wire list names only the verdict.
@@ -967,6 +968,7 @@ impl FlowService {
         evidence: &[String],
         products: &BTreeMap<String, crate::flow_contract::ProductObservation>,
         correlation: crate::flow_contract::CorrelationSummary,
+        target: Option<pam_flow::CorrelationTarget>,
     ) -> Result<(String, Value), CapabilityFailure> {
         let failed = report
             .steps
@@ -987,11 +989,12 @@ impl FlowService {
         .map_err(|error| CapabilityFailure::Failed {
             detail: error.to_string(),
         })?;
-        let projection = projection.with_correlation(correlation).map_err(|error| {
-            CapabilityFailure::Failed {
+        let projection = projection
+            .with_handoff_target(target)
+            .and_then(|p| p.with_correlation(correlation))
+            .map_err(|error| CapabilityFailure::Failed {
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         let meta = json!({
             "agent_result": projection,
             "flow": flow.id,

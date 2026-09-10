@@ -55,6 +55,13 @@ pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, Capabi
         // Progress may have been published after the first origin snapshot.
         authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
     }
+    output.body["read_availability"] = ctx
+        .store
+        .request_budget_report(&ticket, &status.repository)
+        .await
+        .map_err(|_| unavailable())?
+        .unwrap_or(Value::Null);
+    authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
     bounded_output(&ctx.request_id, output.outcome, output.body)
 }
 

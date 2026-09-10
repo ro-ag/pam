@@ -549,3 +549,17 @@ fn durable_flow_projection_preserves_workflow_and_advisory_diagnosis() {
         .contains("running")
     );
 }
+
+#[test]
+fn durable_handoff_render_keeps_read_availability_and_escapes_content() {
+    let body = serde_json::json!({"state":"done","agent_result":{
+        "schema_version":1,"workflow":{"outcome":"unresolved"},
+        "handoff":{"reason":"workflow_not_completed","next_action":{"kind":"evidence_read"}},
+        "observations":[{"text":"untrusted\u{1b}[31m"}]},
+        "read_availability":{"evidence_reads":{"state":"expired","remaining_pages":3}}});
+    let rendered = render_flow_result(&body);
+    assert!(rendered.contains("read_availability"));
+    assert!(rendered.contains("expired"));
+    assert!(rendered.contains("evidence_read"));
+    assert!(!rendered.contains('\u{1b}'));
+}

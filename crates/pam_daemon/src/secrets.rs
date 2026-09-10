@@ -121,7 +121,9 @@ impl From<SecretError> for KeyringHealth {
         Self {
             state: match error {
                 SecretError::Denied => KeyringState::Denied,
-                SecretError::Unavailable => KeyringState::Unavailable,
+                SecretError::Unavailable | SecretError::Busy | SecretError::WorkerFailed => {
+                    KeyringState::Unavailable
+                }
             },
             cause: Some(error.cause()),
             recovery: Some(error.recovery()),
@@ -182,6 +184,10 @@ impl Drop for Secret {
 /// secret material in some backends' error paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretError {
+    /// The bounded worker admission queue is full; the operation did not start.
+    Busy,
+    /// The worker did not return normally; its mutation outcome is unknown.
+    WorkerFailed,
     /// The native credential store could not be reached at all (not
     /// installed, the session bus is down, ...).
     Unavailable,
@@ -195,6 +201,8 @@ impl SecretError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::Busy => "blocking_capacity_exhausted",
+            Self::WorkerFailed => "blocking_job_failed",
             Self::Unavailable => "store_unavailable",
             Self::Denied => "store_denied",
         }
@@ -205,6 +213,8 @@ impl SecretError {
     #[must_use]
     pub fn recovery(&self) -> &'static str {
         match self {
+            Self::Busy => crate::blocking_jobs::Error::Busy.recovery(),
+            Self::WorkerFailed => crate::blocking_jobs::Error::Join.recovery(),
             Self::Unavailable => {
                 "Pam's native credential store is unavailable; open Pam \u{2192} Settings \u{2192} Connectors and try again once the OS keychain service is reachable."
             }
@@ -218,6 +228,8 @@ impl SecretError {
 impl fmt::Display for SecretError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Busy => formatter.write_str("blocking job capacity exhausted"),
+            Self::WorkerFailed => formatter.write_str("credential worker did not return normally"),
             Self::Unavailable => formatter.write_str("native credential store unavailable"),
             Self::Denied => formatter.write_str("native credential store access denied"),
         }
@@ -503,7 +515,11 @@ impl SecretStore {
             Err(error) => KeyringHealth::from(error),
         };
         if let Ok(mut slot) = self.probe.lock() {
-            *slot = Some((Instant::now(), health));
+            *slot = (!matches!(
+                health.cause,
+                Some("blocking_capacity_exhausted" | "blocking_job_failed")
+            ))
+            .then_some((Instant::now(), health));
         }
         health
     }
@@ -599,7 +615,7 @@ impl SecretStore {
 
 /// Runs a backend call through the process-owned bounded keychain lane.
 /// Dropping a waiter cannot release the running call's lane or permit. Admission
-/// and join failures become [`SecretError::Unavailable`]; they never trigger retry.
+/// and join failures preserve their worker causes; they never trigger retry.
 async fn run_blocking<F, T>(call: F) -> Result<T, SecretError>
 where
     F: FnOnce() -> Result<T, SecretError> + Send + 'static,
@@ -609,7 +625,16 @@ where
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "the secret store's blocking task did not finish");
-            Err(SecretError::Unavailable)
+            Err(error.into())
+        }
+    }
+}
+
+impl From<crate::blocking_jobs::Error> for SecretError {
+    fn from(error: crate::blocking_jobs::Error) -> Self {
+        match error {
+            crate::blocking_jobs::Error::Busy => Self::Busy,
+            crate::blocking_jobs::Error::Join => Self::WorkerFailed,
         }
     }
 }

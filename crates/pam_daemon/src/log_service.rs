@@ -191,6 +191,14 @@ pub struct CompressReport {
 /// of these: these are the failures that leave the caller with nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
+    /// A bounded worker admission or completion failure.
+    #[error("{detail}")]
+    Blocking {
+        /// Stable worker refusal cause.
+        cause: &'static str,
+        /// Sanitized worker failure detail.
+        detail: String,
+    },
     /// The source is larger than [`MAX_SOURCE_BYTES`].
     #[error("log source is {actual_bytes} bytes; the maximum is {maximum_bytes}")]
     SourceTooLarge {
@@ -216,6 +224,7 @@ impl LogError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::Blocking { cause, .. } => cause,
             Self::SourceTooLarge { .. } => "source_too_large",
             Self::Compact(err) => err.cause(),
             Self::Store(_) => CAUSE_STORE_ERROR,
@@ -267,7 +276,10 @@ impl LogService {
                 (bytes, compacted)
             })
             .await
-            .map_err(|err| LogError::Join(err.to_string()))?;
+            .map_err(|err| LogError::Blocking {
+                cause: err.cause(),
+                detail: err.to_string(),
+            })?;
         let compacted = compacted?;
 
         let stats = CompressStats::of(&compacted);
@@ -483,6 +495,11 @@ fn compact_meta(
 /// Turns a model-layer refusal into the skip the report carries.
 fn skipped(err: &ModelUnavailable) -> ModelSkipped {
     let cause = match err {
+        ModelUnavailable::Service(crate::model_service::ModelServiceError::Blocking {
+            cause,
+            ..
+        }) => cause,
+        ModelUnavailable::Service(_) => "model_registry_failed",
         ModelUnavailable::NoDefault(_) => CAUSE_NO_DEFAULT,
         ModelUnavailable::Missing(_) => CAUSE_MODEL_MISSING,
         ModelUnavailable::Runtime(runtime) => runtime.cause(),

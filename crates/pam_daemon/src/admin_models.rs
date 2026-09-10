@@ -266,7 +266,7 @@ impl AdminService {
 
     /// Everything under the models directory, header-parsed and classed.
     async fn models_list(&self) -> Result<AdminOk, AdminRefusal> {
-        let models = self.models.scan().await.map_err(registry_refusal)?;
+        let models = self.models.scan().await.map_err(download_refusal)?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body: json!({
@@ -280,7 +280,7 @@ impl AdminService {
     /// The curated catalog, each preset told whether it fits this host and
     /// whether it is already here.
     async fn models_catalog(&self) -> Result<AdminOk, AdminRefusal> {
-        let installed = self.models.scan().await.map_err(registry_refusal)?;
+        let installed = self.models.scan().await.map_err(download_refusal)?;
         let host_ram = self.models.host_ram_bytes();
         // A partial download is invisible to a registry scan — the
         // sidecars are dotfiles — so the catalog reads them directly.
@@ -298,11 +298,7 @@ impl AdminService {
                     .collect::<Vec<_>>()
             })
             .await
-            .map_err(|err| AdminRefusal {
-                cause: CAUSE_INTERNAL_ERROR,
-                detail: format!("the partial-download scan did not finish: {err}"),
-                recovery: RECOVERY_INTERNAL,
-            })?;
+            .map_err(blocking_refusal)?;
         let presets: Vec<Value> = CATALOG
             .iter()
             .zip(partials)
@@ -471,11 +467,7 @@ impl AdminService {
                 registry.delete(&target)
             })
             .await
-            .map_err(|err| AdminRefusal {
-                cause: CAUSE_INTERNAL_ERROR,
-                detail: format!("the delete did not finish: {err}"),
-                recovery: RECOVERY_INTERNAL,
-            })?;
+            .map_err(blocking_refusal)?;
         match deleted {
             Ok(()) => {}
             Err(RegistryError::OutsideModelsDir(path)) => {
@@ -797,6 +789,7 @@ impl AdminService {
         self.models
             .find(model_id)
             .await
+            .map_err(download_refusal)?
             .ok_or_else(|| AdminRefusal {
                 cause: CAUSE_UNKNOWN_MODEL,
                 detail: format!("no model {model_id:?} in the models directory"),
@@ -832,11 +825,7 @@ async fn detect_agents() -> Result<Vec<AgentCli>, AdminRefusal> {
         pam_model::curator::detect(&path, DETECT_DEADLINE)
     })
     .await
-    .map_err(|err| AdminRefusal {
-        cause: CAUSE_INTERNAL_ERROR,
-        detail: format!("agent detection did not finish: {err}"),
-        recovery: RECOVERY_INTERNAL,
-    })
+    .map_err(blocking_refusal)
 }
 
 /// The `.gguf` file name a pasted URL ends in.
@@ -887,6 +876,15 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
             detail: format!("the transfer could not be started: {other}"),
             recovery: RECOVERY_INTERNAL,
         },
+        ModelServiceError::Blocking { cause, detail } => AdminRefusal {
+            cause,
+            detail,
+            recovery: if cause == "blocking_capacity_exhausted" {
+                crate::blocking_jobs::Error::Busy.recovery()
+            } else {
+                crate::blocking_jobs::Error::Join.recovery()
+            },
+        },
         ModelServiceError::Registry(err) => registry_refusal(err),
         ModelServiceError::Store(err) => AdminRefusal::from(err),
     }
@@ -931,5 +929,13 @@ fn registry_refusal(err: RegistryError) -> AdminRefusal {
             detail: format!("the models directory could not be read: {other}"),
             recovery: RECOVERY_INTERNAL,
         },
+    }
+}
+
+fn blocking_refusal(error: crate::blocking_jobs::Error) -> AdminRefusal {
+    AdminRefusal {
+        cause: error.cause(),
+        detail: error.to_string(),
+        recovery: error.recovery(),
     }
 }

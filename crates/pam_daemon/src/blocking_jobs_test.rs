@@ -22,10 +22,14 @@ async fn cancelled_waiter_does_not_release_running_work_capacity() {
     running.await.expect("worker started");
     waiter.abort();
     let _ = waiter.await;
-    assert!(matches!(
-        jobs.run(Kind::LogCompaction, || ()).await,
-        Err(Error::Busy)
-    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            jobs.run(Kind::LogCompaction, || ())
+        )
+        .await
+        .is_err()
+    );
     release.send(()).expect("release work");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -103,4 +107,83 @@ async fn panics_release_capacity_and_completion_history_is_bounded() {
     let status = serde_json::to_value(jobs.snapshot()).unwrap();
     assert_eq!(status["completed"].as_array().unwrap().len(), 64);
     assert!(status["outstanding"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn waiting_is_bounded_and_cancelled_admissions_are_reclaimed() {
+    let jobs = BlockingJobs::new(1);
+    let first_jobs = Arc::clone(&jobs);
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, blocked) = mpsc::channel();
+    let first = tokio::spawn(async move {
+        first_jobs
+            .run(Kind::Keychain, move || {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .await
+    });
+    running.await.unwrap();
+    let mut waiting = Vec::new();
+    for _ in 0..127 {
+        let pending_jobs = Arc::clone(&jobs);
+        waiting.push(tokio::spawn(async move {
+            pending_jobs.run(Kind::LogCompaction, || ()).await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = serde_json::to_value(jobs.snapshot()).unwrap();
+            if snapshot["outstanding"].as_array().unwrap().len() == 128 {
+                assert_eq!(
+                    snapshot["outstanding"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|row| row["state"] == "running")
+                        .count(),
+                    1
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let refusal = jobs
+        .run(Kind::AgentDetection, || panic!("must not run"))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.cause(), "blocking_capacity_exhausted");
+    let model_error = crate::model_service::ModelUnavailable::from(
+        crate::model_service::ModelServiceError::from(refusal),
+    );
+    assert!(matches!(
+        model_error,
+        crate::model_service::ModelUnavailable::Service(
+            crate::model_service::ModelServiceError::Blocking {
+                cause: "blocking_capacity_exhausted",
+                ..
+            }
+        )
+    ));
+    for waiter in &waiting {
+        waiter.abort();
+    }
+    for waiter in waiting {
+        let _ = waiter.await;
+    }
+    let snapshot = serde_json::to_value(jobs.snapshot()).unwrap();
+    assert_eq!(snapshot["outstanding"].as_array().unwrap().len(), 1);
+    assert!(
+        snapshot["completed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["state"] == "cancelled_before_start")
+    );
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    jobs.run(Kind::LogCompaction, || ()).await.unwrap();
 }

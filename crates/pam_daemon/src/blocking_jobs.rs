@@ -9,6 +9,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CAPACITY: usize = 8;
+const ADMISSION_CAPACITY: usize = 128;
 const HISTORY: usize = 64;
 static JOBS: LazyLock<Arc<BlockingJobs>> = LazyLock::new(|| BlockingJobs::new(CAPACITY));
 
@@ -41,6 +42,7 @@ pub(crate) struct Observation {
 #[derive(Debug, Serialize)]
 pub(crate) struct Snapshot {
     capacity: usize,
+    admission_capacity: usize,
     outstanding: Vec<Observation>,
     completed: Vec<Observation>,
 }
@@ -53,6 +55,25 @@ pub(crate) enum Error {
     Join,
 }
 
+impl Error {
+    pub(crate) fn cause(&self) -> &'static str {
+        match self {
+            Self::Busy => "blocking_capacity_exhausted",
+            Self::Join => "blocking_job_failed",
+        }
+    }
+    pub(crate) fn recovery(&self) -> &'static str {
+        match self {
+            Self::Busy => {
+                "This operation did not start. Wait for outstanding work to finish before trying again."
+            }
+            Self::Join => {
+                "The worker did not return normally. Inspect the current state before retrying."
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Records {
     next_id: u64,
@@ -63,6 +84,7 @@ struct Records {
 pub(crate) struct BlockingJobs {
     capacity: usize,
     permits: Arc<Semaphore>,
+    admissions: Arc<Semaphore>,
     keychain: Arc<tokio::sync::Mutex<()>>,
     models: Arc<tokio::sync::Mutex<()>>,
     records: Mutex<Records>,
@@ -73,6 +95,7 @@ impl BlockingJobs {
         Arc::new(Self {
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
+            admissions: Arc::new(Semaphore::new(ADMISSION_CAPACITY)),
             keychain: Arc::new(tokio::sync::Mutex::new(())),
             models: Arc::new(tokio::sync::Mutex::new(())),
             records: Mutex::new(Records::default()),
@@ -89,6 +112,7 @@ impl BlockingJobs {
         let records = self.records();
         Snapshot {
             capacity: self.capacity,
+            admission_capacity: ADMISSION_CAPACITY,
             outstanding: records.outstanding.values().cloned().collect(),
             completed: records.completed.iter().cloned().collect(),
         }
@@ -99,7 +123,7 @@ impl BlockingJobs {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let permit = Arc::clone(&self.permits)
+        let permit = Arc::clone(&self.admissions)
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
         let id = {
@@ -127,9 +151,14 @@ impl BlockingJobs {
             Kind::ModelFilesystem => Some(Arc::clone(&self.models).lock_owned().await),
             Kind::LogCompaction | Kind::AgentDetection => None,
         };
+        let execution = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Join)?;
         tokio::task::spawn_blocking(move || {
             // These guards are owned by actual work, even after its waiter exits.
             let _lane = lane;
+            let _execution = execution;
             job.started = true;
             if let Some(record) = job.owner.records().outstanding.get_mut(&id) {
                 record.state = State::Running;

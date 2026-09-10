@@ -161,6 +161,9 @@ impl Tier {
 /// deterministic path instead — none of them is a daemon failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelUnavailable {
+    /// Registry lookup could not run or failed; this does not mean the model is absent.
+    #[error(transparent)]
+    Service(#[from] ModelServiceError),
     /// No model is configured for the tier (nor for its fallback).
     #[error("no default model for tier {0:?}")]
     NoDefault(Tier),
@@ -178,6 +181,14 @@ pub enum ModelUnavailable {
 /// Why the service refused to start or change a piece of model work.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelServiceError {
+    /// Bounded worker admission or completion failed.
+    #[error("{detail}")]
+    Blocking {
+        /// Stable worker refusal cause.
+        cause: &'static str,
+        /// Sanitized worker failure detail.
+        detail: String,
+    },
     /// A store write failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -306,7 +317,7 @@ impl ModelService {
             Tier::Heavy => heavy.or(light),
         };
         let id = configured.ok_or(ModelUnavailable::NoDefault(tier))?;
-        self.find(&id).await.ok_or(ModelUnavailable::Missing(id))
+        self.find(&id).await?.ok_or(ModelUnavailable::Missing(id))
     }
 
     /// One generation on the tier's model, loading it if needed.
@@ -426,9 +437,7 @@ impl ModelService {
             pam_model::download::discard_partial(&target)
         })
         .await
-        .map_err(|err| {
-            ModelServiceError::Download(DownloadError::Io(std::io::Error::other(err.to_string())))
-        })?
+        .map_err(ModelServiceError::from)?
         .map_err(ModelServiceError::Download)
     }
 
@@ -484,10 +493,7 @@ impl ModelService {
                     JOB_FAILED,
                     job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
                 ),
-                Err(err) => (
-                    JOB_FAILED,
-                    job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
-                ),
+                Err(err) => (JOB_FAILED, job_failure_value(err.cause(), &err.to_string())),
             };
             let _ = store
                 .finish_model_job(&id, state, Some(&detail.to_string()))
@@ -518,39 +524,25 @@ impl ModelService {
         }))
     }
 
-    /// The entry with `id`, or `None`. Registry failures are reported as
-    /// absence — the model is unusable either way — and logged.
-    pub(crate) async fn find(&self, id: &str) -> Option<ModelEntry> {
+    /// The entry with `id`, or `None` only when the registry confirms absence.
+    pub(crate) async fn find(&self, id: &str) -> Result<Option<ModelEntry>, ModelServiceError> {
         let registry = self.registry();
         let wanted = id.to_owned();
-        match crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
             registry.find(&wanted)
         })
-        .await
-        {
-            Ok(Ok(entry)) => entry,
-            Ok(Err(err)) => {
-                tracing::warn!(model = id, error = %err, "models directory unreadable");
-                None
-            }
-            Err(err) => {
-                tracing::warn!(model = id, error = %err, "registry lookup did not finish");
-                None
-            }
-        }
+        .await?
+        .map_err(ModelServiceError::from)
     }
 
     /// Every entry in the models directory, sorted by id.
-    pub(crate) async fn scan(&self) -> Result<Vec<ModelEntry>, RegistryError> {
+    pub(crate) async fn scan(&self) -> Result<Vec<ModelEntry>, ModelServiceError> {
         let registry = self.registry();
-        match crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
             registry.scan()
         })
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => Err(RegistryError::Io(std::io::Error::other(err))),
-        }
+        .await?
+        .map_err(ModelServiceError::from)
     }
 
     /// Whether a transfer is currently writing to `dest`.
@@ -779,4 +771,13 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+impl From<crate::blocking_jobs::Error> for ModelServiceError {
+    fn from(error: crate::blocking_jobs::Error) -> Self {
+        Self::Blocking {
+            cause: error.cause(),
+            detail: error.to_string(),
+        }
+    }
 }

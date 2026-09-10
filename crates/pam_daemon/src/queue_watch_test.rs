@@ -440,3 +440,70 @@ async fn terminal_store_error_keeps_lease_and_blocks_next_repository_work() {
     );
     assert!(queue.take_parked_terminals().await.is_empty());
 }
+
+#[tokio::test]
+async fn background_reaper_delivers_notice_without_executor_and_preserves_explicit_api() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    enqueue(&queue, "no-executor").await;
+    let lease = queue.take_next("/repo").await.unwrap().unwrap();
+    // Dropping the returned work models an executor that has already returned
+    // after a failed terminal write; only the reaper can deliver completion.
+    let deadline = lease.lease_deadline;
+    drop(lease);
+    assert_eq!(queue.reap_expired_notifying(deadline).await.unwrap(), 1);
+    assert_eq!(queue.take_parked_terminals().await, ["no-executor"]);
+    assert_eq!(queue.reap_expired_notifying(deadline).await.unwrap(), 0);
+    assert!(queue.take_parked_terminals().await.is_empty());
+    assert!(queue.leased_ids().await.is_empty());
+    enqueue(&queue, "explicit").await;
+    let lease = queue.take_next("/repo").await.unwrap().unwrap();
+    assert_eq!(
+        queue.reap_expired(lease.lease_deadline).await.unwrap(),
+        ["explicit"]
+    );
+    assert!(queue.take_parked_terminals().await.is_empty());
+}
+
+#[tokio::test]
+async fn background_reaper_retains_expired_lease_when_terminal_notice_buffer_is_full() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    for index in 0..crate::queue::MAX_PARKED_TERMINALS {
+        let id = format!("old-{index}");
+        let (deadline, resume) = park_for_notice(&queue, &store, &id).await;
+        queue.wake_due(deadline, resume).await.unwrap();
+    }
+    enqueue(&queue, "retained-lease").await;
+    let lease = queue.take_next("/repo").await.unwrap().unwrap();
+    assert_eq!(
+        queue
+            .reap_expired_notifying(lease.lease_deadline)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(queue.leased_ids().await, ["retained-lease"]);
+    assert_eq!(
+        store
+            .request_status_meta("retained-lease")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Running
+    );
+    assert_eq!(
+        queue.take_parked_terminals().await.len(),
+        crate::queue::MAX_PARKED_TERMINALS
+    );
+    assert_eq!(
+        queue
+            .reap_expired_notifying(lease.lease_deadline)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(queue.take_parked_terminals().await, ["retained-lease"]);
+    assert!(queue.leased_ids().await.is_empty());
+}

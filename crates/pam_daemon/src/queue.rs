@@ -774,6 +774,33 @@ impl QueueManager {
         Ok(finished)
     }
 
+    /// Background-only expiry delivery. Explicit `reap_expired` callers own
+    /// their returned ids; this path reserves notice capacity before releasing
+    /// leases whose executor may already have exited after a store failure.
+    pub(crate) async fn reap_expired_notifying(&self, now: Instant) -> Result<usize, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let mut expired: Vec<_> = inner
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired.sort();
+        let mut count = 0;
+        for id in expired {
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                break;
+            }
+            if self.expire_locked(&mut inner, &id).await? {
+                inner.parked_terminals.push(id);
+                count += 1;
+                self.work.notify_one();
+            }
+        }
+        Ok(count)
+    }
+
     /// Spawns the background reaper: calls [`Self::reap_expired`] every
     /// `interval` until `shutdown` changes (or its sender drops).
     ///
@@ -790,7 +817,7 @@ impl QueueManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = self.reap_expired(Instant::now()).await;
+                        let _ = self.reap_expired_notifying(Instant::now()).await;
                         let _ = self.wake_due(Instant::now(), wall_clock_ms()).await;
                     }
                     _ = shutdown.changed() => break,

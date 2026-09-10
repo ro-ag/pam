@@ -17,7 +17,7 @@ use pam_daemon::lifecycle::{
     ACTION_DAEMON_RESTART, CAUSE_DAEMON_RESTART, LifecycleError, LifecyclePhase,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
-use pam_daemon::queue::{ACTION_CANCEL, CAUSE_CANCELLED};
+use pam_daemon::queue::{ACTION_CANCEL, ACTION_LEASE_REAPED, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED};
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{Actor, ApprovalResolution, Decision, RequestRow, RequestState, Store};
 use tokio::sync::watch;
@@ -785,16 +785,16 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
         };
         assert_eq!(cause, CAUSE_DEADLINE_EXCEEDED);
 
-        // The request itself is torn down (cancelled through the queue)
+        // The request itself is torn down (expired through the queue)
         // and both the deadline refusal and the teardown are audited.
         let store = daemon.handle.store();
         let row = wait_for_row(&store, "req_late", |row| row.state == RequestState::Failed).await;
-        assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
         let audit = store.audit_for_request("req_late").await.unwrap();
         assert!(audit.iter().any(|row| row.action == ACTION_DEADLINE_REFUSAL
             && row.decision == Decision::Timeout
             && row.actor == Actor::System));
-        assert!(audit.iter().any(|row| row.action == ACTION_CANCEL));
+        assert!(audit.iter().any(|row| row.action == ACTION_LEASE_REAPED));
 
         daemon.stop().await;
     })

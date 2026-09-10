@@ -25,18 +25,23 @@ refresh is a deliberate reviewed dataset change; tests never regenerate it.
 | Development broker replay | Real test daemon and public flow/evidence routes, six connectors, a strict 13-request synthetic HTTP transcript, exact identities and authorized paging | Live enterprise compatibility or held-out incident quality |
 | Derived 40 MB stress | One screening incident surrounded by generated unique long progress records, through the same production preparation path | Another independent incident, realistic log-frequency distributions or model fit |
 
-The first screening replay retained all 212 declared decisive quotes. Its 49,550
+The recorded screening replay retained all 212 declared decisive quotes. Its 49,550
 source bytes became 50,708 compact-view bytes: these inputs are short, and status
 footers add bytes. There is no demonstrated compression benefit for this set.
 
 The derived stress source is exactly 40,000,000 bytes. It reduced to 42,411 bytes
-of compact text and retained its four decisive quotes. Initial preparation took
-about 14 seconds in an unoptimized test build on the 64 GB development host.
+of compact text and retained its four decisive quotes. Recorded preparation took
+14.009 seconds in an unoptimized test build on the 64 GB development host.
 This is a phase timing under ambient load, not a p95 latency or 32 GB result.
 Even a roughly 99.9% byte reduction does not establish model fit: the result is
 approximately 10,603 **estimated** tokens before task framing. Admission must
 use the actual candidate tokenizer, framing, output reserve and measured memory
 envelope. Do not lower evidence-retention requirements merely to fit a model.
+
+Recorded synthetic reports: [screening](benchmarks/2026-09-10-deterministic/screening.json),
+[broker](benchmarks/2026-09-10-deterministic/broker.json), and
+[40 MB stress](benchmarks/2026-09-10-deterministic/stress.json).
+These are single-run observations, not qualification certificates.
 
 ## Replay
 

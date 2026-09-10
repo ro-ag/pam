@@ -3,7 +3,7 @@ use futures::Stream;
 use parking_lot::Mutex;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::atomic;
@@ -14,6 +14,8 @@ pub(crate) struct QueueInner<S, K: Clone> {
     counter: atomic::AtomicUsize,
     ready_queue: BinaryHeap<ReadyEvent<K>>,
     streams: HashMap<K, Pin<Box<S>>>,
+    registrations: HashMap<K, Arc<()>>,
+    queued: HashSet<K>,
     waker: Option<Waker>,
     /// Callback invoked when a stream ends (peer disconnected).
     /// Wrapped in Arc so it can be cloned and called outside the lock.
@@ -21,11 +23,32 @@ pub(crate) struct QueueInner<S, K: Clone> {
 }
 
 impl<S, K: Clone + Eq + Hash> QueueInner<S, K> {
+    fn enqueue(&mut self, event: ReadyEvent<K>) {
+        if self
+            .registrations
+            .get(&event.key)
+            .is_some_and(|token| Arc::ptr_eq(token, &event.token))
+            && self.queued.insert(event.key.clone())
+        {
+            self.ready_queue.push(event);
+        }
+    }
+
+    fn current(&self, event: &ReadyEvent<K>) -> bool {
+        self.registrations
+            .get(&event.key)
+            .is_some_and(|token| Arc::ptr_eq(token, &event.token))
+    }
+
     pub fn insert(&mut self, k: K, s: S) {
+        self.remove(&k);
+        let token = Arc::new(());
+        self.registrations.insert(k.clone(), token.clone());
         self.streams.insert(k.clone(), Box::pin(s));
-        self.ready_queue.push(ReadyEvent {
+        self.enqueue(ReadyEvent {
             priority: self.counter.fetch_add(1, atomic::Ordering::Relaxed),
             key: k,
+            token,
         });
         if let Some(w) = &self.waker {
             w.wake_by_ref();
@@ -34,6 +57,9 @@ impl<S, K: Clone + Eq + Hash> QueueInner<S, K> {
 
     pub fn remove(&mut self, k: &K) {
         self.streams.remove(k);
+        self.registrations.remove(k);
+        self.queued.remove(k);
+        self.ready_queue.retain(|event| &event.key != k);
     }
 
     /// Clear all streams and the ready queue.
@@ -42,6 +68,8 @@ impl<S, K: Clone + Eq + Hash> QueueInner<S, K> {
     /// other components (like reconnect tasks) hold Arc references to the inner.
     pub fn clear(&mut self) {
         self.streams.clear();
+        self.registrations.clear();
+        self.queued.clear();
         self.ready_queue.clear();
         // Wake the waker so any pending poll_next returns
         if let Some(w) = self.waker.take() {
@@ -59,6 +87,7 @@ pub struct FairQueue<S, K: Clone> {
 struct ReadyEvent<K: Clone> {
     priority: usize,
     key: K,
+    token: Arc<()>,
 }
 
 impl<K: Clone> PartialEq for ReadyEvent<K> {
@@ -87,11 +116,11 @@ struct StreamWaker<S, K: Clone> {
 impl<S, K> ArcWake for StreamWaker<S, K>
 where
     S: Send,
-    K: Clone + Send + Sync,
+    K: Clone + Eq + Hash + Send + Sync,
 {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let mut inner = arc_self.inner.lock();
-        inner.ready_queue.push(arc_self.event.clone());
+        inner.enqueue(arc_self.event.clone());
         if let Some(waker) = inner.waker.take() {
             waker.wake_by_ref();
         }
@@ -123,6 +152,7 @@ where
                         }
                     }
                 };
+                inner.queued.remove(&event.key);
                 match inner.streams.remove(&event.key) {
                     Some(stream) => (event, stream),
                     None => continue,
@@ -140,11 +170,14 @@ where
                     let item = Some((event.key.clone(), res));
                     let mut inner = fair_queue.inner.lock();
                     let priority = inner.counter.fetch_add(1, atomic::Ordering::Relaxed);
-                    inner.ready_queue.push(ReadyEvent {
-                        priority,
-                        key: event.key.clone(),
-                    });
-                    inner.streams.insert(event.key, io_stream);
+                    if inner.current(&event) {
+                        inner.enqueue(ReadyEvent {
+                            priority,
+                            key: event.key.clone(),
+                            token: event.token.clone(),
+                        });
+                        inner.streams.insert(event.key, io_stream);
+                    }
                     return Poll::Ready(item);
                 }
                 Poll::Ready(None) => {
@@ -152,8 +185,13 @@ where
                     // Clone the callback Arc so we can call it outside the lock
                     // (to avoid deadlock if callback accesses inner)
                     let callback = {
-                        let inner = fair_queue.inner.lock();
-                        inner.on_disconnect.clone()
+                        let mut inner = fair_queue.inner.lock();
+                        if inner.current(&event) {
+                            inner.remove(&event.key);
+                            inner.on_disconnect.clone()
+                        } else {
+                            None
+                        }
                     };
                     // Call callback outside the lock
                     if let Some(callback) = callback {
@@ -164,7 +202,9 @@ where
                 }
                 Poll::Pending => {
                     let mut inner = fair_queue.inner.lock();
-                    inner.streams.insert(event.key, io_stream);
+                    if inner.current(&event) {
+                        inner.streams.insert(event.key, io_stream);
+                    }
                     continue;
                 }
             }
@@ -180,6 +220,8 @@ impl<S, K: Clone> FairQueue<S, K> {
                 counter: atomic::AtomicUsize::new(0),
                 ready_queue: BinaryHeap::new(),
                 streams: HashMap::new(),
+                registrations: HashMap::new(),
+                queued: HashSet::new(),
                 waker: None,
                 on_disconnect: None,
             })),
@@ -428,3 +470,7 @@ mod test {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fair_queue_limits_test.rs"]
+mod limits_test;

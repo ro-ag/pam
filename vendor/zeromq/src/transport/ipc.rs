@@ -109,6 +109,11 @@ where
         loop {
             select! {
                 incoming = listener.accept().fuse() => {
+                    let Some(permit) = crate::codec::InboundPermit::acquire() else {
+                        drop(incoming);
+                        continue;
+                    };
+                    let task_permit = permit.clone();
                     let maybe_accepted: Result<_, _> = incoming.map(|(raw_socket, peer_addr)| {
                         #[cfg(target_family = "unix")]
                         let peer_addr = pathname_from_unix_addr(peer_addr);
@@ -117,9 +122,13 @@ where
                             let _ = peer_addr;
                             None
                         };
-                        (make_framed(raw_socket), Endpoint::Ipc(peer_addr))
+                        (make_framed(raw_socket).with_inbound_permit(permit), Endpoint::Ipc(peer_addr))
                     }).map_err(|err| err.into());
-                    async_rt::task::spawn(cback(maybe_accepted));
+                    let callback = cback(maybe_accepted);
+                    async_rt::task::spawn(async move {
+                        let _task_permit = task_permit;
+                        callback.await;
+                    });
                 },
                 _ = stop_callback => {
                     log::debug!("Accept task received stop signal. {:?}", listener_addr);

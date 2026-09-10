@@ -19,8 +19,26 @@ Receive limits apply to **both daemon and client** codecs:
 
 A routing identity and a 1 MiB application frame fit. Larger application responses
 must use bounded results/evidence reads or explicit refusals; do not silently
-truncate them. These are per-message limits, not a cap on peer count or concurrent
-connections. PAM must also bound its active request tasks and admission queue.
+truncate them.
+
+Inbound IPC/TCP accepts share a process-wide 256-connection limit. A permit is
+acquired before spawning the handshake callback and remains held by both socket
+halves until disconnect/drop. Inbound handshakes time out after five seconds;
+excess accepted sockets are closed immediately. This limits established peers
+and unfinished handshakes together, including across multiple listeners.
+
+ROUTER receive polls peer streams directly; stopping application reads provides
+socket backpressure, without a background queue of complete messages. FairQueue
+coalesces readiness per live peer generation, removes disconnected events, and
+ignores stale wakes after identity replacement. ROUTER skips the unused
+round-robin identity queue, preventing connection churn from accumulating IDs.
+PAM must additionally bound its active request tasks and admission queue.
+
+Resource regressions cover permit exhaustion and release across both IO halves,
+a real refused socket and timed-out greeting, paused-receiver backpressure,
+repeated/stale wakes, and ROUTER connection churn. Run with
+`cargo test --manifest-path vendor/zeromq/Cargo.toml --lib --offline`.
+
 
 Production dependencies and version are unchanged. The normalized vendored
 manifest disables upstream example/integration/benchmark targets and removes their
@@ -31,8 +49,8 @@ Two upstream six-frame codec fixtures now expect rejection under PAM's four-fram
 policy. New regressions live in `src/codec/zmq_codec_limits_test.rs`.
 
 To update: compare the new upstream decoder and manifest against this version,
-retain or replace the pre-allocation and multipart checks, verify frame/count
-boundaries and counter reset, then run the pure-Rust codec library tests and PAM
+retain or replace the pre-allocation, multipart, inbound lifetime, and readiness
+checks, verify frame/count boundaries and counter reset, then run the pure-Rust codec library tests and PAM
 transport tests. Do not remove the patch until a supported upstream configuration
 provides equivalent checks before allocation.
 

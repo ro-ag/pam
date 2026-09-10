@@ -269,9 +269,12 @@ pub trait Socket: Sized + Send {
             let cloned_backend = cloned_backend.clone();
             async move {
                 let result = match result {
-                    Ok((socket, endpoint)) => util::peer_connected(socket, cloned_backend.clone())
-                        .await
-                        .map(|peer_id| (endpoint, peer_id)),
+                    Ok((socket, endpoint)) => util::run_with_timeout(
+                        Some(Duration::from_secs(5)),
+                        util::peer_connected(socket, cloned_backend.clone()),
+                    )
+                    .await
+                    .map(|peer_id| (endpoint, peer_id)),
                     Err(e) => Err(e),
                 };
 
@@ -420,3 +423,6 @@ pub mod prelude {
 
     pub use crate::{Socket, SocketRecv, SocketSend, TryIntoEndpoint};
 }
+
+#[cfg(all(test, feature = "tokio-runtime", feature = "tcp-transport"))]
+mod resource_limits_test;

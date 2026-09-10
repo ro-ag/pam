@@ -139,7 +139,9 @@ impl MultiPeerBackend for GenericSocketBackend {
         self.peers
             .upsert_async(peer_id.clone(), Peer { send_queue })
             .await;
-        self.round_robin.push(peer_id.clone());
+        if self.socket_type != SocketType::ROUTER {
+            self.round_robin.push(peer_id.clone());
+        }
         match &self.fair_queue_inner {
             None => {}
             Some(inner) => {
@@ -165,3 +167,7 @@ impl MultiPeerBackend for GenericSocketBackend {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "backend_limits_test.rs"]
+mod limits_test;

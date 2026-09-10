@@ -41,6 +41,11 @@ where
         loop {
             select! {
                 incoming = listener.accept().fuse() => {
+                    let Some(permit) = crate::codec::InboundPermit::acquire() else {
+                        drop(incoming);
+                        continue;
+                    };
+                    let task_permit = permit.clone();
                     let maybe_accepted: Result<_, _> = incoming
                         .and_then(|(raw_socket, remote_addr)| {
                             raw_socket
@@ -49,12 +54,16 @@ where
                         })
                         .map(|(raw_socket, remote_addr)| {
                             (
-                                make_framed(raw_socket),
+                                make_framed(raw_socket).with_inbound_permit(permit),
                                 Endpoint::from_tcp_addr(remote_addr),
                             )
                         })
                         .map_err(|err| err.into());
-                    async_rt::task::spawn(cback(maybe_accepted));
+                    let callback = cback(maybe_accepted);
+                    async_rt::task::spawn(async move {
+                        let _task_permit = task_permit;
+                        callback.await;
+                    });
                 }
                 _ = stop_callback => {
                     break

@@ -194,6 +194,8 @@ export type AdminOp =
   | "admin.connectors.configure"
   | "admin.connectors.test"
   | "admin.connectors.keyring"
+  | "admin.connectors.sonar_mappings.get"
+  | "admin.connectors.sonar_mappings.set"
   | "admin.retention.get"
   | "admin.retention.set"
   | "admin.retention.prune";
@@ -1271,4 +1273,25 @@ export async function subscribeEvents(
     throw err;
   }
   return unlisten;
+}
+
+export interface SonarRepositoryMapping {
+  server: string;
+  project: string;
+  repository: string;
+}
+export interface SonarRepositoryMappings {
+  revision: string;
+  mappings: SonarRepositoryMapping[];
+}
+export function sonarMappingsGet(): Promise<SonarRepositoryMappings> {
+  return adminCall("admin.connectors.sonar_mappings.get");
+}
+export function sonarMappingsSet(
+  snapshot: SonarRepositoryMappings,
+): Promise<SonarRepositoryMappings> {
+  return adminCall("admin.connectors.sonar_mappings.set", {
+    expected_revision: snapshot.revision,
+    mappings: snapshot.mappings,
+  });
 }

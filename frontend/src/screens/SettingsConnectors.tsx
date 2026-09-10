@@ -16,6 +16,7 @@ import {
   type ConnectorSummary,
 } from "../lib/ipc";
 import { exactTime, relativeTime } from "../lib/time";
+import { SonarRepositoryMappingsEditor } from "./SonarRepositoryMappings";
 
 export const CAUSE_STORE_DENIED = "store_denied";
 export const STORE_UNAVAILABLE_COPY =
@@ -376,6 +377,9 @@ export function SettingsConnectorsSection({ targetId }: { targetId?: string } = 
           />
         ))}
       </div>
+      {rows.some((connector) => connector.id === "sonarqube") && (
+        <SonarRepositoryMappingsEditor />
+      )}
       {!failure && !connectors.isPending && rows.length === 0 && (
         <Panel ground="raised" className="p-4 text-sm text-ink-muted">
           No connectors available.

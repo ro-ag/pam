@@ -1,6 +1,6 @@
-//! Public SQL regressions for PAM's pure-Rust turso_core vector kernels.
+//! Public SQL regressions for PAM's pure-Rust `turso_core` vector kernels.
 //! Dot distance is the negated dot product; L2 is Euclidean, not squared.
-//! Zero/NaN cosine semantics follow SimSIMD's scalar normalization contract.
+//! Zero/NaN cosine semantics follow `SimSIMD`'s scalar normalization contract.
 use turso::{Builder, Connection, Value};
 
 async fn scalar(connection: &Connection, sql: &str) -> Value {
@@ -13,7 +13,7 @@ async fn scalar(connection: &Connection, sql: &str) -> Value {
         .unwrap()
 }
 
-fn close(actual: Value, expected: f64) {
+fn close(actual: &Value, expected: f64) {
     let Value::Real(actual) = actual else {
         panic!("expected real scalar, got {actual:?}");
     };
@@ -51,7 +51,7 @@ async fn dense_distances_keep_sign_scale_and_geometric_conventions() {
             ("cos", "[1,2]", "[2,4]", 0.0),
         ] {
             close(
-                scalar(
+                &scalar(
                     &connection,
                     &format!(
                         "SELECT vector_distance_{metric}({vector}('{left}'), {vector}('{right}'))"
@@ -71,7 +71,7 @@ async fn empty_and_zero_vectors_preserve_native_cosine_contract() {
     for vector in ["vector32", "vector64"] {
         for metric in ["dot", "l2", "cos"] {
             close(
-                scalar(
+                &scalar(
                     &connection,
                     &format!("SELECT vector_distance_{metric}({vector}('[]'), {vector}('[]'))"),
                 )
@@ -79,7 +79,7 @@ async fn empty_and_zero_vectors_preserve_native_cosine_contract() {
                 0.0,
             );
             close(
-                scalar(
+                &scalar(
                     &connection,
                     &format!(
                         "SELECT vector_distance_{metric}({vector}('[0,0]'), {vector}('[0,0]'))"
@@ -91,7 +91,7 @@ async fn empty_and_zero_vectors_preserve_native_cosine_contract() {
         }
         for (left, right) in [("[0,0]", "[1,2]"), ("[1,2]", "[0,0]")] {
             close(
-                scalar(
+                &scalar(
                     &connection,
                     &format!("SELECT vector_distance_cos({vector}('{left}'), {vector}('{right}'))"),
                 )
@@ -137,7 +137,7 @@ async fn extreme_finite_values_keep_documented_accumulation_behavior() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let connection = db.connect().unwrap();
     close(
-        scalar(
+        &scalar(
             &connection,
             "SELECT vector_distance_dot(vector32('[1e20]'),vector32('[1e20]'))",
         )
@@ -145,7 +145,7 @@ async fn extreme_finite_values_keep_documented_accumulation_behavior() {
         -1e40,
     );
     close(
-        scalar(
+        &scalar(
             &connection,
             "SELECT vector_distance_dot(vector64('[1e150]'),vector64('[1e150]'))",
         )
@@ -153,7 +153,7 @@ async fn extreme_finite_values_keep_documented_accumulation_behavior() {
         -1e300,
     );
     close(
-        scalar(
+        &scalar(
             &connection,
             "SELECT vector_distance_l2(vector64('[1e150]'),vector64('[0]'))",
         )
@@ -171,7 +171,7 @@ async fn extreme_finite_values_keep_documented_accumulation_behavior() {
     );
     for (vector, values) in [("vector32", "[1e15,1e15]"), ("vector64", "[1e150,1e150]")] {
         close(
-            scalar(
+            &scalar(
                 &connection,
                 &format!("SELECT vector_distance_cos({vector}('{values}'),{vector}('{values}'))"),
             )
@@ -213,7 +213,7 @@ async fn binary_nonfinite_vectors_preserve_sql_null_and_infinity_behavior() {
             );
         }
         close(
-            scalar(
+            &scalar(
                 &connection,
                 &format!("SELECT vector_distance_cos(x'{nan}',x'{one}')"),
             )
@@ -221,7 +221,7 @@ async fn binary_nonfinite_vectors_preserve_sql_null_and_infinity_behavior() {
             0.0,
         );
         close(
-            scalar(
+            &scalar(
                 &connection,
                 &format!("SELECT vector_distance_cos(x'{infinity}',x'{one}')"),
             )

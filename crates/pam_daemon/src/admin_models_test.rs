@@ -883,7 +883,7 @@ async fn diagnostic_arguments_and_reservation_are_enforced_before_inference() {
     );
     for extra in [
         json!({"timeout_ms":0}),
-        json!({"timeout_ms":120001}),
+        json!({"timeout_ms":120_001}),
         json!({"timeout_ms":"8000"}),
         json!({"max_tokens":u64::MAX}),
         json!({"max_tokens":-1}),

@@ -243,3 +243,28 @@ fn connection() -> Connection {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
+
+#[tokio::test]
+async fn listing_caps_returned_arrays_even_when_server_ignores_requested_tree_limit() {
+    for (operation, field) in [("jobs", "jobs"), ("builds", "builds")] {
+        let transport = FakeTransport::new().json(200, &serde_json::json!({(field): [{"name":"first","number":1},{"name":"second","number":2}]}).to_string());
+        let mut parameters = args(&[("job", "platform")]);
+        parameters.insert("limit".to_owned(), ArgValue::Int(1));
+        let CallResult::Json(value) = call(
+            ConnectorId::Jenkins,
+            &connection(),
+            operation,
+            &parameters,
+            &transport,
+            deadline(),
+        )
+        .await
+        .unwrap() else {
+            panic!("JSON listing")
+        };
+        assert_eq!(value[field].as_array().unwrap().len(), 1);
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["limit"], 1);
+        assert!(value["coverage"].is_string());
+    }
+}

@@ -61,9 +61,12 @@ async fn jobs(
     let body = get_json(conn, ID, url, transport, deadline).await?;
     let jobs: Vec<Value> = array_field(&body, "jobs")?
         .iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .map(|job| pick(job, JOB_FIELDS))
         .collect();
-    Ok(CallResult::Json(json!({ "jobs": jobs })))
+    Ok(CallResult::Json(
+        json!({ "partial": i64::try_from(jobs.len()).unwrap_or(i64::MAX) >= limit, "coverage": "top_level_only", "limit": limit, "jobs": jobs }),
+    ))
 }
 
 /// `GET /job/…/api/json?tree=builds[…]{0,limit}`.
@@ -86,9 +89,12 @@ async fn builds(
     let body = get_json(conn, ID, url, transport, deadline).await?;
     let builds: Vec<Value> = array_field(&body, "builds")?
         .iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .map(|build| pick(build, BUILD_FIELDS))
         .collect();
-    Ok(CallResult::Json(json!({ "job": job, "builds": builds })))
+    Ok(CallResult::Json(
+        json!({ "job": job, "partial": i64::try_from(builds.len()).unwrap_or(i64::MAX) >= limit, "coverage": "bounded_first_page", "limit": limit, "builds": builds }),
+    ))
 }
 
 /// One build's console text, with the exit status its result implies.

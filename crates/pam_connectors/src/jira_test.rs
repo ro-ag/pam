@@ -191,3 +191,22 @@ fn connection() -> Connection {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
+
+#[tokio::test]
+async fn missing_or_inconsistent_totals_cannot_claim_complete_search() {
+    for body in [
+        r#"{"issues":[{"key":"PAM-1"}]}"#,
+        r#"{"total":-1,"issues":[]}"#,
+        r#"{"total":0,"issues":[{"key":"PAM-1"}]}"#,
+    ] {
+        let transport = FakeTransport::new().json(200, body);
+        let CallResult::Json(value) = run("search", &[("jql", "project = PAM")], &transport)
+            .await
+            .unwrap()
+        else {
+            panic!("JSON search")
+        };
+        assert_eq!(value["partial"], true, "{body}");
+        assert_eq!(value["coverage"], "bounded_first_page");
+    }
+}

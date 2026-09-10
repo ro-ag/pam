@@ -88,6 +88,8 @@ the unresolved GUI compiler conflict. Hiding a socket pathname is not isolation.
 
 ### Plan #32 — Correlate enterprise products and collect decisive evidence
 
+The [enterprise connector contracts](enterprise-connector-contracts.md) record supported deployment/auth modes, bounded coverage, and the distinction between fixtures and live qualification.
+
 | Task | Deliverable | Proof required |
 | --- | --- | --- |
 | #128 | Six deployment-specific adapter contracts | Explicit API/auth/pagination/rate-limit support, contract fixtures, separately labeled live smoke |

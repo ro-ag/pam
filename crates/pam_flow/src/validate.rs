@@ -117,12 +117,22 @@ pub struct CallSpec {
 const GITHUB_CALLS: &[CallSpec] = &[
     CallSpec {
         name: "runs",
-        args: &[("repo", true), ("status", false), ("limit", false)],
+        args: &[
+            ("repo", true),
+            ("status", false),
+            ("limit", false),
+            ("page", false),
+        ],
         yields_log: false,
     },
     CallSpec {
         name: "run",
-        args: &[("repo", true), ("run_id", true)],
+        args: &[
+            ("repo", true),
+            ("run_id", true),
+            ("page", false),
+            ("run_attempt", false),
+        ],
         yields_log: false,
     },
     CallSpec {
@@ -158,12 +168,17 @@ const JENKINS_CALLS: &[CallSpec] = &[
 const SONARQUBE_CALLS: &[CallSpec] = &[
     CallSpec {
         name: "quality_gate",
-        args: &[("project", true)],
+        args: &[("project", true), ("branch", false), ("pullRequest", false)],
         yields_log: false,
     },
     CallSpec {
         name: "issues",
-        args: &[("project", true), ("limit", false)],
+        args: &[
+            ("project", true),
+            ("limit", false),
+            ("branch", false),
+            ("pullRequest", false),
+        ],
         yields_log: false,
     },
 ];

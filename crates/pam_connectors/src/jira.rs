@@ -61,12 +61,17 @@ async fn search(
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .map(summarize)
         .collect();
-    let total = body.get("total").and_then(Value::as_i64);
+    let total = body
+        .get("total")
+        .and_then(Value::as_i64)
+        .filter(|total| *total >= 0);
     let seen = i64::try_from(issues.len()).unwrap_or(i64::MAX);
-    let partial = total.is_some_and(|total| total > seen);
+    let partial = total.is_none_or(|total| total != seen)
+        || array_field(&body, "issues")?.len() > issues.len();
     Ok(CallResult::Json(json!({
         "partial": partial,
         "total": total,
+        "coverage": "bounded_first_page",
         "issues": issues,
     })))
 }

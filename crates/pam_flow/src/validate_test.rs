@@ -570,11 +570,21 @@ fn the_connector_call_table_matches_the_spec() {
     };
     assert_eq!(
         spec(ConnectorId::Github, "runs").args,
-        [("repo", true), ("status", false), ("limit", false)]
+        [
+            ("repo", true),
+            ("status", false),
+            ("limit", false),
+            ("page", false)
+        ]
     );
     assert_eq!(
         spec(ConnectorId::Github, "run").args,
-        [("repo", true), ("run_id", true)]
+        [
+            ("repo", true),
+            ("run_id", true),
+            ("page", false),
+            ("run_attempt", false)
+        ]
     );
     assert_eq!(
         spec(ConnectorId::Jenkins, "console").args,

@@ -963,10 +963,23 @@ export interface FlowDetail extends FlowListEntry {
   flow?: FlowSpec | null;
 }
 
-/** The two knobs Settings › Flows edits. */
+export interface FlowConnectorScope {
+  connector: Exclude<FlowConnectorId, "aws">;
+  base_url: string;
+  access: "targets" | "connector_wide";
+  targets: string[];
+}
+
+export interface FlowScopePolicy {
+  version: 1;
+  repositories: { root: string; connectors: FlowConnectorScope[] }[];
+}
+
+/** Settings › Flows; missing scope policy is interpreted as empty deny. */
 export interface FlowSettings {
   allowed_programs: string[];
   extra_path: string[];
+  scope_policy?: FlowScopePolicy;
 }
 
 /** How one step of a run ended (`pam_daemon::flow_exec::StepStatus`). */

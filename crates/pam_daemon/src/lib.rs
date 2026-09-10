@@ -18,14 +18,14 @@ mod evidence_view;
 #[cfg(test)]
 mod evidence_view_test;
 pub mod executor;
-pub mod flow_exec;
-pub mod flow_service;
 mod flow_contract;
-mod flow_result_service;
 #[cfg(test)]
 mod flow_contract_test;
+pub mod flow_exec;
+mod flow_result_service;
 #[cfg(test)]
 mod flow_result_service_test;
+pub mod flow_service;
 pub mod lifecycle;
 mod log_semantic;
 pub mod log_service;
@@ -53,6 +53,8 @@ mod admin_test;
 mod approval_test;
 #[cfg(test)]
 mod connector_service_test;
+#[cfg(test)]
+mod daemon_repository_test;
 #[cfg(test)]
 mod daemon_test;
 #[cfg(test)]

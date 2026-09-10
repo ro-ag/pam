@@ -70,8 +70,9 @@ head/tail slice.
 Keep the result compact and versioned. The target envelope should fit 16 KiB
 by default, with at most 6,000 UTF-8 bytes of observation summary. Use references
 and explicit omission counts for larger detail. Document/enforce limits on the
-serialized envelope, not just the model's answer. These are acceptance targets
-for #103; existing arbitrary flows do not yet guarantee a whole-result ceiling.
+serialized envelope, not just the model's answer. The bounded flow projection implements these limits; see the
+[CLI contract](flow-cli-contract.md) for its current schema and replay semantics.
+The fuller illustrative schema below remains a roadmap target.
 
 Illustrative target result, not today's wire schema:
 
@@ -168,11 +169,13 @@ The existing CLI can discover flows and execute the deterministic Jenkins slice:
 
 ```sh
 pam status --json
-pam flow list --json
+pam flow list --limit 20 --json
+pam flow inspect jenkins-build-investigation job=platform/nightly build=41 --json
 pam flow show jenkins-build-investigation
 pam flow run jenkins-build-investigation job=platform/nightly build=41 --no-wait --json
 pam subscribe <ticket>
-pam wait <ticket>
+pam wait <ticket> --json
+pam flow result <ticket> --json
 pam cancel <ticket> --json
 pam evidence read <evidence-id> --request <ticket> --json
 ```
@@ -181,8 +184,8 @@ The build/job values are examples; use an authorized explicit build. Settings
 and grants are configured by the human through the GUI. `subscribe` follows the
 submitted request; it is not yet the durable remote-job watcher proposed above.
 Scoped redacted evidence retrieval is available through `pam evidence read`.
-Whole-result bounds and durable result inspection are being added in #103; a
-`land-watch` flow remains future work. Microsoft setup lives in Models → Catalog;
+Bounded results and scoped durable inspection are available through the
+[flow CLI contract](flow-cli-contract.md); a `land-watch` flow remains future work. Microsoft setup lives in Models → Catalog;
 keep it off until its input class and resource envelope qualify.
 
 ## Instructions for the next implementation session

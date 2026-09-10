@@ -75,10 +75,13 @@ Every task carries its own caller/integration and acceptance note in ptrack.
 | #103 | Discoverable CLI task/result contract | Configured operations and actionable refusals are usable without a model; no agent-facing admin API |
 | #120 | End-to-end checkpoint | Sandboxed CLI runs one investigation and retrieves its decisive evidence without GUI-only data access |
 
-Start with #125. Document the supported same-user/OS threat model and deployment
-assumptions before selecting an authentication mechanism. Retain useful existing
-transport; do not confuse removing a socket pathname from help with isolation.
-#103 no longer depends on model eligibility #96.
+The administration boundary, scoped budgets and evidence retrieval are implemented;
+see [administration](admin-boundary.md), [budgets](scoped-admission-and-budgets.md)
+and [flow CLI contracts](flow-cli-contract.md). Use ptrack for current task status.
+Checkpoint #120 must still validate the declared enterprise OS boundary and event
+confidentiality. The [native build audit](native-build-dependencies.md) also records
+the unresolved GUI compiler conflict. Hiding a socket pathname is not isolation.
+#103 does not depend on model eligibility #96.
 
 ### Plan #32 — Correlate enterprise products and collect decisive evidence
 

@@ -206,7 +206,7 @@ async fn seed_relaxed(base: &Path) {
         .await
         .expect("relaxed profile persists");
     store.set_setting("flows.scope_policy", &serde_json::json!({
-        "version": 1, "repositories": [{"root": std::env::current_dir().unwrap().canonicalize().unwrap(), "connectors": []}]
+        "version": 1, "repositories": [{"root": pam::caller::detect_caller().repo, "connectors": []}]
     }).to_string()).await.expect("explicit follow repository scope");
 }
 

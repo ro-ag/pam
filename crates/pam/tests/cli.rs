@@ -204,7 +204,11 @@ async fn echo_solves_with_the_args_mirrored_back() {
 async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
     timeout(DEADLINE, async {
         let daemon = TestDaemon::start().await;
-        seed_repository_scope(&daemon, &std::env::current_dir().unwrap()).await;
+        seed_repository_scope(
+            &daemon,
+            std::path::Path::new(&pam::caller::detect_caller().repo),
+        )
+        .await;
 
         // Enough delay for the follow subscription to register before
         // the terminal event fires (zmq PUB has no replay).
@@ -241,7 +245,11 @@ async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
 async fn a_follow_that_joins_after_the_terminal_event_still_terminates() {
     timeout(DEADLINE, async {
         let daemon = TestDaemon::start().await;
-        seed_repository_scope(&daemon, &std::env::current_dir().unwrap()).await;
+        seed_repository_scope(
+            &daemon,
+            std::path::Path::new(&pam::caller::detect_caller().repo),
+        )
+        .await;
 
         let response = client::send_request(
             &daemon.base(),

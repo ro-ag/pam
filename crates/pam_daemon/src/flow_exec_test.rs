@@ -27,6 +27,19 @@ use crate::flow_exec::{
 /// for integration tests only, and `cargo test --lib` does not build the
 /// package's binaries at all.
 fn git() -> PathBuf {
+    // Exercise Git itself: Apple's /usr/bin/git shim invokes xcrun, whose
+    // cache writes are correctly denied by the command containment policy.
+    if cfg!(target_os = "macos") {
+        for installed in [
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        ] {
+            let path = PathBuf::from(installed);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
     resolve_program(
         "git",
         &[],

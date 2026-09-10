@@ -118,7 +118,7 @@ impl Store {
             .ok_or_else(|| invalid("missing capacity accounting"))?;
         let bytes =
             i64::try_from(canonical_json.len()).map_err(|_| invalid("JSON length overflow"))?;
-        if row.get::<i64>(0)? >= 64 || row.get::<i64>(1)?.saturating_add(bytes) > 524288 {
+        if row.get::<i64>(0)? >= 64 || row.get::<i64>(1)?.saturating_add(bytes) > 524_288 {
             return Err(invalid("step capacity exhausted"));
         }
         drop(rows);
@@ -169,7 +169,7 @@ impl Store {
                 .ok_or_else(|| invalid("stored step JSON oversized"))?;
             validate(&canonical_json, 8192)?;
             bytes = bytes.saturating_add(canonical_json.len());
-            if bytes > 524288 {
+            if bytes > 524_288 {
                 return Err(invalid("stored step bytes exceeded"));
             }
             steps.push(CorrelationStep {

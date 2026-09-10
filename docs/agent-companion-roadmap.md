@@ -88,6 +88,11 @@ GUI compiler conflict in the [native build audit](native-build-dependencies.md).
 Hiding a socket pathname is not isolation.
 #103 does not depend on model eligibility #96.
 
+Explicit revision-bound GitHub and Jenkins flows now use immutable
+[workflow correlation](workflow-correlation.md). Missing or conflicting source
+identity blocks downstream use while retaining evidence. Exact Sonar analysis,
+durable watches and guarded local verification remain separate work.
+
 ### Plan #32 — Correlate enterprise products and collect decisive evidence
 
 The [enterprise connector contracts](enterprise-connector-contracts.md) record supported deployment/auth modes, bounded coverage, and the distinction between fixtures and live qualification.

@@ -602,6 +602,18 @@ impl FlowService {
         for name in missing {
             blockers.push(json!({"cause": "input_unavailable", "input": name, "recovery": "supply the declared input; runtime-derived values require execution"}));
         }
+        let correlation = match &flow.correlation {
+            None => json!({"status":"unbound"}),
+            Some(declaration) => match declaration.resolve(&vars) {
+                Ok(target) => {
+                    json!({"status":"declared","target":target,"frozen_on_execution":true})
+                }
+                Err(error) => {
+                    blockers.push(json!({"cause":crate::correlation::INVALID,"detail":error.to_string(),"recovery":crate::correlation::RECOVERY}));
+                    json!({"status":"unresolved"})
+                }
+            },
+        };
         let configured = self
             .store
             .get_setting(SETTING_ALLOWED_PROGRAMS)
@@ -621,7 +633,7 @@ impl FlowService {
         blockers.extend(step_blockers);
         let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
             "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
-            "steps":steps, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
+            "steps":steps, "correlation":correlation, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
             "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
             "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
         let body = crate::evidence_view::redact_json(&body).map_err(|_| {
@@ -828,13 +840,16 @@ impl FlowService {
             )
             .await?;
 
+        let correlation = self.freeze_correlation(ctx, &repo, flow, &vars).await?;
         let mut state = RunState {
             service: self,
             ctx,
             flow,
             settings: &settings,
             repo,
+            observed: vars.clone(),
             vars,
+            correlation,
             cancel,
             reports: Vec::with_capacity(flow.steps.len()),
             evidence: Vec::new(),
@@ -843,13 +858,14 @@ impl FlowService {
         };
         state.execute().await?;
 
-        let products = product_observations(flow, &state.vars);
+        let products = product_observations(flow, &state.observed);
         let report = RunReport {
-            outcome: outcome_for(&state.reports, flow),
+            outcome: state.correlation.outcome(outcome_for(&state.reports, flow)),
             summary: summary_for(&state.reports),
             steps: state.reports,
         };
         let body = json!({
+            "correlation": state.correlation.report(),
             "budget_usage": ctx.budget.usage(),
             "flow": {
                 "id": flow.id,
@@ -879,6 +895,7 @@ impl FlowService {
                 &capture,
                 &state.evidence,
                 &products,
+                state.correlation.summary(),
             )
             .await?;
         // The projection carries bounded references; the outer wire list names only the verdict.
@@ -888,6 +905,24 @@ impl FlowService {
             body,
             evidence,
         })
+    }
+
+    async fn freeze_correlation(
+        &self,
+        ctx: &ExecContext,
+        repo: &Path,
+        flow: &Flow,
+        vars: &Vars,
+    ) -> Result<crate::correlation::Frozen, FlowRefusal> {
+        crate::correlation::Frozen::prepare(
+            &self.store,
+            &ctx.request_id,
+            &repo.to_string_lossy(),
+            flow,
+            vars,
+        )
+        .await
+        .map_err(|error| FlowRefusal::new(error.cause, error.detail, crate::correlation::RECOVERY))
     }
 
     #[allow(clippy::too_many_arguments)] // Full private report plus its bounded public projection inputs.
@@ -900,6 +935,7 @@ impl FlowService {
         capture: &crate::evidence_service::CaptureScope,
         evidence: &[String],
         products: &BTreeMap<String, crate::flow_contract::ProductObservation>,
+        correlation: crate::flow_contract::CorrelationSummary,
     ) -> Result<(String, Value), CapabilityFailure> {
         let failed = report
             .steps
@@ -919,6 +955,11 @@ impl FlowService {
         )
         .map_err(|error| CapabilityFailure::Failed {
             detail: error.to_string(),
+        })?;
+        let projection = projection.with_correlation(correlation).map_err(|error| {
+            CapabilityFailure::Failed {
+                detail: error.to_string(),
+            }
         })?;
         let meta = json!({
             "agent_result": projection,
@@ -1064,7 +1105,10 @@ fn clean_list(list: &[String]) -> Vec<String> {
 
 /// Every `${…}` key a flow mentions anywhere.
 fn flow_references(flow: &Flow) -> Vec<String> {
-    let mut found = Vec::new();
+    let mut found = flow
+        .correlation
+        .as_ref()
+        .map_or_else(Vec::new, pam_flow::Correlation::references);
     for input in flow.inputs.values() {
         if let Some(default) = &input.default {
             found.extend(references(default));
@@ -1285,6 +1329,8 @@ struct RunState<'a> {
     settings: &'a FlowSettings,
     repo: PathBuf,
     vars: Vars,
+    observed: Vars,
+    correlation: crate::correlation::Frozen,
     cancel: watch::Receiver<bool>,
     reports: Vec<StepReport>,
     evidence: Vec<String>,
@@ -1367,6 +1413,17 @@ impl RunState<'_> {
     /// Gates one step, then runs it.
     async fn run_step(&mut self, step: &Step) -> Result<StepReport, CapabilityFailure> {
         let mut report = StepReport::new(&step.id, step.kind(), StepStatus::Failed);
+        if matches!(step.action, Action::Command { .. })
+            && self.correlation.refuse_unbound_verification(step)
+        {
+            report.fail(
+                StepStatus::Blocked,
+                crate::correlation::MISSING,
+                "local command verification has no authenticated revision binding".to_owned(),
+                crate::correlation::RECOVERY.to_owned(),
+            );
+            return Ok(report);
+        }
         // Do not request or remember a grant for an out-of-scope target.
         if let Err(refusal) = self.check_step_scope(step).await {
             report.fail(
@@ -1868,54 +1925,97 @@ impl RunState<'_> {
                 result
             })
         });
-        Some(assert_connector_attempt(
-            step,
-            match called {
-                Err(_elapsed) => Attempt::Failed {
-                    result: None,
-                    exit_status: None,
-                    output: Vec::new(),
-                    status: StepStatus::Failed,
-                    cause: CAUSE_TIMEOUT,
-                    detail: format!(
-                        "the {connector} call did not answer within step {:?}'s {} second timeout",
-                        step.id,
-                        step.timeout.as_secs()
-                    ),
-                    recovery: format!("open Pam → Settings → Connectors → {connector} → Test"),
-                    retry_after: None,
-                },
-                Ok(Ok(CallResult::Json(value))) => Attempt::Succeeded {
-                    exit_status: None,
-                    output: Vec::new(),
-                    result: Some(value),
-                },
-                Ok(Ok(CallResult::Log {
-                    bytes, exit_status, ..
-                })) => Attempt::Succeeded {
-                    exit_status,
-                    output: bytes,
-                    result: None,
-                },
-                Ok(Err(error)) => Attempt::Failed {
-                    result: None,
-                    exit_status: None,
-                    output: Vec::new(),
-                    // A connector a human has not finished setting up is a
-                    // block (somebody must open Settings); a service that
-                    // answered badly is a failure — the step did run.
-                    status: if blocks_the_run(&error) {
-                        StepStatus::Blocked
-                    } else {
-                        StepStatus::Failed
-                    },
-                    cause: error.cause(),
-                    detail: format!("the {connector} call failed: {}", error.detail()),
-                    recovery: error.recovery(connector),
-                    retry_after: rate_limit_wait(&error),
-                },
+        let attempt = match called {
+            Err(_elapsed) => Attempt::Failed {
+                result: None,
+                exit_status: None,
+                output: Vec::new(),
+                status: StepStatus::Failed,
+                cause: CAUSE_TIMEOUT,
+                detail: format!(
+                    "the {connector} call did not answer within step {:?}'s {} second timeout",
+                    step.id,
+                    step.timeout.as_secs()
+                ),
+                recovery: format!("open Pam → Settings → Connectors → {connector} → Test"),
+                retry_after: None,
             },
-        ))
+            Ok(Ok(CallResult::Json(value))) => Attempt::Succeeded {
+                exit_status: None,
+                output: Vec::new(),
+                result: Some(value),
+            },
+            Ok(Ok(CallResult::Log {
+                bytes, exit_status, ..
+            })) => Attempt::Succeeded {
+                exit_status,
+                output: bytes,
+                result: None,
+            },
+            Ok(Err(error)) => Attempt::Failed {
+                result: None,
+                exit_status: None,
+                output: Vec::new(),
+                // A connector a human has not finished setting up is a
+                // block (somebody must open Settings); a service that
+                // answered badly is a failure — the step did run.
+                status: if blocks_the_run(&error) {
+                    StepStatus::Blocked
+                } else {
+                    StepStatus::Failed
+                },
+                cause: error.cause(),
+                detail: format!("the {connector} call failed: {}", error.detail()),
+                recovery: error.recovery(connector),
+                retry_after: rate_limit_wait(&error),
+            },
+        };
+        let attempt = self.correlate_attempt(step, attempt).await;
+        Some(assert_connector_attempt(step, attempt))
+    }
+
+    async fn correlate_attempt(&mut self, step: &Step, attempt: Attempt) -> Attempt {
+        let Attempt::Succeeded {
+            exit_status,
+            output,
+            result,
+        } = attempt
+        else {
+            return attempt;
+        };
+        let correlated = if let Some(origin) = self.origins.get(&step.id) {
+            self.correlation
+                .associate(
+                    &self.service.store,
+                    &self.ctx.request_id,
+                    step,
+                    origin,
+                    result.as_ref(),
+                )
+                .await
+        } else {
+            Err(crate::correlation::Failure {
+                cause: crate::correlation::MISSING,
+                detail: "connector origin unavailable for association".to_owned(),
+            })
+        };
+        match correlated {
+            Ok(()) => Attempt::Succeeded {
+                exit_status,
+                output,
+                result,
+            },
+            Err(error) => Attempt::Failed {
+                exit_status,
+                output,
+                result,
+                status: StepStatus::Blocked,
+                cause: error.cause,
+                detail: error.detail,
+                recovery: crate::correlation::RECOVERY.to_owned(),
+                retry_after: None,
+            },
+        }
     }
 
     /// Persist a completed failed attempt before waiting or starting another.
@@ -1984,9 +2084,17 @@ impl RunState<'_> {
         } else {
             self.file_output(step, output, exit_status, report).await;
         }
-        self.vars.set_step(
+        self.observed.set_step(
             &step.id,
             json!({ "exit_status": exit_status, "result": result }),
+        );
+        let correlated = report
+            .error
+            .as_ref()
+            .is_none_or(|error| !error.cause.starts_with("correlation_"));
+        self.vars.set_step(
+            &step.id,
+            json!({ "exit_status": if correlated { exit_status } else { None }, "result": if correlated { result } else { None } }),
         );
     }
 

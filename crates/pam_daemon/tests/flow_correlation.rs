@@ -79,7 +79,7 @@ impl Fixture {
                 }),
                 true,
             );
-            request.caller.agent = ADMIN_CALLER_AGENT.to_owned();
+            ADMIN_CALLER_AGENT.clone_into(&mut request.caller.agent);
             let response = client.request(&request).await;
             assert!(matches!(response, Response::Result { .. }), "{response:?}");
         }
@@ -386,7 +386,7 @@ impl HttpTransport for ConcurrentGithub {
 
 #[tokio::test]
 async fn overlapping_requests_freeze_separate_repositories_and_revisions() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let transport = Arc::new(ConcurrentGithub {
             together: tokio::sync::Barrier::new(2),
         });
@@ -411,7 +411,7 @@ async fn overlapping_requests_freeze_separate_repositories_and_revisions() {
         assert_eq!(b["target"]["commit"], OTHER_SHA);
         assert_ne!(a["local_repository"], b["local_repository"]);
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
@@ -441,7 +441,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 #[tokio::test]
 async fn durable_result_keeps_the_frozen_target_after_checkout_changes() {
-    with_deadline(async {
+    with_deadline(Box::pin(async {
         let transport = Arc::new(FakeTransport::new());
         let fx = Fixture::new(FLOW, transport).await;
         let repo = fx.repos[0].path();
@@ -490,7 +490,7 @@ async fn durable_result_keeps_the_frozen_target_after_checkout_changes() {
             "retrieval must not reread products or current HEAD"
         );
         fx.finish().await;
-    })
+    }))
     .await;
 }
 

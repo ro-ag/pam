@@ -11,6 +11,27 @@ fn target() -> CorrelationTarget {
         pull_request_head: None,
     }
 }
+
+#[test]
+fn log_identity_uses_validated_request_arguments_without_json_response() {
+    for id in [ArgValue::Int(91), ArgValue::Text("91".into())] {
+        let args = BTreeMap::from([
+            ("repo".into(), ArgValue::Text("team/app".into())),
+            ("job_id".into(), id),
+        ]);
+        let identity = product_identity(ConnectorId::Github, "job_log", &args, None);
+        assert_eq!(identity["repository"], "team/app");
+        assert_eq!(identity["job_id"], 91);
+    }
+    for id in [ArgValue::Int(-1), ArgValue::Text("0".into())] {
+        let args = BTreeMap::from([("job_id".into(), id)]);
+        assert!(
+            product_identity(ConnectorId::Github, "job_log", &args, None)
+                .get("job_id")
+                .is_none()
+        );
+    }
+}
 fn reported() -> Value {
     json!({"source_identity":{"status":"unambiguous","repository_urls":["https://git.example/team/app.git"],"revisions":["a".repeat(40)],"partial":false,"invalid_metadata":false}})
 }
@@ -118,6 +139,7 @@ fn product_identity_preserves_only_bounded_stable_reported_ids() {
     assert_eq!(before["repository"], "team/app");
     report["status"] = json!("failure");
     report["timestamp"] = json!(888);
+    report["jobs"].as_array_mut().unwrap()[..100].reverse();
     assert_eq!(
         before,
         product_identity(ConnectorId::Github, "run", &args, Some(&report))

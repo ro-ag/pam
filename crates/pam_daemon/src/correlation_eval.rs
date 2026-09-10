@@ -187,6 +187,21 @@ pub(crate) fn product_identity(
     result: Option<&Value>,
 ) -> Value {
     let mut identity = json!({"connector":connector.as_str(),"call":call});
+    if connector == ConnectorId::Github && call == "job_log" {
+        if let Some(ArgValue::Text(repo)) = args.get("repo")
+            && !repo.is_empty()
+            && repo.len() <= 512
+        {
+            identity["repository"] = json!(repo);
+        }
+        let job_id = args.get("job_id").and_then(|value| match value {
+            ArgValue::Int(id) => u64::try_from(*id).ok(),
+            ArgValue::Text(id) => id.parse::<u64>().ok(),
+        });
+        if let Some(id) = job_id.filter(|id| *id > 0) {
+            identity["job_id"] = json!(id);
+        }
+    }
     let Some(result) = result else {
         return identity;
     };
@@ -201,13 +216,15 @@ pub(crate) fn product_identity(
             identity[key] = positive_id(result.get(key));
         }
         let jobs = result.get("jobs").and_then(Value::as_array);
-        identity["job_ids"] = json!(
-            jobs.into_iter()
-                .flatten()
-                .take(100)
-                .filter_map(|job| job.get("id").and_then(Value::as_u64).filter(|id| *id > 0))
-                .collect::<Vec<_>>()
-        );
+        let mut job_ids = jobs
+            .into_iter()
+            .flatten()
+            .take(100)
+            .filter_map(|job| job.get("id").and_then(Value::as_u64).filter(|id| *id > 0))
+            .collect::<Vec<_>>();
+        job_ids.sort_unstable();
+        job_ids.dedup();
+        identity["job_ids"] = json!(job_ids);
     } else if connector == ConnectorId::Jenkins && call == "investigate" {
         if let Some(job) = result
             .get("job")

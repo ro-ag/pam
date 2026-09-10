@@ -27,6 +27,12 @@ service availability remain unknown where they cannot be established without
 accessing external state. Execution rechecks admission; a successful inspection
 is neither approval nor proof that the job will succeed.
 
+Revision-bound recipes additionally expose a declared correlation target during
+inspection and a frozen target digest in results. Use `revision-jenkins-check`
+or `revision-ci-triage` with explicit repository, full commit and product IDs;
+see [exact workflow evidence](workflow-correlation.md). A matched association
+identifies the evidence's revision; product success is a separate observation.
+
 ## Compact results and retained detail
 
 `flow.run` returns a versioned projection containing `ticket`, `flow`, `workflow`,

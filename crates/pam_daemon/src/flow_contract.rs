@@ -26,9 +26,30 @@ pub struct AgentResult {
     pub flow: FlowIdentity,
     pub workflow: Workflow,
     pub diagnosis: Diagnosis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<CorrelationSummary>,
     pub observations: Vec<Observation>,
     pub evidence: Vec<String>,
     pub omitted: Omissions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelationSummary {
+    pub status: String,
+    pub target_id: String,
+    pub commit: Option<String>,
+}
+
+impl AgentResult {
+    pub fn with_correlation(
+        mut self,
+        correlation: CorrelationSummary,
+    ) -> Result<Self, ContractError> {
+        self.correlation = Some(correlation);
+        fit_result(&mut self)?;
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +117,7 @@ pub fn project_result(
         diagnosis: Diagnosis {
             status: "not_attempted".to_owned(),
         },
+        correlation: None,
         observations: Vec::new(),
         evidence: Vec::new(),
         omitted: Omissions::default(),
@@ -135,7 +157,12 @@ pub fn project_result(
             result.evidence.push(id.clone());
         }
     }
-    while serialized_len(&result)? > MAX_RESULT_BYTES {
+    fit_result(&mut result)?;
+    Ok(result)
+}
+
+fn fit_result(result: &mut AgentResult) -> Result<(), ContractError> {
+    while serialized_len(result)? > MAX_RESULT_BYTES {
         if let Some(observation) = result.observations.pop() {
             result.omitted.observations += 1;
             result.omitted.observation_bytes += observation.text.len();
@@ -145,7 +172,7 @@ pub fn project_result(
             return Err(ContractError("flow result cannot fit its identity"));
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 fn serialized_len(value: &impl Serialize) -> Result<usize, ContractError> {

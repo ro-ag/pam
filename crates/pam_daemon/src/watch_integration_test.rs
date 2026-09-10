@@ -134,117 +134,212 @@ async fn pending_watch_releases_lane_reuses_evidence_and_collects_only_at_termin
     .expect("watch fixture completes within bounded deadline");
 }
 
-async fn run_pending_watch_fixture() {
-    let base = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    std::fs::create_dir(base.path().join("flows")).unwrap();
-    std::fs::write(base.path().join("flows/watched.yaml"), FLOW).unwrap();
-    let store = Arc::new(Store::open_in_memory().await.unwrap());
-    store
-        .set_setting("policy.profile", "\"relaxed\"")
-        .await
-        .unwrap();
-    store.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":root,"connectors":[{"connector":"github","base_url":"https://github.test/","access":"targets","targets":["team/repo"]}]}]}).to_string()).await.unwrap();
-    let (events, mut receiver) = EventPublisher::for_tests();
+struct Harness {
+    _base: tempfile::TempDir,
+    _repo: tempfile::TempDir,
+    root: std::path::PathBuf,
+    store: Arc<Store>,
+    events: EventPublisher,
+    approvals: Arc<ApprovalService>,
+    models: Arc<ModelService>,
+    flows: Arc<FlowService>,
+    queue: Arc<QueueManager>,
+    secrets: Arc<SecretStore>,
+    reads: Arc<Reads>,
+    expiry: i64,
+    deadline: Instant,
+}
 
-    let approvals = Arc::new(ApprovalService::new(
-        store.clone(),
-        events.clone(),
-        Duration::from_secs(10),
-    ));
-    let models = ModelService::new(store.clone()).await.unwrap();
-    let logs = LogService::new(store.clone(), models.clone());
-    let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
-    let reads = Arc::new(Reads::default());
-    let connectors = Arc::new(ConnectorService::new(
-        store.clone(),
-        secrets.clone(),
-        reads.clone(),
-    ));
-    connectors
-        .configure(
-            pam_flow::ConnectorId::Github,
-            ConfigurePatch {
-                enabled: Some(true),
-                base_url: Some(Some("https://github.test/".to_owned())),
-                credential: Some(CredentialAction::Set("fixture-only".to_owned())),
-                ..ConfigurePatch::default()
-            },
-        )
-        .await
-        .unwrap();
-    let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
-    let flows = Arc::new(FlowService::new(
-        base.path(),
-        store.clone(),
-        approvals.clone(),
-        connectors,
-        logs,
-        gate,
-    ));
-    let queue = Arc::new(QueueManager::new(store.clone()));
-    for step in ["wait"] {
+impl Harness {
+    async fn new() -> (
+        Self,
+        tokio::sync::mpsc::Receiver<(String, pam_proto::Event)>,
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(base.path().join("flows")).unwrap();
+        std::fs::write(base.path().join("flows/watched.yaml"), FLOW).unwrap();
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
         store
-            .insert_grant(&crate::flow_service::step_capability("watched", step))
+            .set_setting("policy.profile", "\"relaxed\"")
             .await
             .unwrap();
-    }
-    std::fs::write(base.path().join("flows/ordinary.yaml"), ORDINARY).unwrap();
-    store
-        .insert_grant(&crate::flow_service::step_capability("ordinary", "inspect"))
-        .await
-        .unwrap();
+        store.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":root,"connectors":[{"connector":"github","base_url":"https://github.test/","access":"targets","targets":["team/repo"]}]}]}).to_string()).await.unwrap();
+        let (events, receiver) = EventPublisher::for_tests();
 
-    let expiry = now() + 25_000;
-    let deadline = Instant::now() + Duration::from_secs(25);
-    store
-        .insert_admitted_request(
+        let approvals = Arc::new(ApprovalService::new(
+            store.clone(),
+            events.clone(),
+            Duration::from_secs(10),
+        ));
+        let models = ModelService::new(store.clone()).await.unwrap();
+        let logs = LogService::new(store.clone(), models.clone());
+        let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
+        let reads = Arc::new(Reads::default());
+        let connectors = Arc::new(ConnectorService::new(
+            store.clone(),
+            secrets.clone(),
+            reads.clone(),
+        ));
+        connectors
+            .configure(
+                pam_flow::ConnectorId::Github,
+                ConfigurePatch {
+                    enabled: Some(true),
+                    base_url: Some(Some("https://github.test/".to_owned())),
+                    credential: Some(CredentialAction::Set("fixture-only".to_owned())),
+                    ..ConfigurePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
+        let flows = Arc::new(FlowService::new(
+            base.path(),
+            store.clone(),
+            approvals.clone(),
+            connectors,
+            logs,
+            gate,
+        ));
+        let queue = Arc::new(QueueManager::new(store.clone()));
+        store
+            .insert_grant(&crate::flow_service::step_capability("watched", "wait"))
+            .await
+            .unwrap();
+        std::fs::write(base.path().join("flows/ordinary.yaml"), ORDINARY).unwrap();
+        store
+            .insert_grant(&crate::flow_service::step_capability("ordinary", "inspect"))
+            .await
+            .unwrap();
+
+        let harness = Self {
+            _base: base,
+            _repo: repo,
+            root,
+            store,
+            events,
+            approvals,
+            models,
+            flows,
+            queue,
+            secrets,
+            reads,
+            expiry: now() + 25_000,
+            deadline: Instant::now() + Duration::from_secs(25),
+        };
+        (harness, receiver)
+    }
+
+    async fn admit(&self, ticket: &str, flow: &str) -> ExecContext {
+        self.store
+            .insert_admitted_request(
+                ticket,
+                "flow.run",
+                self.root.to_str().unwrap(),
+                "fixture",
+                &json!({"id":flow}).to_string(),
+                None,
+                self.expiry,
+            )
+            .await
+            .unwrap();
+        self.queue
+            .place_in_lane(ticket, self.root.to_str().unwrap(), 25_000)
+            .await
+            .unwrap();
+        let lease = self
+            .queue
+            .take_next(self.root.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.request_id, ticket);
+        ExecContext {
+            budget: crate::request_budget::RequestBudget::load_persistent(
+                self.store.clone(),
+                ticket,
+                self.deadline,
+            )
+            .await
+            .unwrap(),
+            request_id: ticket.into(),
+            args: json!({"id":flow}),
+            cancel: lease.cancel,
+            events: self.events.clone(),
+            store: self.store.clone(),
+            queue: self.queue.clone(),
+            models: self.models.clone(),
+            router: CompletionRouter::new(),
+            approvals: self.approvals.clone(),
+            flows: self.flows.clone(),
+            secrets: self.secrets.clone(),
+            caller: Caller {
+                agent: "fixture".into(),
+                repo: self.root.to_string_lossy().into_owned(),
+                pid: std::process::id(),
+            },
+            capability: "flow.run".into(),
+            started_at: Instant::now(),
+        }
+    }
+
+    async fn resume(&self, ctx: &mut ExecContext, due: i64) {
+        tokio::time::sleep(Duration::from_millis(
+            u64::try_from(due.saturating_sub(now()).max(0)).unwrap() + 1,
+        ))
+        .await;
+        assert_eq!(
+            self.queue
+                .wake_due(tokio::time::Instant::now(), now())
+                .await
+                .unwrap(),
+            1
+        );
+        let lease = self
+            .queue
+            .take_next(self.root.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.request_id, "watch");
+        ctx.cancel = lease.cancel;
+        ctx.budget = crate::request_budget::RequestBudget::load_persistent(
+            self.store.clone(),
             "watch",
-            "flow.run",
-            root.to_str().unwrap(),
-            "fixture",
-            r#"{"id":"watched"}"#,
-            None,
-            expiry,
+            self.deadline,
         )
         .await
         .unwrap();
-    queue
-        .place_in_lane("watch", root.to_str().unwrap(), 25_000)
-        .await
-        .unwrap();
-    let lease = queue
-        .take_next(root.to_str().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    let budget =
-        crate::request_budget::RequestBudget::load_persistent(store.clone(), "watch", deadline)
-            .await
-            .unwrap();
-    let mut ctx = ExecContext {
-        budget,
-        request_id: "watch".into(),
-        args: json!({"id":"watched"}),
-        cancel: lease.cancel,
-        events: events.clone(),
-        store: store.clone(),
-        queue: queue.clone(),
-        models: models.clone(),
-        router: CompletionRouter::new(),
-        approvals: approvals.clone(),
-        flows: flows.clone(),
-        secrets: secrets.clone(),
-        caller: Caller {
-            agent: "fixture".into(),
-            repo: root.to_string_lossy().into_owned(),
-            pid: std::process::id(),
-        },
-        capability: "flow.run".into(),
-        started_at: Instant::now(),
-    };
-    let first = flows.run(&ctx, args("watched")).await.unwrap_err();
+    }
+}
+
+async fn run_pending_watch_fixture() {
+    let (h, mut receiver) = Harness::new().await;
+    let mut ctx = h.admit("watch", "watched").await;
+    let (first_due, first_evidence) = observe_first_pending(&h, &ctx).await;
+    let charged = ctx.budget.usage();
+    let mut other = run_ordinary_while_parked(&h).await;
+    while receiver.try_recv().is_ok() {}
+    h.resume(&mut ctx, first_due).await;
+    assert_eq!(ctx.budget.usage().http_calls, charged.http_calls);
+    assert_eq!(ctx.budget.usage().http_bytes, charged.http_bytes);
+    let second_due = observe_unchanged_pending(&h, &ctx, &mut receiver, &first_evidence).await;
+    h.resume(&mut ctx, second_due).await;
+    observe_terminal_collection(&h, &ctx, &mut other).await;
+}
+
+async fn observe_first_pending(h: &Harness, ctx: &ExecContext) -> (i64, serde_json::Value) {
+    let Harness {
+        flows,
+        queue,
+        store,
+        reads,
+        root,
+        ..
+    } = h;
+    let first = flows.run(ctx, args("watched")).await.unwrap_err();
     let CapabilityFailure::Parked {
         resume_at_ms: first_due,
     } = first
@@ -252,7 +347,7 @@ async fn run_pending_watch_fixture() {
         panic!("expected pending lease: {first:?}")
     };
     assert!(queue.park("watch", first_due).await.unwrap());
-    assert_eq!(watch_count(&store).await, 1);
+    assert_eq!(watch_count(store).await, 1);
     assert_eq!(reads.watched_jobs.load(Ordering::SeqCst), 0);
     let progress: serde_json::Value = serde_json::from_str(
         &store
@@ -265,87 +360,38 @@ async fn run_pending_watch_fixture() {
     assert_eq!(progress["watch_state"], "pending");
     assert_eq!(progress["polls"], 1);
     let first_evidence = progress["evidence_id"].clone();
-    let charged = ctx.budget.usage();
+    (first_due, first_evidence)
+}
+
+async fn run_ordinary_while_parked(h: &Harness) -> ExecContext {
     // Another real flow acquires the same repository lane during the parked interval.
-    store
-        .insert_admitted_request(
-            "ordinary",
-            "flow.run",
-            root.to_str().unwrap(),
-            "fixture",
-            r#"{"id":"ordinary"}"#,
-            None,
-            expiry,
-        )
-        .await
-        .unwrap();
-    queue
-        .place_in_lane("ordinary", root.to_str().unwrap(), 25_000)
-        .await
-        .unwrap();
-    let ordinary = queue
-        .take_next(root.to_str().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(ordinary.request_id, "ordinary");
-    let mut other = ExecContext {
-        budget: crate::request_budget::RequestBudget::load_persistent(
-            store.clone(),
-            "ordinary",
-            deadline,
-        )
-        .await
-        .unwrap(),
-        request_id: "ordinary".into(),
-        args: json!({"id":"ordinary"}),
-        cancel: ordinary.cancel,
-        events: events.clone(),
-        store: store.clone(),
-        queue: queue.clone(),
-        models: models.clone(),
-        router: CompletionRouter::new(),
-        approvals,
-        flows: flows.clone(),
-        secrets,
-        caller: ctx.caller.clone(),
-        capability: "flow.run".into(),
-        started_at: Instant::now(),
-    };
-    let ordinary_output = flows.run(&other, args("ordinary")).await.unwrap();
+    let other = h.admit("ordinary", "ordinary").await;
+    let ordinary_output = h.flows.run(&other, args("ordinary")).await.unwrap();
     assert_eq!(ordinary_output.outcome, Outcome::Solved);
     assert!(
-        queue
+        h.queue
             .complete("ordinary", RequestState::Done, Some("solved"), entry())
             .await
             .unwrap()
     );
-    assert_eq!(reads.ordinary.load(Ordering::SeqCst), 1);
-    while receiver.try_recv().is_ok() {}
-    tokio::time::sleep(Duration::from_millis(
-        u64::try_from(first_due.saturating_sub(now()).max(0)).unwrap() + 1,
-    ))
-    .await;
-    assert_eq!(
-        queue
-            .wake_due(tokio::time::Instant::now(), now())
-            .await
-            .unwrap(),
-        1
-    );
-    let lease = queue
-        .take_next(root.to_str().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    ctx.cancel = lease.cancel;
-    ctx.budget =
-        crate::request_budget::RequestBudget::load_persistent(store.clone(), "watch", deadline)
-            .await
-            .unwrap();
-    assert_eq!(ctx.budget.usage().http_calls, charged.http_calls);
-    assert_eq!(ctx.budget.usage().http_bytes, charged.http_bytes);
-    let second = flows.run(&ctx, args("watched")).await.unwrap_err();
+    assert_eq!(h.reads.ordinary.load(Ordering::SeqCst), 1);
+    other
+}
+
+async fn observe_unchanged_pending(
+    h: &Harness,
+    ctx: &ExecContext,
+    receiver: &mut tokio::sync::mpsc::Receiver<(String, pam_proto::Event)>,
+    first_evidence: &serde_json::Value,
+) -> i64 {
+    let Harness {
+        flows,
+        queue,
+        store,
+        root,
+        ..
+    } = h;
+    let second = flows.run(ctx, args("watched")).await.unwrap_err();
     let CapabilityFailure::Parked {
         resume_at_ms: second_due,
     } = second
@@ -353,7 +399,7 @@ async fn run_pending_watch_fixture() {
         panic!("expected unchanged pending lease: {second:?}")
     };
     assert!(queue.park("watch", second_due).await.unwrap());
-    assert_eq!(watch_count(&store).await, 1);
+    assert_eq!(watch_count(store).await, 1);
     while let Ok((ticket, event)) = receiver.try_recv() {
         if ticket == "watch"
             && let pam_proto::Event::Progress { note, .. } = event
@@ -373,7 +419,7 @@ async fn run_pending_watch_fixture() {
     )
     .unwrap();
     assert_eq!(progress["polls"], 2);
-    assert_eq!(progress["evidence_id"], first_evidence);
+    assert_eq!(&progress["evidence_id"], first_evidence);
     assert_eq!(
         store
             .get_request("watch")
@@ -381,34 +427,24 @@ async fn run_pending_watch_fixture() {
             .unwrap()
             .unwrap()
             .expires_at_ms,
-        Some(expiry)
+        Some(h.expiry)
     );
-    tokio::time::sleep(Duration::from_millis(
-        u64::try_from(second_due.saturating_sub(now()).max(0)).unwrap() + 1,
-    ))
-    .await;
-    assert_eq!(
-        queue
-            .wake_due(tokio::time::Instant::now(), now())
-            .await
-            .unwrap(),
-        1
-    );
-    let lease = queue
-        .take_next(root.to_str().unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    ctx.cancel = lease.cancel;
-    ctx.budget =
-        crate::request_budget::RequestBudget::load_persistent(store.clone(), "watch", deadline)
-            .await
-            .unwrap();
-    let output = flows.run(&ctx, args("watched")).await.unwrap();
+    second_due
+}
+
+async fn observe_terminal_collection(h: &Harness, ctx: &ExecContext, other: &mut ExecContext) {
+    let Harness {
+        flows,
+        queue,
+        store,
+        reads,
+        ..
+    } = h;
+    let output = flows.run(ctx, args("watched")).await.unwrap();
     assert_eq!(output.outcome, Outcome::Verified);
     assert_eq!(reads.watched.load(Ordering::SeqCst), 4);
     assert_eq!(reads.watched_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(watch_count(&store).await, 2);
+    assert_eq!(watch_count(store).await, 2);
     assert_eq!(
         ctx.budget.usage().http_calls,
         5,
@@ -421,11 +457,11 @@ async fn run_pending_watch_fixture() {
             .unwrap()
     );
     assert!(matches!(
-        models.runtime().snapshot().state,
+        h.models.runtime().snapshot().state,
         pam_model::RuntimeState::Idle
     ));
     other.args = json!({"ticket":"watch"});
-    let durable = crate::flow_result_service::result(&other).await.unwrap();
+    let durable = crate::flow_result_service::result(other).await.unwrap();
     assert_eq!(
         durable.body["agent_result"]["workflow"]["outcome"],
         "verified"

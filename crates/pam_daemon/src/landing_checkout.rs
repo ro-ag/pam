@@ -23,6 +23,7 @@ const MAX_FILES: usize = 4096;
 const MAX_FILE: usize = 4 * 1024 * 1024;
 const MAX_TOTAL: usize = 64 * 1024 * 1024;
 const MAX_LIST: usize = 5 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_STDERR: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -648,10 +649,19 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<ManifestEntry>, CheckoutError> {
         entries.push(ManifestEntry {
             path: path.into(),
             oid: fields[2].to_owned(),
-            sha256: String::new(),
+            // Fixed-width placeholder makes the pre-export JSON size exact.
+            sha256: "0".repeat(64),
             mode,
             bytes: size,
         });
+    }
+    let encoded =
+        serde_json::to_vec(&entries).map_err(|_| invalid("manifest cannot be encoded"))?;
+    if encoded.len() > MAX_MANIFEST_BYTES {
+        return Err(error(
+            "landing_checkout_manifest_limit",
+            "serialized tracked-file manifest exceeds 512 KiB",
+        ));
     }
     Ok(entries)
 }

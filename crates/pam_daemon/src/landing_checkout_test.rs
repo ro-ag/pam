@@ -334,3 +334,25 @@ async fn cancelled_caller_leaves_cleanup_owned_by_the_running_worker() {
         "worker cleans its workspace after cancellation"
     );
 }
+
+#[test]
+fn manifest_metadata_limit_includes_final_hashes_before_export() {
+    let oid = "a".repeat(40);
+    let records = (0..MAX_FILES)
+        .map(|index| format!("100644 blob {oid} 0\t{}-{index}\0", "path".repeat(20)))
+        .collect::<String>();
+    let refusal = parse_manifest(records.as_bytes()).unwrap_err();
+    assert_eq!(refusal.cause, "landing_checkout_manifest_limit");
+    let mut accepted = parse_manifest(format!("100644 blob {oid} 0\tfile\0").as_bytes()).unwrap();
+    assert_eq!(accepted[0].sha256.len(), 64);
+    let reserved = serde_json::to_vec(&accepted).unwrap().len();
+    let tree = tempfile::tempdir().unwrap();
+    export_blobs(
+        tree.path(),
+        &mut accepted,
+        format!("{oid} blob 0\n\n").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_vec(&accepted).unwrap().len(), reserved);
+    assert!(reserved <= MAX_MANIFEST_BYTES);
+}

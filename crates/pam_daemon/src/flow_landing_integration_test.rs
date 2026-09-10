@@ -16,6 +16,7 @@ use crate::{
 use pam_connectors::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 use pam_proto::Caller;
 use std::{
+    fmt::Write,
     future::Future,
     pin::Pin,
     sync::Mutex,
@@ -163,14 +164,15 @@ fn recipe(sha: &str) -> String {
         "merge",
         "verify_main",
     ] {
-        yaml.push_str(&format!(" - id: {operation}\n   landing: {operation}\n"));
+        let id = operation.replace('_', "-");
+        writeln!(yaml, " - id: {id}\n   landing: {operation}").unwrap();
         if let Some(prior) = previous {
-            yaml.push_str(&format!("   needs: [{prior}]\n"));
+            writeln!(yaml, "   needs: [{prior}]").unwrap();
         }
         if matches!(operation, "validate" | "verify_pr" | "verify_main") {
             yaml.push_str("   role: verify\n");
         }
-        previous = Some(operation);
+        previous = Some(id);
     }
     yaml
 }
@@ -456,7 +458,7 @@ async fn prepared_pr_creation_recovers_by_reading_without_reposting() {
             fixture.prefix(3).await;
             fixture.github.existing.store(true, Ordering::SeqCst);
             fixture
-                .interrupt_effect("ensure_pr", "ensure_pr", json!({"head_sha":fixture.sha}))
+                .interrupt_effect("ensure-pr", "ensure_pr", json!({"head_sha":fixture.sha}))
                 .await;
             let output = fixture.run().await;
             assert_eq!(output.outcome, Outcome::Changed);
@@ -647,12 +649,11 @@ async fn admitted_budget(
             .await
             .unwrap()
     );
-    let budget = crate::request_budget::RequestBudget::load_persistent(
+    crate::request_budget::RequestBudget::load_persistent(
         store.clone(),
         "landing-ticket",
-        Instant::now() + Duration::from_secs(120),
+        Instant::now() + Duration::from_mins(2),
     )
     .await
-    .unwrap();
-    budget
+    .unwrap()
 }

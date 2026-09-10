@@ -1,4 +1,4 @@
-//! Crash-safe cumulative reservations. Successful captures do not refund capacity.
+//! Crash-safe reservations; exact completed captures may refund unused capacity.
 use super::{Store, StoreError};
 use turso::params;
 
@@ -63,6 +63,41 @@ impl Store {
             return Ok(None);
         }
         self.budget_usage_locked(id).await
+    }
+
+    /// Refund only the unused bytes of one completed, consuming reservation.
+    /// A caller must never retry an ambiguous failure: retaining charge is safe.
+    pub async fn refund_request_budget(
+        &self,
+        id: &str,
+        charge: RequestBudgetCharge,
+    ) -> Result<RequestBudgetUsage, StoreError> {
+        let (http, command) = match charge {
+            RequestBudgetCharge::Http(bytes) if bytes <= 134_217_728 => (bytes, 0),
+            RequestBudgetCharge::Command(bytes) if bytes <= 134_217_728 => (0, bytes),
+            _ => {
+                return Err(StoreError::UnexpectedValue {
+                    column: "request_budget_refund",
+                    value: "invalid refund".to_owned(),
+                });
+            }
+        };
+        let http = i64::try_from(http).expect("compiled bound");
+        let command = i64::try_from(command).expect("compiled bound");
+        let _guard = self.conn_lock.lock().await;
+        let changed=self.conn.execute("UPDATE request_budget SET http_bytes=http_bytes-?2,command_bytes=command_bytes-?3 WHERE request_id=?1 AND http_bytes>=?2 AND command_bytes>=?3",params![id,http,command]).await?;
+        if changed != 1 {
+            return Err(StoreError::UnexpectedValue {
+                column: "request_budget_refund",
+                value: "missing reservation or insufficient charge".to_owned(),
+            });
+        }
+        self.budget_usage_locked(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                table: "request_budget",
+                id: id.to_owned(),
+            })
     }
 
     /// Caller owns the connection mutex; no transaction can be stranded by cancellation.

@@ -126,3 +126,38 @@ async fn database_failure_cannot_manufacture_a_reservation() {
     );
     assert!(store.load_request_budget("budget").await.is_err());
 }
+
+#[tokio::test]
+async fn refund_preserves_counts_and_failure_is_not_reported_as_success() {
+    let store = Store::open_in_memory().await.unwrap();
+    seed(&store).await;
+    store
+        .reserve_request_budget("budget", RequestBudgetCharge::Http(100))
+        .await
+        .unwrap()
+        .unwrap();
+    let usage = store
+        .refund_request_budget("budget", RequestBudgetCharge::Http(90))
+        .await
+        .unwrap();
+    assert_eq!(usage.http_bytes, 10);
+    assert_eq!(usage.http_calls, 1);
+    assert!(
+        store
+            .refund_request_budget("budget", RequestBudgetCharge::Http(11))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load_request_budget("budget").await.unwrap(), usage);
+    store
+        .conn
+        .execute("DROP TABLE request_budget", ())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .refund_request_budget("budget", RequestBudgetCharge::Http(1))
+            .await
+            .is_err()
+    );
+}

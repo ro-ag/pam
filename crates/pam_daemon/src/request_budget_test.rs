@@ -129,7 +129,7 @@ async fn persistent() -> (
 }
 
 #[tokio::test]
-async fn durable_success_and_cancellation_do_not_refund_or_allow_sync_bypass() {
+async fn durable_completed_capture_refunds_but_cancellation_stays_charged() {
     let (store, budget) = persistent().await;
     assert_eq!(
         budget.attempt().unwrap_err().cause,
@@ -138,13 +138,19 @@ async fn durable_success_and_cancellation_do_not_refund_or_allow_sync_bypass() {
     assert!(budget.command(1).is_err());
     assert!(budget.http(1).is_err());
     budget.attempt_persisted().await.unwrap();
-    budget.http_persisted(100).await.unwrap().finish(1).unwrap();
+    budget
+        .http_persisted(100)
+        .await
+        .unwrap()
+        .finish_persisted(1)
+        .await
+        .unwrap();
     drop(budget.command_persisted(200).await.unwrap());
     let restored = RequestBudget::load_persistent(store, "persistent", budget.deadline())
         .await
         .unwrap();
     assert_eq!(restored.usage().attempts, 1);
-    assert_eq!(restored.usage().http_bytes, 100);
+    assert_eq!(restored.usage().http_bytes, 1);
     assert_eq!(restored.usage().command_bytes, 200);
 }
 
@@ -199,4 +205,33 @@ async fn exhausted_persistent_transport_never_reaches_network() {
         })
     ));
     assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn completed_tiny_commands_and_http_calls_can_run_past_two_large_reservations() {
+    let (store, budget) = persistent().await;
+    for _ in 0..4 {
+        budget.attempt_persisted().await.unwrap();
+        budget
+            .command_persisted(64 * 1024 * 1024)
+            .await
+            .unwrap()
+            .finish_persisted(10)
+            .await
+            .unwrap();
+        budget
+            .http_persisted(64 * 1024 * 1024)
+            .await
+            .unwrap()
+            .finish_persisted(20)
+            .await
+            .unwrap();
+    }
+    let restored = RequestBudget::load_persistent(store, "persistent", budget.deadline())
+        .await
+        .unwrap();
+    assert_eq!(restored.usage().attempts, 4);
+    assert_eq!(restored.usage().http_calls, 4);
+    assert_eq!(restored.usage().command_bytes, 40);
+    assert_eq!(restored.usage().http_bytes, 80);
 }

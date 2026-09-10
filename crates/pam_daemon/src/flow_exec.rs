@@ -590,10 +590,12 @@ pub async fn run_command_budgeted(
         CommandOutcome::Exited { output, .. }
         | CommandOutcome::TimedOut { output }
         | CommandOutcome::OutputLimit { output } => {
-            reservation.finish(u64::try_from(output.len()).unwrap_or(u64::MAX))?;
+            reservation
+                .finish_persisted(u64::try_from(output.len()).unwrap_or(u64::MAX))
+                .await?;
         }
         CommandOutcome::SpawnFailed(_) | CommandOutcome::ContainmentUnavailable { .. } => {
-            reservation.finish(0)?;
+            reservation.finish_persisted(0).await?;
         }
         CommandOutcome::Cancelled => {}
     }

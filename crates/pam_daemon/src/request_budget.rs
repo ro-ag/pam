@@ -1,8 +1,8 @@
 //! One request's cumulative work allowance. Retries share this object.
 //!
 //! Reservations stay spent if a future is cancelled or fails without an exact
-//! byte count. Persistent reservations remain fully charged even after success;
-//! only the legacy in-memory test mode refunds unused capture bytes.
+//! byte count. Exact completed captures durably refund unused bytes once;
+//! ambiguous refund failures are never retried.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -74,6 +74,7 @@ pub struct RequestBudget {
     limits: Limits,
     usage: Mutex<Usage>,
     persistent: Option<(Arc<Store>, String)>,
+    persistence_lock: tokio::sync::Mutex<()>,
 }
 
 impl RequestBudget {
@@ -97,6 +98,7 @@ impl RequestBudget {
             },
             usage: Mutex::new(Usage::default()),
             persistent: None,
+            persistence_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -115,6 +117,7 @@ impl RequestBudget {
             limits: Limits::default(),
             usage: Mutex::new(from_stored(usage)),
             persistent: Some((store, request_id.to_owned())),
+            persistence_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -165,19 +168,15 @@ impl RequestBudget {
 
     async fn charge_persisted(&self, charge: RequestBudgetCharge) -> Result<(), BudgetError> {
         self.remaining()?;
+        let _guard = self.persistence_lock.lock().await;
+        self.remaining()?;
         let (store, id) = self.persistent.as_ref().expect("persistent mode checked");
         let usage = store
             .reserve_request_budget(id, charge)
             .await
             .map_err(|_| persistence_error())?
             .ok_or_else(|| exhausted("durable_allowance"))?;
-        // Two awaiting callers may complete out of order. Never move the snapshot backwards.
-        let mut current = self.usage.lock().expect("budget counter mutex");
-        current.attempts = current.attempts.max(usage.attempts);
-        current.http_calls = current.http_calls.max(usage.http_calls);
-        current.http_bytes = current.http_bytes.max(usage.http_bytes);
-        current.command_bytes = current.command_bytes.max(usage.command_bytes);
-        drop(current);
+        *self.usage.lock().expect("budget counter mutex") = from_stored(usage);
         self.remaining()?;
         Ok(())
     }
@@ -279,14 +278,35 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// Refund exactly once after completion. An ambiguous database error remains an error.
+    pub async fn finish_persisted(self, actual: u64) -> Result<(), BudgetError> {
+        if actual > self.maximum {
+            return Err(exhausted("capture_exceeded_reservation"));
+        }
+        let Some((store, id)) = &self.budget.persistent else {
+            return self.finish(actual);
+        };
+        let _guard = self.budget.persistence_lock.lock().await;
+        let unused = self.maximum - actual;
+        let charge = if self.http {
+            RequestBudgetCharge::Http(unused)
+        } else {
+            RequestBudgetCharge::Command(unused)
+        };
+        let usage = store
+            .refund_request_budget(id, charge)
+            .await
+            .map_err(|_| persistence_error())?;
+        *self.budget.usage.lock().expect("budget counter mutex") = from_stored(usage);
+        Ok(())
+    }
+
     /// Reconcile only an exact completed capture, after checking its bound.
     pub fn finish(self, actual: u64) -> Result<(), BudgetError> {
         if actual > self.maximum {
             return Err(exhausted("capture_exceeded_reservation"));
         }
-        if self.budget.persistent.is_some() {
-            return Ok(());
-        }
+        self.budget.require_memory_mode()?;
         let mut usage = self.budget.usage.lock().expect("budget counter mutex");
         let unused = self.maximum - actual;
         if self.http {
@@ -345,7 +365,8 @@ impl HttpTransport for BudgetTransport<'_> {
                 detail: "The request's absolute HTTP deadline elapsed".to_owned(),
             })??;
             reservation
-                .finish(u64::try_from(response.body.len()).unwrap_or(u64::MAX))
+                .finish_persisted(u64::try_from(response.body.len()).unwrap_or(u64::MAX))
+                .await
                 .map_err(|error| TransportError::Policy {
                     cause: error.cause,
                     detail: error.to_string(),

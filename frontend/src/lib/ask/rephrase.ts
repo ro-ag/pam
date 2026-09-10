@@ -44,10 +44,11 @@ export async function maybeRephrase(
   const prompt =
     "Rewrite in one sentence, first person, warm and plain, keeping every number and " +
     `name exactly as written: ${answer.sentence}`;
-  const timer = empty(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = empty(timeoutMs);
   const reply = await Promise.race([
     sources
-      .modelsTry(model, prompt, MAX_TOKENS)
+      .modelsTry(model, prompt, MAX_TOKENS, timeoutMs)
       .then((result) => (result.model?.id === model ? result.text : ""))
       .catch(() => ""),
     timer.race,

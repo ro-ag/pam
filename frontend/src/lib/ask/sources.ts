@@ -83,5 +83,6 @@ export interface Sources {
     modelId: string,
     prompt: string,
     maxTokens: number,
+    timeoutMs?: number,
   ): Promise<{ text: string; model: { id: string } }>;
 }

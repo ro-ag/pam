@@ -276,6 +276,16 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     expect(sent()).toEqual({ op, args });
   });
 
+  it("sends an explicit generation deadline when supplied", async () => {
+    await modelsTry("fixture-model", "Say hello.", 96, 8000);
+    expect(sent().args).toEqual({
+      model_id: "fixture-model",
+      prompt: "Say hello.",
+      max_tokens: 96,
+      timeout_ms: 8000,
+    });
+  });
+
   it("omits max_tokens entirely when the caller names no budget", async () => {
     await modelsTry("fixture-model", "Say hello.");
     expect(sent().args).toEqual({ model_id: "fixture-model", prompt: "Say hello." });

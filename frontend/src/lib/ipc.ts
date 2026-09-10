@@ -571,11 +571,13 @@ export function modelsTry(
   modelId: string,
   prompt: string,
   maxTokens?: number,
+  timeoutMs?: number,
 ): Promise<GenerateResult> {
   return adminCall("admin.models.try", {
     model_id: modelId,
     prompt,
     ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+    ...(timeoutMs === undefined ? {} : { timeout_ms: timeoutMs }),
   });
 }
 

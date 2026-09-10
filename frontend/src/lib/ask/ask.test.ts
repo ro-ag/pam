@@ -343,6 +343,7 @@ describe("rephrase worker identity", () => {
       "light",
       expect.stringContaining("Nothing waits for you."),
       96,
+      8000,
     );
     expect(answer.sentence).toBe("Nothing waits for you.");
     expect(answer.rephrased).toBeUndefined();
@@ -367,6 +368,21 @@ describe("rephrase worker identity", () => {
     );
     expect(generate).not.toHaveBeenCalled();
     if (state === "disabled") expect(status).not.toHaveBeenCalled();
+    expect(answer.sentence).toBe("Nothing waits for you.");
+    expect(answer.rephrased).toBeUndefined();
+  });
+
+  it("sends the same short deadline that bounds local waiting", async () => {
+    const generate = vi.fn(
+      () => new Promise<{ text: string; model: { id: string } }>(() => {}),
+    );
+    const answer = await ask(
+      "approvals?",
+      ctx,
+      fakeSources({ modelsStatus: ready(), modelsTry: generate }),
+      { rephrase: true, timeoutMs: 20 },
+    );
+    expect(generate).toHaveBeenCalledWith("light", expect.any(String), 96, 20);
     expect(answer.sentence).toBe("Nothing waits for you.");
     expect(answer.rephrased).toBeUndefined();
   });

@@ -230,6 +230,9 @@ pub(crate) fn profile(
     Ok((text, program))
 }
 
+// Only the macOS profile builder calls this; without the same gate it is dead
+// code on other targets and fails the lint gate there but never here.
+#[cfg(any(target_os = "macos", test))]
 fn validate_artifact_owner(
     root: &std::path::Path,
     protected: &std::path::Path,

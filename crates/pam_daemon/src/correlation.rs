@@ -29,6 +29,41 @@ pub(crate) struct Frozen {
 }
 
 impl Frozen {
+    pub(crate) fn target(&self) -> Option<&CorrelationTarget> {
+        self.target.as_ref()
+    }
+
+    /// Called only after a typed landing stage established a private receipt.
+    pub(crate) async fn record_landing_receipt(
+        &mut self,
+        store: &Store,
+        ticket: &str,
+        step: &Step,
+        receipt: &Value,
+    ) -> Result<(), Failure> {
+        if self.target.is_none() || !matches!(step.action, pam_flow::Action::Landing { .. }) {
+            return Err(Failure {
+                cause: MISSING,
+                detail: "landing requires a frozen target".to_owned(),
+            });
+        }
+        let decision = json!({"status":"matched","detail":"typed landing receipt bound to the frozen target; resulting merge SHA is recorded separately"});
+        let binding = json!({"schema_version":1,"target_id":self.target_id,"origin":{"kind":"typed_landing"},"identity":receipt,"decision":decision});
+        if store
+            .bind_correlation_step(ticket, &step.id, &binding.to_string())
+            .await
+            .map_err(storage)?
+            == CorrelationBind::Conflict
+        {
+            return Err(Failure {
+                cause: CONFLICT,
+                detail: "landing receipt conflicts with the original step binding".to_owned(),
+            });
+        }
+        self.decisions.insert(step.id.clone(), decision);
+        Ok(())
+    }
+
     pub fn refuse_unbound_verification(&mut self, step: &Step) -> bool {
         if self.target.is_none() || step.role != Role::Verify {
             return false;

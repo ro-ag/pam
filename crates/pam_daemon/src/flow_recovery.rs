@@ -327,6 +327,37 @@ impl Recovery {
         self.cursor = cursor;
         Ok(())
     }
+    /// Park one typed landing check poll without copying the unchanged runtime
+    /// snapshot. The private session owns its bounded poll counter and schedule.
+    pub async fn settle_landing_wait(
+        &mut self,
+        store: &Store,
+        ticket: &str,
+        evidence_id: &str,
+        evidence: &[String],
+    ) -> Result<(), CapabilityFailure> {
+        let cursor = Cursor {
+            evidence_id: self.cursor.evidence_id.clone(),
+            next_step: self.cursor.next_step,
+            watch: None,
+            last_watch_evidence: Some(evidence_id.to_owned()),
+        };
+        let encoded = serde_json::to_string(&cursor).map_err(|_| failure())?;
+        let mut references = evidence.to_vec();
+        if !references.iter().any(|value| value == evidence_id) {
+            references.push(evidence_id.to_owned());
+        }
+        if !store
+            .settle_flow_attempt(ticket, self.revision, &encoded, &references, false)
+            .await
+            .map_err(|_| failure())?
+        {
+            return Err(failure());
+        }
+        self.revision += 1;
+        self.cursor = cursor;
+        Ok(())
+    }
     pub async fn settle(
         &mut self,
         store: &Store,

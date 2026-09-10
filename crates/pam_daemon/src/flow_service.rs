@@ -59,6 +59,14 @@ mod watch_runtime;
 #[path = "flow_watch_runtime_test.rs"]
 mod watch_runtime_test;
 
+#[path = "landing_checks.rs"]
+mod landing_checks;
+#[path = "flow_landing_runtime.rs"]
+mod landing_runtime;
+#[cfg(test)]
+#[path = "flow_landing_runtime_test.rs"]
+mod landing_runtime_test;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -697,8 +705,14 @@ impl FlowService {
             match &step.action {
                 Action::Landing { operation } => {
                     item["landing"] = json!(operation);
-                    item["admission"] = json!("landing_runtime_pending");
-                    blockers.push(json!({"step":step.id,"cause":"landing_runtime_pending","recovery":"Guarded landing runtime integration is not complete."}));
+                    item["live_state"] = json!("unknown_until_frozen_and_verified");
+                    if let Err(error) =
+                        landing_runtime::inspect_policy(&self.store, repo, *operation).await
+                    {
+                        blockers.push(
+                            json!({"step":step.id,"cause":error.cause,"recovery":error.recovery}),
+                        );
+                    }
                 }
                 Action::Command { argv } => {
                     item["containment"] = json!(if cfg!(target_os = "macos") {
@@ -1410,6 +1424,7 @@ impl RunState<'_> {
         for (index, step) in self.flow.steps.iter().enumerate().skip(self.reports.len()) {
             let will_run = self.should_run(step);
             self.watch_due(step)?;
+            self.landing_due(step).await?;
             self.recovery
                 .prepare(&self.service.store, &self.ctx.request_id, step, will_run)
                 .await?;
@@ -1421,7 +1436,7 @@ impl RunState<'_> {
                     .await;
                 continue;
             }
-            if self.recovery.watch.is_none() {
+            if self.recovery.watch.is_none() && !matches!(step.action, Action::Landing { .. }) {
                 self.publish_progress(index, total, &step.id).await;
             }
             let mut report = self.run_step(step).await?;
@@ -1573,12 +1588,9 @@ impl RunState<'_> {
         }
         let started = Instant::now();
         match &step.action {
-            Action::Landing { .. } => report.fail(
-                StepStatus::Blocked,
-                "landing_runtime_pending",
-                "Guarded landing runtime integration is not complete.".to_owned(),
-                "Inspect the configured landing recipe after runtime integration.".to_owned(),
-            ),
+            Action::Landing { operation } => {
+                self.run_landing_step(step, *operation, &mut report).await?
+            }
             Action::Command { argv } => self.run_command_step(step, argv, &mut report).await?,
             Action::Connector {
                 connector,
@@ -1595,6 +1607,9 @@ impl RunState<'_> {
 
     async fn check_step_scope(&self, step: &Step) -> Result<(), FlowRefusal> {
         self.service.approved_repo(&self.repo).await?;
+        if let Action::Landing { operation } = step.action {
+            landing_runtime::inspect_policy(&self.service.store, &self.repo, operation).await?;
+        }
         if let Action::Connector {
             connector,
             call,
@@ -1629,7 +1644,7 @@ impl RunState<'_> {
             CapabilityClass::Destructive
         };
         let current_gate;
-        let gate = if step.watch.is_some() {
+        let gate = if step.watch.is_some() || matches!(step.action, Action::Landing { .. }) {
             current_gate = crate::policy::PolicyGate::new(Arc::clone(&self.service.store))
                 .await
                 .map_err(failed)?;
@@ -1652,7 +1667,9 @@ impl RunState<'_> {
                 Ok(Some(report.clone()))
             }
             GateDecision::RequireApproval { reason } => {
-                if self.watch_approval_valid(step).await? {
+                if self.watch_approval_valid(step).await?
+                    || self.landing_approval_valid(step).await?
+                {
                     return Ok(None);
                 }
                 let outcome = self

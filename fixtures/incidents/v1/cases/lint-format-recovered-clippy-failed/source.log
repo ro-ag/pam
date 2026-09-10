@@ -3,8 +3,8 @@ repository=https://github.com/pam-fixtures/example
 requested_commit=e085694b78686d34db061d21d14178195b50c823
 The following records are authored test evidence, not a live connector export.
 --- captured records ---
-substep=format attempt=1 exit=1; diff found in src/cache.rs.
-temporary checktree formatting correction completed; developer checkout was not modified.
+substep=format attempt=1 exit=1; diff found in a stale temporary copy of src/cache.rs.
+temporary checktree restored from the requested commit after detecting stale preparation; developer checkout was not modified.
 substep=format attempt=2 exit=0; no formatting diff remains.
 substep=clippy attempt=1: error: this MutexGuard is held across an await point
 location: src/cache.rs:92; guard acquired at line 88 and still live during refresh().await.

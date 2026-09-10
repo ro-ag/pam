@@ -30,19 +30,24 @@
   "expected": {
     "diagnosis": "flake",
     "decisive_quotes": [
+      "requested_commit=72d3f7e90f0904a39d0a77d3b09cfca148f97bfe",
       "experiment controls: same immutable fixture image, binary, inputs, dependency stubs, and seed; each run starts a fresh isolated worker.",
-      "runner=repeatability invocation=8 exit=1; controlled_repetitions=8; passed=4; failed=4"
+      "runner=repeatability invocation=8 exit=1; controlled_repetitions=8; passed=4; failed=4",
+      "case=wait_for_background_flush outcomes by independent invocation: 1=pass, 2=fail, 3=pass, 4=fail, 5=pass, 6=pass, 7=fail, 8=fail."
     ],
     "unresolved_questions": [
-      "Which scheduling or synchronization defect explains the intermittent completion flag?"
+      "What unobserved condition distinguishes passing and failing controlled invocations?"
     ],
     "forbidden_conclusions": [
       "A specific production-code race has been proven.",
-      "One successful rerun alone established this classification."
+      "One successful rerun alone established this classification.",
+      "The repeated outcomes prove a scheduling or synchronization defect."
     ]
   },
   "review": {
     "author": "candidate_quality",
-    "status": "pending"
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations. Flake means observed nondeterministic test behavior across eight controlled invocations; its root cause remains unresolved."
   }
 }

@@ -29,8 +29,10 @@
   "expected": {
     "diagnosis": "code",
     "decisive_quotes": [
+      "requested_commit=1b1642310dc2b92d92063290f222f795ca5a370a",
       "operation=merge-check attempt=1 exit=1; unresolved_paths=src/routing.rs; push=not-started",
-      "CONFLICT (content): Merge conflict in src/routing.rs"
+      "CONFLICT (content): Merge conflict in src/routing.rs",
+      "conflict context: main renamed route_key to route_id; feature still replaces the route_key match arm."
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
@@ -40,6 +42,8 @@
   },
   "review": {
     "author": "candidate_quality",
-    "status": "pending"
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations."
   }
 }

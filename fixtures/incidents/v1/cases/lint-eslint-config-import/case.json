@@ -29,8 +29,10 @@
   "expected": {
     "diagnosis": "config",
     "decisive_quotes": [
+      "requested_commit=4018cb02c196764ab6466e00ea98231623ce6532",
       "operation=eslint phase=config-load attempt=1 exit=2; analyzed_files=0",
-      "package manifest inspection: @fixture/eslint-rules is not declared in dependencies or devDependencies."
+      "package manifest inspection: @fixture/eslint-rules is not declared in dependencies or devDependencies.",
+      "Error [ERR_MODULE_NOT_FOUND]: Cannot find package @fixture/eslint-rules imported from eslint.config.mjs"
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
@@ -40,6 +42,8 @@
   },
   "review": {
     "author": "candidate_quality",
-    "status": "pending"
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations."
   }
 }

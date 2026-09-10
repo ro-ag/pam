@@ -29,6 +29,7 @@
   "expected": {
     "diagnosis": "code",
     "decisive_quotes": [
+      "requested_commit=c40b48eae4c9bb06365a7f62077d050dc91a7e14",
       "operation=clippy stage=lint attempt=1 exit=101; diagnostic=clippy::unwrap_used; file=src/route.rs",
       "  route_map.insert(key, parse_route(raw).unwrap());"
     ],
@@ -40,6 +41,8 @@
   },
   "review": {
     "author": "candidate_quality",
-    "status": "pending"
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations."
   }
 }

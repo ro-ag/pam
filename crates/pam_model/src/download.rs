@@ -684,7 +684,11 @@ enum CurlOutcome {
 /// Runs a transfer to its terminal state and publishes it.
 async fn run(job: Job, cancelled: watch::Receiver<bool>) {
     let terminal = job.execute(cancelled).await;
-    let _ = job.state.send(terminal);
+    let state = job.state.clone();
+    // A terminal notification permits immediate resume/discard. Release the
+    // transfer lock before waking observers, not when this task returns.
+    drop(job);
+    let _ = state.send(terminal);
 }
 
 impl Job {

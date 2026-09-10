@@ -559,3 +559,87 @@ async fn discarding_clears_a_checkpoint_conflict() {
         "with the foreign bytes gone the download starts over cleanly"
     );
 }
+
+/// Checks the lock synchronously when the watch sender wakes a terminal waiter.
+/// This catches publication-before-unlock without racing a second async task.
+struct TerminalLockProbe {
+    handle: DownloadHandle,
+    lock: std::sync::Arc<std::fs::File>,
+    observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    locked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    parent: std::task::Waker,
+}
+
+impl std::task::Wake for TerminalLockProbe {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.handle.state().is_terminal() {
+            self.observed.store(true, Ordering::SeqCst);
+            match self.lock.try_lock() {
+                Ok(()) => {
+                    self.lock.unlock().unwrap();
+                }
+                Err(_) => {
+                    self.locked.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        self.parent.wake_by_ref();
+    }
+}
+
+#[tokio::test]
+async fn terminal_notification_releases_the_transfer_lock_before_waking_observers() {
+    use std::future::Future as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(256 * 1024);
+    let server = origin::serve_interrupting(bytes.clone(), "terminal-lock", 64 * 1024).await;
+    let handle = start(request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes)).unwrap();
+    let lock = Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(sidecar_paths(&fixture.dest).lock)
+            .unwrap(),
+    );
+    let observed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let mut waiter = std::pin::pin!(handle.wait());
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(10),
+        std::future::poll_fn(|cx| {
+            let probe = std::task::Waker::from(Arc::new(TerminalLockProbe {
+                handle: handle.clone(),
+                lock: lock.clone(),
+                observed: observed.clone(),
+                locked: locked.clone(),
+                parent: cx.waker().clone(),
+            }));
+            waiter
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&probe))
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(terminal, DownloadState::Failed { .. }));
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "terminal publication woke the observer"
+    );
+    assert!(
+        !locked.load(Ordering::SeqCst),
+        "terminal publication must follow lock release"
+    );
+    drop(lock);
+    assert_eq!(discard_partial(&fixture.dest).unwrap(), 64 * 1024);
+}

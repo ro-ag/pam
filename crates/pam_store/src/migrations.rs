@@ -57,7 +57,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 10,
         sql: SCHEMA_V10,
     },
+    Migration {
+        version: 11,
+        sql: SCHEMA_V11,
+    },
 ];
+
+const SCHEMA_V11: &str = "CREATE TABLE landing_session(request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision>=0), document TEXT NOT NULL CHECK(length(CAST(document AS BLOB))<=131072));";
 
 /// Highest schema version this binary can produce.
 pub(crate) fn latest_version() -> i64 {

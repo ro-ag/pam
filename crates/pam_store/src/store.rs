@@ -11,6 +11,9 @@ mod request_budget;
 pub use request_budget::*;
 #[path = "flow_journal.rs"]
 mod flow_journal;
+#[path = "landing_session.rs"]
+mod landing_session;
+pub use landing_session::LandingSession;
 #[path = "watch_schedule.rs"]
 mod watch_schedule;
 pub use evidence_views::*;
@@ -2153,6 +2156,7 @@ impl Store {
             for sql in [
                 format!("DELETE FROM request_budget WHERE {children}"),
                 format!("DELETE FROM flow_journal WHERE {children}"),
+                format!("DELETE FROM landing_session WHERE {children}"),
                 format!("DELETE FROM correlation_membership WHERE {children}"),
                 format!("DELETE FROM correlation_step WHERE {children}"),
                 format!("DELETE FROM correlation_target WHERE {children}"),

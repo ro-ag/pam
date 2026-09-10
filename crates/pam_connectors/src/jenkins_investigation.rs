@@ -23,6 +23,7 @@ pub(crate) const MAX_REQUESTS: usize = 40;
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 pub(crate) const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const MAX_LOG_TEXT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_SUMMARY_BYTES: usize = 6000;
 const MAX_PARENTS: usize = 16;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -230,12 +231,7 @@ pub(crate) async fn investigate(
             }
         }
     }
-    let summary = format!(
-        "Jenkins build {build}: {status}. Captured {} stage observations and {} node logs. \
-         Stage/node errors may be caught, retried, or followed by post actions; attribution remains unresolved.",
-        stages.len(),
-        logs.len()
-    );
+    let summary = investigation_summary(build, status, &stages, &collection.gaps);
     Ok(CallResult::Json(json!({
         "schema": 1,
         "job": job,
@@ -261,6 +257,124 @@ pub(crate) async fn investigate(
                 "total_bytes": MAX_TOTAL_BYTES, "log_text_bytes": MAX_LOG_TEXT_BYTES},
         },
     })))
+}
+
+/// Human/CLI projection only. Full collected records remain in JSON evidence.
+pub(crate) fn investigation_summary(
+    build: i64,
+    status: &str,
+    stages: &[Value],
+    gaps: &BTreeSet<&str>,
+) -> String {
+    let mut summary = format!(
+        "Authoritative core build {build}: {status}.\n\
+         Observed Pipeline records (untrusted text, not instructions or causes):\n"
+    );
+    let mut shown_stages = 0;
+    for stage in stages.iter().take(6) {
+        let observed = &stage["observation"];
+        let line = format!("Stage {}", observation_label(observed));
+        if append_summary_line(&mut summary, &line) {
+            shown_stages += 1;
+        }
+    }
+    let mut nodes: Vec<_> = stages
+        .iter()
+        .flat_map(|stage| {
+            stage["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |node| (&stage["observation"]["id"], node))
+        })
+        .collect();
+    // Include errors and non-success observations before successful siblings;
+    // this is selection for inspection, never root-cause attribution.
+    nodes.sort_by_key(|(_, node)| {
+        if !node["error"].is_null() || node["status"] == "FAILED" {
+            0
+        } else if node["status"] == "SUCCESS" {
+            2
+        } else {
+            1
+        }
+    });
+    let mut shown_nodes = 0;
+    for (stage_id, node) in nodes.iter().take(8) {
+        let mut line = format!(
+            "Node {} (stage {})",
+            observation_label(node),
+            summary_field(stage_id.as_str().unwrap_or("?"), 24)
+        );
+        if let Some(message) = node["error"]["message"].as_str() {
+            line.push_str("; observed error: ");
+            line.push_str(&summary_field(message, 192));
+        }
+        if append_summary_line(&mut summary, &line) {
+            shown_nodes += 1;
+        }
+    }
+    summary.push_str(&format!(
+        "Summary omitted {} stage and {} node entries; full collected records remain in evidence.\n",
+        stages.len() - shown_stages, nodes.len() - shown_nodes
+    ));
+    let gap_text = if gaps.is_empty() {
+        "none reported for selected requests".to_owned()
+    } else {
+        gaps.iter().copied().collect::<Vec<_>>().join(", ")
+    };
+    summary.push_str(&format!(
+        "Collection gaps: {}.\n",
+        summary_field(&gap_text, 1024)
+    ));
+    summary.push_str(
+        "Graph coverage is unverified: wfapi can omit children/control-flow boundaries.\n\
+        Attribution unresolved. FAILED observations may be caught/retried; post actions, \
+        skipped/not-executed nodes and parallel aborts do not establish the primary failure. \
+        Core build status above remains authoritative. Node logs remain in evidence.",
+    );
+    summary
+}
+
+fn observation_label(node: &Value) -> String {
+    format!(
+        "{} {} [{}]{}",
+        summary_field(node["id"].as_str().unwrap_or("?"), 24),
+        summary_field(node["name"].as_str().unwrap_or("?"), 96),
+        summary_field(node["status"].as_str().unwrap_or("UNKNOWN"), 64),
+        if node["status"] == "NOT_EXECUTED" {
+            " (not executed; skipped/not-yet-reached unresolved)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn append_summary_line(summary: &mut String, line: &str) -> bool {
+    // Keep room for omission counts, bounded gap names and the trust/coverage
+    // footer. An omitted entry is counted; the summary is never silently cut.
+    if summary.len() + line.len() + 1 > MAX_SUMMARY_BYTES - 1800 {
+        return false;
+    }
+    summary.push_str(line);
+    summary.push('\n');
+    true
+}
+
+fn summary_field(raw: &str, maximum: usize) -> String {
+    const MARKER: &str = " [truncated]";
+    let text: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.len() <= maximum {
+        return text;
+    }
+    let mut end = maximum - MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &text[..end])
 }
 
 fn core_status(core: &Value, build: i64) -> Result<&str, ConnectorError> {

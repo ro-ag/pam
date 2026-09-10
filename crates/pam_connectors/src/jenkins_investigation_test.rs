@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use pam_flow::{ArgValue, ConnectorId};
@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::jenkins_investigation::{
-    MAX_LOG_TEXT_BYTES, MAX_LOGS, MAX_NODES, MAX_RESPONSE_BYTES, MAX_STAGES, MAX_TOTAL_BYTES,
+    MAX_LOG_TEXT_BYTES, MAX_LOGS, MAX_NODES, MAX_RESPONSE_BYTES, MAX_STAGES, MAX_SUMMARY_BYTES,
+    MAX_TOTAL_BYTES, investigation_summary,
 };
 use crate::testing::FakeTransport;
 use crate::{CallResult, Connection, ConnectorError, Secret, TransportError, call};
@@ -116,6 +117,11 @@ async fn successful_retry_keeps_failed_child_and_successful_recovery_without_ove
     );
     let report = invoke(&transport).await.unwrap();
     assert_eq!(report["status"], "SUCCESS");
+    let summary = report["summary"].as_str().unwrap();
+    assert!(summary.starts_with("Authoritative core build 41: SUCCESS."));
+    assert!(summary.contains("Node 6 Shell Script [FAILED]"));
+    assert!(summary.contains("Node 7 Shell Script [SUCCESS]"));
+    assert!(summary.contains("observed error: script returned exit code 1"));
     assert_eq!(report["stages"][0]["observation"]["status"], "FAILED");
     assert_eq!(report["stages"][0]["nodes"][1]["parentNodes"], json!(["6"]));
     assert_eq!(
@@ -262,6 +268,13 @@ async fn running_and_not_executed_stages_do_not_become_failures_or_passes() {
         .json(200, &description(running, vec![]).to_string());
     let report = invoke(&transport).await.unwrap();
     assert_eq!(report["status"], "RUNNING");
+    assert!(report["summary"].as_str().unwrap().contains("NOT_EXECUTED"));
+    assert!(
+        report["summary"]
+            .as_str()
+            .unwrap()
+            .contains("skipped/not-yet-reached unresolved")
+    );
     assert_eq!(report["stages"][0]["observation"]["status"], "NOT_EXECUTED");
     assert!(gap(&report, "build_not_terminal"));
 }
@@ -501,4 +514,44 @@ async fn invalid_job_build_and_expired_deadline_do_not_make_requests() {
     .unwrap_err();
     assert_eq!(error, ConnectorError::Timeout);
     assert!(transport.requests().is_empty());
+}
+
+#[test]
+fn summary_is_utf8_bounded_marks_omissions_and_preserves_full_evidence() {
+    let label = "🦀".repeat(200);
+    let message = "錯誤".repeat(1000);
+    let phases: Vec<_> = (1..=24)
+        .map(|id| {
+            let mut atom = node(id + 100, "FAILED", &label, &[]);
+            atom["error"]["message"] = json!(message);
+            atom["log"] = json!("unique log content must not be duplicated");
+            json!({"observation": stage(id, "FAILED", &label), "nodes": [atom]})
+        })
+        .collect();
+    let original = phases.clone();
+    let gaps = BTreeSet::from(["server_log_tail", "node_limit", "connector_forbidden"]);
+    let summary = investigation_summary(41, "FAILURE", &phases, &gaps);
+    assert!(
+        summary.len() <= MAX_SUMMARY_BYTES,
+        "{} bytes",
+        summary.len()
+    );
+    assert!(summary.contains("[truncated]"));
+    assert!(summary.contains("Summary omitted 18 stage and "));
+    assert!(summary.contains("node_limit"));
+    assert!(summary.contains("server_log_tail"));
+    assert!(summary.contains("connector_forbidden"));
+    assert!(summary.contains("Attribution unresolved"));
+    assert!(!summary.contains("unique log content"));
+    assert_eq!(phases, original);
+}
+
+#[test]
+fn empty_investigation_summary_retains_core_failure_and_missing_api() {
+    let summary =
+        investigation_summary(41, "FAILURE", &[], &BTreeSet::from(["connector_not_found"]));
+    assert!(summary.starts_with("Authoritative core build 41: FAILURE."));
+    assert!(summary.contains("Summary omitted 0 stage and 0 node entries"));
+    assert!(summary.contains("connector_not_found"));
+    assert!(summary.contains("Graph coverage is unverified"));
 }

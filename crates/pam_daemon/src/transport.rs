@@ -19,7 +19,11 @@
 //!   without answering.
 //! - **Events out**: [`EventPublisher`] is a clone-able handle over an
 //!   `mpsc`; a task owning the `PUB` socket drains it, sending
-//!   `[request-id topic, JSON event]` frame pairs.
+//!   `[request-id topic, JSON event]` frame pairs. This is a public broadcast:
+//!   a wildcard subscriber can observe opaque request IDs, lifecycle states,
+//!   timing and progress percentages across tasks. Topic filters are not access
+//!   control. Progress prose is replaced with a constant before enqueueing;
+//!   task, product, repository and evidence details require scoped result reads.
 //!
 //! Shutdown is a `tokio::sync::watch` flag: [`Transport::shutdown`] flips
 //! it and joins the three socket tasks; dropping the sockets closes the
@@ -42,6 +46,9 @@ use crate::runtime_dir::{RuntimeDir, remove_stale};
 
 /// Capacity of the internal reply and event channels.
 const CHANNEL_CAPACITY: usize = 256;
+
+/// Public progress carries no task-specific prose; details require scoped reads.
+pub const PUBLIC_PROGRESS_NOTE: &str = "Task progress updated";
 
 /// Why the transport could not start.
 #[derive(Debug, Error)]
@@ -111,6 +118,19 @@ impl EventPublisher {
         request_id: &str,
         event: Event,
     ) -> std::future::Ready<Result<(), PublishError>> {
+        // Sanitize at the shared publication boundary, including test publishers.
+        // Enumerate lifecycle variants so a future payload-bearing event needs review.
+        let event = match event {
+            Event::Progress { pct, note: _ } => Event::Progress {
+                pct,
+                note: PUBLIC_PROGRESS_NOTE.to_owned(),
+            },
+            Event::Queued
+            | Event::Started
+            | Event::ApprovalPending
+            | Event::Done
+            | Event::Refused => event,
+        };
         let result = match self.tx.try_send((request_id.to_owned(), event)) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(PublishError),

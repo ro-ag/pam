@@ -34,6 +34,28 @@ fn status_call(connector: ConnectorId) -> &'static str {
     }
 }
 
+const TARGET_CHANGED: &str = "watch_target_changed";
+
+pub(super) fn conflicting_observation(
+    connector: ConnectorId,
+    pins: &Value,
+    received: &crate::flow_watch::Observation,
+) -> Option<crate::flow_watch::Observation> {
+    if pins.is_null()
+        || received.state == State::Unavailable
+        || flow_watch::validate_pins(connector, pins, &received.payload).is_ok()
+    {
+        return None;
+    }
+    let payload = json!({"watch_state":"unavailable", "status":"conflicting",
+        "cause":TARGET_CHANGED, "received":received.payload});
+    Some(crate::flow_watch::Observation {
+        state: State::Unavailable,
+        digest: pam_compact::sha256_hex(payload.to_string().as_bytes()),
+        payload,
+    })
+}
+
 struct Polled {
     observation: crate::flow_watch::Observation,
     retry_after: Option<Duration>,
@@ -169,6 +191,9 @@ impl RunState<'_> {
         {
             return Err(failure());
         }
+        if let Some(report) = self.retained_watch_conflict(step) {
+            return Ok(Some(report));
+        }
         if self.recovery.watch.as_ref().is_some_and(|w| w.collecting) {
             return Ok(None);
         }
@@ -181,6 +206,15 @@ impl RunState<'_> {
             Ok(polled) => polled,
             Err(report) => return Ok(Some(*report)),
         };
+        let conflict = self.recovery.watch.as_ref().and_then(|watch| {
+            conflicting_observation(*connector, &watch.pins, &polled.observation)
+        });
+        if let Some(observation) = conflict {
+            return self
+                .commit_watch_conflict(step, polled.origin, observation)
+                .await
+                .map(Some);
+        }
         let delay = self.commit_watch(step, fingerprint, polled).await?;
         let watch = self.recovery.watch.as_ref().ok_or_else(failure)?;
         let (collecting, polls, errors, next_poll_ms) = (
@@ -267,6 +301,64 @@ impl RunState<'_> {
             retry_after,
             origin,
         }))
+    }
+
+    fn retained_watch_conflict(&mut self, step: &Step) -> Option<StepReport> {
+        if !self
+            .recovery
+            .watch
+            .as_ref()
+            .is_some_and(|watch| watch.observation["cause"] == TARGET_CHANGED)
+        {
+            return None;
+        }
+        Some(self.watch_blocked(step, &WatchError {
+            cause: TARGET_CHANGED,
+            detail: "The received product identity differs from the pinned target; conflicting evidence is retained and collection stopped",
+        }))
+    }
+
+    async fn commit_watch_conflict(
+        &mut self,
+        step: &Step,
+        origin: crate::evidence_service::ConnectorTarget,
+        observation: crate::flow_watch::Observation,
+    ) -> Result<StepReport, CapabilityFailure> {
+        let mut watch = self.recovery.watch.clone().ok_or_else(failure)?;
+        let stamp = self.watch_stamp().await?;
+        if self.watch_grant_stamp.as_ref() != Some(&stamp) {
+            return Err(failure());
+        }
+        let evidence = self
+            .file_watch(step, &origin, &observation, watch.polls + 1, None)
+            .await?;
+        // The bad observation is evidence, never a replacement for accepted identity pins.
+        watch.polls += 1;
+        watch.collecting = false;
+        watch.next_poll_ms = 0;
+        watch.observation = observation.payload;
+        watch.last_digest = observation.digest;
+        watch.last_evidence = evidence;
+        self.recovery
+            .settle_watch(
+                &self.service.store,
+                &self.ctx.request_id,
+                watch,
+                &self.evidence,
+            )
+            .await?;
+        self.publish_note(
+            self.reports.len(),
+            self.flow.steps.len(),
+            format!("{}: conflicting target; collection stopped", step.id),
+        )
+        .await;
+        // Normal step settlement expects a prepared attempt. A crash before it resumes the
+        // persisted conflict marker and produces the same refusal without another HTTP call.
+        self.recovery
+            .prepare(&self.service.store, &self.ctx.request_id, step, true)
+            .await?;
+        self.retained_watch_conflict(step).ok_or_else(failure)
     }
 
     async fn commit_watch(

@@ -110,3 +110,91 @@ fn github_watch_assertion_uses_actual_conclusion_and_never_top_level_success() {
     );
     assert_eq!(report.status, StepStatus::Succeeded);
 }
+
+#[tokio::test]
+async fn substituted_run_is_committed_as_conflict_without_replacing_valid_pins() {
+    let store = Store::open_in_memory().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    store
+        .insert_request("r", "flow.run", repo.to_str().unwrap(), "test", "{}", None)
+        .await
+        .unwrap();
+    store
+        .set_setting(
+            "flows.scope_policy",
+            &json!({"version":1,"repositories":[{"root":repo,"connectors":[]}]}).to_string(),
+        )
+        .await
+        .unwrap();
+    let flow = flow();
+    let (mut recovery, _) = Recovery::open(&store, "r", &flow, &repo, &Vars::new())
+        .await
+        .unwrap();
+    let pins = json!({"run_id":1,"run_attempt":1});
+    let received = crate::flow_watch::Observation {
+        state: crate::flow_watch::State::Terminal,
+        payload: json!({"run_id":2,"run_attempt":1,"status":"completed","conclusion":"success"}),
+        digest: "unused".into(),
+    };
+    let conflict = super::watch_runtime::conflicting_observation(
+        pam_flow::ConnectorId::Github,
+        &pins,
+        &received,
+    )
+    .unwrap();
+    assert_eq!(conflict.state, crate::flow_watch::State::Unavailable);
+    assert_eq!(conflict.payload["cause"], "watch_target_changed");
+    assert_eq!(conflict.payload["received"], received.payload);
+    let bytes = serde_json::to_vec(&conflict.payload).unwrap();
+    store
+        .insert_evidence("ev_conflict", "r", "flow.watch", &bytes, None)
+        .await
+        .unwrap();
+    let state = WatchState {
+        step: "wait".into(),
+        args_fingerprint: "a".repeat(64),
+        origin: crate::evidence_service::ConnectorTarget {
+            connector: pam_flow::ConnectorId::Github,
+            base_url: "https://api.github.com/".into(),
+            call: "run_status".into(),
+            args: std::collections::BTreeMap::new(),
+        },
+        profile_stamp: "b".repeat(64),
+        authorization_revision: 0,
+        polls: 2,
+        errors: 0,
+        next_poll_ms: 0,
+        collecting: false,
+        observation: conflict.payload,
+        pins: pins.clone(),
+        last_digest: conflict.digest,
+        last_evidence: "ev_conflict".into(),
+    };
+    recovery
+        .prepare(&store, "r", &flow.steps[0], true)
+        .await
+        .unwrap();
+    recovery
+        .settle_watch(&store, "r", state, &[])
+        .await
+        .unwrap();
+    let row = store.read_flow_journal("r").await.unwrap().unwrap();
+    let cursor: serde_json::Value = serde_json::from_str(&row.checkpoint_json).unwrap();
+    assert_eq!(cursor["watch"]["pins"], pins);
+    assert_eq!(
+        cursor["watch"]["observation"]["cause"],
+        "watch_target_changed"
+    );
+    assert_eq!(cursor["watch"]["collecting"], false);
+    assert_eq!(cursor["watch"]["next_poll_ms"], 0);
+    assert_eq!(row.evidence_refs, vec!["ev_conflict"]);
+    assert!(
+        store
+            .list_evidence("r")
+            .await
+            .unwrap()
+            .iter()
+            .any(|evidence| evidence.id == "ev_conflict")
+    );
+}

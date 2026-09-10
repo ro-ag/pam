@@ -481,8 +481,12 @@ export function updateInputs(spec: FlowSpec, inputs: FlowSpec["inputs"]): FlowSp
 // --- graph → file ------------------------------------------------------------
 
 function rawStep(step: FlowStep): RawFlowStep {
-  const { action, note, ...rest } = step;
-  const base: RawFlowStep = note ? { ...rest, note } : rest;
+  const { action, note, watch, ...rest } = step;
+  const base: RawFlowStep = {
+    ...rest,
+    ...(note ? { note } : {}),
+    ...(watch ? { watch: { ...watch } } : {}),
+  };
   if (action.kind === "command") return { ...base, run: action.argv };
   return { ...base, connector: action.connector, call: action.call, with: action.with };
 }

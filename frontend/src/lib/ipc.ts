@@ -767,6 +767,13 @@ export type FlowAction =
       with: Record<string, FlowArgValue>;
     };
 
+/** Existing bounded polling policy; edited as part of the flow, not an access grant. */
+export interface FlowWatch {
+  max_polls: number;
+  interval: string;
+  max_interval: string;
+}
+
 export interface FlowStep {
   id: string;
   action: FlowAction;
@@ -781,6 +788,7 @@ export interface FlowStep {
   needs: string[];
   when: FlowWhen;
   retry: { attempts: number; backoff: string };
+  watch?: FlowWatch | null;
   approval: FlowApproval;
   env: Record<string, string>;
   /** A human note for the canvas; absent when the step has none. */
@@ -816,6 +824,7 @@ export interface RawFlowStep {
   needs?: string[];
   when?: FlowWhen;
   retry?: { attempts: number; backoff?: string };
+  watch?: Partial<FlowWatch>;
   approval?: FlowApproval;
   env?: Record<string, string>;
   note?: string;

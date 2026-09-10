@@ -442,3 +442,27 @@ it("preserves connector status assertions through designer serialization", () =>
   const raw = toRaw(spec({ a: { expect_status: "OK" } }));
   expect(raw.steps[0].expect_status).toBe("OK");
 });
+
+it("preserves an existing watch policy when a canvas note is changed and saved", () => {
+  const watch = { max_polls: 12, interval: "5s", max_interval: "30s" };
+  const original = spec({
+    a: {
+      action: {
+        kind: "connector",
+        connector: "github",
+        call: "run",
+        with: { repo: "team/repo", run_id: 7, run_attempt: 2 },
+      },
+      watch,
+    },
+  });
+  const edited = updateStep(original, "a", { note: "Check this attempt" });
+  const raw = toRaw(edited);
+  expect(raw.steps[0].watch).toEqual(watch);
+  expect(raw.steps[0].watch).not.toBe(watch);
+  expect(raw.steps[0].note).toBe("Check this attempt");
+  expect(raw.steps[0].call).toBe("run");
+  expect(original.steps[0].note).toBeUndefined();
+  expect(original.steps[0].watch).toEqual(watch);
+  expect(raw.steps[1]).not.toHaveProperty("watch");
+});

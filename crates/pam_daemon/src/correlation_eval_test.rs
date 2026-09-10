@@ -166,12 +166,12 @@ fn product_identity_preserves_only_bounded_stable_reported_ids() {
     report["timestamp"] = json!(999);
     let args = BTreeMap::from([("repo".into(), ArgValue::Text("team/app".into()))]);
     let before = product_identity(ConnectorId::Github, "run", &args, Some(&report));
-    assert_eq!(before["job_ids"].as_array().unwrap().len(), 100);
+    assert!(before.get("job_ids").is_none());
     assert_eq!(before["run_attempt"], 3);
     assert_eq!(before["repository"], "team/app");
     report["status"] = json!("failure");
     report["timestamp"] = json!(888);
-    report["jobs"].as_array_mut().unwrap()[..100].reverse();
+    report["jobs"] = json!([{ "id": 999 }]);
     assert_eq!(
         before,
         product_identity(ConnectorId::Github, "run", &args, Some(&report))

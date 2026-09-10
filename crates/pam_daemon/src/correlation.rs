@@ -104,8 +104,10 @@ impl Frozen {
                     detail: "invalid retained product association".to_owned(),
                 });
             }
+            frozen
+                .restore_jobs(store, ticket, &row.step_id, &binding)
+                .await?;
             frozen.decisions.insert(row.step_id, decision.clone());
-            frozen.remember_jobs(&binding);
         }
         Ok(frozen)
     }
@@ -227,8 +229,23 @@ impl Frozen {
                 );
             }
             CorrelationBind::Inserted | CorrelationBind::Existing => {
-                if decision.is_matched() {
-                    self.remember_jobs(&binding);
+                if decision.is_matched() && github_run_binding(&binding) {
+                    let observed = observed_jobs(result)?;
+                    let jobs = store
+                        .append_correlation_membership(
+                            ticket,
+                            &step.id,
+                            &binding.to_string(),
+                            &observed,
+                        )
+                        .await
+                        .map_err(storage)?
+                        .ok_or_else(|| Failure {
+                            cause: CONFLICT,
+                            detail: "run-attempt binding changed before membership capture"
+                                .to_owned(),
+                        })?;
+                    self.remember_jobs(&binding, &jobs);
                 }
             }
         }
@@ -241,23 +258,45 @@ impl Frozen {
         failure.map_or(Ok(()), |cause| Err(Failure { cause, detail }))
     }
 
-    fn remember_jobs(&mut self, binding: &Value) {
-        if binding["target_id"] != self.target_id
-            || binding["decision"]["status"] != "matched"
-            || binding["origin"]["connector"] != "github"
-            || binding["origin"]["call"] != "run"
-        {
+    async fn restore_jobs(
+        &mut self,
+        store: &Store,
+        ticket: &str,
+        step_id: &str,
+        binding: &Value,
+    ) -> Result<(), Failure> {
+        if !github_run_binding(binding) {
+            return Ok(());
+        }
+        if binding["identity"].get("job_ids").is_some() {
+            return Err(Failure { cause: STORAGE, detail: "legacy job membership was part of immutable identity; start a new request after upgrading".to_owned() });
+        }
+        let jobs = store
+            .read_correlation_membership(ticket, step_id, &binding.to_string())
+            .await
+            .map_err(storage)?
+            .ok_or_else(|| Failure {
+                cause: STORAGE,
+                detail: "retained run-attempt binding changed".to_owned(),
+            })?;
+        self.remember_jobs(binding, &jobs);
+        Ok(())
+    }
+
+    fn remember_jobs(&mut self, binding: &Value, ids: &[u64]) {
+        if binding["target_id"] != self.target_id || !github_run_binding(binding) {
             return;
         }
         let Some(base) = binding["origin"]["base_url"].as_str() else {
             return;
         };
-        let identity = &binding["identity"];
-        if let Some(ids) = identity["job_ids"].as_array() {
-            for id in ids.iter().take(100) {
-                if let Some(key) = job_key(base, identity.get("repository"), Some(id)) {
-                    self.jobs.insert(key);
-                }
+        for id in ids {
+            if let Some(key) = job_key(
+                base,
+                binding["identity"].get("repository"),
+                Some(&json!(id)),
+            ) {
+                self.jobs.insert(key);
             }
         }
     }
@@ -336,4 +375,32 @@ fn decide(status: Status, detail: &str) -> Decision {
         status,
         detail: detail.to_owned(),
     }
+}
+
+fn github_run_binding(binding: &Value) -> bool {
+    binding["decision"]["status"] == "matched"
+        && binding["origin"]["connector"] == "github"
+        && binding["origin"]["call"] == "run"
+}
+
+fn observed_jobs(result: Option<&Value>) -> Result<Vec<u64>, Failure> {
+    let jobs = result
+        .and_then(|value| value.get("jobs"))
+        .and_then(Value::as_array)
+        .filter(|jobs| jobs.len() <= 256)
+        .ok_or_else(|| Failure {
+            cause: STORAGE,
+            detail: "run jobs missing or membership capacity exceeded".to_owned(),
+        })?;
+    jobs.iter()
+        .map(|job| {
+            job.get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .ok_or_else(|| Failure {
+                    cause: STORAGE,
+                    detail: "run contains invalid job membership".to_owned(),
+                })
+        })
+        .collect()
 }

@@ -227,16 +227,6 @@ pub(crate) fn product_identity(
         for key in ["run_id", "run_attempt"] {
             identity[key] = positive_id(result.get(key));
         }
-        let jobs = result.get("jobs").and_then(Value::as_array);
-        let mut job_ids = jobs
-            .into_iter()
-            .flatten()
-            .take(100)
-            .filter_map(|job| job.get("id").and_then(Value::as_u64).filter(|id| *id > 0))
-            .collect::<Vec<_>>();
-        job_ids.sort_unstable();
-        job_ids.dedup();
-        identity["job_ids"] = json!(job_ids);
     } else if connector == ConnectorId::Jenkins && matches!(call, "investigate" | "node_evidence") {
         if let Some(job) = result
             .get("job")

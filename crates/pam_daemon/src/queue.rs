@@ -597,34 +597,48 @@ impl QueueManager {
             .collect();
         let mut reaped = Vec::with_capacity(expired.len());
         for id in expired {
-            let Some(lease) = inner.leases.remove(&id) else {
-                continue;
-            };
-            inner.busy.remove(&lease.repo);
-            // Tell a still-running holder to stop; best-effort.
-            let _ = lease.cancel_tx.send(true);
-            let detail = serde_json::json!({ "cause": "timeout" }).to_string();
-            let finished = self
-                .store
-                .finish_request(
-                    &id,
-                    RequestState::Failed,
-                    Some(CAUSE_LEASE_EXPIRED),
-                    AuditEntry {
-                        action: ACTION_LEASE_REAPED,
-                        decision: Decision::Timeout,
-                        actor: Actor::System,
-                        detail: Some(&detail),
-                    },
-                )
-                .await?;
-            // An already-terminal row means someone else finished first;
-            // the lane is freed either way but nothing was reaped.
-            if finished {
+            if self.expire_locked(&mut inner, &id).await? {
                 reaped.push(id);
             }
         }
         Ok(reaped)
+    }
+
+    /// Finish an admitted request whose absolute deadline elapsed. Both the
+    /// original waiter and lease reaper use the same durable timeout cause.
+    /// Explicit user cancellation continues through [`Self::cancel`].
+    pub async fn expire(&self, request_id: &str) -> Result<bool, QueueError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_locked(&mut inner, request_id).await
+    }
+
+    async fn expire_locked(&self, inner: &mut Inner, request_id: &str) -> Result<bool, QueueError> {
+        let detail = serde_json::json!({ "cause": "timeout" }).to_string();
+        // Persist first: a store failure must leave ownership intact for retry.
+        // The queue mutex excludes executor completion until this terminal write.
+        let finished = self
+            .store
+            .finish_request(
+                request_id,
+                RequestState::Failed,
+                Some(CAUSE_LEASE_EXPIRED),
+                AuditEntry {
+                    action: ACTION_LEASE_REAPED,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )
+            .await?;
+        if let Some(lease) = inner.leases.remove(request_id) {
+            inner.busy.remove(&lease.repo);
+            let _ = lease.cancel_tx.send(true);
+        }
+        for lane in inner.lanes.values_mut() {
+            lane.retain(|entry| entry.id != request_id);
+        }
+        inner.lanes.retain(|_, lane| !lane.is_empty());
+        Ok(finished)
     }
 
     /// Spawns the background reaper: calls [`Self::reap_expired`] every

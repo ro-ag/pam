@@ -103,12 +103,12 @@
 //!
 //! # Deadlines
 //!
-//! The envelope's `deadline_ms` is enforced at the pipeline level for
-//! waiting callers: past it, the request is cancelled through the queue
-//! (the executor observes the signal and records the terminal state on
-//! its own path), a [`ACTION_DEADLINE_REFUSAL`] audit row is written,
-//! and the caller gets a [`CAUSE_DEADLINE_EXCEEDED`] refusal. Executor-side
-//! runaways are reaped by the queue's lease reaper independently.
+//! Admission persists one expiry for the original request. Approval waits,
+//! lane waits and execution share it, including ticketed requests. An expired
+//! laned request is recorded as `failed` / `lease_expired`, signalled to stop,
+//! and exposed as [`CAUSE_DEADLINE_EXCEEDED`]. Explicit cancellation retains
+//! its separate cause. Attached observers have independent wait timeouts and
+//! never cancel the original request when their own wait expires.
 //!
 //! # Audit invariant: every terminal state writes its own audit row
 //!
@@ -145,9 +145,9 @@
 //!   decision `refuse`, actor `system`.
 //!
 //! On the laned deadline path the [`ACTION_DEADLINE_REFUSAL`] row is
-//! written *in addition to* the cancellation row of whichever side tears
-//! the request down — the deadline row records the refusal sent to the
-//! caller, the cancellation row is the terminal one.
+//! written *in addition to* the lease-expiry terminal row. The persisted
+//! outcome is `lease_expired`; both the original waiter and reaper expose
+//! `deadline_exceeded` to callers. Explicit cancellation remains `cancelled`.
 //!
 //! A store failure on a terminal write cannot be answered to anyone
 //! (the caller already has its response or its ticket), so it is logged
@@ -170,8 +170,8 @@
 //! `deadline_ms` elapses mid-approval cancels the wait (the service
 //! resolves the row `denied` with note `cancelled`); a `wait: false`
 //! caller gets its ticket immediately and the approval wait runs in a
-//! background task, bounded by the approval timeout alone. The
-//! request-state transitions around the wait belong to the pipeline —
+//! background task, bounded by approval timeout and original admission expiry.
+//! The request-state transitions around the wait belong to the pipeline —
 //! see the approval module docs for the writer split.
 
 use std::collections::HashMap;
@@ -185,7 +185,6 @@ use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
 
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
@@ -200,9 +199,7 @@ use crate::lifecycle::{
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
-use crate::queue::{
-    AdmitOutcome, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED, LeasedWork, QueueError, QueueManager,
-};
+use crate::queue::{AdmitOutcome, CAUSE_CANCELLED, LeasedWork, QueueError, QueueManager};
 use crate::retention::{PRUNE_INTERVAL, RetentionService};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::{SecretBackend, SecretStore};
@@ -284,7 +281,7 @@ const RECOVERY_APPROVAL_CANCELLED: &str =
 
 /// Recovery line for [`CAUSE_DEADLINE_EXCEEDED`] refusals.
 const RECOVERY_DEADLINE: &str =
-    "Retry with a larger deadline, or without wait to poll the ticket instead.";
+    "Inspect retained evidence and retry with a larger request deadline if appropriate.";
 
 /// Recovery line for [`CAUSE_EXECUTION_FAILED`] refusals.
 const RECOVERY_FAILED: &str = "Inspect the failure in the PAM GUI activity view, then retry.";
@@ -1047,15 +1044,22 @@ impl Pipeline {
                 recovery,
             } => self.refuse(id, cause, detail, recovery).await,
             GateDecision::RequireApproval { reason } => self.approval_pause(envelope, reason).await,
-            GateDecision::Allow { .. } => self.place_and_wait(envelope, envelope.deadline_ms).await,
+            GateDecision::Allow { .. } => self.place_and_wait(envelope).await,
         }
     }
 
     /// Places an allowed (or approved) request on its lane and, for a
-    /// waiting caller, parks on the completion router with `deadline_ms`
-    /// of budget left.
-    async fn place_and_wait(&self, envelope: &Envelope, deadline_ms: u64) -> Response {
+    /// waiting caller, parks only until the persisted admission expiry.
+    /// Gate, approval and placement time never renew the request clock.
+    async fn place_and_wait(&self, envelope: &Envelope) -> Response {
         let id = &envelope.id;
+        let deadline = match self.store.get_request(id).await {
+            Ok(Some(row)) => request_deadline(&row),
+            _ => return internal_refusal(id),
+        };
+        let Some(deadline) = deadline else {
+            return self.deadline_refusal(envelope).await;
+        };
         // Register before placement so the completion cannot slip
         // between the two.
         let registration = self.router.register(id).await;
@@ -1065,6 +1069,7 @@ impl Pipeline {
             .await
         {
             Ok(position) => position,
+            Err(QueueError::Expired) => return self.deadline_refusal(envelope).await,
             Err(error) => {
                 let response = self
                     .refuse(
@@ -1081,7 +1086,9 @@ impl Pipeline {
         let _ = self.events.publish(id, Event::Queued).await;
         self.work.notify_one();
         if envelope.wait {
-            match await_registration(registration, deadline_ms).await {
+            match await_registration_until(registration, tokio::time::Instant::from_std(deadline))
+                .await
+            {
                 Ok(response) => response,
                 Err(true) => self.deadline_refusal(envelope).await,
                 Err(false) => internal_refusal(id),
@@ -1099,7 +1106,7 @@ impl Pipeline {
     /// the approval service, then continues into placement (approved) or
     /// refuses (denied, timed out, cancelled). A `wait: false` caller
     /// gets its ticket immediately while the wait runs in a background
-    /// task bounded by the approval timeout.
+    /// task bounded by both admission expiry and the approval timeout.
     async fn approval_pause(self: Arc<Self>, envelope: &Envelope, reason: String) -> Response {
         if envelope.wait {
             return self.approval_wait_inline(envelope, &reason).await;
@@ -1111,52 +1118,44 @@ impl Pipeline {
         };
         let envelope = envelope.clone();
         tokio::spawn(async move {
-            // The cancel signal never fires here — the sender is held
-            // until the wait ends; the approval timeout is the bound.
-            let (_cancel_tx, mut cancel) = watch::channel(false);
-            let outcome = self
-                .approvals
-                .request_approval(&envelope.id, &envelope.capability, &mut cancel)
-                .await;
-            // The response reaches the store, events, and any attached
-            // waiters; the ticket holder polls those.
-            let _ = self
-                .conclude_approval(&envelope, &reason, outcome, envelope.deadline_ms)
-                .await;
+            // A ticket changes how the caller observes the request, not its
+            // lifetime. The original admission expiry also bounds approval.
+            let _ = self.approval_wait_inline(&envelope, &reason).await;
         });
         ticket
     }
 
-    /// The waiting caller's approval pause: the wait is additionally
-    /// bounded by the envelope's `deadline_ms` — past it the wait is
-    /// cancelled (the service resolves the approval row as denied with
-    /// note `cancelled`) and the caller gets a refusal.
+    /// Approval pause for both waiting and ticketed requests. The persisted
+    /// admission expiry bounds the pause; expiry resolves the approval wait
+    /// before recording the durable request timeout.
     async fn approval_wait_inline(&self, envelope: &Envelope, reason: &str) -> Response {
         let id = &envelope.id;
-        let waited_from = Instant::now();
+        let deadline = match self.store.get_request(id).await {
+            Ok(Some(row)) => request_deadline(&row),
+            _ => return internal_refusal(id),
+        };
+        let Some(deadline) = deadline else {
+            return self.deadline_refusal(envelope).await;
+        };
         let (cancel_tx, mut cancel) = watch::channel(false);
         let fut = self
             .approvals
             .request_approval(id, &envelope.capability, &mut cancel);
         tokio::pin!(fut);
-        let outcome = tokio::select! {
-            outcome = &mut fut => outcome,
-            () = tokio::time::sleep(Duration::from_millis(envelope.deadline_ms)) => {
+        tokio::select! {
+            outcome = &mut fut => self.conclude_approval(envelope, reason, outcome).await,
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 let _ = cancel_tx.send(true);
-                // Resolves promptly: the service observes the signal,
-                // records the cancellation, and returns.
-                fut.await
+                // Resolve any pending approval so the GUI cannot grant stale work.
+                let _ = fut.await;
+                self.deadline_refusal(envelope).await
             }
-        };
-        let elapsed_ms = u64::try_from(waited_from.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let remaining_ms = envelope.deadline_ms.saturating_sub(elapsed_ms);
-        self.conclude_approval(envelope, reason, outcome, remaining_ms)
-            .await
+        }
     }
 
     /// Acts on an approval wait's outcome: approved requests move back
-    /// to `queued` and continue into placement with `deadline_ms` of
-    /// budget left; everything else becomes a terminal refusal (audited
+    /// to `queued` and continue under the original admission expiry;
+    /// everything else becomes a terminal refusal (audited
     /// via [`Self::refuse`], released to attached waiters through the
     /// router).
     async fn conclude_approval(
@@ -1164,14 +1163,11 @@ impl Pipeline {
         envelope: &Envelope,
         reason: &str,
         outcome: Result<ApprovalOutcome, StoreError>,
-        deadline_ms: u64,
     ) -> Response {
         let id = &envelope.id;
         let capability = &envelope.capability;
         match outcome {
-            Ok(ApprovalOutcome::Approved { .. }) => {
-                self.place_and_wait(envelope, deadline_ms).await
-            }
+            Ok(ApprovalOutcome::Approved { .. }) => self.place_and_wait(envelope).await,
             Ok(ApprovalOutcome::Denied) => {
                 self.refuse_approval(
                     id,
@@ -1686,10 +1682,16 @@ impl Pipeline {
     /// the refusal, tell subscribers, answer the caller.
     async fn deadline_refusal(&self, envelope: &Envelope) -> Response {
         let id = &envelope.id;
-        let _ = self.queue.cancel(id, Actor::System).await;
+        let terminal = self.queue.expire(id).await;
+        log_terminal_failure(id, &terminal);
+        if terminal.is_err() {
+            return internal_refusal(id);
+        }
         self.audit_deadline(id, envelope.deadline_ms).await;
         let _ = self.events.publish(id, Event::Refused).await;
-        deadline_refusal_response(id, envelope.deadline_ms)
+        let response = deadline_refusal_response(id, envelope.deadline_ms);
+        self.router.finish(id, response.clone()).await;
+        response
     }
 
     /// Releases waiters of a request whose lease was reaped mid-flight
@@ -1701,8 +1703,8 @@ impl Pipeline {
                 id,
                 Response::Refusal {
                     id: id.to_owned(),
-                    cause: CAUSE_LEASE_EXPIRED.to_owned(),
-                    detail: format!("request {id} outlived its lease and was reaped"),
+                    cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
+                    detail: format!("request {id} exceeded its admitted deadline"),
                     recovery: RECOVERY_DEADLINE.to_owned(),
                 },
             )
@@ -1712,8 +1714,8 @@ impl Pipeline {
     /// Audit row for a deadline refusal sent to a waiting caller.
     ///
     /// This is the one supplementary (non-terminal) audit append on the
-    /// laned deadline path: the terminal row is the cancellation row of
-    /// whichever side tears the request down (see the module docs).
+    /// laned deadline path: the terminal row records lease expiry regardless
+    /// of whether the original waiter or reaper observed it first.
     async fn audit_deadline(&self, id: &str, deadline_ms: u64) {
         let detail = serde_json::json!({ "deadline_ms": deadline_ms }).to_string();
         let _ = self
@@ -1830,9 +1832,22 @@ async fn await_registration(
     registration: Registration,
     deadline_ms: u64,
 ) -> Result<Response, bool> {
+    await_registration_until(
+        registration,
+        tokio::time::Instant::now() + Duration::from_millis(deadline_ms),
+    )
+    .await
+}
+
+/// Shared wait primitive; original requests use persisted expiry, attached
+/// observers use their own timeout without cancelling the original request.
+pub(crate) async fn await_registration_until(
+    registration: Registration,
+    deadline: tokio::time::Instant,
+) -> Result<Response, bool> {
     match registration {
         Registration::Ready(response) => Ok(*response),
-        Registration::Pending(rx) => match timeout(Duration::from_millis(deadline_ms), rx).await {
+        Registration::Pending(rx) => match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(false),
             Err(_elapsed) => Err(true),

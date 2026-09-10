@@ -825,3 +825,93 @@ async fn grant_revocation_invalidates_queued_work_even_after_regrant_and_restart
         Some("authorization_changed")
     );
 }
+
+#[tokio::test]
+async fn deadline_winner_orders_keep_timeout_cause_and_retained_evidence() {
+    timeout(DEADLINE, async {
+        for reaper_first in [false, true] {
+            let (store, queue) = manager().await;
+            let env = envelope("deadline", REPO_A, serde_json::json!({}), None);
+            enqueue(&queue, &env).await;
+            let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+            store
+                .insert_evidence(
+                    "ev_failed_attempt",
+                    &env.id,
+                    "log.source",
+                    b"failed attempt\n",
+                    None,
+                )
+                .await
+                .unwrap();
+            if reaper_first {
+                assert_eq!(
+                    queue
+                        .reap_expired(work.lease_deadline)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                    std::slice::from_ref(&env.id)
+                );
+                assert!(!queue.expire(&env.id).await.unwrap());
+            } else {
+                assert!(queue.expire(&env.id).await.unwrap());
+                assert!(
+                    queue
+                        .reap_expired(work.lease_deadline)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            // A woken executor must not relabel expiry as user cancellation.
+            assert!(*work.cancel.borrow());
+            assert!(
+                !queue
+                    .complete(
+                        &env.id,
+                        RequestState::Failed,
+                        Some(CAUSE_CANCELLED),
+                        execute_entry()
+                    )
+                    .await
+                    .unwrap()
+            );
+            let row = store.get_request(&env.id).await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::Failed);
+            assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+            let audit = store.audit_for_request(&env.id).await.unwrap();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].action, ACTION_LEASE_REAPED);
+            assert_eq!(audit[0].decision, Decision::Timeout);
+            assert_eq!(
+                store
+                    .get_evidence("ev_failed_attempt")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                b"failed attempt\n"
+            );
+        }
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn deadline_expiry_removes_queued_work_without_calling_it_cancelled() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let env = envelope("queued_deadline", REPO_A, serde_json::json!({}), None);
+        enqueue(&queue, &env).await;
+        assert!(queue.expire(&env.id).await.unwrap());
+        assert!(queue.take_next(REPO_A).await.unwrap().is_none());
+        let row = store.get_request(&env.id).await.unwrap().unwrap();
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+        assert!(!queue.expire(&env.id).await.unwrap());
+        assert_eq!(store.audit_for_request(&env.id).await.unwrap().len(), 1);
+    })
+    .await
+    .expect("test within deadline");
+}

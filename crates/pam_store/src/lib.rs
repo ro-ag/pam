@@ -41,7 +41,7 @@ pub use store::{
     Decision, EVIDENCE_KIND_FLOW_CHECKPOINT, EVIDENCE_KIND_LOG_COMPACT, EvidenceMeta,
     EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest, EvidenceRow,
     EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin, FlowJournalIdentity,
-    FlowJournalState, FlowResultMeta, GrantRow, MAX_FLOW_CHECKPOINT_BYTES,
+    FlowJournalState, FlowResultMeta, GrantRow, LandingSession, MAX_FLOW_CHECKPOINT_BYTES,
     MAX_FLOW_JOURNAL_EVIDENCE, MAX_REQUEST_LIST_LIMIT, ModelJobRow, PendingApproval,
     RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow, RequestState,
     RequestStatusMeta, Store,

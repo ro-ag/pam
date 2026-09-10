@@ -1,6 +1,5 @@
 //! Bounded private landing receipts, scoped to the original admitted flow ticket.
 use super::{Store, StoreError};
-use serde::Deserialize;
 use turso::params;
 
 /// Private landing manifest and prepared effect state; never returned by public reads.
@@ -10,21 +9,6 @@ pub struct LandingSession {
     pub revision: i64,
     /// Versioned daemon-owned document, at most 128 KiB.
     pub document: String,
-}
-
-#[derive(Deserialize)]
-struct RecoveryProof {
-    version: u32,
-    flow_digest: String,
-    repository: String,
-    intent: RecoveryIntent,
-}
-
-#[derive(Deserialize)]
-struct RecoveryIntent {
-    step_id: String,
-    operation: String,
-    state: String,
 }
 
 fn invalid() -> StoreError {
@@ -100,18 +84,30 @@ impl Store {
             return Ok(false);
         };
         let document: String = row.get::<Option<String>>(0)?.ok_or_else(invalid)?;
-        let Ok(proof) = serde_json::from_str::<RecoveryProof>(&document) else {
+        let Ok(proof) = serde_json::from_str::<serde_json::Value>(&document) else {
             return Ok(false);
         };
-        Ok(proof.version == 1
-            && proof.flow_digest == row.get::<String>(1)?
-            && proof.repository == row.get::<String>(2)?
-            && proof.intent.step_id == row.get::<String>(3)?
-            && proof.intent.state == "prepared"
-            && matches!(
-                proof.intent.operation.as_str(),
-                "push" | "ensure_pr" | "merge" | "sync"
-            ))
+        Ok(
+            proof.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                && proof.get("flow_digest").and_then(serde_json::Value::as_str)
+                    == Some(row.get::<String>(1)?.as_str())
+                && proof.get("repository").and_then(serde_json::Value::as_str)
+                    == Some(row.get::<String>(2)?.as_str())
+                && proof
+                    .pointer("/intent/step_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(row.get::<String>(3)?.as_str())
+                && proof
+                    .pointer("/intent/state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("prepared")
+                && matches!(
+                    proof
+                        .pointer("/intent/operation")
+                        .and_then(serde_json::Value::as_str),
+                    Some("push" | "ensure_pr" | "merge" | "sync")
+                ),
+        )
     }
 
     /// Read without allocating an oversized persisted document.

@@ -20,6 +20,12 @@ mod evidence_view_test;
 pub mod executor;
 pub mod flow_exec;
 pub mod flow_service;
+mod flow_contract;
+mod flow_result_service;
+#[cfg(test)]
+mod flow_contract_test;
+#[cfg(test)]
+mod flow_result_service_test;
 pub mod lifecycle;
 mod log_semantic;
 pub mod log_service;

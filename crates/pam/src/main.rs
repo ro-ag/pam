@@ -627,7 +627,11 @@ async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool, json:
         Ok(_) => terminal_result(base, ticket, json).await,
         Err(err) => {
             eprintln!("pam wait: {err}");
-            ExitCode::FAILURE
+            if matches!(err, client::RequestError::FollowRefused { .. }) {
+                ExitCode::from(render::EXIT_REFUSED)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

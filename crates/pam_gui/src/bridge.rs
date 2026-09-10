@@ -208,6 +208,9 @@ impl From<RequestError> for BridgeError {
                 "Admin operations go through admin_call; everything else through \
                  request_capability.",
             ),
+            RequestError::FollowRefused {
+                cause, recovery, ..
+            } => Self::new(cause, detail, recovery),
             RequestError::Parse { .. } => Self::new(
                 "protocol_error",
                 detail,

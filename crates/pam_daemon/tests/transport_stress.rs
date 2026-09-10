@@ -58,6 +58,9 @@ impl Harness {
             .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
             .await
             .unwrap();
+        store.set_setting("flows.scope_policy", &json!({
+            "version": 1, "repositories": [{"root": base.canonicalize().unwrap(), "connectors": []}]
+        }).to_string()).await.unwrap();
         drop(store);
         let child = Command::new(binary)
             .arg("daemon")
@@ -391,6 +394,7 @@ async fn follow_probe(harness: &mut Harness) {
         Duration::from_secs(15),
         tokio::process::Command::new(std::env::var_os("PAM_STRESS_BINARY").unwrap())
             .args(["subscribe", &ticket, "--timeout-ms", "15000"])
+            .current_dir(&harness.base)
             .env("PAM_BASE_DIR", &harness.base)
             .stdin(Stdio::null())
             .kill_on_drop(true)

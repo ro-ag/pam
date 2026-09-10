@@ -169,6 +169,10 @@ pub enum BuiltinCapability {
     FlowList,
     /// Read one flow's YAML, canonical rendering and digest.
     FlowShow,
+    /// Inspect bounded flow readiness without executing it.
+    FlowInspect,
+    /// Retrieve a bounded, scoped durable flow result.
+    FlowResult,
     /// Read one scoped, bounded redacted evidence range.
     EvidenceRead,
 }
@@ -187,6 +191,8 @@ impl BuiltinCapability {
             crate::flow_service::CAP_FLOW_RUN => Some(Self::FlowRun),
             crate::flow_service::CAP_FLOW_LIST => Some(Self::FlowList),
             crate::flow_service::CAP_FLOW_SHOW => Some(Self::FlowShow),
+            crate::flow_service::CAP_FLOW_INSPECT => Some(Self::FlowInspect),
+            crate::flow_result_service::CAP_FLOW_RESULT => Some(Self::FlowResult),
             crate::evidence_service::CAP_EVIDENCE_READ => Some(Self::EvidenceRead),
             _ => None,
         }
@@ -203,6 +209,8 @@ impl BuiltinCapability {
             Self::FlowRun => crate::flow_service::CAP_FLOW_RUN,
             Self::FlowList => crate::flow_service::CAP_FLOW_LIST,
             Self::FlowShow => crate::flow_service::CAP_FLOW_SHOW,
+            Self::FlowInspect => crate::flow_service::CAP_FLOW_INSPECT,
+            Self::FlowResult => crate::flow_result_service::CAP_FLOW_RESULT,
             Self::EvidenceRead => crate::evidence_service::CAP_EVIDENCE_READ,
         }
     }
@@ -217,6 +225,8 @@ impl BuiltinCapability {
             Self::FlowRun => flow_run(&ctx).await,
             Self::FlowList => flow_list(&ctx),
             Self::FlowShow => flow_show(&ctx),
+            Self::FlowInspect => Ok(ctx.flows.inspect(&ctx, &ctx.args).await?),
+            Self::FlowResult => crate::flow_result_service::result(&ctx).await,
             Self::EvidenceRead => crate::evidence_service::read(&ctx).await,
         }
     }
@@ -230,7 +240,7 @@ async fn flow_run(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailu
 
 /// `flow.list`: the flow library.
 fn flow_list(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    Ok(ctx.flows.list()?)
+    Ok(ctx.flows.list_page(&ctx.args)?)
 }
 
 /// `flow.show`: one flow's text and canonical rendering.
@@ -327,32 +337,7 @@ async fn model_block(ctx: &ExecContext) -> serde_json::Value {
 /// event was published still terminates instead of waiting for an
 /// event that will never be re-sent.
 async fn query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    let Some(ticket) = ctx.args.get("ticket").and_then(serde_json::Value::as_str) else {
-        return Err(CapabilityFailure::Failed {
-            detail: "query needs args.ticket naming the request to look up".to_owned(),
-        });
-    };
-    let row = ctx
-        .store
-        .get_request(ticket)
-        .await
-        .map_err(|err| CapabilityFailure::Failed {
-            detail: format!("cannot read request {ticket}: {err}"),
-        })?;
-    let Some(row) = row else {
-        return Err(CapabilityFailure::Failed {
-            detail: format!("no request {ticket} exists"),
-        });
-    };
-    Ok(CapabilityOutput {
-        outcome: Outcome::Verified,
-        body: serde_json::json!({
-            "ticket": row.id,
-            "state": row.state.as_str(),
-            "outcome": row.outcome,
-        }),
-        evidence: Vec::new(),
-    })
+    crate::flow_result_service::scoped_query(ctx).await
 }
 
 /// `echo`: mirror the args back; `args.delay_ms` sleeps first, honoring

@@ -32,6 +32,8 @@
 //! here beside the rendering so the clap shell in `main.rs` stays thin
 //! and the CLI's whole text surface is unit-testable in one place.
 
+use std::fmt::Write as _;
+
 use pam_proto::{Event, Outcome, Response};
 use serde_json::Value;
 
@@ -219,7 +221,7 @@ pub fn render_flow_list(body: &Value) -> String {
         .collect::<Vec<String>>()
         .join("\n");
     if let Some(offset) = body.get("next_offset").and_then(Value::as_u64) {
-        rendered.push_str(&format!("\nmore: pam flow list --offset {offset}"));
+        let _ = write!(rendered, "\nmore: pam flow list --offset {offset}");
     }
     rendered
 }

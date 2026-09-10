@@ -22,7 +22,7 @@ pub struct RequestStatusMeta {
 pub struct FlowResultMeta {
     /// Private connector authorization metadata, never returned publicly.
     pub origin_json: String,
-    /// Protected verdict metadata; only its typed agent_result may be exposed.
+    /// Protected verdict metadata; only its typed `agent_result` may be exposed.
     pub metadata_json: String,
 }
 
@@ -34,7 +34,7 @@ impl Store {
     ) -> Result<Option<RequestStatusMeta>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let mut rows = self.conn.query(
-            "SELECT capability,repo,state,outcome,authorization_revision FROM request WHERE id=?1 AND LENGTH(CAST(capability AS BLOB))<=128 AND LENGTH(CAST(repo AS BLOB))<=8192 AND (outcome IS NULL OR LENGTH(CAST(outcome AS BLOB))<=128)",params![ticket]).await?;
+            "SELECT capability,repo,state,outcome,authorization_revision FROM request WHERE id=?1 AND LENGTH(CAST(state AS BLOB))<=32 AND LENGTH(CAST(capability AS BLOB))<=128 AND LENGTH(CAST(repo AS BLOB))<=8192 AND (outcome IS NULL OR LENGTH(CAST(outcome AS BLOB))<=128)",params![ticket]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };

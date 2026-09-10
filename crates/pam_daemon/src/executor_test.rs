@@ -127,7 +127,18 @@ fn envelope(id: &str, args: serde_json::Value) -> Envelope {
 
 #[test]
 fn registry_names_round_trip_and_cover_classify() {
-    for name in ["status", "query", "echo", "cancel"] {
+    for name in [
+        "status",
+        "query",
+        "echo",
+        "cancel",
+        "flow.run",
+        "flow.list",
+        "flow.show",
+        "flow.inspect",
+        "flow.result",
+        "evidence.read",
+    ] {
         let capability = BuiltinCapability::from_name(name).unwrap();
         assert_eq!(capability.name(), name);
         assert!(
@@ -175,20 +186,40 @@ async fn status_reports_versions_uptime_and_inflight_count() {
 async fn query_reports_a_request_row_state_and_outcome() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         fx.store
-            .insert_request("req_target", "echo", "/repo/a", "claude", "{}", None)
+            .set_setting(
+                crate::scope_policy::SETTING_SCOPE_POLICY,
+                &serde_json::json!({
+                    "version": 1, "repositories": [{"root": repo, "connectors": []}]
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        fx.store
+            .insert_admitted_request("req_target", "echo", &repo, "claude", "{}", None, 60_000)
             .await
             .unwrap();
 
         // Non-terminal: state comes back as-is, no outcome yet.
-        let ctx = fx.ctx_uncancelled("req_query", serde_json::json!({ "ticket": "req_target" }));
+        let mut ctx =
+            fx.ctx_uncancelled("req_query", serde_json::json!({ "ticket": "req_target" }));
+        ctx.caller.repo.clone_from(&repo);
         let output = BuiltinCapability::Query.execute(ctx).await.unwrap();
-        assert_eq!(output.outcome, Outcome::Verified);
+        assert_eq!(output.outcome, Outcome::Blocked);
         assert_eq!(
             output.body,
             serde_json::json!({
                 "ticket": "req_target",
-                "state": "queued",
+                "capability": "echo",
+                "state": "running",
                 "outcome": null,
             })
         );
@@ -208,7 +239,9 @@ async fn query_reports_a_request_row_state_and_outcome() {
             )
             .await
             .unwrap();
-        let ctx = fx.ctx_uncancelled("req_query2", serde_json::json!({ "ticket": "req_target" }));
+        let mut ctx =
+            fx.ctx_uncancelled("req_query2", serde_json::json!({ "ticket": "req_target" }));
+        ctx.caller.repo.clone_from(&repo);
         let output = BuiltinCapability::Query.execute(ctx).await.unwrap();
         assert_eq!(output.body["state"], "done");
         assert_eq!(output.body["outcome"], "solved");
@@ -225,7 +258,7 @@ async fn query_fails_legibly_without_a_ticket_or_row() {
         let ctx = fx.ctx_uncancelled("req_query", serde_json::json!({}));
         let result = BuiltinCapability::Query.execute(ctx).await;
         assert!(
-            matches!(result, Err(CapabilityFailure::Failed { ref detail }) if detail.contains("args.ticket")),
+            matches!(result, Err(CapabilityFailure::Refused { ref cause, .. }) if cause == "result_unavailable"),
             "got {result:?}"
         );
 
@@ -233,7 +266,7 @@ async fn query_fails_legibly_without_a_ticket_or_row() {
             fx.ctx_uncancelled("req_query", serde_json::json!({ "ticket": "req_ghost" }));
         let result = BuiltinCapability::Query.execute(ctx).await;
         assert!(
-            matches!(result, Err(CapabilityFailure::Failed { ref detail }) if detail.contains("req_ghost")),
+            matches!(result, Err(CapabilityFailure::Refused { ref cause, .. }) if cause == "result_unavailable"),
             "got {result:?}"
         );
     })

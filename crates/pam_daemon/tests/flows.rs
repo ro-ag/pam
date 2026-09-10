@@ -154,7 +154,57 @@ impl FlowDaemon {
         let response = client
             .request(&self.run_envelope(request_id, id, &serde_json::json!({})))
             .await;
-        result_body(response)
+        self.full_report(client, request_id, response).await
+    }
+
+    /// Preserve detailed execution checks through the public redacted evidence path.
+    async fn full_report(
+        &self,
+        client: &mut TestClient,
+        ticket: &str,
+        response: Response,
+    ) -> serde_json::Value {
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 16_384);
+        let projection = result_body(response);
+        assert_eq!(projection["schema_version"], 1);
+        assert_eq!(projection["ticket"], ticket);
+        let verdict = self
+            .daemon
+            .store()
+            .list_evidence(ticket)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == EVIDENCE_KIND_FLOW_RESULT)
+            .expect("full report retained");
+        let mut args =
+            serde_json::json!({"request_id": ticket, "evidence_id": verdict.id, "length": 65536});
+        let mut bytes = Vec::new();
+        for page in 0..128 {
+            let response = client
+                .request(&envelope_for_repo(
+                    &self.repo(),
+                    &format!("{ticket}_report_{page}"),
+                    "evidence.read",
+                    args.clone(),
+                    true,
+                ))
+                .await;
+            let body = result_body(response);
+            let data = body["data"].as_str().expect("hex range");
+            bytes.extend(
+                (0..data.len())
+                    .step_by(2)
+                    .map(|index| u8::from_str_radix(&data[index..index + 2], 16).unwrap()),
+            );
+            if body["eof"] == true {
+                return serde_json::from_slice(&bytes).expect("complete redacted report JSON");
+            }
+            args["offset"] = body["next_offset"].clone();
+            args["expected_view_id"] = body["view_id"].clone();
+            args["expected_sha256"] = body["view_sha256"].clone();
+        }
+        panic!("fixture report exceeded page bound");
     }
 }
 
@@ -342,6 +392,18 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
                 .await,
         );
         assert_eq!(outcome, Outcome::Verified);
+        let body = flows
+            .full_report(
+                &mut client,
+                "req_run",
+                Response::Result {
+                    id: "req_run".into(),
+                    outcome,
+                    body,
+                    evidence: evidence.clone(),
+                },
+            )
+            .await;
         assert_eq!(body["outcome"], "verified");
         assert_eq!(body["flow"]["id"], "two-step");
         assert_eq!(body["flow"]["source"], "library");
@@ -385,7 +447,11 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             ]
         );
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        assert_eq!(ids, evidence, "the answer lists every row the run left");
+        assert_eq!(
+            evidence,
+            vec![ids.last().unwrap().clone()],
+            "outer response retains the full report reference"
+        );
 
         let verdict = store
             .get_evidence(evidence.last().expect("a verdict row"))
@@ -398,15 +464,14 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
         let meta: serde_json::Value =
             serde_json::from_str(verdict.meta_json.as_deref().expect("the verdict has meta"))
                 .expect("the meta is JSON");
-        assert_eq!(
-            meta,
-            serde_json::json!({
-                "flow": "two-step",
-                "outcome": "verified",
-                "steps": 2,
-                "failed": 0,
-            })
-        );
+        assert_eq!(meta["flow"], "two-step");
+        assert_eq!(meta["outcome"], "verified");
+        assert_eq!(meta["steps"], 2);
+        assert_eq!(meta["failed"], 0);
+        let retained = meta["agent_result"]["evidence"].as_array().unwrap();
+        for id in ids {
+            assert!(retained.contains(&serde_json::json!(id)));
+        }
 
         flows
             .daemon
@@ -1235,15 +1300,14 @@ async fn sonar_test_daemon(yaml: &str, transport: Arc<FakeTransport>) -> FlowDae
 
 async fn sonar_run(flows: &FlowDaemon) -> serde_json::Value {
     let mut client = flows.daemon.client().await;
-    result_body(
-        client
-            .request(&flows.run_envelope(
-                "req_run",
-                "sonar-gate-check",
-                &serde_json::json!({"project": "pam"}),
-            ))
-            .await,
-    )
+    let response = client
+        .request(&flows.run_envelope(
+            "req_run",
+            "sonar-gate-check",
+            &serde_json::json!({"project": "pam"}),
+        ))
+        .await;
+    flows.full_report(&mut client, "req_run", response).await
 }
 
 async fn assert_sonar_evidence(
@@ -1553,8 +1617,9 @@ async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_fai
                 "username":"ci-bot","credential":{"set":"test-jenkins-credential"}}))).await;
         assert!(matches!(response, Response::Result { .. }), "{response:?}");
         flows.grant(&step_capability("jenkins-build-investigation", "investigate-build")).await;
-        let body = result_body(client.request(&flows.run_envelope("req_jenkins_investigate",
-            "jenkins-build-investigation", &serde_json::json!({"job":"service","build":"41"}))).await);
+        let response = client.request(&flows.run_envelope("req_jenkins_investigate",
+            "jenkins-build-investigation", &serde_json::json!({"job":"service","build":"41"}))).await;
+        let body = flows.full_report(&mut client, "req_jenkins_investigate", response).await;
         assert_ne!(body["outcome"], "solved");
         let investigation = step(&body, "investigate-build");
         assert_eq!(investigation["status"], "failed");

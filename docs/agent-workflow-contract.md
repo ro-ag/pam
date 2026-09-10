@@ -180,9 +180,9 @@ pam evidence read <evidence-id> --request <ticket> --json
 The build/job values are examples; use an authorized explicit build. Settings
 and grants are configured by the human through the GUI. `subscribe` follows the
 submitted request; it is not yet the durable remote-job watcher proposed above.
-The current CLI summary is bounded, but original evidence retrieval is still
-GUI-oriented: #127/#103 close that gap. No `pam evidence` command or `land-watch`
-flow is promised by these examples. Microsoft setup lives in Models → Catalog;
+Scoped redacted evidence retrieval is available through `pam evidence read`.
+Whole-result bounds and durable result inspection are being added in #103; a
+`land-watch` flow remains future work. Microsoft setup lives in Models → Catalog;
 keep it off until its input class and resource envelope qualify.
 
 ## Instructions for the next implementation session
@@ -190,7 +190,8 @@ keep it off until its input class and resource envelope qualify.
 1. Run `ptrack context`, read repository/machine rules and
    [the roadmap](agent-companion-roadmap.md), then inspect the selected task with
    `ptrack task show <id>`. Confirm dependencies rather than inferring order from
-   task numbers. Start with plan #31 and task #125.
+   task numbers. Use the current ptrack status to select work; completed tasks
+   must not be restarted from this document.
 2. Read the relevant existing module and its callers before adding an abstraction.
    Preserve Unix IPC, flows and GUI seams. Read `pam-old` evidence where referenced,
    but do not transplant old keyword diagnosis or treat its llama.cpp results as

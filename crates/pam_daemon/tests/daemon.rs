@@ -1057,7 +1057,10 @@ async fn a_model_admin_op_from_an_agent_trips_the_wire() {
             panic!("a model admin op from an agent must be refused");
         };
         assert_eq!(cause, CAUSE_ADMIN_DENIED);
-        assert!(detail.contains("GUI-only"), "detail: {detail}");
+        assert!(
+            detail.contains("private native channel"),
+            "detail: {detail}"
+        );
         assert!(!recovery.is_empty());
 
         // Audited as the tripwire, not as an ordinary admin refusal, so

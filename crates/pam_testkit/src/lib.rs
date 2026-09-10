@@ -323,6 +323,15 @@ impl TestDaemon {
             .await
             .expect("dealer connects");
         TestClient {
+            base: self
+                .handle
+                .runtime_dir()
+                .run_dir()
+                .parent()
+                .expect("run parent")
+                .to_path_buf(),
+            admin: self.handle.admin(),
+            pending_admin: std::collections::VecDeque::new(),
             dealer,
             sent_ids: Arc::clone(&self.sent_ids),
         }
@@ -470,13 +479,38 @@ impl TestDaemon {
 /// [`Response`]s, recording every sent request id for the daemon's
 /// invariant sweep.
 pub struct TestClient {
+    base: std::path::PathBuf,
+    admin: Arc<pam_daemon::admin::AdminService>,
+    pending_admin: std::collections::VecDeque<Response>,
     dealer: DealerSocket,
     sent_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestClient {
-    /// Sends one envelope.
+    /// Sends an agent envelope through public IPC or explicitly seeds trusted
+    /// administration through the native channel. Unsupported platform fixtures
+    /// use the in-process service, never an insecure production wire fallback.
     pub async fn send(&mut self, envelope: &Envelope) {
+        if envelope.capability.starts_with("admin.") {
+            self.sent_ids
+                .lock()
+                .expect("sent ids")
+                .push(envelope.id.clone());
+            let response = if pam_daemon::admin_transport::supported() {
+                with_deadline(pam_daemon::admin_transport::exchange(&self.base, envelope))
+                    .await
+                    .expect("private admin exchange")
+            } else {
+                self.admin.handle(envelope).await
+            };
+            self.pending_admin.push_back(response);
+            return;
+        }
+        self.send_public(envelope).await;
+    }
+
+    /// Raw public ingress, including deliberately forged administration.
+    pub async fn send_public(&mut self, envelope: &Envelope) {
         self.sent_ids
             .lock()
             .expect("sent-ids lock")
@@ -489,6 +523,9 @@ impl TestClient {
 
     /// Receives one response.
     pub async fn recv(&mut self) -> Response {
+        if let Some(response) = self.pending_admin.pop_front() {
+            return response;
+        }
         let answer = with_deadline(self.dealer.recv()).await.expect("recv ok");
         let frames = answer.into_vec();
         serde_json::from_slice(&frames[0]).expect("parse response")

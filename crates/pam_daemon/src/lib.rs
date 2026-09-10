@@ -9,6 +9,7 @@ pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;
 pub mod admin_retention;
+pub mod admin_transport;
 pub mod approval;
 pub mod connector_service;
 pub mod daemon;

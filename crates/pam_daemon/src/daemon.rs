@@ -34,9 +34,9 @@
 //! # Admin surface (GUI-only)
 //!
 //! Envelopes whose capability starts with the reserved
-//! [`crate::admin::ADMIN_PREFIX`] are intercepted right after the
-//! lifecycle/version gates and handed to [`crate::admin::AdminService`]
-//! — **before** classify, admit, and the policy gate. Admin operations
+//! [`crate::admin::ADMIN_PREFIX`] are refused on public IPC regardless
+//! of caller labels. Native private administration uses
+//! [`crate::admin_transport`] and owns its work through terminal audit. Admin operations
 //! are not capabilities: they have no `classify()` entry and can never
 //! be granted, approved, or queued. The service records its own request
 //! row, enforces the envelope deadline, audits every outcome
@@ -334,6 +334,9 @@ pub enum DaemonError {
     /// The transport sockets could not be bound.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The private administrative listener could not be secured.
+    #[error("private admin transport: {0}")]
+    AdminTransport(std::io::Error),
     /// The store could not be opened or queried.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -426,6 +429,8 @@ pub struct DaemonHandle {
     approvals: Arc<ApprovalService>,
     models: Arc<ModelService>,
     transport: Transport,
+    admin_transport: crate::admin_transport::AdminTransport,
+    admin: Arc<AdminService>,
     tasks: Vec<JoinHandle<()>>,
     phase: watch::Sender<LifecyclePhase>,
     /// Held for the daemon's lifetime; dropping the handle releases it.
@@ -451,6 +456,13 @@ impl DaemonHandle {
     #[must_use]
     pub fn approvals(&self) -> Arc<ApprovalService> {
         Arc::clone(&self.approvals)
+    }
+
+    /// Trusted in-process administration for embedding/test hosts. This is not
+    /// exposed over public IPC; a socket client cannot obtain this handle.
+    #[must_use]
+    pub fn admin(&self) -> Arc<AdminService> {
+        Arc::clone(&self.admin)
     }
 
     /// The model layer: registry, runtime, downloads, tier defaults.
@@ -482,6 +494,7 @@ impl DaemonHandle {
         for task in self.tasks {
             let _ = task.await;
         }
+        self.admin_transport.shutdown().await;
         self.transport.shutdown().await;
     }
 }
@@ -565,6 +578,10 @@ pub async fn run_daemon(
 /// dispatcher, executor loop, lease reaper, and lifecycle task.
 /// `config.base_dir` defaults to `~/.pam`. Flip `shutdown` to start the
 /// graceful drain, then await [`DaemonHandle::shutdown`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered service assembly keeps lock, ingress and shutdown ownership visible together"
+)]
 pub async fn run_daemon_with(
     config: DaemonConfig,
     shutdown: watch::Receiver<bool>,
@@ -575,6 +592,7 @@ pub async fn run_daemon_with(
             .ok_or(RuntimeDirError::HomeNotFound)?
             .join(".pam"),
     };
+    let base = crate::admin_transport::prepare_base(&base).map_err(DaemonError::AdminTransport)?;
     let dirs = RuntimeDir::at_base(&base)?;
     let lock = acquire_instance_lock(dirs.run_dir())?;
     let store = Arc::new(Store::open(&base.join("state.sqlite3")).await?);
@@ -622,20 +640,33 @@ pub async fn run_daemon_with(
     // dispatch keeps answering (with refusals) until the drain is done.
     let (drain_tx, drain_rx) = watch::channel(false);
     let (dispatch_stop_tx, dispatch_stop_rx) = watch::channel(false);
+    let admin = Arc::new(AdminService::new(
+        Arc::clone(&store),
+        Arc::clone(&approvals),
+        Arc::clone(&models),
+        logs,
+        connectors,
+        Arc::clone(&flows),
+        incoming_tx.clone(),
+    ));
+    let admin_transport = match crate::admin_transport::AdminTransport::bind(
+        &base,
+        Arc::clone(&admin),
+        phase.clone(),
+    ) {
+        Ok(listener) => listener,
+        Err(error) => {
+            transport.shutdown().await;
+            return Err(DaemonError::AdminTransport(error));
+        }
+    };
+
     let pipeline = Arc::new(Pipeline {
         store: Arc::clone(&store),
         gate,
         queue: Arc::clone(&queue),
         approvals: Arc::clone(&approvals),
-        admin: AdminService::new(
-            Arc::clone(&store),
-            Arc::clone(&approvals),
-            Arc::clone(&models),
-            logs,
-            connectors,
-            Arc::clone(&flows),
-            incoming_tx.clone(),
-        ),
+        admin: Arc::clone(&admin),
         flows,
         models: Arc::clone(&models),
         secrets,
@@ -672,6 +703,8 @@ pub async fn run_daemon_with(
         approvals,
         models,
         transport,
+        admin_transport,
+        admin,
         tasks,
         phase,
         _lock: lock,
@@ -779,7 +812,7 @@ struct Pipeline {
     /// GUI-only admin surface; envelopes under the reserved `admin.`
     /// prefix are handed here **before** classify/admit and never touch
     /// the gate, grants, or lanes (see [`crate::admin`]).
-    admin: AdminService,
+    admin: Arc<AdminService>,
     /// The flow engine, carried into every [`ExecContext`] so the three
     /// `flow.*` capabilities can reach it.
     flows: Arc<FlowService>,
@@ -858,6 +891,11 @@ impl Pipeline {
     /// pipeline by `Arc` so the approval path can spawn a background
     /// wait for `wait: false` callers.
     async fn handle(self: Arc<Self>, envelope: Envelope, reply: oneshot::Sender<Response>) {
+        if envelope.capability.starts_with(ADMIN_PREFIX) {
+            let response = self.admin.handle_from_ingress(&envelope, false).await;
+            let _ = reply.send(response);
+            return;
+        }
         let id = envelope.id.clone();
 
         // Lifecycle gates run before anything is recorded: neither a
@@ -887,17 +925,6 @@ impl Pipeline {
                     false
                 }
             });
-            return;
-        }
-
-        // Admin surface: the reserved `admin.` prefix is intercepted
-        // BEFORE classify/admit — admin operations are not capabilities
-        // and never touch the gate, grants, dedupe, or lanes. The
-        // service records, audits, and answers on its own (deadline
-        // included); see `crate::admin` for the full security model.
-        if envelope.capability.starts_with(ADMIN_PREFIX) {
-            let response = self.admin.handle(&envelope).await;
-            let _ = reply.send(response);
             return;
         }
 
@@ -1756,7 +1783,7 @@ fn attach_refusal(id: &str, timed_out: bool) -> Response {
 }
 
 /// Refusal for a request that arrived while the daemon drains.
-fn shutting_down_refusal(id: &str) -> Response {
+pub(crate) fn shutting_down_refusal(id: &str) -> Response {
     Response::Refusal {
         id: id.to_owned(),
         cause: CAUSE_DAEMON_SHUTTING_DOWN.to_owned(),
@@ -1767,7 +1794,7 @@ fn shutting_down_refusal(id: &str) -> Response {
 
 /// Refusal for the version handshake: the client build is newer than
 /// this daemon, which restarts itself.
-fn outdated_refusal(id: &str, client_version: &str) -> Response {
+pub(crate) fn outdated_refusal(id: &str, client_version: &str) -> Response {
     Response::Refusal {
         id: id.to_owned(),
         cause: CAUSE_DAEMON_OUTDATED.to_owned(),

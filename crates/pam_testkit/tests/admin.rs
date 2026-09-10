@@ -1,10 +1,8 @@
-//! Admin-surface integration: real daemon, real zmq, real store —
-//! exercising the GUI-only `admin.*` envelope path end to end.
+//! Administration integration through the trusted native test client.
 //!
-//! Admin envelopes are built by hand here (caller agent `pam-gui`, the
-//! daemon's tripwire) because the production path to them is the GUI's
-//! `pam::client::send_admin`, not the testkit's agent-shaped
-//! [`pam_testkit::envelope`] — mirroring the real separation.
+//! macOS/Linux exercise the private Unix socket. Unsupported platforms use
+//! an explicit in-process fixture; GUI tests separately assert unsupported
+//! production administration. Forgery tests always use raw public `ZeroMQ`.
 
 use pam_daemon::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, CAUSE_ADMIN_DENIED, OP_ACTIVITY_LIST, OP_APPROVALS_PENDING,
@@ -246,6 +244,199 @@ async fn admin_envelope_from_an_agent_identity_trips_the_wire() {
             .assert_row_state("req_trip", RequestState::Refused)
             .await;
         daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn public_socket_refuses_forged_gui_identity_before_version_handshake() {
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
+        for (index, op) in ["admin.grants.add", OP_PROFILE_SET, OP_APPROVALS_RESOLVE,
+            "admin.connectors.save", "admin.models.download", "admin.flows.run"].iter().enumerate() {
+            let mut forged = admin_envelope(&format!("forged_{index}"), op,
+                serde_json::json!({"capability":"deploy", "profile":"strict", "secret":"never-store-this"}));
+            forged.client_version = "forged-version".to_owned();
+            forged.caller.pid = std::process::id();
+            client.send_public(&forged).await;
+            assert!(matches!(client.recv().await, Response::Refusal { cause, .. } if cause == CAUSE_ADMIN_DENIED));
+            let row = daemon.store().get_request(&forged.id).await.unwrap().unwrap();
+            assert_eq!(row.args_json, "{}");
+            assert_eq!(row.state, RequestState::Refused);
+        }
+        assert!(matches!(client.request(&envelope("still_serving", "echo", serde_json::json!({}), true)).await,
+            Response::Result { .. }));
+        daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn replayed_admin_id_cannot_apply_another_mutation() {
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
+        let first = admin_envelope(
+            "same_admin_id",
+            OP_PROFILE_SET,
+            serde_json::json!({"profile":"strict"}),
+        );
+        body_of(client.request(&first).await, Outcome::Changed);
+        let replay = admin_envelope(
+            "same_admin_id",
+            OP_PROFILE_SET,
+            serde_json::json!({"profile":"relaxed"}),
+        );
+        assert!(matches!(
+            client.request(&replay).await,
+            Response::Refusal { .. }
+        ));
+        let body = body_of(
+            client
+                .request(&admin_envelope(
+                    "read_after_replay",
+                    OP_PROFILE_GET,
+                    serde_json::json!({}),
+                ))
+                .await,
+            Outcome::Verified,
+        );
+        assert_eq!(body["profile"], "strict");
+        daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    })
+    .await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn oversized_native_frame_is_closed_without_recording_or_stopping_daemon() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    with_deadline(async {
+        let tmp = short_tempdir();
+        let base = base_of(&tmp);
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let mut raw = tokio::net::UnixStream::connect(base.join("admin/control.sock"))
+            .await
+            .unwrap();
+        raw.write_u32(1024 * 1024 + 1).await.unwrap();
+        let mut byte = [0];
+        assert_eq!(raw.read(&mut byte).await.unwrap(), 0);
+        let mut gui = daemon.client().await;
+        body_of(
+            gui.request(&admin_envelope(
+                "native_after_bad_frame",
+                OP_PROFILE_GET,
+                serde_json::json!({}),
+            ))
+            .await,
+            Outcome::Verified,
+        );
+        daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    })
+    .await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn unsafe_parent_and_symlink_base_are_rejected_before_state_creation() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let tmp = short_tempdir();
+    let parent = base_of(&tmp).join("unsafe");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let base = parent.join("pam");
+    let (_shutdown, receiver) = tokio::sync::watch::channel(false);
+    assert!(
+        pam_daemon::daemon::run_daemon(Some(base.clone()), receiver)
+            .await
+            .is_err()
+    );
+    assert!(!base.join("state.sqlite3").exists());
+    let link = base_of(&tmp).join("alias");
+    symlink(base_of(&tmp), &link).unwrap();
+    let (_shutdown, receiver) = tokio::sync::watch::channel(false);
+    assert!(
+        pam_daemon::daemon::run_daemon(Some(link), receiver)
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is_not_replayed() {
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let base = daemon.base_dir();
+        let response = pam_daemon::admin_transport::exchange(
+            &base,
+            &admin_envelope("before_restart", OP_PROFILE_GET, serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        body_of(response, Outcome::Verified);
+        daemon
+            .store()
+            .insert_running_request(
+                "interrupted_admin",
+                OP_PROFILE_SET,
+                ADMIN_REPO,
+                ADMIN_CALLER_AGENT,
+                "{}",
+                None,
+            )
+            .await
+            .unwrap();
+        let tmp = daemon.stop().await;
+        let restarted = TestDaemon::spawn_at(tmp).await;
+        let interrupted = restarted
+            .store()
+            .get_request("interrupted_admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.state, RequestState::Failed);
+        assert_eq!(interrupted.outcome.as_deref(), Some("daemon_restart"));
+        let response = pam_daemon::admin_transport::exchange(
+            &base,
+            &admin_envelope("after_restart", OP_PROFILE_GET, serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body_of(response, Outcome::Verified)["profile"], "relaxed");
+        restarted.assert_invariant_clean().await;
+        restarted.stop().await;
+    })
+    .await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn native_version_mismatch_refuses_mutation_and_requests_restart() {
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut request = admin_envelope(
+            "native_bad_version",
+            OP_PROFILE_SET,
+            serde_json::json!({"profile":"strict"}),
+        );
+        request.client_version = "different-build".to_owned();
+        let response = pam_daemon::admin_transport::exchange(&daemon.base_dir(), &request)
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Refusal { cause, .. } if cause == "daemon_outdated"));
+        assert!(
+            daemon
+                .store()
+                .get_request(&request.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         daemon.stop().await;
     })
     .await;

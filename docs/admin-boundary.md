@@ -57,3 +57,25 @@ Those tests do not establish the deployed sandbox's filesystem, process, or
 credential restrictions. Deployment verification must separately confirm that
 an agent can reach its permitted public operations while it cannot reach or
 modify the private resources listed above.
+
+## Resource and recovery limits
+
+Native frames are capped before allocation: 1 MiB requests and 16 MiB replies.
+At most 32 native connection handlers are active, with a five-second frame-read
+limit and request deadlines between one millisecond and five minutes. The request
+clock starts before ledger insertion; waiting for bookkeeping cannot grant a
+fresh execution deadline. Terminal audit persistence remains tracked after that
+clock expires. Interrupted admin rows enter crash recovery, never the work queue.
+
+Shutdown stops acceptance and gives owned asynchronous handlers five seconds to
+drain. This is not a cancellation guarantee for already-started blocking work
+(such as an OS keychain call or weight-file deletion): Rust cannot abort that
+work. Its effects can remain uncertain after a timeout, and runtime shutdown may
+wait longer. The connection cap is not a bound on detached blocking jobs. Work
+budget qualification must include these jobs before claiming a total-work bound.
+
+The daemon validates the canonical base and its ancestor ownership/write modes
+before opening state. Root-owned sticky temporary directories are allowed;
+the base must be owned and non-symlink, and the private admin directory/socket
+must have modes 0700/0600. These checks supplement the OS sandbox exclusions;
+they do not isolate mutually hostile processes sharing an unrestricted user.

@@ -1,41 +1,13 @@
-//! Admin surface: GUI-only daemon administration (grants, approvals,
-//! profile, activity, callers, models) over the same socket as everything
-//! else.
+//! Privileged administration through a separate native daemon ingress.
 //!
-//! # Security model — read this before touching the surface
-//!
-//! Security administration is **GUI-only by construction, advisory by
-//! nature**. The honest version, in full:
-//!
-//! - **The CLI has no security commands.** v1's hole was
-//!   `pam access grant`: an agent driving the CLI could grant itself
-//!   capabilities. v2 closes it structurally — no static `pam`
-//!   subcommand constructs an `admin.*` envelope, clap rejects unknown
-//!   subcommands, and agents interact with pam *exclusively* through
-//!   those static subcommands (the protocol is internal and has no
-//!   raw escape hatch in the binary). The client library enforces the
-//!   same line: `pam::client::send_request` refuses `admin.*`
-//!   capabilities outright, so no future subcommand can reach this
-//!   surface by accident; the GUI uses the separate, documented
-//!   `pam::client::send_admin` path.
-//! - **The wall is filesystem permissions, not cryptography.** The GUI
-//!   runs as the same user, over the same `~/.pam/run/pam.sock`; caller
-//!   identity is self-reported (spec: advisory). A process that can
-//!   open the socket and speak the internal protocol *could* craft an
-//!   `admin.*` envelope by bypassing the `pam` binary entirely.
-//!   Nothing on this machine stops the user's own processes from doing
-//!   that — nothing could, since GUI and daemon share the user. What
-//!   the design guarantees is narrower and real: **no agent that uses
-//!   pam as intended (through the CLI) can reach administration**, and
-//!   anything that bypasses the CLI is outside pam's threat model
-//!   (it could just as well edit `state.sqlite3` directly).
-//! - **Tripwire, not authentication.** Admin envelopes must carry
-//!   `caller.agent == "pam-gui"` ([`ADMIN_CALLER_AGENT`]). A mismatch
-//!   is refused (cause [`CAUSE_ADMIN_DENIED`]) and audited (action
-//!   [`ACTION_ADMIN_DENIED`], actor `system`, decision `refuse`) — an
-//!   agent that somehow emitted an `admin.*` capability without also
-//!   forging its identity leaves a visible trace. It is advisory: a
-//!   deliberate bypasser can forge the field, per the point above.
+//! Public `ZeroMQ` refuses every `admin.*` envelope, including forged GUI labels.
+//! Private ingress checks kernel peer ownership; the enterprise sandbox must
+//! exclude that endpoint, PAM state and trusted process/assets from agents.
+//! OS ownership does not prove GUI mode: unrestricted same-user processes remain
+//! privileged and are outside this boundary. See `docs/admin-boundary.md`.
+//! The supported CLI has no administrative subcommands. The native GUI uses the
+//! dedicated client path; its `pam-gui` label remains an advisory consistency
+//! check, never the source of authority. No bearer credential crosses the wire.
 //!
 //! # Structural guard: never in the capability pipeline
 //!
@@ -72,11 +44,8 @@
 //! - deadline elapsed mid-op → state `failed`, the daemon's
 //!   deadline-refusal audit row, decision `timeout`, actor `system`.
 //!
-//! A crash between the row insert and the finish can leave a `queued`
-//! `admin.*` row that the next boot's lane rebuild feeds to the
-//! executor, which fails it legibly (no builtin dispatches it) — a
-//! narrow, audited window, mirroring the pipeline's own admit/place
-//! crash window.
+//! Rows enter `running` atomically. Crash recovery fails interrupted admin
+//! operations without replaying them; effects may need reconciliation.
 //!
 //! Admin envelopes do **not** touch the caller registry
 //! ([`pam_store::Store::upsert_caller`] runs on the admitted pipeline
@@ -118,7 +87,7 @@ use pam_proto::{Envelope, Outcome, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 
 use crate::approval::{ApprovalService, Resolution};
 use crate::connector_service::ConnectorService;
@@ -221,7 +190,8 @@ pub(crate) const RECOVERY_INTERNAL: &str =
     "Retry; if it persists, restart the daemon from the PAM GUI.";
 
 /// Recovery line for an admin op that outlived its deadline.
-const RECOVERY_DEADLINE: &str = "Retry with a larger deadline.";
+const RECOVERY_DEADLINE: &str =
+    "Inspect state before retrying; an effect may already have started.";
 
 /// What a successful admin op hands back: the response pieces plus a
 /// compact audit detail (never the full body — list bodies are large).
@@ -282,9 +252,8 @@ impl From<StoreError> for OwnedRefusal {
     }
 }
 
-/// The admin service: one per daemon, called only by the dispatcher's
-/// [`ADMIN_PREFIX`] intercept (see the module docs for the whole
-/// security model).
+/// One admin service per daemon. Native ingress executes operations; public
+/// ingress records refusals. See module docs for the deployment boundary.
 #[derive(Debug)]
 pub struct AdminService {
     pub(crate) store: Arc<Store>,
@@ -337,11 +306,22 @@ impl AdminService {
     /// row, checks the caller tripwire, dispatches the op under the
     /// envelope's deadline, and finishes the row (terminal state +
     /// audit in one transaction) before answering.
+    /// Trusted in-process entry point. Network dispatch must use ingress
+    /// provenance; constructing this service already requires daemon authority.
     pub async fn handle(&self, envelope: &Envelope) -> Response {
+        self.handle_from_ingress(envelope, true).await
+    }
+
+    pub(crate) async fn handle_from_ingress(
+        &self,
+        envelope: &Envelope,
+        private_ingress: bool,
+    ) -> Response {
+        let deadline = Instant::now() + Duration::from_millis(envelope.deadline_ms.min(300_000));
         let id = &envelope.id;
         let inserted = self
             .store
-            .insert_request(
+            .insert_running_request(
                 id,
                 &envelope.capability,
                 ADMIN_REPO,
@@ -362,16 +342,14 @@ impl AdminService {
             };
         }
 
-        if envelope.caller.agent != ADMIN_CALLER_AGENT {
-            return self.refuse_tripwire(envelope).await;
+        if !private_ingress || envelope.caller.agent != ADMIN_CALLER_AGENT {
+            return self.refuse_tripwire(envelope, private_ingress).await;
         }
 
-        match timeout(
-            Duration::from_millis(envelope.deadline_ms),
-            self.dispatch(envelope),
-        )
-        .await
-        {
+        if Instant::now() >= deadline {
+            return self.finish_deadline(envelope).await;
+        }
+        match timeout_at(deadline, self.dispatch(envelope)).await {
             Ok(Ok(ok)) => self.finish_ok(envelope, ok).await,
             Ok(Err(refusal)) => self.finish_refused(envelope, refusal).await,
             Err(_elapsed) => self.finish_deadline(envelope).await,
@@ -804,12 +782,13 @@ impl AdminService {
 
     /// Finishes a tripwire hit: state `refused`, its own audit action
     /// ([`ACTION_ADMIN_DENIED`]) so the trace stands out in the trail.
-    async fn refuse_tripwire(&self, envelope: &Envelope) -> Response {
+    async fn refuse_tripwire(&self, envelope: &Envelope, private_ingress: bool) -> Response {
         let agent = &envelope.caller.agent;
         let detail = json!({
             "op": envelope.capability,
             "caller_agent": agent,
             "expected": ADMIN_CALLER_AGENT,
+            "private_ingress": private_ingress,
         })
         .to_string();
         let _ = self
@@ -829,7 +808,11 @@ impl AdminService {
         Response::Refusal {
             id: envelope.id.clone(),
             cause: CAUSE_ADMIN_DENIED.to_owned(),
-            detail: format!("admin operations are GUI-only; caller {agent:?} is not the PAM GUI"),
+            detail: if private_ingress {
+                format!("admin operations are GUI-only; caller {agent:?} is not the PAM GUI")
+            } else {
+                "admin operations require the private native channel; public IPC cannot administer PAM".to_owned()
+            },
             recovery: RECOVERY_ADMIN_DENIED.to_owned(),
         }
     }

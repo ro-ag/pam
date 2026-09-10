@@ -378,6 +378,103 @@ pub fn sidecar_paths(dest: &Path) -> SidecarPaths {
     }
 }
 
+/// What is sitting on disk for a transfer that never finished.
+///
+/// A partial is invisible to the registry — the sidecars are dotfiles and
+/// a scan skips them — so this is the only way anyone learns that 12 GB of
+/// a model is already here, or that the bytes came from a URL the current
+/// request disagrees with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PartialDownload {
+    /// Bytes in the part file.
+    pub bytes: u64,
+    /// The URL those bytes came from, when a checkpoint is readable.
+    pub source: Option<String>,
+    /// The digest the checkpoint expects, `sha256:<hex>` or
+    /// `sha256:unknown`.
+    pub expected_digest: Option<String>,
+    /// Whether a transfer is holding the lock right now.
+    pub locked: bool,
+}
+
+/// What a partial for `dest` looks like, or `None` when there is none.
+///
+/// A lock file with no part file is not a partial: [`start`] creates the
+/// lock before curl writes a byte, and a crash can leave it behind.
+#[must_use]
+pub fn inspect_partial(dest: &Path) -> Option<PartialDownload> {
+    let paths = sidecar_paths(dest);
+    if !paths.part.exists() {
+        return None;
+    }
+    let checkpoint = read_checkpoint(&paths.checkpoint);
+    Some(PartialDownload {
+        bytes: file_size(&paths.part),
+        source: checkpoint
+            .as_ref()
+            .map(|point| point.canonical_source.clone()),
+        expected_digest: checkpoint.map(|point| point.expected_digest),
+        locked: is_locked(&paths.lock),
+    })
+}
+
+/// Deletes the partial download beside `dest` and returns the bytes it
+/// threw away.
+///
+/// This is the way out of a [`DownloadError::CheckpointConflict`], and the
+/// way to start a transfer over rather than resume it. A running transfer
+/// holds the lock, and its bytes are not something to delete from under
+/// it: that is [`DownloadError::Locked`], and the caller is told to cancel
+/// first.
+///
+/// The lock file goes too. It carries no state — it exists to be locked —
+/// and leaving it behind would litter the vendor directory with a dotfile
+/// per abandoned download.
+pub fn discard_partial(dest: &Path) -> Result<u64, DownloadError> {
+    let paths = sidecar_paths(dest);
+    // Taking the lock is how "is anyone downloading this" is asked
+    // everywhere else; holding it across the deletes keeps a transfer from
+    // starting between the check and the unlink.
+    let lock = acquire_lock(&paths.lock)?;
+    let bytes = file_size(&paths.part);
+    remove_if_present(&paths.part)?;
+    remove_if_present(&paths.checkpoint)?;
+    remove_if_present(&etag_path(&paths.checkpoint))?;
+    drop(lock);
+    remove_if_present(&paths.lock)?;
+    Ok(bytes)
+}
+
+/// Whether another process or task holds the transfer lock.
+fn is_locked(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .create(false)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        // An unreadable lock is not evidence of a transfer.
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+/// Removes `path`, treating "it was not there" as success.
+fn remove_if_present(path: &Path) -> Result<(), DownloadError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DownloadError::Io(error)),
+    }
+}
+
 /// The `curl` executable on `PATH`, looked up once per process.
 ///
 /// Cached because a download asks for it and so does the GUI, every time it

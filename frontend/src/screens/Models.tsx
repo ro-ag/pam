@@ -16,6 +16,7 @@ import {
   modelsDelete,
   modelsDownload,
   modelsDownloadCancel,
+  modelsDownloadDiscard,
   modelsList,
   modelsLoad,
   modelsStatus,
@@ -516,18 +517,22 @@ function PresetCard({
   busy,
   onDownload,
   onCancel,
+  onDiscard,
 }: {
   preset: CatalogPreset;
   job: ModelJob | undefined;
   busy: boolean;
   onDownload: () => void;
   onCancel: () => void;
+  onDiscard: () => void;
 }) {
   const running = job?.state === "running" ? job : undefined;
   const failure = downloadFailure(job);
-  // A failed or cancelled transfer left its part file behind, so the
-  // button that follows it is a resume, and says so.
-  const resumable = !running && (failure !== null || job?.state === "cancelled");
+  // The catalog reports the part file directly, so a resume is offered on
+  // the evidence on disk rather than on a job row that may have aged out
+  // of the status window.
+  const partial = running ? null : preset.partial_bytes;
+  const resumable = partial !== null && partial > 0;
   return (
     <div className="space-y-3 rounded-card border border-line p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -544,9 +549,19 @@ function PresetCard({
             installed
           </span>
         ) : running ? null : (
-          <Button size="sm" disabled={busy} onClick={onDownload}>
-            {resumable ? "Resume" : "Download"}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button size="sm" disabled={busy} onClick={onDownload}>
+              {resumable ? "Resume" : "Download"}
+            </Button>
+            {resumable && (
+              <ConfirmButton
+                label="Start over"
+                confirmLabel="Discard and start over?"
+                busy={busy}
+                onConfirm={onDiscard}
+              />
+            )}
+          </div>
         )}
       </div>
 
@@ -554,10 +569,14 @@ function PresetCard({
 
       {failure && <FailureNote failure={failure} label="download" />}
 
-      {job?.state === "cancelled" && (
-        <p className="font-sans text-sm text-ink-muted">
-          You stopped this one. The bytes so far are still on disk — Resume picks up where it
-          left off.
+      {job?.state === "cancelled" && !failure && (
+        <p className="font-sans text-sm text-ink-muted">You stopped this one.</p>
+      )}
+
+      {resumable && (
+        <p className="font-data text-xs text-ink-muted tabular-nums">
+          {formatBytes(partial)} of {formatBytes(preset.size_bytes)} already here · Resume
+          continues, Start over throws those bytes away
         </p>
       )}
 
@@ -597,6 +616,13 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
     onSettled: settle,
   });
 
+  const discard = useMutation({
+    mutationFn: (source: { preset_id: string }) => modelsDownloadDiscard(source),
+    onMutate: () => setActionFailure(null),
+    onError: (error) => setActionFailure(toBridgeFailure(error)),
+    onSettled: settle,
+  });
+
   const listFailure = catalog.isError ? toBridgeFailure(catalog.error) : null;
   // Presets this machine cannot hold are hidden, not disabled: an offer
   // that can never be taken is noise, not information.
@@ -631,12 +657,13 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
             key={preset.id}
             preset={preset}
             job={latestDownload(jobs, presetModelId(preset))}
-            busy={download.isPending}
+            busy={download.isPending || discard.isPending}
             onDownload={() => download.mutate({ preset_id: preset.id })}
             onCancel={() => {
               const job = runningDownload(jobs, presetModelId(preset));
               if (job) cancel.mutate(job.id);
             }}
+            onDiscard={() => discard.mutate({ preset_id: preset.id })}
           />
         ))}
       </div>

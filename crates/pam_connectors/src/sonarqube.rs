@@ -42,6 +42,7 @@ pub(crate) async fn call(
     deadline: Instant,
 ) -> Result<CallResult, ConnectorError> {
     match call {
+        "analysis" => crate::sonar_analysis::call(conn, args, transport, deadline).await,
         "quality_gate" => quality_gate(conn, args, transport, deadline).await,
         "issues" => issues(conn, args, transport, deadline).await,
         other => Err(unknown_call(ID, other)),

@@ -43,6 +43,7 @@ mod jenkins;
 mod jenkins_investigation;
 mod jira;
 mod sharepoint;
+mod sonar_analysis;
 mod sonarqube;
 mod transport;
 
@@ -78,6 +79,8 @@ mod jenkins_test;
 mod jira_test;
 #[cfg(test)]
 mod sharepoint_test;
+#[cfg(test)]
+mod sonar_analysis_test;
 #[cfg(test)]
 mod sonarqube_test;
 #[cfg(test)]

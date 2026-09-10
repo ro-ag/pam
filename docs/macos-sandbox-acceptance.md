@@ -3,7 +3,7 @@
 `cargo test -p pam --test sandbox_macos` runs the compiled PAM CLI inside
 `/usr/bin/sandbox-exec`, against a temporary daemon outside that profile. The
 profile is [broker-macos.sb](../crates/pam/tests/support/broker-macos.sb); the
-harness substitutes canonical temporary paths. This does not install or verify
+harness escapes quoted SBPL path contents and substitutes canonical temporary and home paths. This does not install or verify
 an enterprise agent's actual host policy.
 
 The default-deny profile allows executable/library reads, child execution,
@@ -15,10 +15,10 @@ claim of general document confidentiality.
 
 The real CLI must complete an approved echo and read exactly two retained
 evidence bytes. A child of the same sandbox must get permission errors opening
-the private admin socket, reading/writing the database, and opening trusted
+the private admin socket (including a `run/../admin` alias), reading/writing the database, opening the existing daemon lock for writing, unlinking the public socket, and opening trusted
 fixture assets and the PAM executable for writing. A harmless `kill -0` against
 the outside test process must fail with permission denied; no signal that kills
-or changes the target is sent. Removing repository approval must make the same
+or changes the target is sent. The parent verifies the socket and lock inodes and lock bytes remain unchanged, then repeats a successful public echo. The profile grants no runtime-directory writes. Dropping the acceptance deadline kills an outstanding direct child. Removing repository approval must make the same
 evidence request unavailable while its protected source remains in the store.
 
 The keychain probe asks only for a nonexistent service/account. It requires a

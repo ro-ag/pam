@@ -8,7 +8,6 @@
 (allow process-exec process-fork)
 (allow sysctl-read)
 (allow process-info*)
-(allow file-write* (subpath "@BASE@/run"))
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote unix-socket (literal "@BASE@/run/pam.sock")))
 (allow network-outbound (remote unix-socket (literal "@BASE@/run/events.sock")))

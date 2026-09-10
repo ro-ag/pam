@@ -1,6 +1,7 @@
 //! Fixture proof of an explicit macOS sandbox profile, not an installed enterprise policy.
 #![cfg(target_os = "macos")]
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -25,6 +26,18 @@ fn sandbox_probe_child() {
         );
     };
     denied(std::os::unix::net::UnixStream::connect(root.join("pam/admin/control.sock")).map(drop));
+    denied(
+        std::os::unix::net::UnixStream::connect(root.join("pam/run/../admin/control.sock"))
+            .map(drop),
+    );
+    denied(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("pam/run").join(pam_daemon::lifecycle::LOCK_FILE))
+            .map(drop),
+    );
+    denied(std::fs::remove_file(root.join("pam/run/pam.sock")));
+
     denied(std::fs::read(root.join("pam/state.sqlite3")).map(drop));
     denied(
         std::fs::OpenOptions::new()
@@ -70,10 +83,40 @@ fn sandbox_probe_child() {
     );
 }
 
-async fn execute(mut command: Command) -> Output {
-    tokio::task::spawn_blocking(move || command.output().unwrap())
+async fn execute(command: Command) -> Output {
+    // Dropping the enclosing acceptance timeout kills a still-running child.
+    tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .output()
         .await
         .unwrap()
+}
+
+/// Escape only the contents of an SBPL quoted string, never profile syntax.
+fn sbpl_path(path: &Path) -> String {
+    path.to_str()
+        .expect("fixture paths are UTF-8")
+        .chars()
+        .map(|ch| match ch {
+            '\\' => "\\\\".to_owned(),
+            '"' => "\\\"".to_owned(),
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            other => {
+                assert!(
+                    !other.is_control(),
+                    "unsupported profile path control character"
+                );
+                other.to_string()
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn profile_paths_escape_quotes_and_backslashes() {
+    assert_eq!(sbpl_path(Path::new("/tmp/a\"b\\c")), "/tmp/a\\\"b\\\\c");
 }
 
 fn sandbox(profile: &Path, program: &Path, root: &Path, repo: &Path) -> Command {
@@ -124,10 +167,11 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
         let (shutdown, receiver) = watch::channel(false);
         let daemon = run_daemon(Some(base.clone()), receiver).await.unwrap();
         let profile = root.join("agent.sb");
+        let home = std::env::home_dir().unwrap().canonicalize().unwrap();
         let text = include_str!("support/broker-macos.sb")
-            .replace("@BASE@", base.to_str().unwrap())
-            .replace("@ASSET@", root.join("trusted-asset").to_str().unwrap())
-            .replace("@HOME@", std::env::var("HOME").unwrap().as_str());
+            .replace("@BASE@", &sbpl_path(&base))
+            .replace("@ASSET@", &sbpl_path(&root.join("trusted-asset")))
+            .replace("@HOME@", &sbpl_path(&home));
         std::fs::write(&profile, text).unwrap();
         let original = body(&pam(&profile, &root, &repo, &["echo", "{}", "--json"]).await, 0);
         let ticket = original["id"].as_str().unwrap();
@@ -143,6 +187,11 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
         let read = body(&pam(&profile,&root,&repo,&args).await,0);
         assert_eq!(read["body"]["data"],"7361");
         assert_eq!(read["body"]["next_offset"],2);
+        let socket_path = base.join("run/pam.sock");
+        let lock_path = base.join("run").join(pam_daemon::lifecycle::LOCK_FILE);
+        let socket_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
+        let lock_inode = std::fs::symlink_metadata(&lock_path).unwrap().ino();
+        let lock_content = std::fs::read(&lock_path).unwrap();
         let mut probe = sandbox(&profile,&std::env::current_exe().unwrap(),&root,&repo);
         probe.args(["--exact","sandbox_probe_child","--nocapture"])
             .env("PAM_SANDBOX_PROBE",&root)
@@ -150,6 +199,10 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
         let denied = execute(probe).await;
         assert!(denied.status.success(),"{} {}",String::from_utf8_lossy(&denied.stdout),String::from_utf8_lossy(&denied.stderr));
         assert_eq!(std::fs::read(root.join("trusted-asset")).unwrap(),b"trusted fixture asset");
+        assert_eq!(std::fs::symlink_metadata(&socket_path).unwrap().ino(),socket_inode);
+        assert_eq!(std::fs::symlink_metadata(&lock_path).unwrap().ino(),lock_inode);
+        assert_eq!(std::fs::read(&lock_path).unwrap(),lock_content);
+        body(&pam(&profile,&root,&repo,&["echo","{}","--json"]).await,0);
         store.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[]}).to_string()).await.unwrap();
         let refused = body(&pam(&profile,&root,&repo,&args).await,3);
         assert_eq!(refused["cause"],"evidence_unavailable");

@@ -64,8 +64,8 @@ async fn documents(
     let documents: Vec<Value> = array_field(&body, "value")?
         .iter()
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|item| pick(item, DOCUMENT_FIELDS))
-        .collect();
+        .map(|item| identified_item(item, DOCUMENT_FIELDS))
+        .collect::<Result<_, _>>()?;
     Ok(CallResult::Json(json!({
         "site": site,
         "partial": partial(&body, documents.len(), limit),
@@ -91,8 +91,8 @@ async fn lists(
     let lists: Vec<Value> = array_field(&body, "value")?
         .iter()
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|item| pick(item, LIST_FIELDS))
-        .collect();
+        .map(|item| identified_item(item, LIST_FIELDS))
+        .collect::<Result<_, _>>()?;
     Ok(CallResult::Json(json!({
         "site": site,
         "partial": partial(&body, lists.len(), limit),
@@ -112,6 +112,21 @@ pub(crate) async fn verify(
     Ok(VerifyReport {
         detail: format!("site id {id}"),
     })
+}
+
+/// Opaque Graph identities must survive projection; an empty object is not an item.
+fn identified_item(item: &Value, fields: &[&str]) -> Result<Value, ConnectorError> {
+    let valid = item.get("id").and_then(Value::as_str).is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= 1024
+            && !id.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    });
+    if !valid {
+        return Err(ConnectorError::BadResponse(
+            "Graph returned an item without a valid string identity".to_owned(),
+        ));
+    }
+    Ok(pick(item, fields))
 }
 
 /// Whether Graph is holding more than this page showed.

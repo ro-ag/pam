@@ -210,3 +210,38 @@ async fn missing_or_inconsistent_totals_cannot_claim_complete_search() {
         assert_eq!(value["coverage"], "bounded_first_page");
     }
 }
+
+#[tokio::test]
+async fn issue_refuses_wrong_identity_missing_fields_and_non_dc_descriptions() {
+    for response in [
+        serde_json::json!({}),
+        serde_json::json!({"key":"OTHER-1","fields":{"description":"wrong issue"}}),
+        serde_json::json!({"key":7,"fields":{"description":"wrong identity type"}}),
+        serde_json::json!({"key":"PAM-7"}),
+        serde_json::json!({"key":"PAM-7","fields":[]}),
+        serde_json::json!({"key":"PAM-7","fields":{}}),
+        serde_json::json!({"key":"PAM-7","fields":{"description":{"type":"doc","content":[]}}}),
+        serde_json::json!({"key":"PAM-7","fields":{"description":false}}),
+    ] {
+        let transport = FakeTransport::new().json(200, &response.to_string());
+        let error = run("issue", &[("key", "PAM-7")], &transport)
+            .await
+            .unwrap_err();
+        assert_eq!(error.cause(), "connector_bad_response", "{response}");
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn issue_distinguishes_explicit_null_and_empty_description() {
+    for description in [serde_json::Value::Null, serde_json::json!("")] {
+        let response = serde_json::json!({"key":"PAM-7","fields":{"description":description}});
+        let transport = FakeTransport::new().json(200, &response.to_string());
+        let CallResult::Json(value) = run("issue", &[("key", "PAM-7")], &transport).await.unwrap()
+        else {
+            panic!("JSON");
+        };
+        assert_eq!(value["issue"]["description"], description);
+        assert_eq!(value["partial"], false);
+    }
+}

@@ -89,15 +89,30 @@ async fn issue(
         .append_pair("fields", &format!("{FIELDS},description"));
     let body = get_json(conn, ID, url, transport, deadline).await?;
 
-    let mut issue = summarize(&body);
-    let raw = body
+    if body.get("key").and_then(Value::as_str) != Some(key.as_str()) {
+        return Err(ConnectorError::BadResponse(
+            "Jira issue key does not match the requested issue".to_owned(),
+        ));
+    }
+    let fields = body
         .get("fields")
-        .and_then(|fields| fields.get("description"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let (description, cut) = cut_at(raw, MAX_DESCRIPTION_BYTES);
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ConnectorError::BadResponse("Jira issue carries no fields object".to_owned())
+        })?;
+    let (description, cut) = match fields.get("description") {
+        Some(Value::Null) => (Value::Null, false),
+        Some(Value::String(raw)) => {
+            let (text, cut) = cut_at(raw, MAX_DESCRIPTION_BYTES);
+            (Value::String(text), cut)
+        }
+        _ => return Err(ConnectorError::BadResponse(
+            "Jira Data Center description must be present as text or null; other representations are unsupported".to_owned(),
+        )),
+    };
+    let mut issue = summarize(&body);
     if let Some(object) = issue.as_object_mut() {
-        object.insert("description".to_owned(), Value::String(description));
+        object.insert("description".to_owned(), description);
     }
     Ok(CallResult::Json(json!({
         "partial": cut,

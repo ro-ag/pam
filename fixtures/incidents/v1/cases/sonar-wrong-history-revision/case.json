@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-wrong-history-revision; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -29,7 +29,10 @@
   "expected": {
     "diagnosis": "unresolved",
     "decisive_quotes": [
-      "history analysis=a-505 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      "history analysis=a-505 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "Requested project=example revision=1234567890abcdef1234567890abcdef12345678",
+      "ce_task=ce-505 status=SUCCESS analysisId=a-505",
+      "qualitygate analysisId=a-505 status=OK"
     ],
     "unresolved_questions": [
       "Which exact analysis belongs to the requested revision?"
@@ -40,6 +43,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

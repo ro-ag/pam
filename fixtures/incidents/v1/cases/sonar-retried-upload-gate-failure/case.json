@@ -14,7 +14,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-retried-upload-gate-failure; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -31,15 +31,20 @@
     "diagnosis": "code",
     "decisive_quotes": [
       "upload attempt 2: accepted ce_task=ce-510",
-      "metric=new_security_rating threshold=1 actual=3 status=ERROR"
+      "condition metric=new_security_rating threshold=1 actual=3 status=ERROR",
+      "ce_task=ce-510 status=SUCCESS analysisId=a-510 revision=1234567890abcdef1234567890abcdef12345678",
+      "qualitygate analysisId=a-510 status=ERROR"
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
-      "The handled upload error is the final failure cause."
+      "The handled upload error is the final failure cause.",
+      "The aggregate gate metric proves a particular exploitable vulnerability or identifies its source location."
     ]
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Code denotes the reported source-quality violation category only; no individual defect or exploitability is established."
   }
 }

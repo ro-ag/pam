@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-compute-storage-error; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -29,8 +29,9 @@
   "expected": {
     "diagnosis": "infra",
     "decisive_quotes": [
-      "analysis persistence failed: database storage volume is full",
-      "analysisId: absent"
+      "ce error: analysis persistence failed: database storage volume is full",
+      "analysisId: absent",
+      "project=example branch=feature/work ce_task=ce-503 status=FAILED"
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
@@ -39,6 +40,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

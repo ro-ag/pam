@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for build-undefined-export; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -24,12 +24,16 @@
   },
   "authoritative_observation": {
     "status": "failure",
-    "basis": "Jenkins build 410 result FAILURE; failed node 31 belongs to the compile stage."
+    "basis": "Jenkins build 410 result FAILURE; failed node 31 belongs to the link stage."
   },
   "expected": {
     "diagnosis": "code",
     "decisive_quotes": [
-      "ld: undefined symbol: inventory::decode_manifest_v2"
+      "ld: undefined symbol: inventory::decode_manifest_v2",
+      "node=31 stage=link result=FAILURE exit=1",
+      "reference: package_reader.o invokes decode_manifest_v2; exported symbols contain decode_manifest_v1 only",
+      "node=44 stage=post/archive result=SUCCESS",
+      "Final build result: FAILURE"
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
@@ -38,6 +42,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Corrected observation basis from compile to the explicitly named link stage."
   }
 }

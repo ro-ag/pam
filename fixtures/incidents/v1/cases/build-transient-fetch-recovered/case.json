@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for build-transient-fetch-recovered; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -27,19 +27,26 @@
     "basis": "Jenkins build 419 result SUCCESS follows a recorded transient repository response and successful retry."
   },
   "expected": {
-    "diagnosis": "flake",
+    "diagnosis": "unresolved",
     "decisive_quotes": [
-      "retry=1: repository returned HTTP 502, no object downloaded",
-      "retry=2: identical URL returned HTTP 200; expected digest matched",
-      "Final build result: SUCCESS"
+      "stage=dependencies retry=1: repository returned HTTP 502, no object downloaded",
+      "stage=dependencies retry=2: identical URL returned HTTP 200; expected digest matched",
+      "Final build result: SUCCESS",
+      "stage=compile node=145 status=SUCCESS exit=0",
+      "stage=package node=146 status=SUCCESS artifact digest recorded"
     ],
-    "unresolved_questions": [],
+    "unresolved_questions": [
+      "What caused the initial HTTP 502, and does any controlled repeated evidence establish recurring nondeterminism?"
+    ],
     "forbidden_conclusions": [
-      "The recovered dependency error means the final build failed."
+      "The recovered dependency error means the final build failed.",
+      "One recovered HTTP error proves that the build or tests are flaky."
     ]
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Changed flake to unresolved: one failed fetch followed by one success does not establish a reproducible flake family; authoritative build success is preserved."
   }
 }

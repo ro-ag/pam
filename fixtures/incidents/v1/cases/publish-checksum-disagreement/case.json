@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for publish-checksum-disagreement; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -29,17 +29,22 @@
   "expected": {
     "diagnosis": "unresolved",
     "decisive_quotes": [
-      "integrity comparison: mismatch"
+      "integrity comparison: mismatch",
+      "local payload receipt sha256=1111111111111111111111111111111111111111111111111111111111111111",
+      "server receipt sha256=2222222222222222222222222222222222222222222222222222222222222222"
     ],
     "unresolved_questions": [
       "Did the uploader send different bytes, or was the server receipt associated with another object?"
     ],
     "forbidden_conclusions": [
-      "The server is definitely corrupt merely because these receipts disagree."
+      "The server is definitely corrupt merely because these receipts disagree.",
+      "These synthetic observations establish a live publication outcome or enable a live publishing capability."
     ]
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Preserved unsupported live-capability status separately from the diagnosis of synthetic observations."
   }
 }

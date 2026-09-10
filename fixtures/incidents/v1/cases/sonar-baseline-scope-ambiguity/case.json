@@ -14,7 +14,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-baseline-scope-ambiguity; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -30,8 +30,9 @@
   "expected": {
     "diagnosis": "unresolved",
     "decisive_quotes": [
-      "metric=new_duplicated_lines_density threshold=3 actual=12 status=ERROR",
-      "The bundle does not contain the effective approved baseline policy for feature/work."
+      "condition metric=new_duplicated_lines_density threshold=3 actual=12 status=ERROR",
+      "The bundle does not contain the effective approved baseline policy for feature/work.",
+      "project=example analysisId=a-509 revision=1234567890abcdef1234567890abcdef12345678 qualitygate=ERROR"
     ],
     "unresolved_questions": [
       "Which baseline policy is approved for this branch?"
@@ -42,6 +43,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

@@ -14,7 +14,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for publish-repository-permission; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -30,15 +30,19 @@
   "expected": {
     "diagnosis": "config",
     "decisive_quotes": [
-      "HTTP 403; deploy permission missing for repository release-local"
+      "Artifactory observation: HTTP 403; deploy permission missing for repository release-local",
+      "payload preparation completed; upload acceptance receipt absent"
     ],
     "unresolved_questions": [],
     "forbidden_conclusions": [
-      "Packaging success proves the artifact was published."
+      "Packaging success proves the artifact was published.",
+      "These synthetic observations establish a live publication outcome or enable a live publishing capability."
     ]
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Preserved unsupported live-capability status separately from the diagnosis of synthetic observations."
   }
 }

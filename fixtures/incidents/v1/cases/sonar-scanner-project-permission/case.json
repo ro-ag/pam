@@ -14,7 +14,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-scanner-project-permission; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -30,7 +30,9 @@
   "expected": {
     "diagnosis": "config",
     "decisive_quotes": [
-      "HTTP 403; account is not authorized to analyze project example"
+      "scanner server response: HTTP 403; account is not authorized to analyze project example",
+      "Jenkins scanner stage build=520 revision=1234567890abcdef1234567890abcdef12345678 exit=3",
+      "report upload: refused before compute-engine task creation"
     ],
     "unresolved_questions": [
       "Does the configured scanner account have analysis permission for this project?"
@@ -41,6 +43,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for build-sdk-path; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -29,7 +29,9 @@
   "expected": {
     "diagnosis": "config",
     "decisive_quotes": [
-      "required SDK directory /opt/company/sdk/17 does not exist"
+      "preflight: required SDK directory /opt/company/sdk/17 does not exist",
+      "stage=toolchain node=101 state=FAILED exit=2",
+      "compile stage: NOT_EXECUTED"
     ],
     "unresolved_questions": [
       "Is SDK 18 approved for this branch?"
@@ -40,6 +42,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

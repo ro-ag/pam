@@ -13,7 +13,7 @@
     "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
   },
   "export_policy": "synthetic_only",
-  "task": "Determine the bounded diagnosis and decisive evidence for sonar-latest-green-substitution; preserve the requested execution identity and state any unresolved question.",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
   "target": {
     "repository": "https://github.com/pam-fixtures/example",
     "commit": "1234567890abcdef1234567890abcdef12345678"
@@ -29,7 +29,9 @@
   "expected": {
     "diagnosis": "unresolved",
     "decisive_quotes": [
-      "exact qualitygate analysisId=a-504: snapshot missing"
+      "exact qualitygate analysisId=a-504: snapshot missing",
+      "Requested project=example analysisId=a-504 revision=1234567890abcdef1234567890abcdef12345678",
+      "captured latest project gate: analysisId=a-599 status=OK revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ],
     "unresolved_questions": [
       "What gate did exact analysis a-504 report?"
@@ -40,6 +42,8 @@
   },
   "review": {
     "author": "compatibility",
-    "status": "pending"
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
   }
 }

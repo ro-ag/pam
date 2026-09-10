@@ -1,5 +1,4 @@
 PAM synthetic offline incident snapshot v1
-Case: build-transient-fetch-recovered
 Source authenticity: authored synthetic; no captured private service data.
 Requested repository: https://github.com/pam-fixtures/example
 Requested revision: 1234567890abcdef1234567890abcdef12345678

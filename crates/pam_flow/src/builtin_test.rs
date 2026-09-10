@@ -13,15 +13,18 @@ fn pam_ships_the_starter_flows() {
         [
             "after-merge-checks",
             "ci-failure-triage",
+            "confluence-page-context",
             "dependency-audit",
             "jenkins-build-investigation",
             "jenkins-node-evidence",
+            "jira-issue-context",
             "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
             "revision-ci-triage",
             "revision-jenkins-check",
             "revision-sonar-check",
+            "sharepoint-document-context",
             "sonar-analysis-evidence",
             "sonar-gate-check",
             "summarize-build-log",
@@ -432,4 +435,52 @@ fn sonar_revision_starter_requires_exact_inputs_and_separate_gate_verification()
     assert!(discovery.correlation.is_none());
     assert_eq!(discovery.steps[0].role, crate::Role::Observe);
     assert!(discovery.steps[0].expect_status.is_none());
+}
+
+#[test]
+fn document_context_starters_require_exact_identifiers_and_only_observe() {
+    for (id, connector, call, required) in [
+        (
+            "jira-issue-context",
+            ConnectorId::Jira,
+            "issue",
+            vec!["key"],
+        ),
+        (
+            "confluence-page-context",
+            ConnectorId::Confluence,
+            "page",
+            vec!["id"],
+        ),
+        (
+            "sharepoint-document-context",
+            ConnectorId::Sharepoint,
+            "document",
+            vec!["site", "drive", "item"],
+        ),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert_eq!(flow.inputs.len(), required.len());
+        assert!(flow.inputs.values().all(|input| input.default.is_none()));
+        assert_eq!(flow.steps.len(), 1);
+        let step = &flow.steps[0];
+        assert_eq!(step.role, Role::Observe);
+        assert_eq!(step.output, OutputPolicy::Compact);
+        assert!(step.expect_status.is_none());
+        let Action::Connector {
+            connector: actual_connector,
+            call: actual_call,
+            with,
+        } = &step.action
+        else {
+            panic!("connector step")
+        };
+        assert_eq!(*actual_connector, connector);
+        assert_eq!(actual_call, call);
+        assert_eq!(with.len(), required.len());
+        for key in required {
+            assert!(flow.inputs.contains_key(key));
+            assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+        }
+    }
 }

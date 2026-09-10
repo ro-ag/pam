@@ -25,6 +25,10 @@ const BUILTINS: &[BuiltinFlow] = &[
         yaml: include_str!("../flows/ci-failure-triage.yaml"),
     },
     BuiltinFlow {
+        id: "confluence-page-context",
+        yaml: include_str!("../flows/confluence-page-context.yaml"),
+    },
+    BuiltinFlow {
         id: "dependency-audit",
         yaml: include_str!("../flows/dependency-audit.yaml"),
     },
@@ -35,6 +39,10 @@ const BUILTINS: &[BuiltinFlow] = &[
     BuiltinFlow {
         id: "jenkins-node-evidence",
         yaml: include_str!("../flows/jenkins-node-evidence.yaml"),
+    },
+    BuiltinFlow {
+        id: "jira-issue-context",
+        yaml: include_str!("../flows/jira-issue-context.yaml"),
     },
     BuiltinFlow {
         id: "pam-pr-readiness",
@@ -59,6 +67,10 @@ const BUILTINS: &[BuiltinFlow] = &[
     BuiltinFlow {
         id: "revision-sonar-check",
         yaml: include_str!("../flows/revision-sonar-check.yaml"),
+    },
+    BuiltinFlow {
+        id: "sharepoint-document-context",
+        yaml: include_str!("../flows/sharepoint-document-context.yaml"),
     },
     BuiltinFlow {
         id: "sonar-analysis-evidence",

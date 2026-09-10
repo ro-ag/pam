@@ -425,18 +425,21 @@ const FLOW_DEADLINE: Duration = Duration::from_mins(1);
 const EXIT_USAGE: i32 = 2;
 
 /// Every flow that ships in the binary.
-const BUILTIN_FLOWS: [&str; 14] = [
+const BUILTIN_FLOWS: [&str; 17] = [
     "after-merge-checks",
     "ci-failure-triage",
     "jenkins-build-investigation",
     "jenkins-node-evidence",
+    "confluence-page-context",
     "dependency-audit",
+    "jira-issue-context",
     "pam-pr-readiness",
     "pr-readiness",
     "release-readiness",
     "revision-ci-triage",
     "revision-jenkins-check",
     "revision-sonar-check",
+    "sharepoint-document-context",
     "sonar-analysis-evidence",
     "sonar-gate-check",
     "summarize-build-log",

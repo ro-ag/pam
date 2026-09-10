@@ -279,7 +279,9 @@ the same legible message.
   figures, `admin.evidence.list/get/stats` agree), refusals for a
   relative path, a missing file, and a file over the bound (the bound
   test writes a sparse 64 MiB + 1 file), `evidence.get` truncation, and
-  the tripwire (a non-GUI caller is refused before dispatch).
+  public-channel rejection even for a forged GUI caller label. Private-transport
+  authorization precedes the legacy caller-label consistency check; see the
+  [administration boundary](../admin-boundary.md).
   `remove_stale_with` retry policy over a counting remover.
 - Gate: `tools/check.sh` green on the settled tree before every PR; CI
   green on all five targets after every merge.

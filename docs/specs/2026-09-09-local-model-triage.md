@@ -21,10 +21,12 @@ Enterprise-approved host policy must permit PAM execution and IPC connection.
 The CLI abstracts transport details; it cannot prevent the OS sandbox from
 observing, intercepting, or restricting IPC. Socket secrecy is not
 authentication; a shell wrapper is not a sandbox escape. Security administration
-remains GUI-only. The current client separates admin calls but its caller
-identity is self-reported and the socket boundary relies on filesystem
-permissions; hostile same-user clients can forge a `pam-gui` label. Enterprise
-deployment requires verified admin isolation, not that label alone.
+uses a private native endpoint on macOS and Linux; the public socket rejects
+all admin operations even with a forged `pam-gui` label. Kernel peer credentials
+identify the process and owner, not GUI mode. Enterprise deployment must isolate
+the private endpoint and trusted PAM resources from the agent sandbox; PAM does
+not install that policy automatically. See the [administration boundary](../admin-boundary.md)
+for deployment assumptions and the Windows unsupported-platform behavior.
 
 Secrets belong in the OS keychain, not a PAM key store or model context.
 Authorized daemon connector adapters resolve credentials transiently; the model

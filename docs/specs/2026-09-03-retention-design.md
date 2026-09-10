@@ -126,10 +126,11 @@ impl RetentionService {
 `RETENTION_ADMIN_OPS` is spliced into `pam_gui::bridge::ADMIN_OPS`
 like the other four lists; the bridge test's core count (`9 + ...`)
 gains `+ RETENTION_ADMIN_OPS.len()`. Ordinary admin ops in every other
-way: tripwire, request row, one terminal audit row (audit detail
+way: private-transport authorization, request row, one terminal audit row (audit detail
 carries the settings or the counts, never a body), 30 s deadline. The
 ops build a `RetentionService` over `self.store` on demand — no new
-`AdminService` field, no constructor change.
+`AdminService` field, no constructor change. The legacy caller-label consistency
+check is not authorization; see the [administration boundary](../admin-boundary.md).
 
 ### Wiring
 

@@ -272,8 +272,10 @@ row plus a tracing line.
 
 ### Admin ops
 
-All under the existing `AdminService` dispatch, tripwire, deadline, and
-audit rules. Bodies are JSON; refusals carry `cause` + `recovery`.
+All under the existing `AdminService` dispatch, deadline, and audit rules.
+Private-transport authorization precedes the legacy caller-label consistency
+check; that label is not authorization. See the [administration boundary](../admin-boundary.md).
+Bodies are JSON; refusals carry `cause` + `recovery`.
 
 | op | args | body |
 | --- | --- | --- |

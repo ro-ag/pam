@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
+import { LandingSettings } from "./LandingSettings";
 import { useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -219,6 +220,8 @@ export function SettingsFlowsSection() {
         busy={busy}
         onSave={(scope_policy, onSaved) => change({ scope_policy }, onSaved)}
       />
+
+      <LandingSettings />
 
       <p className="border-t border-line pt-4 font-sans text-sm text-ink-muted">
         Commands require an allowed program and approved repository. Connector reads also

@@ -6,7 +6,13 @@
 
 #[path = "evidence_views.rs"]
 mod evidence_views;
+#[path = "request_budget.rs"]
+mod request_budget;
+pub use request_budget::*;
+#[path = "flow_journal.rs"]
+mod flow_journal;
 pub use evidence_views::*;
+pub use flow_journal::*;
 #[path = "correlation.rs"]
 mod correlation;
 pub use correlation::*;
@@ -686,6 +692,21 @@ impl Store {
                 params![now_ts(), id, repo, now_ms],
             )
             .await?;
+        Ok(changed == 1)
+    }
+
+    /// Restores only a safe journaled flow under its original admission and expiry.
+    /// The startup lock must be held; runtime authorization is checked again on dispatch.
+    pub async fn requeue_journaled_flow(&self, id: &str, now_ms: i64) -> Result<bool, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let changed = self.conn.execute(
+            "UPDATE request SET state = 'queued', updated_ts = ?1 WHERE id = ?2
+             AND capability = 'flow.run' AND state IN ('running','waiting_approval')
+             AND queue_authorized = 1 AND expires_at_ms > ?3
+             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+             AND EXISTS (SELECT 1 FROM flow_journal WHERE request_id = ?2 AND state IN ('ready','completed'))",
+            params![now_ts(), id, now_ms],
+        ).await?;
         Ok(changed == 1)
     }
 
@@ -2071,6 +2092,8 @@ impl Store {
         if requests > 0 {
             // Children first: the foreign keys point at `request`.
             for sql in [
+                format!("DELETE FROM request_budget WHERE {children}"),
+                format!("DELETE FROM flow_journal WHERE {children}"),
                 format!("DELETE FROM correlation_step WHERE {children}"),
                 format!("DELETE FROM correlation_target WHERE {children}"),
                 format!("DELETE FROM evidence_view WHERE {children}"),

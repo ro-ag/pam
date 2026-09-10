@@ -99,6 +99,14 @@ impl HttpResponse {
 /// Anything the service said, including 500, arrives as an [`HttpResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransportError {
+    /// A daemon policy or cumulative budget refused further work.
+    #[error("{detail}")]
+    Policy {
+        /// Stable daemon refusal cause.
+        cause: &'static str,
+        /// Sanitized policy detail, never request credentials.
+        detail: String,
+    },
     /// The deadline passed with no answer.
     #[error("the request timed out")]
     Timeout,
@@ -122,6 +130,7 @@ pub enum TransportError {
 impl From<TransportError> for ConnectorError {
     fn from(error: TransportError) -> Self {
         match error {
+            TransportError::Policy { cause, detail } => Self::Policy { cause, detail },
             TransportError::Timeout => Self::Timeout,
             TransportError::Certificate => Self::Certificate,
             TransportError::Network(detail) => Self::Network(detail),

@@ -38,6 +38,7 @@ pub(crate) async fn call(
     deadline: Instant,
 ) -> Result<CallResult, ConnectorError> {
     match call {
+        "document" => crate::sharepoint_document::document(conn, args, transport, deadline).await,
         "documents" => documents(conn, args, transport, deadline).await,
         "lists" => lists(conn, args, transport, deadline).await,
         other => Err(unknown_call(ID, other)),

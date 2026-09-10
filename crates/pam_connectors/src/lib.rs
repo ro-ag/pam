@@ -43,6 +43,9 @@ mod jenkins;
 mod jenkins_investigation;
 mod jira;
 mod sharepoint;
+mod sharepoint_document;
+#[cfg(test)]
+mod sharepoint_document_test;
 mod sonar_analysis;
 mod sonarqube;
 mod transport;

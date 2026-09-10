@@ -144,7 +144,7 @@ fn resolve_ref(git: &Path, reference: &str) -> Result<String, CheckoutError> {
     }
     Ok(value.to_ascii_lowercase())
 }
-fn ref_state(request: &CheckoutRequest) -> Result<(String, String), CheckoutError> {
+pub(crate) fn ref_state(request: &CheckoutRequest) -> Result<(String, String), CheckoutError> {
     let git = request.repository.join(".git");
     let head = bounded_read(&git.join("HEAD"), 512)?;
     let branch = text(&head)?
@@ -160,7 +160,7 @@ fn ref_state(request: &CheckoutRequest) -> Result<(String, String), CheckoutErro
     }
     Ok((branch.to_owned(), resolve_ref(&git, &request.base_ref)?))
 }
-fn validate_layout(request: &CheckoutRequest) -> Result<(), CheckoutError> {
+pub(crate) fn validate_layout(request: &CheckoutRequest) -> Result<(), CheckoutError> {
     if !valid_oid(&request.expected_commit)
         || request.expected_commit != request.expected_commit.to_ascii_lowercase()
     {
@@ -243,8 +243,8 @@ fn validate_git_paths(git: &Path) -> Result<(), CheckoutError> {
     Ok(())
 }
 
-struct Workspace {
-    root: PathBuf,
+pub(crate) struct Workspace {
+    pub(crate) root: PathBuf,
     tree: PathBuf,
     keep: bool,
 }
@@ -256,7 +256,7 @@ impl Drop for Workspace {
     }
 }
 impl Workspace {
-    fn create(parent: &Path, source: &Path) -> Result<Self, CheckoutError> {
+    pub(crate) fn create(parent: &Path, source: &Path) -> Result<Self, CheckoutError> {
         let root = parent.join(format!("landing-{}", ulid::Ulid::new()));
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -746,7 +746,7 @@ impl Drop for CancelWorker {
     }
 }
 
-async fn owned_worker<T, F>(
+pub(crate) async fn owned_worker<T, F>(
     cancel: &mut watch::Receiver<bool>,
     operation: F,
 ) -> Result<T, CheckoutError>

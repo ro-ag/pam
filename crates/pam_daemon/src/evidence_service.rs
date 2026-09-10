@@ -282,7 +282,7 @@ fn read_output(
     })
 }
 
-async fn authorize_origin(
+pub(crate) async fn authorize_origin(
     store: &Store,
     policy: &ScopePolicy,
     repo: &Path,

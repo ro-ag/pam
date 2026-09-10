@@ -39,11 +39,15 @@ pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, DEFAULT_REQUEST_LIST_LIMIT, Decision, EVIDENCE_KIND_LOG_COMPACT,
     EvidenceMeta, EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest,
-    EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, GrantRow, MAX_REQUEST_LIST_LIMIT,
-    ModelJobRow, PendingApproval, RequestPrune, RequestRow, RequestState, Store,
+    EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, FlowResultMeta, GrantRow,
+    MAX_REQUEST_LIST_LIMIT, ModelJobRow, PendingApproval, RequestPrune, RequestRow, RequestState,
+    RequestStatusMeta, Store,
 };
 
 #[cfg(test)]
 mod migrations_test;
 #[cfg(test)]
 mod store_test;
+
+#[cfg(test)]
+mod flow_results_test;

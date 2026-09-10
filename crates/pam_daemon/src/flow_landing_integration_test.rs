@@ -398,6 +398,95 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn full_landing_refuses_unavailable_sync_before_any_work() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false).await;
+            let yaml = format!(
+                "{} - id: sync\n   landing: sync\n   needs: [verify-main]\n",
+                recipe(&fixture.sha)
+            );
+            pam_flow::parse(&yaml).unwrap();
+            std::fs::write(
+                fixture
+                    .ctx
+                    .flows
+                    .protected_base()
+                    .join("flows/landing.yaml"),
+                yaml,
+            )
+            .unwrap();
+            let inspection = fixture
+                .ctx
+                .flows
+                .inspect(&fixture.ctx, &json!({"id":"landing"}))
+                .await
+                .unwrap();
+            assert_eq!(inspection.body["readiness"], "blocked");
+            assert!(
+                inspection.body["blockers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|blocker| blocker["step"] == "sync"
+                        && blocker["cause"] == "landing_sync_unavailable")
+            );
+            let result = fixture
+                .ctx
+                .flows
+                .run(
+                    &fixture.ctx,
+                    RunArgs {
+                        id: "landing".into(),
+                        inputs: BTreeMap::new(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(super::CapabilityFailure::Refused { ref cause, .. })
+                        if cause == "landing_sync_unavailable"
+                ),
+                "{result:?}"
+            );
+            assert!(fixture.github.requests.lock().unwrap().is_empty());
+            let usage = fixture.ctx.budget.usage();
+            assert_eq!(usage.attempts, 0);
+            assert_eq!(usage.command_bytes, 0);
+            assert_eq!(usage.http_calls, 0);
+            assert!(
+                fixture
+                    .ctx
+                    .store
+                    .read_flow_journal(&fixture.ctx.request_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .ctx
+                    .store
+                    .read_landing_session(&fixture.ctx.request_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                std::fs::read_dir(fixture._dirs.path().join("workspaces"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn gated_local_prefix_and_fake_github_land_verify_the_exact_merge_sha() {
     tokio::time::timeout(
         Duration::from_secs(90),

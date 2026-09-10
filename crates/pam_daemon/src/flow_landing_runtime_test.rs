@@ -53,3 +53,22 @@ async fn landing_poll_commits_progress_without_copying_or_advancing_protected_sn
         original.identity
     );
 }
+
+#[test]
+fn landing_availability_blocks_sync_but_preserves_supported_prefix() {
+    use pam_flow::LandingOperation;
+
+    for operation in [
+        LandingOperation::Freeze,
+        LandingOperation::Validate,
+        LandingOperation::Push,
+        LandingOperation::EnsurePr,
+        LandingOperation::VerifyPr,
+        LandingOperation::Merge,
+        LandingOperation::VerifyMain,
+    ] {
+        super::landing_runtime::available(operation).unwrap();
+    }
+    let error = super::landing_runtime::available(LandingOperation::Sync).unwrap_err();
+    assert_eq!(error.cause, "landing_sync_unavailable");
+}

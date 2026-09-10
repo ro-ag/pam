@@ -853,6 +853,8 @@ impl FlowService {
             )
         })?;
 
+        landing_runtime::preflight(flow)?;
+
         let repo = PathBuf::from(&ctx.caller.repo);
         if !repo.is_dir() {
             return Err(FlowRefusal::new(

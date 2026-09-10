@@ -96,11 +96,34 @@ fn permitted(policy: &Repository, operation: Op) -> bool {
         _ => true,
     }
 }
+/// Reject statically unavailable stages before any recipe operation can run.
+pub(super) fn available(operation: Op) -> Result<(), FlowRefusal> {
+    if operation == Op::Sync {
+        return Err(FlowRefusal::new(
+            "landing_sync_unavailable",
+            "Guarded local synchronization is unavailable; this flow cannot complete safely."
+                .to_owned(),
+            "Use an explicitly reviewed prefix ending before sync, or wait for supported guarded synchronization; a prefix does not complete landing.",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn preflight(flow: &pam_flow::Flow) -> Result<(), FlowRefusal> {
+    for step in &flow.steps {
+        if let Action::Landing { operation } = step.action {
+            available(operation)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn inspect_policy(
     store: &Store,
     repo: &Path,
     operation: Op,
 ) -> Result<(), FlowRefusal> {
+    available(operation)?;
     let policy = Policy::load(store)
         .await
         .map_err(|e| FlowRefusal::new(e.cause, e.detail.to_owned(), RECOVERY))?;

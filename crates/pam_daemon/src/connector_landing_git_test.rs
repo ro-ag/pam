@@ -60,7 +60,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Store>, GitTarget, String) {
     let receipt = CheckoutReceipt {
         repository: repo,
         remote_url: request.remote_url.clone(),
-        branch: "feature/work".into(),
+        branch: "refs/heads/feature/work".into(),
         commit: request.expected_commit.clone(),
         base_ref: request.base_ref.clone(),
         base_commit: "b".repeat(40),
@@ -164,6 +164,88 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
         .unwrap();
     assert!(
         guard(store, &target, &revision, true)
+            .authorize_row()
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn initialize_captured_repository(target: &mut GitTarget) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        &target.request.checkouts_root,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    target.request.git_program = PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/git");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new(&target.request.git_program)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&target.request.repository)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "local capture fixture setup failed"
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["remote", "add", "origin", &target.request.remote_url]);
+    std::fs::write(target.request.repository.join("tracked"), "fixture\n").unwrap();
+    git(&["add", "tracked"]);
+    git(&["commit", "-qm", "fixture"]);
+    git(&["checkout", "-qb", "feature/work"]);
+    target.request.expected_commit = git(&["rev-parse", "HEAD"]);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn captured_full_branch_receipt_reaches_current_guard_without_network() {
+    let (_temp, store, mut target, revision) = fixture().await;
+    initialize_captured_repository(&mut target);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let budget = crate::request_budget::RequestBudget::new(deadline);
+    let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+    let snapshot =
+        crate::landing_checkout::capture(&target.request, budget.clone(), &mut cancel, deadline)
+            .await
+            .unwrap();
+    assert_eq!(snapshot.receipt.branch, "refs/heads/feature/work");
+    assert_eq!(snapshot.receipt.commit, target.request.expected_commit);
+    target.receipt = snapshot.receipt;
+    guard(store.clone(), &target, &revision, false)
+        .authorize_row()
+        .await
+        .unwrap();
+    guard(store.clone(), &target, &revision, true)
+        .authorize_row()
+        .await
+        .unwrap();
+    assert_eq!(
+        budget.usage().http_calls,
+        0,
+        "capture and authorization are network-free"
+    );
+    store.insert_grant("flow.run").await.unwrap();
+    store.revoke_grant("flow.run").await.unwrap();
+    assert!(
+        guard(store, &target, &revision, false)
             .authorize_row()
             .await
             .is_err()

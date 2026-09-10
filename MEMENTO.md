@@ -119,3 +119,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## child-stdin-eof-before-output-wait
+- kind: habit
+- scope: project
+- rule: Drop a child stdin handle after writing the complete input, before awaiting output EOF; AsyncWrite shutdown alone may leave the pipe open.
+- fix: Move stdin into the writer future so it is dropped when the write completes, and keep a real child-process regression that finishes under the original deadline.
+- hits: 2026-09-10
+- cost: 0
+- status: watching
+

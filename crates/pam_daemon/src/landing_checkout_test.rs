@@ -28,9 +28,10 @@ fn manifest_and_batch_enforce_count_size_identity_and_exact_bytes() {
     let oid = "a".repeat(40);
     let row = format!("100644 blob {oid} 3\tdir/file\0");
     let mut entries = parse_manifest(row.as_bytes()).unwrap();
-    let too_many = (0..=MAX_FILES)
-        .map(|index| format!("100644 blob {oid} 0\tfile-{index}\0"))
-        .collect::<String>();
+    let mut too_many = String::new();
+    for index in 0..=MAX_FILES {
+        let _ = write!(too_many, "100644 blob {oid} 0\tfile-{index}\0");
+    }
     assert!(parse_manifest(too_many.as_bytes()).is_err());
     assert!(
         parse_manifest(format!("100644 blob {oid} {}\tlarge\0", MAX_FILE + 1).as_bytes()).is_err()
@@ -338,9 +339,14 @@ async fn cancelled_caller_leaves_cleanup_owned_by_the_running_worker() {
 #[test]
 fn manifest_metadata_limit_includes_final_hashes_before_export() {
     let oid = "a".repeat(40);
-    let records = (0..MAX_FILES)
-        .map(|index| format!("100644 blob {oid} 0\t{}-{index}\0", "path".repeat(20)))
-        .collect::<String>();
+    let mut records = String::new();
+    for index in 0..MAX_FILES {
+        let _ = write!(
+            records,
+            "100644 blob {oid} 0\t{}-{index}\0",
+            "path".repeat(20)
+        );
+    }
     let refusal = parse_manifest(records.as_bytes()).unwrap_err();
     assert_eq!(refusal.cause, "landing_checkout_manifest_limit");
     let mut accepted = parse_manifest(format!("100644 blob {oid} 0\tfile\0").as_bytes()).unwrap();

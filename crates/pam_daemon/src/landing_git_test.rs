@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 struct Allow;
 impl GitAuthorization for Allow {
     fn authorize(
@@ -189,8 +190,8 @@ fn ephemeral_credentials_only_enter_fixed_environment_config() {
 
 #[tokio::test]
 async fn transport_pipe_captures_are_bounded_before_public_projection() {
-    let (mut writer, reader) = tokio::io::duplex(PIPE_LIMIT + 1);
     use tokio::io::AsyncWriteExt;
+    let (mut writer, reader) = tokio::io::duplex(PIPE_LIMIT + 1);
     writer.write_all(&vec![b'x'; PIPE_LIMIT + 1]).await.unwrap();
     drop(writer);
     assert!(pipe(reader).await.is_err());
@@ -223,9 +224,10 @@ fn outbound_preflight_requires_exact_bounded_object_identity_and_size() {
             .is_err()
         );
     }
-    let many = (1..=MAX_OUTBOUND_OBJECTS + 1)
-        .map(|n| format!("{n:040x}\n"))
-        .collect::<String>();
+    let mut many = String::new();
+    for n in 1..=MAX_OUTBOUND_OBJECTS + 1 {
+        let _ = writeln!(many, "{n:040x}");
+    }
     assert_eq!(
         outbound_ids(&Capture {
             code: Some(0),
@@ -237,10 +239,10 @@ fn outbound_preflight_requires_exact_bounded_object_identity_and_size() {
         "landing_git_outbound_limit"
     );
     let ids = (1..=17).map(|n| format!("{n:040x}")).collect::<Vec<_>>();
-    let output = ids
-        .iter()
-        .map(|id| format!("{id} blob {}\n", 4 * 1024 * 1024))
-        .collect::<String>();
+    let mut output = String::new();
+    for id in &ids {
+        let _ = writeln!(output, "{id} blob {}", 4 * 1024 * 1024);
+    }
     assert_eq!(
         outbound_sizes(
             &ids,

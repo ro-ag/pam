@@ -381,7 +381,7 @@ fn summary_field(raw: &str, maximum: usize) -> String {
     format!("{}{MARKER}", &text[..end])
 }
 
-fn core_status(core: &Value, build: i64) -> Result<&str, ConnectorError> {
+pub(crate) fn core_status(core: &Value, build: i64) -> Result<&str, ConnectorError> {
     if core.get("number").and_then(Value::as_i64) != Some(build) {
         return Err(bad_response(
             "core response does not identify the requested build",

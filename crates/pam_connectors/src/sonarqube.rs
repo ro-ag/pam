@@ -225,7 +225,7 @@ fn check_echo(
 
 /// Confirm required query parameters before sending a potentially unfiltered request.
 /// Uses the existing 1 MiB JSON cap and caller deadline; oversized catalogs refuse.
-/// SonarSource SearchAction records the `components` rename in its 10.2 changelog.
+/// `SonarSource` `SearchAction` records the `components` rename in its 10.2 changelog.
 async fn require_contract(
     conn: &Connection,
     path: &str,

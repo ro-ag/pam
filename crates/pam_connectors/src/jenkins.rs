@@ -115,9 +115,10 @@ async fn console(
     let mut status_url = job_url(&conn.base_url, &status_segments)?;
     status_url
         .query_pairs_mut()
-        .append_pair("tree", "result,building");
+        .append_pair("tree", "number,result,building");
     let status = get_json(conn, ID, status_url, transport, deadline).await?;
-    let exit_status = exit_status(status.get("result").and_then(Value::as_str));
+    let status = crate::jenkins_investigation::core_status(&status, build)?;
+    let exit_status = exit_status(Some(status));
 
     let mut log_segments = base;
     log_segments.push(build.to_string());

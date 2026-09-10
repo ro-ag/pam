@@ -81,9 +81,11 @@ see [administration](admin-boundary.md), [budgets](scoped-admission-and-budgets.
 and [flow CLI contracts](flow-cli-contract.md). Broker commands additionally require
 [child-process containment](command-containment.md), whose network and artifact-write
 limits must be addressed by the guarded landing workstream. Use ptrack for current task status.
-Checkpoint #120 must still validate the declared enterprise OS boundary and event
-confidentiality. The [native build audit](native-build-dependencies.md) also records
-the unresolved GUI compiler conflict. Hiding a socket pathname is not isolation.
+Caller and broker-child macOS sandbox fixtures now pass; public progress text is
+generic and scoped evidence retrieval remains enforced. These fixtures do not attest
+every enterprise sandbox deployment. Checkpoint #120 remains held by the unresolved
+GUI compiler conflict in the [native build audit](native-build-dependencies.md).
+Hiding a socket pathname is not isolation.
 #103 does not depend on model eligibility #96.
 
 ### Plan #32 — Correlate enterprise products and collect decisive evidence

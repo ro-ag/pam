@@ -19,6 +19,10 @@ Graph's drive search uses the selected site's default drive and supports paged r
 
 Jenkins exposes resource-specific remote APIs; PAM uses bounded read endpoints rather than an unrestricted API proxy. See [Jenkins Remote Access API](https://www.jenkins.io/doc/book/using/remote-access-api/).
 
+Confluence's page contract follows the [Cloud v2 page API](https://developer.atlassian.com/cloud/confluence/rest/v2/api-group-page/); CQL search remains a separate v1 operation. GitHub jobs use [attempt-specific endpoints](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt), with later pages requiring the caller to retain the attempt number.
+
+Sonar issue reads first consult `/api/webservices/list` and require the advertised `components`, `resolved`, and `ps` parameters (plus any selected branch/PR parameter). This qualifies the 10.2+ project-filter contract rather than guessing an older parameter. Metadata stays under the normal 1 MiB JSON limit; oversized/unknown metadata refuses. Selected gate reads similarly check parameter support. This adds one bounded HTTP request to those operations. The implementation follows Sonar's [issue SearchAction](https://github.com/SonarSource/sonarqube/blob/master/server/sonar-webserver-webapi/src/main/java/org/sonar/server/issue/ws/SearchAction.java) and [ProjectStatusAction](https://github.com/SonarSource/sonarqube/blob/master/server/sonar-webserver-webapi/src/main/java/org/sonar/server/qualitygate/ws/ProjectStatusAction.java).
+
 ## Authority and transport
 
 GUI administration grants exact repository/product scopes. Every operation rechecks those scopes, current configuration, expiry, and cumulative request budgets. A successful credential probe does not grant access to another target or prove a deployment's full compatibility.

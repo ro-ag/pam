@@ -415,7 +415,8 @@ async fn revocation_blocks_a_second_api_read_and_a_signed_log_redirect() {
             .save(&store)
             .await
             .unwrap();
-        let mut inner = FakeTransport::new().json(200, r#"{"conclusion":"failure"}"#);
+        let mut inner =
+            FakeTransport::new().json(200, r#"{"id":41,"run_attempt":1,"conclusion":"failure"}"#);
         if redirect {
             inner = inner.with_headers(
                 302,
@@ -465,7 +466,7 @@ async fn changing_connector_url_during_read_blocks_next_http_request() {
         .unwrap();
     let transport = Arc::new(RevokingTransport {
         store: Arc::clone(&store),
-        inner: FakeTransport::new().json(200, "{}"),
+        inner: FakeTransport::new().json(200, r#"{"id":41,"run_attempt":1}"#),
         calls: AtomicUsize::new(0),
         revoke_after: 1,
         change_url: true,

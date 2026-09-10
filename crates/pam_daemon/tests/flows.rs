@@ -1507,9 +1507,15 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
         ),
         (
             200,
-            r#"{"projectStatus":{"status":"UNKNOWN","conditions":[]}}"#,
-            Some("UNKNOWN"),
+            r#"{"projectStatus":{"status":"NONE","conditions":[]}}"#,
+            Some("NONE"),
             Some("status_assertion"),
+        ),
+        (
+            200,
+            r#"{"projectStatus":{"status":"UNKNOWN","conditions":[]}}"#,
+            None,
+            Some("connector_bad_response"),
         ),
         (
             200,
@@ -1528,6 +1534,7 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
             let transport = Arc::new(
                 FakeTransport::new()
                     .json(http, response)
+                    .json(200, SONAR_ISSUES_CONTRACT)
                     .json(200, r#"{"issues":[],"total":0}"#),
             );
             let flows = sonar_test_daemon(
@@ -1558,7 +1565,7 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
                 assert_eq!(gate["error"]["cause"], cause);
             }
             assert_eq!(step(&body, "open-issues")["status"], "succeeded");
-            assert!(transport.url(1).contains("/api/issues/search"));
+            assert!(transport.url(2).contains("/api/issues/search"));
             assert_sonar_evidence(&flows, &body, status).await;
             flows.daemon.assert_invariant_clean().await;
             flows.daemon.stop().await;
@@ -1577,6 +1584,7 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
                     r#"{"projectStatus":{"status":"ERROR","conditions":[]}}"#,
                 )
                 .json(200, r#"{"projectStatus":{"status":"OK","conditions":[]}}"#)
+                .json(200, SONAR_ISSUES_CONTRACT)
                 .json(200, r#"{"issues":[],"total":0}"#),
         );
         let yaml = pam_flow::builtin_yaml("sonar-gate-check").unwrap().replace(
@@ -1592,7 +1600,7 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
                 .url(1)
                 .contains("/api/qualitygates/project_status")
         );
-        assert!(transport.url(2).contains("/api/issues/search"));
+        assert!(transport.url(3).contains("/api/issues/search"));
         assert_sonar_evidence(&flows, &body, Some("OK")).await;
         flows.daemon.stop().await;
     })
@@ -1875,3 +1883,5 @@ async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view(
         flows.daemon.stop().await;
     }).await;
 }
+
+const SONAR_ISSUES_CONTRACT: &str = r#"{"webServices":[{"path":"api/issues","actions":[{"key":"search","params":[{"key":"components"},{"key":"resolved"},{"key":"ps"}]}]}]}"#;

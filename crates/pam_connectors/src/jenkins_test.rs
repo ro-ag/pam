@@ -74,7 +74,7 @@ async fn builds_keeps_the_named_fields_and_echoes_the_job() {
 #[tokio::test]
 async fn console_reads_the_result_then_the_text() {
     let transport = FakeTransport::new()
-        .json(200, r#"{"result":"FAILURE","building":false}"#)
+        .json(200, r#"{"number":41,"result":"FAILURE","building":false}"#)
         .bytes(200, b"Started by user pam\nBUILD FAILURE".to_vec());
     let result = console(&transport, "platform", 41).await.unwrap();
 
@@ -113,7 +113,10 @@ async fn a_builds_result_decides_the_exit_status() {
         ("null", None),
     ] {
         let transport = FakeTransport::new()
-            .json(200, &format!(r#"{{"result":{result}}}"#))
+            .json(
+                200,
+                &format!(r#"{{"number":1,"building":false,"result":{result}}}"#),
+            )
             .bytes(200, b"log".to_vec());
         let CallResult::Log { exit_status, .. } = console(&transport, "platform", 1).await.unwrap()
         else {
@@ -126,7 +129,7 @@ async fn a_builds_result_decides_the_exit_status() {
 #[tokio::test]
 async fn a_nested_log_name_flattens_the_folder_path() {
     let transport = FakeTransport::new()
-        .json(200, r#"{"result":"SUCCESS"}"#)
+        .json(200, r#"{"number":3,"building":false,"result":"SUCCESS"}"#)
         .bytes(200, b"log".to_vec());
     let CallResult::Log { name, .. } = console(&transport, "platform/nightly", 3).await.unwrap()
     else {
@@ -267,4 +270,23 @@ async fn listing_caps_returned_arrays_even_when_server_ignores_requested_tree_li
         assert_eq!(value["limit"], 1);
         assert!(value["coverage"].is_string());
     }
+}
+
+#[tokio::test]
+async fn console_rejects_wrong_build_before_fetching_log_and_never_passes_running_build() {
+    let wrong =
+        FakeTransport::new().json(200, r#"{"number":2,"building":false,"result":"SUCCESS"}"#);
+    assert_eq!(
+        console(&wrong, "platform", 1).await.unwrap_err().cause(),
+        "connector_bad_response"
+    );
+    assert_eq!(wrong.requests().len(), 1);
+    let running = FakeTransport::new()
+        .json(200, r#"{"number":1,"building":true,"result":"SUCCESS"}"#)
+        .bytes(200, b"still running".to_vec());
+    let CallResult::Log { exit_status, .. } = console(&running, "platform", 1).await.unwrap()
+    else {
+        panic!("console log")
+    };
+    assert_eq!(exit_status, None);
 }

@@ -396,3 +396,29 @@ async fn enabled_compressor_skips_before_loading_when_no_investigator_exists() {
         2
     );
 }
+#[test]
+fn summary_input_identity_follows_actual_selected_view_bytes() {
+    use crate::log_service::{EvidenceRef, summary_input};
+    let semantic = EvidenceRef {
+        id: "semantic".into(),
+        bytes: 123,
+    };
+    let (prompt, identity) = summary_input(
+        "compact text",
+        "compact",
+        Some(("selected text", &semantic)),
+    );
+    assert_eq!(prompt, "selected text");
+    assert_eq!(identity["evidence_id"], "semantic");
+    assert_eq!(
+        identity["sha256"],
+        pam_compact::sha256_hex(prompt.as_bytes())
+    );
+    assert_eq!(identity["offset_basis"], "view_bytes");
+    let (prompt, identity) = summary_input("compact text", "compact", None);
+    assert_eq!(identity["evidence_id"], "compact");
+    assert_eq!(
+        identity["sha256"],
+        pam_compact::sha256_hex(prompt.as_bytes())
+    );
+}

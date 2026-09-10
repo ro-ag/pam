@@ -190,7 +190,7 @@ enum FlowCmd {
 
 #[derive(Subcommand)]
 enum EvidenceCmd {
-    /// Read one byte range; use returned view/digest with next_offset to continue.
+    /// Read one byte range; use returned view/digest with `next_offset` to continue.
     Read(EvidenceReadArgs),
 }
 

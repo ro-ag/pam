@@ -878,31 +878,7 @@ async fn evidence_read_binary_binds_origin_and_view_and_preserves_exact_bytes() 
         assert_eq!(original.code, 0, "{}", original.stderr);
         let original: serde_json::Value = serde_json::from_str(&original.stdout).unwrap();
         let request_id = original["id"].as_str().expect("echo response id");
-        let store = daemon.handle.store();
-        store
-            .insert_evidence("ev_cli", request_id, "log_source", b"x\xff\n", None)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .insert_evidence_view(&pam_store::EvidenceViewInsert {
-                    evidence_id: "ev_cli".into(),
-                    request_id: request_id.into(),
-                    repository: repo
-                        .path()
-                        .canonicalize()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    origin_json: serde_json::json!({"targets": []}).to_string(),
-                    identity_json: serde_json::json!({"schema_version": 1}).to_string(),
-                    map_json: serde_json::json!([{"view":{"start":0,"end":3},"parent":{"start":0,"end":3},"relation":"identity"}]).to_string(),
-                    view_id: "view_cli".into(),
-                    view_bytes: b"x\xff\n".to_vec(),
-                })
-                .await
-                .unwrap()
-        );
+        seed_cli_evidence(&daemon.handle.store(), repo.path(), request_id).await;
         let page = run_pam(
             &daemon.base(),
             repo.path(),
@@ -988,4 +964,19 @@ async fn evidence_read_binary_binds_origin_and_view_and_preserves_exact_bytes() 
     })
     .await
     .expect("evidence CLI test within deadline");
+}
+
+async fn seed_cli_evidence(store: &Store, repo: &Path, request_id: &str) {
+    store
+        .insert_evidence("ev_cli", request_id, "log_source", b"x\xff\n", None)
+        .await
+        .unwrap();
+    assert!(store.insert_evidence_view(&pam_store::EvidenceViewInsert {
+        evidence_id: "ev_cli".into(), request_id: request_id.into(),
+        repository: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+        origin_json: serde_json::json!({"targets": []}).to_string(),
+        identity_json: serde_json::json!({"schema_version": 1}).to_string(),
+        map_json: serde_json::json!([{"view":{"start":0,"end":3},"parent":{"start":0,"end":3},"relation":"identity"}]).to_string(),
+        view_id: "view_cli".into(), view_bytes: b"x\xff\n".to_vec(),
+    }).await.unwrap());
 }

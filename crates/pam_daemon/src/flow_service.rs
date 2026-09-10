@@ -1782,30 +1782,27 @@ impl RunState<'_> {
             Ok(()) => {
                 let capture = self.capture_scope(step);
                 let view = crate::evidence_service::prepare(content).await;
-                match (capture, view) {
-                    (Ok(capture), Ok(view)) => {
-                        if let Err(error) = crate::evidence_service::publish(
-                            &self.service.store,
-                            &capture,
-                            &self.ctx.request_id,
-                            &id,
-                            view,
-                            json!({"kind": "protected_connector_result"}),
-                        )
-                        .await
-                        {
-                            tracing::warn!(step = %step.id, %error, "connector evidence view unavailable");
-                            report
-                                .evidence_unavailable
-                                .push(format!("{id}: view_unavailable"));
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(step = %step.id, "connector evidence view could not be prepared");
+                if let (Ok(capture), Ok(view)) = (capture, view) {
+                    if let Err(error) = crate::evidence_service::publish(
+                        &self.service.store,
+                        &capture,
+                        &self.ctx.request_id,
+                        &id,
+                        view,
+                        json!({"kind": "protected_connector_result"}),
+                    )
+                    .await
+                    {
+                        tracing::warn!(step = %step.id, %error, "connector evidence view unavailable");
                         report
                             .evidence_unavailable
                             .push(format!("{id}: view_unavailable"));
                     }
+                } else {
+                    tracing::warn!(step = %step.id, "connector evidence view could not be prepared");
+                    report
+                        .evidence_unavailable
+                        .push(format!("{id}: view_unavailable"));
                 }
                 report.evidence.push(id.clone());
                 self.evidence.push(id);
@@ -1869,6 +1866,11 @@ impl RunState<'_> {
                 return;
             }
         };
+        for skipped in &compressed.view_skipped {
+            report
+                .evidence_unavailable
+                .push(format!("{}: {}", skipped.detail, skipped.cause));
+        }
         for id in [
             Some(compressed.source.id.clone()),
             Some(compressed.compact.id.clone()),

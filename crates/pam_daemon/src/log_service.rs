@@ -636,7 +636,7 @@ fn safe_summary(text: &str) -> Result<(crate::evidence_view::RedactedView, Strin
     Ok((view, safe_text))
 }
 
-fn summary_input(
+pub(crate) fn summary_input(
     compact_text: &str,
     compact_id: &str,
     semantic: Option<(&str, &EvidenceRef)>,
@@ -649,37 +649,6 @@ fn summary_input(
         json!({"evidence_id": evidence_id,
         "sha256": pam_compact::sha256_hex(prompt.as_bytes()), "offset_basis": "view_bytes"}),
     )
-}
-
-#[cfg(test)]
-mod summary_input_tests {
-    use super::{EvidenceRef, summary_input};
-
-    #[test]
-    fn input_identity_follows_actual_selected_view_bytes() {
-        let semantic = EvidenceRef {
-            id: "semantic".into(),
-            bytes: 123,
-        };
-        let (prompt, identity) = summary_input(
-            "compact text",
-            "compact",
-            Some(("selected text", &semantic)),
-        );
-        assert_eq!(prompt, "selected text");
-        assert_eq!(identity["evidence_id"], "semantic");
-        assert_eq!(
-            identity["sha256"],
-            pam_compact::sha256_hex(prompt.as_bytes())
-        );
-        assert_eq!(identity["offset_basis"], "view_bytes");
-        let (prompt, identity) = summary_input("compact text", "compact", None);
-        assert_eq!(identity["evidence_id"], "compact");
-        assert_eq!(
-            identity["sha256"],
-            pam_compact::sha256_hex(prompt.as_bytes())
-        );
-    }
 }
 
 impl CompressStats {

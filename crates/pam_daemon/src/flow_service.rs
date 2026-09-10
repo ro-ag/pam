@@ -61,6 +61,9 @@ mod watch_runtime_test;
 
 #[path = "landing_checks.rs"]
 mod landing_checks;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "flow_landing_integration_test.rs"]
+mod landing_integration_test;
 #[path = "flow_landing_runtime.rs"]
 mod landing_runtime;
 #[cfg(test)]
@@ -704,15 +707,8 @@ impl FlowService {
             }
             match &step.action {
                 Action::Landing { operation } => {
-                    item["landing"] = json!(operation);
-                    item["live_state"] = json!("unknown_until_frozen_and_verified");
-                    if let Err(error) =
-                        landing_runtime::inspect_policy(&self.store, repo, *operation).await
-                    {
-                        blockers.push(
-                            json!({"step":step.id,"cause":error.cause,"recovery":error.recovery}),
-                        );
-                    }
+                    self.inspect_landing_step(repo, step, *operation, &mut item, &mut blockers)
+                        .await;
                 }
                 Action::Command { argv } => {
                     item["containment"] = json!(if cfg!(target_os = "macos") {
@@ -778,6 +774,21 @@ impl FlowService {
             steps.push(item);
         }
         Ok((steps, blockers))
+    }
+
+    async fn inspect_landing_step(
+        &self,
+        repo: &Path,
+        step: &Step,
+        operation: pam_flow::LandingOperation,
+        item: &mut Value,
+        blockers: &mut Vec<Value>,
+    ) {
+        item["landing"] = json!(operation);
+        item["live_state"] = json!("unknown_until_frozen_and_verified");
+        if let Err(error) = landing_runtime::inspect_policy(&self.store, repo, operation).await {
+            blockers.push(json!({"step":step.id,"cause":error.cause,"recovery":error.recovery}));
+        }
     }
 
     /// `flow.show`: one flow's text, its canonical rendering, and its
@@ -1573,7 +1584,7 @@ impl RunState<'_> {
             );
             return Ok(report);
         }
-        if step.watch.is_some() {
+        if step.watch.is_some() || matches!(step.action, Action::Landing { .. }) {
             self.watch_grant_stamp = Some(self.watch_stamp().await?);
         }
         if step.gated()
@@ -1589,7 +1600,7 @@ impl RunState<'_> {
         let started = Instant::now();
         match &step.action {
             Action::Landing { operation } => {
-                self.run_landing_step(step, *operation, &mut report).await?
+                self.run_landing_step(step, *operation, &mut report).await?;
             }
             Action::Command { argv } => self.run_command_step(step, argv, &mut report).await?,
             Action::Connector {

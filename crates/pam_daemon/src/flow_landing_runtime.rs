@@ -1,5 +1,9 @@
 //! Original-ticket typed landing orchestration. Recipes supply no commands or URLs.
-use super::*;
+use super::{
+    Action, Arc, ArgValue, BTreeMap, CapabilityFailure, ConnectorId, Duration, FlowRefusal,
+    Instant, Path, PathBuf, RunState, Step, StepReport, StepStatus, Store, Value, digest, failed,
+    json, new_evidence_id, resolve_program,
+};
 use crate::connector_service::LandingGithubOp;
 use crate::flow_recovery::failure;
 use crate::landing_checkout::{self, CheckoutReceipt, CheckoutRequest};
@@ -308,7 +312,12 @@ impl RunState<'_> {
                 "Landing configuration changed",
             ));
         }
-        self.watch_stamp().await?;
+        if self.watch_grant_stamp.as_ref() != Some(&self.watch_stamp().await?) {
+            return Err(refused(
+                "landing_authorization_changed",
+                "The admission or policy profile changed after this stage was gated",
+            ));
+        }
         let request = self.checkout_request(&loaded.policy, &loaded.receipt.commit)?;
         landing_checkout::revalidate(
             &request,
@@ -523,21 +532,38 @@ impl RunState<'_> {
         self.landing_live(loaded, deadline).await?;
         let mut checked = Vec::new();
         for (index, check) in loaded.policy.checks.iter().enumerate() {
+            let settings = self.service.settings().await.map_err(failed)?;
             let mut spec = super::landing_checks::prepare(
                 &loaded.policy,
                 index,
                 &loaded.session.checktree,
-                self.settings,
+                &settings,
                 &self.service.protected_base,
             )
             .await
             .map_err(|e| refused(e.cause, e.detail))?;
+            self.landing_live(loaded, deadline).await?;
+            if settings != self.service.settings().await.map_err(failed)? {
+                return Err(refused(
+                    "landing_check_configuration_changed",
+                    "The command allowlist or executable search path changed while preparing this check",
+                ));
+            }
             spec.timeout = spec
                 .timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
             let attempt = self.attempt_command(&spec, step).await;
             self.settle(step, attempt, report).await;
-            if report.status != StepStatus::Succeeded || !report.evidence_unavailable.is_empty() {
+            if !report.evidence_unavailable.is_empty() {
+                report.fail(
+                    StepStatus::Blocked,
+                    "landing_check_evidence_unavailable",
+                    "A mandatory check completed without publishable retained evidence".to_owned(),
+                    RECOVERY.to_owned(),
+                );
+                return Ok(None);
+            }
+            if report.status != StepStatus::Succeeded {
                 return Ok(None);
             }
             checked.push(json!({"name":check.name,"program":spec.program,"argv":spec.argv,"configuration_sha256":pam_compact::sha256_hex(&crate::flow_recovery::encode(check)?)}));
@@ -972,6 +998,13 @@ impl RunState<'_> {
                 .clone()
         };
         let (profile_stamp, authorization_revision) = self.watch_stamp().await?;
+        if self.watch_grant_stamp.as_ref() != Some(&(profile_stamp.clone(), authorization_revision))
+        {
+            return Err(refused(
+                "landing_authorization_changed",
+                "The admission or policy profile changed during this poll",
+            ));
+        }
         loaded.session.poll = Some(Poll {
             step: step.id.clone(),
             polls,

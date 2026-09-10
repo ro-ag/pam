@@ -117,6 +117,8 @@ struct Collection<'a> {
     stopped: bool,
     sources: Vec<Value>,
     gaps: BTreeSet<&'static str>,
+    next_reads: Vec<Value>,
+    next_reads_omitted: usize,
 }
 
 impl Collection<'_> {
@@ -213,6 +215,8 @@ pub(crate) async fn investigate(
         stopped: false,
         sources: Vec::new(),
         gaps: BTreeSet::new(),
+        next_reads: Vec::new(),
+        next_reads_omitted: 0,
     };
     let mut url = collection.url(&["api", "json"])?;
     url.query_pairs_mut()
@@ -222,8 +226,14 @@ pub(crate) async fn investigate(
     if status == "RUNNING" || status == "UNKNOWN" {
         collection.gaps.insert("build_not_terminal");
     }
-    let (pipeline_status, stages, candidates) = collect_stages(&mut collection).await;
+    let (pipeline_status, stages, mut candidates) = collect_stages(&mut collection).await;
+    let supplemental = collect_parents(&mut collection, &stages).await;
+    candidates.extend(supplemental.iter().filter(|node| node.has_log()).cloned());
+    if candidates.len() > MAX_LOGS {
+        candidates = diversify(candidates, &stages);
+    }
     let logs = collect_logs(&mut collection, candidates).await;
+    bind_next_reads(&mut collection.next_reads, job, build);
     let mut node_status_counts = BTreeMap::<String, usize>::new();
     for stage in &stages {
         for node in stage["nodes"].as_array().into_iter().flatten() {
@@ -240,6 +250,9 @@ pub(crate) async fn investigate(
         "status": status,
         "source_identity": scm_identity(&core),
         "build_result": crate::transport::pick(&core, &["number", "result", "building", "timestamp", "duration"]),
+        "supplemental_nodes": supplemental,
+        "next_reads": collection.next_reads,
+        "next_reads_omitted": collection.next_reads_omitted,
         "pipeline_status": pipeline_status,
         "summary": summary,
         "attribution": "unresolved",
@@ -465,6 +478,7 @@ async fn collect_stages(
             }
         } else {
             collection.gaps.insert("stage_details_unavailable");
+            collection.next_read(&stage.id, "describe", "stage_details_unavailable");
         }
         stages.push(json!({
             "endpoint": collection.url(&["execution", "node", &stage.id, "wfapi", "describe"]).ok().map(|url| url.to_string()),
@@ -496,16 +510,23 @@ fn parse_stage(value: Value, expected: &str) -> Result<StageDescription, Connect
 async fn collect_logs(collection: &mut Collection<'_>, mut candidates: Vec<Node>) -> Vec<Value> {
     // Failed/error observations first, then other states and successful nodes.
     // Preserve successes too: they may explain retry recovery or post actions.
-    candidates.sort_by_key(Node::priority);
+    // Callers order capped collections for stage/context diversity.
+    if candidates.len() <= MAX_LOGS {
+        candidates.sort_by_key(Node::priority);
+    }
     let mut seen = BTreeSet::new();
     candidates.retain(|node| seen.insert(node.id.clone()));
     if candidates.len() > MAX_LOGS {
         collection.gaps.insert("log_limit");
+        for node in candidates.iter().skip(MAX_LOGS) {
+            collection.next_read(&node.id, "log", "log_limit");
+        }
     }
     let mut logs = Vec::new();
     for node in candidates.into_iter().take(MAX_LOGS) {
         let suffix = ["execution", "node", &node.id, "wfapi", "log"];
         let Some(body) = collection.optional(&suffix).await else {
+            collection.next_read(&node.id, "log", "log_unavailable");
             continue;
         };
         match parse_log(body, &node.id) {
@@ -532,6 +553,7 @@ async fn collect_logs(collection: &mut Collection<'_>, mut candidates: Vec<Node>
             }
             Err(_) => {
                 collection.gaps.insert("malformed_node_log");
+                collection.next_read(&node.id, "log", "malformed_node_log");
             }
         }
     }
@@ -569,7 +591,10 @@ fn excerpts(text: &str) -> Vec<Value> {
 }
 
 fn node_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit())
+    !id.is_empty()
+        && id.len() <= 20
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<i64>().is_ok_and(|value| value > 0)
 }
 
 fn bad_response(message: &str) -> ConnectorError {
@@ -666,4 +691,189 @@ fn scm_identity(core: &Value) -> Value {
         }
     }
     source_identity(urls, revisions, partial)
+}
+
+impl Collection<'_> {
+    fn next_read(&mut self, id: &str, kind: &'static str, reason: &'static str) {
+        if self
+            .next_reads
+            .iter()
+            .any(|read| read["node_id"] == id && read["kind"] == kind)
+        {
+            return;
+        }
+        if self.next_reads.len() == 24 {
+            self.next_reads_omitted += 1;
+            return;
+        }
+        self.next_reads
+            .push(json!({"flow":"jenkins-node-evidence","call":"node_evidence","node_id":id,"kind":kind,"reason":reason}));
+    }
+}
+fn bind_next_reads(reads: &mut [Value], job: &str, build: i64) {
+    for read in reads {
+        read["args"] = json!({"job":job,"build":build,"node_id":read["node_id"]});
+    }
+}
+
+/// Select observed failure and success context from each stage before filling
+/// spare slots. Success is context, never proof that an earlier error recovered.
+fn diversify(candidates: Vec<Node>, stages: &[Value]) -> Vec<Node> {
+    let mut selected = Vec::new();
+    let mut used = BTreeSet::new();
+    for stage in stages {
+        let ids: BTreeSet<_> = stage["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|node| node["id"].as_str())
+            .collect();
+        for want_success in [false, true] {
+            if let Some(node) = candidates
+                .iter()
+                .filter(|node| {
+                    ids.contains(node.id.as_str())
+                        && (node.status == "SUCCESS") == want_success
+                        && !used.contains(&node.id)
+                })
+                .min_by_key(|node| node.priority())
+            {
+                used.insert(node.id.clone());
+                selected.push(node.clone());
+            }
+        }
+    }
+    let mut remaining: Vec<_> = candidates
+        .into_iter()
+        .filter(|node| !used.contains(&node.id))
+        .collect();
+    remaining.sort_by_key(Node::priority);
+    selected.extend(remaining);
+    selected
+}
+
+async fn collect_parents(collection: &mut Collection<'_>, stages: &[Value]) -> Vec<Node> {
+    let mut known = BTreeMap::<String, Node>::new();
+    for stage in stages {
+        for value in std::iter::once(&stage["observation"])
+            .chain(stage["nodes"].as_array().into_iter().flatten())
+        {
+            if let Ok(node) = parse_node(value.clone()) {
+                known.insert(node.id.clone(), node);
+            }
+        }
+    }
+    let mut pending: BTreeSet<String> = known
+        .values()
+        .flat_map(|node| node.parent_nodes.iter().cloned())
+        .filter(|id| !known.contains_key(id))
+        .collect();
+    let mut attempted = BTreeSet::new();
+    let mut supplemental = Vec::new();
+    while let Some(id) = pending.pop_first() {
+        if known.contains_key(&id) || !attempted.insert(id.clone()) {
+            continue;
+        }
+        if attempted.len() > 4 {
+            collection.gaps.insert("parent_limit");
+            collection.next_read(&id, "describe", "parent_limit");
+            continue;
+        }
+        let body = collection
+            .optional(&["execution", "node", &id, "wfapi", "describe"])
+            .await;
+        let node = body
+            .and_then(|body| parse_node(body).ok())
+            .filter(|node| node.id == id);
+        if let Some(node) = node {
+            pending.extend(
+                node.parent_nodes
+                    .iter()
+                    .filter(|parent| !known.contains_key(*parent))
+                    .cloned(),
+            );
+            known.insert(id, node.clone());
+            supplemental.push(node);
+        } else {
+            collection.gaps.insert("parent_unavailable");
+            collection.next_read(&id, "describe", "parent_unavailable");
+        }
+    }
+    // Directed parent cycles are malformed graph evidence, never causal proof.
+    for start in known.keys() {
+        let mut seen = BTreeSet::new();
+        let mut todo = known[start].parent_nodes.clone();
+        while let Some(id) = todo.pop() {
+            if &id == start {
+                collection.gaps.insert("parent_cycle");
+                break;
+            }
+            if seen.insert(id.clone())
+                && let Some(node) = known.get(&id)
+            {
+                todo.extend(node.parent_nodes.iter().cloned());
+            }
+        }
+    }
+    supplemental
+}
+
+/// An executable bounded follow-up using only reconstructed same-build URLs.
+pub(crate) async fn node_evidence(
+    conn: &Connection,
+    args: &BTreeMap<String, ArgValue>,
+    transport: &dyn HttpTransport,
+    deadline: Instant,
+) -> Result<CallResult, ConnectorError> {
+    let job = text_arg(args, "job")?;
+    let build = id_arg(args, "build")?;
+    let node = id_arg(args, "node_id")?.to_string();
+    let mut base = job_segments(job)?;
+    if job.len() > 1024
+        || build <= 0
+        || node == "0"
+        || base.iter().any(|part| part == "." || part == "..")
+    {
+        return Err(ConnectorError::BadArgs(
+            "node_evidence requires an explicit job, build and positive node id".into(),
+        ));
+    }
+    base.push(build.to_string());
+    let mut collection = Collection {
+        conn,
+        transport,
+        deadline,
+        base,
+        requests: 0,
+        bytes: 0,
+        stopped: false,
+        sources: Vec::new(),
+        gaps: BTreeSet::new(),
+        next_reads: Vec::new(),
+        next_reads_omitted: 0,
+    };
+    let mut url = collection.url(&["api", "json"])?;
+    url.query_pairs_mut().append_pair("tree","number,result,building,timestamp,duration,actions[remoteUrls,lastBuiltRevision[SHA1],revision[hash,pullHash,baseHash]]");
+    let core = collection.fetch(url).await?;
+    let status = core_status(&core, build)?;
+    let body = collection
+        .optional(&["execution", "node", &node, "wfapi", "describe"])
+        .await;
+    let observed = body
+        .and_then(|body| parse_node(body).ok())
+        .filter(|value| value.id == node);
+    let mut candidates = Vec::new();
+    if let Some(value) = &observed {
+        if value.has_log() {
+            candidates.push(value.clone());
+        }
+    } else {
+        collection.gaps.insert("node_description_unavailable");
+        collection.next_read(&node, "describe", "node_description_unavailable");
+    }
+    let logs = collect_logs(&mut collection, candidates).await;
+    bind_next_reads(&mut collection.next_reads, job, build);
+    Ok(CallResult::Json(
+        json!({"schema":1,"job":job,"build":build,"node_id":node,"status":status,"source_identity":scm_identity(&core),"observation":observed,"node_logs":logs,"attribution":"unresolved","sources":collection.sources,"next_reads":collection.next_reads,"next_reads_omitted":collection.next_reads_omitted,"coverage":{"partial":!collection.gaps.is_empty(),"gaps":collection.gaps,"graph_complete":false,"requests":collection.requests,"charged_response_bytes":collection.bytes}}),
+    ))
 }

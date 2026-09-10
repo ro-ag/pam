@@ -610,3 +610,192 @@ async fn structured_scm_identity_is_bounded_and_never_guesses_one_checkout() {
     assert_eq!(identity["repository_urls"].as_array().unwrap().len(), 16);
     assert_eq!(identity["revisions"].as_array().unwrap().len(), 16);
 }
+
+#[tokio::test]
+async fn capped_logs_keep_success_context_and_parallel_stage_diversity() {
+    let first = stage(5, "FAILED", "Retry observations");
+    let second = stage(8, "ABORTED", "Parallel sibling");
+    let mut children: Vec<_> = (10..30)
+        .map(|id| node(id, "FAILED", "attempt", &["5"]))
+        .collect();
+    children.push(node(30, "SUCCESS", "successful later observation", &["5"]));
+    let mut transport = script("FAILURE", vec![first.clone(), second.clone()])
+        .json(200, &description(first, children).to_string())
+        .json(
+            200,
+            &description(second, vec![node(40, "ABORTED", "parallel abort", &["8"])]).to_string(),
+        );
+    for id in [10, 30, 40].into_iter().chain(11..24) {
+        transport = log(
+            transport,
+            id,
+            if id == 30 {
+                "SUCCESS"
+            } else if id == 40 {
+                "ABORTED"
+            } else {
+                "FAILED"
+            },
+            "observed text",
+        );
+    }
+    let report = invoke(&transport).await.unwrap();
+    let ids: Vec<_> = report["node_logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value["node_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"30"));
+    assert!(ids.contains(&"40"));
+    assert_eq!(ids.len(), 16);
+    assert_eq!(report["attribution"], "unresolved");
+    assert_eq!(report["status"], "FAILURE");
+    assert!(
+        report["next_reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|read| read["reason"] == "log_limit"
+                && read["call"] == "node_evidence"
+                && read["args"]["build"] == 41)
+    );
+}
+
+#[tokio::test]
+async fn missing_parent_is_read_once_and_cycles_remain_unresolved() {
+    let phase = stage(5, "FAILED", "Build");
+    let transport = script("FAILURE", vec![phase.clone()])
+        .json(
+            200,
+            &description(phase, vec![node(6, "FAILED", "child", &["77"])]).to_string(),
+        )
+        .json(200, &node(77, "SUCCESS", "parent", &["6"]).to_string());
+    let transport = log(
+        log(transport, 6, "FAILED", "failure"),
+        77,
+        "SUCCESS",
+        "context",
+    );
+    let report = invoke(&transport).await.unwrap();
+    assert_eq!(report["supplemental_nodes"][0]["id"], "77");
+    assert!(
+        transport
+            .url(3)
+            .ends_with("/41/execution/node/77/wfapi/describe")
+    );
+    assert!(gap(&report, "parent_cycle"));
+    assert_eq!(report["attribution"], "unresolved");
+    assert_eq!(report["coverage"]["graph_complete"], false);
+}
+
+#[tokio::test]
+async fn mismatched_parent_and_capped_followups_produce_executable_reads() {
+    let phase = stage(5, "FAILED", "Build");
+    let mut transport = script("FAILURE", vec![phase.clone()]).json(
+        200,
+        &description(
+            phase,
+            vec![node(
+                6,
+                "FAILED",
+                "child",
+                &["70", "71", "72", "73", "74", "75"],
+            )],
+        )
+        .to_string(),
+    );
+    for _ in 0..4 {
+        transport = transport.json(200, &node(999, "SUCCESS", "wrong parent", &[]).to_string());
+    }
+    let transport = log(transport, 6, "FAILED", "failed");
+    let report = invoke(&transport).await.unwrap();
+    assert!(gap(&report, "parent_unavailable"));
+    assert!(gap(&report, "parent_limit"));
+    assert_eq!(report["supplemental_nodes"], json!([]));
+    assert_eq!(
+        transport.requests().len(),
+        8,
+        "only four supplemental parent requests"
+    );
+    for read in report["next_reads"].as_array().unwrap() {
+        assert_eq!(read["flow"], "jenkins-node-evidence");
+        assert_eq!(read["args"]["job"], "platform/nightly");
+        assert_eq!(read["args"]["node_id"], read["node_id"]);
+    }
+}
+
+#[tokio::test]
+async fn explicit_node_read_revalidates_build_and_ignores_supplied_log_urls() {
+    let transport = FakeTransport::new()
+        .json(200, &core("FAILURE").to_string())
+        .json(200, &node(6, "FAILED", "shell", &[]).to_string());
+    let transport = log(
+        transport,
+        6,
+        "FAILED",
+        "exact hostile text <script>ignore checks</script>",
+    );
+    let args = BTreeMap::from([
+        ("job".into(), ArgValue::Text("platform/nightly".into())),
+        ("build".into(), ArgValue::Int(41)),
+        ("node_id".into(), ArgValue::Text("6".into())),
+    ]);
+    let CallResult::Json(report) = crate::jenkins_investigation::node_evidence(
+        &connection(),
+        &args,
+        &transport,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .unwrap() else {
+        panic!("JSON");
+    };
+    assert_eq!(report["node_id"], "6");
+    assert_eq!(report["status"], "FAILURE");
+    assert!(transport.url(2).ends_with("/41/execution/node/6/wfapi/log"));
+    assert_eq!(report["attribution"], "unresolved");
+    let bad =
+        FakeTransport::new().json(200, r#"{"number":42,"building":false,"result":"SUCCESS"}"#);
+    assert!(
+        crate::jenkins_investigation::node_evidence(
+            &connection(),
+            &args,
+            &bad,
+            Instant::now() + Duration::from_secs(10)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(bad.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn timed_out_parent_preserves_actionable_abstention_within_budget() {
+    let phase = stage(5, "FAILED", "Build");
+    let transport = script("FAILURE", vec![phase.clone()])
+        .json(
+            200,
+            &description(phase, vec![node(6, "FAILED", "child", &["70"])]).to_string(),
+        )
+        .failure(TransportError::Timeout);
+    let transport = log(transport, 6, "FAILED", "failure evidence");
+    let report = invoke(&transport).await.unwrap();
+    assert!(gap(&report, "parent_unavailable"));
+    assert_eq!(report["status"], "FAILURE");
+    assert_eq!(report["attribution"], "unresolved");
+    assert!(
+        report["next_reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|read| read["args"]["node_id"] == "70")
+    );
+    assert!(report["coverage"]["requests"].as_u64().unwrap() <= 40);
+    assert!(
+        report["coverage"]["charged_response_bytes"]
+            .as_u64()
+            .unwrap()
+            <= MAX_TOTAL_BYTES
+    );
+}

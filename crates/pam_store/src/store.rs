@@ -7,6 +7,9 @@
 #[path = "evidence_views.rs"]
 mod evidence_views;
 pub use evidence_views::*;
+#[path = "correlation.rs"]
+mod correlation;
+pub use correlation::*;
 #[path = "flow_results.rs"]
 mod flow_results;
 pub use flow_results::*;
@@ -2014,6 +2017,8 @@ impl Store {
         if requests > 0 {
             // Children first: the foreign keys point at `request`.
             for sql in [
+                format!("DELETE FROM correlation_step WHERE {children}"),
+                format!("DELETE FROM correlation_target WHERE {children}"),
                 format!("DELETE FROM evidence_view WHERE {children}"),
                 format!("DELETE FROM evidence_read_allowance WHERE {children}"),
                 format!("DELETE FROM evidence WHERE {children}"),

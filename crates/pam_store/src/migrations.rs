@@ -45,6 +45,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 7,
         sql: SCHEMA_V7,
     },
+    Migration {
+        version: 8,
+        sql: SCHEMA_V8,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -272,5 +276,19 @@ CREATE TABLE evidence_read_allowance (
  remaining_bytes INTEGER NOT NULL,
  remaining_pages INTEGER NOT NULL,
  PRIMARY KEY(request_id, repository)
+);
+";
+
+/// Immutable workflow identities, retained exactly as long as their request.
+const SCHEMA_V8: &str = "
+CREATE TABLE correlation_target (
+ request_id TEXT PRIMARY KEY REFERENCES request(id),
+ canonical_json TEXT NOT NULL CHECK(LENGTH(CAST(canonical_json AS BLOB))<=16384)
+);
+CREATE TABLE correlation_step (
+ request_id TEXT NOT NULL REFERENCES correlation_target(request_id),
+ step_id TEXT NOT NULL CHECK(LENGTH(CAST(step_id AS BLOB)) BETWEEN 1 AND 256),
+ canonical_json TEXT NOT NULL CHECK(LENGTH(CAST(canonical_json AS BLOB))<=8192),
+ PRIMARY KEY(request_id,step_id)
 );
 ";

@@ -841,21 +841,36 @@ impl FlowService {
             .await?;
 
         let correlation = self.freeze_correlation(ctx, &repo, flow, &vars).await?;
+        let (recovery, restored) =
+            crate::flow_recovery::Recovery::open(&self.store, &ctx.request_id, flow, &repo, &vars)
+                .await?;
+        let restored_reports = restored.restore_reports(flow)?;
         let mut state = RunState {
             service: self,
             ctx,
             flow,
             settings: &settings,
             repo,
-            observed: vars.clone(),
-            vars,
+            observed: restored.observed,
+            vars: restored.vars,
+            recovery,
             correlation,
             cancel,
-            reports: Vec::with_capacity(flow.steps.len()),
-            evidence: Vec::new(),
-            origins: BTreeMap::new(),
-            all_origins: Vec::new(),
+            reports: restored_reports,
+            evidence: restored.evidence,
+            origins: restored.origins,
+            all_origins: restored.all_origins,
         };
+        for report in &state.reports {
+            if let Some(error) = &report.error
+                && error.cause.starts_with("correlation_")
+            {
+                state.correlation.invalidate(&crate::correlation::Failure {
+                    cause: crate::correlation::CONFLICT,
+                    detail: error.detail.clone(),
+                });
+            }
+        }
         state.execute().await?;
 
         if let Err(error) = state.correlation.check_mapping(&self.store).await {
@@ -1335,6 +1350,7 @@ struct RunState<'a> {
     vars: Vars,
     observed: Vars,
     correlation: crate::correlation::Frozen,
+    recovery: crate::flow_recovery::Recovery,
     cancel: watch::Receiver<bool>,
     reports: Vec<StepReport>,
     evidence: Vec<String>,
@@ -1346,10 +1362,22 @@ impl RunState<'_> {
     /// Walks the steps in file order, stopping at the first blocked one.
     async fn execute(&mut self) -> Result<(), CapabilityFailure> {
         let total = self.flow.steps.len();
-        for (index, step) in self.flow.steps.iter().enumerate() {
-            if !self.should_run(step) {
+        if self
+            .reports
+            .iter()
+            .any(|report| matches!(report.status, StepStatus::Blocked | StepStatus::Cancelled))
+        {
+            return Ok(());
+        }
+        for (index, step) in self.flow.steps.iter().enumerate().skip(self.reports.len()) {
+            let will_run = self.should_run(step);
+            self.recovery
+                .prepare(&self.service.store, &self.ctx.request_id, step, will_run)
+                .await?;
+            if !will_run {
                 self.reports
                     .push(StepReport::new(&step.id, step.kind(), StepStatus::Skipped));
+                self.checkpoint(index + 1 == total).await?;
                 self.publish_settled(index, total, &step.id, StepStatus::Skipped)
                     .await;
                 continue;
@@ -1360,11 +1388,38 @@ impl RunState<'_> {
             self.publish_settled(index, total, &step.id, report.status)
                 .await;
             self.reports.push(report);
+            self.checkpoint(blocked || index + 1 == total).await?;
             if blocked {
                 break;
             }
         }
         Ok(())
+    }
+
+    async fn checkpoint(&mut self, completed: bool) -> Result<(), CapabilityFailure> {
+        let reports = self
+            .reports
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failed)?;
+        let snapshot = crate::flow_recovery::Snapshot {
+            fingerprint: self.recovery.fingerprint.clone(),
+            vars: self.vars.clone(),
+            observed: self.observed.clone(),
+            reports,
+            evidence: self.evidence.clone(),
+            origins: self.origins.clone(),
+            all_origins: self.all_origins.clone(),
+        };
+        self.recovery
+            .settle(
+                &self.service.store,
+                &self.ctx.request_id,
+                &snapshot,
+                completed,
+            )
+            .await
     }
 
     /// Whether this step's `when` condition holds, given what ran before.
@@ -1733,7 +1788,8 @@ impl RunState<'_> {
                         status: StepStatus::Blocked,
                         ..
                     }
-            ) || number == step.retry.attempts;
+            ) || step.effect == pam_flow::Effect::Stateful
+                || number == step.retry.attempts;
             if done {
                 attempt = Some(outcome);
                 break;

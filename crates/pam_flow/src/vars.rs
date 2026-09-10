@@ -32,7 +32,8 @@ pub enum VarError {
 /// Plain keys (`inputs.repo`, `repo.path`) hold strings; step keys hold the
 /// step's JSON — `{ "result": …, "exit_status": … }` — so
 /// `steps.<id>.result.jobs[0].id` walks straight into it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Vars {
     map: BTreeMap<String, String>,
     steps: BTreeMap<String, Value>,

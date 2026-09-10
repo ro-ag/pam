@@ -1146,6 +1146,9 @@ fn github_owner_name(url: &str) -> Option<String> {
 /// git's interactive prompts wired shut.
 fn base_env(settings: &FlowSettings) -> Vec<(String, String)> {
     let mut env = scrub_env(std::env::vars_os());
+    // Replace inherited Git config injection coherently; stale count/parameter
+    // variables must not override the isolated defaults, including in children.
+    env.retain(|(name, _)| name != "GIT_CONFIG" && !name.starts_with("GIT_CONFIG_"));
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs = settings.extra_path_dirs();
     dirs.extend(std::env::split_paths(&inherited));
@@ -1170,6 +1173,16 @@ fn base_env(settings: &FlowSettings) -> Vec<(String, String)> {
     // readable within the approved root; any helpers still inherit containment.
     env.push(("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()));
     env.push(("GIT_CONFIG_SYSTEM".to_owned(), "/dev/null".to_owned()));
+    // Git also consults personal ignore/attribute files independently of its
+    // global config. Disable those defaults without granting HOME/XDG access.
+    env.push(("GIT_CONFIG_COUNT".to_owned(), "2".to_owned()));
+    for (index, key) in ["core.excludesFile", "core.attributesFile"]
+        .iter()
+        .enumerate()
+    {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), (*key).to_owned()));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), "/dev/null".to_owned()));
+    }
     env
 }
 

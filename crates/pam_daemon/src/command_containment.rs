@@ -169,7 +169,7 @@ pub(crate) fn profile(
     }
     // Do not import system/app profiles: they grant services beyond this contract.
     let mut text = String::from(
-        "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow signal (target self))\n(allow process-info* (target self))\n(allow file-read-data (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
+        "(version 1)\n(deny default)\n(allow process-fork process-exec)\n(allow sysctl-read)\n(allow file-read-metadata)\n(allow signal (target self))\n(allow process-info* (target self))\n(allow file-read-data (literal \"/\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
     );
     // The OS loader and the env trampoline require these immutable system reads.
     for root in SYSTEM_READ_ROOTS {

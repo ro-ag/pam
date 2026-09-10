@@ -29,8 +29,8 @@
 //! credential refuses with the keychain's own cause. When `curl` is not
 //! installed, the service still lists and configures, and every operation
 //! that would speak HTTP refuses with `connector_cli_missing` and the
-//! platform's install line. AWS is the exception on that second path: it
-//! drives the local `aws` CLI, not `curl`, so it keeps working.
+//! platform's install line. AWS CLI execution is separately refused until
+//! its credential helpers have qualified containment.
 
 use std::collections::BTreeMap;
 use std::future::Future;

@@ -145,6 +145,12 @@ async fn real_flow_contains_children_and_descendants_or_refuses_before_spawn() {
     let response = tokio::time::timeout(Duration::from_secs(100), client.request(&request))
         .await
         .unwrap();
+    let mut retained_debug = String::new();
+    for meta in daemon.store().list_evidence("containment-run").await.unwrap() {
+        if let Some(row) = daemon.store().get_evidence(&meta.id).await.unwrap() {
+            retained_debug.push_str(&String::from_utf8_lossy(&row.content));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         assert!(
@@ -155,7 +161,7 @@ async fn real_flow_contains_children_and_descendants_or_refuses_before_spawn() {
                     ..
                 }
             ),
-            "{response:?}"
+            "{response:?} retained: {retained_debug}"
         );
         assert_eq!(
             std::fs::read(repo.path().join("child-verified")).unwrap(),

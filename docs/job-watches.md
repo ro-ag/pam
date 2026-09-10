@@ -121,4 +121,6 @@ notices. None of these outcomes becomes a successful product result.
 
 Local fixtures exercise these contracts with fake transports and credentials.
 They are not live enterprise compatibility results or local-model qualification.
-Guarded landing, remote mutations and artifact publication remain separate work.
+[Guarded landing](guarded-landing.md) adds separately scoped remote mutations and
+exact PR/main verification on the original ticket; its end-to-end qualification
+is still pending. Artifact publication remains unsupported.

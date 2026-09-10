@@ -14,9 +14,9 @@ HTTP transport uses the trusted system curl on macOS/Linux with `-q` first, an e
 
 ## Deliberate execution limits
 
-Network commands such as `git fetch`, push, and publishing cannot run inside this profile. Existing network command recipes are not thereby qualified for landing. Future remote operations require a separately scoped broker implementation and acceptance tests; granting a program cannot loosen containment.
+Network commands such as `git fetch`, push, and publishing cannot run inside this profile. Existing network command recipes are not thereby qualified for landing. [Guarded landing](guarded-landing.md) uses separate typed brokers with exact remote/ref policy; granting a program cannot loosen containment. That flow remains under end-to-end qualification.
 
-Command environments default Git global/system configuration and personal ignore/attribute files to `/dev/null`; repository configuration remains subject to repository access and helper containment. Personal identity and remote credentials need explicit scoped handling in later landing support.
+Command environments default Git global/system configuration and personal ignore/attribute files to `/dev/null`; repository configuration remains subject to repository access and helper containment. Typed landing network operations use isolated Git metadata and the scoped broker credential. Local checks read sealed source and may write only separately declared private artifact roots; approved caches remain read-only.
 
 There are no implicit HOME, cache, temporary-directory, or build-output write allowances. A read-only step that runs a tool which writes artifacts can fail. A later build capability must declare and validate artifact roots explicitly. Stateful execution in a checkout containing the running PAM executable is refused: install trusted PAM assets outside the writable repository.
 

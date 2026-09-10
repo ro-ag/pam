@@ -856,6 +856,9 @@ pub(crate) async fn node_evidence(
     url.query_pairs_mut().append_pair("tree","number,result,building,timestamp,duration,actions[remoteUrls,lastBuiltRevision[SHA1],revision[hash,pullHash,baseHash]]");
     let core = collection.fetch(url).await?;
     let status = core_status(&core, build)?;
+    if status == "RUNNING" || status == "UNKNOWN" {
+        collection.gaps.insert("build_not_terminal");
+    }
     let body = collection
         .optional(&["execution", "node", &node, "wfapi", "describe"])
         .await;

@@ -46,6 +46,23 @@
 //! half-finished part file. Integrity here comes from the digest, which is
 //! stronger than an `ETag` and does not need the server's cooperation.
 //!
+//! # Stalls
+//!
+//! curl waits forever by default: a server that accepts the connection
+//! and then sends nothing leaves the transfer running with a part file
+//! that never grows, and PAM's progress poll faithfully reports the same
+//! byte count until someone gives up. [`TransferLimits`] closes that —
+//! a connect deadline and a minimum sustained rate, both handed to curl,
+//! so a dead transfer becomes a [`DownloadState::Failed`] with a cause
+//! instead of a spinner. The part file survives it, so the next attempt
+//! resumes.
+//!
+//! curl's exit code is the only structured thing it reports, and
+//! [`failure_cause`] turns it into the cause the GUI shows: a refused
+//! connection, a name that does not resolve and a stall are three
+//! different problems with three different fixes, and calling them all
+//! `download_failed` hides that. [`failure_recovery`] carries the fix.
+//!
 //! # Shape of a transfer
 //!
 //! [`start`] does everything that can fail fast — locate curl, refuse an
@@ -114,6 +131,35 @@ pub struct DownloadRequest {
     pub license_id: Option<String>,
 }
 
+/// Deadlines handed to curl, so a dead transfer ends instead of hanging.
+///
+/// The defaults are deliberately loose: a model is gigabytes over a link
+/// PAM does not control, and a transfer that crawls is still a transfer.
+/// What they refuse is a transfer that has stopped — no connection inside
+/// [`Self::connect_timeout`], or less than [`Self::min_bytes_per_sec`]
+/// sustained across [`Self::stall_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferLimits {
+    /// How long curl may spend getting a connection.
+    pub connect_timeout: Duration,
+    /// How long the rate may stay under [`Self::min_bytes_per_sec`]
+    /// before the transfer is abandoned. Rounded down to whole seconds:
+    /// curl's `--speed-time` takes no finer unit.
+    pub stall_window: Duration,
+    /// The rate below which a transfer counts as stopped.
+    pub min_bytes_per_sec: u64,
+}
+
+impl Default for TransferLimits {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            stall_window: Duration::from_mins(1),
+            min_bytes_per_sec: 1024,
+        }
+    }
+}
+
 /// Bytes moved so far, and the target when it is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DownloadProgress {
@@ -142,8 +188,8 @@ pub enum DownloadState {
     /// The transfer stopped and the file is not there.
     ///
     /// `cause` is one of `curl_missing`, `checkpoint_conflict`,
-    /// `download_failed`, `digest_mismatch`, `size_mismatch`,
-    /// `already_exists`, `locked`, `io`.
+    /// `digest_mismatch`, `size_mismatch`, `already_exists`, `locked`,
+    /// `io`, or one of the transport causes [`failure_cause`] names.
     Failed {
         /// Machine-readable cause the daemon maps to a recovery sentence.
         cause: String,
@@ -360,6 +406,102 @@ pub fn curl_recovery_line() -> &'static str {
     }
 }
 
+/// What a curl exit code means, as a cause the GUI can act on.
+///
+/// curl's exit codes are its only structured output, and the handful that
+/// matter here describe genuinely different situations: a name that will
+/// not resolve, a refused connection, a transfer that stopped moving, a
+/// server that will not resume, a full disk. Reporting them all as
+/// `download_failed` leaves the human with a stderr tail to interpret.
+/// Codes outside this set keep the generic cause; their detail still
+/// carries curl's own complaint.
+#[must_use]
+pub fn failure_cause(code: Option<i32>) -> &'static str {
+    match code {
+        // 5 proxy, 6 host: neither name resolved.
+        Some(5 | 6) => "dns_failed",
+        Some(7) => "connect_failed",
+        // 28 covers both deadlines PAM sets: the connect timeout and the
+        // sustained-rate window.
+        Some(28) => "network_timeout",
+        // `--fail` turns any 4xx/5xx into 22.
+        Some(22) => "http_error",
+        Some(23) => "disk_error",
+        // 18 short body, 52 empty reply, 55/56 send/recv, 92 HTTP/2
+        // stream: the connection broke rather than refused.
+        Some(18 | 52 | 55 | 56 | 92) => "transfer_interrupted",
+        // 33 no byte ranges, 36 the resume offset was rejected.
+        Some(33 | 36) => "resume_unsupported",
+        Some(35 | 58 | 59 | 60 | 77 | 83 | 91) => "tls_error",
+        _ => "download_failed",
+    }
+}
+
+/// The one sentence that tells a human what to do about `cause`.
+///
+/// Covers every cause a download can end with, transport or not, so the
+/// daemon has a single lookup to attach to a failed job row — the same
+/// shape as an admin refusal's `recovery`.
+#[must_use]
+pub fn failure_recovery(cause: &str) -> &'static str {
+    match cause {
+        "curl_missing" => curl_recovery_line(),
+        "dns_failed" => {
+            "The download host did not resolve; check DNS and any VPN, then download again."
+        }
+        "connect_failed" => {
+            "Nothing accepted the connection; check the network or proxy, then download again."
+        }
+        "network_timeout" => {
+            "The transfer stopped moving and was abandoned; the partial file is kept, so download \
+             again to resume from where it stopped."
+        }
+        "http_error" => {
+            "The server refused the request — the detail carries the status. A gated model needs \
+             its licence accepted on the source site first."
+        }
+        "tls_error" => {
+            "The TLS handshake failed; check the system clock and any inspecting proxy, then \
+             download again."
+        }
+        "transfer_interrupted" => {
+            "The connection dropped mid-transfer; the partial file is kept, so download again to \
+             resume."
+        }
+        "resume_unsupported" => {
+            "The server would not continue from the partial file; discard the partial download and \
+             start it over."
+        }
+        "disk_error" | "io" => {
+            "Writing to the models directory failed; check free space and permissions, then \
+             download again."
+        }
+        "digest_mismatch" => {
+            "The finished file did not match the catalog digest and was removed; download again, \
+             and report it if it happens twice."
+        }
+        "size_mismatch" => {
+            "The transfer ended at the wrong size; discard the partial download and start it over."
+        }
+        "checkpoint_conflict" => {
+            "The partial file on disk came from a different source; discard it, then download again."
+        }
+        "already_exists" => {
+            "Those weights are already in the models directory; delete them first to refetch."
+        }
+        "locked" => "Another transfer is writing that file; cancel it first.",
+        "verify_failed" => {
+            "The digest run could not finish; check the file is readable and still there, then \
+             verify again."
+        }
+        "daemon_restart" => {
+            "The daemon restarted while this transfer ran; the partial file is kept, so download \
+             again to resume."
+        }
+        _ => "Read the detail; the partial file is kept, so downloading again resumes it.",
+    }
+}
+
 /// Starts a transfer and returns immediately.
 ///
 /// Everything that can be refused up front is refused here, synchronously,
@@ -367,6 +509,18 @@ pub fn curl_recovery_line() -> &'static str {
 /// before a job row exists. Needs a tokio runtime: the transfer runs as a
 /// spawned task.
 pub fn start(request: DownloadRequest) -> Result<DownloadHandle, DownloadError> {
+    start_with_limits(request, TransferLimits::default())
+}
+
+/// [`start`], with the stall and connect deadlines spelled out.
+///
+/// Production takes [`TransferLimits::default`] through [`start`]; this
+/// exists so the suite can prove a stalled transfer dies without waiting
+/// a minute for it.
+pub fn start_with_limits(
+    request: DownloadRequest,
+    limits: TransferLimits,
+) -> Result<DownloadHandle, DownloadError> {
     let curl = curl_path()?;
     if request.dest.exists() {
         return Err(DownloadError::AlreadyExists(request.dest.clone()));
@@ -396,6 +550,7 @@ pub fn start(request: DownloadRequest) -> Result<DownloadHandle, DownloadError> 
         request,
         paths,
         curl,
+        limits,
         state,
         _lock: lock,
     };
@@ -413,6 +568,7 @@ struct Job {
     paths: SidecarPaths,
     curl: PathBuf,
     etag_file: PathBuf,
+    limits: TransferLimits,
     state: watch::Sender<DownloadState>,
     /// Held, not read: dropping it releases the advisory lock.
     _lock: File,
@@ -461,13 +617,26 @@ impl Job {
     /// `--fail` turns an HTTP error status into a nonzero exit instead of a
     /// saved error page; `--continue-at -` resumes from whatever is in the
     /// part file; `--retry 0` keeps retry policy here rather than inside
-    /// curl, where PAM cannot report it.
+    /// curl, where PAM cannot report it. `--connect-timeout`,
+    /// `--speed-limit` and `--speed-time` come from [`TransferLimits`] and
+    /// are the difference between a failed download and a hung one.
     fn spawn_curl(&self) -> std::io::Result<Child> {
+        // `--speed-time` counts whole seconds, and 0 would disable the
+        // check entirely; a sub-second window becomes one second rather
+        // than no window at all.
+        let stall_secs = self.limits.stall_window.as_secs().max(1);
+        let connect_secs = self.limits.connect_timeout.as_secs().max(1);
         Command::new(&self.curl)
             .arg("--fail")
             .arg("--location")
             .arg("--silent")
             .arg("--show-error")
+            .arg("--connect-timeout")
+            .arg(connect_secs.to_string())
+            .arg("--speed-limit")
+            .arg(self.limits.min_bytes_per_sec.to_string())
+            .arg("--speed-time")
+            .arg(stall_secs.to_string())
             .arg("--continue-at")
             .arg("-")
             .arg("--output")
@@ -521,7 +690,7 @@ impl Job {
             .map_or_else(|| "signal".to_owned(), |code| code.to_string());
         let tail = read_stderr_tail(&mut stderr).await;
         CurlOutcome::Failed {
-            cause: "download_failed".to_owned(),
+            cause: failure_cause(status.code()).to_owned(),
             detail: format!("curl exited {code}: {tail}"),
         }
     }

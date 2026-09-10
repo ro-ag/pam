@@ -55,6 +55,7 @@ use crate::daemon::CompletionRouter;
 use crate::flow_service::{FlowService, RunArgs};
 use crate::model_service::ModelService;
 use crate::queue::{CAUSE_CANCELLED, CancelOutcome, QueueManager};
+use crate::secrets::SecretStore;
 use crate::transport::EventPublisher;
 
 /// Recovery line offered when a request was cancelled.
@@ -92,6 +93,9 @@ pub struct ExecContext {
     pub approvals: Arc<ApprovalService>,
     /// The flow engine behind `flow.run` / `flow.list` / `flow.show`.
     pub flows: Arc<FlowService>,
+    /// The credential store, for the read-only `keyring` block on
+    /// `status`. Reachability only: no capability reads a secret.
+    pub secrets: Arc<SecretStore>,
     /// Who asked. A flow runs its command steps in
     /// [`Caller::repo`](pam_proto::Caller::repo), so this is not
     /// attribution here — it is where the work happens.
@@ -273,12 +277,19 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
             "uptime_s": ctx.started_at.elapsed().as_secs(),
             "active_requests": active_requests,
             "model": model_block(ctx).await,
+            "keyring": ctx.secrets.keyring_health().await,
         }),
         evidence: Vec::new(),
     })
 }
 
 /// The `status` body's read-only `model` block.
+///
+/// The sibling `keyring` block comes straight from
+/// [`SecretStore::keyring_health`]: whether the platform credential store
+/// answers, and what to do when it does not. It is cached for
+/// [`crate::secrets::PROBE_TTL`], so a polling GUI does not wake the
+/// keychain on every tick.
 async fn model_block(ctx: &ExecContext) -> serde_json::Value {
     let snapshot = ctx.models.runtime().snapshot();
     let (state, id, tokens_per_sec) = match &snapshot.state {

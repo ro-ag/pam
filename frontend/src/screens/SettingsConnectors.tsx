@@ -8,6 +8,7 @@ import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
 import {
   connectorsConfigure,
+  connectorsKeyring,
   connectorsList,
   connectorsTest,
   toBridgeFailure,
@@ -305,12 +306,62 @@ function ConnectorRow({
   );
 }
 
+/**
+ * KeyringBanner — the answer to "does PAM have keychain access?", asked
+ * plainly instead of inferred from a connector that will not save.
+ *
+ * A reachable store says so quietly; a blocked one carries the daemon's
+ * own recovery sentence and a Re-check, because the fix happens outside
+ * PAM (an OS prompt, a policy) and the human needs to see the screen
+ * change the moment they have made it.
+ */
+function KeyringBanner() {
+  const health = useQuery({
+    queryKey: ["connectors", "keyring"],
+    queryFn: () => connectorsKeyring(false),
+  });
+  const recheck = useMutation({
+    mutationFn: () => connectorsKeyring(true),
+    onSuccess: (fresh) => health.refetch().then(() => fresh),
+  });
+  const failure = health.isError ? toBridgeFailure(health.error) : null;
+  if (failure) return <FailureNote failure={failure} label="keychain" />;
+  if (!health.data) return null;
+
+  const reachable = health.data.state === "reachable";
+  return (
+    <div
+      aria-label="keychain access"
+      className={`flex flex-wrap items-center gap-3 rounded-card border p-3 ${
+        reachable ? "border-line" : "border-danger/40 bg-danger-soft"
+      }`}
+    >
+      <p className={`font-data text-xs ${reachable ? "text-ink-muted" : "text-danger"}`}>
+        keychain · {health.data.state}
+      </p>
+      {!reachable && health.data.recovery && (
+        <p className="font-sans text-sm text-ink">{health.data.recovery}</p>
+      )}
+      <Button
+        size="sm"
+        variant="ghost"
+        className="ml-auto"
+        disabled={recheck.isPending || health.isFetching}
+        onClick={() => recheck.mutate()}
+      >
+        Re-check
+      </Button>
+    </div>
+  );
+}
+
 export function SettingsConnectorsSection({ targetId }: { targetId?: string } = {}) {
   const connectors = useQuery({ queryKey: ["connectors"], queryFn: connectorsList });
   const failure = connectors.isError ? toBridgeFailure(connectors.error) : null;
   const rows = connectors.data?.connectors ?? [];
   return (
     <div className="settings-connectors">
+      <KeyringBanner />
       {failure && <FailureNote failure={failure} label="connectors" />}
       {!failure && connectors.isPending && (
         <p className="font-data text-xs text-ink-faint">asking the keychain…</p>

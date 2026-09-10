@@ -86,7 +86,7 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")
@@ -94,7 +94,27 @@ pub fn render_status(body: &serde_json::Value) -> String {
             .map_or_else(|| "?".to_owned(), render_uptime),
         field("active_requests"),
         render_model(body.get("model")),
+        render_keyring(body.get("keyring")),
     )
+}
+
+/// The `keyring:` line: `reachable`, or the refusal and its way out.
+///
+/// This is how a terminal answers "does the app have keychain access?".
+/// A daemon that publishes no `keyring` block is an older build and
+/// renders `?`, like every other missing field.
+fn render_keyring(keyring: Option<&serde_json::Value>) -> String {
+    let Some(keyring) = keyring else {
+        return "?".to_owned();
+    };
+    let state = keyring
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    match keyring.get("recovery").and_then(serde_json::Value::as_str) {
+        Some(recovery) => format!("{state}\n    {recovery}"),
+        None => state.to_owned(),
+    }
 }
 
 /// The `model:` line: `idle`, `loading <id>`, or `<id> loaded (<n> tok/s)`.

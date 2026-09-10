@@ -45,7 +45,7 @@ use pam_store::{ConnectorPatch, ConnectorRow, Store, StoreError};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::secrets::{SecretBackend, SecretError, SecretStore};
+use crate::secrets::{KeyringHealth, SecretBackend, SecretError, SecretStore};
 
 /// How long a credential test may take before it counts as failed.
 ///
@@ -393,6 +393,19 @@ impl ConnectorService {
 
     /// Every connector, static shape merged with its row and its
     /// credential's presence, in [`ConnectorId::ALL`] order.
+    /// Whether the platform credential store answers right now.
+    ///
+    /// `fresh` skips the cached answer: the Re-check button exists
+    /// because the human just changed something at the OS level and wants
+    /// the screen to reflect it, not the reading from half a minute ago.
+    pub async fn keyring_health(&self, fresh: bool) -> KeyringHealth {
+        if fresh {
+            self.secrets.probe_keyring().await
+        } else {
+            self.secrets.keyring_health().await
+        }
+    }
+
     pub async fn list(&self) -> Result<Vec<ConnectorSummary>, StoreError> {
         let rows = self.store.list_connectors().await?;
         let mut summaries = Vec::with_capacity(ConnectorId::ALL.len());

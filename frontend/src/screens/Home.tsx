@@ -9,7 +9,13 @@ import { Panel } from "../components/ui/Panel";
 import { liveSources } from "../lib/ask/live";
 import { useRephrasePref } from "../lib/ask/prefs";
 import { INTENTS, ask, type Answer, type AskLink } from "../lib/ask/router";
-import { approvalsPending, daemonStatus, modelsStatus, toBridgeFailure } from "../lib/ipc";
+import {
+  approvalsPending,
+  daemonStatus,
+  keyringHealth,
+  modelsStatus,
+  toBridgeFailure,
+} from "../lib/ipc";
 import type { BridgeFailure } from "../lib/ipc";
 
 /** Read-only answers from live daemon state, with a three-exchange session history. */
@@ -96,6 +102,9 @@ export function HomeScreen() {
   const connected = status.data?.connected === true;
   const hands = pending.data?.pending.length ?? 0;
   const activeRequests = status.data?.status?.active_requests;
+  // Only worth a line when it is not fine: a working keychain is the
+  // expected state and does not need saying on the home screen.
+  const keyring = keyringHealth(status.data?.status);
   const greeting = pending.isPending
     ? "Checking approvals…"
     : pending.isError
@@ -158,6 +167,15 @@ export function HomeScreen() {
               Active requests:{" "}
               {connected && typeof activeRequests === "number" ? activeRequests : "Unavailable"}
             </Link>
+            {connected && keyring && keyring.state !== "reachable" && (
+              <Link
+                to="/settings"
+                hash="connectors"
+                className="rounded-control text-danger hover:underline"
+              >
+                Keychain {keyring.state} — connector credentials cannot be used
+              </Link>
+            )}
           </aside>
           <Panel ground="command" className="min-w-0 overflow-hidden" aria-busy={asking}>
             <div className="space-y-4 p-5">

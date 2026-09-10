@@ -56,12 +56,16 @@ pub const OP_CONNECTORS_CONFIGURE: &str = "admin.connectors.configure";
 /// `admin.connectors.test { id }` → `{ status, detail, ts }`.
 pub const OP_CONNECTORS_TEST: &str = "admin.connectors.test";
 
+/// `admin.connectors.keyring { fresh? }` → `{ state, cause, recovery }`.
+pub const OP_CONNECTORS_KEYRING: &str = "admin.connectors.keyring";
+
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const CONNECTOR_ADMIN_OPS: &[&str] = &[
     OP_CONNECTORS_LIST,
     OP_CONNECTORS_CONFIGURE,
     OP_CONNECTORS_TEST,
+    OP_CONNECTORS_KEYRING,
 ];
 
 /// `audit.action` recording a connector's configuration change.
@@ -88,6 +92,7 @@ impl AdminService {
             OP_CONNECTORS_LIST => self.connectors_list().await,
             OP_CONNECTORS_CONFIGURE => self.connectors_configure(envelope_id, args).await,
             OP_CONNECTORS_TEST => self.connectors_test(args).await,
+            OP_CONNECTORS_KEYRING => self.connectors_keyring(args).await,
             _ => return None,
         })
     }
@@ -154,6 +159,26 @@ impl AdminService {
                 "op": OP_CONNECTORS_CONFIGURE,
                 "id": summary.id,
                 "credential": credential,
+            }),
+        })
+    }
+
+    /// Whether PAM can reach the platform credential store.
+    ///
+    /// Never a refusal: "the keychain said no" is the answer the caller
+    /// asked for, and refusing it would leave the screen with nothing to
+    /// show. `{ fresh: true }` bypasses the cached reading for a
+    /// Re-check.
+    async fn connectors_keyring(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+        let health = self.connectors.keyring_health(fresh).await;
+        Ok(AdminOk {
+            outcome: Outcome::Verified,
+            body: json!(health),
+            audit: json!({
+                "op": OP_CONNECTORS_KEYRING,
+                "state": health.state.as_str(),
+                "fresh": fresh,
             }),
         })
     }

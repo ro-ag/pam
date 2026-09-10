@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use keyring_core::{CredentialStore, Entry, Error as KeyringError};
 
@@ -40,6 +41,92 @@ pub const SECRET_SERVICE: &str = "dev.pam.connector";
 #[must_use]
 pub fn account_for(connector_id: &str) -> String {
     format!("pam.connector.v1.{connector_id}")
+}
+
+/// The connector id a reachability probe reads under.
+///
+/// Nothing is ever stored here: the probe asks for an account that does
+/// not exist, because "no such entry" and "you may not look" are exactly
+/// the two answers that separate a working keychain from a blocked one.
+pub const PROBE_CONNECTOR: &str = "keyring.probe";
+
+/// How long a probe result stands before the next call re-asks the
+/// platform.
+///
+/// The GUI polls the daemon's status every few seconds and a keychain
+/// round trip is not free — on macOS it can wake a system service. The
+/// answer changes only when someone grants or revokes access, so a stale
+/// window of this size costs nothing and the Re-check button forces a
+/// fresh read anyway.
+pub const PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// Whether PAM can reach the platform's credential store right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyringState {
+    /// The store answered. Credentials can be read and written.
+    Reachable,
+    /// The store is there and said no — an unanswered prompt, a policy,
+    /// a revoked grant.
+    Denied,
+    /// The store could not be reached at all.
+    Unavailable,
+}
+
+impl KeyringState {
+    /// Whether connector credentials can be used at all.
+    #[must_use]
+    pub fn is_reachable(self) -> bool {
+        matches!(self, Self::Reachable)
+    }
+
+    /// The wire name, as the status body and the CLI print it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Denied => "denied",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One answer to "can Pam reach the keychain?", with the way out when it
+/// cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct KeyringHealth {
+    /// What the store said.
+    pub state: KeyringState,
+    /// The refusal cause, when there was one — the same string a failed
+    /// credential op carries, so one vocabulary covers both.
+    pub cause: Option<&'static str>,
+    /// What to do about it, when there is something to do.
+    pub recovery: Option<&'static str>,
+}
+
+impl KeyringHealth {
+    /// The healthy answer.
+    #[must_use]
+    pub fn reachable() -> Self {
+        Self {
+            state: KeyringState::Reachable,
+            cause: None,
+            recovery: None,
+        }
+    }
+}
+
+impl From<SecretError> for KeyringHealth {
+    fn from(error: SecretError) -> Self {
+        Self {
+            state: match error {
+                SecretError::Denied => KeyringState::Denied,
+                SecretError::Unavailable => KeyringState::Unavailable,
+            },
+            cause: Some(error.cause()),
+            recovery: Some(error.recovery()),
+        }
+    }
 }
 
 /// A connector secret, held only long enough to be used.
@@ -367,13 +454,65 @@ impl SecretBackend for FakeSecretBackend {
 /// belongs on the runtime thread that is also serving the socket.
 pub struct SecretStore {
     backend: Arc<dyn SecretBackend>,
+    /// The last reachability answer and when it was taken. A plain
+    /// `Mutex` rather than an async one: it is held for a field read,
+    /// never across the blocking call that produces the value.
+    probe: Mutex<Option<(Instant, KeyringHealth)>>,
+}
+
+impl fmt::Debug for SecretStore {
+    /// Names the type and nothing else: what backend is in use and what
+    /// it last answered are both details a log line has no business
+    /// carrying.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretStore")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SecretStore {
     /// Builds a store over an injected backend.
     #[must_use]
     pub fn new(backend: Arc<dyn SecretBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            probe: Mutex::new(None),
+        }
+    }
+
+    /// Whether the credential store answers, from the cache when it is
+    /// fresh (see [`PROBE_TTL`]).
+    pub async fn keyring_health(&self) -> KeyringHealth {
+        if let Some(cached) = self.cached_probe() {
+            return cached;
+        }
+        self.probe_keyring().await
+    }
+
+    /// Asks the platform now, whatever the cache says.
+    ///
+    /// This is what a Re-check button calls: the human just granted (or
+    /// revoked) access and wants the screen to say so, not in thirty
+    /// seconds.
+    pub async fn probe_keyring(&self) -> KeyringHealth {
+        let health = match self.get(PROBE_CONNECTOR).await {
+            // A missing entry is the expected answer, and it proves the
+            // store answered at all — which is the whole question.
+            Ok(_) => KeyringHealth::reachable(),
+            Err(error) => KeyringHealth::from(error),
+        };
+        if let Ok(mut slot) = self.probe.lock() {
+            *slot = Some((Instant::now(), health));
+        }
+        health
+    }
+
+    /// The cached answer, when it is still inside [`PROBE_TTL`].
+    fn cached_probe(&self) -> Option<KeyringHealth> {
+        let slot = self.probe.lock().ok()?;
+        let (taken, health) = (*slot)?;
+        (taken.elapsed() < PROBE_TTL).then_some(health)
     }
 
     /// Builds a store over the platform's native credential backend,

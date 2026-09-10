@@ -595,7 +595,7 @@ pub async fn run_daemon_with(
     secrets.warm();
     let connectors = Arc::new(ConnectorService::from_parts(
         Arc::clone(&store),
-        Some(secrets),
+        Some(Arc::clone(&secrets)),
         open_http_transport(config.http_transport),
     ));
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
@@ -638,6 +638,7 @@ pub async fn run_daemon_with(
         ),
         flows,
         models: Arc::clone(&models),
+        secrets,
         events: transport.event_publisher(),
         router: CompletionRouter::new(),
         work: Notify::new(),
@@ -785,6 +786,11 @@ struct Pipeline {
     /// The model layer, carried into every [`ExecContext`] so the
     /// `status` capability can report it.
     models: Arc<ModelService>,
+    /// The credential store, carried into every [`ExecContext`] so
+    /// `status` can say whether the platform keychain answers. Read-only
+    /// in that direction: reachability is not a secret, and nothing on
+    /// this path can read or write one.
+    secrets: Arc<SecretStore>,
     events: EventPublisher,
     router: CompletionRouter,
     /// Kicked on lane placement and execution completion; wakes the
@@ -1437,6 +1443,7 @@ impl Pipeline {
             router: self.router.clone(),
             approvals: Arc::clone(&self.approvals),
             flows: Arc::clone(&self.flows),
+            secrets: Arc::clone(&self.secrets),
             caller,
             capability,
             started_at: self.started_at,

@@ -220,3 +220,21 @@ async fn send_admin_rejects_non_admin_operations() {
         crate::client::RequestError::NotAdmin { ref capability } if capability == "echo"
     ));
 }
+
+#[tokio::test]
+async fn send_admin_requires_the_private_channel_even_when_public_daemon_is_ready() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _daemon = start_fake_daemon(tmp.path());
+    let error = crate::client::send_admin(
+        tmp.path(),
+        "admin.grants.add",
+        serde_json::json!({"capability": "deploy"}),
+        100,
+    )
+    .await
+    .expect_err("public readiness does not authorize administration");
+    assert!(matches!(
+        error,
+        crate::client::RequestError::AdminTransport { .. }
+    ));
+}

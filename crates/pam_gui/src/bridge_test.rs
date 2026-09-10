@@ -192,6 +192,18 @@ fn disconnects_are_classified_for_the_status_command() {
 }
 
 #[test]
+fn private_admin_transport_failure_warns_against_replaying_unknown_effects() {
+    let error = RequestError::AdminTransport {
+        source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reply lost"),
+    };
+    assert!(!is_disconnect(&error));
+    let mapped = BridgeError::from(error);
+    assert_eq!(mapped.cause, "admin_transport_failed");
+    assert!(mapped.detail.contains("operation was not retried"));
+    assert!(mapped.recovery.contains("already took effect"));
+}
+
+#[test]
 fn daemon_refusals_pass_through_verbatim() {
     let refusal = Response::Refusal {
         id: "req_1".to_owned(),

@@ -282,6 +282,14 @@ pub enum RequestError {
         /// The refused capability.
         capability: String,
     },
+    /// The private administration channel failed. The request is never replayed:
+    /// a lost reply does not establish whether its effects were applied.
+    #[error("private administration channel failed: {source}; operation was not retried")]
+    AdminTransport {
+        /// Native transport, peer-verification, or unsupported-platform error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// True when `response` is the version-handshake refusal after which
@@ -330,10 +338,13 @@ pub async fn send_request(
 /// through — grants, approvals, profile, activity. It is deliberately
 /// separate from [`send_request`], which refuses `admin.*` outright so
 /// the CLI subcommand surface can never reach administration. The
-/// separation is structural for CLI users and advisory at the socket:
-/// the envelope carries the `pam-gui` caller tripwire the daemon
-/// requires, but filesystem permissions on the runtime dir remain the
-/// actual security wall (see `pam_daemon::admin` for the full model).
+/// native administration channel authenticates peers independently of the
+/// envelope's caller fields. It never falls back to the public socket.
+/// Administration is unavailable where that native channel is unsupported.
+///
+/// The exchange runs once. A transport error or version refusal is returned
+/// without replaying the operation, because a missing reply can follow an
+/// applied change. Inspect the resulting state before manually trying again.
 ///
 /// A capability outside `admin.*` errors with
 /// [`RequestError::NotAdmin`]. Admin ops always wait (they are
@@ -364,10 +375,13 @@ pub async fn send_admin(
         deadline_ms,
         wait: true,
     };
-    send_envelope(base_dir, &envelope).await
+    ensure_daemon(base_dir)?;
+    pam_daemon::admin_transport::exchange(base_dir, &envelope)
+        .await
+        .map_err(|source| RequestError::AdminTransport { source })
 }
 
-/// The shared exchange loop behind [`send_request`] and [`send_admin`]:
+/// The public exchange loop behind [`send_request`]:
 /// ensure the daemon, exchange over `pam.sock`, retry exactly once
 /// after a `daemon_outdated` refusal.
 async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response, RequestError> {

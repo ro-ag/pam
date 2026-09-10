@@ -228,6 +228,13 @@ impl From<RequestError> for BridgeError {
                 detail,
                 "Retry; the daemon may have been restarting.",
             ),
+            RequestError::AdminTransport { .. } => Self::new(
+                "admin_transport_failed",
+                detail,
+                "Open the installed PAM GUI on a supported platform and check the daemon log. \
+                 Inspect whether the change already took effect before trying again; \
+                 administration never falls back to the public socket.",
+            ),
         }
     }
 }

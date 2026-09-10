@@ -462,6 +462,16 @@ export interface ModelsStatus {
 
 /** What one generation produced, and what it cost. */
 export interface GenerateResult {
+  model: {
+    id: string;
+    architecture: string;
+    quant: string;
+    device: string;
+    weight_bytes: number;
+  };
+  requested_model_id: string;
+  diagnostic_only: true;
+  qualification: "not_assessed";
   text: string;
   prompt_tokens: number;
   completion_tokens: number;
@@ -553,12 +563,17 @@ export function modelsSettingsSet(patch: {
 }
 
 /**
- * One diagnostic generation on whatever is loaded — deliberately allowed
+ * One diagnostic generation on the explicitly named loaded model — allowed
  * on `test_only` weights, because proving the wiring is its purpose. The
  * bridge gives this op a 120 s deadline; every other admin op gets 30 s.
  */
-export function modelsTry(prompt: string, maxTokens?: number): Promise<GenerateResult> {
+export function modelsTry(
+  modelId: string,
+  prompt: string,
+  maxTokens?: number,
+): Promise<GenerateResult> {
   return adminCall("admin.models.try", {
+    model_id: modelId,
     prompt,
     ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
   });

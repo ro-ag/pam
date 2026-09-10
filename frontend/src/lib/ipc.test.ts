@@ -265,9 +265,9 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     ],
     [
       "modelsTry",
-      () => modelsTry("Say hello.", 64),
+      () => modelsTry("fixture-model", "Say hello.", 64),
       "admin.models.try",
-      { prompt: "Say hello.", max_tokens: 64 },
+      { model_id: "fixture-model", prompt: "Say hello.", max_tokens: 64 },
     ],
     ["curatorSet", () => curatorSet("codex"), "admin.curator.set", { agent: "codex" }],
     ["curatorSet (cleared)", () => curatorSet(null), "admin.curator.set", { agent: null }],
@@ -277,8 +277,8 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
   });
 
   it("omits max_tokens entirely when the caller names no budget", async () => {
-    await modelsTry("Say hello.");
-    expect(sent().args).toEqual({ prompt: "Say hello." });
+    await modelsTry("fixture-model", "Say hello.");
+    expect(sent().args).toEqual({ model_id: "fixture-model", prompt: "Say hello." });
   });
 });
 

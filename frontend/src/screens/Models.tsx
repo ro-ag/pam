@@ -730,7 +730,24 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
 
   const run = useMutation({
-    mutationFn: ({ text, budget }: { text: string; budget: number }) => modelsTry(text, budget),
+    mutationFn: async ({
+      modelId,
+      text,
+      budget,
+    }: {
+      modelId: string;
+      text: string;
+      budget: number;
+    }) => {
+      const reply = await modelsTry(modelId, text, budget);
+      if (reply.model?.id !== modelId)
+        throw {
+          cause: "model_mismatch",
+          detail: "The worker did not confirm the requested model identity",
+          recovery: "Refresh model status and try again.",
+        };
+      return reply;
+    },
     onMutate: () => {
       setFailure(null);
       setResult(null);
@@ -739,8 +756,8 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
     onError: (error) => setFailure(toBridgeFailure(error)),
   });
 
-  const loaded = status?.runtime.state.state === "loaded";
-  const closed = !loaded;
+  const modelId = status?.runtime.state.state === "loaded" ? status.runtime.state.id : null;
+  const closed = !modelId || status?.runtime.busy === true;
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
@@ -778,7 +795,9 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
           size="sm"
           disabled={closed || run.isPending || !prompt.trim()}
           onClick={() =>
+            modelId &&
             run.mutate({
+              modelId,
               text: prompt.trim(),
               budget: Number(maxTokens) || TRY_DEFAULT_MAX_TOKENS,
             })
@@ -800,6 +819,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
             {result.text}
           </p>
           <p className="font-data text-xs text-ink-faint tabular-nums">
+            {result.model.id} · {result.model.quant} · {result.model.device} · diagnostic only ·{" "}
             {result.prompt_tokens} prompt · {result.completion_tokens} completion ·{" "}
             <span className="text-ink">{result.tokens_per_sec.toFixed(1)} tokens/sec</span>
           </p>

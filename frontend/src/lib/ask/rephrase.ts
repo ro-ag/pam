@@ -34,15 +34,21 @@ export async function maybeRephrase(
   if (!options.rephrase || answer.intent === "fallback") return answer;
   const status = await sources.modelsStatus().catch(() => null);
   const model = status?.defaults.light ?? null;
-  if (!model) return answer;
+  if (
+    !model ||
+    status?.runtime.busy ||
+    status?.runtime.state.state !== "loaded" ||
+    status.runtime.state.id !== model
+  )
+    return answer;
   const prompt =
     "Rewrite in one sentence, first person, warm and plain, keeping every number and " +
     `name exactly as written: ${answer.sentence}`;
   const timer = empty(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const reply = await Promise.race([
     sources
-      .modelsTry(prompt, MAX_TOKENS)
-      .then((result) => result.text)
+      .modelsTry(model, prompt, MAX_TOKENS)
+      .then((result) => (result.model?.id === model ? result.text : ""))
       .catch(() => ""),
     timer.race,
   ]);

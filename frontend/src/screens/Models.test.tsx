@@ -443,7 +443,11 @@ describe("catalog", () => {
       downloadFailure(
         job({
           state: "failed",
-          detail: JSON.stringify({ cause: "tls_error", detail: "bad cert", recovery: "Fix it." }),
+          detail: JSON.stringify({
+            cause: "tls_error",
+            detail: "bad cert",
+            recovery: "Fix it.",
+          }),
         }),
       ),
     ).toEqual({ cause: "tls_error", detail: "bad cert", recovery: "Fix it." });
@@ -458,7 +462,9 @@ describe("catalog", () => {
   });
 
   it("follows a model's latest download whatever state it reached", () => {
-    expect(latestDownload([job({ state: "failed" })], presetModelId(preset()))?.id).toBe("job_01");
+    expect(latestDownload([job({ state: "failed" })], presetModelId(preset()))?.id).toBe(
+      "job_01",
+    );
     expect(latestDownload([job()], "qwen/other")).toBeUndefined();
     expect(
       latestDownload([job({ kind: "verify", state: "failed" })], presetModelId(preset())),
@@ -523,6 +529,7 @@ describe("try box", () => {
     mocks.modelsStatus.mockResolvedValue(loadedStatus());
     mocks.modelsTry.mockResolvedValue({
       text: "Hello there, friend of mine.",
+      model: { id: entry().id, quant: "Q4_K_M", device: "cpu" },
       prompt_tokens: 21,
       completion_tokens: 7,
       prompt_ms: 90,
@@ -537,11 +544,31 @@ describe("try box", () => {
     fireEvent.change(prompt, { target: { value: "Say hello in five words." } });
     fireEvent.click(box.getByRole("button", { name: "Run" }));
     await waitFor(() =>
-      expect(mocks.modelsTry).toHaveBeenCalledWith("Say hello in five words.", 64),
+      expect(mocks.modelsTry).toHaveBeenCalledWith(entry().id, "Say hello in five words.", 64),
     );
     expect(await box.findByText("Hello there, friend of mine.")).toBeInTheDocument();
     expect(box.getByText(/23.3 tokens\/sec/)).toBeInTheDocument();
     expect(box.getByText(/21 prompt · 7 completion/)).toBeInTheDocument();
+  });
+
+  it("rejects text from a worker other than the requested loaded model", async () => {
+    mocks.modelsStatus.mockResolvedValue(loadedStatus());
+    mocks.modelsTry.mockResolvedValue({
+      text: "Unexpected worker output",
+      model: { id: "different-model" },
+    });
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Test model" }));
+    const box = within(await screen.findByRole("region", { name: "Test model" }));
+    const prompt = box.getByLabelText("prompt");
+    await waitFor(() => expect(prompt).toBeEnabled());
+    fireEvent.change(prompt, { target: { value: "Hello" } });
+    fireEvent.click(box.getByRole("button", { name: "Run" }));
+    expect(
+      await box.findByText("The worker did not confirm the requested model identity."),
+    ).toBeInTheDocument();
+    expect(box.queryByText("Unexpected worker output")).not.toBeInTheDocument();
+    expect(mocks.modelsTry).toHaveBeenCalledWith(entry().id, "Hello", 64);
   });
 
   it("renders a refusal through the uniform failure note", async () => {

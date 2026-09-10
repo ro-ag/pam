@@ -45,7 +45,7 @@ function fakeSources(overrides: Partial<Sources> = {}): Sources {
       ],
     }),
     auditRequest: async () => ({ rows: [] }),
-    modelsTry: async () => ({ text: "" }),
+    modelsTry: async () => ({ text: "", model: { id: "m" } }),
     ...overrides,
   };
 }
@@ -297,19 +297,19 @@ describe("ask", () => {
   it("rephrases only when enabled, one line, every fact intact; otherwise keeps the template", async () => {
     const good = fakeSources({
       modelsStatus: async () => ({
-        runtime: { state: { state: "idle" }, busy: false },
+        runtime: { state: { state: "loaded", id: "m" }, busy: false },
         defaults: { light: "m", heavy: null },
         host_ram_bytes: 1,
         models_dir: "/x",
       }),
-      modelsTry: async () => ({ text: "Right now nothing waits for you." }),
+      modelsTry: async () => ({ text: "Right now nothing waits for you.", model: { id: "m" } }),
     });
     const on = await ask("approvals?", ctx, good, { rephrase: true });
     expect(on.sentence).toBe("Right now nothing waits for you.");
     expect(on.rephrased).toEqual({ model: "m" });
     const bad = fakeSources({
       modelsStatus: good.modelsStatus,
-      modelsTry: async () => ({ text: "Two things\nwait" }),
+      modelsTry: async () => ({ text: "Two things\nwait", model: { id: "m" } }),
     });
     expect((await ask("approvals?", ctx, bad, { rephrase: true })).rephrased).toBeUndefined();
     const slow = fakeSources({
@@ -319,6 +319,71 @@ describe("ask", () => {
     const answer = await ask("approvals?", ctx, slow, { rephrase: true, timeoutMs: 20 });
     expect(answer.sentence).toBe("Nothing waits for you.");
     expect((await ask("approvals?", ctx, good, off)).rephrased).toBeUndefined();
+  });
+});
+
+describe("rephrase worker identity", () => {
+  function ready(loaded = "light", busy = false): Sources["modelsStatus"] {
+    return async () => ({
+      runtime: { state: { state: "loaded", id: loaded }, busy },
+      defaults: { light: "light", heavy: "heavy" },
+      host_ram_bytes: 1,
+      models_dir: "/x",
+    });
+  }
+
+  it("requests the explicit light identity and never attributes a different worker", async () => {
+    const generate = vi.fn(async () => ({
+      text: "Right now nothing waits for you.",
+      model: { id: "heavy" },
+    }));
+    const sources = fakeSources({ modelsStatus: ready(), modelsTry: generate });
+    const answer = await ask("approvals?", ctx, sources, { rephrase: true });
+    expect(generate).toHaveBeenCalledWith(
+      "light",
+      expect.stringContaining("Nothing waits for you."),
+      96,
+    );
+    expect(answer.sentence).toBe("Nothing waits for you.");
+    expect(answer.rephrased).toBeUndefined();
+  });
+
+  it.each(["heavy", "idle", "busy", "disabled"])("does no inference when %s", async (state) => {
+    const generate = vi.fn(async () => ({
+      text: "Right now nothing waits for you.",
+      model: { id: "light" },
+    }));
+    const status = vi.fn(ready(state === "heavy" ? "heavy" : "light", state === "busy"));
+    if (state === "idle")
+      status.mockImplementation(async () => ({
+        ...(await ready()()),
+        runtime: { state: { state: "idle" }, busy: false },
+      }));
+    const answer = await ask(
+      "approvals?",
+      ctx,
+      fakeSources({ modelsStatus: status, modelsTry: generate }),
+      { rephrase: state !== "disabled" },
+    );
+    expect(generate).not.toHaveBeenCalled();
+    if (state === "disabled") expect(status).not.toHaveBeenCalled();
+    expect(answer.sentence).toBe("Nothing waits for you.");
+    expect(answer.rephrased).toBeUndefined();
+  });
+
+  it("keeps the template after a worker refusal", async () => {
+    const generate = vi.fn(async () => {
+      throw { cause: "model_mismatch" };
+    });
+    const answer = await ask(
+      "approvals?",
+      ctx,
+      fakeSources({ modelsStatus: ready(), modelsTry: generate }),
+      { rephrase: true },
+    );
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(answer.sentence).toBe("Nothing waits for you.");
+    expect(answer.rephrased).toBeUndefined();
   });
 });
 
@@ -414,12 +479,15 @@ describe("ask failure paths", () => {
         ],
       }),
       modelsStatus: async () => ({
-        runtime: { state: { state: "idle" }, busy: false },
+        runtime: { state: { state: "loaded", id: "m" }, busy: false },
         defaults: { light: "m", heavy: null },
         host_ram_bytes: 1,
         models_dir: "/x",
       }),
-      modelsTry: async () => ({ text: "Someone is waiting for your hand." }),
+      modelsTry: async () => ({
+        text: "Someone is waiting for your hand.",
+        model: { id: "m" },
+      }),
     });
     const answer = await ask("approvals?", ctx, sources, { rephrase: true });
     expect(answer.sentence).toBe("1 request waits for your hand.");

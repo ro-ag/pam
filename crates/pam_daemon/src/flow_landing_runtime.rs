@@ -426,7 +426,12 @@ impl RunState<'_> {
                     .await?
             }
             Op::Merge => self.landing_merge(step, &mut loaded, deadline).await?,
-            Op::Sync => self.landing_sync(step, &mut loaded, deadline).await?,
+            Op::Sync => {
+                return Err(refused(
+                    "landing_sync_unavailable",
+                    "The guarded local synchronization adapter is unavailable; confirmed remote merge receipts remain retained",
+                ));
+            }
         };
         loaded
             .session
@@ -811,17 +816,6 @@ impl RunState<'_> {
         Ok(
             json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
         )
-    }
-    async fn landing_sync(
-        &mut self,
-        _step: &Step,
-        _loaded: &mut Loaded,
-        _deadline: Instant,
-    ) -> Result<Value, CapabilityFailure> {
-        Err(refused(
-            "landing_sync_unavailable",
-            "The guarded local synchronization adapter is unavailable; confirmed remote merge receipts remain retained",
-        ))
     }
     async fn landing_merge(
         &mut self,

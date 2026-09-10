@@ -135,10 +135,34 @@ impl Store {
         {
             return Err(invalid());
         }
+        let mut identity: serde_json::Value =
+            serde_json::from_str(&view.identity_json).map_err(|_| invalid())?;
+        let identity_fields = identity.as_object_mut().ok_or_else(invalid)?;
         let _guard = self.conn_lock.lock().await;
+        // Only bounded metadata is loaded; the protected source may be a large
+        // serialized compact rather than the logical text passed to redaction.
+        let mut rows = self.conn.query(
+            "SELECT substr(content_hash,1,65),LENGTH(content) FROM evidence WHERE id=?1 AND request_id=?2",
+            params![view.evidence_id.clone(), view.request_id.clone()],
+        ).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        let digest: String = row.get(0)?;
+        let bytes = u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid());
+        }
+        drop(rows);
+        identity_fields.insert("protected_evidence_sha256".into(), digest.into());
+        identity_fields.insert("protected_evidence_bytes".into(), bytes.into());
+        let identity_json = identity.to_string();
+        if identity_json.len() > META_LIMIT {
+            return Err(invalid());
+        }
         let affected = self.conn.execute(
             "INSERT INTO evidence_view (evidence_id,request_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,view_blob) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
-            params![view.evidence_id.clone(),view.request_id.clone(),view.repository.clone(),view.origin_json.clone(),view.identity_json.clone(),view.map_json.clone(),view.view_id.clone(),hex::encode(Sha256::digest(&view.view_bytes)), i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes.clone()],
+            params![view.evidence_id.clone(),view.request_id.clone(),view.repository.clone(),view.origin_json.clone(),identity_json,view.map_json.clone(),view.view_id.clone(),hex::encode(Sha256::digest(&view.view_bytes)), i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes.clone()],
         ).await?;
         Ok(affected > 0)
     }
@@ -455,5 +479,50 @@ mod tests {
         assert!(store.insert_evidence_view(&view).await.is_err());
         view.origin_json = format!("\"{}\"", "x".repeat(META_LIMIT));
         assert!(store.insert_evidence_view(&view).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn protected_identity_overwrites_forgery_and_rechecks_augmented_bound() {
+        let (_dir, store, _r) = fixture().await;
+        let protected = br#"{"records":["logical text"]}"#;
+        store
+            .insert_evidence("source", "r", "log.compact", protected, None)
+            .await
+            .unwrap();
+        let mut view = EvidenceViewInsert {
+            evidence_id: "source".into(), request_id: "r".into(), repository: "/repo".into(),
+            origin_json: "{}".into(), map_json: "[]".into(), view_id: "protected-view".into(),
+            view_bytes: b"logical text".to_vec(),
+            identity_json: serde_json::json!({"protected_evidence_sha256":"forged", "protected_evidence_bytes":999, "input_sha256":"logical-input"}).to_string(),
+        };
+        assert!(store.insert_evidence_view(&view).await.unwrap());
+        let meta = store
+            .evidence_view_meta("r", "source", "/repo")
+            .await
+            .unwrap()
+            .unwrap();
+        let identity: serde_json::Value = serde_json::from_str(&meta.identity_json).unwrap();
+        assert_eq!(
+            identity["protected_evidence_sha256"],
+            hex::encode(Sha256::digest(protected))
+        );
+        assert_eq!(identity["protected_evidence_bytes"], protected.len());
+        assert_eq!(identity["input_sha256"], "logical-input");
+        store
+            .insert_evidence("too-large", "r", "log", b"input", None)
+            .await
+            .unwrap();
+        view.evidence_id = "too-large".into();
+        view.view_id = "too-large-view".into();
+        view.identity_json = serde_json::json!({"padding":"x".repeat(META_LIMIT - 32)}).to_string();
+        assert!(view.identity_json.len() < META_LIMIT);
+        assert!(store.insert_evidence_view(&view).await.is_err());
+        assert!(
+            store
+                .evidence_view_meta("r", "too-large", "/repo")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

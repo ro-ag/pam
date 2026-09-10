@@ -425,13 +425,14 @@ const FLOW_DEADLINE: Duration = Duration::from_mins(1);
 const EXIT_USAGE: i32 = 2;
 
 /// Every flow that ships in the binary.
-const BUILTIN_FLOWS: [&str; 20] = [
+const BUILTIN_FLOWS: [&str; 21] = [
     "after-merge-checks",
     "ci-failure-triage",
     "jenkins-build-investigation",
     "jenkins-node-evidence",
     "confluence-page-context",
     "dependency-audit",
+    "guarded-land",
     "jira-issue-context",
     "pam-pr-readiness",
     "pr-readiness",
@@ -553,7 +554,12 @@ async fn flow_list_prints_every_builtin_and_exits_zero() {
     timeout(FLOW_DEADLINE, async {
         let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
 
-        let run = run_pam(&daemon.base(), daemon.tmp.path(), &["flow", "list"]).await;
+        let run = run_pam(
+            &daemon.base(),
+            daemon.tmp.path(),
+            &["flow", "list", "--limit", "50"],
+        )
+        .await;
 
         assert_eq!(run.code, 0, "stderr: {}", run.stderr);
         assert_eq!(

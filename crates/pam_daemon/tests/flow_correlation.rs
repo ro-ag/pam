@@ -539,3 +539,27 @@ async fn a_live_sonar_green_measure_cannot_verify_a_declared_commit() {
         fx.finish().await;
     }).await;
 }
+
+#[tokio::test]
+async fn matched_remote_evidence_does_not_authorize_unassociated_local_verification() {
+    with_deadline(async {
+        let yaml = format!("{FLOW}  - id: after\n    run: [git, --version]\n    role: verify\n    needs: [inspect]\n");
+        let transport = Arc::new(scripted(&metadata(9, 3, SHA)));
+        let fx = Fixture::new(&yaml, transport.clone()).await;
+        let body = fx.run("local_verify").await;
+        assert_eq!(body["workflow"]["outcome"], "blocked", "{body}");
+        assert_eq!(body["correlation"]["status"], "missing");
+        let report = fx.report("local_verify").await;
+        assert_eq!(report["steps"][0]["status"], "succeeded");
+        let local = &report["steps"][1];
+        assert_eq!(local["id"], "after");
+        assert_eq!(local["status"], "blocked");
+        assert_eq!(local["error"]["cause"], "correlation_missing");
+        assert_eq!(local["attempts"], 0, "local verification is refused before command admission");
+        assert!(local["exit_status"].is_null());
+        assert!(local["evidence"].as_array().unwrap().is_empty());
+        assert_eq!(report["budget_usage"]["command_bytes"], 0);
+        assert_eq!(transport.requests().len(), 2);
+        fx.finish().await;
+    }).await;
+}

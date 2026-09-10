@@ -595,7 +595,7 @@ async fn missing_scope_setting_does_not_inherit_connector_permission() {
 }
 
 #[tokio::test]
-async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
+async fn a_daemon_without_curl_refuses_http_and_uncontained_aws() {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
     let repo = tempfile::tempdir().expect("repo");
     approve_connector_repo(&store, repo.path()).await;
@@ -640,8 +640,8 @@ async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
         .expect_err("no curl, no call");
     assert_eq!(error.cause(), CAUSE_CLI_MISSING);
 
-    // AWS drives the local CLI, not curl, so it is unaffected: `commands`
-    // answers the allowlist without spawning anything.
+    // AWS's separate CLI bridge is refused until its descendants are contained,
+    // including the local allowlist call so discovery never implies readiness.
     service
         .configure(
             ConnectorId::Aws,
@@ -652,7 +652,7 @@ async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
         )
         .await
         .expect("aws needs no base URL and no credential");
-    let result = service
+    let error = service
         .invoke(
             repo.path(),
             ConnectorId::Aws,
@@ -661,8 +661,8 @@ async fn a_daemon_without_curl_refuses_http_connectors_and_keeps_aws() {
             deadline(),
         )
         .await
-        .expect("the AWS allowlist answers locally");
-    assert!(matches!(result, CallResult::Json(_)));
+        .expect_err("AWS CLI containment is unavailable");
+    assert_eq!(error.cause(), "command_containment_unavailable");
 }
 
 #[tokio::test]
@@ -870,4 +870,67 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
             .last_test
             .is_none()
     );
+}
+
+#[derive(Default)]
+struct UntouchedSecrets(std::sync::atomic::AtomicUsize);
+
+impl SecretBackend for UntouchedSecrets {
+    fn get(&self, _account: &str) -> Result<Option<String>, SecretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SecretError::Unavailable)
+    }
+    fn set(&self, _account: &str, _secret: &str) -> Result<(), SecretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SecretError::Unavailable)
+    }
+    fn delete(&self, _account: &str) -> Result<bool, SecretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SecretError::Unavailable)
+    }
+}
+
+#[tokio::test]
+async fn aws_containment_refusal_precedes_credentials_transport_and_cli_validation() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let repo = tempfile::tempdir().unwrap();
+    approve_connector_repo(&store, repo.path()).await;
+    // Defense in depth for the fixture: even if the containment guard regresses,
+    // this invalid profile fails adapter validation before any real CLI spawn.
+    store
+        .upsert_connector(
+            "aws",
+            pam_store::ConnectorPatch {
+                enabled: Some(true),
+                username: Some(Some("--fixture-no-process")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let secrets = Arc::new(UntouchedSecrets::default());
+    let transport = Arc::new(FakeTransport::new());
+    let service = ConnectorService::new(
+        store,
+        Arc::new(SecretStore::new(secrets.clone())),
+        transport.clone(),
+    );
+    let args = BTreeMap::from([
+        ("service".to_owned(), ArgValue::Text("sts".to_owned())),
+        (
+            "command".to_owned(),
+            ArgValue::Text("get-caller-identity".to_owned()),
+        ),
+    ]);
+    for call in ["commands", "cli"] {
+        let error = service
+            .invoke(repo.path(), ConnectorId::Aws, call, &args, deadline())
+            .await
+            .unwrap_err();
+        assert_eq!(error.cause(), "command_containment_unavailable");
+    }
+    let error = service.test(ConnectorId::Aws).await.unwrap_err();
+    assert_eq!(error.cause(), "command_containment_unavailable");
+    assert_eq!(secrets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(transport.requests().is_empty());
 }

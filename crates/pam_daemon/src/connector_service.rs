@@ -938,7 +938,7 @@ impl HttpTransport for MissingCurl {
     > {
         Box::pin(async {
             Err(TransportError::Spawn(
-                "curl is not installed, or not on the daemon's PATH".to_owned(),
+                "a trusted operating-system curl is unavailable".to_owned(),
             ))
         })
     }

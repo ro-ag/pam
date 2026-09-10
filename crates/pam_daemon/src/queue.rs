@@ -109,7 +109,7 @@ use std::time::Duration;
 use pam_proto::Envelope;
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -244,6 +244,13 @@ struct QueuedEntry {
     deadline: Instant,
 }
 
+/// A checkpoint waiting outside ready lanes while retaining its admission.
+struct ParkedEntry {
+    repo: String,
+    entry: QueuedEntry,
+    resume_at_ms: i64,
+}
+
 /// An outstanding lease.
 struct Lease {
     repo: String,
@@ -260,12 +267,15 @@ struct Inner {
     leases: HashMap<String, Lease>,
     /// repo → the leased request id keeping the lane busy.
     busy: HashMap<String, String>,
+    /// Original request id → durable watch waiting for its next poll.
+    parked: HashMap<String, ParkedEntry>,
 }
 
 /// The queue manager service. See the module docs for the design.
 pub struct QueueManager {
     store: Arc<Store>,
     inner: Mutex<Inner>,
+    work: Notify,
 }
 
 impl std::fmt::Debug for QueueManager {
@@ -282,6 +292,7 @@ impl QueueManager {
         Self {
             store,
             inner: Mutex::new(Inner::default()),
+            work: Notify::new(),
         }
     }
 
@@ -505,6 +516,93 @@ impl QueueManager {
         inner.leases.keys().cloned().collect()
     }
 
+    /// Wait for a parked request becoming ready or releasing its repository lane.
+    /// The executor selects this alongside its existing admission notification.
+    pub async fn work_available(&self) {
+        self.work.notified().await;
+    }
+
+    /// Persist a future poll before releasing the current lease. Failure leaves
+    /// lease ownership intact; parked admissions still count against store caps.
+    pub async fn park(&self, request_id: &str, resume_at_ms: i64) -> Result<bool, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let Some(lease) = inner.leases.get(request_id) else {
+            return Ok(false);
+        };
+        if lease.deadline <= Instant::now() || *lease.cancel_tx.borrow() {
+            return Ok(false);
+        }
+        let repo = lease.repo.clone();
+        let deadline = lease.deadline;
+        if !self
+            .store
+            .park_flow_request(request_id, resume_at_ms, wall_clock_ms())
+            .await?
+        {
+            return Ok(false);
+        }
+        inner.leases.remove(request_id);
+        inner.busy.remove(&repo);
+        inner.parked.insert(
+            request_id.to_owned(),
+            ParkedEntry {
+                repo,
+                entry: QueuedEntry {
+                    id: request_id.to_owned(),
+                    deadline,
+                },
+                resume_at_ms,
+            },
+        );
+        self.work.notify_one();
+        Ok(true)
+    }
+
+    /// Move due parked checkpoints into ordinary lanes, retaining the original
+    /// monotonic expiry. Authorization changes and expiry fail without dispatch.
+    pub async fn wake_due(&self, now: Instant, now_ms: i64) -> Result<usize, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let mut due: Vec<_> = inner
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.entry.deadline <= now || parked.resume_at_ms <= now_ms)
+            .map(|(id, parked)| (parked.resume_at_ms, id.clone()))
+            .collect();
+        due.sort();
+        let mut ready = 0;
+        for (_, id) in due {
+            let Some(parked) = inner.parked.get(&id) else {
+                continue;
+            };
+            if parked.entry.deadline <= now {
+                self.expire_locked(&mut inner, &id).await?;
+                continue;
+            }
+            if !self.store.wake_parked_flow_request(&id, now_ms).await? {
+                let cause = if self.store.request_admission_expired(&id, now_ms).await? {
+                    CAUSE_LEASE_EXPIRED
+                } else {
+                    "authorization_changed"
+                };
+                self.fail_recovered(&id, cause).await?;
+                inner.parked.remove(&id);
+                continue;
+            }
+            let Some(parked) = inner.parked.remove(&id) else {
+                continue;
+            };
+            inner
+                .lanes
+                .entry(parked.repo)
+                .or_default()
+                .push_back(parked.entry);
+            ready += 1;
+            // A later store failure must not strand work already made ready.
+            self.work.notify_one();
+        }
+        Ok(ready)
+    }
+
     /// Releases `request_id`'s lease and records its terminal
     /// `final_state` / `outcome` together with the executor's `audit`
     /// row (one transaction, via [`Store::finish_request`]), freeing the
@@ -553,18 +651,14 @@ impl QueueManager {
             let _ = lease.cancel_tx.send(true);
             return Ok(CancelOutcome::SignalledRunning);
         }
-        let mut found = false;
-        for lane in inner.lanes.values_mut() {
-            if let Some(index) = lane.iter().position(|entry| entry.id == request_id) {
-                lane.remove(index);
-                found = true;
-                break;
-            }
-        }
+        let found = inner.parked.contains_key(request_id)
+            || inner
+                .lanes
+                .values()
+                .any(|lane| lane.iter().any(|entry| entry.id == request_id));
         if !found {
             return Ok(CancelOutcome::NotFound);
         }
-        inner.lanes.retain(|_, lane| !lane.is_empty());
         let detail = serde_json::json!({ "actor": actor.as_str() }).to_string();
         self.store
             .finish_request(
@@ -579,6 +673,11 @@ impl QueueManager {
                 },
             )
             .await?;
+        inner.parked.remove(request_id);
+        for lane in inner.lanes.values_mut() {
+            lane.retain(|entry| entry.id != request_id);
+        }
+        inner.lanes.retain(|_, lane| !lane.is_empty());
         Ok(CancelOutcome::CancelledQueued)
     }
 
@@ -638,6 +737,7 @@ impl QueueManager {
             lane.retain(|entry| entry.id != request_id);
         }
         inner.lanes.retain(|_, lane| !lane.is_empty());
+        inner.parked.remove(request_id);
         Ok(finished)
     }
 
@@ -658,6 +758,7 @@ impl QueueManager {
                 tokio::select! {
                     _ = ticker.tick() => {
                         let _ = self.reap_expired(Instant::now()).await;
+                        let _ = self.wake_due(Instant::now(), wall_clock_ms()).await;
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -677,6 +778,7 @@ impl QueueManager {
     pub async fn rebuild_from_store(&self) -> Result<usize, QueueError> {
         let mut inner = self.inner.lock().await;
         inner.lanes.clear();
+        inner.parked.clear();
         let revision = self.store.grant_revocation_revision().await?;
         let mut restored = 0;
         let mut retained_bytes = 0u64;
@@ -724,17 +826,18 @@ impl QueueManager {
                     self.fail_recovered(&row.id, cause).await?;
                     continue;
                 }
+                if row.resume_at_ms.is_some()
+                    && !self
+                        .store
+                        .validate_parked_flow_request(&row.id, wall_clock_ms())
+                        .await?
+                {
+                    self.fail_recovered(&row.id, "admission_invalid").await?;
+                    continue;
+                }
                 retained_bytes += bytes;
                 restored += 1;
-                inner
-                    .lanes
-                    .entry(row.repo)
-                    .or_default()
-                    .push_back(QueuedEntry {
-                        id: row.id,
-                        deadline: Instant::now()
-                            + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
-                    });
+                restore_queued_entry(&mut inner, row, remaining);
             }
         }
         Ok(usize::try_from(restored).unwrap_or(usize::MAX))
@@ -769,4 +872,24 @@ fn wall_clock_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Restore the bounded index without replacing the persisted poll/deadline times.
+fn restore_queued_entry(inner: &mut Inner, row: pam_store::RequestRow, remaining: i64) {
+    let entry = QueuedEntry {
+        id: row.id.clone(),
+        deadline: Instant::now() + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
+    };
+    if let Some(resume_at_ms) = row.resume_at_ms {
+        inner.parked.insert(
+            row.id,
+            ParkedEntry {
+                repo: row.repo,
+                entry,
+                resume_at_ms,
+            },
+        );
+    } else {
+        inner.lanes.entry(row.repo).or_default().push_back(entry);
+    }
 }

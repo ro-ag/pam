@@ -11,6 +11,8 @@ mod request_budget;
 pub use request_budget::*;
 #[path = "flow_journal.rs"]
 mod flow_journal;
+#[path = "watch_schedule.rs"]
+mod watch_schedule;
 pub use evidence_views::*;
 pub use flow_journal::*;
 #[path = "correlation.rs"]
@@ -215,6 +217,8 @@ pub struct RequestRow {
     pub queue_authorized: bool,
     /// Monotonic retained grant-revocation count captured at authorization.
     pub authorization_revision: Option<i64>,
+    /// Earliest next watch poll in Unix milliseconds; never extends admission expiry.
+    pub resume_at_ms: Option<i64>,
 }
 
 /// How a pending approval was resolved.
@@ -717,8 +721,8 @@ impl Store {
         let changed = self
             .conn
             .execute(
-                "UPDATE request SET state = 'running', updated_ts = ?1 WHERE id = ?2
-             AND state = 'queued' AND queue_authorized = 1 AND expires_at_ms > ?3
+                "UPDATE request SET state = 'running', resume_at_ms = NULL, updated_ts = ?1 WHERE id = ?2
+             AND resume_at_ms IS NULL AND state = 'queued' AND queue_authorized = 1 AND expires_at_ms > ?3
              AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)",
                 params![now_ts(), id, now_ms],
             )
@@ -834,7 +838,7 @@ impl Store {
     /// The `request` column list every row query selects, in the order
     /// [`Self::parse_request_row`] expects.
     const REQUEST_COLUMNS: &'static str = "id, capability, repo, caller_agent, args_json,
-         idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision";
+         idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision, resume_at_ms";
 
     /// Builds a [`RequestRow`] from a row selected with
     /// [`Self::REQUEST_COLUMNS`].
@@ -854,6 +858,7 @@ impl Store {
             expires_at_ms: row.get(10)?,
             queue_authorized: row.get::<i64>(11)? == 1,
             authorization_revision: row.get(12)?,
+            resume_at_ms: row.get(13)?,
         })
     }
 

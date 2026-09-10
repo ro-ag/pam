@@ -206,5 +206,9 @@ fn policy_refusal_preserves_cause_and_never_retries() {
     });
     assert_eq!(error.cause(), "request_budget_exhausted");
     assert!(!error.retryable());
-    assert!(error.recovery(pam_flow::ConnectorId::Jenkins).contains("narrow"));
+    assert!(
+        error
+            .recovery(pam_flow::ConnectorId::Jenkins)
+            .contains("narrow")
+    );
 }

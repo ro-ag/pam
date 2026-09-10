@@ -183,8 +183,8 @@ use pam_connectors::{CurlTransport, HttpTransport};
 use pam_proto::{Envelope, Event, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
@@ -847,19 +847,55 @@ async fn dispatch_loop(
     mut incoming: mpsc::Receiver<IncomingRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let work_slots = Arc::new(Semaphore::new(128));
+    let control_slots = Arc::new(Semaphore::new(16));
+    let mut tasks = JoinSet::new();
+    let mut work_rate = crate::admission_rate::RateWindow::new(256);
+    let mut control_rate = crate::admission_rate::RateWindow::new(64);
     loop {
         let request = tokio::select! {
             () = signalled(&mut shutdown) => break,
-            request = incoming.recv() => match request {
-                Some(request) => request,
-                None => break,
-            },
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            request = incoming.recv() => match request { Some(request) => request, None => break },
+        };
+        let (slots, rate) = if matches!(
+            request.envelope.capability.as_str(),
+            "status" | "query" | "cancel"
+        ) {
+            (&control_slots, &mut control_rate)
+        } else {
+            (&work_slots, &mut work_rate)
+        };
+        if !rate.admit(std::time::Instant::now()) {
+            let _ = request.reply.send(Response::Refusal {
+                id: request.envelope.id,
+                cause: "request_rate_exhausted".to_owned(),
+                detail: "PAM has reached its aggregate request rate limit".to_owned(),
+                recovery: "Back off before sending more requests".to_owned(),
+            });
+            continue;
+        }
+        let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            let _ = request.reply.send(Response::Refusal {
+                id: request.envelope.id,
+                cause: "request_capacity_exhausted".to_owned(),
+                detail: "PAM has reached its active request limit".to_owned(),
+                recovery: "Wait for work to finish or cancel an existing request".to_owned(),
+            });
+            continue;
         };
         let pipeline = Arc::clone(&pipeline);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
+            let _permit = permit;
             pipeline.handle(request.envelope, request.reply).await;
         });
     }
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Leases ready work off the lanes and spawns an execution task per
@@ -936,9 +972,17 @@ impl Pipeline {
             return;
         };
 
-        let Ok(admitted) = self.queue.admit(&envelope, class).await else {
-            let _ = reply.send(internal_refusal(&id));
-            return;
+        let admitted = match self.queue.admit(&envelope, class).await {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                let _ = reply.send(Response::Refusal {
+                    id,
+                    cause: error.cause().to_owned(),
+                    detail: error.to_string(),
+                    recovery: error.recovery().to_owned(),
+                });
+                return;
+            }
         };
         // Advisory caller registry: every admitted request records its
         // observed agent+repo pair (attribution and GUI filters, never
@@ -1015,10 +1059,25 @@ impl Pipeline {
         // Register before placement so the completion cannot slip
         // between the two.
         let registration = self.router.register(id).await;
-        let position = self
+        let position = match self
             .queue
             .place_in_lane(id, &envelope.caller.repo, envelope.deadline_ms)
-            .await;
+            .await
+        {
+            Ok(position) => position,
+            Err(error) => {
+                let response = self
+                    .refuse(
+                        id,
+                        error.cause().to_owned(),
+                        error.to_string(),
+                        error.recovery().to_owned(),
+                    )
+                    .await;
+                self.router.finish(id, response.clone()).await;
+                return response;
+            }
+        };
         let _ = self.events.publish(id, Event::Queued).await;
         self.work.notify_one();
         if envelope.wait {
@@ -1111,17 +1170,6 @@ impl Pipeline {
         let capability = &envelope.capability;
         match outcome {
             Ok(ApprovalOutcome::Approved { .. }) => {
-                // The pipeline owns the transition out of
-                // waiting_approval (see the approval module docs):
-                // back to queued, then placement as any allow.
-                if self
-                    .store
-                    .update_request_state(id, RequestState::Queued, None)
-                    .await
-                    .is_err()
-                {
-                    return self.fail_internal(id).await;
-                }
                 self.place_and_wait(envelope, deadline_ms).await
             }
             Ok(ApprovalOutcome::Denied) => {
@@ -1193,15 +1241,22 @@ impl Pipeline {
                 )
                 .await;
         };
+        let Ok(Some(row)) = self.store.get_request(id).await else {
+            return internal_refusal(id);
+        };
+        let Some(deadline) = request_deadline(&row) else {
+            return self.deadline_refusal(envelope).await;
+        };
         let ctx = self.exec_context(
             id.clone(),
             envelope.capability.clone(),
             envelope.caller.clone(),
             envelope.args.clone(),
             cancel,
+            deadline,
         );
-        match timeout(
-            Duration::from_millis(envelope.deadline_ms),
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
             capability.execute(ctx),
         )
         .await
@@ -1279,12 +1334,26 @@ impl Pipeline {
         let LeasedWork {
             request_id: id,
             cancel,
-            ..
+            lease_deadline,
         } = work;
         let Ok(Some(row)) = self.store.get_request(&id).await else {
             self.fail_vanished_row(&id).await;
             return;
         };
+        if self.store.grant_revocation_revision().await.ok() != row.authorization_revision {
+            self.complete_leased(
+                &id,
+                &row.capability,
+                Err(CapabilityFailure::Refused {
+                    cause: "authorization_changed".to_owned(),
+                    detail: "A grant was revoked after this work was authorized".to_owned(),
+                    recovery: "Review current grants and submit a fresh request".to_owned(),
+                }),
+            )
+            .await;
+            self.work.notify_one();
+            return;
+        }
         let _ = self.events.publish(&id, Event::Started).await;
 
         let result = match BuiltinCapability::from_name(&row.capability) {
@@ -1298,8 +1367,14 @@ impl Pipeline {
                     repo: row.repo.clone(),
                     pid: 0,
                 };
-                let ctx =
-                    self.exec_context(id.clone(), row.capability.clone(), caller, args, cancel);
+                let ctx = self.exec_context(
+                    id.clone(),
+                    row.capability.clone(),
+                    caller,
+                    args,
+                    cancel,
+                    lease_deadline.into_std(),
+                );
                 capability.execute(ctx).await
             }
             // The gate classified it, so this only fires on registry
@@ -1458,8 +1533,10 @@ impl Pipeline {
         caller: pam_proto::Caller,
         args: serde_json::Value,
         cancel: watch::Receiver<bool>,
+        deadline: std::time::Instant,
     ) -> ExecContext {
         ExecContext {
+            budget: crate::request_budget::RequestBudget::new(deadline),
             request_id,
             args,
             cancel,
@@ -1844,4 +1921,15 @@ fn deadline_refusal_response(id: &str, deadline_ms: u64) -> Response {
         detail: format!("request exceeded its {deadline_ms} ms deadline"),
         recovery: RECOVERY_DEADLINE.to_owned(),
     }
+}
+
+/// Translate the original persisted expiry without granting time spent queued.
+fn request_deadline(row: &pam_store::RequestRow) -> Option<std::time::Instant> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let remaining = i128::from(row.expires_at_ms?) - i128::try_from(now_ms).ok()?;
+    let remaining = u64::try_from(remaining).ok().filter(|ms| *ms > 0)?;
+    Some(std::time::Instant::now() + Duration::from_millis(remaining.min(3_600_000)))
 }

@@ -1253,7 +1253,9 @@ async fn assert_sonar_evidence(
 ) {
     let store = flows.daemon.store();
     if let Some(status) = expected_status {
-        let id = step(body, "quality-gate")["evidence"][0].as_str().unwrap();
+        // All failed attempts are retained; inspect the final connector result.
+        let evidence_ids = step(body, "quality-gate")["evidence"].as_array().unwrap();
+        let id = evidence_ids.last().unwrap().as_str().unwrap();
         let evidence = store.get_evidence(id).await.unwrap().unwrap();
         assert_eq!(evidence.kind, EVIDENCE_KIND_CONNECTOR_RESULT);
         let saved: serde_json::Value = serde_json::from_slice(&evidence.content).unwrap();
@@ -1570,6 +1572,31 @@ async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_fai
         assert!(!String::from_utf8(row.content).unwrap().contains("test-jenkins-credential"));
         assert_eq!(transport.requests().len(),4);
         flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() {
+    assert!(
+        tokio::process::Command::new(helper())
+            .args(["exit", "0"])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    with_deadline(async {
+        let yaml = "schema: 1\nid: retained-retry\nname: Retained retry\nsteps:\n  - id: failing\n    run: [pam-flow-helper, unknown-operation]\n    retry: { attempts: 2, backoff: 10s }\n";
+        let flows = FlowDaemon::spawn(&[("retained-retry", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        let mut request = flows.run_envelope("req_retained_retry", "retained-retry", &serde_json::json!({}));
+        request.deadline_ms = 2_000;
+        assert!(matches!(client.request(&request).await, Response::Refusal { cause, .. } if cause == "deadline_exceeded"));
+        let evidence = flows.daemon.store().list_evidence(&request.id).await.unwrap();
+        let source = evidence.iter().find(|row| row.kind == EVIDENCE_KIND_LOG_SOURCE).expect("completed failure survives timeout during backoff");
+        let source = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();
+        assert!(String::from_utf8(source.content).unwrap().contains("unknown-operation"));
         flows.daemon.stop().await;
     }).await;
 }

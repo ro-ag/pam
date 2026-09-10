@@ -75,6 +75,9 @@ impl Fixture {
         cancel: watch::Receiver<bool>,
     ) -> ExecContext {
         ExecContext {
+            budget: crate::request_budget::RequestBudget::new(
+                std::time::Instant::now() + std::time::Duration::from_hours(1),
+            ),
             request_id: request_id.to_owned(),
             args,
             cancel,
@@ -330,7 +333,8 @@ async fn cancel_of_a_queued_request_releases_waiters_and_tells_subscribers() {
         );
         fx.queue
             .place_in_lane(&target.id, &target.caller.repo, target.deadline_ms)
-            .await;
+            .await
+            .unwrap();
 
         // Someone waits on the target's completion.
         let Registration::Pending(waiter) = fx.router.register("req_target").await else {

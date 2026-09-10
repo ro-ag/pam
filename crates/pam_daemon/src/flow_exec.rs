@@ -539,3 +539,25 @@ pub async fn sleep_or_cancel(delay: Duration, cancel: &mut watch::Receiver<bool>
         () = tokio::time::sleep(delay) => false,
     }
 }
+
+/// Execute with the original request's cumulative capture and attempt budget.
+pub async fn run_command_budgeted(
+    mut spec: CommandSpec,
+    cancel: &mut watch::Receiver<bool>,
+    budget: &std::sync::Arc<crate::request_budget::RequestBudget>,
+) -> Result<CommandOutcome, crate::request_budget::BudgetError> {
+    budget.attempt()?;
+    let reservation = budget.command(u64::try_from(MAX_SOURCE_BYTES).unwrap_or(u64::MAX))?;
+    spec.timeout = spec.timeout.min(budget.remaining()?);
+    let outcome = run_command(spec, cancel).await;
+    match &outcome {
+        CommandOutcome::Exited { output, .. }
+        | CommandOutcome::TimedOut { output }
+        | CommandOutcome::OutputLimit { output } => {
+            reservation.finish(u64::try_from(output.len()).unwrap_or(u64::MAX))?;
+        }
+        CommandOutcome::SpawnFailed(_) => reservation.finish(0)?,
+        CommandOutcome::Cancelled => {}
+    }
+    Ok(outcome)
+}

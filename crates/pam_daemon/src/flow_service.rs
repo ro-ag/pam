@@ -74,7 +74,7 @@ use crate::daemon::{CAUSE_APPROVAL_DENIED, CAUSE_APPROVAL_TIMEOUT};
 use crate::executor::{CapabilityFailure, CapabilityOutput, ExecContext, outcome_str};
 use crate::flow_exec::{
     CommandOutcome, CommandSpec, RunReport, StepReport, StepStatus, cancelled, outcome_for,
-    resolve_program, run_command, scrub_env, sleep_or_cancel, summary_for,
+    resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
 };
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
 use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
@@ -423,13 +423,18 @@ impl FlowService {
 
     /// Current GUI-approved scopes, independently of capability grants.
     pub async fn scope_policy(&self) -> Result<ScopePolicy, FlowRefusal> {
-        ScopePolicy::load(&self.store).await.map_err(scope_refusal)
+        ScopePolicy::load(&self.store)
+            .await
+            .map_err(|error| scope_refusal(&error))
     }
 
     /// Replace the scope policy through private administration only.
     pub async fn set_scope_policy(&self, policy: ScopePolicy) -> Result<ScopePolicy, FlowRefusal> {
-        let policy = policy.normalize().map_err(scope_refusal)?;
-        policy.save(&self.store).await.map_err(scope_refusal)?;
+        let policy = policy.normalize().map_err(|error| scope_refusal(&error))?;
+        policy
+            .save(&self.store)
+            .await
+            .map_err(|error| scope_refusal(&error))?;
         Ok(policy)
     }
 
@@ -437,7 +442,7 @@ impl FlowService {
         self.scope_policy()
             .await?
             .authorize_repo(repo)
-            .map_err(scope_refusal)
+            .map_err(|error| scope_refusal(&error))
     }
 
     /// One string-list setting, persisted from `default` when unset (or
@@ -576,17 +581,13 @@ impl FlowService {
     ) -> Result<CapabilityOutput, CapabilityFailure> {
         let settings = self.settings().await.map_err(failed)?;
         let entry = self.entry(&args.id)?;
-        let flow = match &entry.parsed {
-            Ok(flow) => flow.clone(),
-            Err(error) => {
-                return Err(FlowRefusal::new(
-                    CAUSE_FLOW_INVALID,
-                    format!("flow {:?} does not validate: {error}", args.id),
-                    RECOVERY_FLOW_EDIT,
-                )
-                .into());
-            }
-        };
+        let flow = entry.parsed.as_ref().map_err(|error| {
+            FlowRefusal::new(
+                CAUSE_FLOW_INVALID,
+                format!("flow {:?} does not validate: {error}", args.id),
+                RECOVERY_FLOW_EDIT,
+            )
+        })?;
 
         let repo = PathBuf::from(&ctx.caller.repo);
         if !repo.is_dir() {
@@ -605,13 +606,20 @@ impl FlowService {
         let repo = self.approved_repo(&repo).await?;
         let mut cancel = ctx.cancel.clone();
         let (vars, inputs) = self
-            .resolve_vars(&flow, &args.inputs, &repo, &settings, &mut cancel)
+            .resolve_vars(
+                flow,
+                &args.inputs,
+                &repo,
+                &settings,
+                &mut cancel,
+                &ctx.budget,
+            )
             .await?;
 
         let mut state = RunState {
             service: self,
             ctx,
-            flow: &flow,
+            flow,
             settings: &settings,
             repo,
             vars,
@@ -622,16 +630,17 @@ impl FlowService {
         state.execute().await?;
 
         let report = RunReport {
-            outcome: outcome_for(&state.reports, &flow),
+            outcome: outcome_for(&state.reports, flow),
             summary: summary_for(&state.reports),
             steps: state.reports,
         };
         let body = json!({
+            "budget_usage": ctx.budget.usage(),
             "flow": {
                 "id": flow.id,
                 "name": flow.name,
                 "source": entry.source.as_str(),
-                "digest": digest(&flow),
+                "digest": digest(flow),
             },
             "repo": ctx.caller.repo,
             "inputs": inputs,
@@ -683,6 +692,7 @@ impl FlowService {
         repo: &Path,
         settings: &FlowSettings,
         cancel: &mut watch::Receiver<bool>,
+        budget: &Arc<crate::request_budget::RequestBudget>,
     ) -> Result<(Vars, BTreeMap<String, String>), FlowRefusal> {
         let mut vars = Vars::new();
         vars.set("repo.path", repo.display().to_string());
@@ -692,7 +702,9 @@ impl FlowService {
         // `git remote get-url origin` costs a child process, so it runs
         // only when the flow actually mentions the variable.
         if flow_references(flow).iter().any(|key| key == "repo.origin")
-            && let Some(origin) = repo_origin(repo, settings, cancel).await
+            && let Some(origin) = repo_origin(repo, settings, cancel, budget)
+                .await
+                .map_err(budget_refusal)?
         {
             vars.set("repo.origin", origin);
         }
@@ -799,10 +811,13 @@ async fn repo_origin(
     repo: &Path,
     settings: &FlowSettings,
     cancel: &mut watch::Receiver<bool>,
-) -> Option<String> {
+    budget: &Arc<crate::request_budget::RequestBudget>,
+) -> Result<Option<String>, crate::request_budget::BudgetError> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let program = resolve_program("git", &settings.extra_path_dirs(), &path)?;
-    let outcome = run_command(
+    let Some(program) = resolve_program("git", &settings.extra_path_dirs(), &path) else {
+        return Ok(None);
+    };
+    let outcome = run_command_budgeted(
         CommandSpec {
             program,
             argv: vec![
@@ -815,12 +830,13 @@ async fn repo_origin(
             timeout: ORIGIN_TIMEOUT,
         },
         cancel,
+        budget,
     )
-    .await;
+    .await?;
     let CommandOutcome::Exited { status: 0, output } = outcome else {
-        return None;
+        return Ok(None);
     };
-    github_owner_name(&String::from_utf8_lossy(&output))
+    Ok(github_owner_name(&String::from_utf8_lossy(&output)))
 }
 
 /// `owner/name` out of a GitHub remote URL, in any of the shapes git
@@ -928,7 +944,7 @@ fn entry_digest(entry: &Entry) -> String {
 }
 
 /// A store failure a flow surface reports as a refusal.
-fn scope_refusal(error: ScopeError) -> FlowRefusal {
+fn scope_refusal(error: &ScopeError) -> FlowRefusal {
     FlowRefusal::new(error.cause(), error.to_string(), RECOVERY_SCOPE)
 }
 
@@ -1087,7 +1103,9 @@ impl RunState<'_> {
                 .connectors
                 .authorize_scope(&self.repo, *connector, call, &args)
                 .await
-                .map_err(|error| FlowRefusal::new(error.cause(), error.detail(), RECOVERY_SCOPE))?;
+                .map_err(|error| {
+                    FlowRefusal::new(error.cause(), error.detail(), &error.recovery(*connector))
+                })?;
         }
         Ok(())
     }
@@ -1339,10 +1357,11 @@ impl RunState<'_> {
                         ..
                     }
             ) || number == step.retry.attempts;
-            attempt = Some(outcome);
             if done {
+                attempt = Some(outcome);
                 break;
             }
+            self.preserve_attempt(step, outcome, report).await;
             if self.wait_before_retry(step.retry, number, None).await {
                 return Err(CapabilityFailure::Cancelled);
             }
@@ -1366,7 +1385,12 @@ impl RunState<'_> {
                 retry_after: None,
             });
         }
-        match run_command(spec.clone(), &mut self.cancel).await {
+        let outcome =
+            match run_command_budgeted(spec.clone(), &mut self.cancel, &self.ctx.budget).await {
+                Ok(outcome) => outcome,
+                Err(error) => return Some(budget_attempt(error)),
+            };
+        match outcome {
             CommandOutcome::Exited { status: 0, output }
                 if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
                 result: None,                    exit_status: Some(0),
@@ -1475,10 +1499,11 @@ impl RunState<'_> {
                         ..
                     }
             ) || number == step.retry.attempts;
-            attempt = Some(outcome);
             if done {
+                attempt = Some(outcome);
                 break;
             }
+            self.preserve_attempt(step, outcome, report).await;
             if self
                 .wait_before_retry(step.retry, number, retry_after)
                 .await
@@ -1505,7 +1530,7 @@ impl RunState<'_> {
             () = cancelled(&mut self.cancel) => return None,
             called = tokio::time::timeout(
                 step.timeout,
-                self.service.connectors.invoke(&self.repo, connector, call, args, deadline),
+                self.service.connectors.invoke_with_budget(&self.repo, connector, call, args, deadline.min(self.ctx.budget.deadline()), Arc::clone(&self.ctx.budget)),
             ) => called,
         };
         Some(assert_connector_attempt(
@@ -1556,6 +1581,28 @@ impl RunState<'_> {
                 },
             },
         ))
+    }
+
+    /// Persist a completed failed attempt before waiting or starting another.
+    async fn preserve_attempt(&mut self, step: &Step, attempt: Attempt, report: &mut StepReport) {
+        let (output, result, exit_status) = match attempt {
+            Attempt::Succeeded {
+                output,
+                result,
+                exit_status,
+            }
+            | Attempt::Failed {
+                output,
+                result,
+                exit_status,
+                ..
+            } => (output, result, exit_status),
+        };
+        if let Some(result) = result {
+            self.file_connector_result(step, &result, report).await;
+        } else {
+            self.file_output(step, output, exit_status, report).await;
+        }
     }
 
     /// Files the last attempt's output and writes the step's verdict.
@@ -1632,6 +1679,7 @@ impl RunState<'_> {
         }
         let meta = json!({
             "connector": connector.as_str(),
+            "attempt": report.attempts,
             "call": call,
             "args": with.iter().map(|(name, value)| (name.clone(), value.to_string()))
                 .collect::<BTreeMap<String, String>>(),
@@ -1688,7 +1736,7 @@ impl RunState<'_> {
             .compress(
                 &self.ctx.request_id,
                 CompressInput {
-                    name: format!("{}/{}", self.flow.id, step.id),
+                    name: format!("{}/{}/attempt-{}", self.flow.id, step.id, report.attempts),
                     bytes: output,
                     exit_status,
                     use_model: summarize,
@@ -1797,5 +1845,26 @@ fn rate_limit_wait(error: &InvokeError) -> Option<Duration> {
             *retry_after
         }
         _ => None,
+    }
+}
+
+fn budget_refusal(error: crate::request_budget::BudgetError) -> FlowRefusal {
+    FlowRefusal::new(
+        error.cause,
+        error.to_string(),
+        crate::request_budget::RECOVERY_BUDGET,
+    )
+}
+
+fn budget_attempt(error: crate::request_budget::BudgetError) -> Attempt {
+    Attempt::Failed {
+        result: None,
+        exit_status: None,
+        output: Vec::new(),
+        status: StepStatus::Blocked,
+        cause: error.cause,
+        detail: error.to_string(),
+        recovery: crate::request_budget::RECOVERY_BUDGET.to_owned(),
+        retry_after: None,
     }
 }

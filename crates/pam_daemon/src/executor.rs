@@ -64,6 +64,8 @@ const RECOVERY_CANCELLED: &str = "Re-run the pam command to start a fresh reques
 /// Everything a capability may need while executing one request.
 #[derive(Debug)]
 pub struct ExecContext {
+    /// Shared absolute deadline and cumulative work allowance.
+    pub budget: Arc<crate::request_budget::RequestBudget>,
     /// Id of the request being executed.
     pub request_id: String,
     /// The envelope's capability arguments.
@@ -276,6 +278,7 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
             "protocol": PROTOCOL_VERSION,
             "uptime_s": ctx.started_at.elapsed().as_secs(),
             "active_requests": active_requests,
+            "blocking_jobs": crate::blocking_jobs::snapshot(),
             "model": model_block(ctx).await,
             "keyring": ctx.secrets.keyring_health().await,
         }),

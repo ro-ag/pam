@@ -29,8 +29,9 @@ use std::io;
 use std::path::PathBuf;
 
 use pam_proto::{Envelope, Event, Response};
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use zeromq::{
     PubSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, Socket, SocketRecv, SocketSend,
@@ -207,6 +208,8 @@ async fn recv_loop(
     reply_tx: mpsc::Sender<(Vec<u8>, Response)>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let work_replies = Arc::new(Semaphore::new(128));
+    let control_replies = Arc::new(Semaphore::new(16));
     loop {
         let message = tokio::select! {
             () = signalled(&mut shutdown) => break,
@@ -219,7 +222,14 @@ async fn recv_loop(
                 }
             },
         };
-        handle_frames(message, &incoming, &reply_tx).await;
+        handle_frames(
+            message,
+            &incoming,
+            &reply_tx,
+            &work_replies,
+            &control_replies,
+        )
+        .await;
     }
 }
 
@@ -227,6 +237,8 @@ async fn handle_frames(
     message: ZmqMessage,
     incoming: &mpsc::Sender<IncomingRequest>,
     reply_tx: &mpsc::Sender<(Vec<u8>, Response)>,
+    work_replies: &Arc<Semaphore>,
+    control_replies: &Arc<Semaphore>,
 ) {
     // `ROUTER` prepends the peer identity, so a well-formed request is
     // exactly [identity, payload].
@@ -244,8 +256,53 @@ async fn handle_frames(
     }
     let payload = &frames[1];
 
+    if payload.len() > 1024 * 1024 {
+        let _ = reply_tx
+            .send((
+                identity,
+                bad_request("unknown".to_owned(), "request payload exceeds 1 MiB"),
+            ))
+            .await;
+        return;
+    }
     match serde_json::from_slice::<Envelope>(payload) {
         Ok(envelope) => {
+            if envelope.id.is_empty()
+                || envelope.id.len() > 128
+                || envelope.capability.len() > 128
+                || envelope.caller.agent.len() > 128
+                || envelope.caller.repo.len() > 4096
+                || envelope
+                    .idempotency_key
+                    .as_ref()
+                    .is_some_and(|key| key.len() > 128)
+            {
+                let _ = reply_tx
+                    .send((
+                        identity,
+                        bad_request(
+                            "unknown".to_owned(),
+                            "request identity or scope fields exceed their limits",
+                        ),
+                    ))
+                    .await;
+                return;
+            }
+            let slots = if matches!(envelope.capability.as_str(), "status" | "query" | "cancel") {
+                control_replies
+            } else {
+                work_replies
+            };
+            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+                let response = Response::Refusal {
+                    id: envelope.id,
+                    cause: "request_capacity_exhausted".to_owned(),
+                    detail: "PAM has reached its waiting reply limit".to_owned(),
+                    recovery: "Wait for work to finish or cancel an existing request".to_owned(),
+                };
+                let _ = reply_tx.send((identity, response)).await;
+                return;
+            };
             let (tx, rx) = oneshot::channel();
             let request = IncomingRequest {
                 identity: identity.clone(),
@@ -260,6 +317,7 @@ async fn handle_frames(
             // the ROUTER send half via the shared reply channel.
             let reply_tx = reply_tx.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Ok(response) = rx.await {
                     let _ = reply_tx.send((identity, response)).await;
                 }
@@ -310,7 +368,7 @@ async fn reply_loop(
                 None => break,
             },
         };
-        let Ok(payload) = serde_json::to_vec(&response) else {
+        let Ok(payload) = bounded_response(&response) else {
             continue;
         };
         let mut message = ZmqMessage::from(identity);
@@ -353,4 +411,39 @@ async fn publish_loop(
             _ = pub_socket.send(message) => {}
         }
     }
+}
+
+/// Encode through a bounded writer, so oversized replies cannot allocate a
+/// second unbounded copy or leave the caller waiting on a dropped wire frame.
+pub(crate) fn bounded_response(response: &Response) -> Result<Vec<u8>, serde_json::Error> {
+    struct Writer(Vec<u8>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (1024 * 1024_usize).saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("response budget exhausted"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer(Vec::new());
+    if serde_json::to_writer(&mut writer, response).is_ok() {
+        return Ok(writer.0);
+    }
+    let (Response::Result { id, .. } | Response::Refusal { id, .. } | Response::Ticket { id, .. }) =
+        response;
+    serde_json::to_vec(&Response::Refusal {
+        id: if id.len() <= 128 {
+            id.clone()
+        } else {
+            "unknown".to_owned()
+        },
+        cause: "response_budget_exhausted".to_owned(),
+        detail: "The response exceeds the public 1 MiB transport limit; evidence remains in PAM"
+            .to_owned(),
+        recovery: "Request a bounded evidence range or inspect the ticket in PAM".to_owned(),
+    })
 }

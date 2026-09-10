@@ -862,10 +862,35 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
                 .insert_approval("req_dead_wait", "echo")
                 .await
                 .expect("approval row");
+            let now_ms = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
             store
-                .insert_request("req_survivor", "echo", REPO, "claude", "{}", None)
+                .insert_admitted_request(
+                    "req_survivor",
+                    "echo",
+                    REPO,
+                    "claude",
+                    "{}",
+                    None,
+                    now_ms + 60_000,
+                )
                 .await
-                .expect("insert queued");
+                .unwrap();
+            assert!(
+                store
+                    .authorize_queued_request("req_survivor", REPO, now_ms)
+                    .await
+                    .unwrap()
+            );
+            store
+                .insert_request("req_legacy", "echo", REPO, "claude", "{}", None)
+                .await
+                .unwrap();
         }
 
         let daemon = TestDaemon::start_at(tmp).await;
@@ -887,7 +912,17 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
             .unwrap();
         assert_eq!(approval.resolution, Some(ApprovalResolution::Timeout));
 
-        // The queued row was rebuilt into its lane and executes.
+        // Unapproved legacy rows fail closed; authorized unexpired work resumes.
+        assert_eq!(
+            store
+                .get_request("req_legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RequestState::Failed
+        );
+        // The authorized queued row was rebuilt into its lane and executes.
         let row = wait_for_row(&store, "req_survivor", |row| {
             row.state == RequestState::Done
         })

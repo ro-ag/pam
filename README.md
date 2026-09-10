@@ -105,6 +105,8 @@ Both flows retain the configured program allowlist and approval policy.
 
 ## Agent-companion roadmap
 
+[Scoped admission and budgets](docs/scoped-admission-and-budgets.md) explains GUI repository approvals, target scopes, restart behavior and enforced limits.
+
 The [delivery roadmap](docs/agent-companion-roadmap.md) maps remaining work to
 ptrack plans and acceptance gates. The [agent workflow contract](docs/agent-workflow-contract.md)
 defines what PAM should do for a sandboxed caller, what works today, and how to

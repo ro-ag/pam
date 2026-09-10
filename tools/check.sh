@@ -24,6 +24,9 @@ cargo fmt --all --check
 echo "==> cargo clippy (all targets, -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "==> bounded ZeroMQ codec regression tests"
+cargo test --manifest-path vendor/zeromq/Cargo.toml --lib --offline
+
 echo "==> cargo test --workspace"
 cargo test --workspace
 

@@ -359,3 +359,29 @@ async fn sleep_or_cancel_returns_early_when_the_request_is_cancelled() {
     let (_alive, mut cancel) = live_cancel();
     assert!(!sleep_or_cancel(Duration::from_millis(1), &mut cancel).await);
 }
+
+#[tokio::test]
+async fn command_attempt_budget_blocks_a_retry_before_process_spawn() {
+    let budget = crate::request_budget::RequestBudget::with_limits(
+        std::time::Instant::now() + Duration::from_secs(30),
+        crate::request_budget::Limits {
+            attempts: 1,
+            ..Default::default()
+        },
+    );
+    let (_sender, mut cancel) = live_cancel();
+    let first =
+        crate::flow_exec::run_command_budgeted(git_spec(&["--version"]), &mut cancel, &budget)
+            .await
+            .unwrap();
+    assert!(matches!(first, CommandOutcome::Exited { status: 0, .. }));
+    let mut second = git_spec(&["--version"]);
+    second.program = PathBuf::from("/nonexistent-budget-probe");
+    let error = crate::flow_exec::run_command_budgeted(second, &mut cancel, &budget)
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause, "request_budget_exhausted");
+    assert_eq!(error.resource, "attempts");
+    assert!(budget.usage().command_bytes > 0);
+    assert!(budget.usage().command_bytes < 1024);
+}

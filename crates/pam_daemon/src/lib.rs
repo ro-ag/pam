@@ -70,3 +70,18 @@ mod secrets_test;
 
 #[cfg(test)]
 mod transport_test;
+
+mod blocking_jobs;
+#[cfg(test)]
+mod blocking_jobs_test;
+pub mod request_budget;
+#[cfg(test)]
+mod request_budget_test;
+
+pub mod scope_policy;
+#[cfg(test)]
+mod scope_policy_test;
+
+mod admission_rate;
+#[cfg(test)]
+mod admission_rate_test;

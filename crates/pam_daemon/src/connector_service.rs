@@ -531,7 +531,57 @@ impl ConnectorService {
         args: &BTreeMap<String, ArgValue>,
         deadline: Instant,
     ) -> Result<CallResult, InvokeError> {
+        self.invoke_with_budget(
+            repo,
+            id,
+            call,
+            args,
+            deadline,
+            crate::request_budget::RequestBudget::new(deadline),
+        )
+        .await
+    }
+
+    /// Execute a flow attempt using its original cumulative request allowance.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "request scope and its existing call deadline remain explicit"
+    )]
+    pub async fn invoke_with_budget(
+        &self,
+        repo: &Path,
+        id: ConnectorId,
+        call: &str,
+        args: &BTreeMap<String, ArgValue>,
+        deadline: Instant,
+        budget: Arc<crate::request_budget::RequestBudget>,
+    ) -> Result<CallResult, InvokeError> {
+        budget.attempt().map_err(|error| {
+            InvokeError::Connector(pam_connectors::ConnectorError::Policy {
+                cause: error.cause,
+                detail: error.to_string(),
+            })
+        })?;
         let row = self.scoped_row(repo, id, call, args).await?;
+        // The AWS adapter captures its own child pipes, outside HTTP. Keep the
+        // full reservation because it does not return an exact stderr byte count.
+        let _aws_capture = if id == ConnectorId::Aws {
+            Some(
+                budget
+                    .command(
+                        pam_connectors::aws::MAX_STDOUT_BYTES
+                            + pam_connectors::aws::MAX_STDERR_BYTES,
+                    )
+                    .map_err(|error| {
+                        InvokeError::Connector(pam_connectors::ConnectorError::Policy {
+                            cause: error.cause,
+                            detail: error.to_string(),
+                        })
+                    })?,
+            )
+        } else {
+            None
+        };
         let connection = self.connection(id, row.as_ref()).await?;
         self.ensure_transport(id)?;
         let transport = ScopedTransport {
@@ -541,6 +591,7 @@ impl ConnectorService {
             call,
             args,
             base_url: connection.base_url.to_string(),
+            budget,
         };
         let result = pam_connectors::call(id, &connection, call, args, &transport, deadline).await;
         Ok(result?)
@@ -725,6 +776,7 @@ struct ScopedTransport<'a> {
     call: &'a str,
     args: &'a BTreeMap<String, ArgValue>,
     base_url: String,
+    budget: Arc<crate::request_budget::RequestBudget>,
 }
 
 impl ScopedTransport<'_> {
@@ -757,7 +809,12 @@ impl ScopedTransport<'_> {
             });
         }
         request.follow_one_https_redirect_without_auth = false;
-        self.service.transport.send(request, deadline).await
+        crate::request_budget::BudgetTransport {
+            inner: self.service.transport.as_ref(),
+            budget: Arc::clone(&self.budget),
+        }
+        .send(request, deadline)
+        .await
     }
 }
 

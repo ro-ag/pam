@@ -74,3 +74,6 @@ mod watch_progress_test;
 
 #[cfg(test)]
 mod correlation_membership_test;
+
+#[cfg(test)]
+mod landing_session_test;

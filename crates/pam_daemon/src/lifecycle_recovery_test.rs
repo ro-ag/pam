@@ -214,3 +214,147 @@ async fn waiting_approval_is_expired_before_requeue_and_legacy_work_stays_failed
     assert_eq!(legacy.state, RequestState::Failed);
     assert_eq!(legacy.outcome.as_deref(), Some("daemon_restart"));
 }
+
+async fn landing_intent(store: &Store, id: &str, expiry: i64) {
+    admitted(store, id, expiry).await;
+    let document = serde_json::json!({
+        "version":1,"flow_digest":DIGEST,"repository":REPO,
+        "intent":{"step_id":"push","operation":"push","state":"prepared"},
+        "frozen":{"commit":"c".repeat(40)}
+    })
+    .to_string();
+    assert!(
+        store
+            .save_landing_session(id, None, &document, 0)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .prepare_flow_attempt(id, 0, "push", 1, true)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn typed_landing_requeues_original_ticket_for_reconciliation_but_generic_write_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let expiry = future_expiry();
+    {
+        let store = Store::open(&path).await.unwrap();
+        landing_intent(&store, "landing", expiry).await;
+        admitted(&store, "ordinary", expiry).await;
+        assert!(
+            store
+                .prepare_flow_attempt("ordinary", 0, "push", 1, true)
+                .await
+                .unwrap()
+        );
+        store.load_request_budget("landing").await.unwrap();
+        store
+            .reserve_request_budget("landing", RequestBudgetCharge::Http(123))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let store = Store::open(&path).await.unwrap();
+    let session = store
+        .read_landing_session("landing")
+        .await
+        .unwrap()
+        .unwrap();
+    let before = store.get_request("landing").await.unwrap().unwrap();
+    assert_eq!(recover_stuck_rows(&store).await.unwrap(), 2);
+    let landing = store.get_request("landing").await.unwrap().unwrap();
+    assert_eq!(landing.state, RequestState::Queued);
+    assert_eq!(landing.expires_at_ms, Some(expiry));
+    assert_eq!(
+        landing.authorization_revision,
+        before.authorization_revision
+    );
+    assert_eq!(
+        store
+            .read_landing_session("landing")
+            .await
+            .unwrap()
+            .unwrap(),
+        session
+    );
+    let journal = store.read_flow_journal("landing").await.unwrap().unwrap();
+    assert_eq!(journal.state, FlowJournalState::Ready);
+    assert!(journal.effectful);
+    assert_eq!(journal.step_id.as_deref(), Some("push"));
+    assert_eq!(
+        store
+            .load_request_budget("landing")
+            .await
+            .unwrap()
+            .http_bytes,
+        123
+    );
+    assert_eq!(
+        store
+            .get_request("ordinary")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("flow_effect_uncertain")
+    );
+    assert_eq!(recover_stuck_rows(&store).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn expired_revoked_or_mismatched_landing_intent_stays_terminal_uncertain() {
+    for guard in ["expired", "revoked", "wrong_step"] {
+        let store = Store::open_in_memory().await.unwrap();
+        let expiry = if guard == "expired" {
+            1
+        } else {
+            future_expiry()
+        };
+        landing_intent(&store, "landing", expiry).await;
+        if guard == "revoked" {
+            store.insert_grant("flow.run").await.unwrap();
+            store.revoke_grant("flow.run").await.unwrap();
+        }
+        if guard == "wrong_step" {
+            let mut document: serde_json::Value = serde_json::from_str(
+                &store
+                    .read_landing_session("landing")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .document,
+            )
+            .unwrap();
+            document["intent"]["step_id"] = serde_json::json!("other");
+            assert!(
+                store
+                    .save_landing_session("landing", Some(0), &document.to_string(), 0)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(recover_stuck_rows(&store).await.unwrap(), 1, "{guard}");
+        let row = store.get_request("landing").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed, "{guard}");
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("flow_effect_uncertain"),
+            "{guard}"
+        );
+        assert_eq!(
+            store
+                .read_flow_journal("landing")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            FlowJournalState::Uncertain
+        );
+    }
+}

@@ -277,7 +277,8 @@ async fn expire_old_approval(store: &Store, id: &str) -> Result<(), StoreError> 
 }
 
 /// Startup holds the instance lock, so no worker can race these transitions.
-/// An interrupted write is never downgraded to a read, even if spawn was not reached.
+/// Ordinary interrupted writes are never replayed. A private typed landing
+/// intent can resume only its read-only reconciliation on the original ticket.
 async fn recover_journal(
     store: &Store,
     row: &pam_store::RequestRow,
@@ -289,11 +290,17 @@ async fn recover_journal(
     let Some(journal) = store.read_flow_journal(&row.id).await? else {
         return Ok(JournalRecovery::Legacy);
     };
+    let now = recovery_now_ms();
     match journal.state {
         FlowJournalState::Uncertain => return Ok(JournalRecovery::Uncertain),
         FlowJournalState::Prepared if journal.effectful => {
-            store.mark_flow_uncertain(&row.id, journal.revision).await?;
-            return Ok(JournalRecovery::Uncertain);
+            if !store
+                .recover_landing_reconciliation(&row.id, journal.revision, now)
+                .await?
+            {
+                store.mark_flow_uncertain(&row.id, journal.revision).await?;
+                return Ok(JournalRecovery::Uncertain);
+            }
         }
         FlowJournalState::Prepared => {
             if !store
@@ -308,16 +315,24 @@ async fn recover_journal(
     if row.state == RequestState::WaitingApproval {
         expire_old_approval(store, &row.id).await?;
     }
-    let now = std::time::SystemTime::now()
+    Ok(
+        if store
+            .requeue_journaled_flow(&row.id, recovery_now_ms())
+            .await?
+        {
+            JournalRecovery::Requeued
+        } else {
+            JournalRecovery::Legacy
+        },
+    )
+}
+
+fn recovery_now_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(i64::MAX, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        });
-    Ok(if store.requeue_journaled_flow(&row.id, now).await? {
-        JournalRecovery::Requeued
-    } else {
-        JournalRecovery::Legacy
-    })
+        })
 }
 
 /// Builds the non-blocking writer for the daemon's own log:

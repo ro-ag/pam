@@ -1,5 +1,6 @@
 //! Bounded private landing receipts, scoped to the original admitted flow ticket.
 use super::{Store, StoreError};
+use serde::Deserialize;
 use turso::params;
 
 /// Private landing manifest and prepared effect state; never returned by public reads.
@@ -9,6 +10,21 @@ pub struct LandingSession {
     pub revision: i64,
     /// Versioned daemon-owned document, at most 128 KiB.
     pub document: String,
+}
+
+#[derive(Deserialize)]
+struct RecoveryProof {
+    version: u32,
+    flow_digest: String,
+    repository: String,
+    intent: RecoveryIntent,
+}
+
+#[derive(Deserialize)]
+struct RecoveryIntent {
+    step_id: String,
+    operation: String,
+    state: String,
 }
 
 fn invalid() -> StoreError {
@@ -31,6 +47,73 @@ fn validate(id: &str, document: &str) -> Result<(), StoreError> {
 }
 
 impl Store {
+    /// Startup-only handoff to read-only reconciliation on the original ticket.
+    /// This is not permission to repeat the effect: the private prepared intent
+    /// remains unchanged and the runtime must reconcile it before any new I/O.
+    /// Original admission, expiry, spent budget, and checkpoint are never reset.
+    pub async fn recover_landing_reconciliation(
+        &self,
+        request_id: &str,
+        expected_revision: i64,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        validate(request_id, "{}")?;
+        if !(0..i64::MAX).contains(&expected_revision) {
+            return Err(invalid());
+        }
+        let _guard = self.conn_lock.lock().await;
+        if !self.landing_prepared_intent_locked(request_id).await? {
+            return Ok(false);
+        }
+        Ok(self.conn.execute(
+            "UPDATE flow_journal SET state='ready',revision=revision+1
+             WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=1
+             AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND repo=flow_journal.repository
+             AND capability='flow.run' AND state IN ('running','waiting_approval')
+             AND queue_authorized=1 AND expires_at_ms>?3
+             AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL))",
+            params![request_id,expected_revision,now_ms],
+        ).await? == 1)
+    }
+
+    /// Caller owns `conn_lock`, including during terminal-write transactions.
+    /// Recognizes the retained uncertain effect across the ready/requeue handoff;
+    /// it does not authorize recovery and deliberately does not require live admission.
+    pub(super) async fn landing_prepared_intent_locked(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self.conn.query(
+            "SELECT CASE WHEN length(CAST(s.document AS BLOB))<=131072 THEN s.document ELSE NULL END,
+             j.flow_digest, j.repository, j.step_id FROM landing_session s
+             JOIN flow_journal j ON j.request_id=s.request_id
+             JOIN request r ON r.id=j.request_id
+             WHERE r.id=?1 AND j.schema_version=1
+             AND j.state IN ('ready','prepared') AND j.effectful=1
+             AND length(CAST(j.flow_digest AS BLOB))=64
+             AND length(CAST(j.repository AS BLOB)) BETWEEN 1 AND 4096
+             AND length(CAST(j.step_id AS BLOB)) BETWEEN 1 AND 256
+             AND r.repo=j.repository AND r.capability='flow.run'",
+            params![request_id],
+        ).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        let document: String = row.get::<Option<String>>(0)?.ok_or_else(invalid)?;
+        let Ok(proof) = serde_json::from_str::<RecoveryProof>(&document) else {
+            return Ok(false);
+        };
+        Ok(proof.version == 1
+            && proof.flow_digest == row.get::<String>(1)?
+            && proof.repository == row.get::<String>(2)?
+            && proof.intent.step_id == row.get::<String>(3)?
+            && proof.intent.state == "prepared"
+            && matches!(
+                proof.intent.operation.as_str(),
+                "push" | "ensure_pr" | "merge" | "sync"
+            ))
+    }
+
     /// Read without allocating an oversized persisted document.
     pub async fn read_landing_session(
         &self,

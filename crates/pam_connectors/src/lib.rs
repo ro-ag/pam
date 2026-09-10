@@ -39,9 +39,17 @@ mod curl;
 mod descriptor;
 mod error;
 mod github;
+pub mod github_landing;
+#[cfg(test)]
+mod github_landing_test;
 mod jenkins;
+mod jenkins_investigation;
 mod jira;
 mod sharepoint;
+mod sharepoint_document;
+#[cfg(test)]
+mod sharepoint_document_test;
+mod sonar_analysis;
 mod sonarqube;
 mod transport;
 
@@ -70,11 +78,15 @@ mod error_test;
 #[cfg(test)]
 mod github_test;
 #[cfg(test)]
+mod jenkins_investigation_test;
+#[cfg(test)]
 mod jenkins_test;
 #[cfg(test)]
 mod jira_test;
 #[cfg(test)]
 mod sharepoint_test;
+#[cfg(test)]
+mod sonar_analysis_test;
 #[cfg(test)]
 mod sonarqube_test;
 #[cfg(test)]

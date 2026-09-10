@@ -1,0 +1,801 @@
+{
+  "arm": "deterministic_broker_public_evidence",
+  "authenticity": "synthetic",
+  "avoided_attempts": null,
+  "corrections": null,
+  "fixture": "enterprise-six-products-v1",
+  "fixture_source_sha256": "4282d2070c3d1bd555c3b3ca32194596e5ffc6edab7dfd80d4c49a05e97df6b1",
+  "flow_sha256": "5eba6222917d7c01380aa704a45fc8eac0888fcbe7fb157dfa34c587598029fa",
+  "frontier_tokens": null,
+  "held_out": false,
+  "limitations": [
+    "No model, frontier agent, live service or real incident was evaluated.",
+    "Bytes count HTTP response bodies and serialized PAM responses, not TLS/network wire traffic.",
+    "Setup is measured separately; elapsed times describe synthetic local replay, not live-service latency.",
+    "Exact local paths, derived local target IDs, evidence IDs and flow step durations are normalized only for replay comparison; provider IDs and revisions are retained.",
+    "A paired agent experiment with independently reviewed labels is still required for token savings or qualification."
+  ],
+  "measurement_status": {
+    "avoided_attempts": "not_measured",
+    "corrections": "not_measured",
+    "frontier_tokens": "not_measured"
+  },
+  "runs": [
+    {
+      "authorized_evidence_reads": 7,
+      "evidence": [
+        {
+          "evidence_id": "ev_01m25xnbdywsxhfdr1q3fth430",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbdywsxhfdr1q3fth430",
+            "input_bytes": 4636,
+            "input_sha256": "c4922cdc855825d1c0a975b3f8ceb229a254baf2d38558f02858de295f4ea6a6",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_flow_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence",
+              "sharepoint"
+            ],
+            "protected_evidence_bytes": 4636,
+            "protected_evidence_sha256": "c4922cdc855825d1c0a975b3f8ceb229a254baf2d38558f02858de295f4ea6a6",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 4636,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 4636,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 4636,
+              "serialized_response_bytes": 10560
+            }
+          ],
+          "view_bytes": 4636,
+          "view_id": "view_01M25XNBE12WJBTCXVMSVTJVP8",
+          "view_sha256": "c4922cdc855825d1c0a975b3f8ceb229a254baf2d38558f02858de295f4ea6a6"
+        },
+        {
+          "evidence_id": "ev_01m25xnbc997r5zzr9cvzmmp6t",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbc997r5zzr9cvzmmp6t",
+            "input_bytes": 985,
+            "input_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github"
+            ],
+            "protected_evidence_bytes": 985,
+            "protected_evidence_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 985,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 985,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 985,
+              "serialized_response_bytes": 3202
+            }
+          ],
+          "view_bytes": 985,
+          "view_id": "view_01M25XNBCAESS2MAW8JPJTJC2E",
+          "view_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906"
+        },
+        {
+          "evidence_id": "ev_01m25xnbcjrmx9s0m96qdqfyqy",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbcjrmx9s0m96qdqfyqy",
+            "input_bytes": 1955,
+            "input_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins"
+            ],
+            "protected_evidence_bytes": 1955,
+            "protected_evidence_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 1955,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 1955,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 1955,
+              "serialized_response_bytes": 5158
+            }
+          ],
+          "view_bytes": 1955,
+          "view_id": "view_01M25XNBCKR11JEXNWFRTSCD3P",
+          "view_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919"
+        },
+        {
+          "evidence_id": "ev_01m25xnbcz73bxanc45f50cn7c",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbcz73bxanc45f50cn7c",
+            "input_bytes": 1110,
+            "input_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube"
+            ],
+            "protected_evidence_bytes": 1110,
+            "protected_evidence_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 1110,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 1110,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 1110,
+              "serialized_response_bytes": 3480
+            }
+          ],
+          "view_bytes": 1110,
+          "view_id": "view_01M25XNBCZ8QDPB1WM299DN4SS",
+          "view_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e"
+        },
+        {
+          "evidence_id": "ev_01m25xnbd6bfm2mtr0pjwnscxk",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbd6bfm2mtr0pjwnscxk",
+            "input_bytes": 482,
+            "input_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira"
+            ],
+            "protected_evidence_bytes": 482,
+            "protected_evidence_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 482,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 482,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 482,
+              "serialized_response_bytes": 2225
+            }
+          ],
+          "view_bytes": 482,
+          "view_id": "view_01M25XNBD7S8492X39GXV0SM6Y",
+          "view_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038"
+        },
+        {
+          "evidence_id": "ev_01m25xnbde60m0t92x9cp2m5es",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbde60m0t92x9cp2m5es",
+            "input_bytes": 471,
+            "input_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence"
+            ],
+            "protected_evidence_bytes": 471,
+            "protected_evidence_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 471,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 471,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 471,
+              "serialized_response_bytes": 2216
+            }
+          ],
+          "view_bytes": 471,
+          "view_id": "view_01M25XNBDF715XQT6XS1XX52DM",
+          "view_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901"
+        },
+        {
+          "evidence_id": "ev_01m25xnbdt072qycx0rn6rvv1y",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbdt072qycx0rn6rvv1y",
+            "input_bytes": 851,
+            "input_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence",
+              "sharepoint"
+            ],
+            "protected_evidence_bytes": 851,
+            "protected_evidence_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 851,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 851,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 851,
+              "serialized_response_bytes": 2989
+            }
+          ],
+          "view_bytes": 851,
+          "view_id": "view_01M25XNBDT4J1VEEHD44X5A53A",
+          "view_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1"
+        }
+      ],
+      "evidence_serialized_response_bytes": 29830,
+      "flow_elapsed_ns": "77469875",
+      "flow_serialized_response_bytes": 3587,
+      "http_calls": 13,
+      "http_response_body_bytes": 1855,
+      "normalized_content_sha256": "4c861b79d8ced322a35bdae2b8425eb15f44e87c269188e479f47d56cb80258a",
+      "permitted_http_reads": 13,
+      "retrieval_elapsed_ns": "46029500",
+      "revoked_evidence_reads": 1,
+      "revoked_read_serialized_response_bytes": 268,
+      "setup_elapsed_ns": "193784459",
+      "unexpected_reads": 0
+    },
+    {
+      "authorized_evidence_reads": 7,
+      "evidence": [
+        {
+          "evidence_id": "ev_01m25xnbk8ry1tmwzr3g99mnm3",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbk8ry1tmwzr3g99mnm3",
+            "input_bytes": 4636,
+            "input_sha256": "1c2bce6b7c51dedf6b8192ec2f426d1e58b51d1c34c65aa9016cb5b965dcd092",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_flow_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence",
+              "sharepoint"
+            ],
+            "protected_evidence_bytes": 4636,
+            "protected_evidence_sha256": "1c2bce6b7c51dedf6b8192ec2f426d1e58b51d1c34c65aa9016cb5b965dcd092",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 4636,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 4636,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 4636,
+              "serialized_response_bytes": 10560
+            }
+          ],
+          "view_bytes": 4636,
+          "view_id": "view_01M25XNBKB0MHRWPMJWK9Q3MFP",
+          "view_sha256": "1c2bce6b7c51dedf6b8192ec2f426d1e58b51d1c34c65aa9016cb5b965dcd092"
+        },
+        {
+          "evidence_id": "ev_01m25xnbhr759gatzc36gx5m19",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbhr759gatzc36gx5m19",
+            "input_bytes": 985,
+            "input_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github"
+            ],
+            "protected_evidence_bytes": 985,
+            "protected_evidence_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 985,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 985,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 985,
+              "serialized_response_bytes": 3202
+            }
+          ],
+          "view_bytes": 985,
+          "view_id": "view_01M25XNBHSYXJE8QTXGQ45CJKF",
+          "view_sha256": "c196571e334c50903fa847569d5f1af457660cb90e5f3d242fedbfc6cb6a9906"
+        },
+        {
+          "evidence_id": "ev_01m25xnbj108th1rffntx8vr4x",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbj108th1rffntx8vr4x",
+            "input_bytes": 1955,
+            "input_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins"
+            ],
+            "protected_evidence_bytes": 1955,
+            "protected_evidence_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 1955,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 1955,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 1955,
+              "serialized_response_bytes": 5158
+            }
+          ],
+          "view_bytes": 1955,
+          "view_id": "view_01M25XNBJ1XF4NBC94HPRTSA0H",
+          "view_sha256": "ad0446e4af9e3c5e523b3f75a42d24c8d4e0f5771d8a48d5d74bb17df5444919"
+        },
+        {
+          "evidence_id": "ev_01m25xnbjc1v9sxm53tsp91gcp",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbjc1v9sxm53tsp91gcp",
+            "input_bytes": 1110,
+            "input_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube"
+            ],
+            "protected_evidence_bytes": 1110,
+            "protected_evidence_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 1110,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 1110,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 1110,
+              "serialized_response_bytes": 3480
+            }
+          ],
+          "view_bytes": 1110,
+          "view_id": "view_01M25XNBJDYWRK6C6PJP10MHAV",
+          "view_sha256": "4664a8d7c488b693a35b3886aa20b0ccb808ddc0836662a5150d69de0c60bc3e"
+        },
+        {
+          "evidence_id": "ev_01m25xnbjk3x1hghg15t0a72r5",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbjk3x1hghg15t0a72r5",
+            "input_bytes": 482,
+            "input_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira"
+            ],
+            "protected_evidence_bytes": 482,
+            "protected_evidence_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 482,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 482,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 482,
+              "serialized_response_bytes": 2225
+            }
+          ],
+          "view_bytes": 482,
+          "view_id": "view_01M25XNBJKX334Z4PND87C15W7",
+          "view_sha256": "118980c154a0d9294a8c34bce9eac287d175fa7feb8d4c2ae737c72f968d1038"
+        },
+        {
+          "evidence_id": "ev_01m25xnbjt45xxa1d452qmd4qr",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbjt45xxa1d452qmd4qr",
+            "input_bytes": 471,
+            "input_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence"
+            ],
+            "protected_evidence_bytes": 471,
+            "protected_evidence_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 471,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 471,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 471,
+              "serialized_response_bytes": 2216
+            }
+          ],
+          "view_bytes": 471,
+          "view_id": "view_01M25XNBJV87A6E41G0T9W1PYC",
+          "view_sha256": "8c055f4e18204ddb359058548d0c1a0a45ef7149b73805ed754ad0483c06e901"
+        },
+        {
+          "evidence_id": "ev_01m25xnbk43bk5w8gfr2dvrk38",
+          "identity": {
+            "captured_at": 1789052759,
+            "completeness": "not_asserted",
+            "evidence_id": "ev_01m25xnbk43bk5w8gfr2dvrk38",
+            "input_bytes": 851,
+            "input_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1",
+            "offset_basis": "view_bytes",
+            "parent": {
+              "kind": "protected_connector_result"
+            },
+            "products": [
+              "github",
+              "jenkins",
+              "sonarqube",
+              "jira",
+              "confluence",
+              "sharepoint"
+            ],
+            "protected_evidence_bytes": 851,
+            "protected_evidence_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1",
+            "redaction": {
+              "coverage": "bounded_detectors",
+              "policy": "pam-evidence-redact-v1",
+              "replacements": 0
+            },
+            "request_id": "enterprise_run",
+            "schema_version": 1
+          },
+          "offset_basis": "view_bytes",
+          "pages": [
+            {
+              "offset": 0,
+              "provenance": [
+                {
+                  "parent": {
+                    "end": 851,
+                    "start": 0
+                  },
+                  "relation": "identity",
+                  "view": {
+                    "end": 851,
+                    "start": 0
+                  }
+                }
+              ],
+              "returned_bytes": 851,
+              "serialized_response_bytes": 2989
+            }
+          ],
+          "view_bytes": 851,
+          "view_id": "view_01M25XNBK5SVNQ55E501Z7DGBP",
+          "view_sha256": "34995497d6d0ccea57f410a05f756630004fad9b68399ea12c89fccb2fa359b1"
+        }
+      ],
+      "evidence_serialized_response_bytes": 29830,
+      "flow_elapsed_ns": "67557458",
+      "flow_serialized_response_bytes": 3587,
+      "http_calls": 13,
+      "http_response_body_bytes": 1855,
+      "normalized_content_sha256": "4c861b79d8ced322a35bdae2b8425eb15f44e87c269188e479f47d56cb80258a",
+      "permitted_http_reads": 13,
+      "retrieval_elapsed_ns": "44355708",
+      "revoked_evidence_reads": 1,
+      "revoked_read_serialized_response_bytes": 268,
+      "setup_elapsed_ns": "44196417",
+      "unexpected_reads": 0
+    }
+  ],
+  "schema_version": 1,
+  "split": "development"
+}

@@ -1,0 +1,12 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=33033a10a55ab1af61fbae9a1f2c87e3114a25a0
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+approved clone URL: https://github.com/pam-fixtures/example
+configured origin URL: https://github.com/pam-fixtures/example-archive
+preflight comparison: full canonical repository path differs; matching host alone is insufficient.
+operation=remote-policy-check exit=1; cause=remote_mismatch; git_spawned=false
+[synthetic Confluence Cloud citation] https://docs.fixture.invalid/wiki/spaces/ENG/pages/440 ; page_id=440 ; version=3 ; title=Archived repository migration.
+cited page excerpt: The archived checkout retains its original origin until a developer updates its local configuration. This document does not authorize a remote change.
+No network response or push result belongs to this record.

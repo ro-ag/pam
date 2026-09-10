@@ -37,7 +37,33 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: SCHEMA_V5,
     },
+    Migration {
+        version: 6,
+        sql: SCHEMA_V6,
+    },
+    Migration {
+        version: 7,
+        sql: SCHEMA_V7,
+    },
+    Migration {
+        version: 8,
+        sql: SCHEMA_V8,
+    },
+    Migration {
+        version: 9,
+        sql: SCHEMA_V9,
+    },
+    Migration {
+        version: 10,
+        sql: SCHEMA_V10,
+    },
+    Migration {
+        version: 11,
+        sql: SCHEMA_V11,
+    },
 ];
+
+const SCHEMA_V11: &str = "CREATE TABLE landing_session(request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision>=0), document TEXT NOT NULL CHECK(length(CAST(document AS BLOB))<=131072));";
 
 /// Highest schema version this binary can produce.
 pub(crate) fn latest_version() -> i64 {
@@ -230,5 +256,88 @@ CREATE TABLE connector (
   last_test_detail TEXT,
   last_test_ts INTEGER,
   updated_ts INTEGER NOT NULL
+);
+";
+
+/// Durable expiry and post-gate queue authorization. Legacy rows default closed.
+const SCHEMA_V6: &str = "
+ALTER TABLE request ADD COLUMN expires_at_ms INTEGER;
+ALTER TABLE request ADD COLUMN authorization_revision INTEGER;
+ALTER TABLE request ADD COLUMN queue_authorized INTEGER NOT NULL DEFAULT 0 CHECK (queue_authorized IN (0, 1));
+";
+
+/// Immutable public views survive source retention as metadata-only tombstones.
+const SCHEMA_V7: &str = "
+CREATE TABLE evidence_view (
+ evidence_id TEXT PRIMARY KEY,
+ request_id TEXT NOT NULL REFERENCES request(id),
+ repository TEXT NOT NULL,
+ origin_json TEXT NOT NULL,
+ identity_json TEXT NOT NULL,
+ map_json TEXT NOT NULL,
+ view_id TEXT NOT NULL UNIQUE,
+ view_sha256 TEXT NOT NULL,
+ view_bytes INTEGER NOT NULL,
+ view_blob BLOB,
+ expired_at INTEGER
+);
+CREATE INDEX evidence_view_request_idx ON evidence_view(request_id);
+CREATE TABLE evidence_read_allowance (
+ request_id TEXT NOT NULL REFERENCES request(id),
+ repository TEXT NOT NULL,
+ started_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL,
+ remaining_bytes INTEGER NOT NULL,
+ remaining_pages INTEGER NOT NULL,
+ PRIMARY KEY(request_id, repository)
+);
+";
+
+/// Immutable workflow identities, retained exactly as long as their request.
+const SCHEMA_V8: &str = "
+CREATE TABLE correlation_target (
+ request_id TEXT PRIMARY KEY REFERENCES request(id),
+ canonical_json TEXT NOT NULL CHECK(LENGTH(CAST(canonical_json AS BLOB))<=16384)
+);
+CREATE TABLE correlation_step (
+ request_id TEXT NOT NULL REFERENCES correlation_target(request_id),
+ step_id TEXT NOT NULL CHECK(LENGTH(CAST(step_id AS BLOB)) BETWEEN 1 AND 256),
+ canonical_json TEXT NOT NULL CHECK(LENGTH(CAST(canonical_json AS BLOB))<=8192),
+ PRIMARY KEY(request_id,step_id)
+);
+";
+
+const SCHEMA_V9: &str = r"
+CREATE TABLE request_budget (
+ request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE,
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 256),
+ http_calls INTEGER NOT NULL DEFAULT 0 CHECK(http_calls BETWEEN 0 AND 128),
+ http_bytes INTEGER NOT NULL DEFAULT 0 CHECK(http_bytes BETWEEN 0 AND 134217728),
+ command_bytes INTEGER NOT NULL DEFAULT 0 CHECK(command_bytes BETWEEN 0 AND 134217728)
+);
+CREATE TABLE flow_journal (
+ request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE,
+ schema_version INTEGER NOT NULL CHECK(schema_version=1),
+ flow_digest TEXT NOT NULL CHECK(length(CAST(flow_digest AS BLOB))=64),
+ repository TEXT NOT NULL CHECK(length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096),
+ input_fingerprint TEXT NOT NULL CHECK(length(CAST(input_fingerprint AS BLOB))=64),
+ revision INTEGER NOT NULL CHECK(revision>=0),
+ state TEXT NOT NULL CHECK(state IN ('ready','prepared','completed','uncertain')),
+ step_id TEXT CHECK(step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256),
+ attempt INTEGER NOT NULL CHECK(attempt BETWEEN 0 AND 256),
+ effectful INTEGER NOT NULL CHECK(effectful IN (0,1)),
+ checkpoint_json TEXT NOT NULL CHECK(length(CAST(checkpoint_json AS BLOB))<=131072),
+ evidence_refs_json TEXT NOT NULL CHECK(length(CAST(evidence_refs_json AS BLOB))<=16384)
+);
+";
+
+const SCHEMA_V10: &str = "
+ALTER TABLE request ADD COLUMN resume_at_ms INTEGER;
+CREATE TABLE correlation_membership (
+ request_id TEXT NOT NULL,
+ step_id TEXT NOT NULL,
+ members_json TEXT NOT NULL CHECK(length(CAST(members_json AS BLOB))<=16384),
+ PRIMARY KEY(request_id,step_id),
+ FOREIGN KEY(request_id,step_id) REFERENCES correlation_step(request_id,step_id) ON DELETE CASCADE
 );
 ";

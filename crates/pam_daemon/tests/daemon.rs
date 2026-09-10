@@ -17,7 +17,7 @@ use pam_daemon::lifecycle::{
     ACTION_DAEMON_RESTART, CAUSE_DAEMON_RESTART, LifecycleError, LifecyclePhase,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
-use pam_daemon::queue::{ACTION_CANCEL, CAUSE_CANCELLED};
+use pam_daemon::queue::{ACTION_CANCEL, ACTION_LEASE_REAPED, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED};
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{Actor, ApprovalResolution, Decision, RequestRow, RequestState, Store};
 use tokio::sync::watch;
@@ -785,16 +785,16 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
         };
         assert_eq!(cause, CAUSE_DEADLINE_EXCEEDED);
 
-        // The request itself is torn down (cancelled through the queue)
+        // The request itself is torn down (expired through the queue)
         // and both the deadline refusal and the teardown are audited.
         let store = daemon.handle.store();
         let row = wait_for_row(&store, "req_late", |row| row.state == RequestState::Failed).await;
-        assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
         let audit = store.audit_for_request("req_late").await.unwrap();
         assert!(audit.iter().any(|row| row.action == ACTION_DEADLINE_REFUSAL
             && row.decision == Decision::Timeout
             && row.actor == Actor::System));
-        assert!(audit.iter().any(|row| row.action == ACTION_CANCEL));
+        assert!(audit.iter().any(|row| row.action == ACTION_LEASE_REAPED));
 
         daemon.stop().await;
     })
@@ -862,10 +862,35 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
                 .insert_approval("req_dead_wait", "echo")
                 .await
                 .expect("approval row");
+            let now_ms = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
             store
-                .insert_request("req_survivor", "echo", REPO, "claude", "{}", None)
+                .insert_admitted_request(
+                    "req_survivor",
+                    "echo",
+                    REPO,
+                    "claude",
+                    "{}",
+                    None,
+                    now_ms + 60_000,
+                )
                 .await
-                .expect("insert queued");
+                .unwrap();
+            assert!(
+                store
+                    .authorize_queued_request("req_survivor", REPO, now_ms)
+                    .await
+                    .unwrap()
+            );
+            store
+                .insert_request("req_legacy", "echo", REPO, "claude", "{}", None)
+                .await
+                .unwrap();
         }
 
         let daemon = TestDaemon::start_at(tmp).await;
@@ -887,7 +912,17 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
             .unwrap();
         assert_eq!(approval.resolution, Some(ApprovalResolution::Timeout));
 
-        // The queued row was rebuilt into its lane and executes.
+        // Unapproved legacy rows fail closed; authorized unexpired work resumes.
+        assert_eq!(
+            store
+                .get_request("req_legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RequestState::Failed
+        );
+        // The authorized queued row was rebuilt into its lane and executes.
         let row = wait_for_row(&store, "req_survivor", |row| {
             row.state == RequestState::Done
         })
@@ -1057,7 +1092,10 @@ async fn a_model_admin_op_from_an_agent_trips_the_wire() {
             panic!("a model admin op from an agent must be refused");
         };
         assert_eq!(cause, CAUSE_ADMIN_DENIED);
-        assert!(detail.contains("GUI-only"), "detail: {detail}");
+        assert!(
+            detail.contains("private native channel"),
+            "detail: {detail}"
+        );
         assert!(!recovery.is_empty());
 
         // Audited as the tripwire, not as an ordinary admin refusal, so

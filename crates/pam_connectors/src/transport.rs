@@ -33,12 +33,16 @@ pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 /// way, so it is filled with a reserved name that can never resolve.
 pub const AWS_BASE_URL: &str = "https://aws.invalid/";
 
-/// The HTTP verb a connector may use. Read-only means one entry.
+/// HTTP verbs for read-only connectors and separately authorized typed mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
     /// `GET`.
     #[default]
     Get,
+    /// `POST`, for typed mutation clients only.
+    Post,
+    /// `PUT`, for typed mutation clients only.
+    Put,
 }
 
 impl Method {
@@ -47,6 +51,8 @@ impl Method {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
         }
     }
 }
@@ -59,6 +65,8 @@ impl Method {
 pub struct HttpRequest {
     /// The verb.
     pub method: Method,
+    /// Optional JSON object, capped at 16 KiB and supplied only on stdin.
+    pub body: Option<Vec<u8>>,
     /// The absolute URL, query included.
     pub url: Url,
     /// Every header to send, in order.
@@ -99,6 +107,14 @@ impl HttpResponse {
 /// Anything the service said, including 500, arrives as an [`HttpResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransportError {
+    /// A daemon policy or cumulative budget refused further work.
+    #[error("{detail}")]
+    Policy {
+        /// Stable daemon refusal cause.
+        cause: &'static str,
+        /// Sanitized policy detail, never request credentials.
+        detail: String,
+    },
     /// The deadline passed with no answer.
     #[error("the request timed out")]
     Timeout,
@@ -122,6 +138,7 @@ pub enum TransportError {
 impl From<TransportError> for ConnectorError {
     fn from(error: TransportError) -> Self {
         match error {
+            TransportError::Policy { cause, detail } => Self::Policy { cause, detail },
             TransportError::Timeout => Self::Timeout,
             TransportError::Certificate => Self::Certificate,
             TransportError::Network(detail) => Self::Network(detail),
@@ -295,6 +312,7 @@ pub(crate) fn request(
     }
     Ok(HttpRequest {
         method: Method::Get,
+        body: None,
         url,
         headers,
         max_bytes,

@@ -13,6 +13,7 @@ use pam_flow::{Flow, parse};
 use pam_proto::Outcome;
 use tokio::sync::watch;
 
+use crate::command_containment::CommandContainment;
 use crate::flow_exec::{
     CommandOutcome, CommandSpec, SECRET_ENV_FRAGMENTS, StepReport, StepStatus, is_secret_env_name,
     outcome_for, resolve_program, run_command, scrub_env, sleep_or_cancel, summary_for,
@@ -26,6 +27,19 @@ use crate::flow_exec::{
 /// for integration tests only, and `cargo test --lib` does not build the
 /// package's binaries at all.
 fn git() -> PathBuf {
+    // Exercise Git itself: Apple's /usr/bin/git shim invokes xcrun, whose
+    // cache writes are correctly denied by the command containment policy.
+    if cfg!(target_os = "macos") {
+        for installed in [
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        ] {
+            let path = PathBuf::from(installed);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
     resolve_program(
         "git",
         &[],
@@ -34,15 +48,48 @@ fn git() -> PathBuf {
     .expect("git is installed wherever this workspace builds")
 }
 
-/// A spec that runs `git` with `argv`.
-fn git_spec(argv: &[&str]) -> CommandSpec {
-    CommandSpec {
-        program: git(),
+/// Retain separate repository and private roots until the command has ended.
+fn git_spec(argv: &[&str]) -> (tempfile::TempDir, CommandSpec) {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let repository = fixture.path().join("repository");
+    let protected_base = fixture.path().join("private");
+    std::fs::create_dir(&repository).unwrap();
+    std::fs::create_dir(&protected_base).unwrap();
+    let program = git().canonicalize().unwrap();
+    let mut read_only_roots = vec![program.parent().unwrap().to_path_buf()];
+    for root in ["/Library/Developer", "/Applications/Xcode.app"] {
+        if Path::new(root).is_dir() {
+            read_only_roots.push(PathBuf::from(root));
+        }
+    }
+    let spec = CommandSpec {
+        program,
         argv: argv.iter().map(|part| (*part).to_owned()).collect(),
-        cwd: std::env::temp_dir(),
+        cwd: repository.clone(),
         env: Vec::new(),
         timeout: Duration::from_secs(30),
+        containment: CommandContainment {
+            protected_base,
+            repository,
+            read_only_roots,
+            allow_repository_writes: false,
+            artifact_roots: Vec::new(),
+        },
+    };
+    (fixture, spec)
+}
+
+/// Unsupported hosts must refuse before a workload starts, never run a bypass.
+fn assert_unsupported(outcome: &CommandOutcome) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
     }
+    assert!(
+        matches!(outcome, CommandOutcome::ContainmentUnavailable { detail }
+            if detail.contains("supported only on macOS")),
+        "expected unsupported containment refusal, got {outcome:?}"
+    );
+    true
 }
 
 /// A cancel channel that never fires, and the sender that keeps it open.
@@ -270,7 +317,11 @@ fn resolve_program_refuses_a_name_with_a_path_separator() {
 #[tokio::test]
 async fn a_clean_exit_reports_its_output() {
     let (_alive, mut cancel) = live_cancel();
-    let outcome = run_command(git_spec(&["--version"]), &mut cancel).await;
+    let (_fixture, spec) = git_spec(&["--version"]);
+    let outcome = run_command(spec, &mut cancel).await;
+    if assert_unsupported(&outcome) {
+        return;
+    }
     match outcome {
         CommandOutcome::Exited { status, output } => {
             assert_eq!(status, 0);
@@ -283,7 +334,11 @@ async fn a_clean_exit_reports_its_output() {
 #[tokio::test]
 async fn a_non_zero_exit_arrives_with_the_stderr_it_wrote() {
     let (_alive, mut cancel) = live_cancel();
-    let outcome = run_command(git_spec(&["pam-nonsense-subcommand"]), &mut cancel).await;
+    let (_fixture, spec) = git_spec(&["pam-nonsense-subcommand"]);
+    let outcome = run_command(spec, &mut cancel).await;
+    if assert_unsupported(&outcome) {
+        return;
+    }
     match outcome {
         CommandOutcome::Exited { status, output } => {
             assert_ne!(status, 0, "a bad subcommand does not exit zero");
@@ -301,12 +356,11 @@ async fn a_non_zero_exit_arrives_with_the_stderr_it_wrote() {
 #[tokio::test]
 async fn the_environment_reaches_the_child_and_nothing_else_does() {
     let (_alive, mut cancel) = live_cancel();
-    let mut spec = git_spec(&["config", "--get", "pam.marker"]);
+    let (_fixture, mut spec) = git_spec(&["config", "--get", "pam.marker"]);
     // `git config --get` reads the marker out of a config file named by
     // an environment variable, which proves the env we set is the env the
     // child saw — and that nothing was inherited implicitly.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = dir.path().join("gitconfig");
+    let config = spec.cwd.join("gitconfig");
     std::fs::write(
         &config,
         "[pam]
@@ -315,8 +369,11 @@ async fn the_environment_reaches_the_child_and_nothing_else_does() {
     )
     .expect("the config is written");
     spec.env = vec![("GIT_CONFIG_GLOBAL".to_owned(), config.display().to_string())];
-    spec.cwd = dir.path().to_path_buf();
-    match run_command(spec, &mut cancel).await {
+    let outcome = run_command(spec, &mut cancel).await;
+    if assert_unsupported(&outcome) {
+        return;
+    }
+    match outcome {
         CommandOutcome::Exited { status, output } => {
             assert_eq!(
                 status,
@@ -331,22 +388,14 @@ async fn the_environment_reaches_the_child_and_nothing_else_does() {
 }
 
 #[tokio::test]
-async fn a_program_that_cannot_be_started_says_so() {
+async fn a_program_that_cannot_be_validated_never_starts() {
     let (_alive, mut cancel) = live_cancel();
-    let outcome = run_command(
-        CommandSpec {
-            program: Path::new("/definitely/not/here/pam-flow-helper").to_path_buf(),
-            argv: Vec::new(),
-            cwd: std::env::temp_dir(),
-            env: Vec::new(),
-            timeout: Duration::from_secs(5),
-        },
-        &mut cancel,
-    )
-    .await;
+    let (_fixture, mut spec) = git_spec(&[]);
+    spec.program = PathBuf::from("/definitely/not/here/pam-flow-helper");
+    let outcome = run_command(spec, &mut cancel).await;
     assert!(
-        matches!(outcome, CommandOutcome::SpawnFailed(_)),
-        "expected a spawn failure, got {outcome:?}"
+        matches!(outcome, CommandOutcome::ContainmentUnavailable { .. }),
+        "expected containment validation failure, got {outcome:?}"
     );
 }
 
@@ -358,4 +407,36 @@ async fn sleep_or_cancel_returns_early_when_the_request_is_cancelled() {
 
     let (_alive, mut cancel) = live_cancel();
     assert!(!sleep_or_cancel(Duration::from_millis(1), &mut cancel).await);
+}
+
+#[tokio::test]
+async fn command_attempt_budget_blocks_a_retry_before_process_spawn() {
+    let budget = crate::request_budget::RequestBudget::with_limits(
+        std::time::Instant::now() + Duration::from_secs(30),
+        crate::request_budget::Limits {
+            attempts: 1,
+            ..Default::default()
+        },
+    );
+    let (_sender, mut cancel) = live_cancel();
+    let (_fixture, spec) = git_spec(&["--version"]);
+    let first = crate::flow_exec::run_command_budgeted(spec, &mut cancel, &budget)
+        .await
+        .unwrap();
+    if !assert_unsupported(&first) {
+        assert!(matches!(first, CommandOutcome::Exited { status: 0, .. }));
+    }
+    let (_second_fixture, mut second) = git_spec(&["--version"]);
+    second.program = PathBuf::from("/nonexistent-budget-probe");
+    let error = crate::flow_exec::run_command_budgeted(second, &mut cancel, &budget)
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause, "request_budget_exhausted");
+    assert_eq!(error.resource, "attempts");
+    if cfg!(target_os = "macos") {
+        assert!(budget.usage().command_bytes > 0);
+    } else {
+        assert_eq!(budget.usage().command_bytes, 0);
+    }
+    assert!(budget.usage().command_bytes < 1024);
 }

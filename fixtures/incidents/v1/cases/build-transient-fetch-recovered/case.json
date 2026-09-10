@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "case_id": "build-transient-fetch-recovered",
+  "family_id": "v1-build-transient-fetch-recovered",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "success",
+    "basis": "Jenkins build 419 result SUCCESS follows a recorded transient repository response and successful retry."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "stage=dependencies retry=1: repository returned HTTP 502, no object downloaded",
+      "stage=dependencies retry=2: identical URL returned HTTP 200; expected digest matched",
+      "Final build result: SUCCESS",
+      "stage=compile node=145 status=SUCCESS exit=0",
+      "stage=package node=146 status=SUCCESS artifact digest recorded"
+    ],
+    "unresolved_questions": [
+      "What caused the initial HTTP 502, and does any controlled repeated evidence establish recurring nondeterminism?"
+    ],
+    "forbidden_conclusions": [
+      "The recovered dependency error means the final build failed.",
+      "One recovered HTTP error proves that the build or tests are flaky."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Changed flake to unresolved: one failed fetch followed by one success does not establish a reproducible flake family; authoritative build success is preserved. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

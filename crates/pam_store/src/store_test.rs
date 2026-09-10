@@ -46,7 +46,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 5);
+    assert_eq!(store.schema_version().await.unwrap(), 11);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
@@ -179,6 +179,157 @@ async fn list_queued_ordered_returns_oldest_first_queued_only() {
     let queued = store.list_queued_ordered().await.unwrap();
     let ids: Vec<&str> = queued.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["req_a", "req_c"]);
+}
+
+#[tokio::test]
+async fn queued_recovery_pages_preserve_timestamp_then_id_order() {
+    let store = Store::open_in_memory().await.unwrap();
+    let mut expected = Vec::new();
+    for number in (0_i64..37).rev() {
+        let id = format!("page_{number:02}");
+        insert_demo_request(&store, &id).await;
+        let created = 100 + number / 7;
+        store
+            .conn
+            .execute(
+                "UPDATE request SET created_ts = ?2 WHERE id = ?1",
+                params![id.as_str(), created],
+            )
+            .await
+            .unwrap();
+        expected.push((created, id));
+    }
+    expected.sort();
+    let mut cursor: Option<(i64, String)> = None;
+    let mut actual = Vec::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let page = store
+            .queued_recovery_page(
+                cursor.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                8 * 1024 * 1024,
+            )
+            .await
+            .unwrap()
+            .expect("bounded legacy rows");
+        let Some(last) = page.last() else { break };
+        cursor = Some((last.created_ts, last.id.clone()));
+        page_sizes.push(page.len());
+        actual.extend(page.into_iter().map(|row| (row.created_ts, row.id)));
+    }
+    assert_eq!(page_sizes, [16, 16, 5]);
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn queued_recovery_pages_bound_aggregate_materialized_bytes() {
+    let store = Store::open_in_memory().await.unwrap();
+    for id in ["a", "b", "c"] {
+        store
+            .insert_request(id, "echo", "repo", "agent", &"x".repeat(100), None)
+            .await
+            .unwrap();
+    }
+    // One row is below 200 bytes but two are above it, so the row-count cap
+    // alone would not establish this bound.
+    let first = store
+        .queued_recovery_page(None, 200)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, "a");
+    let second = store
+        .queued_recovery_page(Some((first[0].created_ts, &first[0].id)), 200)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, "b");
+}
+
+#[tokio::test]
+async fn stuck_recovery_filters_states_and_rejects_oversized_payloads() {
+    for state in [RequestState::Running, RequestState::WaitingApproval] {
+        let store = Store::open_in_memory().await.unwrap();
+        insert_demo_request(&store, "queued").await;
+        insert_demo_request(&store, "stuck").await;
+        store
+            .update_request_state("stuck", state, None)
+            .await
+            .unwrap();
+        let page = store.stuck_recovery_page(None, 300).await.unwrap().unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "stuck");
+        store
+            .conn
+            .execute(
+                "UPDATE request SET args_json = ?1 WHERE id = 'stuck'",
+                params![format!("\0{}", "é".repeat(200))],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .stuck_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .queued_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_recovery_rejects_each_oversized_text_field_before_materialization() {
+    // Include fields a payload-only check misses. Multibyte text proves that
+    // the SQL guard measures bytes; NUL verifies it does not stop at a prefix.
+    for column in [
+        "id",
+        "capability",
+        "repo",
+        "caller_agent",
+        "args_json",
+        "idempotency_key",
+        "outcome",
+    ] {
+        let store = Store::open_in_memory().await.unwrap();
+        insert_demo_request(&store, "legacy").await;
+        let oversized = format!("\0{}", "é".repeat(200));
+        store
+            .conn
+            .execute(
+                &format!("UPDATE request SET {column} = ?1 WHERE id = 'legacy'"),
+                params![oversized],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .queued_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .is_none(),
+            "{column}"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM request WHERE state = 'queued'"
+            )
+            .await,
+            1,
+            "guard must not erase {column}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1564,4 +1715,224 @@ async fn connector_identity_changes_invalidate_all_test_fields() {
     assert_eq!(row.last_test_status.as_deref(), Some("passed"));
     assert_eq!(row.last_test_detail.as_deref(), Some("passed"));
     assert!(row.last_test_ts.is_some());
+}
+
+#[tokio::test]
+async fn running_request_insertion_is_atomic_and_rejects_duplicate_ids() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_running_request(
+            "req_admin",
+            "admin.connectors.configure",
+            "gui",
+            "pam-gui",
+            "{}",
+            Some("admin-key"),
+        )
+        .await
+        .unwrap();
+    let row = store.get_request("req_admin").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Running);
+    assert_eq!(row.capability, "admin.connectors.configure");
+    assert_eq!(row.repo, "gui");
+    assert_eq!(row.caller_agent, "pam-gui");
+    assert_eq!(row.args_json, "{}");
+    assert_eq!(row.idempotency_key.as_deref(), Some("admin-key"));
+    assert_eq!(row.outcome, None);
+    assert_eq!(row.created_ts, row.updated_ts);
+    assert!(store.list_queued_ordered().await.unwrap().is_empty());
+
+    let duplicate = store
+        .insert_running_request(
+            "req_admin",
+            "replacement",
+            "other",
+            "other",
+            "{\"changed\":true}",
+            None,
+        )
+        .await;
+    assert!(matches!(duplicate, Err(StoreError::Database(_))));
+    let unchanged = store.get_request("req_admin").await.unwrap().unwrap();
+    assert_eq!(unchanged.state, RequestState::Running);
+    assert_eq!(unchanged.capability, row.capability);
+    assert_eq!(unchanged.args_json, row.args_json);
+    assert_eq!(unchanged.idempotency_key, row.idempotency_key);
+}
+
+#[tokio::test]
+async fn admitted_request_authorization_checks_state_scope_and_expiry() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_admitted_request("admitted", "echo", "repo", "agent", "{}", Some("key"), 5000)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "other", 1000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "repo", 5000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .authorize_queued_request("admitted", "repo", 4999)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_queued_request("admitted", "repo", 4999)
+            .await
+            .unwrap()
+    );
+    let row = store.get_request("admitted").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert_eq!(row.expires_at_ms, Some(5000));
+    assert_eq!(row.authorization_revision, Some(0));
+    assert!(row.queue_authorized);
+    assert!(
+        store
+            .find_admitted_by_shape("echo", "repo", "{}", Some("key"), 4999)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .find_admitted_by_shape("echo", "repo", "{}", Some("key"), 5000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.admission_usage().await.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn revocation_between_admission_and_placement_invalidates_prior_gate_decision() {
+    let store = Store::open_in_memory().await.unwrap();
+    store.insert_grant("flow.run").await.unwrap();
+    for (id, state) in [
+        ("gating", RequestState::Running),
+        ("approval", RequestState::WaitingApproval),
+    ] {
+        store
+            .insert_admitted_request(id, "flow.run", "repo", "agent", "{}", None, 5000)
+            .await
+            .unwrap();
+        store.update_request_state(id, state, None).await.unwrap();
+        assert_eq!(
+            store
+                .get_request(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authorization_revision,
+            Some(0)
+        );
+    }
+    // The gate may have allowed both requests before this revocation.
+    store.revoke_grant("flow.run").await.unwrap();
+    // Re-granting cannot silently revive their earlier authorization.
+    store.insert_grant("flow.run").await.unwrap();
+    for id in ["gating", "approval"] {
+        assert!(
+            !store
+                .authorize_queued_request(id, "repo", 1000)
+                .await
+                .unwrap()
+        );
+        assert!(!store.start_queued_request(id, 1000).await.unwrap());
+        let row = store.get_request(id).await.unwrap().unwrap();
+        assert!(!row.queue_authorized);
+        assert_eq!(row.authorization_revision, Some(0));
+    }
+    assert!(store.list_queued_ordered().await.unwrap().is_empty());
+    store
+        .insert_admitted_request("fresh", "flow.run", "repo", "agent", "{}", None, 5000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_request("fresh")
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_revision,
+        Some(1)
+    );
+    assert!(
+        store
+            .authorize_queued_request("fresh", "repo", 1000)
+            .await
+            .unwrap()
+    );
+    assert!(store.start_queued_request("fresh", 1000).await.unwrap());
+}
+
+#[tokio::test]
+async fn stale_lane_cannot_restart_a_terminal_or_expired_request() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_admitted_request("done", "echo", "repo", "agent", "{}", None, 5000)
+        .await
+        .unwrap();
+    store
+        .authorize_queued_request("done", "repo", 1000)
+        .await
+        .unwrap();
+    assert!(!store.start_queued_request("done", 5000).await.unwrap());
+    store
+        .finish_request(
+            "done",
+            RequestState::Failed,
+            Some("cancelled"),
+            entry("cancel"),
+        )
+        .await
+        .unwrap();
+    assert!(!store.start_queued_request("done", 1000).await.unwrap());
+    assert_eq!(
+        store.get_request("done").await.unwrap().unwrap().state,
+        RequestState::Failed
+    );
+}
+
+#[tokio::test]
+async fn bounded_setting_cas_preserves_concurrent_changes() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert!(
+        store
+            .get_setting_bounded("map", 32)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (a, b) = tokio::join!(
+        store.compare_exchange_setting("map", None, "a"),
+        store.compare_exchange_setting("map", None, "b")
+    );
+    assert_ne!(a.unwrap(), b.unwrap());
+    assert!(
+        !store
+            .compare_exchange_setting("map", Some("stale"), "other")
+            .await
+            .unwrap()
+    );
+    store
+        .set_setting("large", &"x".repeat(32769))
+        .await
+        .unwrap();
+    assert!(store.get_setting_bounded("large", 32768).await.is_err());
+    assert!(
+        store
+            .compare_exchange_setting("large", None, "replacement")
+            .await
+            .is_err()
+    );
 }

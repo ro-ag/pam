@@ -54,6 +54,8 @@ struct NormalFlow<'a> {
     description: &'a str,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     inputs: BTreeMap<&'a str, NormalInput<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation: Option<&'a crate::correlation::Correlation>,
     steps: Vec<NormalStep<'a>>,
 }
 
@@ -77,6 +79,7 @@ impl<'a> From<&'a Flow> for NormalFlow<'a> {
                     )
                 })
                 .collect(),
+            correlation: flow.correlation.as_ref(),
             steps: flow.steps.iter().map(NormalStep::from).collect(),
         }
     }
@@ -95,6 +98,8 @@ struct NormalStep<'a> {
     id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     run: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landing: Option<crate::LandingOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     connector: Option<ConnectorId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +125,8 @@ struct NormalStep<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry: Option<NormalRetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    watch: Option<crate::schema::Watch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<Approval>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     env: &'a BTreeMap<String, String>,
@@ -129,8 +136,9 @@ struct NormalStep<'a> {
 
 impl<'a> From<&'a Step> for NormalStep<'a> {
     fn from(step: &'a Step) -> Self {
-        let (run, connector, call, with) = match &step.action {
-            Action::Command { argv } => (Some(argv.as_slice()), None, None, None),
+        let (run, connector, call, with, landing) = match &step.action {
+            Action::Command { argv } => (Some(argv.as_slice()), None, None, None, None),
+            Action::Landing { operation } => (None, None, None, None, Some(*operation)),
             Action::Connector {
                 connector,
                 call,
@@ -140,11 +148,13 @@ impl<'a> From<&'a Step> for NormalStep<'a> {
                 Some(*connector),
                 Some(call.as_str()),
                 (!with.is_empty()).then_some(with),
+                None,
             ),
         };
         Self {
             id: &step.id,
             run,
+            landing,
             connector,
             call,
             with,
@@ -160,6 +170,7 @@ impl<'a> From<&'a Step> for NormalStep<'a> {
                 attempts: step.retry.attempts,
                 backoff: format_duration(step.retry.backoff),
             }),
+            watch: step.watch,
             approval: (step.approval != Approval::default()).then_some(step.approval),
             env: &step.env,
             note: &step.note,

@@ -1,0 +1,22 @@
+schema: 1
+id: sharepoint-document-context
+name: SharePoint document context
+description: >-
+  Retrieve one explicit SharePoint document as bounded context. Supply its site, drive and item IDs; this observation does not verify a build or revision.
+inputs:
+  site:
+    description: explicit sharepoint site identifier
+  drive:
+    description: explicit sharepoint drive identifier
+  item:
+    description: explicit sharepoint item identifier
+steps:
+  - id: retrieve-context
+    connector: sharepoint
+    call: document
+    with:
+      site: "${inputs.site}"
+      drive: "${inputs.drive}"
+      item: "${inputs.item}"
+    role: observe
+    output: compact

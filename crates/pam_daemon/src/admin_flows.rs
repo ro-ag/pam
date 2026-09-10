@@ -40,6 +40,7 @@ use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
     CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal, RECOVERY_FLOW_EDIT, SettingsPatch,
 };
+use crate::scope_policy::{CAUSE_SCOPE_INVALID, RECOVERY_SCOPE, ScopePolicy};
 use crate::transport::IncomingRequest;
 
 /// `admin.flows.list` → every flow, builtins and library merged.
@@ -73,6 +74,11 @@ pub const OP_FLOWS_SETTINGS_GET: &str = "admin.flows.settings.get";
 /// settings as they now stand.
 pub const OP_FLOWS_SETTINGS_SET: &str = "admin.flows.settings.set";
 
+/// GUI-only landing recipe and mutation-scope inspection.
+pub const OP_LANDING_GET: &str = "admin.flows.landing.get";
+/// GUI-only compare-and-swap update of landing authority.
+pub const OP_LANDING_SET: &str = "admin.flows.landing.set";
+
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const FLOW_ADMIN_OPS: &[&str] = &[
@@ -84,6 +90,8 @@ pub const FLOW_ADMIN_OPS: &[&str] = &[
     OP_FLOWS_RUN,
     OP_FLOWS_SETTINGS_GET,
     OP_FLOWS_SETTINGS_SET,
+    OP_LANDING_GET,
+    OP_LANDING_SET,
 ];
 
 /// The deadline an `admin.flows.run` envelope carries: half an hour,
@@ -118,6 +126,10 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, OwnedRefusal>> {
         Some(match op {
+            OP_LANDING_GET | OP_LANDING_SET => self
+                .landing_settings(op, args)
+                .await
+                .map_err(OwnedRefusal::from),
             OP_FLOWS_LIST => self.flows_list().map_err(OwnedRefusal::from),
             OP_FLOWS_GET => self.flows_get(args).map_err(OwnedRefusal::from),
             OP_FLOWS_SAVE => self.flows_save(args).map_err(OwnedRefusal::from),
@@ -130,6 +142,26 @@ impl AdminService {
                 .await
                 .map_err(OwnedRefusal::from),
             _ => return None,
+        })
+    }
+
+    async fn landing_settings(&self, op: &str, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let snapshot = if op == OP_LANDING_SET {
+            crate::landing_policy::Snapshot::save(&self.store, args, self.flows.protected_base()).await
+        } else {
+            crate::landing_policy::Snapshot::load(&self.store).await
+        }.map_err(|error| AdminRefusal {
+            cause: error.cause, detail: error.to_string(),
+            recovery: "Open PAM Settings → Flows → Landing; reload and correct the approved recipe and targets.",
+        })?;
+        Ok(AdminOk {
+            outcome: if op == OP_LANDING_SET {
+                Outcome::Changed
+            } else {
+                Outcome::Verified
+            },
+            body: snapshot.response(),
+            audit: json!({"op":op,"revision":snapshot.revision}),
         })
     }
 
@@ -334,11 +366,17 @@ impl AdminService {
     /// The flow settings, as the Settings › Flows panel edits them.
     async fn flows_settings_get(&self) -> Result<AdminOk, AdminRefusal> {
         let settings = self.flows.settings().await?;
+        let scope_policy = self
+            .flows
+            .scope_policy()
+            .await
+            .map_err(|error| refuse(&error))?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body: json!({
                 "allowed_programs": settings.allowed_programs,
                 "extra_path": settings.extra_path,
+                "scope_policy": scope_policy,
             }),
             audit: json!({ "op": OP_FLOWS_SETTINGS_GET }),
         })
@@ -346,6 +384,23 @@ impl AdminService {
 
     /// Replaces the named settings, refusing a shell in the allowlist.
     async fn flows_settings_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let scope_policy = args
+            .get("scope_policy")
+            .map(|value| {
+                serde_json::from_value::<ScopePolicy>(value.clone())
+                    .map_err(|_| AdminRefusal {
+                        cause: CAUSE_SCOPE_INVALID,
+                        detail: "scope_policy must be a versioned policy object".to_owned(),
+                        recovery: RECOVERY_SCOPE,
+                    })?
+                    .normalize()
+                    .map_err(|error| AdminRefusal {
+                        cause: error.cause(),
+                        detail: error.to_string(),
+                        recovery: RECOVERY_SCOPE,
+                    })
+            })
+            .transpose()?;
         let patch = SettingsPatch {
             allowed_programs: string_list(args, "allowed_programs", OP_FLOWS_SETTINGS_SET)?,
             extra_path: string_list(args, "extra_path", OP_FLOWS_SETTINGS_SET)?,
@@ -355,16 +410,23 @@ impl AdminService {
             .set_settings(patch)
             .await
             .map_err(|refusal| refuse(&refusal))?;
+        let scope_policy = match scope_policy {
+            Some(policy) => self.flows.set_scope_policy(policy).await,
+            None => self.flows.scope_policy().await,
+        }
+        .map_err(|error| refuse(&error))?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
             body: json!({
                 "allowed_programs": settings.allowed_programs,
                 "extra_path": settings.extra_path,
+                "scope_policy": scope_policy,
             }),
             audit: json!({
                 "op": OP_FLOWS_SETTINGS_SET,
                 "allowed_programs": settings.allowed_programs.len(),
                 "extra_path": settings.extra_path.len(),
+                "approved_repositories": scope_policy.repositories.len(),
             }),
         })
     }

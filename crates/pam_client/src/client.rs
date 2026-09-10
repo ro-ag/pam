@@ -9,14 +9,14 @@
 //! # Probe
 //!
 //! "A daemon is running" is read from the same facts the daemon
-//! maintains: the `daemon.lock` file is **held** (the probe tries the
-//! advisory lock itself — winning it proves nobody else holds it, and
-//! the probe releases it immediately) and the `pam.sock` file exists.
+//! maintains: the `daemon.lock` file has an **exclusive holder** (a
+//! read-only shared-lock probe conflicts with the daemon's exclusive lock)
+//! and the `pam.sock` file exists. A successful probe unlocks explicitly.
 //! A stale socket with no lock holder therefore reads as *no daemon*,
 //! and the spawned daemon removes and rebinds it under the lock. The
-//! lock probe is authoritative in a way pinging the socket is not: it
-//! cannot be fooled by a leftover socket file, needs no timeout, and
-//! costs one syscall.
+//! probe uses a nonblocking OS lock operation and cannot be fooled by a
+//! leftover socket file. Client path resolution never creates or chmods
+//! the runtime directory; only daemon startup prepares that directory.
 //!
 //! # Request flow
 //!
@@ -41,7 +41,7 @@
 //! quietly; `pam subscribe` prints each event — one code path, the
 //! callback decides.
 
-use std::fs::{OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -134,7 +134,7 @@ pub(crate) fn ensure_daemon_with(
     wait: Duration,
     poll: Duration,
 ) -> Result<EnsureOutcome, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     if daemon_ready(&dirs)? {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -165,23 +165,31 @@ fn daemon_ready(dirs: &RuntimeDir) -> Result<bool, ClientError> {
     lock_is_held(&dirs.run_dir().join(LOCK_FILE))
 }
 
-/// Probes the advisory lock on `path`: `true` when someone else holds
-/// it. Winning the lock proves nobody does; it is released immediately
-/// (the handle drops at return).
+/// Probe the daemon's exclusive instance lock through a read-only handle.
+/// A shared probe conflicts with that exclusive lock on both Unix and Windows,
+/// but concurrent probes do not mistake each other for a running daemon.
+/// Missing files mean no holder; access/locking errors never imply readiness.
 fn lock_is_held(path: &Path) -> Result<bool, ClientError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        // Never truncate: a live daemon's pid lives in this file.
-        .truncate(false)
-        .open(path)
-        .map_err(|source| ClientError::Probe {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    match file.try_lock() {
-        Ok(()) => Ok(false),
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ClientError::Probe {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            // Explicitly release before promising no holder: a concurrent fork
+            // can retain a duplicate handle after this local File drops.
+            file.unlock().map_err(|source| ClientError::Probe {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(false)
+        }
         Err(TryLockError::WouldBlock) => Ok(true),
         Err(TryLockError::Error(source)) => Err(ClientError::Probe {
             path: path.to_path_buf(),
@@ -264,6 +272,18 @@ pub enum RequestError {
         /// How long the client waited.
         waited: Duration,
     },
+    /// Scoped ticket lookup refused access; following stops without retrying.
+    #[error("cannot follow request {ticket}: {cause}: {detail}; {recovery}")]
+    FollowRefused {
+        /// The original ticket, retained for later authorized recovery.
+        ticket: String,
+        /// Stable daemon refusal cause.
+        cause: String,
+        /// Safe refusal explanation.
+        detail: String,
+        /// Authorized next step.
+        recovery: String,
+    },
     /// [`send_request`] was handed a GUI-only `admin.*` capability —
     /// the structural guard keeping every CLI code path out of the
     /// admin surface (see [`send_admin`]).
@@ -281,6 +301,14 @@ pub enum RequestError {
     NotAdmin {
         /// The refused capability.
         capability: String,
+    },
+    /// The private administration channel failed. The request is never replayed:
+    /// a lost reply does not establish whether its effects were applied.
+    #[error("private administration channel failed: {source}; operation was not retried")]
+    AdminTransport {
+        /// Native transport, peer-verification, or unsupported-platform error.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -330,10 +358,13 @@ pub async fn send_request(
 /// through — grants, approvals, profile, activity. It is deliberately
 /// separate from [`send_request`], which refuses `admin.*` outright so
 /// the CLI subcommand surface can never reach administration. The
-/// separation is structural for CLI users and advisory at the socket:
-/// the envelope carries the `pam-gui` caller tripwire the daemon
-/// requires, but filesystem permissions on the runtime dir remain the
-/// actual security wall (see `pam_daemon::admin` for the full model).
+/// native administration channel authenticates peers independently of the
+/// envelope's caller fields. It never falls back to the public socket.
+/// Administration is unavailable where that native channel is unsupported.
+///
+/// The exchange runs once. A transport error or version refusal is returned
+/// without replaying the operation, because a missing reply can follow an
+/// applied change. Inspect the resulting state before manually trying again.
 ///
 /// A capability outside `admin.*` errors with
 /// [`RequestError::NotAdmin`]. Admin ops always wait (they are
@@ -364,17 +395,20 @@ pub async fn send_admin(
         deadline_ms,
         wait: true,
     };
-    send_envelope(base_dir, &envelope).await
+    ensure_daemon(base_dir)?;
+    pam_daemon::admin_transport::exchange(base_dir, &envelope)
+        .await
+        .map_err(|source| RequestError::AdminTransport { source })
 }
 
-/// The shared exchange loop behind [`send_request`] and [`send_admin`]:
+/// The public exchange loop behind [`send_request`]:
 /// ensure the daemon, exchange over `pam.sock`, retry exactly once
 /// after a `daemon_outdated` refusal.
 async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response, RequestError> {
     let mut retried = false;
     loop {
         ensure_daemon(base_dir)?;
-        let dirs = RuntimeDir::at_base(base_dir)?;
+        let dirs = RuntimeDir::paths_at_base(base_dir)?;
         let response = exchange(&dirs, envelope).await?;
         if should_retry(&response) && !retried {
             retried = true;
@@ -453,8 +487,8 @@ const RECONCILE_MAX: Duration = Duration::from_secs(30);
 ///
 /// The store is the authority on request state, so the follow never
 /// trusts the event stream with the *termination* decision alone:
-/// subscribe first, then reconcile by asking the daemon (read-only
-/// `query` capability) whether the ticket is already terminal —
+/// authorize through the scoped `query` capability before subscribing, then
+/// reconcile whether the ticket is already terminal —
 /// immediately after subscribing (catches a follower that joined after
 /// the finish), and again on a backing-off interval while events are
 /// quiet (catches a terminal event lost to the subscription race). A
@@ -471,7 +505,20 @@ pub async fn follow_ticket(
     mut on_event: impl FnMut(&Event),
 ) -> Result<Event, RequestError> {
     ensure_daemon(base_dir)?;
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let deadline = Instant::now() + timeout;
+    let timed_out = || RequestError::FollowTimeout {
+        ticket: ticket.to_owned(),
+        waited: timeout,
+    };
+    // Authorize before subscribing: unavailable tickets never consume PUB data.
+    if let Some(event) = tokio::time::timeout(timeout, query_terminal(base_dir, ticket))
+        .await
+        .map_err(|_| timed_out())??
+    {
+        on_event(&event);
+        return Ok(event);
+    }
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let endpoint = dirs.events_endpoint();
     let mut sub = SubSocket::new();
     sub.connect(&endpoint)
@@ -481,11 +528,6 @@ pub async fn follow_ticket(
         .await
         .map_err(|source| RequestError::Transport { source })?;
 
-    let deadline = Instant::now() + timeout;
-    let timed_out = || RequestError::FollowTimeout {
-        ticket: ticket.to_owned(),
-        waited: timeout,
-    };
     let mut reconcile_pause = RECONCILE_MIN;
     let mut next_reconcile = Instant::now();
     loop {
@@ -520,9 +562,12 @@ pub async fn follow_ticket(
         };
         let event: Event =
             serde_json::from_slice(payload).map_err(|source| RequestError::Parse { source })?;
-        on_event(&event);
         if matches!(event, Event::Done | Event::Refused) {
-            return Ok(event);
+            // PUB is only a hint; recheck current scope and durable state before
+            // exposing a terminal event or deciding the follow has finished.
+            next_reconcile = Instant::now();
+        } else {
+            on_event(&event);
         }
     }
 }
@@ -532,22 +577,43 @@ pub async fn follow_ticket(
 /// stored state. `Some(event)` maps a terminal state to the terminal
 /// event a subscriber would have seen (`done` → [`Event::Done`],
 /// `refused`/`failed` → [`Event::Refused`], matching what the daemon
-/// publishes); `None` means not terminal yet — or not answerable (a
-/// refusal, e.g. an unknown ticket), in which case the follow keeps
-/// waiting on events and times out as before rather than guessing.
+/// publishes). Only an explicitly pending state returns `None`; refusals and
+/// malformed responses fail closed instead of repeatedly querying or watching.
 async fn query_terminal(base_dir: &Path, ticket: &str) -> Result<Option<Event>, RequestError> {
     let args = serde_json::json!({ "ticket": ticket });
     let response = send_request(base_dir, "query", args, true, QUERY_DEADLINE_MS, None).await?;
-    let Response::Result { body, .. } = response else {
-        return Ok(None);
-    };
-    Ok(
-        match body.get("state").and_then(serde_json::Value::as_str) {
-            Some("done") => Some(Event::Done),
-            Some("refused" | "failed") => Some(Event::Refused),
-            _ => None,
-        },
-    )
+    match response {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => Err(RequestError::FollowRefused {
+            ticket: ticket.to_owned(),
+            cause,
+            detail,
+            recovery,
+        }),
+        Response::Result { body, .. } => {
+            match body.get("state").and_then(serde_json::Value::as_str) {
+                Some("done") => Ok(Some(Event::Done)),
+                Some("refused" | "failed") => Ok(Some(Event::Refused)),
+                Some("queued" | "running" | "waiting_approval") => Ok(None),
+                _ => Err(unavailable_follow(ticket)),
+            }
+        }
+        Response::Ticket { .. } => Err(unavailable_follow(ticket)),
+    }
+}
+
+fn unavailable_follow(ticket: &str) -> RequestError {
+    RequestError::FollowRefused {
+        ticket: ticket.to_owned(),
+        cause: "request_unavailable".to_owned(),
+        detail: "The daemon did not return an authorized request state.".to_owned(),
+        recovery: "Check the original ticket and current repository access in the PAM GUI."
+            .to_owned(),
+    }
 }
 
 /// What the daemon-lock probe found, for `pam daemon stop`.
@@ -565,7 +631,7 @@ pub enum DaemonStatus {
 /// Probes whether a daemon holds the instance lock under `base_dir`,
 /// reporting its pid (from the lock file) when it does.
 pub fn probe_daemon(base_dir: &Path) -> Result<DaemonStatus, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let path = dirs.run_dir().join(LOCK_FILE);
     if !lock_is_held(&path)? {
         return Ok(DaemonStatus::NotRunning);
@@ -670,7 +736,7 @@ fn signal_terminate(_pid: u32) -> Result<(), StopError> {
 /// Waits (bounded) for the daemon lock under `base_dir` to be released:
 /// `true` when it was released within `timeout`.
 pub fn wait_for_daemon_exit(base_dir: &Path, timeout: Duration) -> Result<bool, ClientError> {
-    let dirs = RuntimeDir::at_base(base_dir)?;
+    let dirs = RuntimeDir::paths_at_base(base_dir)?;
     let path = dirs.run_dir().join(LOCK_FILE);
     let deadline = Instant::now() + timeout;
     loop {

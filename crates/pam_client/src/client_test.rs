@@ -220,3 +220,142 @@ async fn send_admin_rejects_non_admin_operations() {
         crate::client::RequestError::NotAdmin { ref capability } if capability == "echo"
     ));
 }
+
+#[tokio::test]
+async fn send_admin_requires_the_private_channel_even_when_public_daemon_is_ready() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _daemon = start_fake_daemon(tmp.path());
+    let error = crate::client::send_admin(
+        tmp.path(),
+        "admin.grants.add",
+        serde_json::json!({"capability": "deploy"}),
+        100,
+    )
+    .await
+    .expect_err("public readiness does not authorize administration");
+    assert!(matches!(
+        error,
+        crate::client::RequestError::AdminTransport { .. }
+    ));
+}
+
+#[tokio::test]
+async fn refused_follow_queries_once_and_never_subscribes_to_events() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = RuntimeDir::at_base(tmp.path()).unwrap();
+    let _lock = acquire_instance_lock(dirs.run_dir()).unwrap();
+    let mut router = RouterSocket::new();
+    router.bind(&dirs.router_endpoint()).await.unwrap();
+    // Deliberately no events endpoint: an unauthorized follow must not connect.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        loop {
+            let frames = router.recv().await.unwrap().into_vec();
+            observed.fetch_add(1, Ordering::SeqCst);
+            let request: serde_json::Value =
+                serde_json::from_slice(frames.last().unwrap()).unwrap();
+            assert_eq!(request["capability"], "query");
+            let reply = Response::Refusal {
+                id: request["id"].as_str().unwrap().to_owned(),
+                cause: "request_unavailable".to_owned(),
+                detail: "Ticket is unavailable in this repository.".to_owned(),
+                recovery: "Check repository access in the PAM GUI.".to_owned(),
+            };
+            let payload = serde_json::to_vec(&reply).unwrap();
+            let mut message = ZmqMessage::from(payload);
+            message.push_front(frames[0].clone());
+            router.send(message).await.unwrap();
+        }
+    });
+    let mut events = Vec::new();
+    let result = crate::client::follow_ticket(
+        tmp.path(),
+        "original-ticket",
+        Duration::from_secs(5),
+        |event| events.push(event.clone()),
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(crate::client::RequestError::FollowRefused { ticket, cause, .. }) if ticket == "original-ticket" && cause == "request_unavailable"),
+        "{result:?}"
+    );
+    assert!(events.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "denial is never retried");
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
+fn probe_and_exit_wait_leave_absent_runtime_directory_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(probe_daemon(tmp.path()).unwrap(), DaemonStatus::NotRunning);
+    assert!(wait_for_daemon_exit(tmp.path(), WAIT).unwrap());
+    assert!(!tmp.path().join("run").exists());
+}
+
+#[test]
+fn daemon_autostart_is_responsible_for_creating_runtime_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut daemon = None;
+    let result = ensure_daemon_with(
+        tmp.path(),
+        &mut || {
+            assert!(!tmp.path().join("run").exists());
+            daemon = Some(start_fake_daemon(tmp.path()));
+            Ok(())
+        },
+        WAIT,
+        POLL,
+    )
+    .unwrap();
+    assert_eq!(result, EnsureOutcome::Started);
+    assert!(daemon.is_some());
+}
+
+#[test]
+fn another_shared_probe_is_not_mistaken_for_the_exclusive_daemon_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = RuntimeDir::at_base(tmp.path()).unwrap();
+    let path = dirs.run_dir().join(pam_daemon::lifecycle::LOCK_FILE);
+    std::fs::write(&path, "stale").unwrap();
+    let reader = File::open(&path).unwrap();
+    reader.try_lock_shared().unwrap();
+    assert_eq!(probe_daemon(tmp.path()).unwrap(), DaemonStatus::NotRunning);
+    reader.unlock().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale");
+    // The probe released its lock before returning, so a daemon can acquire it.
+    let _daemon = acquire_instance_lock(dirs.run_dir()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn connecting_to_running_daemon_preserves_read_only_runtime_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let _daemon = start_fake_daemon(tmp.path());
+    let dirs = RuntimeDir::paths_at_base(tmp.path()).unwrap();
+    let lock = dirs.run_dir().join(pam_daemon::lifecycle::LOCK_FILE);
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(dirs.run_dir(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut spawn = || panic!("running daemon must not spawn another process");
+    let ready = ensure_daemon_with(tmp.path(), &mut spawn, WAIT, POLL);
+    let status = probe_daemon(tmp.path());
+    let run_mode = std::fs::metadata(dirs.run_dir())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let lock_mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(dirs.run_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(ready.unwrap(), EnsureOutcome::AlreadyRunning);
+    assert!(matches!(status.unwrap(), DaemonStatus::Running { .. }));
+    assert_eq!(run_mode, 0o500);
+    assert_eq!(lock_mode, 0o400);
+}

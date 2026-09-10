@@ -180,7 +180,7 @@ Load: `gguf_file::Content::read`, dispatch on `general.architecture`
 (`qwen3` → `quantized_qwen3::ModelWeights`, `qwen3moe` →
 `quantized_qwen3_moe::GGUFQWenMoE`), device = Metal on macOS else CPU,
 tokenizer from metadata. Load progress is reported as phases
-(`reading_header`, `mapping_tensors`, `ready`) — candle does not expose
+(`reading_header`, `reading_tensors`, `ready`) — candle does not expose
 per-tensor progress. Failures are `load_failed` with candle's message.
 
 Generate: `GenerateRequest { system?, prompt, max_tokens, temperature,
@@ -272,8 +272,10 @@ row plus a tracing line.
 
 ### Admin ops
 
-All under the existing `AdminService` dispatch, tripwire, deadline, and
-audit rules. Bodies are JSON; refusals carry `cause` + `recovery`.
+All under the existing `AdminService` dispatch, deadline, and audit rules.
+Private-transport authorization precedes the legacy caller-label consistency
+check; that label is not authorization. See the [administration boundary](../admin-boundary.md).
+Bodies are JSON; refusals carry `cause` + `recovery`.
 
 | op | args | body |
 | --- | --- | --- |
@@ -289,7 +291,7 @@ audit rules. Bodies are JSON; refusals carry `cause` + `recovery`.
 | `admin.models.status` | — | `{ runtime: RuntimeSnapshot, jobs: [running + last 20], defaults: { light, heavy }, idle_unload_min }` |
 | `admin.models.defaults.set` | `{ tier, model_id \| null }` | `{ tier, model_id }`; refuses `below_floor` for a `test_only` model, `unknown_model` |
 | `admin.models.settings.set` | `{ models_dir?, idle_unload_min? }` | echo; `models_dir` must exist and be a directory |
-| `admin.models.try` | `{ prompt, max_tokens? }` | `GenerateResult`; refuses `no_model_loaded`, `prompt_too_long`, `busy` |
+| `admin.models.try` | `{ model_id, prompt, max_tokens? }` | `GenerateResult`; refuses `no_model_loaded`, `prompt_too_long`, `busy` |
 | `admin.curator.list` | — | `{ detected: [AgentCli…], selected }` |
 | `admin.curator.set` | `{ agent \| null }` | `{ selected }`; refuses `not_detected` |
 | `admin.curator.test` | — | `{ reply, ms }`; refuses `no_curator`, `curator_failed` |
@@ -416,3 +418,6 @@ No release job — plan #9.
 - CUDA / Vulkan acceleration on Linux and Windows (C toolchains).
 - Curator use beyond detection + test (catalog curation flows).
 - "No model" composer banner (plan #7).
+
+Diagnostic identity and cancellation behavior is updated by
+[the implemented diagnostic contract](../model-diagnostics.md) (task #100).

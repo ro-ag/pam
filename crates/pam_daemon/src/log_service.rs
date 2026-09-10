@@ -31,21 +31,11 @@
 //! Only the bound check, the compaction itself, and the two evidence
 //! writes that carry the deterministic result can fail the call.
 //!
-//! # Why the prompt is fitted, not truncated
+//! # Bounded summaries
 //!
-//! A reduced log is still allowed to be megabytes. The summary runs on the
-//! heavy tier under an 8192-token context, so [`fit_prompt`] keeps the
-//! head and the tail — where a build log puts its invocation and its
-//! verdict — and says in the middle how many bytes it dropped. Cutting at
-//! line boundaries keeps the model from reading half a line as a whole
-//! one.
-//!
-//! # Who calls this
-//!
-//! Today: [`crate::admin_logs`], a GUI-only admin op, so a human can drive
-//! a log through the pipeline and inspect every row it left. Later: flow
-//! steps and connector diagnoses, which call the service directly. There
-//! is deliberately no `pam` subcommand and no agent capability.
+//! Optional Microsoft extraction selects source-mapped records after deterministic
+//! compaction. Oversized evidence is refused before generation, never head/tail
+//! truncated. Flow steps and the GUI log observatory both call this service.
 
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -63,17 +53,8 @@ pub const EVIDENCE_KIND_LOG_SOURCE: &str = "log.source";
 /// Evidence kind holding the model's plain-text summary of a compact log.
 pub const EVIDENCE_KIND_LOG_SUMMARY: &str = "log.summary";
 
-/// Largest prompt [`fit_prompt`] hands the model, in bytes.
-///
-/// Roughly 6k tokens: comfortably under the 8192-token context with the
-/// system turn framed in and [`SUMMARY_MAX_TOKENS`] left to answer with.
-pub const PROMPT_BUDGET_BYTES: usize = 24_000;
-
-/// Bytes of the reduced log kept from the front when it does not fit.
-pub const PROMPT_HEAD_BYTES: usize = 16_000;
-
-/// Bytes of the reduced log kept from the end when it does not fit.
-pub const PROMPT_TAIL_BYTES: usize = 8_000;
+/// Conservative byte ceiling before the exact 2,048-token summary preflight.
+pub const PROMPT_BUDGET_BYTES: usize = 6_000;
 
 /// Hard ceiling on the summary's length, in tokens.
 pub const SUMMARY_MAX_TOKENS: usize = 400;
@@ -82,11 +63,10 @@ pub const SUMMARY_MAX_TOKENS: usize = 400;
 pub const SUMMARY_TEMPERATURE: f64 = 0.0;
 
 /// The system turn framing every summary generation.
-pub const SUMMARY_SYSTEM: &str = "You are PAM's log summarizer. You receive a build or test log that was already reduced \
-     deterministically; bracketed markers say how many records were omitted and why. Answer in \
-     plain text, at most eight lines: the outcome first (pass, fail, or unknown), then the failing \
-     step and the exact error lines that explain it, quoted verbatim, then what a developer must \
-     fix. Never invent lines that are not in the log.";
+pub const SUMMARY_SYSTEM: &str = "You receive selected build evidence. Report observations in at most eight lines, \
+    quoting exact diagnostics. The supplied exit status is authoritative; error text alone is not a final failure. \
+    Errors may be retried, caught, or followed by cleanup. Selected evidence may omit decisive context. \
+    Say unknown when the failed stage or cause cannot be established. Do not invent fixes or override the reported status.";
 
 /// [`ModelSkipped::cause`] when no model is configured for the tier.
 pub const CAUSE_NO_DEFAULT: &str = "no_default";
@@ -100,8 +80,8 @@ pub const CAUSE_STORE_ERROR: &str = "store_error";
 /// The daemon's log compression service (see the module docs).
 #[derive(Debug)]
 pub struct LogService {
-    store: Arc<Store>,
-    models: Arc<ModelService>,
+    pub(crate) store: Arc<Store>,
+    pub(crate) models: Arc<ModelService>,
 }
 
 /// One log offered for compression.
@@ -197,6 +177,15 @@ pub struct CompressReport {
     pub model: Option<ModelUse>,
     /// Why none did, when none did.
     pub model_skipped: Option<ModelSkipped>,
+    /// Source-mapped Microsoft selection over the deterministic rendering.
+    pub semantic: Option<EvidenceRef>,
+    /// The selected rendering; exact source remains in compact/source evidence.
+    pub semantic_text: Option<String>,
+    /// Why optional semantic compression did not run or could not fit.
+    pub compression_skipped: Option<ModelSkipped>,
+    /// Optional source/compact views unavailable for bounded agent retrieval.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub view_skipped: Vec<ModelSkipped>,
 }
 
 /// Why a compression could not produce its deterministic result.
@@ -205,6 +194,14 @@ pub struct CompressReport {
 /// of these: these are the failures that leave the caller with nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
+    /// A bounded worker admission or completion failure.
+    #[error("{detail}")]
+    Blocking {
+        /// Stable worker refusal cause.
+        cause: &'static str,
+        /// Sanitized worker failure detail.
+        detail: String,
+    },
     /// The source is larger than [`MAX_SOURCE_BYTES`].
     #[error("log source is {actual_bytes} bytes; the maximum is {maximum_bytes}")]
     SourceTooLarge {
@@ -230,6 +227,7 @@ impl LogError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::Blocking { cause, .. } => cause,
             Self::SourceTooLarge { .. } => "source_too_large",
             Self::Compact(err) => err.cause(),
             Self::Store(_) => CAUSE_STORE_ERROR,
@@ -255,6 +253,15 @@ impl LogService {
         request_id: &str,
         input: CompressInput,
     ) -> Result<CompressReport, LogError> {
+        self.compress_scoped(request_id, input, None).await
+    }
+
+    pub(crate) async fn compress_scoped(
+        &self,
+        request_id: &str,
+        input: CompressInput,
+        capture: Option<&crate::evidence_service::CaptureScope>,
+    ) -> Result<CompressReport, LogError> {
         let CompressInput {
             name,
             bytes,
@@ -271,20 +278,6 @@ impl LogService {
             });
         }
 
-        // The reduction is pure CPU over up to 64 MiB; it does not belong
-        // on a runtime thread that is also serving the socket. The bytes
-        // travel with the closure and come back so the source row can be
-        // written from them without a second copy.
-        let (bytes, compacted) = tokio::task::spawn_blocking(move || {
-            let compacted = compact(&bytes, exit_status, &Policy::default());
-            (bytes, compacted)
-        })
-        .await
-        .map_err(|err| LogError::Join(err.to_string()))?;
-        let compacted = compacted?;
-
-        let stats = CompressStats::of(&compacted);
-
         let source_id = new_evidence_id();
         self.store
             .insert_evidence(
@@ -296,6 +289,93 @@ impl LogService {
             )
             .await?;
 
+        let source_bytes = as_u64(bytes.len());
+        // Pure CPU preparation stays on the bounded blocking worker.
+        let (safe, compacted, compact_view) =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
+                prepare_compaction(&bytes, exit_status)
+            })
+            .await
+            .map_err(|err| LogError::Blocking {
+                cause: err.cause(),
+                detail: err.to_string(),
+            })?
+            .map_err(LogError::Join)?;
+        let compact_text = String::from_utf8(compact_view.bytes.clone())
+            .map_err(|error| LogError::Join(error.to_string()))?;
+
+        let stats = CompressStats::of(&compacted);
+
+        let source_view_skip = self
+            .publish_optional_view(
+                request_id,
+                &source_id,
+                safe,
+                json!({"kind": "protected_source"}),
+                capture,
+            )
+            .await;
+
+        let (compact_ref, compact_view_skip) = self
+            .file_compact(
+                request_id,
+                &name,
+                &source_id,
+                &compacted,
+                compact_view,
+                capture,
+            )
+            .await?;
+        let compact_id = compact_ref.id.clone();
+
+        let mut report = CompressReport {
+            source: EvidenceRef {
+                id: source_id.clone(),
+                bytes: source_bytes,
+            },
+            compact: compact_ref,
+            summary: None,
+            compact_text,
+            summary_text: None,
+            stats,
+            model: None,
+            model_skipped: None,
+            semantic: None,
+            semantic_text: None,
+            compression_skipped: None,
+            view_skipped: source_view_skip
+                .into_iter()
+                .chain(compact_view_skip)
+                .collect(),
+        };
+
+        if use_model {
+            self.semantic_prompt(request_id, &name, &compact_id, &mut report, capture)
+                .await;
+            self.summarize(
+                request_id,
+                &name,
+                &source_id,
+                &compact_id,
+                &mut report,
+                capture,
+            )
+            .await;
+        }
+
+        trace_compression(request_id, &name, &report);
+        Ok(report)
+    }
+
+    async fn file_compact(
+        &self,
+        request_id: &str,
+        name: &str,
+        source_id: &str,
+        compacted: &Compacted,
+        compact_view: crate::evidence_view::RedactedView,
+        capture: Option<&crate::evidence_service::CaptureScope>,
+    ) -> Result<(EvidenceRef, Option<ModelSkipped>), LogError> {
         let compact_json = serde_json::to_vec(&compacted).map_err(|err| {
             LogError::Join(format!("the compaction report did not serialize: {err}"))
         })?;
@@ -306,46 +386,85 @@ impl LogService {
                 request_id,
                 EVIDENCE_KIND_LOG_COMPACT,
                 &compact_json,
-                Some(&compact_meta(&name, &compacted, stats, &source_id).to_string()),
+                Some(
+                    &compact_meta(name, compacted, CompressStats::of(compacted), source_id)
+                        .to_string(),
+                ),
             )
             .await?;
 
-        let mut report = CompressReport {
-            source: EvidenceRef {
-                id: source_id.clone(),
-                bytes: stats.source_bytes,
-            },
-            compact: EvidenceRef {
-                id: compact_id.clone(),
+        let view_skip = self
+            .publish_optional_view(
+                request_id,
+                &compact_id,
+                compact_view,
+                json!({"evidence_id": source_id, "source_sha256": compacted.source_sha256,
+                "offset_basis": "redacted_source_bytes", "relation": "covering_record"}),
+                capture,
+            )
+            .await;
+
+        Ok((
+            EvidenceRef {
+                id: compact_id,
                 bytes: as_u64(compact_json.len()),
             },
-            summary: None,
-            compact_text: compacted.rendered_text,
-            summary_text: None,
-            stats,
-            model: None,
-            model_skipped: None,
-        };
+            view_skip,
+        ))
+    }
 
-        if use_model {
-            self.summarize(request_id, &name, &source_id, &compact_id, &mut report)
-                .await;
+    /// Optional retrieval views never change the underlying step outcome.
+    async fn publish_optional_view(
+        &self,
+        request_id: &str,
+        evidence_id: &str,
+        view: crate::evidence_view::RedactedView,
+        parent: serde_json::Value,
+        capture: Option<&crate::evidence_service::CaptureScope>,
+    ) -> Option<ModelSkipped> {
+        if let Some(capture) = capture
+            && let Err(error) = crate::evidence_service::publish(
+                &self.store,
+                capture,
+                request_id,
+                evidence_id,
+                view,
+                parent,
+            )
+            .await
+        {
+            tracing::warn!(request_id, evidence_id, %error, "the optional log evidence view could not be filed");
+            return Some(ModelSkipped {
+                cause: "evidence_view_unavailable".to_owned(),
+                detail: evidence_id.to_owned(),
+            });
         }
+        None
+    }
 
-        tracing::info!(
-            request_id,
-            name,
-            source_bytes = stats.source_bytes,
-            compact_bytes = stats.compact_bytes,
-            tokens_avoided_est = stats.tokens_avoided_est,
-            summarized = report.summary.is_some(),
-            model_skipped = report
-                .model_skipped
-                .as_ref()
-                .map(|skip| skip.cause.as_str()),
-            "compressed a log"
-        );
-        Ok(report)
+    async fn file_summary(
+        &self,
+        request_id: &str,
+        summary_id: &str,
+        text: &str,
+        meta: &serde_json::Value,
+    ) -> Result<(), ModelSkipped> {
+        self.store
+            .insert_evidence(
+                summary_id,
+                request_id,
+                EVIDENCE_KIND_LOG_SUMMARY,
+                text.as_bytes(),
+                Some(&meta.to_string()),
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(request_id, %err, "the log summary row could not be written");
+                ModelSkipped {
+                    cause: CAUSE_STORE_ERROR.to_owned(),
+                    detail: format!("the summary row could not be written: {err}"),
+                }
+            })
     }
 
     /// Asks the heavy tier for a summary and files it, or records why it
@@ -357,7 +476,23 @@ impl LogService {
         source_id: &str,
         compact_id: &str,
         report: &mut CompressReport,
+        capture: Option<&crate::evidence_service::CaptureScope>,
     ) {
+        let (prompt, input) = summary_input(
+            &report.compact_text,
+            compact_id,
+            report
+                .semantic_text
+                .as_deref()
+                .zip(report.semantic.as_ref()),
+        );
+        if prompt.len() > PROMPT_BUDGET_BYTES {
+            report.model_skipped = Some(ModelSkipped {
+                cause: "evidence_exceeds_budget".to_owned(),
+                detail: "The evidence exceeds the bounded summary input; inspect a specific stage or node. No head/tail truncation was sent to the model.".to_owned(),
+            });
+            return;
+        }
         // Resolved once, up front: `generate` resolves for itself, but the
         // report has to name the model that answered and the entry is the
         // only place that id lives.
@@ -370,12 +505,16 @@ impl LogService {
         };
         let request = GenerateRequest {
             system: Some(SUMMARY_SYSTEM.to_owned()),
-            prompt: fit_prompt(&report.compact_text),
+            prompt,
             max_tokens: SUMMARY_MAX_TOKENS,
             temperature: SUMMARY_TEMPERATURE,
             stop: Vec::new(),
         };
-        let result = match self.models.generate(Tier::Heavy, request).await {
+        let result = match self
+            .models
+            .generate_bounded(Tier::Heavy, request, 2048)
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 report.model_skipped = Some(skipped(&err));
@@ -384,6 +523,13 @@ impl LogService {
         };
 
         let summary_id = new_evidence_id();
+        let (view, safe_text) = match safe_summary(&result.text) {
+            Ok(prepared) => prepared,
+            Err(skip) => {
+                report.model_skipped = Some(skip);
+                return;
+            }
+        };
         let meta = json!({
             "name": name,
             "model_id": entry.id,
@@ -393,28 +539,36 @@ impl LogService {
             "tokens_per_sec": result.tokens_per_sec,
             "source_evidence": source_id,
             "compact_evidence": compact_id,
+            "semantic_evidence": report.semantic.as_ref().map(|evidence| &evidence.id),
+            "input": input,
         });
-        if let Err(err) = self
-            .store
-            .insert_evidence(
-                &summary_id,
-                request_id,
-                EVIDENCE_KIND_LOG_SUMMARY,
-                result.text.as_bytes(),
-                Some(&meta.to_string()),
-            )
+        if let Err(skip) = self
+            .file_summary(request_id, &summary_id, &result.text, &meta)
             .await
         {
-            // The compaction already happened and is already stored; a
-            // lost summary row is a skip, not a failure.
-            tracing::warn!(request_id, %err, "the log summary row could not be written");
-            report.model_skipped = Some(ModelSkipped {
-                cause: CAUSE_STORE_ERROR.to_owned(),
-                detail: format!("the summary row could not be written: {err}"),
-            });
+            report.model_skipped = Some(skip);
             return;
         }
 
+        if let Some(capture) = capture
+            && let Err(error) = crate::evidence_service::publish(
+                &self.store,
+                capture,
+                request_id,
+                &summary_id,
+                view,
+                json!({"kind": "untrusted_model_output", "input_evidence_id": input["evidence_id"],
+                    "input_sha256": input["sha256"], "offset_basis": input["offset_basis"],
+                    "quotation_support": "not_asserted"}),
+            )
+            .await
+        {
+            report.model_skipped = Some(ModelSkipped {
+                cause: "evidence_view_unavailable".to_owned(),
+                detail: error,
+            });
+            return;
+        }
         report.summary = Some(EvidenceRef {
             id: summary_id,
             bytes: as_u64(result.text.len()),
@@ -426,8 +580,75 @@ impl LogService {
             completion_tokens: result.completion_tokens,
             tokens_per_sec: result.tokens_per_sec,
         });
-        report.summary_text = Some(result.text);
+        report.summary_text = Some(safe_text);
     }
+}
+
+fn trace_compression(request_id: &str, name: &str, report: &CompressReport) {
+    tracing::info!(
+        request_id,
+        name,
+        source_bytes = report.stats.source_bytes,
+        compact_bytes = report.stats.compact_bytes,
+        tokens_avoided_est = report.stats.tokens_avoided_est,
+        summarized = report.summary.is_some(),
+        model_skipped = report
+            .model_skipped
+            .as_ref()
+            .map(|skip| skip.cause.as_str()),
+        "compressed a log"
+    );
+}
+
+/// Build safe model input and explicitly covering provenance outside Tokio workers.
+fn prepare_compaction(
+    bytes: &[u8],
+    exit_status: Option<i32>,
+) -> Result<
+    (
+        crate::evidence_view::RedactedView,
+        Compacted,
+        crate::evidence_view::RedactedView,
+    ),
+    String,
+> {
+    let safe = crate::evidence_view::redact(bytes).map_err(|error| error.to_string())?;
+    let compacted =
+        compact(&safe.bytes, exit_status, &Policy::default()).map_err(|error| error.to_string())?;
+    let compact_map = crate::evidence_view::compact_segments(&compacted, &safe.bytes)
+        .map_err(|error| error.to_string())?;
+    let mut view = crate::evidence_view::redact(compacted.rendered_text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    view.segments = crate::evidence_view::compose_segments(&view.segments, &compact_map)
+        .map_err(|error| error.to_string())?;
+    Ok((safe, compacted, view))
+}
+
+fn safe_summary(text: &str) -> Result<(crate::evidence_view::RedactedView, String), ModelSkipped> {
+    let view = crate::evidence_view::redact(text.as_bytes()).map_err(|error| ModelSkipped {
+        cause: "redaction_unavailable".to_owned(),
+        detail: error.to_string(),
+    })?;
+    let safe_text = String::from_utf8(view.bytes.clone()).map_err(|_| ModelSkipped {
+        cause: "redaction_unavailable".to_owned(),
+        detail: "The safe summary is not UTF-8.".to_owned(),
+    })?;
+    Ok((view, safe_text))
+}
+
+pub(crate) fn summary_input(
+    compact_text: &str,
+    compact_id: &str,
+    semantic: Option<(&str, &EvidenceRef)>,
+) -> (String, serde_json::Value) {
+    let (prompt, evidence_id) = semantic.map_or((compact_text, compact_id), |(text, evidence)| {
+        (text, evidence.id.as_str())
+    });
+    (
+        prompt.to_owned(),
+        json!({"evidence_id": evidence_id,
+        "sha256": pam_compact::sha256_hex(prompt.as_bytes()), "offset_basis": "view_bytes"}),
+    )
 }
 
 impl CompressStats {
@@ -475,6 +696,11 @@ fn compact_meta(
 /// Turns a model-layer refusal into the skip the report carries.
 fn skipped(err: &ModelUnavailable) -> ModelSkipped {
     let cause = match err {
+        ModelUnavailable::Service(crate::model_service::ModelServiceError::Blocking {
+            cause,
+            ..
+        }) => cause,
+        ModelUnavailable::Service(_) => "model_registry_failed",
         ModelUnavailable::NoDefault(_) => CAUSE_NO_DEFAULT,
         ModelUnavailable::Missing(_) => CAUSE_MODEL_MISSING,
         ModelUnavailable::Runtime(runtime) => runtime.cause(),
@@ -484,39 +710,6 @@ fn skipped(err: &ModelUnavailable) -> ModelSkipped {
         cause: cause.to_owned(),
         detail: err.to_string(),
     }
-}
-
-/// Fits a reduced log to [`PROMPT_BUDGET_BYTES`].
-///
-/// Short enough, and the text goes through untouched. Otherwise the head
-/// and the tail are kept — where a build log puts its invocation and its
-/// verdict — with one marker between them saying how much went. Both cuts
-/// land on line boundaries so the model never reads half a line as a whole
-/// one, and the marker sits on its own line.
-#[must_use]
-pub fn fit_prompt(text: &str) -> String {
-    if text.len() <= PROMPT_BUDGET_BYTES {
-        return text.to_owned();
-    }
-    // Cut back to the last newline inside the head window; if the window
-    // holds no newline at all (one enormous line), the char boundary is
-    // the best cut available.
-    let head_cut = text.floor_char_boundary(PROMPT_HEAD_BYTES);
-    let head_end = text[..head_cut].rfind('\n').map_or(head_cut, |at| at + 1);
-    // Forward to the first newline at or after the tail window's start,
-    // for the same reason in the other direction.
-    let tail_cut = text.ceil_char_boundary(text.len() - PROMPT_TAIL_BYTES);
-    let tail_start = text[tail_cut..]
-        .find('\n')
-        .map_or(tail_cut, |at| tail_cut + at + 1);
-    if tail_start <= head_end {
-        // The two windows met: nothing was actually elided.
-        return text.to_owned();
-    }
-    let head = &text[..head_end];
-    let tail = &text[tail_start..];
-    let elided = text.len() - head.len() - tail.len();
-    format!("{head}[... {elided} bytes elided for the model prompt ...]\n{tail}")
 }
 
 /// A fresh `ev_<ulid>` evidence id.

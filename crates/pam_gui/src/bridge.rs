@@ -208,6 +208,9 @@ impl From<RequestError> for BridgeError {
                 "Admin operations go through admin_call; everything else through \
                  request_capability.",
             ),
+            RequestError::FollowRefused {
+                cause, recovery, ..
+            } => Self::new(cause, detail, recovery),
             RequestError::Parse { .. } => Self::new(
                 "protocol_error",
                 detail,
@@ -227,6 +230,13 @@ impl From<RequestError> for BridgeError {
                 "transport_failure",
                 detail,
                 "Retry; the daemon may have been restarting.",
+            ),
+            RequestError::AdminTransport { .. } => Self::new(
+                "admin_transport_failed",
+                detail,
+                "Open the installed PAM GUI on a supported platform and check the daemon log. \
+                 Inspect whether the change already took effect before trying again; \
+                 administration never falls back to the public socket.",
             ),
         }
     }

@@ -26,6 +26,141 @@ const SETTINGS = {
   extra_path: ["/opt/homebrew/bin"],
 };
 
+async function addScopeDraft() {
+  fireEvent.change(screen.getByLabelText("repository root"), { target: { value: "/repo" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add repository" }));
+  fireEvent.change(screen.getByLabelText("service URL for /repo"), {
+    target: { value: "https://jenkins.example/" },
+  });
+  fireEvent.change(screen.getByLabelText("exact targets for /repo"), {
+    target: { value: "platform/nightly" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Add connector scope" }));
+}
+
+describe("repository scopes", () => {
+  it("saves exact connector targets and removes grants explicitly", async () => {
+    await renderSection();
+    await addScopeDraft();
+    expect(mocks.flowsSettingsSet).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Save scopes" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({
+        scope_policy: {
+          version: 1,
+          repositories: [
+            {
+              root: "/repo",
+              connectors: [
+                {
+                  connector: "jenkins",
+                  base_url: "https://jenkins.example/",
+                  access: "targets",
+                  targets: ["platform/nightly"],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("Unsaved scope changes")).not.toBeInTheDocument(),
+    );
+    await waitFor(() => expect(screen.getByLabelText("remove repository /repo")).toBeEnabled());
+    fireEvent.click(screen.getByLabelText(/remove connector scope jenkins/));
+    fireEvent.click(screen.getByRole("button", { name: "Save scopes" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenLastCalledWith({
+        scope_policy: {
+          version: 1,
+          repositories: [{ root: "/repo", connectors: [] }],
+        },
+      }),
+    );
+    await waitFor(() => expect(screen.getByLabelText("remove repository /repo")).toBeEnabled());
+    fireEvent.click(screen.getByLabelText("remove repository /repo"));
+    fireEvent.click(screen.getByRole("button", { name: "Save scopes" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenLastCalledWith({
+        scope_policy: { version: 1, repositories: [] },
+      }),
+    );
+  });
+
+  it("requires explicit connector-wide access and saves no targets for it", async () => {
+    await renderSection();
+    fireEvent.change(screen.getByLabelText("repository root"), { target: { value: "/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add repository" }));
+    fireEvent.change(screen.getByLabelText("service URL for /repo"), {
+      target: { value: "https://jenkins.example/" },
+    });
+    expect(screen.getByRole("button", { name: "Add connector scope" })).toBeDisabled();
+    fireEvent.click(
+      screen.getByLabelText("Allow all connector targets and searches for /repo"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add connector scope" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save scopes" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({
+        scope_policy: {
+          version: 1,
+          repositories: [
+            {
+              root: "/repo",
+              connectors: [
+                {
+                  connector: "jenkins",
+                  base_url: "https://jenkins.example/",
+                  access: "connector_wide",
+                  targets: [],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+  });
+
+  it("keeps a rejected draft and displays the daemon refusal", async () => {
+    await renderSection();
+    await addScopeDraft();
+    mocks.flowsSettingsSet.mockRejectedValueOnce({
+      cause: "invalid_scope",
+      detail: "Repository does not exist",
+      recovery: "Choose an existing repository.",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save scopes" }));
+    await screen.findByText(/Repository does not exist/);
+    expect(screen.getByText("Unsaved scope changes")).toBeInTheDocument();
+    expect(screen.getByLabelText("remove repository /repo")).toBeInTheDocument();
+  });
+
+  it("retains dirty drafts on refresh and blocks overwriting changed scopes", async () => {
+    const client = await renderSection();
+    await addScopeDraft();
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["flow-settings"] });
+    });
+    expect(screen.getByText("Unsaved scope changes")).toBeInTheDocument();
+    act(() =>
+      client.setQueryData(["flow-settings"], {
+        ...SETTINGS,
+        scope_policy: { version: 1, repositories: [{ root: "/elsewhere", connectors: [] }] },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save scopes" })).toBeDisabled(),
+    );
+    expect(screen.getByText(/Saved scopes changed/)).toBeInTheDocument();
+    expect(screen.getByLabelText("remove repository /repo")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Discard scope changes" }));
+    expect(screen.getByLabelText("remove repository /elsewhere")).toBeInTheDocument();
+    expect(mocks.flowsSettingsSet).not.toHaveBeenCalled();
+  });
+});
+
 beforeEach(() => {
   let current = { ...SETTINGS };
   mocks.flowsSettingsGet.mockImplementation(async () => current);

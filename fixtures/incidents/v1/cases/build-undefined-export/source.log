@@ -1,0 +1,15 @@
+PAM synthetic offline incident snapshot v1
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Jenkins build=410 attempt=1 revision=1234567890abcdef1234567890abcdef12345678
+node=12 stage=fetch result=SUCCESS
+node=31 stage=link result=FAILURE exit=1
+ld: undefined symbol: inventory::decode_manifest_v2
+reference: package_reader.o invokes decode_manifest_v2; exported symbols contain decode_manifest_v1 only
+node=44 stage=post/archive result=SUCCESS
+Final build result: FAILURE

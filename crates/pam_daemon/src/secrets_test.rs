@@ -193,3 +193,22 @@ fn a_probe_never_stores_anything() {
     // with a real connector id.
     assert!(pam_flow::ConnectorId::parse(PROBE_CONNECTOR).is_none());
 }
+
+#[tokio::test]
+async fn worker_capacity_failure_keeps_its_cause_and_is_not_cached_as_os_health() {
+    let backend = Arc::new(FakeSecretBackend::default());
+    let store = SecretStore::new(backend.clone());
+    let busy = SecretError::from(crate::blocking_jobs::Error::Busy);
+    assert_eq!(busy.cause(), "blocking_capacity_exhausted");
+    *backend.fail_with.lock().unwrap() = Some(busy);
+    assert_eq!(
+        store.keyring_health().await.cause,
+        Some("blocking_capacity_exhausted")
+    );
+    *backend.fail_with.lock().unwrap() = None;
+    assert!(store.keyring_health().await.state.is_reachable());
+    assert_eq!(
+        SecretError::from(crate::blocking_jobs::Error::Join).cause(),
+        "blocking_job_failed"
+    );
+}

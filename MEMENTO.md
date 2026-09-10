@@ -101,3 +101,30 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
 
+## pam-blocking-work-outlives-timeout
+- kind: habit
+- scope: project
+- rule: Keep resource permits inside actual blocking closures, bound pending admission separately, and preserve overload as a typed capacity refusal rather than missing models or unavailable credentials.
+- fix: Track closure lifetime after caller cancellation, serialize conflicting mutations, retain finite waiting slots and do not cache capacity pressure as backend health.
+- hits: 2026-09-10
+- cost: 0
+- status: watching
+
+## large-async-fixture-stack
+- kind: habit
+- scope: project
+- rule: Keep large nested daemon test fixture futures heap-pinned instead of accumulating them on the test thread stack.
+- fix: Box::pin the outer deadline future and nested fixture constructor; preserve the normal thread stack and real deadlines. Sonar integration fixture overflowed before boxing and passed all five cases after.
+- hits: 2026-09-10
+- cost: 0
+- status: watching
+
+## child-stdin-eof-before-output-wait
+- kind: habit
+- scope: project
+- rule: Drop a child stdin handle after writing the complete input, before awaiting output EOF; AsyncWrite shutdown alone may leave the pipe open.
+- fix: Move stdin into the writer future so it is dropped when the write completes, and keep a real child-process regression that finishes under the original deadline.
+- hits: 2026-09-10
+- cost: 0
+- status: watching
+

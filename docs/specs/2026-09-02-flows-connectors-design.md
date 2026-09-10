@@ -204,6 +204,8 @@ header dropped). Base URLs must be `https://` without userinfo, query
 or fragment; private/loopback hosts are allowed (self-hosted Jenkins
 and SonarQube live there) — the human types the URL in the GUI.
 
+Current deployment and pagination amendments are recorded in [enterprise connector contracts](../enterprise-connector-contracts.md). The original table below is historical where that document or the current call schema differs.
+
 Read-only calls (arguments in parentheses, `*` required):
 
 | connector | auth | calls |

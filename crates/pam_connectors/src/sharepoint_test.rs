@@ -175,3 +175,52 @@ fn connection() -> Connection {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
+
+#[tokio::test]
+async fn graph_pages_refuse_missing_or_malformed_item_identity() {
+    for call_name in ["documents", "lists"] {
+        for item in [
+            serde_json::json!({}),
+            serde_json::Value::Null,
+            serde_json::json!({"id":7}),
+            serde_json::json!({"id":null}),
+            serde_json::json!({"id":""}),
+            serde_json::json!({"id":" "}),
+            serde_json::json!({"id":"A\nB"}),
+            serde_json::json!({"id":"x".repeat(1025)}),
+        ] {
+            let response = serde_json::json!({"value":[{"id":"valid"},item]});
+            let transport = FakeTransport::new().json(200, &response.to_string());
+            let error = run(
+                call_name,
+                &[("site", SITE), ("query", "runbook")],
+                &transport,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.cause(),
+                "connector_bad_response",
+                "{call_name}: {item}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn valid_empty_graph_pages_are_complete_without_an_item_identity() {
+    for call_name in ["documents", "lists"] {
+        let transport = FakeTransport::new().json(200, r#"{"value":[]}"#);
+        let CallResult::Json(value) = run(
+            call_name,
+            &[("site", SITE), ("query", "runbook")],
+            &transport,
+        )
+        .await
+        .unwrap() else {
+            panic!("JSON");
+        };
+        assert_eq!(value[call_name], serde_json::json!([]));
+        assert_eq!(value["partial"], false);
+    }
+}

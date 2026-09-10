@@ -14,7 +14,7 @@
 //!
 //! A read-only bypass still inserts a `request` row — the audit trail and
 //! the GUI activity feed need every request on record — but the row is
-//! born `queued` and immediately moved to `running`, and its id is never
+//! born `running` atomically, with an admission expiry, and its id is never
 //! pushed into a lane. The caller executes it straight away and records
 //! the terminal state itself.
 //!
@@ -25,8 +25,8 @@
 //! row to exist; the spec wants the gate before enqueue):
 //!
 //! 1. [`QueueManager::admit`] — dedupe check + `request` row insert
-//!    (state `queued`), atomically under the internal mutex.
-//! 2. [`QueueManager::place_in_lane`] — pushes the admitted request onto
+//!    (state `running` with an absolute expiry), under the internal mutex.
+//! 2. [`QueueManager::place_in_lane`] — persists authorization and `queued`, then pushes onto
 //!    its repo's lane, once the gate has allowed it.
 //!
 //! A gate refusal between the two moves the row straight to `refused`;
@@ -41,7 +41,7 @@
 //!
 //! Before inserting a laned request, the manager looks for an *in-flight*
 //! duplicate (state `queued`, `running`, or `waiting_approval`): by
-//! `idempotency_key` when the envelope carries one, otherwise by shape —
+//! complete shape plus `idempotency_key` when the envelope carries one, otherwise by shape —
 //! byte equality of capability + repo + serialized args (deterministic:
 //! `serde_json` serializes maps with sorted keys). A hit returns
 //! [`AdmitOutcome::Attached`] naming the existing request; the caller
@@ -109,14 +109,19 @@ use std::time::Duration;
 use pam_proto::Envelope;
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 /// Upper bound on any lease: an envelope `deadline_ms` beyond this is
-/// clamped. Also the lease budget for requests rebuilt from the store,
-/// whose original deadline is not persisted.
+/// clamped. Admission persists the absolute expiry for placement and recovery.
 pub const MAX_LEASE: Duration = Duration::from_hours(1);
+/// Global active admission cap, including approval waits and read-only bypasses.
+pub const MAX_ADMITTED_REQUESTS: u64 = 128;
+/// Maximum cumulative persisted identity and argument bytes for active admissions.
+pub const MAX_ADMITTED_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum parked terminal tickets waiting for executor/router notification.
+pub const MAX_PARKED_TERMINALS: usize = 128;
 
 /// `request.outcome` recorded when a queued request is cancelled.
 pub const CAUSE_CANCELLED: &str = "cancelled";
@@ -133,7 +138,7 @@ pub const ACTION_LEASE_REAPED: &str = "lease_reaped";
 /// What [`QueueManager::admit`] did with a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmitOutcome {
-    /// A new request row was inserted in state `queued`. The caller gates
+    /// A new request row was inserted in state `running`. The caller gates
     /// it and, on allow, calls [`QueueManager::place_in_lane`].
     Admitted,
     /// An in-flight duplicate exists; no row was inserted. The caller
@@ -177,6 +182,20 @@ pub struct LeasedWork {
 /// Why a queue operation failed.
 #[derive(Debug, Error)]
 pub enum QueueError {
+    /// An old queued row cannot be read within the startup recovery byte bound.
+    #[error(
+        "legacy_queue_oversized: a queued row exceeds the recovery byte limit; stop PAM, back up its state database, and have the operator repair the oversized legacy row before restarting"
+    )]
+    LegacyQueueOversized,
+    /// The original request deadline elapsed before work could begin.
+    #[error("request admission deadline expired")]
+    Expired,
+    /// No matching unplaced admission exists for this repository.
+    #[error("request has no valid unplaced admission")]
+    NotAdmitted,
+    /// Admission was refused before inserting more retained work.
+    #[error("{cause}: admission maximum is {maximum}")]
+    Capacity { cause: &'static str, maximum: u64 },
     /// [`QueueManager::complete`] was handed a non-terminal state.
     #[error("state {state:?} is not terminal; complete() records only done, refused or failed")]
     NotTerminal {
@@ -188,12 +207,50 @@ pub enum QueueError {
     Store(#[from] StoreError),
 }
 
+impl QueueError {
+    /// Stable refusal cause for the daemon response.
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        match self {
+            Self::LegacyQueueOversized => "legacy_queue_oversized",
+            Self::Expired => "deadline_exceeded",
+            Self::NotAdmitted => "admission_invalid",
+            Self::Capacity { cause, .. } => cause,
+            Self::NotTerminal { .. } | Self::Store(_) => "internal_error",
+        }
+    }
+
+    /// Caller recovery without retrying denied work in a loop.
+    #[must_use]
+    pub fn recovery(&self) -> &'static str {
+        match self {
+            Self::LegacyQueueOversized => {
+                "Stop PAM and back up its state database; operator repair of the oversized legacy queued row is required before restart."
+            }
+            Self::Expired => "Submit a fresh request with enough time for the authorized work.",
+            Self::Capacity { .. } => {
+                "Wait for active work to finish or cancel an existing request, then retry."
+            }
+            Self::NotAdmitted => "Submit a fresh request through PAM admission.",
+            Self::NotTerminal { .. } | Self::Store(_) => {
+                "Inspect the PAM daemon status and audit before retrying."
+            }
+        }
+    }
+}
+
 /// One request waiting in a lane.
 struct QueuedEntry {
     id: String,
-    /// Lease duration granted when the entry is taken, derived from the
-    /// envelope's `deadline_ms` (clamped to [`MAX_LEASE`]).
-    lease_budget: Duration,
+    /// Fixed expiry converted to a monotonic deadline when admitted to a lane.
+    deadline: Instant,
+}
+
+/// A checkpoint waiting outside ready lanes while retaining its admission.
+struct ParkedEntry {
+    repo: String,
+    entry: QueuedEntry,
+    resume_at_ms: i64,
 }
 
 /// An outstanding lease.
@@ -212,12 +269,17 @@ struct Inner {
     leases: HashMap<String, Lease>,
     /// repo → the leased request id keeping the lane busy.
     busy: HashMap<String, String>,
+    /// Original request id → durable watch waiting for its next poll.
+    parked: HashMap<String, ParkedEntry>,
+    /// Terminal parked tickets whose original waiting caller must be finished.
+    parked_terminals: Vec<String>,
 }
 
 /// The queue manager service. See the module docs for the design.
 pub struct QueueManager {
     store: Arc<Store>,
     inner: Mutex<Inner>,
+    work: Notify,
 }
 
 impl std::fmt::Debug for QueueManager {
@@ -234,6 +296,7 @@ impl QueueManager {
         Self {
             store,
             inner: Mutex::new(Inner::default()),
+            work: Notify::new(),
         }
     }
 
@@ -251,50 +314,114 @@ impl QueueManager {
         class: crate::policy::CapabilityClass,
     ) -> Result<AdmitOutcome, QueueError> {
         let args_json = envelope.args.to_string();
-        if class == crate::policy::CapabilityClass::ReadOnly {
-            // Bypass: on record for the audit trail, never in a lane.
-            self.insert_row(envelope, &args_json).await?;
-            self.store
-                .update_request_state(&envelope.id, RequestState::Running, None)
-                .await?;
-            return Ok(AdmitOutcome::Bypass);
-        }
-
-        // The lock spans dedupe-check + insert so two concurrent
-        // duplicates cannot both miss the check and both insert.
         let _inner = self.inner.lock().await;
-        let existing = match &envelope.idempotency_key {
-            Some(key) => self.store.find_inflight_by_key(key).await?,
-            None => {
-                self.store
-                    .find_inflight_by_shape(&envelope.capability, &envelope.caller.repo, &args_json)
-                    .await?
+        let now = wall_clock_ms();
+        let duration = clamp_lease(envelope.deadline_ms);
+        if duration.is_zero() {
+            return Err(QueueError::Expired);
+        }
+        let expires_at_ms =
+            now.saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+        if class != crate::policy::CapabilityClass::ReadOnly {
+            let existing = self
+                .store
+                .find_admitted_by_shape(
+                    &envelope.capability,
+                    &envelope.caller.repo,
+                    &args_json,
+                    envelope.idempotency_key.as_deref(),
+                    now,
+                )
+                .await?;
+            if let Some(row) = existing {
+                return Ok(AdmitOutcome::Attached {
+                    existing_request_id: row.id,
+                });
             }
-        };
-        if let Some(row) = existing {
-            return Ok(AdmitOutcome::Attached {
-                existing_request_id: row.id,
+        }
+        let (count, bytes) = self.store.admission_usage().await?;
+        if count >= MAX_ADMITTED_REQUESTS {
+            return Err(QueueError::Capacity {
+                cause: "queue_count_limit",
+                maximum: MAX_ADMITTED_REQUESTS,
             });
         }
-
-        self.insert_row(envelope, &args_json).await?;
-        Ok(AdmitOutcome::Admitted)
+        let incoming = [
+            &envelope.id,
+            &envelope.capability,
+            &envelope.caller.repo,
+            &envelope.caller.agent,
+            &args_json,
+        ]
+        .iter()
+        .map(|v| v.len() as u64)
+        .sum::<u64>()
+        .saturating_add(
+            envelope
+                .idempotency_key
+                .as_ref()
+                .map_or(0, |v| v.len() as u64),
+        );
+        if bytes.saturating_add(incoming) > MAX_ADMITTED_BYTES {
+            return Err(QueueError::Capacity {
+                cause: "queue_bytes_limit",
+                maximum: MAX_ADMITTED_BYTES,
+            });
+        }
+        self.store
+            .insert_admitted_request(
+                &envelope.id,
+                &envelope.capability,
+                &envelope.caller.repo,
+                &envelope.caller.agent,
+                &args_json,
+                envelope.idempotency_key.as_deref(),
+                expires_at_ms,
+            )
+            .await?;
+        Ok(if class == crate::policy::CapabilityClass::ReadOnly {
+            AdmitOutcome::Bypass
+        } else {
+            AdmitOutcome::Admitted
+        })
     }
 
     /// Places an admitted (and gate-allowed) request onto `repo`'s lane,
-    /// with a lease budget derived from `deadline_ms` (clamped to
-    /// [`MAX_LEASE`]). Returns the number of requests already waiting
+    /// preserving the expiry recorded at admission. The deadline argument cannot
+    /// extend it. Returns the number of requests already waiting
     /// ahead of it (0 = lane head; a currently leased request is not
     /// counted).
-    pub async fn place_in_lane(&self, request_id: &str, repo: &str, deadline_ms: u64) -> usize {
+    pub async fn place_in_lane(
+        &self,
+        request_id: &str,
+        repo: &str,
+        _deadline_ms: u64,
+    ) -> Result<usize, QueueError> {
         let mut inner = self.inner.lock().await;
+        let row = self
+            .store
+            .get_request(request_id)
+            .await?
+            .ok_or(QueueError::NotAdmitted)?;
+        let expires = row.expires_at_ms.ok_or(QueueError::NotAdmitted)?;
+        let remaining = expires.saturating_sub(wall_clock_ms());
+        if remaining <= 0 {
+            return Err(QueueError::Expired);
+        }
+        if !self
+            .store
+            .authorize_queued_request(request_id, repo, wall_clock_ms())
+            .await?
+        {
+            return Err(QueueError::NotAdmitted);
+        }
         let lane = inner.lanes.entry(repo.to_owned()).or_default();
         let position = lane.len();
         lane.push_back(QueuedEntry {
             id: request_id.to_owned(),
-            lease_budget: clamp_lease(deadline_ms),
+            deadline: Instant::now() + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
         });
-        position
+        Ok(position)
     }
 
     /// Repos whose lane has waiting work and no outstanding lease — the
@@ -321,28 +448,59 @@ impl QueueManager {
         if inner.busy.contains_key(repo) {
             return Ok(None);
         }
-        let Some(entry) = inner.lanes.get_mut(repo).and_then(VecDeque::pop_front) else {
+        // Capacity is reserved before any terminal write; admission remains in
+        // its lane on every database failure or notification backpressure.
+        let Some(entry) = inner.lanes.get(repo).and_then(VecDeque::front) else {
             return Ok(None);
         };
-        if let Err(err) = self
+        let entry = QueuedEntry {
+            id: entry.id.clone(),
+            deadline: entry.deadline,
+        };
+        let cause = if entry.deadline <= Instant::now() {
+            Some(CAUSE_LEASE_EXPIRED)
+        } else if self
             .store
-            .update_request_state(&entry.id, RequestState::Running, None)
-            .await
+            .start_queued_request(&entry.id, wall_clock_ms())
+            .await?
         {
-            // Leave the lane as it was so the request is not lost.
-            inner
-                .lanes
-                .entry(repo.to_owned())
-                .or_default()
-                .push_front(entry);
-            return Err(err.into());
+            None
+        } else if self
+            .store
+            .request_admission_expired(&entry.id, wall_clock_ms())
+            .await?
+        {
+            Some(CAUSE_LEASE_EXPIRED)
+        } else {
+            Some("authorization_changed")
+        };
+        if let Some(cause) = cause {
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                return Ok(None);
+            }
+            let finished = self.fail_recovered(&entry.id, cause).await?;
+            if let Some(lane) = inner.lanes.get_mut(repo) {
+                lane.pop_front();
+            }
+            if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
+                inner.lanes.remove(repo);
+            }
+            if finished {
+                inner.parked_terminals.push(entry.id);
+                self.work.notify_one();
+            }
+            return Ok(None);
+        }
+        if let Some(lane) = inner.lanes.get_mut(repo) {
+            lane.pop_front();
         }
         if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
             inner.lanes.remove(repo);
         }
 
         let (cancel_tx, cancel) = watch::channel(false);
-        let lease_deadline = Instant::now() + entry.lease_budget;
+        let lease_deadline = entry.deadline;
         let request_id = entry.id;
         inner.leases.insert(
             request_id.clone(),
@@ -367,6 +525,113 @@ impl QueueManager {
         inner.leases.keys().cloned().collect()
     }
 
+    /// Wait for a parked request becoming ready or releasing its repository lane.
+    /// The executor selects this alongside its existing admission notification.
+    pub async fn work_available(&self) {
+        self.work.notified().await;
+    }
+
+    /// Drain bounded terminal notices for the executor to publish and finish
+    /// through the original ticket's router. Explicit cancellation is separate.
+    pub async fn take_parked_terminals(&self) -> Vec<String> {
+        let mut inner = self.inner.lock().await;
+        std::mem::take(&mut inner.parked_terminals)
+    }
+
+    /// Persist a future poll before releasing the current lease. Failure leaves
+    /// lease ownership intact; parked admissions still count against store caps.
+    pub async fn park(&self, request_id: &str, resume_at_ms: i64) -> Result<bool, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let Some(lease) = inner.leases.get(request_id) else {
+            return Ok(false);
+        };
+        if lease.deadline <= Instant::now() || *lease.cancel_tx.borrow() {
+            return Ok(false);
+        }
+        let repo = lease.repo.clone();
+        let deadline = lease.deadline;
+        if !self
+            .store
+            .park_flow_request(request_id, resume_at_ms, wall_clock_ms())
+            .await?
+        {
+            return Ok(false);
+        }
+        inner.leases.remove(request_id);
+        inner.busy.remove(&repo);
+        inner.parked.insert(
+            request_id.to_owned(),
+            ParkedEntry {
+                repo,
+                entry: QueuedEntry {
+                    id: request_id.to_owned(),
+                    deadline,
+                },
+                resume_at_ms,
+            },
+        );
+        self.work.notify_one();
+        Ok(true)
+    }
+
+    /// Move due parked checkpoints into ordinary lanes, retaining the original
+    /// monotonic expiry. Authorization changes and expiry fail without dispatch.
+    pub async fn wake_due(&self, now: Instant, now_ms: i64) -> Result<usize, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let mut due: Vec<_> = inner
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.entry.deadline <= now || parked.resume_at_ms <= now_ms)
+            .map(|(id, parked)| (parked.resume_at_ms, id.clone()))
+            .collect();
+        due.sort();
+        let mut ready = 0;
+        for (_, id) in due {
+            // Retain admissions until the executor has consumed older notices.
+            // Never terminalize a parked request whose notification cannot fit.
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                break;
+            }
+            let Some(parked) = inner.parked.get(&id) else {
+                continue;
+            };
+            if parked.entry.deadline <= now {
+                if self.expire_locked(&mut inner, &id).await? {
+                    inner.parked_terminals.push(id);
+                    self.work.notify_one();
+                }
+                continue;
+            }
+            if !self.store.wake_parked_flow_request(&id, now_ms).await? {
+                let cause = if self.store.request_admission_expired(&id, now_ms).await? {
+                    CAUSE_LEASE_EXPIRED
+                } else {
+                    "authorization_changed"
+                };
+                let finished = self.fail_recovered(&id, cause).await?;
+                inner.parked.remove(&id);
+                if finished {
+                    inner.parked_terminals.push(id);
+                    self.work.notify_one();
+                }
+                continue;
+            }
+            let Some(parked) = inner.parked.remove(&id) else {
+                continue;
+            };
+            inner
+                .lanes
+                .entry(parked.repo)
+                .or_default()
+                .push_back(parked.entry);
+            ready += 1;
+            // A later store failure must not strand work already made ready.
+            self.work.notify_one();
+        }
+        Ok(ready)
+    }
+
     /// Releases `request_id`'s lease and records its terminal
     /// `final_state` / `outcome` together with the executor's `audit`
     /// row (one transaction, via [`Store::finish_request`]), freeing the
@@ -388,14 +653,18 @@ impl QueueManager {
             return Err(QueueError::NotTerminal { state: final_state });
         }
         let mut inner = self.inner.lock().await;
-        let Some(lease) = inner.leases.remove(request_id) else {
+        let Some(lease) = inner.leases.get(request_id) else {
             return Ok(false);
         };
-        inner.busy.remove(&lease.repo);
+        let repo = lease.repo.clone();
+        // A failed terminal write must retain ownership so completion can be
+        // retried or reaped; it is not evidence that another writer finished.
         let finished = self
             .store
             .finish_request(request_id, final_state, outcome, audit)
             .await?;
+        inner.leases.remove(request_id);
+        inner.busy.remove(&repo);
         Ok(finished)
     }
 
@@ -415,18 +684,14 @@ impl QueueManager {
             let _ = lease.cancel_tx.send(true);
             return Ok(CancelOutcome::SignalledRunning);
         }
-        let mut found = false;
-        for lane in inner.lanes.values_mut() {
-            if let Some(index) = lane.iter().position(|entry| entry.id == request_id) {
-                lane.remove(index);
-                found = true;
-                break;
-            }
-        }
+        let found = inner.parked.contains_key(request_id)
+            || inner
+                .lanes
+                .values()
+                .any(|lane| lane.iter().any(|entry| entry.id == request_id));
         if !found {
             return Ok(CancelOutcome::NotFound);
         }
-        inner.lanes.retain(|_, lane| !lane.is_empty());
         let detail = serde_json::json!({ "actor": actor.as_str() }).to_string();
         self.store
             .finish_request(
@@ -441,6 +706,11 @@ impl QueueManager {
                 },
             )
             .await?;
+        inner.parked.remove(request_id);
+        for lane in inner.lanes.values_mut() {
+            lane.retain(|entry| entry.id != request_id);
+        }
+        inner.lanes.retain(|_, lane| !lane.is_empty());
         Ok(CancelOutcome::CancelledQueued)
     }
 
@@ -459,34 +729,76 @@ impl QueueManager {
             .collect();
         let mut reaped = Vec::with_capacity(expired.len());
         for id in expired {
-            let Some(lease) = inner.leases.remove(&id) else {
-                continue;
-            };
-            inner.busy.remove(&lease.repo);
-            // Tell a still-running holder to stop; best-effort.
-            let _ = lease.cancel_tx.send(true);
-            let detail = serde_json::json!({ "cause": "timeout" }).to_string();
-            let finished = self
-                .store
-                .finish_request(
-                    &id,
-                    RequestState::Failed,
-                    Some(CAUSE_LEASE_EXPIRED),
-                    AuditEntry {
-                        action: ACTION_LEASE_REAPED,
-                        decision: Decision::Timeout,
-                        actor: Actor::System,
-                        detail: Some(&detail),
-                    },
-                )
-                .await?;
-            // An already-terminal row means someone else finished first;
-            // the lane is freed either way but nothing was reaped.
-            if finished {
+            if self.expire_locked(&mut inner, &id).await? {
                 reaped.push(id);
             }
         }
         Ok(reaped)
+    }
+
+    /// Finish an admitted request whose absolute deadline elapsed. Both the
+    /// original waiter and lease reaper use the same durable timeout cause.
+    /// Explicit user cancellation continues through [`Self::cancel`].
+    pub async fn expire(&self, request_id: &str) -> Result<bool, QueueError> {
+        let mut inner = self.inner.lock().await;
+        self.expire_locked(&mut inner, request_id).await
+    }
+
+    async fn expire_locked(&self, inner: &mut Inner, request_id: &str) -> Result<bool, QueueError> {
+        let detail = serde_json::json!({ "cause": "timeout" }).to_string();
+        // Persist first: a store failure must leave ownership intact for retry.
+        // The queue mutex excludes executor completion until this terminal write.
+        let finished = self
+            .store
+            .finish_request(
+                request_id,
+                RequestState::Failed,
+                Some(CAUSE_LEASE_EXPIRED),
+                AuditEntry {
+                    action: ACTION_LEASE_REAPED,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )
+            .await?;
+        if let Some(lease) = inner.leases.remove(request_id) {
+            inner.busy.remove(&lease.repo);
+            let _ = lease.cancel_tx.send(true);
+        }
+        for lane in inner.lanes.values_mut() {
+            lane.retain(|entry| entry.id != request_id);
+        }
+        inner.lanes.retain(|_, lane| !lane.is_empty());
+        inner.parked.remove(request_id);
+        Ok(finished)
+    }
+
+    /// Background-only expiry delivery. Explicit `reap_expired` callers own
+    /// their returned ids; this path reserves notice capacity before releasing
+    /// leases whose executor may already have exited after a store failure.
+    pub(crate) async fn reap_expired_notifying(&self, now: Instant) -> Result<usize, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let mut expired: Vec<_> = inner
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired.sort();
+        let mut count = 0;
+        for id in expired {
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                break;
+            }
+            if self.expire_locked(&mut inner, &id).await? {
+                inner.parked_terminals.push(id);
+                count += 1;
+                self.work.notify_one();
+            }
+        }
+        Ok(count)
     }
 
     /// Spawns the background reaper: calls [`Self::reap_expired`] every
@@ -505,7 +817,8 @@ impl QueueManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = self.reap_expired(Instant::now()).await;
+                        let _ = self.reap_expired_notifying(Instant::now()).await;
+                        let _ = self.wake_due(Instant::now(), wall_clock_ms()).await;
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -514,40 +827,94 @@ impl QueueManager {
     }
 
     /// Rebuilds every lane from the store's `queued` rows, oldest first,
-    /// replacing the in-memory lanes. Rebuilt entries get [`MAX_LEASE`]
-    /// as their lease budget — the envelope's `deadline_ms` is not
-    /// persisted. Returns how many requests were restored.
+    /// replacing the in-memory lanes. Missing authorization or expiry fails closed;
+    /// restored entries retain only the time remaining on their original deadline.
+    /// Reads keyset pages bounded by row count and aggregate text bytes. An
+    /// oversized legacy row stops startup for operator backup/repair; recovery
+    /// does not fetch or silently delete its payload.
     ///
     /// Crash recovery of `running` / `waiting_approval` rows left behind
     /// by a dead daemon is task #12, not handled here.
     pub async fn rebuild_from_store(&self) -> Result<usize, QueueError> {
-        let queued = self.store.list_queued_ordered().await?;
         let mut inner = self.inner.lock().await;
         inner.lanes.clear();
-        let restored = queued.len();
-        for row in queued {
-            inner
-                .lanes
-                .entry(row.repo)
-                .or_default()
-                .push_back(QueuedEntry {
-                    id: row.id,
-                    lease_budget: MAX_LEASE,
-                });
+        inner.parked.clear();
+        let revision = self.store.grant_revocation_revision().await?;
+        let mut restored = 0;
+        let mut retained_bytes = 0u64;
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let queued = self
+                .store
+                .queued_recovery_page(
+                    after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                    MAX_ADMITTED_BYTES,
+                )
+                .await?
+                .ok_or(QueueError::LegacyQueueOversized)?;
+            let Some(last) = queued.last() else { break };
+            after = Some((last.created_ts, last.id.clone()));
+            for row in queued {
+                let remaining = row
+                    .expires_at_ms
+                    .map_or(0, |expires| expires.saturating_sub(wall_clock_ms()));
+                let bytes = [
+                    &row.id,
+                    &row.capability,
+                    &row.repo,
+                    &row.caller_agent,
+                    &row.args_json,
+                ]
+                .iter()
+                .map(|v| v.len() as u64)
+                .sum::<u64>()
+                .saturating_add(row.idempotency_key.as_ref().map_or(0, |v| v.len() as u64));
+                let cause = if !row.queue_authorized || row.expires_at_ms.is_none() {
+                    Some("admission_invalid")
+                } else if row.authorization_revision != Some(revision) {
+                    Some("authorization_changed")
+                } else if remaining <= 0 {
+                    Some(CAUSE_LEASE_EXPIRED)
+                } else if restored >= MAX_ADMITTED_REQUESTS
+                    || retained_bytes.saturating_add(bytes) > MAX_ADMITTED_BYTES
+                {
+                    Some("queue_recovery_limit")
+                } else {
+                    None
+                };
+                if let Some(cause) = cause {
+                    self.fail_recovered(&row.id, cause).await?;
+                    continue;
+                }
+                if row.resume_at_ms.is_some()
+                    && !self
+                        .store
+                        .validate_parked_flow_request(&row.id, wall_clock_ms())
+                        .await?
+                {
+                    self.fail_recovered(&row.id, "admission_invalid").await?;
+                    continue;
+                }
+                retained_bytes += bytes;
+                restored += 1;
+                restore_queued_entry(&mut inner, row, remaining);
+            }
         }
-        Ok(restored)
+        Ok(usize::try_from(restored).unwrap_or(usize::MAX))
     }
 
-    /// Inserts the envelope's `request` row in the `queued` state.
-    async fn insert_row(&self, envelope: &Envelope, args_json: &str) -> Result<(), StoreError> {
+    async fn fail_recovered(&self, id: &str, cause: &str) -> Result<bool, StoreError> {
         self.store
-            .insert_request(
-                &envelope.id,
-                &envelope.capability,
-                &envelope.caller.repo,
-                &envelope.caller.agent,
-                args_json,
-                envelope.idempotency_key.as_deref(),
+            .finish_request(
+                id,
+                RequestState::Failed,
+                Some(cause),
+                AuditEntry {
+                    action: ACTION_LEASE_REAPED,
+                    decision: Decision::Refuse,
+                    actor: Actor::System,
+                    detail: Some(cause),
+                },
             )
             .await
     }
@@ -558,4 +925,30 @@ impl QueueManager {
 /// no lower bound is applied here.
 fn clamp_lease(deadline_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms).min(MAX_LEASE)
+}
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Restore the bounded index without replacing the persisted poll/deadline times.
+fn restore_queued_entry(inner: &mut Inner, row: pam_store::RequestRow, remaining: i64) {
+    let entry = QueuedEntry {
+        id: row.id.clone(),
+        deadline: Instant::now() + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
+    };
+    if let Some(resume_at_ms) = row.resume_at_ms {
+        inner.parked.insert(
+            row.id,
+            ParkedEntry {
+                repo: row.repo,
+                entry,
+                resume_at_ms,
+            },
+        );
+    } else {
+        inner.lanes.entry(row.repo).or_default().push_back(entry);
+    }
 }

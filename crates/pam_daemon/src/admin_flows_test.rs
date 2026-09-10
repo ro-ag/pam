@@ -126,7 +126,9 @@ fn the_bridge_whitelist_names_every_op_once() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), FLOW_ADMIN_OPS.len());
-    assert_eq!(FLOW_ADMIN_OPS.len(), 8);
+    assert_eq!(FLOW_ADMIN_OPS.len(), 10);
+    assert!(FLOW_ADMIN_OPS.contains(&"admin.flows.landing.get"));
+    assert!(FLOW_ADMIN_OPS.contains(&"admin.flows.landing.set"));
     for op in FLOW_ADMIN_OPS {
         assert!(op.starts_with("admin.flows."), "{op} is misnamed");
     }

@@ -1,0 +1,47 @@
+schema: 1
+id: revision-ci-triage
+name: Revision CI triage
+description: >-
+  Collect one explicit GitHub Actions attempt and jobs page for a declared
+  source repository and commit, then read an explicit job from that matched
+  page. Fork source and workflow repository remain distinct. This observes
+  bounded evidence and does not establish that the whole pipeline passed.
+inputs:
+  repository:
+    description: exact HTTPS source clone URL, including its .git suffix when present
+  commit:
+    description: full 40 or 64 hexadecimal source commit
+  repo:
+    description: workflow repository owner/name on GitHub
+  run_id:
+    description: explicit positive workflow run ID; never latest
+  run_attempt:
+    description: explicit positive attempt number
+  job_id:
+    description: explicit positive job ID listed on the selected run attempt page
+  page:
+    description: explicit jobs page containing the selected job
+    default: "1"
+correlation:
+  repository: "${inputs.repository}"
+  commit: "${inputs.commit}"
+steps:
+  - id: run-jobs
+    connector: github
+    call: run
+    with:
+      repo: "${inputs.repo}"
+      run_id: "${inputs.run_id}"
+      run_attempt: "${inputs.run_attempt}"
+      page: "${inputs.page}"
+    role: observe
+    output: compact
+  - id: job-log
+    connector: github
+    call: job_log
+    with:
+      repo: "${inputs.repo}"
+      job_id: "${inputs.job_id}"
+    needs: [run-jobs]
+    role: observe
+    output: compact

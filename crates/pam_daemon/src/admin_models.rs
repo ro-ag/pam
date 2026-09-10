@@ -51,7 +51,7 @@ use crate::admin::{
     RECOVERY_INTERNAL, required_str,
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
-use crate::model_service::{ModelServiceError, SETTING_CURATOR, Tier};
+use crate::model_service::{ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier};
 
 /// `admin.models.list` → `{ models, models_dir }`.
 pub const OP_MODELS_LIST: &str = "admin.models.list";
@@ -90,7 +90,7 @@ pub const OP_MODELS_DEFAULTS_SET: &str = "admin.models.defaults.set";
 /// `admin.models.settings.set { models_dir?, idle_unload_min? }`.
 pub const OP_MODELS_SETTINGS_SET: &str = "admin.models.settings.set";
 
-/// `admin.models.try { prompt, max_tokens? }` → one diagnostic generation.
+/// `admin.models.try { model_id, prompt, max_tokens? }` → one diagnostic generation.
 pub const OP_MODELS_TRY: &str = "admin.models.try";
 
 /// `admin.curator.list` → the vendor agent CLIs on `PATH`.
@@ -105,6 +105,9 @@ pub const OP_CURATOR_TEST: &str = "admin.curator.test";
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const MODEL_ADMIN_OPS: &[&str] = &[
+    crate::admin_compressor::OP_STATUS,
+    crate::admin_compressor::OP_INSTALL,
+    crate::admin_compressor::OP_SET,
     OP_MODELS_LIST,
     OP_MODELS_CATALOG,
     OP_MODELS_DOWNLOAD,
@@ -238,6 +241,9 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
+            crate::admin_compressor::OP_STATUS => self.compressor_status().await,
+            crate::admin_compressor::OP_INSTALL => self.compressor_install(args).await,
+            crate::admin_compressor::OP_SET => self.compressor_set(args).await,
             OP_MODELS_LIST => self.models_list().await,
             OP_MODELS_CATALOG => self.models_catalog().await,
             OP_MODELS_DOWNLOAD => self.models_download(args).await,
@@ -260,7 +266,7 @@ impl AdminService {
 
     /// Everything under the models directory, header-parsed and classed.
     async fn models_list(&self) -> Result<AdminOk, AdminRefusal> {
-        let models = self.models.scan().await.map_err(registry_refusal)?;
+        let models = self.models.scan().await.map_err(download_refusal)?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body: json!({
@@ -274,28 +280,25 @@ impl AdminService {
     /// The curated catalog, each preset told whether it fits this host and
     /// whether it is already here.
     async fn models_catalog(&self) -> Result<AdminOk, AdminRefusal> {
-        let installed = self.models.scan().await.map_err(registry_refusal)?;
+        let installed = self.models.scan().await.map_err(download_refusal)?;
         let host_ram = self.models.host_ram_bytes();
         // A partial download is invisible to a registry scan — the
         // sidecars are dotfiles — so the catalog reads them directly.
         // Without this the GUI can only infer a resumable transfer from a
         // job row, and job rows age out of the status window.
         let registry = self.models.registry();
-        let partials = tokio::task::spawn_blocking(move || {
-            CATALOG
-                .iter()
-                .map(|preset| {
-                    let dest = registry.dest_for(preset.vendor, preset.file_name);
-                    pam_model::download::inspect_partial(&dest)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|err| AdminRefusal {
-            cause: CAUSE_INTERNAL_ERROR,
-            detail: format!("the partial-download scan did not finish: {err}"),
-            recovery: RECOVERY_INTERNAL,
-        })?;
+        let partials =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                CATALOG
+                    .iter()
+                    .map(|preset| {
+                        let dest = registry.dest_for(preset.vendor, preset.file_name);
+                        pam_model::download::inspect_partial(&dest)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(blocking_refusal)?;
         let presets: Vec<Value> = CATALOG
             .iter()
             .zip(partials)
@@ -441,6 +444,15 @@ impl AdminService {
     /// them.
     async fn models_delete(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let model_id = required_str(args, "model_id", OP_MODELS_DELETE)?;
+        let operation = self
+            .models
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| runtime_refusal(&pam_model::RuntimeError::Busy))?;
+        if self.models.runtime().has_pending_work() {
+            return Err(runtime_refusal(&pam_model::RuntimeError::Busy));
+        }
         let entry = self.entry(model_id).await?;
         if self.loaded_id() == Some(entry.id.clone()) {
             return Err(AdminRefusal {
@@ -459,13 +471,13 @@ impl AdminService {
 
         let registry = self.models.registry();
         let target = entry.clone();
-        let deleted = tokio::task::spawn_blocking(move || registry.delete(&target))
+        // The blocking closure owns the reservation even if its caller times out.
+        let (deleted, _operation) =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                (registry.delete(&target), operation)
+            })
             .await
-            .map_err(|err| AdminRefusal {
-                cause: CAUSE_INTERNAL_ERROR,
-                detail: format!("the delete did not finish: {err}"),
-                recovery: RECOVERY_INTERNAL,
-            })?;
+            .map_err(blocking_refusal)?;
         match deleted {
             Ok(()) => {}
             Err(RegistryError::OutsideModelsDir(path)) => {
@@ -546,6 +558,7 @@ impl AdminService {
 
     /// Drops the weights. Already idle is a success, not a refusal.
     async fn models_unload(&self) -> Result<AdminOk, AdminRefusal> {
+        let _operation = self.models.operation.lock().await;
         let previous = self.loaded_id();
         self.models
             .runtime()
@@ -621,7 +634,10 @@ impl AdminService {
                     recovery: RECOVERY_FIX_ARGS,
                 });
             }
-            self.models.set_models_dir(&dir).await?;
+            self.models
+                .set_models_dir(&dir)
+                .await
+                .map_err(diagnostic_refusal)?;
         }
         if let Some(raw) = args.get("idle_unload_min") {
             let minutes = raw.as_u64().ok_or_else(|| AdminRefusal {
@@ -644,25 +660,34 @@ impl AdminService {
         })
     }
 
-    /// One diagnostic generation on whatever is loaded.
-    ///
-    /// Deliberately works on `test_only` models: proving the wiring is the
-    /// whole point of this op.
+    /// One diagnostic on the explicitly requested installed and loaded model.
+    /// Test-only models remain usable; this does not establish qualification.
     async fn models_try(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let model_id = required_str(args, "model_id", OP_MODELS_TRY)?;
         let prompt = required_str(args, "prompt", OP_MODELS_TRY)?;
-        let max_tokens = args
-            .get("max_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(TRY_DEFAULT_MAX_TOKENS);
-        let snapshot = self.models.runtime().snapshot();
-        if snapshot.busy {
-            return Err(AdminRefusal {
-                cause: pam_model::RuntimeError::Busy.cause(),
-                detail: "the model thread is working on another command".to_owned(),
-                recovery: RECOVERY_RETRY_LATER,
-            });
-        }
+        let max_tokens = match args.get("max_tokens") {
+            None => TRY_DEFAULT_MAX_TOKENS,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value <= pam_model::runtime::CONTEXT_TOKENS)
+                .ok_or_else(|| AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: "max_tokens must be an integer from 0 through 8192".to_owned(),
+                    recovery: RECOVERY_FIX_ARGS,
+                })?,
+        };
+        let timeout_ms = match args.get("timeout_ms") {
+            None => 120_000,
+            Some(value) => value
+                .as_u64()
+                .filter(|value| (1..=120_000).contains(value))
+                .ok_or_else(|| AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: "timeout_ms must be an integer from 1 through 120000".to_owned(),
+                    recovery: RECOVERY_FIX_ARGS,
+                })?,
+        };
         let request = GenerateRequest {
             system: None,
             prompt: prompt.to_owned(),
@@ -670,25 +695,30 @@ impl AdminService {
             temperature: TRY_TEMPERATURE,
             stop: Vec::new(),
         };
-        // No cancel surface on an admin op: the sender outlives the call
-        // and never fires; the envelope deadline is the bound.
-        let (_never, cancel) = tokio::sync::watch::channel(false);
-        let result = self
-            .models
-            .runtime()
-            .generate(request, cancel)
-            .await
-            .map_err(|err| runtime_refusal(&err))?;
-        let body = serde_json::to_value(&result).map_err(|err| AdminRefusal {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            self.models.generate_diagnostic(model_id, request),
+        ).await.map_err(|_| AdminRefusal {
+            cause: "diagnostic_timeout",
+            detail: "The diagnostic deadline elapsed; cancellation was requested. An in-progress forward pass may still finish before the worker stops.".to_owned(),
+            recovery: RECOVERY_RETRY_LATER,
+        })?.map_err(diagnostic_refusal)?;
+        let mut body = serde_json::to_value(&result).map_err(|err| AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,
             detail: format!("the generation result did not serialize: {err}"),
             recovery: RECOVERY_INTERNAL,
         })?;
+        body["requested_model_id"] = json!(model_id);
+        body["diagnostic_only"] = json!(true);
+        body["qualification"] = json!("not_assessed");
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body,
             audit: json!({
                 "op": OP_MODELS_TRY,
+                "requested_model_id": model_id,
+                "model": result.model,
+                "diagnostic_only": true,
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
                 "tokens_per_sec": result.tokens_per_sec,
@@ -781,6 +811,7 @@ impl AdminService {
         self.models
             .find(model_id)
             .await
+            .map_err(download_refusal)?
             .ok_or_else(|| AdminRefusal {
                 cause: CAUSE_UNKNOWN_MODEL,
                 detail: format!("no model {model_id:?} in the models directory"),
@@ -812,13 +843,11 @@ impl AdminService {
 /// threads (detection stats the filesystem and waits on children).
 async fn detect_agents() -> Result<Vec<AgentCli>, AdminRefusal> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    tokio::task::spawn_blocking(move || pam_model::curator::detect(&path, DETECT_DEADLINE))
-        .await
-        .map_err(|err| AdminRefusal {
-            cause: CAUSE_INTERNAL_ERROR,
-            detail: format!("agent detection did not finish: {err}"),
-            recovery: RECOVERY_INTERNAL,
-        })
+    crate::blocking_jobs::run(crate::blocking_jobs::Kind::AgentDetection, move || {
+        pam_model::curator::detect(&path, DETECT_DEADLINE)
+    })
+    .await
+    .map_err(blocking_refusal)
 }
 
 /// The `.gguf` file name a pasted URL ends in.
@@ -834,6 +863,20 @@ fn file_name_from_url(url: &str) -> Option<String> {
         return None;
     }
     Some(name.to_owned())
+}
+
+fn diagnostic_refusal(error: ModelUnavailable) -> AdminRefusal {
+    match error {
+        ModelUnavailable::Runtime(error) => runtime_refusal(&error),
+        ModelUnavailable::Service(error) => download_refusal(error),
+        ModelUnavailable::Store(error) => AdminRefusal::from(error),
+        ModelUnavailable::Missing(id) => download_refusal(ModelServiceError::UnknownModel(id)),
+        ModelUnavailable::NoDefault(_) => AdminRefusal {
+            cause: CAUSE_INTERNAL_ERROR,
+            detail: "Explicit diagnostic unexpectedly attempted tier resolution.".to_owned(),
+            recovery: RECOVERY_INTERNAL,
+        },
+    }
 }
 
 /// A refusal for what the service would not start.
@@ -869,6 +912,15 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
             detail: format!("the transfer could not be started: {other}"),
             recovery: RECOVERY_INTERNAL,
         },
+        ModelServiceError::Blocking { cause, detail } => AdminRefusal {
+            cause,
+            detail,
+            recovery: if cause == "blocking_capacity_exhausted" {
+                crate::blocking_jobs::Error::Busy.recovery()
+            } else {
+                crate::blocking_jobs::Error::Join.recovery()
+            },
+        },
         ModelServiceError::Registry(err) => registry_refusal(err),
         ModelServiceError::Store(err) => AdminRefusal::from(err),
     }
@@ -878,6 +930,9 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
 pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
     let recovery = match err {
         pam_model::RuntimeError::NoModelLoaded => RECOVERY_LOAD_A_MODEL,
+        pam_model::RuntimeError::ModelMismatch { .. } => {
+            "Explicitly load the requested model on the PAM GUI Models screen, then retry."
+        }
         pam_model::RuntimeError::UnsupportedArchitecture(_) => RECOVERY_SUPPORTED_ARCH,
         pam_model::RuntimeError::LoadFailed(_) => RECOVERY_VERIFY_FILE,
         pam_model::RuntimeError::PromptTooLong { .. } => RECOVERY_SHORTEN_PROMPT,
@@ -889,7 +944,11 @@ pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
         pam_model::RuntimeError::Crashed => RECOVERY_INTERNAL,
     };
     AdminRefusal {
-        cause: err.cause(),
+        cause: if matches!(err, pam_model::RuntimeError::Busy) {
+            "runtime_busy"
+        } else {
+            err.cause()
+        },
         detail: err.to_string(),
         recovery,
     }
@@ -913,5 +972,13 @@ fn registry_refusal(err: RegistryError) -> AdminRefusal {
             detail: format!("the models directory could not be read: {other}"),
             recovery: RECOVERY_INTERNAL,
         },
+    }
+}
+
+fn blocking_refusal(error: crate::blocking_jobs::Error) -> AdminRefusal {
+    AdminRefusal {
+        cause: error.cause(),
+        detail: error.to_string(),
+        recovery: error.recovery(),
     }
 }

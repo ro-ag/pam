@@ -134,6 +134,34 @@ pub async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
     seed_string_list(tmp, SETTING_ALLOWED_PROGRAMS, programs).await;
 }
 
+/// Explicit fixture approval for one real repository and named service roots.
+/// This does not alter harness defaults; denial tests omit this helper.
+pub async fn seed_repository_scope(
+    tmp: &tempfile::TempDir,
+    repo: &std::path::Path,
+    connectors: &[(&str, &str)],
+) {
+    let root = repo.canonicalize().expect("fixture repository exists");
+    let connectors: Vec<_> = connectors
+        .iter()
+        .map(|(connector, base_url)| {
+            serde_json::json!({"connector": connector, "base_url": base_url,
+            "access": "connector_wide", "targets": []})
+        })
+        .collect();
+    open_store(tmp)
+        .await
+        .set_setting(
+            "flows.scope_policy",
+            &serde_json::json!({
+                "version": 1, "repositories": [{"root": root, "connectors": connectors}]
+            })
+            .to_string(),
+        )
+        .await
+        .expect("test repository scope persists");
+}
+
 /// Persists the directories a flow's command steps resolve programs on,
 /// before any daemon opens the store.
 ///
@@ -323,6 +351,15 @@ impl TestDaemon {
             .await
             .expect("dealer connects");
         TestClient {
+            base: self
+                .handle
+                .runtime_dir()
+                .run_dir()
+                .parent()
+                .expect("run parent")
+                .to_path_buf(),
+            admin: self.handle.admin(),
+            pending_admin: std::collections::VecDeque::new(),
             dealer,
             sent_ids: Arc::clone(&self.sent_ids),
         }
@@ -470,13 +507,38 @@ impl TestDaemon {
 /// [`Response`]s, recording every sent request id for the daemon's
 /// invariant sweep.
 pub struct TestClient {
+    base: std::path::PathBuf,
+    admin: Arc<pam_daemon::admin::AdminService>,
+    pending_admin: std::collections::VecDeque<Response>,
     dealer: DealerSocket,
     sent_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestClient {
-    /// Sends one envelope.
+    /// Sends an agent envelope through public IPC or explicitly seeds trusted
+    /// administration through the native channel. Unsupported platform fixtures
+    /// use the in-process service, never an insecure production wire fallback.
     pub async fn send(&mut self, envelope: &Envelope) {
+        if envelope.capability.starts_with("admin.") {
+            self.sent_ids
+                .lock()
+                .expect("sent ids")
+                .push(envelope.id.clone());
+            let response = if pam_daemon::admin_transport::supported() {
+                with_deadline(pam_daemon::admin_transport::exchange(&self.base, envelope))
+                    .await
+                    .expect("private admin exchange")
+            } else {
+                self.admin.handle(envelope).await
+            };
+            self.pending_admin.push_back(response);
+            return;
+        }
+        self.send_public(envelope).await;
+    }
+
+    /// Raw public ingress, including deliberately forged administration.
+    pub async fn send_public(&mut self, envelope: &Envelope) {
         self.sent_ids
             .lock()
             .expect("sent-ids lock")
@@ -489,6 +551,9 @@ impl TestClient {
 
     /// Receives one response.
     pub async fn recv(&mut self) -> Response {
+        if let Some(response) = self.pending_admin.pop_front() {
+            return response;
+        }
         let answer = with_deadline(self.dealer.recv()).await.expect("recv ok");
         let frames = answer.into_vec();
         serde_json::from_slice(&frames[0]).expect("parse response")

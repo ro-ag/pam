@@ -1,0 +1,11 @@
+OFFLINE SYNTHETIC INCIDENT
+repository=https://github.com/pam-fixtures/example
+requested_commit=72d3f7e90f0904a39d0a77d3b09cfca148f97bfe
+The following records are authored test evidence, not a live connector export.
+--- captured records ---
+experiment controls: same immutable fixture image, binary, inputs, dependency stubs, and seed; each run starts a fresh isolated worker.
+case=wait_for_background_flush outcomes by independent invocation: 1=pass, 2=fail, 3=pass, 4=fail, 5=pass, 6=pass, 7=fail, 8=fail.
+all four failures: completion flag remained false at the test-owned 10ms wait; no external I/O is used.
+runner=repeatability invocation=8 exit=1; controlled_repetitions=8; passed=4; failed=4
+[synthetic SharePoint 365 citation] https://tenant.fixture.invalid/sites/testing/Shared%20Documents/repeatability.txt ; item_id=repeat-8 ; etag=fixture-r8.
+cited context: No stack trace was captured during the repeatability experiment.

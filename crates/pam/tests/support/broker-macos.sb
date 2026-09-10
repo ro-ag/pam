@@ -1,0 +1,21 @@
+(version 1)
+; Default-deny fixture profile, not an installed enterprise policy.
+; Paths substituted by the harness are canonical absolute temporary paths.
+(deny default)
+; Executable/dynamic-library reads and caller attribution. Private paths below
+; remain excluded; process-info grants inspection, not task ports or control.
+(allow file-read*)
+(allow process-exec process-fork)
+(allow sysctl-read)
+(allow process-info*)
+(allow file-write-data (literal "/dev/null"))
+(allow network-outbound (remote unix-socket (literal "@BASE@/run/pam.sock")))
+(allow network-outbound (remote unix-socket (literal "@BASE@/run/events.sock")))
+(deny file-read-data file-write* (subpath "@BASE@/admin"))
+(deny file-read-data file-write* (literal "@BASE@/state.sqlite3"))
+(deny file-read-data file-write* (literal "@BASE@/state.sqlite3-wal"))
+(deny file-read-data file-write* (literal "@BASE@/state.sqlite3-shm"))
+(deny file-write* (literal "@ASSET@"))
+(deny file-read-data file-write* (subpath "@HOME@/Library/Keychains"))
+(deny mach-lookup)
+(deny signal)

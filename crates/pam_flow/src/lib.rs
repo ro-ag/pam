@@ -24,20 +24,27 @@
 #![forbid(unsafe_code)]
 
 pub mod builtin;
+pub mod correlation;
 pub mod duration;
+pub mod landing;
 pub mod library;
+pub use landing::LandingOperation;
 pub mod normalize;
 pub mod schema;
 pub mod validate;
 pub mod vars;
 
 pub use builtin::{BuiltinFlow, builtin, builtin_yaml};
+pub use correlation::{
+    Correlation, CorrelationError, CorrelationTarget, canonical_repository_url,
+    validate_full_commit,
+};
 pub use duration::{DurationError, format_duration, parse_duration};
 pub use library::{Entry, Library, Source};
 pub use normalize::{digest, to_normalized_yaml};
 pub use schema::{
     Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Retry, Role,
-    SCHEMA_VERSION, Step, When,
+    SCHEMA_VERSION, Step, Watch, When,
 };
 pub use validate::{
     CallSpec, DEFAULT_TIMEOUT, FlowError, MAX_ARG_BYTES, MAX_ARGS, MAX_ARGV_BYTES,
@@ -50,6 +57,8 @@ pub use vars::{VarError, Vars, references, substitute};
 #[cfg(test)]
 mod builtin_test;
 #[cfg(test)]
+mod correlation_test;
+#[cfg(test)]
 mod duration_test;
 #[cfg(test)]
 mod library_test;
@@ -61,3 +70,10 @@ mod schema_test;
 mod validate_test;
 #[cfg(test)]
 mod vars_test;
+
+mod watch;
+#[cfg(test)]
+mod watch_test;
+
+#[cfg(test)]
+mod landing_test;

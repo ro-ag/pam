@@ -26,6 +26,14 @@ use crate::descriptor::descriptor;
 /// map through [`From<TransportError>`](crate::TransportError).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ConnectorError {
+    /// A daemon policy or cumulative budget refused further work.
+    #[error("{detail}")]
+    Policy {
+        /// Stable daemon refusal cause.
+        cause: &'static str,
+        /// Sanitized policy detail, never request credentials.
+        detail: String,
+    },
     /// The stored credential was rejected (HTTP 401).
     #[error("the stored credential was rejected")]
     Auth,
@@ -100,6 +108,7 @@ impl ConnectorError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::Policy { cause, .. } => cause,
             Self::Auth => "connector_auth",
             Self::Forbidden => "connector_forbidden",
             Self::NotFound => "connector_not_found",
@@ -130,6 +139,7 @@ impl ConnectorError {
     pub fn recovery(&self, id: ConnectorId) -> String {
         let name = descriptor(id).name;
         match self {
+            Self::Policy { .. } => "Inspect retained evidence and narrow the operation; review approved scopes in PAM Settings → Flows.".to_owned(),
             Self::Auth => format!(
                 "open Pam → Settings → Connectors → {name} → replace the credential and Test"
             ),

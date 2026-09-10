@@ -6,19 +6,32 @@ use super::schema::{Action, ConnectorId, OutputPolicy, Role};
 use super::validate::parse;
 
 #[test]
-fn pam_ships_the_eight_starter_flows() {
+fn pam_ships_the_starter_flows() {
     let ids: Vec<_> = builtin().iter().map(|flow| flow.id).collect();
     assert_eq!(
         ids,
         [
             "after-merge-checks",
             "ci-failure-triage",
+            "confluence-page-context",
             "dependency-audit",
+            "guarded-land",
+            "jenkins-build-investigation",
+            "jenkins-node-evidence",
+            "jira-issue-context",
             "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
+            "revision-ci-triage",
+            "revision-jenkins-check",
+            "revision-sonar-check",
+            "sharepoint-document-context",
+            "sonar-analysis-evidence",
             "sonar-gate-check",
             "summarize-build-log",
+            "watch-github-run",
+            "watch-jenkins-build",
+            "watch-sonar-analysis",
         ]
     );
     let mut sorted = ids.clone();
@@ -85,7 +98,7 @@ fn the_command_starters_match_the_spec_table() {
             .iter()
             .filter_map(|step| match &step.action {
                 Action::Command { argv } => Some(argv.clone()),
-                Action::Connector { .. } => None,
+                Action::Connector { .. } | Action::Landing { .. } => None,
             })
             .collect()
     };
@@ -199,7 +212,7 @@ fn the_connector_starters_call_the_spec_table() {
                 Action::Connector {
                     connector, call, ..
                 } => Some((*connector, call.clone())),
-                Action::Command { .. } => None,
+                Action::Command { .. } | Action::Landing { .. } => None,
             })
             .collect()
     };
@@ -279,10 +292,12 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
         .skip(1)
         .map(|step| match &step.action {
             Action::Command { argv } => argv.clone(),
-            Action::Connector { .. } => panic!("local gates must be commands"),
+            Action::Connector { .. } | Action::Landing { .. } => {
+                panic!("local gates must be commands")
+            }
         })
         .collect();
-    assert_eq!(required.len(), 6);
+    assert_eq!(required.len(), 7);
     assert_eq!(actual, required);
     assert!(flow.steps[0].expect_empty_output);
     for pair in flow.steps.windows(2) {
@@ -294,6 +309,209 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
     assert!(generic.name.contains("Rust"));
     assert!(generic.steps.iter().all(|step| match &step.action {
         Action::Command { argv } => argv[0] != "npm",
-        Action::Connector { .. } => true,
+        Action::Connector { .. } | Action::Landing { .. } => true,
     }));
+}
+
+#[test]
+fn jenkins_investigation_targets_one_build_and_checks_only_its_core_status() {
+    let flow = parse(builtin_yaml("jenkins-build-investigation").unwrap()).unwrap();
+    assert_eq!(flow.steps.len(), 1);
+    assert_eq!(flow.inputs.len(), 2);
+    assert!(flow.inputs.values().all(|input| input.default.is_none()));
+    let step = &flow.steps[0];
+    assert_eq!(step.role, Role::Verify);
+    assert_eq!(step.expect_status.as_deref(), Some("SUCCESS"));
+    assert_eq!(step.output, OutputPolicy::Compact);
+    let Action::Connector {
+        connector,
+        call,
+        with,
+    } = &step.action
+    else {
+        panic!("connector step")
+    };
+    assert_eq!(*connector, ConnectorId::Jenkins);
+    assert_eq!(call, "investigate");
+    assert_eq!(with["job"].to_string(), "${inputs.job}");
+    assert_eq!(with["build"].to_string(), "${inputs.build}");
+}
+
+#[test]
+fn revision_starters_require_explicit_source_and_run_identity() {
+    for (id, required) in [
+        (
+            "revision-jenkins-check",
+            vec!["repository", "commit", "job", "build"],
+        ),
+        (
+            "revision-ci-triage",
+            vec![
+                "repository",
+                "commit",
+                "repo",
+                "run_id",
+                "run_attempt",
+                "job_id",
+            ],
+        ),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert!(flow.correlation.is_some());
+        for input in required {
+            assert!(
+                flow.inputs[input].default.is_none(),
+                "{id} silently defaults {input}"
+            );
+        }
+        let yaml = to_normalized_yaml(&flow);
+        assert!(yaml.contains("${inputs.repository}"));
+        assert!(yaml.contains("${inputs.commit}"));
+        for step in &flow.steps {
+            let Action::Connector { call, .. } = &step.action else {
+                panic!("brokered connector");
+            };
+            assert_ne!(call, "runs", "revision recipes never discover a latest run");
+            assert_eq!(step.output, OutputPolicy::Compact);
+        }
+    }
+    let flow = parse(builtin_yaml("revision-jenkins-check").unwrap()).unwrap();
+    assert_eq!(flow.steps.len(), 1);
+    assert_eq!(flow.steps[0].role, Role::Verify);
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("SUCCESS"));
+    let flow = parse(builtin_yaml("revision-ci-triage").unwrap()).unwrap();
+    assert_eq!(flow.inputs["page"].default.as_deref(), Some("1"));
+    assert!(
+        flow.steps
+            .iter()
+            .all(|step| step.role == Role::Observe && step.expect_status.is_none())
+    );
+    assert_eq!(flow.steps[1].needs, ["run-jobs"]);
+    let Action::Connector { with, .. } = &flow.steps[0].action else {
+        panic!("run");
+    };
+    assert_eq!(with["run_id"].to_string(), "${inputs.run_id}");
+    assert_eq!(with["run_attempt"].to_string(), "${inputs.run_attempt}");
+    assert_eq!(with["page"].to_string(), "${inputs.page}");
+    let Action::Connector { with, .. } = &flow.steps[1].action else {
+        panic!("job log");
+    };
+    assert_eq!(with["job_id"].to_string(), "${inputs.job_id}");
+}
+
+#[test]
+fn jenkins_node_evidence_requires_exact_inputs_and_only_observes() {
+    let flow = parse(builtin_yaml("jenkins-node-evidence").unwrap()).unwrap();
+    assert_eq!(
+        flow.inputs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["build", "job", "node_id"]
+    );
+    assert!(flow.inputs.values().all(|input| input.default.is_none()));
+    assert_eq!(flow.steps.len(), 1);
+    let step = &flow.steps[0];
+    assert_eq!(step.role, Role::Observe);
+    assert_eq!(step.output, OutputPolicy::Compact);
+    assert!(step.expect_status.is_none());
+    let Action::Connector {
+        connector,
+        call,
+        with,
+    } = &step.action
+    else {
+        panic!("connector step")
+    };
+    assert_eq!(*connector, ConnectorId::Jenkins);
+    assert_eq!(call, "node_evidence");
+    assert_eq!(with.len(), 3);
+    for key in ["job", "build", "node_id"] {
+        assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+    }
+}
+
+#[test]
+fn sonar_revision_starter_requires_exact_inputs_and_separate_gate_verification() {
+    let flow = crate::parse(crate::builtin_yaml("revision-sonar-check").unwrap()).unwrap();
+    for key in ["repository", "commit", "project", "ce_task", "branch"] {
+        assert!(flow.inputs[key].default.is_none());
+    }
+    assert!(flow.correlation.is_some());
+    assert_eq!(flow.steps[0].role, crate::Role::Verify);
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("OK"));
+    let discovery = crate::parse(crate::builtin_yaml("sonar-analysis-evidence").unwrap()).unwrap();
+    assert!(discovery.correlation.is_none());
+    assert_eq!(discovery.steps[0].role, crate::Role::Observe);
+    assert!(discovery.steps[0].expect_status.is_none());
+}
+
+#[test]
+fn document_context_starters_require_exact_identifiers_and_only_observe() {
+    for (id, connector, call, required) in [
+        (
+            "jira-issue-context",
+            ConnectorId::Jira,
+            "issue",
+            vec!["key"],
+        ),
+        (
+            "confluence-page-context",
+            ConnectorId::Confluence,
+            "page",
+            vec!["id"],
+        ),
+        (
+            "sharepoint-document-context",
+            ConnectorId::Sharepoint,
+            "document",
+            vec!["site", "drive", "item"],
+        ),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert_eq!(flow.inputs.len(), required.len());
+        assert!(flow.inputs.values().all(|input| input.default.is_none()));
+        assert_eq!(flow.steps.len(), 1);
+        let step = &flow.steps[0];
+        assert_eq!(step.role, Role::Observe);
+        assert_eq!(step.output, OutputPolicy::Compact);
+        assert!(step.expect_status.is_none());
+        let Action::Connector {
+            connector: actual_connector,
+            call: actual_call,
+            with,
+        } = &step.action
+        else {
+            panic!("connector step")
+        };
+        assert_eq!(*actual_connector, connector);
+        assert_eq!(actual_call, call);
+        assert_eq!(with.len(), required.len());
+        for key in required {
+            assert!(flow.inputs.contains_key(key));
+            assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+        }
+    }
+}
+
+#[test]
+fn watches_require_explicit_revision_and_product_inputs() {
+    for (id, required) in [
+        ("watch-github-run", vec!["repo", "run_id", "run_attempt"]),
+        ("watch-jenkins-build", vec!["job", "build"]),
+        ("watch-sonar-analysis", vec!["project", "ce_task"]),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert!(flow.correlation.is_some());
+        assert!(flow.inputs.values().all(|input| input.default.is_none()));
+        assert!(flow.inputs.contains_key("repository"));
+        assert!(flow.inputs.contains_key("commit"));
+        let step = &flow.steps[0];
+        assert_eq!(step.role, Role::Verify);
+        assert_eq!(step.output, OutputPolicy::Compact);
+        assert!(step.watch.is_some());
+        let Action::Connector { with, .. } = &step.action else {
+            panic!("collector")
+        };
+        for key in required {
+            assert_eq!(with[key].to_string(), format!("${{inputs.{key}}}"));
+        }
+    }
 }

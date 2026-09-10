@@ -7,11 +7,10 @@
 //! wire — including the `Authorization` header that never appears in the
 //! child's argument vector.
 //!
-//! The whole file is skipped, with a printed line, when `curl` is not on
-//! `PATH`.
+//! The whole file is skipped, with a printed line, when the trusted OS `curl` is unavailable.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -133,6 +132,7 @@ async fn a_refused_connection_is_a_network_failure() {
 fn request(address: SocketAddr, path: &str, max_bytes: u64) -> HttpRequest {
     HttpRequest {
         method: Method::Get,
+        body: None,
         url: Url::parse(&format!("http://{address}{path}")).expect("the origin URL parses"),
         headers: vec![
             ("Authorization".to_owned(), "Bearer wire-token".to_owned()),
@@ -220,30 +220,72 @@ fn deadline(seconds: u64) -> Instant {
     Instant::now() + Duration::from_secs(seconds)
 }
 
-/// The first executable `curl` on `PATH`.
+/// The qualified OS curl, independent of the test process PATH.
 fn curl_on_path() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "curl.exe" } else { "curl" };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
+    CurlTransport::trusted_path().ok()
 }
 
-/// Whether a path is an executable file.
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
+#[tokio::test]
+async fn mutation_json_arrives_exactly_and_redirect_is_never_followed() {
+    let Some(curl) = curl_on_path() else {
+        return;
     };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
+    for method in [Method::Post, Method::Put] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                assert!(bytes.len() < 8192);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let size = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|s| s.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + size {
+                        break;
+                    }
+                }
+            }
+            let response = if method == Method::Put {
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:1/never\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+            bytes
+        });
+        let body = b"{\n\"title\":\"quote\\\" and slash\\\\\"\n}".to_vec();
+        let mut req = request(address, "/mutation", 1024);
+        req.method = method;
+        req.body = Some(body.clone());
+        let result = CurlTransport::new(curl.clone())
+            .allow_http_for_tests()
+            .send(req, deadline(5))
+            .await;
+        if method == Method::Put {
+            assert!(matches!(
+                result,
+                Err(TransportError::Policy {
+                    cause: "mutation_redirect_refused",
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(result.unwrap().status, 200);
+        }
+        let wire = server.await.unwrap();
+        assert!(wire.starts_with(format!("{} /mutation HTTP/1.1", method.as_str()).as_bytes()));
+        assert!(wire.ends_with(&body));
     }
 }

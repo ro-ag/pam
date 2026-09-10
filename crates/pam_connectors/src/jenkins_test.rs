@@ -74,7 +74,7 @@ async fn builds_keeps_the_named_fields_and_echoes_the_job() {
 #[tokio::test]
 async fn console_reads_the_result_then_the_text() {
     let transport = FakeTransport::new()
-        .json(200, r#"{"result":"FAILURE","building":false}"#)
+        .json(200, r#"{"number":41,"result":"FAILURE","building":false}"#)
         .bytes(200, b"Started by user pam\nBUILD FAILURE".to_vec());
     let result = console(&transport, "platform", 41).await.unwrap();
 
@@ -113,7 +113,10 @@ async fn a_builds_result_decides_the_exit_status() {
         ("null", None),
     ] {
         let transport = FakeTransport::new()
-            .json(200, &format!(r#"{{"result":{result}}}"#))
+            .json(
+                200,
+                &format!(r#"{{"number":1,"building":false,"result":{result}}}"#),
+            )
             .bytes(200, b"log".to_vec());
         let CallResult::Log { exit_status, .. } = console(&transport, "platform", 1).await.unwrap()
         else {
@@ -126,7 +129,7 @@ async fn a_builds_result_decides_the_exit_status() {
 #[tokio::test]
 async fn a_nested_log_name_flattens_the_folder_path() {
     let transport = FakeTransport::new()
-        .json(200, r#"{"result":"SUCCESS"}"#)
+        .json(200, r#"{"number":3,"building":false,"result":"SUCCESS"}"#)
         .bytes(200, b"log".to_vec());
     let CallResult::Log { name, .. } = console(&transport, "platform/nightly", 3).await.unwrap()
     else {
@@ -242,4 +245,92 @@ fn connection() -> Connection {
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+
+#[tokio::test]
+async fn listing_caps_returned_arrays_even_when_server_ignores_requested_tree_limit() {
+    for (operation, field) in [("jobs", "jobs"), ("builds", "builds")] {
+        let transport = FakeTransport::new().json(200, &serde_json::json!({(field): [{"name":"first","number":1},{"name":"second","number":2}]}).to_string());
+        let mut parameters = args(&[("job", "platform")]);
+        parameters.insert("limit".to_owned(), ArgValue::Int(1));
+        let CallResult::Json(value) = call(
+            ConnectorId::Jenkins,
+            &connection(),
+            operation,
+            &parameters,
+            &transport,
+            deadline(),
+        )
+        .await
+        .unwrap() else {
+            panic!("JSON listing")
+        };
+        assert_eq!(value[field].as_array().unwrap().len(), 1);
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["limit"], 1);
+        assert!(value["coverage"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn console_rejects_wrong_build_before_fetching_log_and_never_passes_running_build() {
+    let wrong =
+        FakeTransport::new().json(200, r#"{"number":2,"building":false,"result":"SUCCESS"}"#);
+    assert_eq!(
+        console(&wrong, "platform", 1).await.unwrap_err().cause(),
+        "connector_bad_response"
+    );
+    assert_eq!(wrong.requests().len(), 1);
+    let running = FakeTransport::new()
+        .json(200, r#"{"number":1,"building":true,"result":"SUCCESS"}"#)
+        .bytes(200, b"still running".to_vec());
+    let CallResult::Log { exit_status, .. } = console(&running, "platform", 1).await.unwrap()
+    else {
+        panic!("console log")
+    };
+    assert_eq!(exit_status, None);
+}
+
+#[tokio::test]
+async fn build_status_uses_core_only_and_building_overrides_stale_failure() {
+    for (building, result, state, status) in [
+        (true, serde_json::json!("FAILURE"), "pending", "RUNNING"),
+        (false, serde_json::Value::Null, "unavailable", "UNKNOWN"),
+        (false, serde_json::json!("UNSTABLE"), "terminal", "UNSTABLE"),
+    ] {
+        let t = FakeTransport::new().json(
+            200,
+            &serde_json::json!({"number":42,"building":building,"result":result}).to_string(),
+        );
+        let CallResult::Json(v) = run(
+            "build_status",
+            &[("job", "folder/app"), ("build", "42")],
+            &t,
+        )
+        .await
+        .unwrap() else {
+            panic!("JSON")
+        };
+        assert_eq!(v["watch_state"], state);
+        assert_eq!(v["status"], status);
+        assert_eq!(t.requests().len(), 1);
+        assert!(t.url(0).contains("/job/folder/job/app/42/api/json?tree="));
+        assert!(v.get("node_logs").is_none());
+    }
+}
+
+#[tokio::test]
+async fn build_status_refuses_wrong_build_or_unknown_terminal_status() {
+    for body in [
+        serde_json::json!({"number":43,"building":false,"result":"SUCCESS"}),
+        serde_json::json!({"number":42,"building":false,"result":"NEW_STATUS"}),
+    ] {
+        let t = FakeTransport::new().json(200, &body.to_string());
+        assert!(
+            run("build_status", &[("job", "app"), ("build", "42")], &t)
+                .await
+                .is_err()
+        );
+        assert_eq!(t.requests().len(), 1);
+    }
 }

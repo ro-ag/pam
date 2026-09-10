@@ -45,6 +45,9 @@
 //! that for them.
 
 pub mod catalog;
+pub mod compression;
+#[cfg(test)]
+mod compression_test;
 pub mod curator;
 pub mod download;
 pub mod error;

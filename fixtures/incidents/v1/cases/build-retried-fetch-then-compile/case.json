@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "build-retried-fetch-then-compile",
+  "family_id": "v1-build-retried-fetch-then-compile",
+  "split": "screening",
+  "stage": "build",
+  "products": [
+    "jenkins"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Jenkins build 413 failed compilation after its dependency retry succeeded."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "stage=dependencies node=74 retry=2 status=SUCCESS: archive digest matched",
+      "error: field tenant_id is initialized twice in RequestEnvelope",
+      "stage=compile node=79 status=FAILED exit=1",
+      "Final build result: FAILURE"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The recovered HTTP 503 decided the final failure."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships."
+  }
+}

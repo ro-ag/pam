@@ -2,8 +2,8 @@
 //!
 //! Two layers live here. The public types ([`Flow`], [`Step`], [`Action`],
 //! …) are what the rest of pam works with: every default is already
-//! resolved, durations are real [`Duration`]s, and an action is either a
-//! command or a connector call — never both and never neither. The private
+//! resolved, durations are real [`Duration`]s, and an action is a command,
+//! connector call, or typed landing operation. The private
 //! `Raw*` types mirror the YAML file one key at a time, reject unknown keys,
 //! and keep `timeout`/`retry.backoff` as strings; [`crate::validate::parse`]
 //! turns one into the other and is the only place the conversion happens.
@@ -102,6 +102,11 @@ impl fmt::Display for ArgValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    /// A typed operation using GUI-owned landing policy and frozen target state.
+    Landing {
+        /// Fixed operation; no recipe-supplied command or remote arguments.
+        operation: crate::landing::LandingOperation,
+    },
     /// Run a local program. `argv[0]` is a bare program name, never a shell
     /// string.
     Command {
@@ -279,7 +284,7 @@ pub struct Input {
 pub struct Step {
     /// Unique within the flow, `[a-z0-9-]{1,64}`.
     pub id: String,
-    /// The command or connector call.
+    /// The command, connector call, or typed landing operation.
     pub action: Action,
     /// Wall-clock limit for one attempt.
     #[serde(serialize_with = "serialize_duration")]
@@ -300,6 +305,9 @@ pub struct Step {
     pub needs: Vec<String>,
     /// The condition guarding the step.
     pub when: When,
+    /// Optional bounded polling; terminal meanings belong to the connector adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<Watch>,
     /// Retry policy.
     pub retry: Retry,
     /// Whether the step always asks a human.
@@ -313,23 +321,27 @@ pub struct Step {
 }
 
 impl Step {
-    /// `"command"` or `"connector"` — the word the verdict body uses.
+    /// The action kind used by the verdict body.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self.action {
+            Action::Landing { .. } => "landing",
             Action::Command { .. } => "command",
             Action::Connector { .. } => "connector",
         }
     }
 
     /// Whether the step goes through the policy gate before it runs: every
-    /// stateful step, every step that asks for approval, and every connector
-    /// step (it leaves the machine).
+    /// stateful step, every step that asks for approval, every connector
+    /// step (it leaves the machine), and every typed landing operation.
     #[must_use]
     pub fn gated(&self) -> bool {
         self.effect == Effect::Stateful
             || self.approval == Approval::Required
-            || matches!(self.action, Action::Connector { .. })
+            || matches!(
+                self.action,
+                Action::Connector { .. } | Action::Landing { .. }
+            )
     }
 }
 
@@ -344,6 +356,9 @@ pub struct Flow {
     pub description: String,
     /// Declared inputs, keyed by name.
     pub inputs: BTreeMap<String, Input>,
+    /// Optional revision expectation frozen before any collection starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::correlation::Correlation>,
     /// Steps in execution order.
     pub steps: Vec<Step>,
 }
@@ -363,6 +378,8 @@ pub(crate) struct RawFlow {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) inputs: BTreeMap<String, RawInput>,
+    #[serde(default)]
+    pub(crate) correlation: Option<crate::correlation::Correlation>,
     pub(crate) steps: Vec<RawStep>,
 }
 
@@ -384,6 +401,8 @@ pub(crate) struct RawStep {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) run: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) landing: Option<crate::landing::LandingOperation>,
     #[serde(default)]
     pub(crate) connector: Option<String>,
     #[serde(default)]
@@ -409,6 +428,8 @@ pub(crate) struct RawStep {
     #[serde(default)]
     pub(crate) retry: Option<RawRetry>,
     #[serde(default)]
+    pub(crate) watch: Option<RawWatch>,
+    #[serde(default)]
     pub(crate) approval: Option<Approval>,
     #[serde(default)]
     pub(crate) env: Option<BTreeMap<String, String>>,
@@ -423,4 +444,33 @@ pub(crate) struct RawRetry {
     pub(crate) attempts: u8,
     #[serde(default)]
     pub(crate) backoff: Option<String>,
+}
+
+/// Bounded observation policy; cumulative request budgets may stop it earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Watch {
+    /// Maximum cheap status samples, including the first.
+    pub max_polls: u16,
+    /// Initial interval between samples.
+    #[serde(serialize_with = "serialize_duration")]
+    pub interval: Duration,
+    /// Maximum backoff interval.
+    #[serde(serialize_with = "serialize_duration")]
+    pub max_interval: Duration,
+}
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            max_polls: 60,
+            interval: Duration::from_secs(5),
+            max_interval: Duration::from_secs(30),
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawWatch {
+    pub max_polls: Option<u16>,
+    pub interval: Option<String>,
+    pub max_interval: Option<String>,
 }

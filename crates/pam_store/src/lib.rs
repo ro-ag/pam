@@ -37,12 +37,43 @@ mod store;
 pub use error::StoreError;
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
-    ConnectorPatch, ConnectorRow, DEFAULT_REQUEST_LIST_LIMIT, Decision, EVIDENCE_KIND_LOG_COMPACT,
-    EvidenceMeta, EvidencePrune, EvidenceRow, GrantRow, MAX_REQUEST_LIST_LIMIT, ModelJobRow,
-    PendingApproval, RequestPrune, RequestRow, RequestState, Store,
+    ConnectorPatch, ConnectorRow, CorrelationBind, CorrelationStep, DEFAULT_REQUEST_LIST_LIMIT,
+    Decision, EVIDENCE_KIND_FLOW_CHECKPOINT, EVIDENCE_KIND_LOG_COMPACT, EvidenceMeta,
+    EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest, EvidenceRow,
+    EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin, FlowJournalIdentity,
+    FlowJournalState, FlowResultMeta, GrantRow, LandingSession, MAX_FLOW_CHECKPOINT_BYTES,
+    MAX_FLOW_JOURNAL_EVIDENCE, MAX_REQUEST_LIST_LIMIT, ModelJobRow, PendingApproval,
+    RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow, RequestState,
+    RequestStatusMeta, Store,
 };
 
 #[cfg(test)]
 mod migrations_test;
 #[cfg(test)]
 mod store_test;
+
+#[cfg(test)]
+mod flow_results_test;
+
+#[cfg(test)]
+mod correlation_test;
+
+#[cfg(test)]
+mod flow_journal_test;
+#[cfg(test)]
+mod request_budget_test;
+
+#[cfg(test)]
+mod terminal_uncertainty_test;
+
+#[cfg(test)]
+mod watch_schedule_test;
+
+#[cfg(test)]
+mod watch_progress_test;
+
+#[cfg(test)]
+mod correlation_membership_test;
+
+#[cfg(test)]
+mod landing_session_test;

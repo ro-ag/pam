@@ -32,6 +32,7 @@ use pam_daemon::admin_flows::{
     OP_FLOWS_DELETE, OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_RUN, OP_FLOWS_SAVE,
 };
 use pam_daemon::approval::Resolution;
+use pam_daemon::command_containment::CommandContainment;
 use pam_daemon::daemon::{
     ACTION_EXECUTION_REFUSAL, CAUSE_APPROVAL_DENIED, DAEMON_VERSION, DaemonConfig,
 };
@@ -48,7 +49,8 @@ use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{EVIDENCE_KIND_LOG_COMPACT, RequestState};
 use pam_testkit::{
     FakeSecretBackend, FakeTransport, TestClient, TestDaemon, envelope_for_repo,
-    seed_allowed_programs, seed_extra_path, seed_flow, seed_relaxed, short_tempdir, with_deadline,
+    seed_allowed_programs, seed_extra_path, seed_flow, seed_relaxed, seed_repository_scope,
+    short_tempdir, with_deadline,
 };
 use tokio::sync::watch;
 
@@ -66,6 +68,24 @@ fn helper_dir() -> String {
         .expect("the helper has a directory")
         .display()
         .to_string()
+}
+
+/// Pin fixture Git to Apple's installed toolchain, avoiding the xcrun shim
+/// selected by /usr/bin/git and its denied cache writes.
+fn fixture_extra_path() -> Vec<String> {
+    let mut paths = vec![helper_dir()];
+    if cfg!(target_os = "macos") {
+        for directory in [
+            "/Library/Developer/CommandLineTools/usr/bin",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin",
+        ] {
+            if PathBuf::from(directory).join("git").is_file() {
+                paths.push(directory.to_owned());
+                break;
+            }
+        }
+    }
+    paths
 }
 
 /// A daemon whose flow settings allow `git` and the helper, on a repo
@@ -87,11 +107,23 @@ impl FlowDaemon {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
         seed_allowed_programs(&tmp, &["git", "pam-flow-helper"]).await;
-        seed_extra_path(&tmp, &[&helper_dir()]).await;
+        let extra_path = fixture_extra_path();
+        let extra_path: Vec<&str> = extra_path.iter().map(String::as_str).collect();
+        seed_extra_path(&tmp, &extra_path).await;
         for (id, yaml) in flows {
             drop(seed_flow(&tmp, id, yaml));
         }
         let repo = short_tempdir();
+        seed_repository_scope(
+            &tmp,
+            repo.path(),
+            &[
+                ("github", "https://api.github.test/"),
+                ("sonarqube", "https://sonar.test/"),
+                ("jenkins", "https://jenkins.test/"),
+            ],
+        )
+        .await;
         Self {
             daemon: TestDaemon::spawn_at_with(tmp, mutate).await,
             repo,
@@ -100,7 +132,12 @@ impl FlowDaemon {
 
     /// The repo path a flow's command steps run in.
     fn repo(&self) -> String {
-        self.repo.path().display().to_string()
+        self.repo
+            .path()
+            .canonicalize()
+            .expect("fixture repo exists")
+            .display()
+            .to_string()
     }
 
     /// A `flow.run` envelope for `id`, waiting for the verdict.
@@ -138,7 +175,57 @@ impl FlowDaemon {
         let response = client
             .request(&self.run_envelope(request_id, id, &serde_json::json!({})))
             .await;
-        result_body(response)
+        self.full_report(client, request_id, response).await
+    }
+
+    /// Preserve detailed execution checks through the public redacted evidence path.
+    async fn full_report(
+        &self,
+        client: &mut TestClient,
+        ticket: &str,
+        response: Response,
+    ) -> serde_json::Value {
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 16_384);
+        let projection = result_body(response);
+        assert_eq!(projection["schema_version"], 1);
+        assert_eq!(projection["ticket"], ticket);
+        let verdict = self
+            .daemon
+            .store()
+            .list_evidence(ticket)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == EVIDENCE_KIND_FLOW_RESULT)
+            .expect("full report retained");
+        let mut args =
+            serde_json::json!({"request_id": ticket, "evidence_id": verdict.id, "length": 65536});
+        let mut bytes = Vec::new();
+        for page in 0..128 {
+            let response = client
+                .request(&envelope_for_repo(
+                    &self.repo(),
+                    &format!("{ticket}_report_{page}"),
+                    "evidence.read",
+                    args.clone(),
+                    true,
+                ))
+                .await;
+            let body = result_body(response);
+            let data = body["data"].as_str().expect("hex range");
+            bytes.extend(
+                (0..data.len())
+                    .step_by(2)
+                    .map(|index| u8::from_str_radix(&data[index..index + 2], 16).unwrap()),
+            );
+            if body["eof"] == true {
+                return serde_json::from_slice(&bytes).expect("complete redacted report JSON");
+            }
+            args["offset"] = body["next_offset"].clone();
+            args["expected_view_id"] = body["view_id"].clone();
+            args["expected_sha256"] = body["view_sha256"].clone();
+        }
+        panic!("fixture report exceeded page bound");
     }
 }
 
@@ -233,7 +320,7 @@ async fn flow_list_and_show_answer_for_the_builtins() {
                 .request(&read_envelope(
                     "req_list",
                     CAP_FLOW_LIST,
-                    serde_json::json!({}),
+                    serde_json::json!({"limit":50}),
                 ))
                 .await,
         );
@@ -295,7 +382,7 @@ async fn a_library_flow_shadows_a_builtin_of_the_same_id() {
                 .request(&read_envelope(
                     "req_list",
                     CAP_FLOW_LIST,
-                    serde_json::json!({}),
+                    serde_json::json!({"limit":50}),
                 ))
                 .await,
         );
@@ -325,7 +412,25 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
                 .request(&flows.run_envelope("req_run", "two-step", &serde_json::json!({})))
                 .await,
         );
-        assert_eq!(outcome, Outcome::Verified);
+        let body = flows
+            .full_report(
+                &mut client,
+                "req_run",
+                Response::Result {
+                    id: "req_run".into(),
+                    outcome,
+                    body,
+                    evidence: evidence.clone(),
+                },
+            )
+            .await;
+        if assert_unsupported_flow(&body) {
+            assert_eq!(outcome, Outcome::Blocked);
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
+        assert_eq!(outcome, Outcome::Verified, "{body}");
         assert_eq!(body["outcome"], "verified");
         assert_eq!(body["flow"]["id"], "two-step");
         assert_eq!(body["flow"]["source"], "library");
@@ -357,6 +462,7 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             .list_evidence("req_run")
             .await
             .expect("evidence list ok");
+        let rows = public_step_evidence(&rows);
         let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
         assert_eq!(
             kinds,
@@ -369,7 +475,11 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             ]
         );
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        assert_eq!(ids, evidence, "the answer lists every row the run left");
+        assert_eq!(
+            evidence,
+            vec![ids.last().unwrap().clone()],
+            "outer response retains the full report reference"
+        );
 
         let verdict = store
             .get_evidence(evidence.last().expect("a verdict row"))
@@ -382,15 +492,14 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
         let meta: serde_json::Value =
             serde_json::from_str(verdict.meta_json.as_deref().expect("the verdict has meta"))
                 .expect("the meta is JSON");
-        assert_eq!(
-            meta,
-            serde_json::json!({
-                "flow": "two-step",
-                "outcome": "verified",
-                "steps": 2,
-                "failed": 0,
-            })
-        );
+        assert_eq!(meta["flow"], "two-step");
+        assert_eq!(meta["outcome"], "verified");
+        assert_eq!(meta["steps"], 2);
+        assert_eq!(meta["failed"], 0);
+        let retained = meta["agent_result"]["evidence"].as_array().unwrap();
+        for id in ids {
+            assert!(retained.contains(&serde_json::json!(id)));
+        }
 
         flows
             .daemon
@@ -414,6 +523,11 @@ async fn a_failing_step_is_unresolved_with_its_exit_status_and_attempts() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "failing").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         let bad = step(&body, "bad");
         assert_eq!(bad["status"], "failed");
@@ -451,6 +565,11 @@ async fn a_when_failed_step_runs_only_after_a_failure() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "conditional").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(step(&body, "bad")["status"], "failed");
         assert_eq!(step(&body, "rescue")["status"], "succeeded");
         assert_eq!(step(&body, "never")["status"], "skipped");
@@ -472,6 +591,11 @@ async fn a_step_that_outlives_its_timeout_ends_the_run_unresolved() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "slow").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         let nap = step(&body, "nap");
         assert_eq!(nap["status"], "failed");
@@ -503,6 +627,11 @@ async fn a_step_past_the_output_cap_is_killed() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "loud").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         assert_eq!(step(&body, "spew")["error"]["cause"], CAUSE_OUTPUT_LIMIT);
 
@@ -521,6 +650,13 @@ async fn cancelling_mid_step_stops_the_run_and_the_child() {
                     \x20   timeout: 300s\n";
         let flows = FlowDaemon::spawn(&[("napping", yaml)]).await;
         let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "napping").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let mut cancel_client = flows.daemon.client().await;
 
         // Start the run without waiting, so the cancel has a client of
@@ -617,13 +753,48 @@ async fn a_missing_repo_refuses_before_anything_runs() {
 }
 
 #[tokio::test]
-async fn every_step_publishes_a_running_note_then_its_settle_note() {
+async fn an_existing_but_unapproved_repo_runs_no_steps() {
+    with_deadline(async {
+        let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
+        flows
+            .daemon
+            .store()
+            .set_setting("flows.scope_policy", r#"{"version":1,"repositories":[]}"#)
+            .await
+            .unwrap();
+        let mut client = flows.daemon.client().await;
+        let response = client
+            .request(&flows.run_envelope("req_unscoped", "two-step", &serde_json::json!({})))
+            .await;
+        assert_eq!(refusal_parts(response).0, "scope_denied");
+        assert!(
+            flows
+                .daemon
+                .store()
+                .list_evidence("req_unscoped")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
     with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
         let mut events = flows.daemon.subscribe(&["req_run"]).await;
 
         let body = flows.run(&mut client, "req_run", "two-step").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(step(&body, "version")["status"], "succeeded");
         assert_eq!(step(&body, "prove")["status"], "succeeded");
 
@@ -635,15 +806,7 @@ async fn every_step_publishes_a_running_note_then_its_settle_note() {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            notes,
-            vec![
-                "version: running (1/2)".to_owned(),
-                "version: succeeded".to_owned(),
-                "prove: running (2/2)".to_owned(),
-                "prove: succeeded".to_owned(),
-            ]
-        );
+        assert_eq!(notes, vec!["Task progress updated".to_owned(); 4]);
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
@@ -702,7 +865,14 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
             .wait_for_row("req_run", |row| row.state.is_terminal())
             .await;
         assert_eq!(row.state, RequestState::Done);
-        assert_eq!(row.outcome.as_deref(), Some("changed"));
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "changed"
+            } else {
+                "blocked"
+            })
+        );
 
         let seen: Vec<Event> = events.until_terminal("req_run").await;
         assert!(seen.contains(&Event::ApprovalPending));
@@ -710,8 +880,10 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
 
         // Remembered: the second run never pauses.
         let body = flows.run(&mut client, "req_again", "stateful").await;
-        assert_eq!(body["outcome"], "changed");
-        assert_eq!(step(&body, "change")["status"], "succeeded");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(body["outcome"], "changed");
+            assert_eq!(step(&body, "change")["status"], "succeeded");
+        }
         flows
             .daemon
             .assert_row_state("req_again", RequestState::Done)
@@ -850,7 +1022,7 @@ async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
         flows.grant(&step_capability("connected", "runs")).await;
 
         let body = flows.run(&mut client, "req_run", "connected").await;
-        assert_eq!(body["outcome"], "solved");
+        assert_eq!(body["outcome"], if cfg!(target_os = "macos") { "solved" } else { "blocked" });
         assert_eq!(body["inputs"]["repo"], "ro-ag/pam");
 
         let runs = step(&body, "runs");
@@ -875,7 +1047,9 @@ async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
         assert_eq!(meta["call"], "runs");
 
         // `${steps.runs.result.runs[0].id}` reached the second step's env.
-        assert_eq!(step(&body, "echo")["status"], "succeeded");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(step(&body, "echo")["status"], "succeeded");
+        }
         assert!(transport.url(0).contains("/repos/ro-ag/pam/actions/runs"));
         assert!(
             backend
@@ -944,7 +1118,14 @@ async fn admin_flows_run_submits_through_the_pipeline_as_the_gui() {
             .wait_for_row(&ticket, |row| row.state.is_terminal())
             .await;
         assert_eq!(row.state, RequestState::Done);
-        assert_eq!(row.outcome.as_deref(), Some("verified"));
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "verified"
+            } else {
+                "blocked"
+            })
+        );
         assert_eq!(row.capability, CAP_FLOW_RUN);
         assert_eq!(row.caller_agent, ADMIN_CALLER_AGENT);
         assert_eq!(row.repo, flows.repo());
@@ -1009,7 +1190,9 @@ async fn admin_flows_save_get_and_delete_reach_the_library_the_daemon_reads() {
 
         // And the running daemon can immediately run what was saved.
         let body = flows.run(&mut client, "req_run", "two-step").await;
-        assert_eq!(body["outcome"], "verified");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(body["outcome"], "verified");
+        }
 
         let deleted = result_body(
             client
@@ -1036,26 +1219,85 @@ fn live_cancel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
-/// A spec that runs the helper.
-fn helper_spec(argv: &[&str], timeout: Duration) -> CommandSpec {
-    CommandSpec {
-        program: helper(),
+/// Retain private and repository siblings for the entire contained workload.
+fn helper_spec(argv: &[&str], timeout: Duration) -> (tempfile::TempDir, CommandSpec) {
+    let fixture = short_tempdir();
+    let repository = fixture.path().join("repository");
+    let protected_base = fixture.path().join("private");
+    std::fs::create_dir(&repository).unwrap();
+    std::fs::create_dir(&protected_base).unwrap();
+    let program = helper().canonicalize().unwrap();
+    let read_only_roots = vec![program.parent().unwrap().to_path_buf()];
+    let spec = CommandSpec {
+        program,
         argv: argv.iter().map(|part| (*part).to_owned()).collect(),
-        cwd: std::env::temp_dir(),
+        cwd: repository.clone(),
         env: Vec::new(),
         timeout,
+        containment: CommandContainment {
+            protected_base,
+            repository,
+            read_only_roots,
+            allow_repository_writes: false,
+            artifact_roots: Vec::new(),
+        },
+    };
+    (fixture, spec)
+}
+
+fn assert_unsupported_command(outcome: &CommandOutcome) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
     }
+    assert!(
+        matches!(outcome, CommandOutcome::ContainmentUnavailable { detail }
+            if detail.contains("supported only on macOS")),
+        "expected unsupported containment refusal, got {outcome:?}"
+    );
+    true
+}
+
+/// Platform refusal is a blocked verdict, with no invented output or retry.
+fn assert_unsupported_flow(body: &serde_json::Value) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+    assert_eq!(body["outcome"], "blocked", "{body}");
+    let command = body["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["kind"] == "command")
+        .expect("command report");
+    assert_eq!(command["status"], "blocked", "{body}");
+    assert_eq!(
+        command["error"]["cause"], "command_containment_unavailable",
+        "{body}"
+    );
+    assert!(
+        command["exit_status"].is_null(),
+        "no workload exit is invented"
+    );
+    assert_eq!(
+        command["attempts"], 1,
+        "unavailable containment is not retried"
+    );
+    assert!(
+        command["evidence"].as_array().unwrap().is_empty(),
+        "no workload log exists"
+    );
+    true
 }
 
 #[tokio::test]
 async fn run_command_kills_a_child_that_outlives_its_timeout() {
     with_deadline(async {
         let (_alive, mut cancel) = live_cancel();
-        let outcome = run_command(
-            helper_spec(&["sleep", "600000"], Duration::from_millis(200)),
-            &mut cancel,
-        )
-        .await;
+        let (_fixture, spec) = helper_spec(&["sleep", "600000"], Duration::from_millis(200));
+        let outcome = run_command(spec, &mut cancel).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         assert!(
             matches!(outcome, CommandOutcome::TimedOut { .. }),
             "expected a timeout, got {outcome:?}"
@@ -1068,11 +1310,11 @@ async fn run_command_kills_a_child_that_outlives_its_timeout() {
 async fn run_command_stops_a_child_past_the_output_cap() {
     with_deadline(async {
         let bytes = MAX_SOURCE_BYTES + 1;
-        let outcome = run_command(
-            helper_spec(&["spew", &bytes.to_string()], Duration::from_mins(2)),
-            &mut live_cancel().1,
-        )
-        .await;
+        let (_fixture, spec) = helper_spec(&["spew", &bytes.to_string()], Duration::from_mins(2));
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         match outcome {
             CommandOutcome::OutputLimit { output } => assert_eq!(output.len(), MAX_SOURCE_BYTES),
             other => panic!("expected the output cap, got {other:?}"),
@@ -1085,15 +1327,20 @@ async fn run_command_stops_a_child_past_the_output_cap() {
 async fn run_command_stops_on_the_cancel_signal() {
     with_deadline(async {
         let (alive, mut cancel) = live_cancel();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let _ = alive.send(true);
-        });
-        let outcome = run_command(
-            helper_spec(&["sleep", "600000"], Duration::from_mins(5)),
-            &mut cancel,
-        )
-        .await;
+        let _unsupported_alive = if cfg!(target_os = "macos") {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = alive.send(true);
+            });
+            None
+        } else {
+            Some(alive)
+        };
+        let (_fixture, spec) = helper_spec(&["sleep", "600000"], Duration::from_mins(5));
+        let outcome = run_command(spec, &mut cancel).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         assert_eq!(outcome, CommandOutcome::Cancelled);
     })
     .await;
@@ -1102,9 +1349,13 @@ async fn run_command_stops_on_the_cancel_signal() {
 #[tokio::test]
 async fn the_helper_reads_the_environment_a_step_gives_it() {
     with_deadline(async {
-        let mut spec = helper_spec(&["echo-env", "PAM_FLOW"], Duration::from_secs(30));
+        let (_fixture, mut spec) = helper_spec(&["echo-env", "PAM_FLOW"], Duration::from_secs(30));
         spec.env = vec![("PAM_FLOW".to_owned(), "two-step".to_owned())];
-        match run_command(spec, &mut live_cancel().1).await {
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
+        match outcome {
             CommandOutcome::Exited { status, output } => {
                 assert_eq!(status, 0);
                 assert_eq!(String::from_utf8_lossy(&output).trim(), "two-step");
@@ -1141,6 +1392,11 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "summarized").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let version = step(&body, "version");
         assert_eq!(version["status"], "succeeded");
         assert!(
@@ -1189,15 +1445,14 @@ async fn sonar_test_daemon(yaml: &str, transport: Arc<FakeTransport>) -> FlowDae
 
 async fn sonar_run(flows: &FlowDaemon) -> serde_json::Value {
     let mut client = flows.daemon.client().await;
-    result_body(
-        client
-            .request(&flows.run_envelope(
-                "req_run",
-                "sonar-gate-check",
-                &serde_json::json!({"project": "pam"}),
-            ))
-            .await,
-    )
+    let response = client
+        .request(&flows.run_envelope(
+            "req_run",
+            "sonar-gate-check",
+            &serde_json::json!({"project": "pam"}),
+        ))
+        .await;
+    flows.full_report(&mut client, "req_run", response).await
 }
 
 async fn assert_sonar_evidence(
@@ -1207,7 +1462,9 @@ async fn assert_sonar_evidence(
 ) {
     let store = flows.daemon.store();
     if let Some(status) = expected_status {
-        let id = step(body, "quality-gate")["evidence"][0].as_str().unwrap();
+        // All failed attempts are retained; inspect the final connector result.
+        let evidence_ids = step(body, "quality-gate")["evidence"].as_array().unwrap();
+        let id = evidence_ids.last().unwrap().as_str().unwrap();
         let evidence = store.get_evidence(id).await.unwrap().unwrap();
         assert_eq!(evidence.kind, EVIDENCE_KIND_CONNECTOR_RESULT);
         let saved: serde_json::Value = serde_json::from_slice(&evidence.content).unwrap();
@@ -1254,9 +1511,15 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
         ),
         (
             200,
-            r#"{"projectStatus":{"status":"UNKNOWN","conditions":[]}}"#,
-            Some("UNKNOWN"),
+            r#"{"projectStatus":{"status":"NONE","conditions":[]}}"#,
+            Some("NONE"),
             Some("status_assertion"),
+        ),
+        (
+            200,
+            r#"{"projectStatus":{"status":"UNKNOWN","conditions":[]}}"#,
+            None,
+            Some("connector_bad_response"),
         ),
         (
             200,
@@ -1275,6 +1538,7 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
             let transport = Arc::new(
                 FakeTransport::new()
                     .json(http, response)
+                    .json(200, SONAR_ISSUES_CONTRACT)
                     .json(200, r#"{"issues":[],"total":0}"#),
             );
             let flows = sonar_test_daemon(
@@ -1305,7 +1569,7 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
                 assert_eq!(gate["error"]["cause"], cause);
             }
             assert_eq!(step(&body, "open-issues")["status"], "succeeded");
-            assert!(transport.url(1).contains("/api/issues/search"));
+            assert!(transport.url(2).contains("/api/issues/search"));
             assert_sonar_evidence(&flows, &body, status).await;
             flows.daemon.assert_invariant_clean().await;
             flows.daemon.stop().await;
@@ -1324,6 +1588,7 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
                     r#"{"projectStatus":{"status":"ERROR","conditions":[]}}"#,
                 )
                 .json(200, r#"{"projectStatus":{"status":"OK","conditions":[]}}"#)
+                .json(200, SONAR_ISSUES_CONTRACT)
                 .json(200, r#"{"issues":[],"total":0}"#),
         );
         let yaml = pam_flow::builtin_yaml("sonar-gate-check").unwrap().replace(
@@ -1339,7 +1604,7 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
                 .url(1)
                 .contains("/api/qualitygates/project_status")
         );
-        assert!(transport.url(2).contains("/api/issues/search"));
+        assert!(transport.url(3).contains("/api/issues/search"));
         assert_sonar_evidence(&flows, &body, Some("OK")).await;
         flows.daemon.stop().await;
     })
@@ -1372,6 +1637,11 @@ async fn pam_readiness_any_gate_failure_prevents_verified_and_skips_dependents()
             let flows = FlowDaemon::spawn(&[("pam-pr-readiness", &yaml)]).await;
             let mut client = flows.daemon.client().await;
             let body = flows.run(&mut client, "req_run", "pam-pr-readiness").await;
+            if assert_unsupported_flow(&body) {
+                flows.daemon.assert_invariant_clean().await;
+                flows.daemon.stop().await;
+                return;
+            }
             assert_eq!(
                 body["outcome"],
                 if fail_at.is_none() {
@@ -1417,6 +1687,7 @@ async fn pam_readiness_runs_all_real_project_gates() {
     let tmp = short_tempdir();
     seed_relaxed(&tmp).await;
     seed_allowed_programs(&tmp, &["git", "cargo", "npm"]).await;
+    seed_repository_scope(&tmp, std::path::Path::new(&repo), &[]).await;
     let daemon = TestDaemon::spawn_at(tmp).await;
     let mut client = daemon.client().await;
     let mut envelope = envelope_for_repo(
@@ -1467,6 +1738,9 @@ async fn pam_readiness_runs_all_real_project_gates() {
         serde_json::to_string(&body).unwrap()
     );
     daemon.stop().await;
+    if assert_unsupported_flow(&body) {
+        return;
+    }
     assert_eq!(body["outcome"], "verified", "{body}");
     let steps = body["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 7);
@@ -1483,4 +1757,188 @@ async fn pam_readiness_runs_all_real_project_gates() {
         assert_eq!(step["status"], "succeeded", "{body}");
         assert_eq!(step["exit_status"], 0, "{body}");
     }
+}
+
+#[tokio::test]
+async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_failed_build() {
+    with_deadline(async {
+        let transport = Arc::new(FakeTransport::new()
+            .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
+            .json(200, r##"{"name":"#41","status":"FAILED","stages":[{"id":"5","name":"Test","status":"FAILED"}]}"##)
+            .json(200, r#"{"id":"5","name":"Test","status":"FAILED","stageFlowNodes":[{"id":"6","name":"Shell Script","status":"FAILED","parentNodes":["5"],"error":{"type":"hudson.AbortException","message":"script returned exit code 1"},"_links":{"log":{"href":"/ignored"}}}]}"#)
+            .json(200, r#"{"nodeId":"6","nodeStatus":"FAILED","length":17,"hasMore":false,"text":"assertion failed\n"}"#));
+        let transport_arc = Arc::clone(&transport);
+        let flows = FlowDaemon::spawn_with(&[], move |config| {
+            config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
+            config.http_transport = Some(transport_arc);
+        }).await;
+        let mut client = flows.daemon.client().await;
+        let response = client.request(&admin_envelope("req_jenkins_config", "admin.connectors.configure",
+            serde_json::json!({"id":"jenkins","enabled":true,"base_url":"https://jenkins.test/",
+                "username":"ci-bot","credential":{"set":"test-jenkins-credential"}}))).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        flows.grant(&step_capability("jenkins-build-investigation", "investigate-build")).await;
+        let response = client.request(&flows.run_envelope("req_jenkins_investigate",
+            "jenkins-build-investigation", &serde_json::json!({"job":"service","build":"41"}))).await;
+        let body = flows.full_report(&mut client, "req_jenkins_investigate", response).await;
+        assert_ne!(body["outcome"], "solved");
+        let investigation = step(&body, "investigate-build");
+        assert_eq!(investigation["status"], "failed");
+        let summary = investigation["summary"].as_str().expect("CLI gets bounded observations");
+        assert!(summary.contains("FAILURE") && summary.contains("unresolved"));
+        assert!(summary.len() <= 6000);
+        let evidence = investigation["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        let row = flows.daemon.store().get_evidence(evidence[0].as_str().unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.kind, EVIDENCE_KIND_CONNECTOR_RESULT);
+        let report:serde_json::Value = serde_json::from_slice(&row.content).unwrap();
+        assert_eq!(report["status"],"FAILURE");
+        assert_eq!(report["attribution"],"unresolved");
+        assert_eq!(report["node_logs"][0]["excerpts"][0]["text"],"assertion failed\n");
+        assert!(!String::from_utf8(row.content).unwrap().contains("test-jenkins-credential"));
+        assert_eq!(transport.requests().len(),4);
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() {
+    // macOS assesses newly linked executables once. Warm up through the same
+    // containment path outside the deadline being tested, never via raw exec.
+    if cfg!(target_os = "macos") {
+        let (_fixture, spec) = helper_spec(&["exit", "0"], Duration::from_mins(2));
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        assert!(
+            matches!(outcome, CommandOutcome::Exited { status: 0, .. }),
+            "{outcome:?}"
+        );
+    }
+    with_deadline(async {
+        let yaml = "schema: 1\nid: retained-retry\nname: Retained retry\nsteps:\n  - id: failing\n    run: [pam-flow-helper, unknown-operation]\n    retry: { attempts: 2, backoff: 10s }\n";
+        let flows = FlowDaemon::spawn(&[("retained-retry", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "retained-retry").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
+        let mut request = flows.run_envelope("req_retained_retry", "retained-retry", &serde_json::json!({}));
+        request.deadline_ms = 2_000;
+        let response = client.request(&request).await;
+        assert!(matches!(&response, Response::Refusal { cause, .. } if cause == "deadline_exceeded"), "{response:?}");
+        let evidence = flows.daemon.store().list_evidence(&request.id).await.unwrap();
+        let source = evidence.iter().find(|row| row.kind == EVIDENCE_KIND_LOG_SOURCE).expect("completed failure survives timeout during backoff");
+        let source = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();
+        assert!(String::from_utf8(source.content).unwrap().contains("unknown-operation"));
+        flows.daemon.stop().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view() {
+    with_deadline(async {
+        let yaml = "schema: 1\nid: safe-evidence\nname: Safe evidence\nsteps:\n  - id: failing\n    run: [pam-flow-helper, 'password=private-sentinel-726']\n";
+        let flows = FlowDaemon::spawn(&[("safe-evidence", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "safe-evidence").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
+        let original = flows.run_envelope("req_safe_source", "safe-evidence", &serde_json::json!({}));
+        let response = client.request(&original).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let rows = flows.daemon.store().list_evidence(&original.id).await.unwrap();
+        let source = rows.iter().find(|row| row.kind == EVIDENCE_KIND_LOG_SOURCE).unwrap();
+        let protected = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&protected.content).contains("private-sentinel-726"));
+        let mut read = original.clone();
+        read.capability = "evidence.read".to_owned();
+        let mut collected = Vec::new();
+        let mut offset = 0;
+        let mut view_id = None;
+        let mut digest = None;
+        loop {
+            read.id = format!("req_safe_page_{offset}");
+            read.args = serde_json::json!({"evidence_id":source.id,"request_id":original.id,
+                "offset":offset,"length":8,"expected_view_id":view_id,"expected_sha256":digest});
+            let response = client.request(&read).await;
+            let Response::Result { body, .. } = response else { panic!("{response:?}") };
+            let data = body["data"].as_str().unwrap();
+            for pair in data.as_bytes().chunks_exact(2) {
+                collected.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+            }
+            assert!(body["provenance"].is_array());
+            view_id = Some(body["view_id"].as_str().unwrap().to_owned());
+            digest = Some(body["view_sha256"].as_str().unwrap().to_owned());
+            let Some(next) = body["next_offset"].as_u64() else { break };
+            offset = next;
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(!text.contains("private-sentinel-726"), "{text}");
+        assert!(text.contains("REDACTED"), "{text}");
+        let hash = pam_compact::compact(&collected, None, &pam_compact::Policy::default()).unwrap().source_sha256;
+        assert_eq!(digest.as_deref(), Some(hash.as_str()));
+        flows.daemon.stop().await;
+    }).await;
+}
+
+const SONAR_ISSUES_CONTRACT: &str = r#"{"webServices":[{"path":"api/issues","actions":[{"key":"search","params":[{"key":"components"},{"key":"resolved"},{"key":"ps"}]}]}]}"#;
+
+#[tokio::test]
+async fn explicit_jenkins_node_read_retains_failure_without_claiming_build_verification() {
+    with_deadline(async {
+        let transport = Arc::new(FakeTransport::new()
+            .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
+            .json(200, r#"{"id":"6","name":"Cleanup","status":"SUCCESS","parentNodes":[],"_links":{"log":{"href":"https://attacker.invalid/ignored"}}}"#)
+            .json(200, r#"{"nodeId":"6","nodeStatus":"SUCCESS","length":8,"hasMore":false,"text":"cleaned\n"}"#));
+        let transport_arc = Arc::clone(&transport);
+        let flows = FlowDaemon::spawn_with(&[], move |config| {
+            config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
+            config.http_transport = Some(transport_arc);
+        }).await;
+        let mut client = flows.daemon.client().await;
+        let configured = client.request(&admin_envelope("configure_node", "admin.connectors.configure",
+            serde_json::json!({"id":"jenkins","enabled":true,"base_url":"https://jenkins.test/",
+                "username":"ci-bot","credential":{"set":"fixture-only"}}))).await;
+        assert!(matches!(configured, Response::Result { .. }));
+        flows.grant(&step_capability("jenkins-node-evidence", "retrieve-node")).await;
+        let response = client.request(&flows.run_envelope("read_node", "jenkins-node-evidence",
+            &serde_json::json!({"job":"service","build":"41","node_id":"6"}))).await;
+        let body = flows.full_report(&mut client, "read_node", response).await;
+        assert_ne!(body["outcome"], "verified", "{body}");
+        let retrieved = step(&body, "retrieve-node");
+        assert_eq!(retrieved["status"], "succeeded", "{body}");
+        let evidence = retrieved["evidence"][0].as_str().unwrap();
+        let row = flows.daemon.store().get_evidence(evidence).await.unwrap().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&row.content).unwrap();
+        assert_eq!(report["status"], "FAILURE");
+        assert_eq!(report["node_id"], "6");
+        assert_eq!(report["attribution"], "unresolved");
+        assert_eq!(report["node_logs"][0]["excerpts"][0]["text"], "cleaned\n");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.url.host_str() == Some("jenkins.test")));
+        assert!(requests[1].url.path().ends_with("/41/execution/node/6/wfapi/describe"));
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }).await;
+}
+
+fn public_step_evidence(rows: &[pam_store::EvidenceMeta]) -> Vec<&pam_store::EvidenceMeta> {
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == pam_store::EVIDENCE_KIND_FLOW_CHECKPOINT)
+            .count(),
+        3,
+        "initial state and both settled steps have private checkpoints"
+    );
+    rows.iter()
+        .filter(|row| row.kind != pam_store::EVIDENCE_KIND_FLOW_CHECKPOINT)
+        .collect()
 }

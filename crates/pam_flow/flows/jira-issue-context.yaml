@@ -1,0 +1,16 @@
+schema: 1
+id: jira-issue-context
+name: Jira issue context
+description: >-
+  Retrieve one explicit Jira issue as bounded context. This observation does not verify a build or revision.
+inputs:
+  key:
+    description: explicit jira key identifier
+steps:
+  - id: retrieve-context
+    connector: jira
+    call: issue
+    with:
+      key: "${inputs.key}"
+    role: observe
+    output: compact

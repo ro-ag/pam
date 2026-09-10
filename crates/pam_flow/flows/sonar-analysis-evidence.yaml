@@ -1,0 +1,19 @@
+schema: 1
+id: sonar-analysis-evidence
+name: Sonar analysis evidence
+description: Read the historical gate for an explicit main-branch compute task. Retrieval does not verify a revision.
+inputs:
+  project: { description: Exact Sonar project key }
+  ce_task: { description: Exact compute task ID }
+  page: { default: "1", description: Explicit analysis history page }
+steps:
+  - id: analysis
+    connector: sonarqube
+    call: analysis
+    with:
+      project: "${inputs.project}"
+      ce_task: "${inputs.ce_task}"
+      page: "${inputs.page}"
+    role: observe
+    output: compact
+    timeout: 120s

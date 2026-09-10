@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-truncated-worker-tail",
+  "family_id": "lint/truncated-worker-tail",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "Jenkins",
+    "cargo clippy"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "f6ef8fb36e1ea89ba730306db4971990514ba0d4"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "The exporter has no terminal worker state or exit code."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "requested_commit=f6ef8fb36e1ea89ba730306db4971990514ba0d4",
+      "coverage: tail_missing=true; exit_code=not-observed; worker_terminal_state=not-observed"
+    ],
+    "unresolved_questions": [
+      "What is the terminal state and exit code for this exact worker invocation?"
+    ],
+    "forbidden_conclusions": [
+      "Lint succeeded because the prefix has no error.",
+      "The worker definitely crashed."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

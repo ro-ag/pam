@@ -16,6 +16,11 @@
 //! base dir (for example the one `pam gui` started) instead of spawning
 //! a `pam_testkit` daemon, and `PAM_CHECKPOINT_MODELS_DIR` names the
 //! models directory it installs into (a fresh temp dir by default).
+//!
+//! Native administration is supported on macOS/Linux only. The bridge integration
+//! suite separately verifies explicit unsupported-platform failure.
+
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

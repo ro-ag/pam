@@ -61,11 +61,18 @@ pub const OP_CONNECTORS_KEYRING: &str = "admin.connectors.keyring";
 
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
+/// Read GUI-owned Sonar repository mappings.
+pub const OP_SONAR_MAPPINGS_GET: &str = "admin.connectors.sonar_mappings.get";
+/// Replace GUI-owned Sonar mappings with stale-write protection.
+pub const OP_SONAR_MAPPINGS_SET: &str = "admin.connectors.sonar_mappings.set";
+
 pub const CONNECTOR_ADMIN_OPS: &[&str] = &[
     OP_CONNECTORS_LIST,
     OP_CONNECTORS_CONFIGURE,
     OP_CONNECTORS_TEST,
     OP_CONNECTORS_KEYRING,
+    OP_SONAR_MAPPINGS_GET,
+    OP_SONAR_MAPPINGS_SET,
 ];
 
 /// `audit.action` recording a connector's configuration change.
@@ -89,11 +96,29 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
+            OP_SONAR_MAPPINGS_GET | OP_SONAR_MAPPINGS_SET => self.sonar_mappings(op, args).await,
             OP_CONNECTORS_LIST => self.connectors_list().await,
             OP_CONNECTORS_CONFIGURE => self.connectors_configure(envelope_id, args).await,
             OP_CONNECTORS_TEST => self.connectors_test(args).await,
             OP_CONNECTORS_KEYRING => self.connectors_keyring(args).await,
             _ => return None,
+        })
+    }
+
+    async fn sonar_mappings(&self, op: &str, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let snapshot = if op == OP_SONAR_MAPPINGS_SET {
+            crate::sonar_mapping::Snapshot::save(&self.store,args).await
+        } else {
+            crate::sonar_mapping::Snapshot::load(&self.store).await
+        }.map_err(|error| AdminRefusal { cause: error.cause(), detail: error.to_string(), recovery: "Open PAM Settings → Connectors → SonarQube mappings; reload and correct the mapping." })?;
+        Ok(AdminOk {
+            outcome: if op == OP_SONAR_MAPPINGS_SET {
+                Outcome::Changed
+            } else {
+                Outcome::Verified
+            },
+            body: snapshot.response(),
+            audit: json!({"op":op,"revision":snapshot.revision()}),
         })
     }
 

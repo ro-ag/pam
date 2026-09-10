@@ -300,7 +300,90 @@ fn tensor_dtype_preflight_refuses_known_backend_kernel_gaps() {
         if let Err(RuntimeError::LoadFailed(detail)) = result {
             assert!(detail.contains("blk.0.ffn_down_exps.weight"));
             assert!(detail.contains(backend));
-            assert!(detail.contains("no weights were mapped"));
+            assert!(detail.contains("no weights were read"));
         }
     }
+}
+
+fn loaded_metadata(id: &str) -> crate::runtime::LoadedModel {
+    crate::runtime::LoadedModel {
+        id: id.into(),
+        quant: "Q5_K_M".into(),
+        architecture: "qwen3".into(),
+        context_length: 8192,
+        weight_bytes: 10_514_569_568,
+        device: "cpu".into(),
+        loaded_at: 1,
+        last_used_at: 1,
+        last_tokens_per_sec: None,
+    }
+}
+
+#[test]
+fn requested_identity_is_checked_against_worker_metadata_not_a_prior_snapshot() {
+    let prior = loaded_metadata("qwen/requested");
+    let actual = loaded_metadata("qwen/replacement");
+    let error = crate::runtime::check_requested_model(&actual, Some(&prior.id)).unwrap_err();
+    assert_eq!(
+        error,
+        RuntimeError::ModelMismatch {
+            requested: prior.id.clone(),
+            actual: actual.id.clone(),
+        }
+    );
+    assert_eq!(error.cause(), "model_mismatch");
+    crate::runtime::check_requested_model(&actual, Some(&actual.id)).unwrap();
+    crate::runtime::check_requested_model(&actual, None).unwrap();
+    let identity = crate::runtime::GenerationModel::from(&actual);
+    let serialized = serde_json::to_value(identity).unwrap();
+    assert_eq!(
+        serialized,
+        serde_json::json!({"id":"qwen/replacement","quant":"Q5_K_M",
+        "architecture":"qwen3","device":"cpu","weight_bytes":10_514_569_568_u64})
+    );
+    assert!(serialized.get("sha256").is_none());
+}
+
+#[tokio::test]
+async fn explicit_diagnostic_never_loads_an_idle_worker() {
+    let runtime = Runtime::new();
+    let error = runtime
+        .generate_for("qwen/requested", request(), live(), 2048)
+        .await
+        .unwrap_err();
+    assert_eq!(error, RuntimeError::NoModelLoaded);
+    assert_eq!(runtime.snapshot().state, RuntimeState::Idle);
+    assert!(!runtime.has_pending_work());
+}
+
+#[test]
+fn queued_and_running_work_prevent_exclusive_diagnostic_admission() {
+    use crate::runtime::CommandReservation;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let pending = CommandReservation::acquire(count.clone(), false).unwrap();
+    assert!(CommandReservation::acquire(count.clone(), true).is_none());
+    let queued = CommandReservation::acquire(count.clone(), false).unwrap();
+    drop(pending);
+    assert!(CommandReservation::acquire(count.clone(), true).is_none());
+    drop(queued);
+    let diagnostic = CommandReservation::acquire(count.clone(), true).unwrap();
+    assert!(CommandReservation::acquire(count.clone(), true).is_none());
+    drop(diagnostic);
+    assert_eq!(count.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn prompt_plus_output_overflow_and_smaller_model_context_are_refused() {
+    use crate::runtime::check_output_budget;
+    assert!(check_output_budget(1, usize::MAX, 8192).is_err());
+    assert!(check_output_budget(usize::MAX, 1, 8192).is_err());
+    assert!(check_output_budget(1024, 1025, 2048).is_err());
+    check_output_budget(1024, 1024, 2048).unwrap();
+    check_output_budget(8192, 0, usize::MAX).unwrap();
+    assert!(check_output_budget(8193, 0, usize::MAX).is_err());
 }

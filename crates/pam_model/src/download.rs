@@ -587,6 +587,9 @@ pub fn failure_recovery(cause: &str) -> &'static str {
             "Those weights are already in the models directory; delete them first to refetch."
         }
         "locked" => "Another transfer is writing that file; cancel it first.",
+        "lock_release_failed" => {
+            "Inspect the installed file and current transfer state before retrying; the transfer ended but releasing its lock failed."
+        }
         "verify_failed" => {
             "The digest run could not finish; check the file is readable and still there, then \
              verify again."
@@ -684,7 +687,29 @@ enum CurlOutcome {
 /// Runs a transfer to its terminal state and publishes it.
 async fn run(job: Job, cancelled: watch::Receiver<bool>) {
     let terminal = job.execute(cancelled).await;
-    let _ = job.state.send(terminal);
+    let Job {
+        state, _lock: lock, ..
+    } = job;
+    publish_terminal(&state, lock, terminal);
+}
+
+/// A terminal observer may resume or discard immediately. Explicitly unlock:
+/// closing alone can leave an inherited/duplicated file description holding the
+/// lock until its last reference closes (including a concurrent fork before exec).
+pub(crate) fn publish_terminal(
+    state: &watch::Sender<DownloadState>,
+    lock: File,
+    terminal: DownloadState,
+) {
+    let terminal = match lock.unlock() {
+        Ok(()) => terminal,
+        Err(error) => DownloadState::failed(
+            "lock_release_failed",
+            format!("could not release the transfer lock: {error}"),
+        ),
+    };
+    drop(lock);
+    let _ = state.send(terminal);
 }
 
 impl Job {

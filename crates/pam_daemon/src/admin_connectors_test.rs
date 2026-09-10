@@ -214,6 +214,7 @@ async fn configure_writes_one_connector_configure_row_that_carries_no_secret() {
     drop(logging);
     drop(guard);
 
+    assert_no_persisted_secret(&fixture, &id, &response).await;
     let body = body_of(response, Outcome::Changed);
     assert_eq!(body["id"], "github");
     assert_eq!(body["enabled"], true);
@@ -250,9 +251,8 @@ async fn configure_writes_one_connector_configure_row_that_carries_no_secret() {
             "an audit row carries the secret: {row:?}"
         );
     }
-    // The request row keeps the envelope's args verbatim, so the GUI must
-    // never put a credential where the row can see it — this asserts the
-    // op's own bookkeeping, not the envelope.
+    // Safe operation-specific audit fields preserve the change history while
+    // the generic request row omits arguments entirely.
     assert_eq!(fixture.terminal_actions(&id).await, [ACTION_ADMIN]);
 
     let mut logged = String::new();
@@ -465,7 +465,9 @@ fn the_op_list_names_every_connector_op() {
             OP_CONNECTORS_LIST,
             OP_CONNECTORS_CONFIGURE,
             OP_CONNECTORS_TEST,
-            OP_CONNECTORS_KEYRING
+            OP_CONNECTORS_KEYRING,
+            "admin.connectors.sonar_mappings.get",
+            "admin.connectors.sonar_mappings.set",
         ]
     );
     for op in CONNECTOR_ADMIN_OPS {
@@ -496,5 +498,63 @@ async fn the_keyring_op_answers_reachable_and_denied_without_refusing() {
             .as_str()
             .is_some_and(|line| !line.is_empty()),
         "a denial names the way out: {denied}"
+    );
+}
+
+async fn assert_no_persisted_secret(fixture: &Fixture, id: &str, response: &Response) {
+    let request = fixture
+        .store
+        .get_request(id)
+        .await
+        .expect("request query")
+        .expect("request");
+    assert_eq!(request.args_json, "{}");
+    assert!(
+        !format!("{request:?}").contains(TOKEN),
+        "request contains credential"
+    );
+    assert!(
+        !serde_json::to_string(response)
+            .expect("response JSON")
+            .contains(TOKEN),
+        "response contains credential"
+    );
+    for row in fixture.audit(id).await {
+        assert!(
+            !format!("{row:?}").contains(TOKEN),
+            "audit contains credential"
+        );
+    }
+}
+
+#[tokio::test]
+async fn denied_and_malformed_admin_requests_never_persist_credential_args() {
+    let fixture = fixture().await;
+    let (id, response) = fixture
+        .run_as(
+            "codex",
+            OP_CONNECTORS_CONFIGURE,
+            json!({"id": "github", "credential": {"set": TOKEN}}),
+        )
+        .await;
+    assert_no_persisted_secret(&fixture, &id, &response).await;
+    let (cause, _, _) = refusal_of(response);
+    assert_eq!(cause, CAUSE_ADMIN_DENIED);
+
+    let (id, response) = fixture
+        .run(
+            OP_CONNECTORS_CONFIGURE,
+            json!({"id": "github", "credential": {"set": [TOKEN]}}),
+        )
+        .await;
+    assert_no_persisted_secret(&fixture, &id, &response).await;
+    let (cause, _, _) = refusal_of(response);
+    assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS);
+    assert_eq!(
+        fixture
+            .backend
+            .get(&account_for("github"))
+            .expect("backend"),
+        None
     );
 }

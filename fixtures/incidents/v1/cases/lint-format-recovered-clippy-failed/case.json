@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "case_id": "lint-format-recovered-clippy-failed",
+  "family_id": "lint/format-recovered-clippy-failed",
+  "split": "screening",
+  "stage": "lint",
+  "products": [
+    "rustfmt",
+    "cargo clippy"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline fixture authored for bounded evidence screening; no customer log, credential, or live connector export."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "e085694b78686d34db061d21d14178195b50c823"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "The final clippy result, not the repaired formatting substep, failed the stage."
+  },
+  "expected": {
+    "diagnosis": "code",
+    "decisive_quotes": [
+      "requested_commit=e085694b78686d34db061d21d14178195b50c823",
+      "substep=format attempt=2 exit=0; no formatting diff remains.",
+      "stage=lint terminal=failure; decisive_substep=clippy; clippy_exit=101; format_exit=0",
+      "location: src/cache.rs:92; guard acquired at line 88 and still live during refresh().await.",
+      "temporary checktree restored from the requested commit after detecting stale preparation; developer checkout was not modified."
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "The unresolved formatter diff caused the final failure.",
+      "A single repaired formatting pass proves flakiness."
+    ]
+  },
+  "review": {
+    "author": "candidate_quality",
+    "reviewer": "compatibility",
+    "status": "agent_adjudicated",
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations. Corrected the snapshot to bind the successful formatting check and failing clippy run to the requested source instead of uncommitted formatting changes. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

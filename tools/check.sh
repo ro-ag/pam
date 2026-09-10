@@ -24,6 +24,13 @@ cargo fmt --all --check
 echo "==> cargo clippy (all targets, -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "==> bounded ZeroMQ codec regression tests"
+# --locked, not --offline: the lockfile stays authoritative so dependencies
+# cannot drift, but a machine without these crates already cached (a fresh CI
+# runner) can still fetch them. --offline made this pass only where the
+# registry happened to be warm.
+cargo test --manifest-path vendor/zeromq/Cargo.toml --lib --locked
+
 echo "==> cargo test --workspace"
 cargo test --workspace
 

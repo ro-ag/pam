@@ -1,0 +1,372 @@
+{
+  "schema_version": 1,
+  "purpose": "capped_resource_screening_not_qualification",
+  "task": 137,
+  "pam_revision": "8488dcb",
+  "build_profile": "release",
+  "harness": "crates/pam_model/tests/resource_screen.rs supervised by tools/screen-model.py",
+  "host": {
+    "cpu": "Apple M4 Max",
+    "memory_bytes": 68719476736,
+    "memory_label": "64 GiB, NOT the 32 GB target hardware",
+    "macos_version": "26.6.2",
+    "workload": "ambient editor and browser activity; uncontrolled",
+    "baseline_swap_used_bytes": 1080672256,
+    "impact": "The raised-ceiling Metal runs pushed this host into heavy swapping: swap grew from 1.03 GB used of a 2 GB file to 15.1 GB used of a 16 GB file, receding to 9.6 GB afterwards. Raised-ceiling runs are not routine and should not be repeated without cause."
+  },
+  "artifact": {
+    "repository": "https://huggingface.co/Qwen/Qwen3-14B-GGUF",
+    "revision": "530227a7d994db8eca5ab5ced2fb692b614357fd",
+    "file": "Qwen3-14B-Q5_K_M.gguf",
+    "bytes": 10514569568,
+    "sha256": "e7c9aba1129ca2936be9eca01419d9f86af40e08caa01230d5574b34d08e3e31",
+    "sha256_verified_locally": true,
+    "license_sha256_declared": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+    "license_verified_by_harness": false
+  },
+  "supervisor": {
+    "sampled_rss_soft_stop_bytes": 17179869184,
+    "sample_interval_seconds": 0.5,
+    "deadline_seconds": 1200,
+    "stop_kind": "sampled soft stop, not an OS hard cap",
+    "rss_is_metal_total": false,
+    "phys_footprint_sampled_since_run3": true,
+    "phys_footprint_note": "Runs 1 and 2 on each backend recorded ps RSS only. Run 3 records phys_footprint, the metric macOS uses for pressure and jetsam, alongside RSS."
+  },
+  "framing": {
+    "template": "production_chatml",
+    "template_qualified": false,
+    "note": "The runtime hardcodes generic ChatML. The pinned dense Qwen3 template requires an empty think prefix for enable_thinking=false, so these framed token counts are the production framing, not the upstream-equivalent framing.",
+    "temperature": 0,
+    "output_cap_tokens": 64
+  },
+  "metal": {
+    "outcome": "terminated_during_load_before_any_phase",
+    "runs": [
+      {
+        "run": 1,
+        "elapsed_seconds": 25.904,
+        "peak_sampled_rss_bytes": 17528012800,
+        "reason": "sampled_rss_limit",
+        "samples": 50
+      },
+      {
+        "run": 2,
+        "elapsed_seconds": 23.085,
+        "peak_sampled_rss_bytes": 18354438144,
+        "reason": "sampled_rss_limit",
+        "samples": 45
+      },
+      {
+        "run": 3,
+        "elapsed_seconds": 21.755,
+        "peak_sampled_rss_bytes": 18732000000,
+        "peak_sampled_phys_footprint_bytes": 19330000000,
+        "reason": "sampled_rss_limit",
+        "instrumentation": "phys_footprint sampled"
+      }
+    ],
+    "load_completed": false,
+    "prefill_measured": false,
+    "decode_measured": false,
+    "unload_measured": false,
+    "peak_is_lower_bound": true,
+    "synchronized_prefill_run": {
+      "ceiling_bytes": 51539607552,
+      "ceiling_is_default": false,
+      "load_wall_ms": 1912,
+      "elapsed_seconds": 53.125,
+      "reason": "sampled_footprint_limit",
+      "child_reaped": false,
+      "peak_sampled_rss_bytes": 17690000000,
+      "kernel_peak_phys_footprint_bytes": 58090000000,
+      "steady_state_rss_bytes": 17680000000,
+      "phases": [
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 1487,
+          "decode_ms": 2311
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 1442,
+          "decode_ms": 2316
+        },
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 3094,
+          "decode_ms": 2729
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 3265,
+          "decode_ms": 2742
+        }
+      ],
+      "note": "Prefill is about 342 tokens per second against CPU's 11.3, roughly 30x. Steady state after load is about 17.7 GB, but transient GPU allocations during generation take the kernel high-water mark far above it."
+    }
+  },
+  "cpu": {
+    "outcome": "load_and_512_and_1024_phases_completed_then_terminated_during_2048_phase",
+    "model_reported": {
+      "id": "qwen/Qwen3-14B-Q5_K_M",
+      "architecture": "qwen3",
+      "quant": "Q5_K_M",
+      "device": "cpu",
+      "context_length": 8192,
+      "weight_bytes": 10514569568
+    },
+    "runs": [
+      {
+        "run": 1,
+        "load_wall_ms": 1935,
+        "rss_after_load_bytes": 15560000000,
+        "elapsed_seconds": 460.54,
+        "peak_sampled_rss_bytes": 17191075840,
+        "reason": "sampled_rss_limit",
+        "samples": 881,
+        "added_swapout_pages": 0,
+        "phases": [
+          {
+            "phase": "first_at_length",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44159,
+            "decode_ms": 9670,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.617898727764735,
+            "wall_ms": 53830,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44753,
+            "decode_ms": 9420,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.793845478861928,
+            "wall_ms": 54174,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "first_at_length",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 90085,
+            "decode_ms": 11934,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.362636697839836,
+            "wall_ms": 102020,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 91342,
+            "decode_ms": 11773,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.4361286386474985,
+            "wall_ms": 103115,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          }
+        ]
+      },
+      {
+        "run": 2,
+        "load_wall_ms": 1901,
+        "rss_after_load_bytes": 15560000000,
+        "elapsed_seconds": 470.49,
+        "peak_sampled_rss_bytes": 17184079872,
+        "reason": "sampled_rss_limit",
+        "samples": 896,
+        "added_swapout_pages": 0,
+        "phases": [
+          {
+            "phase": "first_at_length",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44292,
+            "decode_ms": 9336,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.86,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44210,
+            "decode_ms": 9347,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.85,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "first_at_length",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 91060,
+            "decode_ms": 12662,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.05,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 101696,
+            "decode_ms": 11706,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.47,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          }
+        ]
+      },
+      {
+        "run": 3,
+        "elapsed_seconds": 455.805,
+        "peak_sampled_rss_bytes": 17194713088,
+        "peak_sampled_phys_footprint_bytes": 17180000000,
+        "reason": "sampled_rss_limit",
+        "added_swapout_pages": 0,
+        "instrumentation": "phys_footprint sampled in parallel at 2 s cadence",
+        "note": "Same phases as runs 1 and 2; terminated during the 2048-token phase."
+      }
+    ],
+    "phases_never_reached": [
+      "2048_token_prefill",
+      "cancellation",
+      "recovery",
+      "unload"
+    ],
+    "complete_run": {
+      "ceiling_bytes": 23622320128,
+      "ceiling_is_default": false,
+      "outcome": "every phase completed",
+      "exit_code": 0,
+      "elapsed_seconds": 1119.502,
+      "peak_sampled_rss_bytes": 19170000000,
+      "kernel_peak_phys_footprint_bytes": 19240000000,
+      "added_swapout_pages": 0,
+      "pressure": "normal throughout",
+      "load_wall_ms": 1712,
+      "phases": [
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 44391,
+          "decode_ms": 9155
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 44188,
+          "decode_ms": 9208
+        },
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 89407,
+          "decode_ms": 11340
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 89287,
+          "decode_ms": 11265
+        },
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 2045,
+          "prompt_ms": 185741,
+          "decode_ms": 15715
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 2045,
+          "prompt_ms": 185231,
+          "decode_ms": 15702
+        }
+      ],
+      "cancellation": {
+        "signal_sent": true,
+        "outcome": "cancelled",
+        "signal_to_return_ms": 185050,
+        "worker_preemption_proven": false,
+        "phase_at_signal": "not_observable",
+        "reading": "The signal was sent after 100 ms and the call returned only after the whole prefill. Cancellation is not honoured within any useful bound."
+      },
+      "recovery_after_cancel": {
+        "succeeded": true,
+        "actual_prompt_tokens": 2045,
+        "prompt_ms": 185603,
+        "decode_ms": 15748
+      },
+      "unload": {
+        "wall_ms": 64,
+        "external_rss_after_unload_bytes": 17800000000,
+        "reading": "Unload reports success but the working set stays resident: RSS held near 17.8 GB for the final ten seconds of sampling. Allocator retention could explain some of it, but large tensor allocations would normally be munmapped on free, so this needs a dedicated check."
+      }
+    }
+  },
+  "findings": [
+    "The artifact is Candle-compatible on CPU: it loads reporting architecture qwen3, quant Q5_K_M and context_length 8192, and it generates.",
+    "Decoding is deterministic at temperature 0: warm repeats and both independent processes produced identical output digests at 509 and 1019 framed tokens.",
+    "Both backends exceeded the 16 GiB sampled screening ceiling. Metal exceeded it during load alone, in both runs, without producing any load time, prefill, decode or unload measurement.",
+    "CPU resident set was about 1.5x artifact bytes after load and then climbed monotonically from about 16.0 GB to about 17.2 GB across the 2048-token phase, never returning.",
+    "CPU prefill is roughly linear at about 11.3 tokens per second: 44 s at 509 framed tokens and 90 s at 1019.",
+    "Pressure remained normal and no swapout pages were added in any run on this 64 GiB host.",
+    "Resident set is not an overstatement from evictable mapped weights: phys_footprint tracks ps RSS within about 0.4 GB throughout and peaks HIGHER on both backends (CPU 17.18 GB against RSS 17.16 GB; Metal 19.33 GB against RSS 18.73 GB), because it excludes clean file-backed pages and includes compressed ones. The working set is real anonymous memory: weights are materialized, not mapped.",
+    "The working set exceeds artifact bytes by roughly 4.5 GB on CPU and over 8.8 GB on Metal, so weight bytes underestimate demand by a large and backend-dependent margin.",
+    "Metal is far faster than CPU once its timings are honest: prefill about 342 tokens per second against 11.3, with load at about 1.9 s on both. Steady state after load is about 17.7 GB.",
+    "Metal's binding constraint is not steady state but transient GPU allocation during generation, which grows with prompt length and drove the kernel high-water mark to 58.09 GB on a 64 GiB host while RSS stayed flat near 17.7 GB. That figure is an upper bound on what this host PERMITTED, not a prediction of demand under a smaller budget: with headroom available the allocator and Metal driver cache freely, the compressor stays lazy and purgeable GPU memory is never reclaimed.",
+    "A 2048-token prefill costs over three minutes on CPU (185.7 s), and the widest phase sets the peak: 19.17 GB RSS against the 17.53 GB seen when a run stopped after 1024 tokens.",
+    "Cancellation is not bounded: a signal sent at 100 ms returned only after 185,050 ms, the entire prefill, with worker preemption unproven. Recovery after cancel did succeed.",
+    "Unload does not return the working set: it reports success in 64 ms while about 17.8 GB stays resident."
+  ],
+  "limitations": [
+    "This is capped resource screening on 64 GiB hardware. It is not a 32 GB qualification and no 32 GB claim follows from it.",
+    "Every peak is a lower bound: the supervisor terminated each run mid-climb at a sampled soft stop, so no true peak working set was established for either backend.",
+    "Resident set size is not the Metal footprint; the Metal figures bound host RSS only.",
+    "The 2048-token envelope, cancellation behaviour, recovery and unload were never measured, on either backend.",
+    "Framing is the production generic ChatML, which is not the upstream-equivalent framing for this artifact in non-thinking mode, so answer quality was neither measured nor compared.",
+    "One synthetic build-record fixture with a 64-token output cap and ambient host load. No task quality, incident, fidelity or benefit qualification.",
+    "The second pinned candidate, Qwen3-Coder-30B-A3B-Instruct-Q3_K_S, has not been downloaded or screened.",
+    "Whether phys_footprint attributing unified-memory GPU allocations this way reflects pressure the same as anonymous CPU memory has not been independently confirmed.",
+    "The complete run is CPU only and used a 22 GiB ceiling. Metal still has no 2048-token, cancellation, recovery or unload measurement, because its transient GPU allocation stops the run first.",
+    "No behaviour observed here predicts a 32 GB machine, in either direction. Memory management is budget-dependent: a constrained host compresses, evicts purgeable buffers, fails allocations or sizes driver caches differently, and none of those paths are exercised when 64 GiB is available. Only the real target hardware, or a genuinely memory-constrained environment, can answer admission."
+  ],
+  "corrections": [
+    {
+      "what": "Metal prefill timing was fabricated",
+      "detail": "prompt_ms stopped its clock right after forward(), which on Metal only ENQUEUES GPU work, so the reported prefill was enqueue latency (6-11 ms for a 1000-token prompt) and its real cost reappeared inside decode_ms. This was production code feeding GUI diagnostics, not only the harness. The device is now synchronized before the prefill clock stops.",
+      "before": {
+        "509_prompt_ms": 11,
+        "1019_prompt_ms": 9
+      },
+      "after": {
+        "509_prompt_ms": 1487,
+        "1019_prompt_ms": 3094
+      }
+    },
+    {
+      "what": "phys_footprint readings carried false precision",
+      "detail": "`footprint -p` text output rounds large processes to whole GB, so every earlier reading was an exact whole GiB (17, 19, 22, 24, 34, 40) presented with two decimals. The probe now uses `footprint -j`, which is byte-exact and also exposes phys_footprint_peak, a kernel high-water mark that cannot miss a transient between samples."
+    },
+    {
+      "what": "The measurement record was lost on the most extreme runs",
+      "detail": "A child inside an uninterruptible GPU call survived SIGTERM and SIGKILL, and the unhandled second wait() raised TimeoutExpired, killing the supervisor before it wrote its finished record. terminate() no longer raises and the record now reports child_reaped."
+    },
+    {
+      "what": "The soft stop could be evaded by a spike",
+      "detail": "The stop tested only the current sampled phys_footprint, so a GPU allocation that spiked and subsided between 0.5 s samples never triggered it: under a 48 GiB ceiling the kernel high-water mark reached 58.09 GB. The stop now also tests the kernel peak."
+    }
+  ]
+}

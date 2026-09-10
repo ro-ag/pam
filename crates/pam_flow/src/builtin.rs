@@ -1,6 +1,6 @@
 //! The starter flows, compiled into the binary.
 //!
-//! A fresh install has a working library on day one: these eight files ship
+//! A fresh install has a working library on day one: these starter files ship
 //! inside pam, are listed like any other flow, and are the templates a human
 //! clones and edits. Saving a library file with the same id shadows the
 //! builtin; deleting that file reveals it again, so a starter flow can never
@@ -25,8 +25,28 @@ const BUILTINS: &[BuiltinFlow] = &[
         yaml: include_str!("../flows/ci-failure-triage.yaml"),
     },
     BuiltinFlow {
+        id: "confluence-page-context",
+        yaml: include_str!("../flows/confluence-page-context.yaml"),
+    },
+    BuiltinFlow {
         id: "dependency-audit",
         yaml: include_str!("../flows/dependency-audit.yaml"),
+    },
+    BuiltinFlow {
+        id: "guarded-land",
+        yaml: include_str!("../flows/guarded-land.yaml"),
+    },
+    BuiltinFlow {
+        id: "jenkins-build-investigation",
+        yaml: include_str!("../flows/jenkins-build-investigation.yaml"),
+    },
+    BuiltinFlow {
+        id: "jenkins-node-evidence",
+        yaml: include_str!("../flows/jenkins-node-evidence.yaml"),
+    },
+    BuiltinFlow {
+        id: "jira-issue-context",
+        yaml: include_str!("../flows/jira-issue-context.yaml"),
     },
     BuiltinFlow {
         id: "pam-pr-readiness",
@@ -41,12 +61,44 @@ const BUILTINS: &[BuiltinFlow] = &[
         yaml: include_str!("../flows/release-readiness.yaml"),
     },
     BuiltinFlow {
+        id: "revision-ci-triage",
+        yaml: include_str!("../flows/revision-ci-triage.yaml"),
+    },
+    BuiltinFlow {
+        id: "revision-jenkins-check",
+        yaml: include_str!("../flows/revision-jenkins-check.yaml"),
+    },
+    BuiltinFlow {
+        id: "revision-sonar-check",
+        yaml: include_str!("../flows/revision-sonar-check.yaml"),
+    },
+    BuiltinFlow {
+        id: "sharepoint-document-context",
+        yaml: include_str!("../flows/sharepoint-document-context.yaml"),
+    },
+    BuiltinFlow {
+        id: "sonar-analysis-evidence",
+        yaml: include_str!("../flows/sonar-analysis-evidence.yaml"),
+    },
+    BuiltinFlow {
         id: "sonar-gate-check",
         yaml: include_str!("../flows/sonar-gate-check.yaml"),
     },
     BuiltinFlow {
         id: "summarize-build-log",
         yaml: include_str!("../flows/summarize-build-log.yaml"),
+    },
+    BuiltinFlow {
+        id: "watch-github-run",
+        yaml: include_str!("../flows/watch-github-run.yaml"),
+    },
+    BuiltinFlow {
+        id: "watch-jenkins-build",
+        yaml: include_str!("../flows/watch-jenkins-build.yaml"),
+    },
+    BuiltinFlow {
+        id: "watch-sonar-analysis",
+        yaml: include_str!("../flows/watch-sonar-analysis.yaml"),
     },
 ];
 

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-compute-storage-error",
+  "family_id": "v1-sonar-compute-storage-error",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Exact CE task ce-503 reports FAILED with storage failure; no analysis ID exists."
+  },
+  "expected": {
+    "diagnosis": "infra",
+    "decisive_quotes": [
+      "ce error: analysis persistence failed: database storage volume is full",
+      "analysisId: absent",
+      "project=example branch=feature/work ce_task=ce-503 status=FAILED"
+    ],
+    "unresolved_questions": [],
+    "forbidden_conclusions": [
+      "A previous green gate rescues this failed compute-engine task."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

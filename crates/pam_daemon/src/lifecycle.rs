@@ -10,8 +10,9 @@
 //! Windows). The holder writes its pid into the file so a losing
 //! contender can name who beat it. The lock is held for the daemon's
 //! whole lifetime — [`InstanceLock`] keeps the file handle open and the
-//! OS releases the lock when the handle drops (daemon exit included, so
-//! a crashed daemon never wedges the next one).
+//! guard explicitly unlocks on drop, including when a subprocess temporarily
+//! inherited the open file description. Process exit also releases the lock
+//! once the OS closes the last inherited handle.
 //!
 //! # Lock-first ordering
 //!
@@ -26,7 +27,8 @@
 //! # Crash recovery
 //!
 //! On boot — after the lock, before the lanes are rebuilt —
-//! [`recover_stuck_rows`] fails every `running` / `waiting_approval`
+//! [`recover_stuck_rows`] requeues safe journaled flows under their original
+//! admission and expiry, and fails legacy `running` / `waiting_approval`
 //! row a dead daemon left mid-flight: terminal `failed`, outcome
 //! [`CAUSE_DAEMON_RESTART`], audited through the
 //! [`pam_store::Store::finish_request`] choke point (action
@@ -88,6 +90,14 @@ pub enum LifecyclePhase {
 /// Why a lifecycle operation failed.
 #[derive(Debug, Error)]
 pub enum LifecycleError {
+    /// A durable recovery operation failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A legacy in-flight row exceeds the bounded startup reader.
+    #[error(
+        "legacy_recovery_oversized: stop PAM, back up the state database, and have an operator repair oversized running/waiting_approval rows before restarting"
+    )]
+    LegacyRecoveryOversized,
     /// Another daemon already holds the instance lock.
     #[error(
         "another pam daemon already holds {} ({})",
@@ -118,11 +128,23 @@ pub enum LifecycleError {
 #[derive(Debug)]
 pub struct InstanceLock {
     /// The open, locked handle. Held only for the lock it carries.
-    _file: File,
+    file: File,
     path: PathBuf,
 }
 
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing only this descriptor is insufficient while a forked child
+        // retains the shared open file description before exec closes it.
+        let _ = self.file.unlock();
+    }
+}
+
 impl InstanceLock {
+    #[cfg(test)]
+    pub(crate) fn duplicate_handle_for_test(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
     /// Path of the held lock file.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -156,7 +178,7 @@ pub fn acquire_instance_lock(run_dir: &Path) -> Result<InstanceLock, LifecycleEr
             file.seek(SeekFrom::Start(0)).map_err(io_err)?;
             write!(file, "{}", std::process::id()).map_err(io_err)?;
             file.flush().map_err(io_err)?;
-            Ok(InstanceLock { _file: file, path })
+            Ok(InstanceLock { file, path })
         }
         Err(TryLockError::WouldBlock) => {
             let pid = std::fs::read_to_string(&path)
@@ -169,57 +191,161 @@ pub fn acquire_instance_lock(run_dir: &Path) -> Result<InstanceLock, LifecycleEr
 }
 
 /// Fails every `running` / `waiting_approval` row a dead daemon left
-/// mid-flight (see the module docs), returning the ids it recovered.
+/// mid-flight (see the module docs), returning the number it recovered.
 ///
 /// Every failure goes through [`Store::finish_request`] — terminal
 /// state and audit row in one transaction, first-wins on an already
 /// terminal row. A recovered `waiting_approval` row's dangling approval
 /// is resolved as a timeout (note [`CAUSE_DAEMON_RESTART`]) so the
 /// GUI's pending list does not advertise an approval nobody can grant.
-pub async fn recover_stuck_rows(store: &Store) -> Result<Vec<String>, StoreError> {
-    let stuck = store.list_stuck_ordered().await?;
-    let mut recovered = Vec::with_capacity(stuck.len());
-    for row in stuck {
-        let was_waiting = row.state == RequestState::WaitingApproval;
-        let detail = serde_json::json!({
-            "cause": CAUSE_DAEMON_RESTART,
-            "note": "the daemon restarted while this request was in flight; \
-                     re-run the pam command to retry",
-        })
-        .to_string();
-        let finished = store
-            .finish_request(
-                &row.id,
-                RequestState::Failed,
-                Some(CAUSE_DAEMON_RESTART),
-                AuditEntry {
-                    action: ACTION_DAEMON_RESTART,
-                    decision: Decision::Timeout,
-                    actor: Actor::System,
-                    detail: Some(&detail),
-                },
+/// Pages contain at most 16 rows and 8 MiB of selected text. Oversized legacy
+/// rows stop startup explicitly for operator backup/repair; prior recovered
+/// pages remain audited and terminal, making the next startup restart-safe.
+pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> {
+    let mut recovered = 0_usize;
+    let mut after: Option<(i64, String)> = None;
+    loop {
+        let stuck = store
+            .stuck_recovery_page(
+                after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                8 * 1024 * 1024,
             )
-            .await?;
-        if was_waiting {
-            match store
-                .resolve_approval(
+            .await?
+            .ok_or(LifecycleError::LegacyRecoveryOversized)?;
+        let Some(last) = stuck.last() else {
+            return Ok(recovered);
+        };
+        after = Some((last.created_ts, last.id.clone()));
+        for row in stuck {
+            let was_waiting = row.state == RequestState::WaitingApproval;
+            let recovery = recover_journal(store, &row).await?;
+            if recovery == JournalRecovery::Requeued {
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
+            let cause = if recovery == JournalRecovery::Uncertain {
+                "flow_effect_uncertain"
+            } else {
+                CAUSE_DAEMON_RESTART
+            };
+            let detail = serde_json::json!({
+                "cause": cause,
+                "note": if recovery == JournalRecovery::Uncertain {
+                    "A state-changing step may have executed. Inspect the retained checkpoint and reconcile its effects before submitting new work; PAM will not replay it."
+                } else {
+                    "The daemon restarted without a recoverable checkpoint; inspect evidence before submitting new work."
+                },
+            })
+            .to_string();
+            let finished = store
+                .finish_request(
                     &row.id,
-                    ApprovalResolution::Timeout,
-                    Some(CAUSE_DAEMON_RESTART),
+                    RequestState::Failed,
+                    Some(cause),
+                    AuditEntry {
+                        action: ACTION_DAEMON_RESTART,
+                        decision: Decision::Timeout,
+                        actor: Actor::System,
+                        detail: Some(&detail),
+                    },
                 )
-                .await
-            {
-                // NotFound: no unresolved approval row (e.g. the daemon
-                // died between the state write and the approval insert).
-                Ok(()) | Err(StoreError::NotFound { .. }) => {}
-                Err(err) => return Err(err),
+                .await?;
+            if was_waiting {
+                match store
+                    .resolve_approval(
+                        &row.id,
+                        ApprovalResolution::Timeout,
+                        Some(CAUSE_DAEMON_RESTART),
+                    )
+                    .await
+                {
+                    // NotFound: no unresolved approval row (e.g. the daemon
+                    // died between the state write and the approval insert).
+                    Ok(()) | Err(StoreError::NotFound { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            if finished {
+                recovered = recovered.saturating_add(1);
             }
         }
-        if finished {
-            recovered.push(row.id);
-        }
     }
-    Ok(recovered)
+}
+
+#[derive(PartialEq, Eq)]
+enum JournalRecovery {
+    Requeued,
+    Uncertain,
+    Legacy,
+}
+
+async fn expire_old_approval(store: &Store, id: &str) -> Result<(), StoreError> {
+    match store
+        .resolve_approval(id, ApprovalResolution::Timeout, Some(CAUSE_DAEMON_RESTART))
+        .await
+    {
+        Ok(()) | Err(StoreError::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Startup holds the instance lock, so no worker can race these transitions.
+/// Ordinary interrupted writes are never replayed. A private typed landing
+/// intent can resume only its read-only reconciliation on the original ticket.
+async fn recover_journal(
+    store: &Store,
+    row: &pam_store::RequestRow,
+) -> Result<JournalRecovery, StoreError> {
+    use pam_store::FlowJournalState;
+    if row.capability != "flow.run" {
+        return Ok(JournalRecovery::Legacy);
+    }
+    let Some(journal) = store.read_flow_journal(&row.id).await? else {
+        return Ok(JournalRecovery::Legacy);
+    };
+    let now = recovery_now_ms();
+    match journal.state {
+        FlowJournalState::Uncertain => return Ok(JournalRecovery::Uncertain),
+        FlowJournalState::Prepared if journal.effectful => {
+            if !store
+                .recover_landing_reconciliation(&row.id, journal.revision, now)
+                .await?
+            {
+                store.mark_flow_uncertain(&row.id, journal.revision).await?;
+                return Ok(JournalRecovery::Uncertain);
+            }
+        }
+        FlowJournalState::Prepared => {
+            if !store
+                .abandon_read_attempt(&row.id, journal.revision)
+                .await?
+            {
+                return Ok(JournalRecovery::Legacy);
+            }
+        }
+        FlowJournalState::Ready | FlowJournalState::Completed => {}
+    }
+    if row.state == RequestState::WaitingApproval {
+        expire_old_approval(store, &row.id).await?;
+    }
+    Ok(
+        if store
+            .requeue_journaled_flow(&row.id, recovery_now_ms())
+            .await?
+        {
+            JournalRecovery::Requeued
+        } else {
+            JournalRecovery::Legacy
+        },
+    )
+}
+
+fn recovery_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Builds the non-blocking writer for the daemon's own log:

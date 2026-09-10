@@ -59,6 +59,7 @@
 use std::io::{Read, Seek};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -115,6 +116,9 @@ pub struct GenerateRequest {
 /// What a generation produced, and what it cost.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GenerateResult {
+    /// Identity captured from the worker that performed this generation.
+    /// This is loaded-model metadata, not a freshly verified file digest.
+    pub model: GenerationModel,
     /// The decoded completion, special tokens dropped and truncated at a
     /// stop string when one hit.
     pub text: String,
@@ -131,6 +135,33 @@ pub struct GenerateResult {
     pub tokens_per_sec: f64,
 }
 
+/// Actual loaded-model identity associated with a single generation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GenerationModel {
+    /// Registry ID of the loaded artifact.
+    pub id: String,
+    /// Architecture actually loaded by the worker.
+    pub architecture: String,
+    /// Quantization label recorded at load.
+    pub quant: String,
+    /// Actual backend, for example `cpu` or `metal`.
+    pub device: String,
+    /// Artifact size recorded at load, not a working-set measurement.
+    pub weight_bytes: u64,
+}
+
+impl From<&LoadedModel> for GenerationModel {
+    fn from(model: &LoadedModel) -> Self {
+        Self {
+            id: model.id.clone(),
+            architecture: model.architecture.clone(),
+            quant: model.quant.clone(),
+            device: model.device.clone(),
+            weight_bytes: model.weight_bytes,
+        }
+    }
+}
+
 /// The model currently in memory.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LoadedModel {
@@ -143,7 +174,12 @@ pub struct LoadedModel {
     /// Effective context: [`CONTEXT_TOKENS`], or the model's own figure when
     /// that is smaller.
     pub context_length: usize,
-    /// File size — the mapped footprint. No invented KV-cache byte figures.
+    /// Artifact file size. This is NOT the working set: tensors are read
+    /// into owned buffers rather than mapped, and the token embedding is
+    /// dequantized to F32, so measured resident memory runs well above this
+    /// figure — about 15.0 GB on CPU and over 19.3 GB on Metal for a
+    /// 10.5 GB artifact. See docs/model-resource-screen.md. No invented
+    /// KV-cache byte figures.
     pub weight_bytes: u64,
     /// `metal` or `cpu`.
     pub device: String,
@@ -161,7 +197,7 @@ pub struct LoadedModel {
 pub enum RuntimeState {
     /// Nothing loaded; the memory is back with the developer.
     Idle,
-    /// A load is in flight. `phase` is `reading_header`, `mapping_tensors`
+    /// A load is in flight. `phase` is `reading_header`, `reading_tensors`
     /// or `ready` — candle exposes no per-tensor progress, so PAM reports
     /// the phases it can actually observe instead of a fake percentage.
     Loading {
@@ -189,6 +225,14 @@ pub enum RuntimeError {
     /// A generate arrived with nothing loaded.
     #[error("no model is loaded")]
     NoModelLoaded,
+    /// The requested installed model is not the one held by this worker.
+    #[error("requested model {requested:?} is not loaded; actual loaded model is {actual:?}")]
+    ModelMismatch {
+        /// The explicit model requested by this diagnostic.
+        requested: String,
+        /// The model held by the worker when it refused.
+        actual: String,
+    },
     /// The file is a model PAM does not implement.
     #[error("architecture {0:?} is not supported (qwen3, qwen3moe)")]
     UnsupportedArchitecture(String),
@@ -226,6 +270,7 @@ impl RuntimeError {
     pub fn cause(&self) -> &'static str {
         match self {
             Self::NoModelLoaded => "no_model_loaded",
+            Self::ModelMismatch { .. } => "model_mismatch",
             Self::UnsupportedArchitecture(_) => "unsupported_architecture",
             Self::LoadFailed(_) => "load_failed",
             Self::PromptTooLong { .. } => "prompt_too_long",
@@ -253,8 +298,20 @@ enum Command {
         /// Where the acknowledgement goes.
         reply: oneshot::Sender<()>,
     },
+    /// Run Microsoft extraction after releasing the generator weights.
+    Compress {
+        directory: std::path::PathBuf,
+        text: String,
+        target_bytes: usize,
+        cancel: watch::Receiver<bool>,
+        reply: oneshot::Sender<Result<crate::compression::CompressionReport, RuntimeError>>,
+    },
     /// Run one generation to completion.
     Generate {
+        /// An explicit identity constraint, checked atomically on the worker.
+        expected_model: Option<String>,
+        /// Maximum admitted input tokens for this task.
+        input_limit: usize,
         /// What to generate.
         request: Box<GenerateRequest>,
         /// Flips to true to stop between tokens.
@@ -264,12 +321,42 @@ enum Command {
     },
 }
 
+/// Includes accepted-but-not-started work and outlives abandoned reply receivers.
+pub(crate) struct CommandReservation(Arc<AtomicUsize>);
+
+impl CommandReservation {
+    pub(crate) fn acquire(counter: Arc<AtomicUsize>, exclusive: bool) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                if exclusive && pending != 0 {
+                    None
+                } else {
+                    pending.checked_add(1)
+                }
+            })
+            .ok()?;
+        Some(Self(counter))
+    }
+}
+
+impl Drop for CommandReservation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct QueuedCommand {
+    command: Command,
+    reservation: CommandReservation,
+}
+
 /// Shared state behind every [`Runtime`] handle.
 #[derive(Debug)]
 struct Inner {
     /// `None` before the first load and after the thread dies; the next
     /// `load` respawns it.
-    sender: Mutex<Option<Sender<Command>>>,
+    sender: Mutex<Option<Sender<QueuedCommand>>>,
+    pending: Arc<AtomicUsize>,
     /// What the thread last said about itself.
     snapshot: Arc<Mutex<RuntimeSnapshot>>,
 }
@@ -301,6 +388,13 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// Whether accepted work is queued or still owned by the worker.
+    /// Unlike the display snapshot, this includes commands not yet started.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.inner.pending.load(Ordering::Acquire) != 0
+    }
+
     /// A runtime with no thread and no weights. The thread is spawned on the
     /// first [`load`](Runtime::load), so a daemon that never loads a model
     /// never pays for one.
@@ -309,6 +403,7 @@ impl Runtime {
         Self {
             inner: Arc::new(Inner {
                 sender: Mutex::new(None),
+                pending: Arc::new(AtomicUsize::new(0)),
                 snapshot: Arc::new(Mutex::new(RuntimeSnapshot {
                     state: RuntimeState::Idle,
                     busy: false,
@@ -376,13 +471,55 @@ impl Runtime {
         request: GenerateRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<GenerateResult, RuntimeError> {
+        self.generate_bounded(request, cancel, CONTEXT_TOKENS).await
+    }
+
+    /// Generates only when the fully framed input fits the task-specific limit.
+    pub async fn generate_bounded(
+        &self,
+        request: GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<GenerateResult, RuntimeError> {
+        self.generate_inner(None, request, cancel, input_limit)
+            .await
+    }
+
+    /// Generate only on the explicitly requested loaded model; never load or swap.
+    /// The worker checks identity immediately before inference, not from a snapshot.
+    pub async fn generate_for(
+        &self,
+        expected_model: &str,
+        request: GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<GenerateResult, RuntimeError> {
+        self.generate_inner(
+            Some(expected_model.to_owned()),
+            request,
+            cancel,
+            input_limit,
+        )
+        .await
+    }
+
+    async fn generate_inner(
+        &self,
+        expected_model: Option<String>,
+        request: GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<GenerateResult, RuntimeError> {
         let (reply, answer) = oneshot::channel();
+        let exclusive = expected_model.is_some();
         let command = Command::Generate {
+            expected_model,
+            input_limit,
             request: Box::new(request),
             cancel,
             reply,
         };
-        if !self.send(command, false) {
+        if !self.send_inner(command, false, exclusive)? {
             let crashed = matches!(lock(&self.inner.snapshot).state, RuntimeState::Loaded(_));
             self.reset_to_idle();
             return Err(if crashed {
@@ -394,32 +531,72 @@ impl Runtime {
         self.await_reply(answer).await?
     }
 
+    /// Runs bounded extraction on the same worker as generation. The outgoing
+    /// generator is dropped before the compressor loads; compressor weights
+    /// are released before the reply and any subsequent generator load.
+    pub async fn compress(
+        &self,
+        directory: std::path::PathBuf,
+        text: String,
+        target_bytes: usize,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<crate::compression::CompressionReport, RuntimeError> {
+        let (reply, answer) = oneshot::channel();
+        if !self.send(
+            Command::Compress {
+                directory,
+                text,
+                target_bytes,
+                cancel,
+                reply,
+            },
+            true,
+        ) {
+            return Err(RuntimeError::Crashed);
+        }
+        self.await_reply(answer).await?
+    }
+
     /// Queues a command, spawning the thread when `spawn` is set and the
     /// previous one is gone. Returns false when there is no live thread to
     /// take the command.
     fn send(&self, command: Command, spawn: bool) -> bool {
+        self.send_inner(command, spawn, false).unwrap_or(false)
+    }
+
+    fn send_inner(
+        &self,
+        command: Command,
+        spawn: bool,
+        exclusive: bool,
+    ) -> Result<bool, RuntimeError> {
         let mut slot = lock(&self.inner.sender);
+        let reservation = CommandReservation::acquire(self.inner.pending.clone(), exclusive)
+            .ok_or(RuntimeError::Busy)?;
+        let queued = QueuedCommand {
+            command,
+            reservation,
+        };
         if slot.is_none() {
             if !spawn {
-                return false;
+                return Ok(false);
             }
             *slot = spawn_thread(Arc::clone(&self.inner.snapshot));
         }
         let Some(sender) = slot.as_ref() else {
-            return false;
+            return Ok(false);
         };
-        let Err(rejected) = sender.send(command) else {
-            return true;
+        let Err(rejected) = sender.send(queued) else {
+            return Ok(true);
         };
-        // The thread died between the last command and this one. Retry once
-        // on a fresh thread when we are allowed to make one.
         *slot = None;
         if !spawn {
-            return false;
+            return Ok(false);
         }
         *slot = spawn_thread(Arc::clone(&self.inner.snapshot));
-        slot.as_ref()
-            .is_some_and(|sender| sender.send(rejected.0).is_ok())
+        Ok(slot
+            .as_ref()
+            .is_some_and(|sender| sender.send(rejected.0).is_ok()))
     }
 
     /// Awaits a reply, turning a dropped sender — a panicked command — into
@@ -450,7 +627,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Spawns the `pam-model` thread, or `None` when the OS refuses.
-fn spawn_thread(mirror: Arc<Mutex<RuntimeSnapshot>>) -> Option<Sender<Command>> {
+fn spawn_thread(mirror: Arc<Mutex<RuntimeSnapshot>>) -> Option<Sender<QueuedCommand>> {
     let (sender, receiver) = channel();
     std::thread::Builder::new()
         .name("pam-model".to_string())
@@ -509,9 +686,13 @@ impl Loaded {
 
 /// The thread body: take a command, run it inside `catch_unwind`, repeat
 /// until every handle is gone.
-fn thread_main(receiver: &Receiver<Command>, mirror: &Arc<Mutex<RuntimeSnapshot>>) {
+fn thread_main(receiver: &Receiver<QueuedCommand>, mirror: &Arc<Mutex<RuntimeSnapshot>>) {
     let mut loaded: Option<Loaded> = None;
-    while let Ok(command) = receiver.recv() {
+    while let Ok(QueuedCommand {
+        command,
+        reservation,
+    }) = receiver.recv()
+    {
         lock(mirror).busy = true;
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             handle(command, &mut loaded, mirror);
@@ -522,7 +703,8 @@ fn thread_main(receiver: &Receiver<Command>, mirror: &Arc<Mutex<RuntimeSnapshot>
             loaded = None;
             settle(mirror, RuntimeState::Idle);
         }
-        // Deliberately nothing in the success case. `handle` is the only
+        drop(reservation);
+        // Deliberately no mirror update in the success case. `handle` is the only
         // thing that clears `busy`, and it does so before it answers. A
         // trailing `busy = false` here would look like a safety net and
         // would in fact be the opposite: it would paper over an arm that
@@ -567,7 +749,25 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             settle(mirror, RuntimeState::Idle);
             let _ = reply.send(());
         }
+        Command::Compress {
+            directory,
+            text,
+            target_bytes,
+            cancel,
+            reply,
+        } => {
+            *loaded = None;
+            set_state(mirror, RuntimeState::Idle);
+            let result = crate::compression::compress(&directory, &text, target_bytes, &cancel)
+                .map_err(|error| {
+                    RuntimeError::GenerationFailed(format!("{}: {error}", error.cause()))
+                });
+            settle(mirror, RuntimeState::Idle);
+            drop(reply.send(result));
+        }
         Command::Generate {
+            expected_model,
+            input_limit,
             request,
             cancel,
             reply,
@@ -577,7 +777,8 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
                 drop(reply.send(Err(RuntimeError::NoModelLoaded)));
                 return;
             };
-            let result = generate_on_thread(model, &request, &cancel);
+            let result = check_requested_model(&model.meta, expected_model.as_deref())
+                .and_then(|()| generate_on_thread(model, &request, &cancel, input_limit));
             if let Ok(generated) = &result {
                 model.meta.last_used_at = now();
                 model.meta.last_tokens_per_sec = Some(generated.tokens_per_sec);
@@ -588,6 +789,23 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             drop(reply.send(result));
         }
     }
+}
+
+/// Runs on the owning worker immediately before generation; no command can
+/// replace its loaded model between this check and the forward pass.
+pub(crate) fn check_requested_model(
+    loaded: &LoadedModel,
+    expected: Option<&str>,
+) -> Result<(), RuntimeError> {
+    if let Some(requested) = expected
+        && requested != loaded.id
+    {
+        return Err(RuntimeError::ModelMismatch {
+            requested: requested.to_owned(),
+            actual: loaded.id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Replaces the mirrored state mid-command, leaving `busy` set.
@@ -649,7 +867,7 @@ fn load_model(
     let tokenizer =
         tokenizer::from_gguf(&content).map_err(|err| RuntimeError::LoadFailed(err.to_string()))?;
 
-    set_state(mirror, loading(&entry.id, "mapping_tensors"));
+    set_state(mirror, loading(&entry.id, "reading_tensors"));
     let model = build_model(&architecture, content, &mut file, &device)?;
     set_state(mirror, loading(&entry.id, "ready"));
 
@@ -730,7 +948,7 @@ pub(crate) fn preflight_tensor_dtypes(
         };
         if unsupported {
             return Err(RuntimeError::LoadFailed(format!(
-                "tensor {name:?} uses {:?}, unsupported by PAM's Candle 0.9.2 {backend} inference path; no weights were mapped. Choose a supported quantization/backend and retain this detail when reporting the model",
+                "tensor {name:?} uses {:?}, unsupported by PAM's Candle 0.9.2 {backend} inference path; no weights were read. Choose a supported quantization/backend and retain this detail when reporting the model",
                 tensor.ggml_dtype,
             )));
         }
@@ -769,6 +987,24 @@ struct Decoded {
     completion_tokens: usize,
 }
 
+pub(crate) fn check_output_budget(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    context_length: usize,
+) -> Result<(), RuntimeError> {
+    let limit = context_length.min(CONTEXT_TOKENS);
+    if prompt_tokens
+        .checked_add(max_tokens)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(RuntimeError::PromptTooLong {
+            tokens: prompt_tokens,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 /// Frames, encodes, checks the budget, runs the prompt, then decodes.
 ///
 /// The context rule: a request is refused when `prompt_tokens + max_tokens`
@@ -780,10 +1016,16 @@ struct Decoded {
 /// `prompt_ms` is the prefill: framing, encoding and the one forward pass
 /// over the whole prompt. Clearing the cache costs nothing measurable on
 /// either architecture, so nothing else hides in that number.
+///
+/// The device is synchronized before the prefill clock stops. Metal only
+/// enqueues the forward pass, so without this the number was enqueue time —
+/// single-digit milliseconds for a 1000-token prompt — and the real prefill
+/// cost silently reappeared inside `decode_ms`.
 fn generate_on_thread(
     loaded: &mut Loaded,
     request: &GenerateRequest,
     cancel: &watch::Receiver<bool>,
+    input_limit: usize,
 ) -> Result<GenerateResult, RuntimeError> {
     if *cancel.borrow() {
         return Err(RuntimeError::Cancelled);
@@ -803,25 +1045,43 @@ fn generate_on_thread(
         ids.insert(0, bos);
     }
     let prompt_tokens = ids.len();
-    if prompt_tokens + request.max_tokens > CONTEXT_TOKENS {
+    if prompt_tokens > input_limit {
         return Err(RuntimeError::PromptTooLong {
             tokens: prompt_tokens,
-            limit: CONTEXT_TOKENS,
+            limit: input_limit,
         });
     }
+    check_output_budget(
+        prompt_tokens,
+        request.max_tokens,
+        loaded.meta.context_length,
+    )?;
 
+    if *cancel.borrow() {
+        return Err(RuntimeError::Cancelled);
+    }
     loaded.reset_cache();
     let input = Tensor::new(ids.as_slice(), &loaded.device)
         .and_then(|tensor| tensor.unsqueeze(0))
         .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
     let logits = loaded.forward(&input, 0)?;
+    // Metal enqueues rather than completes; without this the prefill figure is
+    // enqueue latency and its real cost is attributed to decoding instead.
+    loaded
+        .device
+        .synchronize()
+        .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
     let prompt_ms = millis(started.elapsed());
+    if *cancel.borrow() {
+        return Err(RuntimeError::Cancelled);
+    }
 
     let decode_started = Instant::now();
     let decoded = decode_loop(loaded, request, logits, prompt_tokens, cancel)?;
     let decode_elapsed = decode_started.elapsed();
 
     Ok(GenerateResult {
+        model: GenerationModel::from(&loaded.meta),
         text: decoded.text,
         prompt_tokens,
         completion_tokens: decoded.completion_tokens,

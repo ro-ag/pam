@@ -116,13 +116,28 @@ pub struct CallSpec {
 
 const GITHUB_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "run_status",
+        args: &[("repo", true), ("run_id", true), ("run_attempt", true)],
+        yields_log: false,
+    },
+    CallSpec {
         name: "runs",
-        args: &[("repo", true), ("status", false), ("limit", false)],
+        args: &[
+            ("repo", true),
+            ("status", false),
+            ("limit", false),
+            ("page", false),
+        ],
         yields_log: false,
     },
     CallSpec {
         name: "run",
-        args: &[("repo", true), ("run_id", true)],
+        args: &[
+            ("repo", true),
+            ("run_id", true),
+            ("page", false),
+            ("run_attempt", false),
+        ],
         yields_log: false,
     },
     CallSpec {
@@ -133,6 +148,11 @@ const GITHUB_CALLS: &[CallSpec] = &[
 ];
 
 const JENKINS_CALLS: &[CallSpec] = &[
+    CallSpec {
+        name: "build_status",
+        args: &[("job", true), ("build", true)],
+        yields_log: false,
+    },
     CallSpec {
         name: "jobs",
         args: &[("limit", false)],
@@ -148,17 +168,53 @@ const JENKINS_CALLS: &[CallSpec] = &[
         args: &[("job", true), ("build", true)],
         yields_log: true,
     },
+    CallSpec {
+        name: "investigate",
+        args: &[("job", true), ("build", true)],
+        yields_log: false,
+    },
+    CallSpec {
+        name: "node_evidence",
+        args: &[("job", true), ("build", true), ("node_id", true)],
+        yields_log: false,
+    },
 ];
 
 const SONARQUBE_CALLS: &[CallSpec] = &[
     CallSpec {
+        name: "ce_status",
+        args: &[
+            ("project", true),
+            ("ce_task", true),
+            ("branch", false),
+            ("pullRequest", false),
+        ],
+        yields_log: false,
+    },
+    CallSpec {
+        name: "analysis",
+        args: &[
+            ("project", true),
+            ("ce_task", true),
+            ("branch", false),
+            ("pullRequest", false),
+            ("page", false),
+        ],
+        yields_log: false,
+    },
+    CallSpec {
         name: "quality_gate",
-        args: &[("project", true)],
+        args: &[("project", true), ("branch", false), ("pullRequest", false)],
         yields_log: false,
     },
     CallSpec {
         name: "issues",
-        args: &[("project", true), ("limit", false)],
+        args: &[
+            ("project", true),
+            ("limit", false),
+            ("branch", false),
+            ("pullRequest", false),
+        ],
         yields_log: false,
     },
 ];
@@ -190,6 +246,11 @@ const CONFLUENCE_CALLS: &[CallSpec] = &[
 ];
 
 const SHAREPOINT_CALLS: &[CallSpec] = &[
+    CallSpec {
+        name: "document",
+        args: &[("site", true), ("drive", true), ("item", true)],
+        yields_log: false,
+    },
     CallSpec {
         name: "documents",
         args: &[("site", true), ("query", true), ("limit", false)],
@@ -434,11 +495,30 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
         steps.push(step);
     }
 
+    let correlation = raw
+        .correlation
+        .map(|value| value.validated(&inputs))
+        .transpose()
+        .map_err(|error| {
+            FlowError::invalid(format!("correlation.{}", error.field), error.message)
+        })?;
+    if correlation.is_none()
+        && steps
+            .iter()
+            .any(|step| step.watch.is_some() && step.role == Role::Verify)
+    {
+        return Err(FlowError::invalid(
+            "correlation",
+            "watch verification requires an explicit revision target",
+        ));
+    }
+    crate::landing::sequence(&steps, correlation.is_some())?;
     Ok(Flow {
         id: raw.id,
         name: raw.name,
         description: raw.description,
         inputs,
+        correlation,
         steps,
     })
 }
@@ -505,6 +585,10 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         ));
     }
 
+    if raw.landing.is_some() {
+        return crate::landing::step(raw, &at, &scope.earlier);
+    }
+
     let action = match (raw.run, raw.connector) {
         (Some(_), Some(_)) => {
             return Err(FlowError::invalid(
@@ -515,7 +599,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         (None, None) => {
             return Err(FlowError::invalid(
                 &at,
-                "a step needs `run` (a command) or `connector` (a connector call)",
+                "a step needs `run`, `connector`, or a typed `landing` operation",
             ));
         }
         (Some(argv), None) => {
@@ -578,6 +662,8 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
 
     let retry = validate_retry(raw.retry, &at)?;
 
+    let watch = crate::watch::validate(raw.watch, &action, effect, retry, &at)?;
+
     let env = raw.env.unwrap_or_default();
     validate_env(&env, &at, scope)?;
 
@@ -595,6 +681,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         needs,
         when,
         retry,
+        watch,
         approval,
         env,
         note,
@@ -603,7 +690,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
 
 /// A note is trimmed — whitespace alone is no note — bounded like the
 /// description, and refused when it looks like a credential.
-fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
+pub(crate) fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
     let note = note.map(str::trim).unwrap_or_default();
     let path = format!("{at}.note");
     check_length(&path, note.len(), MAX_DESCRIPTION_BYTES)?;
@@ -611,7 +698,7 @@ fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
     Ok(note.to_string())
 }
 
-fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowError> {
+pub(crate) fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowError> {
     let Some(text) = timeout else {
         return Ok(DEFAULT_TIMEOUT);
     };
@@ -629,7 +716,7 @@ fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowErr
     Ok(value)
 }
 
-fn validate_retry(retry: Option<RawRetry>, at: &str) -> Result<Retry, FlowError> {
+pub(crate) fn validate_retry(retry: Option<RawRetry>, at: &str) -> Result<Retry, FlowError> {
     let Some(raw) = retry else {
         return Ok(Retry::default());
     };

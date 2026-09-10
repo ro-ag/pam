@@ -23,7 +23,9 @@ use pam_gui::bridge::{expect_result, is_disconnect, is_known_admin_op};
 use pam_gui::events::decode_event_frames;
 use pam_proto::{Event, Response};
 use pam_testkit::{TestDaemon, with_deadline};
-use serde_json::{Value, json};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use serde_json::Value;
+use serde_json::json;
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 /// The deadlines the bridge commands use (`bridge.rs` constants are
@@ -68,6 +70,7 @@ async fn daemon_status_call_answers_the_status_body() {
 /// `admin_call`'s happy path: a whitelisted op goes through
 /// `send_admin` and unwraps to its result body.
 #[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
@@ -89,6 +92,7 @@ async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
 /// bridge whitelist against a live daemon answers the block the runtime
 /// card reads, with an empty runtime on a fresh base dir.
 #[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn admin_call_reads_the_model_status_block() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
@@ -111,6 +115,32 @@ async fn admin_call_reads_the_model_status_block() {
             "models.status body must carry {field}: {body}"
         );
     }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+async fn admin_call_reports_unsupported_native_administration() {
+    let daemon = TestDaemon::spawn().await;
+    let op = "admin.profile.get";
+    assert!(is_known_admin_op(op));
+    let error = with_deadline(client::send_admin(
+        &daemon.base_dir(),
+        op,
+        json!({}),
+        ADMIN_DEADLINE_MS,
+    ))
+    .await
+    .expect_err("unsupported platforms must not fall back to public administration");
+    assert!(matches!(
+        &error,
+        client::RequestError::AdminTransport { source }
+            if source.kind() == std::io::ErrorKind::Unsupported
+    ));
+    let mapped = pam_gui::bridge::BridgeError::from(error);
+    assert_eq!(mapped.cause, "admin_transport_failed");
+    assert!(mapped.recovery.contains("supported platform"));
+    assert!(mapped.recovery.contains("never falls back"));
     daemon.stop().await;
 }
 

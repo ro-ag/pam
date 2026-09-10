@@ -161,6 +161,9 @@ impl Tier {
 /// deterministic path instead — none of them is a daemon failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelUnavailable {
+    /// Registry lookup could not run or failed; this does not mean the model is absent.
+    #[error(transparent)]
+    Service(#[from] ModelServiceError),
     /// No model is configured for the tier (nor for its fallback).
     #[error("no default model for tier {0:?}")]
     NoDefault(Tier),
@@ -178,6 +181,14 @@ pub enum ModelUnavailable {
 /// Why the service refused to start or change a piece of model work.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelServiceError {
+    /// Bounded worker admission or completion failed.
+    #[error("{detail}")]
+    Blocking {
+        /// Stable worker refusal cause.
+        cause: &'static str,
+        /// Sanitized worker failure detail.
+        detail: String,
+    },
     /// A store write failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -198,6 +209,23 @@ pub enum ModelServiceError {
     Registry(#[from] RegistryError),
 }
 
+/// Owns the cancellation sender while an admin diagnostic future is alive.
+/// Dropping a watch sender alone would leave its final `false` value unchanged.
+pub(crate) struct DiagnosticCancellation(watch::Sender<bool>);
+
+impl DiagnosticCancellation {
+    pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self(sender), receiver)
+    }
+}
+
+impl Drop for DiagnosticCancellation {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 /// The live download handles, keyed by job id, with the destination each
 /// is writing to.
 type Downloads = Arc<Mutex<HashMap<String, (PathBuf, DownloadHandle)>>>;
@@ -211,6 +239,7 @@ pub struct ModelService {
     /// hold a stale one.
     models_dir: RwLock<PathBuf>,
     runtime: Runtime,
+    pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
     host_ram_bytes: u64,
 }
@@ -249,6 +278,7 @@ impl ModelService {
             store,
             models_dir: RwLock::new(models_dir),
             runtime: Runtime::new(),
+            operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
             host_ram_bytes: host_ram_bytes(),
         });
@@ -304,7 +334,7 @@ impl ModelService {
             Tier::Heavy => heavy.or(light),
         };
         let id = configured.ok_or(ModelUnavailable::NoDefault(tier))?;
-        self.find(&id).await.ok_or(ModelUnavailable::Missing(id))
+        self.find(&id).await?.ok_or(ModelUnavailable::Missing(id))
     }
 
     /// One generation on the tier's model, loading it if needed.
@@ -317,17 +347,79 @@ impl ModelService {
         tier: Tier,
         request: GenerateRequest,
     ) -> Result<GenerateResult, ModelUnavailable> {
+        self.generate_bounded(tier, request, pam_model::runtime::CONTEXT_TOKENS)
+            .await
+    }
+
+    /// Applies a task-specific prefill limit using the generator's exact tokenizer.
+    pub async fn generate_bounded(
+        &self,
+        tier: Tier,
+        request: GenerateRequest,
+        input_limit: usize,
+    ) -> Result<GenerateResult, ModelUnavailable> {
+        let _operation = self.operation.lock().await;
         let entry = self.resolve(tier).await?;
-        self.ensure_loaded(&entry).await?;
+        self.ensure_loaded_inner(&entry).await?;
         // The daemon-internal path has no cancel surface yet: the sender
         // lives as long as the call and never fires.
         let (_never, cancel) = watch::channel(false);
-        Ok(self.runtime.generate(request, cancel).await?)
+        Ok(self
+            .runtime
+            .generate_bounded(request, cancel, input_limit)
+            .await?)
+    }
+
+    /// Diagnose on one explicitly requested installed model without loading or swapping.
+    /// Dropping the caller signals cancellation; an in-progress forward pass finishes
+    /// before the worker observes that signal, so cancellation is cooperative.
+    pub async fn generate_diagnostic(
+        &self,
+        model_id: &str,
+        request: GenerateRequest,
+    ) -> Result<GenerateResult, ModelUnavailable> {
+        let _operation = self.operation.try_lock().map_err(|_| RuntimeError::Busy)?;
+        if self.runtime.has_pending_work() {
+            return Err(RuntimeError::Busy.into());
+        }
+        let entry = self
+            .find(model_id)
+            .await?
+            .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
+        let (guard, cancel) = DiagnosticCancellation::new();
+        let result = self
+            .runtime
+            .generate_for(
+                &entry.id,
+                request,
+                cancel,
+                pam_model::runtime::CONTEXT_TOKENS,
+            )
+            .await;
+        drop(guard);
+        Ok(result?)
     }
 
     /// Makes `entry` the loaded model, unloading whatever else was in
     /// memory first. A no-op when it is already loaded.
     pub async fn ensure_loaded(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
+        let _operation = self.operation.lock().await;
+        let current = self
+            .find(&entry.id)
+            .await
+            .map_err(|error| RuntimeError::LoadFailed(error.to_string()))?;
+        if current
+            .as_ref()
+            .is_none_or(|current| current.path != entry.path)
+        {
+            return Err(RuntimeError::LoadFailed(
+                "The installed model entry changed before loading; select it again.".to_owned(),
+            ));
+        }
+        self.ensure_loaded_inner(entry).await
+    }
+
+    async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
         match self.runtime.snapshot().state {
             RuntimeState::Loaded(loaded) if loaded.id == entry.id => return Ok(loaded),
             RuntimeState::Loaded(loaded) => {
@@ -400,14 +492,12 @@ impl ModelService {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
         let target = dest.to_path_buf();
-        tokio::task::spawn_blocking(move || pam_model::download::discard_partial(&target))
-            .await
-            .map_err(|err| {
-                ModelServiceError::Download(DownloadError::Io(std::io::Error::other(
-                    err.to_string(),
-                )))
-            })?
-            .map_err(ModelServiceError::Download)
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            pam_model::download::discard_partial(&target)
+        })
+        .await
+        .map_err(ModelServiceError::from)?
+        .map_err(ModelServiceError::Download)
     }
 
     /// Stops a running transfer, keeping its part file for a resume.
@@ -439,7 +529,11 @@ impl ModelService {
         let registry = self.registry();
         let id = job_id.clone();
         tokio::spawn(async move {
-            let outcome = tokio::task::spawn_blocking(move || registry.verify(&entry)).await;
+            let outcome =
+                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                    registry.verify(&entry)
+                })
+                .await;
             let (state, detail) = match outcome {
                 Ok(Ok(verified)) => {
                     if let Ok(done) = i64::try_from(verified.size_bytes) {
@@ -458,10 +552,7 @@ impl ModelService {
                     JOB_FAILED,
                     job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
                 ),
-                Err(err) => (
-                    JOB_FAILED,
-                    job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
-                ),
+                Err(err) => (JOB_FAILED, job_failure_value(err.cause(), &err.to_string())),
             };
             let _ = store
                 .finish_model_job(&id, state, Some(&detail.to_string()))
@@ -492,31 +583,25 @@ impl ModelService {
         }))
     }
 
-    /// The entry with `id`, or `None`. Registry failures are reported as
-    /// absence — the model is unusable either way — and logged.
-    pub(crate) async fn find(&self, id: &str) -> Option<ModelEntry> {
+    /// The entry with `id`, or `None` only when the registry confirms absence.
+    pub(crate) async fn find(&self, id: &str) -> Result<Option<ModelEntry>, ModelServiceError> {
         let registry = self.registry();
         let wanted = id.to_owned();
-        match tokio::task::spawn_blocking(move || registry.find(&wanted)).await {
-            Ok(Ok(entry)) => entry,
-            Ok(Err(err)) => {
-                tracing::warn!(model = id, error = %err, "models directory unreadable");
-                None
-            }
-            Err(err) => {
-                tracing::warn!(model = id, error = %err, "registry lookup did not finish");
-                None
-            }
-        }
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            registry.find(&wanted)
+        })
+        .await?
+        .map_err(ModelServiceError::from)
     }
 
     /// Every entry in the models directory, sorted by id.
-    pub(crate) async fn scan(&self) -> Result<Vec<ModelEntry>, RegistryError> {
+    pub(crate) async fn scan(&self) -> Result<Vec<ModelEntry>, ModelServiceError> {
         let registry = self.registry();
-        match tokio::task::spawn_blocking(move || registry.scan()).await {
-            Ok(result) => result,
-            Err(err) => Err(RegistryError::Io(std::io::Error::other(err))),
-        }
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            registry.scan()
+        })
+        .await?
+        .map_err(ModelServiceError::from)
     }
 
     /// Whether a transfer is currently writing to `dest`.
@@ -544,7 +629,17 @@ impl ModelService {
     }
 
     /// Persists a new models directory and rebuilds the registry over it.
-    pub(crate) async fn set_models_dir(&self, dir: &Path) -> Result<(), StoreError> {
+    pub(crate) async fn set_models_dir(&self, dir: &Path) -> Result<(), ModelUnavailable> {
+        let _operation = self.operation.lock().await;
+        if self.models_dir().as_path() == dir {
+            return Ok(());
+        }
+        if self.runtime.has_pending_work() {
+            return Err(RuntimeError::Busy.into());
+        }
+        // Registry IDs repeat across directories. Never leave the previous root's
+        // loaded snapshot available under an ID now resolved in a different root.
+        self.runtime.unload().await?;
         let encoded = json!(dir.display().to_string()).to_string();
         self.store.set_setting(SETTING_MODELS_DIR, &encoded).await?;
         *self
@@ -566,6 +661,9 @@ impl ModelService {
 
     /// Drops the weights if the runtime has been idle long enough.
     async fn maybe_idle_unload(&self) {
+        let Ok(_operation) = self.operation.try_lock() else {
+            return;
+        };
         let Ok(idle_min) = self.idle_unload_min().await else {
             return;
         };
@@ -742,4 +840,13 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+impl From<crate::blocking_jobs::Error> for ModelServiceError {
+    fn from(error: crate::blocking_jobs::Error) -> Self {
+        Self::Blocking {
+            cause: error.cause(),
+            detail: error.to_string(),
+        }
+    }
 }

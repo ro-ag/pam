@@ -550,12 +550,31 @@ fn the_connector_call_table_matches_the_spec() {
             .map(|spec| spec.name)
             .collect::<Vec<_>>()
     };
-    assert_eq!(names(ConnectorId::Github), ["runs", "run", "job_log"]);
-    assert_eq!(names(ConnectorId::Jenkins), ["jobs", "builds", "console"]);
-    assert_eq!(names(ConnectorId::Sonarqube), ["quality_gate", "issues"]);
+    assert_eq!(
+        names(ConnectorId::Github),
+        ["run_status", "runs", "run", "job_log"]
+    );
+    assert_eq!(
+        names(ConnectorId::Jenkins),
+        [
+            "build_status",
+            "jobs",
+            "builds",
+            "console",
+            "investigate",
+            "node_evidence"
+        ]
+    );
+    assert_eq!(
+        names(ConnectorId::Sonarqube),
+        ["ce_status", "analysis", "quality_gate", "issues"]
+    );
     assert_eq!(names(ConnectorId::Jira), ["search", "issue"]);
     assert_eq!(names(ConnectorId::Confluence), ["search", "page"]);
-    assert_eq!(names(ConnectorId::Sharepoint), ["documents", "lists"]);
+    assert_eq!(
+        names(ConnectorId::Sharepoint),
+        ["document", "documents", "lists"]
+    );
     assert_eq!(names(ConnectorId::Aws), ["commands", "cli"]);
 
     let spec = |id, call: &str| {
@@ -567,11 +586,21 @@ fn the_connector_call_table_matches_the_spec() {
     };
     assert_eq!(
         spec(ConnectorId::Github, "runs").args,
-        [("repo", true), ("status", false), ("limit", false)]
+        [
+            ("repo", true),
+            ("status", false),
+            ("limit", false),
+            ("page", false)
+        ]
     );
     assert_eq!(
         spec(ConnectorId::Github, "run").args,
-        [("repo", true), ("run_id", true)]
+        [
+            ("repo", true),
+            ("run_id", true),
+            ("page", false),
+            ("run_attempt", false)
+        ]
     );
     assert_eq!(
         spec(ConnectorId::Jenkins, "console").args,

@@ -30,7 +30,9 @@
 //! own grandchildren therefore leaks them, exactly as a shell's `Ctrl-C`
 //! would; chasing a process tree needs per-OS process-group and job-object
 //! code that this plan does not carry. The buffer is still closed and the
-//! step still ends on time — a surviving grandchild delays nothing.
+//! step still ends on time — a surviving grandchild delays nothing. All
+//! descendants still inherit the OS containment profile; detaching cannot gain
+//! network, private PAM access, or host write authority.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -132,6 +134,9 @@ pub struct StepReport {
     pub exit_status: Option<i32>,
     /// Evidence rows this step left, in write order.
     pub evidence: Vec<String>,
+    /// Explicit source/view omissions, separate from the step's real outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_unavailable: Vec<String>,
     /// The model's summary, for an `output: summarize` step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -152,6 +157,7 @@ impl StepReport {
             duration_ms: 0,
             exit_status: None,
             evidence: Vec::new(),
+            evidence_unavailable: Vec::new(),
             summary: None,
             error: None,
         }
@@ -279,8 +285,10 @@ pub struct CommandSpec {
     pub cwd: PathBuf,
     /// The complete environment; nothing is inherited implicitly.
     pub env: Vec<(String, String)>,
-    /// Wall-clock limit for this one attempt.
+    /// Wall-clock limit for this one attempt, including containment validation.
     pub timeout: Duration,
+    /// Trusted host boundaries; every workload is contained, with no opt-out.
+    pub containment: crate::command_containment::CommandContainment,
 }
 
 /// How one child process ended.
@@ -307,6 +315,11 @@ pub enum CommandOutcome {
     /// The request was cancelled; the child was killed and its output
     /// dropped (nothing is filed for a run nobody is waiting on).
     Cancelled,
+    /// The OS containment boundary could not be established; no workload started.
+    ContainmentUnavailable {
+        /// A bounded local configuration/platform explanation.
+        detail: String,
+    },
     /// The process could never be started.
     SpawnFailed(
         /// The operating system's reason.
@@ -331,23 +344,11 @@ enum Ending {
 /// four endings (see the module docs for the contract and the kill
 /// caveat).
 pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) -> CommandOutcome {
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.argv)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .kill_on_drop(true);
-    for (name, value) in &spec.env {
-        command.env(name, value);
-    }
-    // Own process group: a signal aimed at the daemon's group never
-    // reaches a flow's child (see the module docs).
-    #[cfg(unix)]
-    command.process_group(0);
-
+    let deadline = tokio::time::Instant::now() + spec.timeout;
+    let mut command = match contained_command(&spec, cancel, deadline).await {
+        Ok(command) => command,
+        Err(outcome) => return outcome,
+    };
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return CommandOutcome::SpawnFailed(error.to_string()),
@@ -361,7 +362,7 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
     ];
 
     let mut output: Vec<u8> = Vec::new();
-    let deadline = tokio::time::sleep(spec.timeout);
+    let deadline = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline);
 
     let ending = loop {
@@ -417,6 +418,39 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
             Err(error) => CommandOutcome::SpawnFailed(error.to_string()),
         }
     }
+}
+
+/// Prepare the trusted launcher under the same deadline as the workload.
+async fn contained_command(
+    spec: &CommandSpec,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<Command, CommandOutcome> {
+    let validation = spec.clone();
+    let prepared = tokio::select! {
+        biased;
+        () = cancelled(cancel) => return Err(CommandOutcome::Cancelled),
+        () = tokio::time::sleep_until(deadline) => return Err(CommandOutcome::TimedOut { output: Vec::new() }),
+        result = crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+            validation.containment.prepare(&validation.program, &validation.cwd, &validation.env)
+        }) => result.map_err(|error| CommandOutcome::ContainmentUnavailable { detail: error.to_string() })?
+            .map_err(|detail| CommandOutcome::ContainmentUnavailable { detail })?,
+    };
+    // Never give caller-controlled loader variables to sandbox-exec. Its argv
+    // invokes env inside the installed policy, then the actual workload.
+    let mut command = Command::new(prepared.program);
+    command
+        .args(prepared.argv)
+        .args(&spec.argv)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    Ok(command)
 }
 
 /// Resolves when the request is cancelled — the flag flipping, or the
@@ -538,4 +572,32 @@ pub async fn sleep_or_cancel(delay: Duration, cancel: &mut watch::Receiver<bool>
         () = cancelled(cancel) => true,
         () = tokio::time::sleep(delay) => false,
     }
+}
+
+/// Execute with the original request's cumulative capture and attempt budget.
+pub async fn run_command_budgeted(
+    mut spec: CommandSpec,
+    cancel: &mut watch::Receiver<bool>,
+    budget: &std::sync::Arc<crate::request_budget::RequestBudget>,
+) -> Result<CommandOutcome, crate::request_budget::BudgetError> {
+    budget.attempt_persisted().await?;
+    let reservation = budget
+        .command_persisted(u64::try_from(MAX_SOURCE_BYTES).unwrap_or(u64::MAX))
+        .await?;
+    spec.timeout = spec.timeout.min(budget.remaining()?);
+    let outcome = run_command(spec, cancel).await;
+    match &outcome {
+        CommandOutcome::Exited { output, .. }
+        | CommandOutcome::TimedOut { output }
+        | CommandOutcome::OutputLimit { output } => {
+            reservation
+                .finish_persisted(u64::try_from(output.len()).unwrap_or(u64::MAX))
+                .await?;
+        }
+        CommandOutcome::SpawnFailed(_) | CommandOutcome::ContainmentUnavailable { .. } => {
+            reservation.finish_persisted(0).await?;
+        }
+        CommandOutcome::Cancelled => {}
+    }
+    Ok(outcome)
 }

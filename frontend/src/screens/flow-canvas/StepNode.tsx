@@ -80,6 +80,7 @@ export const glyphVariants = cva("flex shrink-0", {
     kind: {
       command: "text-accent",
       connector: "warm-label text-ink-muted",
+      landing: "text-accent",
     },
   },
   defaultVariants: { kind: "command" },
@@ -104,6 +105,7 @@ const DEFAULT_RETRY = { attempts: 1, backoff: "500ms" };
 
 /** What the second row says: the argv line, or `connector · call`. */
 export function stepBody(step: FlowStep): string {
+  if (step.action.kind === "landing") return `landing · ${step.action.operation}`;
   return step.action.kind === "command"
     ? joinArgv(step.action.argv)
     : `${step.action.connector} · ${step.action.call}`;

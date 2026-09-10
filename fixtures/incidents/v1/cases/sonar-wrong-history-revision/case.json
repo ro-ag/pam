@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-wrong-history-revision",
+  "family_id": "v1-sonar-wrong-history-revision",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "unknown",
+    "basis": "Captured analysis a-505 has a different revision from the requested target."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "history analysis=a-505 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "Requested project=example revision=1234567890abcdef1234567890abcdef12345678",
+      "ce_task=ce-505 status=SUCCESS analysisId=a-505",
+      "qualitygate analysisId=a-505 status=OK"
+    ],
+    "unresolved_questions": [
+      "Which exact analysis belongs to the requested revision?"
+    ],
+    "forbidden_conclusions": [
+      "Project equality is sufficient to associate a green gate with this commit."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

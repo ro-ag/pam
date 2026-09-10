@@ -171,6 +171,9 @@ export type AdminOp =
   | "admin.models.status"
   | "admin.models.defaults.set"
   | "admin.models.settings.set"
+  | "admin.models.compressor.status"
+  | "admin.models.compressor.install"
+  | "admin.models.compressor.set"
   | "admin.models.try"
   | "admin.curator.list"
   | "admin.curator.set"
@@ -187,10 +190,14 @@ export type AdminOp =
   | "admin.flows.normalize"
   | "admin.flows.settings.get"
   | "admin.flows.settings.set"
+  | "admin.flows.landing.get"
+  | "admin.flows.landing.set"
   | "admin.connectors.list"
   | "admin.connectors.configure"
   | "admin.connectors.test"
   | "admin.connectors.keyring"
+  | "admin.connectors.sonar_mappings.get"
+  | "admin.connectors.sonar_mappings.set"
   | "admin.retention.get"
   | "admin.retention.set"
   | "admin.retention.prune";
@@ -455,6 +462,16 @@ export interface ModelsStatus {
 
 /** What one generation produced, and what it cost. */
 export interface GenerateResult {
+  model: {
+    id: string;
+    architecture: string;
+    quant: string;
+    device: string;
+    weight_bytes: number;
+  };
+  requested_model_id: string;
+  diagnostic_only: true;
+  qualification: "not_assessed";
   text: string;
   prompt_tokens: number;
   completion_tokens: number;
@@ -546,14 +563,21 @@ export function modelsSettingsSet(patch: {
 }
 
 /**
- * One diagnostic generation on whatever is loaded — deliberately allowed
+ * One diagnostic generation on the explicitly named loaded model — allowed
  * on `test_only` weights, because proving the wiring is its purpose. The
  * bridge gives this op a 120 s deadline; every other admin op gets 30 s.
  */
-export function modelsTry(prompt: string, maxTokens?: number): Promise<GenerateResult> {
+export function modelsTry(
+  modelId: string,
+  prompt: string,
+  maxTokens?: number,
+  timeoutMs?: number,
+): Promise<GenerateResult> {
   return adminCall("admin.models.try", {
+    model_id: modelId,
     prompt,
     ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+    ...(timeoutMs === undefined ? {} : { timeout_ms: timeoutMs }),
   });
 }
 
@@ -608,6 +632,9 @@ export interface ModelUse {
 
 /** Everything one compression produced. */
 export interface CompressReport {
+  semantic?: EvidenceRef | null;
+  semantic_text?: string | null;
+  compression_skipped?: { cause: string; detail: string } | null;
   source: EvidenceRef;
   compact: EvidenceRef;
   /** Null when no model answered; `model_skipped` then says why. */
@@ -750,7 +777,11 @@ export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
 /** A connector call argument: YAML scalars only, string or integer. */
 export type FlowArgValue = string | number;
 
+export type LandingOperation =
+  "freeze" | "validate" | "push" | "ensure_pr" | "verify_pr" | "merge" | "verify_main" | "sync";
+
 export type FlowAction =
+  | { kind: "landing"; operation: LandingOperation }
   | { kind: "command"; argv: string[] }
   | {
       kind: "connector";
@@ -758,6 +789,13 @@ export type FlowAction =
       call: string;
       with: Record<string, FlowArgValue>;
     };
+
+/** Existing bounded polling policy; edited as part of the flow, not an access grant. */
+export interface FlowWatch {
+  max_polls: number;
+  interval: string;
+  max_interval: string;
+}
 
 export interface FlowStep {
   id: string;
@@ -773,6 +811,7 @@ export interface FlowStep {
   needs: string[];
   when: FlowWhen;
   retry: { attempts: number; backoff: string };
+  watch?: FlowWatch | null;
   approval: FlowApproval;
   env: Record<string, string>;
   /** A human note for the canvas; absent when the step has none. */
@@ -784,11 +823,19 @@ export interface FlowSpecInput {
   default: string | null;
 }
 
+export interface FlowCorrelation {
+  repository: string;
+  commit: string;
+  pull_request?: FlowArgValue;
+  pull_request_head?: string;
+}
+
 export interface FlowSpec {
   id: string;
   name: string;
   description: string;
   inputs: Record<string, FlowSpecInput>;
+  correlation?: FlowCorrelation | null;
   steps: FlowStep[];
 }
 
@@ -796,6 +843,7 @@ export interface FlowSpec {
 export interface RawFlowStep {
   id: string;
   run?: string[];
+  landing?: LandingOperation;
   connector?: FlowConnectorId;
   call?: string;
   with?: Record<string, FlowArgValue>;
@@ -808,6 +856,7 @@ export interface RawFlowStep {
   needs?: string[];
   when?: FlowWhen;
   retry?: { attempts: number; backoff?: string };
+  watch?: Partial<FlowWatch>;
   approval?: FlowApproval;
   env?: Record<string, string>;
   note?: string;
@@ -820,6 +869,7 @@ export interface RawFlow {
   name: string;
   description?: string;
   inputs?: Record<string, { description?: string; default?: string | null }>;
+  correlation?: FlowCorrelation;
   steps: RawFlowStep[];
 }
 
@@ -875,6 +925,13 @@ export const FLOW_CONNECTOR_CALLS: Record<FlowConnectorId, FlowCallSpec[]> = {
     },
     {
       name: "console",
+      args: [
+        { name: "job", required: true },
+        { name: "build", required: true },
+      ],
+    },
+    {
+      name: "investigate",
       args: [
         { name: "job", required: true },
         { name: "build", required: true },
@@ -950,10 +1007,23 @@ export interface FlowDetail extends FlowListEntry {
   flow?: FlowSpec | null;
 }
 
-/** The two knobs Settings › Flows edits. */
+export interface FlowConnectorScope {
+  connector: Exclude<FlowConnectorId, "aws">;
+  base_url: string;
+  access: "targets" | "connector_wide";
+  targets: string[];
+}
+
+export interface FlowScopePolicy {
+  version: 1;
+  repositories: { root: string; connectors: FlowConnectorScope[] }[];
+}
+
+/** Settings › Flows; missing scope policy is interpreted as empty deny. */
 export interface FlowSettings {
   allowed_programs: string[];
   extra_path: string[];
+  scope_policy?: FlowScopePolicy;
 }
 
 /** How one step of a run ended (`pam_daemon::flow_exec::StepStatus`). */
@@ -962,7 +1032,7 @@ export type FlowStepStatus = "succeeded" | "failed" | "skipped" | "blocked" | "c
 /** One step of a finished run, as the step table reads it. */
 export interface FlowStepReport {
   id: string;
-  kind: "command" | "connector";
+  kind: "command" | "connector" | "landing";
   status: FlowStepStatus;
   attempts: number;
   duration_ms: number;
@@ -1245,4 +1315,25 @@ export async function subscribeEvents(
     throw err;
   }
   return unlisten;
+}
+
+export interface SonarRepositoryMapping {
+  server: string;
+  project: string;
+  repository: string;
+}
+export interface SonarRepositoryMappings {
+  revision: string;
+  mappings: SonarRepositoryMapping[];
+}
+export function sonarMappingsGet(): Promise<SonarRepositoryMappings> {
+  return adminCall("admin.connectors.sonar_mappings.get");
+}
+export function sonarMappingsSet(
+  snapshot: SonarRepositoryMappings,
+): Promise<SonarRepositoryMappings> {
+  return adminCall("admin.connectors.sonar_mappings.set", {
+    expected_revision: snapshot.revision,
+    mappings: snapshot.mappings,
+  });
 }

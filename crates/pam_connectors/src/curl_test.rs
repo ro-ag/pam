@@ -80,6 +80,7 @@ fn a_body_holding_a_blank_line_survives_the_split() {
 fn request() -> HttpRequest {
     HttpRequest {
         method: Method::Get,
+        body: None,
         url: Url::parse("https://api.github.com/user").expect("the test URL parses"),
         headers: vec![
             ("Authorization".to_owned(), "Bearer ghp_secret".to_owned()),
@@ -87,5 +88,165 @@ fn request() -> HttpRequest {
         ],
         max_bytes: MAX_JSON_BYTES,
         follow_one_https_redirect_without_auth: false,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn connector_command_uses_only_trusted_curl_without_argv_credentials() {
+    let Ok(path) = CurlTransport::trusted_path() else {
+        return;
+    };
+    let transport = CurlTransport::new(path.clone());
+    let command = transport.command(&request(), 12).unwrap();
+    let command = command.as_std();
+    assert_eq!(command.get_program(), path.as_os_str());
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args[0], "-q");
+    assert_eq!(args[1], "--config");
+    assert_eq!(args[2], "-");
+    assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
+    assert!(command.get_envs().next().is_none());
+    assert!(
+        args.iter()
+            .all(|arg| !arg.to_string_lossy().contains("ghp_secret"))
+    );
+    assert!(
+        args.iter()
+            .all(|arg| !arg.to_string_lossy().contains("api.github.com"))
+    );
+}
+
+#[test]
+fn caller_supplied_executable_cannot_replace_the_connector_bridge() {
+    let transport = CurlTransport::new("/agent-controlled/curl".into());
+    assert!(matches!(
+        transport.command(&request(), 1),
+        Err(crate::TransportError::Policy {
+            cause: "trusted_curl_unavailable",
+            ..
+        })
+    ));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn platforms_without_a_verified_system_binary_fail_closed() {
+    assert!(matches!(
+        CurlTransport::trusted_path(),
+        Err(crate::TransportError::Policy {
+            cause: "trusted_curl_unavailable",
+            ..
+        })
+    ));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn inherited_curl_home_cannot_enable_a_trace_file() {
+    if CurlTransport::trusted_path().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("forbidden-trace");
+    std::fs::write(
+        dir.path().join(".curlrc"),
+        format!("trace = \"{}\"\n", trace.display()),
+    )
+    .unwrap();
+    // A subprocess supplies hostile inherited variables without mutating this
+    // multithreaded test runner's environment.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "curl_test::hostile_environment_child"])
+        .env("PAM_CURL_ENV_PROBE", "1")
+        .env("CURL_HOME", dir.path())
+        .env("HOME", dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!trace.exists(), "inherited curlrc wrote a host trace file");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn hostile_environment_child() {
+    use tokio::io::AsyncWriteExt;
+    if std::env::var_os("PAM_CURL_ENV_PROBE").is_none() {
+        return;
+    }
+    let path = CurlTransport::trusted_path().unwrap();
+    let transport = CurlTransport::new(path);
+    let mut child = transport.command(&request(), 1).unwrap().spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(b"url = \"https://127.0.0.1:1/\"\n")
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn mutation_body_and_credentials_stay_in_escaped_stdin_config() {
+    let mut req = request();
+    req.method = Method::Post;
+    req.body = Some(b"{\n\"title\":\"secret body\\nurl = evil\"\n}".to_vec());
+    let config = CurlTransport::config_for(&req, 5);
+    assert!(config.contains("request = \"POST\""));
+    assert_eq!(
+        config
+            .lines()
+            .filter(|line| line.starts_with("url ="))
+            .count(),
+        1
+    );
+    assert!(config.contains("data-binary = \"{\\n"));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
+        let command = transport.command(&req, 5).unwrap();
+        let argv = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!argv.contains("secret body"));
+        assert!(!argv.contains("ghp_secret"));
+    }
+}
+
+#[tokio::test]
+async fn mutation_invalid_body_or_redirect_policy_refuses_before_process_start() {
+    use crate::HttpTransport;
+    let transport = CurlTransport::new(std::path::PathBuf::from("untrusted-unused"));
+    for (body, follow) in [
+        (Some(vec![b'x'; 16 * 1024 + 1]), false),
+        (Some(b"[]".to_vec()), false),
+        (Some(b"{}".to_vec()), true),
+        (None, false),
+    ] {
+        let mut req = request();
+        req.method = Method::Put;
+        req.body = body;
+        req.follow_one_https_redirect_without_auth = follow;
+        let error = transport
+            .send(
+                req,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::TransportError::Policy {
+                cause: "mutation_body_invalid",
+                ..
+            }
+        ));
     }
 }

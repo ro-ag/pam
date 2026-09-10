@@ -261,7 +261,7 @@ fn tiny_gguf() -> Vec<u8> {
 async fn every_model_op_is_dispatched_and_none_is_unknown() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        assert_eq!(MODEL_ADMIN_OPS.len(), 16, "the spec's sixteen ops");
+        assert_eq!(MODEL_ADMIN_OPS.len(), 19, "model and compressor ops");
         for op in MODEL_ADMIN_OPS {
             assert!(op.starts_with("admin."), "{op} is under the admin prefix");
             // Called with no arguments: whatever comes back, it must not
@@ -590,15 +590,24 @@ async fn load_and_verify_refuse_a_model_that_is_not_there() {
 async fn try_with_nothing_loaded_says_so() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
+        fx.install_gguf("qwen", "tiny.gguf");
         let detail = expect_refusal(
-            fx.run(OP_MODELS_TRY, json!({ "prompt": "hello" })).await,
+            fx.run(
+                OP_MODELS_TRY,
+                json!({ "model_id":"qwen/tiny", "prompt": "hello" }),
+            )
+            .await,
             "no_model_loaded",
         );
         assert!(!detail.is_empty());
 
         // And an empty prompt never reaches the runtime at all.
         expect_refusal(
-            fx.run(OP_MODELS_TRY, json!({ "prompt": "" })).await,
+            fx.run(
+                OP_MODELS_TRY,
+                json!({ "model_id":"qwen/tiny", "prompt": "" }),
+            )
+            .await,
             CAUSE_INVALID_ADMIN_ARGS,
         );
     })
@@ -833,4 +842,84 @@ async fn discarding_an_unknown_preset_is_an_argument_refusal() {
     })
     .await
     .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn compressor_setup_defaults_off_and_refuses_missing_assets() {
+    use crate::admin_compressor::{OP_SET, OP_STATUS, SETTING_ENABLED};
+    let f = fixture().await;
+    let status = f.run(OP_STATUS, json!({})).await;
+    let Response::Result { body, .. } = status else {
+        panic!("status succeeds")
+    };
+    assert_eq!(body["installed"], false);
+    assert_eq!(body["enabled"], false);
+    assert!(matches!(
+        f.run(OP_SET, json!({"enabled": true})).await,
+        Response::Refusal { .. }
+    ));
+    assert_eq!(f.store.get_setting(SETTING_ENABLED).await.unwrap(), None);
+    assert!(matches!(
+        f.run(OP_SET, json!({"enabled": false})).await,
+        Response::Result { .. }
+    ));
+}
+
+#[tokio::test]
+async fn diagnostic_arguments_and_reservation_are_enforced_before_inference() {
+    let fx = fixture().await;
+    let path = fx.install_gguf("qwen", "tiny.gguf");
+    expect_refusal(
+        fx.run(OP_MODELS_TRY, json!({"prompt":"hello"})).await,
+        CAUSE_INVALID_ADMIN_ARGS,
+    );
+    expect_refusal(
+        fx.run(
+            OP_MODELS_TRY,
+            json!({"model_id":"qwen/missing","prompt":"hello"}),
+        )
+        .await,
+        CAUSE_UNKNOWN_MODEL,
+    );
+    for extra in [
+        json!({"timeout_ms":0}),
+        json!({"timeout_ms":120_001}),
+        json!({"timeout_ms":"8000"}),
+        json!({"max_tokens":u64::MAX}),
+        json!({"max_tokens":-1}),
+        json!({"max_tokens":"96"}),
+    ] {
+        let mut args = json!({"model_id":"qwen/tiny","prompt":"hello"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        expect_refusal(fx.run(OP_MODELS_TRY, args).await, CAUSE_INVALID_ADMIN_ARGS);
+    }
+    let _reservation = fx.models.operation.lock().await;
+    expect_refusal(
+        fx.run(
+            OP_MODELS_TRY,
+            json!({"model_id":"qwen/tiny","prompt":"hello","timeout_ms":8000}),
+        )
+        .await,
+        "runtime_busy",
+    );
+    expect_refusal(
+        fx.run(OP_MODELS_DELETE, json!({"model_id":"qwen/tiny"}))
+            .await,
+        "runtime_busy",
+    );
+    assert!(path.exists(), "reservation prevents filesystem mutation");
+}
+
+#[test]
+fn diagnostic_mismatch_refusal_reports_both_actual_and_requested_model() {
+    let refusal = crate::admin_models::runtime_refusal(&pam_model::RuntimeError::ModelMismatch {
+        requested: "qwen/requested".into(),
+        actual: "qwen/other".into(),
+    });
+    assert_eq!(refusal.cause, "model_mismatch");
+    assert!(refusal.detail.contains("qwen/requested"));
+    assert!(refusal.detail.contains("qwen/other"));
+    assert!(refusal.recovery.contains("Explicitly load"));
 }

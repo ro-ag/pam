@@ -1,0 +1,14 @@
+PAM synthetic offline incident snapshot v1
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+Synthetic publish revision=1234567890abcdef1234567890abcdef12345678 repository=release-local
+upload response: HTTP 507; repository storage quota exceeded
+service quota diagnostic: limit_bytes=104857600 used_bytes=104857600
+artifact acceptance receipt: absent
+Client retry was not attempted because capacity had not changed.
+Live capability: unsupported; all records are synthetic offline observations.

@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/zeromq", "vendor/turso_core", "vendor/aegis"]
 resolver = "3"
 members = [
     "crates/pam",
@@ -38,8 +39,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # default features off: `mimalloc` bundles C, and the point of turso is a
 # pure-Rust engine. pure-rust-crypto keeps aegis pure Rust on every platform.
-# Known residue: turso_core links simsimd (small C SIMD kernel for vector
-# functions) unconditionally; no feature removes it as of 0.7.
+# Same-version patches below remove mandatory SimSIMD C compilation and
+# the unused aegis cc build dependency; runtime cryptography stays upstream.
 turso = { version = "0.7", default-features = false, features = ["pure-rust-crypto"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # pure-Rust ZeroMQ (zmq.rs) — NEVER the `zmq` crate (libzmq C bindings).
@@ -67,8 +68,8 @@ tracing-appender = "0.2"
 # desktop shell for `pam gui`. Default features off: `compression` (brotli
 # for embedded assets) and `dbus`/tray extras are not needed for the
 # scaffold; `wry` is the webview runtime, `x11` keeps Linux building.
-# The tauri stack is pure Rust on macOS (objc2/block2 are Rust bindings to
-# system frameworks, no C compile step); see the workspace C-residue notes.
+# Wry currently compiles an Objective-C exception helper on macOS. This
+# conflicts with the no-C-compiler constraint; see ptrack issue 16/task 142.
 tauri = { version = "2", default-features = false, features = ["wry", "x11"] }
 tauri-build = { version = "2", default-features = false, features = ["config-json"] }
 
@@ -104,3 +105,9 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# Same-version local fix: reject oversized ZMTP frames before buffer allocation.
+[patch.crates-io]
+zeromq = { path = "vendor/zeromq" }
+turso_core = { path = "vendor/turso_core" }
+aegis = { path = "vendor/aegis" }

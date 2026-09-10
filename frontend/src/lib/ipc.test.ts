@@ -265,9 +265,9 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     ],
     [
       "modelsTry",
-      () => modelsTry("Say hello.", 64),
+      () => modelsTry("fixture-model", "Say hello.", 64),
       "admin.models.try",
-      { prompt: "Say hello.", max_tokens: 64 },
+      { model_id: "fixture-model", prompt: "Say hello.", max_tokens: 64 },
     ],
     ["curatorSet", () => curatorSet("codex"), "admin.curator.set", { agent: "codex" }],
     ["curatorSet (cleared)", () => curatorSet(null), "admin.curator.set", { agent: null }],
@@ -276,9 +276,19 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     expect(sent()).toEqual({ op, args });
   });
 
+  it("sends an explicit generation deadline when supplied", async () => {
+    await modelsTry("fixture-model", "Say hello.", 96, 8000);
+    expect(sent().args).toEqual({
+      model_id: "fixture-model",
+      prompt: "Say hello.",
+      max_tokens: 96,
+      timeout_ms: 8000,
+    });
+  });
+
   it("omits max_tokens entirely when the caller names no budget", async () => {
-    await modelsTry("Say hello.");
-    expect(sent().args).toEqual({ prompt: "Say hello." });
+    await modelsTry("fixture-model", "Say hello.");
+    expect(sent().args).toEqual({ model_id: "fixture-model", prompt: "Say hello." });
   });
 });
 
@@ -393,6 +403,13 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "run",
       "job_log",
     ]);
+    expect(FLOW_CONNECTOR_CALLS.jenkins.find((call) => call.name === "investigate")).toEqual({
+      name: "investigate",
+      args: [
+        { name: "job", required: true },
+        { name: "build", required: true },
+      ],
+    });
     expect(FLOW_CONNECTOR_CALLS.aws).toEqual([
       { name: "commands", args: [] },
       {

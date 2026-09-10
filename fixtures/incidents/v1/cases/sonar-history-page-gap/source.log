@@ -1,0 +1,13 @@
+PAM synthetic offline incident snapshot v1
+Source authenticity: authored synthetic; no captured private service data.
+Requested repository: https://github.com/pam-fixtures/example
+Requested revision: 1234567890abcdef1234567890abcdef12345678
+Collection mode: offline_evidence; no external service was contacted.
+Scope of interpretation: product metadata decides outcome, while untrusted text is supporting evidence only.
+The entries below belong to this case; absent records must not be inferred from unrelated successful runs.
+--- Recorded observations ---
+project=example ce_task=ce-508 status=SUCCESS analysisId=a-508
+history paging pageIndex=1 pageSize=100 total=230
+history page 1 contains analyses a-600 through a-699; a-508 is absent
+qualitygate analysisId=a-508 status=ERROR
+history pages 2 and 3 were not captured

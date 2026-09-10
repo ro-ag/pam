@@ -29,6 +29,7 @@ export function liveSources(): Sources {
     evidenceStats: (sinceTs) => ipc.evidenceStats(sinceTs),
     flowsList: () => ipc.flowsList(),
     auditRequest: (id) => ipc.auditRequest(id),
-    modelsTry: (prompt, maxTokens) => ipc.modelsTry(prompt, maxTokens),
+    modelsTry: (modelId, prompt, maxTokens, timeoutMs) =>
+      ipc.modelsTry(modelId, prompt, maxTokens, timeoutMs),
   };
 }

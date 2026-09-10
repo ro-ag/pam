@@ -46,6 +46,27 @@ fn lock_is_exclusive_and_released_on_drop() {
     drop(again);
 }
 
+// Unix flock follows the open file description, shared by dup and fork.
+// Windows byte-range locks have different duplicate-handle semantics; the
+// portable lifecycle test above continues to cover that platform.
+#[cfg(unix)]
+#[test]
+fn explicit_drop_unlocks_even_while_an_inherited_description_remains_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = acquire_instance_lock(tmp.path()).expect("initial lock");
+    let inherited = first
+        .duplicate_handle_for_test()
+        .expect("duplicate descriptor");
+    assert!(acquire_instance_lock(tmp.path()).is_err());
+    drop(first);
+    let second = acquire_instance_lock(tmp.path()).expect("explicit unlock releases shared lock");
+    // Closing the old duplicate must not unlock the independently acquired lock.
+    drop(inherited);
+    assert!(acquire_instance_lock(tmp.path()).is_err());
+    drop(second);
+    assert!(acquire_instance_lock(tmp.path()).is_ok());
+}
+
 /// Seeds one request row in `state` (via the non-terminal transition
 /// helper, since rows are born `queued`).
 async fn seed_request(store: &Store, id: &str, state: RequestState) {
@@ -74,7 +95,7 @@ async fn recover_fails_stuck_rows_and_leaves_queued_alone() {
         seed_request(&store, "req_queued", RequestState::Queued).await;
 
         let recovered = recover_stuck_rows(&store).await.expect("recovery runs");
-        assert_eq!(recovered, ["req_running", "req_waiting"]);
+        assert_eq!(recovered, 2);
 
         for id in ["req_running", "req_waiting"] {
             let row = store.get_request(id).await.unwrap().unwrap();
@@ -86,7 +107,10 @@ async fn recover_fails_stuck_rows_and_leaves_queued_alone() {
             assert_eq!(audit[0].decision, Decision::Timeout);
             assert_eq!(audit[0].actor, Actor::System);
             let detail = audit[0].detail.as_deref().expect("detail present");
-            assert!(detail.contains("retry"), "retry hint in {detail}");
+            assert!(
+                detail.contains("inspect evidence"),
+                "reconciliation hint in {detail}"
+            );
         }
 
         // The queued row is restart-safe and untouched.
@@ -131,9 +155,86 @@ async fn recover_is_a_no_op_when_nothing_is_stuck() {
         let store = Store::open_in_memory().await.expect("store opens");
         seed_request(&store, "req_queued", RequestState::Queued).await;
         let recovered = recover_stuck_rows(&store).await.expect("recovery runs");
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, 0);
         let row = store.get_request("req_queued").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Queued);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn crash_recovery_pages_do_not_skip_rows_as_states_change() {
+    timeout(DEADLINE, async {
+        let store = Store::open_in_memory().await.unwrap();
+        for number in (0..37).rev() {
+            let id = format!("stuck_{number:02}");
+            let state = if number % 2 == 0 {
+                RequestState::Running
+            } else {
+                RequestState::WaitingApproval
+            };
+            seed_request(&store, &id, state).await;
+            if state == RequestState::WaitingApproval {
+                store.insert_approval(&id, "echo").await.unwrap();
+            }
+        }
+        seed_request(&store, "queued", RequestState::Queued).await;
+        assert_eq!(recover_stuck_rows(&store).await.unwrap(), 37);
+        for number in 0..37 {
+            let id = format!("stuck_{number:02}");
+            let row = store.get_request(&id).await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::Failed);
+            assert_eq!(row.outcome.as_deref(), Some(CAUSE_DAEMON_RESTART));
+            assert_eq!(store.audit_for_request(&id).await.unwrap().len(), 1);
+        }
+        assert!(store.list_pending_approvals().await.unwrap().is_empty());
+        assert_eq!(recover_stuck_rows(&store).await.unwrap(), 0);
+        assert_eq!(
+            store.get_request("queued").await.unwrap().unwrap().state,
+            RequestState::Queued
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn oversized_crash_recovery_requires_operator_repair() {
+    timeout(DEADLINE, async {
+        for state in [RequestState::Running, RequestState::WaitingApproval] {
+            let store = Store::open_in_memory().await.unwrap();
+            store
+                .insert_request(
+                    "oversized",
+                    "echo",
+                    "/repo",
+                    "agent",
+                    &"x".repeat(8 * 1024 * 1024),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .update_request_state("oversized", state, None)
+                .await
+                .unwrap();
+            let error = recover_stuck_rows(&store).await.unwrap_err();
+            assert!(matches!(error, LifecycleError::LegacyRecoveryOversized));
+            assert!(error.to_string().contains("legacy_recovery_oversized"));
+            assert!(error.to_string().contains("back up"));
+            assert_eq!(
+                store.get_request("oversized").await.unwrap().unwrap().state,
+                state
+            );
+            assert!(
+                store
+                    .audit_for_request("oversized")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     })
     .await
     .expect("test within deadline");

@@ -1,0 +1,44 @@
+schema: 1
+id: guarded-land
+name: Guarded land and verify main
+description: >-
+  Freeze the explicitly declared revision, run GUI-configured checks, then
+  authorize and reconcile each push, pull request, merge and local sync.
+  Exact remote checks gate merge and verify the confirmed main commit.
+  Requires an approved repository landing policy; no tagging, publishing or
+  branch deletion is authorized by this recipe.
+inputs:
+  repository:
+    description: Exact HTTPS source repository identity configured in landing policy.
+  commit:
+    description: Full source commit expected when the branch is frozen.
+correlation:
+  repository: "${inputs.repository}"
+  commit: "${inputs.commit}"
+steps:
+  - id: freeze
+    landing: freeze
+  - id: validate
+    landing: validate
+    needs: [freeze]
+    role: verify
+  - id: push
+    landing: push
+    needs: [validate]
+  - id: ensure-pr
+    landing: ensure_pr
+    needs: [push]
+  - id: verify-pr
+    landing: verify_pr
+    needs: [ensure-pr]
+    role: verify
+  - id: merge
+    landing: merge
+    needs: [verify-pr]
+  - id: verify-main
+    landing: verify_main
+    needs: [merge]
+    role: verify
+  - id: sync
+    landing: sync
+    needs: [verify-main]

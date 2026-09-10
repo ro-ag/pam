@@ -1,0 +1,25 @@
+schema: 1
+id: jenkins-node-evidence
+name: Jenkins node evidence
+description: >-
+  Retrieve bounded Pipeline node evidence for an explicit Jenkins job, build
+  and node ID. Requires the Pipeline REST API plugin. This retrieval observes
+  the selected node; it does not verify the build or assert a failure cause.
+inputs:
+  job:
+    description: Jenkins job path, including folders
+  build:
+    description: explicit positive build number; never latest
+  node_id:
+    description: explicit Pipeline node ID from the selected build's evidence
+steps:
+  - id: retrieve-node
+    connector: jenkins
+    call: node_evidence
+    with:
+      job: "${inputs.job}"
+      build: "${inputs.build}"
+      node_id: "${inputs.node_id}"
+    timeout: 120s
+    role: observe
+    output: compact

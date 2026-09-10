@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "case_id": "sonar-new-code-coverage",
+  "family_id": "v1-sonar-new-code-coverage",
+  "split": "screening",
+  "stage": "sonar",
+  "products": [
+    "sonarqube"
+  ],
+  "authenticity": "synthetic",
+  "source_reference": {
+    "kind": "authored",
+    "note": "Original offline scenario authored for screening; product-shaped observations are synthetic, not captured service responses."
+  },
+  "export_policy": "synthetic_only",
+  "task": "Explain the observed outcome for the requested target using only this bounded evidence; identify decisive records and unresolved questions.",
+  "target": {
+    "repository": "https://github.com/pam-fixtures/example",
+    "commit": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "mode": "offline_evidence",
+  "snapshot": {
+    "path": "source.log"
+  },
+  "authoritative_observation": {
+    "status": "failure",
+    "basis": "Exact analysis a-501 has quality gate ERROR for new-code coverage at the requested commit."
+  },
+  "expected": {
+    "diagnosis": "unresolved",
+    "decisive_quotes": [
+      "condition metric=new_coverage comparator=LT threshold=80 actual=54 status=ERROR",
+      "history analysis=a-501 revision=1234567890abcdef1234567890abcdef12345678",
+      "qualitygate analysisId=a-501 status=ERROR"
+    ],
+    "unresolved_questions": [
+      "Does the analysis include the intended coverage report and approved new-code baseline, or does the reported coverage reflect missing tests?"
+    ],
+    "forbidden_conclusions": [
+      "Compute-engine SUCCESS means quality gate OK.",
+      "The metric alone proves missing tests rather than coverage import or baseline configuration."
+    ]
+  },
+  "review": {
+    "author": "compatibility",
+    "reviewer": "candidate_quality",
+    "status": "agent_adjudicated",
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Changed code to unresolved: exact gate failure is established, but metric alone does not distinguish test coverage from report/baseline configuration. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
+  }
+}

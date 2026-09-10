@@ -1677,9 +1677,9 @@ impl Pipeline {
         }
     }
 
-    /// Tears a deadline-expired waiting request down: cancel through the
-    /// queue (whichever side holds it records the terminal state), audit
-    /// the refusal, tell subscribers, answer the caller.
+    /// Tears a deadline-expired request down: the queue records expiry before
+    /// signalling the executor; then audit the refusal, notify subscribers,
+    /// and answer the caller.
     async fn deadline_refusal(&self, envelope: &Envelope) -> Response {
         let id = &envelope.id;
         let terminal = self.queue.expire(id).await;

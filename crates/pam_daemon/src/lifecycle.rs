@@ -88,6 +88,14 @@ pub enum LifecyclePhase {
 /// Why a lifecycle operation failed.
 #[derive(Debug, Error)]
 pub enum LifecycleError {
+    /// A durable recovery operation failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A legacy in-flight row exceeds the bounded startup reader.
+    #[error(
+        "legacy_recovery_oversized: stop PAM, back up the state database, and have an operator repair oversized running/waiting_approval rows before restarting"
+    )]
+    LegacyRecoveryOversized,
     /// Another daemon already holds the instance lock.
     #[error(
         "another pam daemon already holds {} ({})",
@@ -169,57 +177,72 @@ pub fn acquire_instance_lock(run_dir: &Path) -> Result<InstanceLock, LifecycleEr
 }
 
 /// Fails every `running` / `waiting_approval` row a dead daemon left
-/// mid-flight (see the module docs), returning the ids it recovered.
+/// mid-flight (see the module docs), returning the number it recovered.
 ///
 /// Every failure goes through [`Store::finish_request`] — terminal
 /// state and audit row in one transaction, first-wins on an already
 /// terminal row. A recovered `waiting_approval` row's dangling approval
 /// is resolved as a timeout (note [`CAUSE_DAEMON_RESTART`]) so the
 /// GUI's pending list does not advertise an approval nobody can grant.
-pub async fn recover_stuck_rows(store: &Store) -> Result<Vec<String>, StoreError> {
-    let stuck = store.list_stuck_ordered().await?;
-    let mut recovered = Vec::with_capacity(stuck.len());
-    for row in stuck {
-        let was_waiting = row.state == RequestState::WaitingApproval;
-        let detail = serde_json::json!({
-            "cause": CAUSE_DAEMON_RESTART,
-            "note": "the daemon restarted while this request was in flight; \
-                     re-run the pam command to retry",
-        })
-        .to_string();
-        let finished = store
-            .finish_request(
-                &row.id,
-                RequestState::Failed,
-                Some(CAUSE_DAEMON_RESTART),
-                AuditEntry {
-                    action: ACTION_DAEMON_RESTART,
-                    decision: Decision::Timeout,
-                    actor: Actor::System,
-                    detail: Some(&detail),
-                },
+/// Pages contain at most 16 rows and 8 MiB of selected text. Oversized legacy
+/// rows stop startup explicitly for operator backup/repair; prior recovered
+/// pages remain audited and terminal, making the next startup restart-safe.
+pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> {
+    let mut recovered = 0_usize;
+    let mut after: Option<(i64, String)> = None;
+    loop {
+        let stuck = store
+            .stuck_recovery_page(
+                after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                8 * 1024 * 1024,
             )
-            .await?;
-        if was_waiting {
-            match store
-                .resolve_approval(
+            .await?
+            .ok_or(LifecycleError::LegacyRecoveryOversized)?;
+        let Some(last) = stuck.last() else {
+            return Ok(recovered);
+        };
+        after = Some((last.created_ts, last.id.clone()));
+        for row in stuck {
+            let was_waiting = row.state == RequestState::WaitingApproval;
+            let detail = serde_json::json!({
+                "cause": CAUSE_DAEMON_RESTART,
+                "note": "the daemon restarted while this request was in flight; \
+                         re-run the pam command to retry",
+            })
+            .to_string();
+            let finished = store
+                .finish_request(
                     &row.id,
-                    ApprovalResolution::Timeout,
+                    RequestState::Failed,
                     Some(CAUSE_DAEMON_RESTART),
+                    AuditEntry {
+                        action: ACTION_DAEMON_RESTART,
+                        decision: Decision::Timeout,
+                        actor: Actor::System,
+                        detail: Some(&detail),
+                    },
                 )
-                .await
-            {
-                // NotFound: no unresolved approval row (e.g. the daemon
-                // died between the state write and the approval insert).
-                Ok(()) | Err(StoreError::NotFound { .. }) => {}
-                Err(err) => return Err(err),
+                .await?;
+            if was_waiting {
+                match store
+                    .resolve_approval(
+                        &row.id,
+                        ApprovalResolution::Timeout,
+                        Some(CAUSE_DAEMON_RESTART),
+                    )
+                    .await
+                {
+                    // NotFound: no unresolved approval row (e.g. the daemon
+                    // died between the state write and the approval insert).
+                    Ok(()) | Err(StoreError::NotFound { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            if finished {
+                recovered = recovered.saturating_add(1);
             }
         }
-        if finished {
-            recovered.push(row.id);
-        }
     }
-    Ok(recovered)
 }
 
 /// Builds the non-blocking writer for the daemon's own log:

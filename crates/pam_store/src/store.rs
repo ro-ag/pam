@@ -21,6 +21,22 @@ pub const DEFAULT_REQUEST_LIST_LIMIT: u64 = 100;
 /// larger request is clamped, keeping the activity query bounded.
 pub const MAX_REQUEST_LIST_LIMIT: u64 = 500;
 
+/// Fixed startup subsets; never interpolate caller-supplied SQL predicates.
+#[derive(Clone, Copy)]
+enum RecoveryRows {
+    Queued,
+    Stuck,
+}
+
+impl RecoveryRows {
+    fn predicate(self) -> &'static str {
+        match self {
+            Self::Queued => "state = 'queued'",
+            Self::Stuck => "state IN ('running','waiting_approval')",
+        }
+    }
+}
+
 /// Lifecycle state of a capability request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestState {
@@ -888,9 +904,8 @@ impl Store {
         }
     }
 
-    /// Reads every `queued` request, oldest first (ties broken by id, and
-    /// request ids are ULID-ordered). The queue manager rebuilds its lanes
-    /// from this on boot.
+    /// Reads every `queued` request. Intended for bounded test fixtures;
+    /// startup recovery must use [`Self::queued_recovery_page`] instead.
     pub async fn list_queued_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let mut rows = self
@@ -911,11 +926,125 @@ impl Store {
         Ok(out)
     }
 
-    /// Reads every `running` or `waiting_approval` row, oldest first —
-    /// the rows a dead daemon left mid-flight. Crash recovery on boot
-    /// fails each of them (cause `daemon_restart`) through
-    /// [`Self::finish_request`] before the lanes are rebuilt; a live
-    /// daemon never calls this.
+    /// Reads the next recovery page in `(created_ts, id)` order, strictly after
+    /// `after`. A page contains at most 16 rows and `maximum_bytes` selected text
+    /// bytes, clamped to the queue's absolute 8 MiB ceiling.
+    ///
+    /// SQL checks byte lengths before returning even an identifier to Rust.
+    /// `None` means an oversized legacy row was encountered; no payload from that
+    /// page is read. `Some([])` means recovery is complete. The caller must stop
+    /// startup on `None`, leaving backup/repair of the legacy database to its
+    /// operator. Silently skipping such a row would conceal retained work.
+    pub async fn queued_recovery_page(
+        &self,
+        after: Option<(i64, &str)>,
+        maximum_bytes: u64,
+    ) -> Result<Option<Vec<RequestRow>>, StoreError> {
+        self.recovery_page(RecoveryRows::Queued, after, maximum_bytes)
+            .await
+    }
+
+    /// Reads a bounded page of `running` / `waiting_approval` rows using the
+    /// same ordering and byte guards as [`Self::queued_recovery_page`].
+    /// `None` requires an explicit startup failure and operator backup/repair.
+    pub async fn stuck_recovery_page(
+        &self,
+        after: Option<(i64, &str)>,
+        maximum_bytes: u64,
+    ) -> Result<Option<Vec<RequestRow>>, StoreError> {
+        self.recovery_page(RecoveryRows::Stuck, after, maximum_bytes)
+            .await
+    }
+
+    async fn recovery_page(
+        &self,
+        subset: RecoveryRows,
+        after: Option<(i64, &str)>,
+        maximum_bytes: u64,
+    ) -> Result<Option<Vec<RequestRow>>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let maximum = i64::try_from(maximum_bytes.min(8 * 1024 * 1024)).unwrap_or(0);
+        let Some(ids) = self.recovery_ids(subset, after, maximum).await? else {
+            return Ok(None);
+        };
+        let mut page = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Keep the SQL bound at the payload query too. The same connection
+            // mutex covers both reads; no local writer can enlarge a row between
+            // the metadata pass and materialization.
+            let mut rows = self
+                .conn
+                .query(
+                    &format!(
+                        "SELECT {} FROM request WHERE id = ?1 AND ({})
+                     AND ({}) <= ?2",
+                        Self::REQUEST_COLUMNS,
+                        subset.predicate(),
+                        Self::RECOVERY_TEXT_BYTES,
+                    ),
+                    params![id, maximum],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            page.push(Self::parse_request_row(&row)?);
+        }
+        Ok(Some(page))
+    }
+
+    // Include every selected text field, especially nullable legacy outcome/key.
+    // CAST AS BLOB counts UTF-8 bytes, not characters or a prefix before NUL.
+    const RECOVERY_TEXT_BYTES: &'static str =
+        "LENGTH(CAST(id AS BLOB)) + LENGTH(CAST(capability AS BLOB))
+         + LENGTH(CAST(repo AS BLOB)) + LENGTH(CAST(caller_agent AS BLOB))
+         + LENGTH(CAST(args_json AS BLOB)) + LENGTH(CAST(state AS BLOB))
+         + COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0)
+         + COALESCE(LENGTH(CAST(outcome AS BLOB)), 0)";
+
+    /// Metadata-only page; called with conn_lock held by the page reader.
+    async fn recovery_ids(
+        &self,
+        subset: RecoveryRows,
+        after: Option<(i64, &str)>,
+        maximum: i64,
+    ) -> Result<Option<Vec<String>>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT CASE WHEN ({size}) <= ?3 THEN id ELSE NULL END, ({size})
+                 FROM request WHERE ({predicate})
+                 AND (?1 IS NULL OR created_ts > ?1 OR (created_ts = ?1 AND id > ?2))
+                 ORDER BY created_ts, id LIMIT 16",
+                    size = Self::RECOVERY_TEXT_BYTES,
+                    predicate = subset.predicate(),
+                ),
+                params![after.map(|(ts, _)| ts), after.map(|(_, id)| id), maximum],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        let mut bytes = 0_i64;
+        while let Some(row) = rows.next().await? {
+            let size = row.get::<i64>(1)?;
+            if size < 0 || size > maximum {
+                return Ok(None);
+            }
+            if bytes.saturating_add(size) > maximum {
+                break;
+            }
+            let Some(id) = row.get::<Option<String>>(0)? else {
+                return Ok(None);
+            };
+            bytes += size;
+            ids.push(id);
+        }
+        Ok(Some(ids))
+    }
+
+    /// Reads every `running` or `waiting_approval` row, oldest first.
+    /// Intended for bounded test fixtures; startup recovery must use
+    /// [`Self::stuck_recovery_page`] instead.
     pub async fn list_stuck_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let mut rows = self

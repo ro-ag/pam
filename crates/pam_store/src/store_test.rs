@@ -182,6 +182,157 @@ async fn list_queued_ordered_returns_oldest_first_queued_only() {
 }
 
 #[tokio::test]
+async fn queued_recovery_pages_preserve_timestamp_then_id_order() {
+    let store = Store::open_in_memory().await.unwrap();
+    let mut expected = Vec::new();
+    for number in (0_i64..37).rev() {
+        let id = format!("page_{number:02}");
+        insert_demo_request(&store, &id).await;
+        let created = 100 + number / 7;
+        store
+            .conn
+            .execute(
+                "UPDATE request SET created_ts = ?2 WHERE id = ?1",
+                params![id.as_str(), created],
+            )
+            .await
+            .unwrap();
+        expected.push((created, id));
+    }
+    expected.sort();
+    let mut cursor: Option<(i64, String)> = None;
+    let mut actual = Vec::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let page = store
+            .queued_recovery_page(
+                cursor.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                8 * 1024 * 1024,
+            )
+            .await
+            .unwrap()
+            .expect("bounded legacy rows");
+        let Some(last) = page.last() else { break };
+        cursor = Some((last.created_ts, last.id.clone()));
+        page_sizes.push(page.len());
+        actual.extend(page.into_iter().map(|row| (row.created_ts, row.id)));
+    }
+    assert_eq!(page_sizes, [16, 16, 5]);
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn queued_recovery_pages_bound_aggregate_materialized_bytes() {
+    let store = Store::open_in_memory().await.unwrap();
+    for id in ["a", "b", "c"] {
+        store
+            .insert_request(id, "echo", "repo", "agent", &"x".repeat(100), None)
+            .await
+            .unwrap();
+    }
+    // One row is below 200 bytes but two are above it, so the row-count cap
+    // alone would not establish this bound.
+    let first = store
+        .queued_recovery_page(None, 200)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, "a");
+    let second = store
+        .queued_recovery_page(Some((first[0].created_ts, &first[0].id)), 200)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, "b");
+}
+
+#[tokio::test]
+async fn stuck_recovery_filters_states_and_rejects_oversized_payloads() {
+    for state in [RequestState::Running, RequestState::WaitingApproval] {
+        let store = Store::open_in_memory().await.unwrap();
+        insert_demo_request(&store, "queued").await;
+        insert_demo_request(&store, "stuck").await;
+        store
+            .update_request_state("stuck", state, None)
+            .await
+            .unwrap();
+        let page = store.stuck_recovery_page(None, 300).await.unwrap().unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "stuck");
+        store
+            .conn
+            .execute(
+                "UPDATE request SET args_json = ?1 WHERE id = 'stuck'",
+                params![format!("\0{}", "é".repeat(200))],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .stuck_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .queued_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_recovery_rejects_each_oversized_text_field_before_materialization() {
+    // Include fields a payload-only check misses. Multibyte text proves that
+    // the SQL guard measures bytes; NUL verifies it does not stop at a prefix.
+    for column in [
+        "id",
+        "capability",
+        "repo",
+        "caller_agent",
+        "args_json",
+        "idempotency_key",
+        "outcome",
+    ] {
+        let store = Store::open_in_memory().await.unwrap();
+        insert_demo_request(&store, "legacy").await;
+        let oversized = format!("\0{}", "é".repeat(200));
+        store
+            .conn
+            .execute(
+                &format!("UPDATE request SET {column} = ?1 WHERE id = 'legacy'"),
+                params![oversized],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .queued_recovery_page(None, 300)
+                .await
+                .unwrap()
+                .is_none(),
+            "{column}"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM request WHERE state = 'queued'"
+            )
+            .await,
+            1,
+            "guard must not erase {column}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn updating_missing_request_is_an_error() {
     let store = Store::open_in_memory().await.unwrap();
     let err = store

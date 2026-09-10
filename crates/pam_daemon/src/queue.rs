@@ -180,6 +180,11 @@ pub struct LeasedWork {
 /// Why a queue operation failed.
 #[derive(Debug, Error)]
 pub enum QueueError {
+    /// An old queued row cannot be read within the startup recovery byte bound.
+    #[error(
+        "legacy_queue_oversized: a queued row exceeds the recovery byte limit; stop PAM, back up its state database, and have the operator repair the oversized legacy row before restarting"
+    )]
+    LegacyQueueOversized,
     /// The original request deadline elapsed before work could begin.
     #[error("request admission deadline expired")]
     Expired,
@@ -205,6 +210,7 @@ impl QueueError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::LegacyQueueOversized => "legacy_queue_oversized",
             Self::Expired => "deadline_exceeded",
             Self::NotAdmitted => "admission_invalid",
             Self::Capacity { cause, .. } => cause,
@@ -216,6 +222,9 @@ impl QueueError {
     #[must_use]
     pub fn recovery(&self) -> &'static str {
         match self {
+            Self::LegacyQueueOversized => {
+                "Stop PAM and back up its state database; operator repair of the oversized legacy queued row is required before restart."
+            }
             Self::Expired => "Submit a fresh request with enough time for the authorized work.",
             Self::Capacity { .. } => {
                 "Wait for active work to finish or cancel an existing request, then retry."
@@ -645,59 +654,74 @@ impl QueueManager {
     /// Rebuilds every lane from the store's `queued` rows, oldest first,
     /// replacing the in-memory lanes. Missing authorization or expiry fails closed;
     /// restored entries retain only the time remaining on their original deadline.
+    /// Reads keyset pages bounded by row count and aggregate text bytes. An
+    /// oversized legacy row stops startup for operator backup/repair; recovery
+    /// does not fetch or silently delete its payload.
     ///
     /// Crash recovery of `running` / `waiting_approval` rows left behind
     /// by a dead daemon is task #12, not handled here.
     pub async fn rebuild_from_store(&self) -> Result<usize, QueueError> {
-        let queued = self.store.list_queued_ordered().await?;
         let mut inner = self.inner.lock().await;
         inner.lanes.clear();
         let revision = self.store.grant_revocation_revision().await?;
         let mut restored = 0;
         let mut retained_bytes = 0u64;
-        for row in queued {
-            let remaining = row
-                .expires_at_ms
-                .map_or(0, |expires| expires.saturating_sub(wall_clock_ms()));
-            let bytes = [
-                &row.id,
-                &row.capability,
-                &row.repo,
-                &row.caller_agent,
-                &row.args_json,
-            ]
-            .iter()
-            .map(|v| v.len() as u64)
-            .sum::<u64>()
-            .saturating_add(row.idempotency_key.as_ref().map_or(0, |v| v.len() as u64));
-            let cause = if !row.queue_authorized || row.expires_at_ms.is_none() {
-                Some("admission_invalid")
-            } else if row.authorization_revision != Some(revision) {
-                Some("authorization_changed")
-            } else if remaining <= 0 {
-                Some(CAUSE_LEASE_EXPIRED)
-            } else if restored >= MAX_ADMITTED_REQUESTS
-                || retained_bytes.saturating_add(bytes) > MAX_ADMITTED_BYTES
-            {
-                Some("queue_recovery_limit")
-            } else {
-                None
-            };
-            if let Some(cause) = cause {
-                self.fail_recovered(&row.id, cause).await?;
-                continue;
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let queued = self
+                .store
+                .queued_recovery_page(
+                    after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                    MAX_ADMITTED_BYTES,
+                )
+                .await?
+                .ok_or(QueueError::LegacyQueueOversized)?;
+            let Some(last) = queued.last() else { break };
+            after = Some((last.created_ts, last.id.clone()));
+            for row in queued {
+                let remaining = row
+                    .expires_at_ms
+                    .map_or(0, |expires| expires.saturating_sub(wall_clock_ms()));
+                let bytes = [
+                    &row.id,
+                    &row.capability,
+                    &row.repo,
+                    &row.caller_agent,
+                    &row.args_json,
+                ]
+                .iter()
+                .map(|v| v.len() as u64)
+                .sum::<u64>()
+                .saturating_add(row.idempotency_key.as_ref().map_or(0, |v| v.len() as u64));
+                let cause = if !row.queue_authorized || row.expires_at_ms.is_none() {
+                    Some("admission_invalid")
+                } else if row.authorization_revision != Some(revision) {
+                    Some("authorization_changed")
+                } else if remaining <= 0 {
+                    Some(CAUSE_LEASE_EXPIRED)
+                } else if restored >= MAX_ADMITTED_REQUESTS
+                    || retained_bytes.saturating_add(bytes) > MAX_ADMITTED_BYTES
+                {
+                    Some("queue_recovery_limit")
+                } else {
+                    None
+                };
+                if let Some(cause) = cause {
+                    self.fail_recovered(&row.id, cause).await?;
+                    continue;
+                }
+                retained_bytes += bytes;
+                restored += 1;
+                inner
+                    .lanes
+                    .entry(row.repo)
+                    .or_default()
+                    .push_back(QueuedEntry {
+                        id: row.id,
+                        deadline: Instant::now()
+                            + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
+                    });
             }
-            retained_bytes += bytes;
-            restored += 1;
-            inner
-                .lanes
-                .entry(row.repo)
-                .or_default()
-                .push_back(QueuedEntry {
-                    id: row.id,
-                    deadline: Instant::now()
-                        + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
-                });
         }
         Ok(usize::try_from(restored).unwrap_or(usize::MAX))
     }

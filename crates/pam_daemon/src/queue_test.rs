@@ -556,6 +556,85 @@ async fn rebuild_from_store_restores_lane_order() {
 }
 
 #[tokio::test]
+async fn recovery_pages_do_not_skip_rows_failed_between_pages() {
+    let (store, queue) = manager().await;
+    for number in (0..39).rev() {
+        let id = format!("recovery_{number:02}");
+        if number % 3 == 0 {
+            // These legacy rows are failed during recovery. OFFSET pagination
+            // would skip surviving rows as the queued set shrinks.
+            store
+                .insert_request(&id, "echo", REPO_A, "claude", "{}", None)
+                .await
+                .unwrap();
+        } else {
+            enqueue(
+                &queue,
+                &envelope(&id, REPO_A, serde_json::json!({"id": id}), None),
+            )
+            .await;
+        }
+    }
+    let expected: Vec<String> = store
+        .list_queued_ordered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.queue_authorized)
+        .map(|row| row.id)
+        .collect();
+    let restarted = QueueManager::new(Arc::clone(&store));
+    assert_eq!(restarted.rebuild_from_store().await.unwrap(), 26);
+    for number in 0..39 {
+        let id = format!("recovery_{number:02}");
+        if number % 3 == 0 {
+            let row = store.get_request(&id).await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::Failed);
+            assert_eq!(row.outcome.as_deref(), Some("admission_invalid"));
+        }
+    }
+    for id in expected {
+        let work = restarted.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(work.request_id, id);
+        restarted
+            .complete(&id, RequestState::Done, None, execute_entry())
+            .await
+            .unwrap();
+    }
+    assert!(restarted.take_next(REPO_A).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn oversized_legacy_queue_requires_operator_repair_without_deleting_work() {
+    let (store, queue) = manager().await;
+    let oversized = "x".repeat(usize::try_from(crate::queue::MAX_ADMITTED_BYTES).unwrap() + 1);
+    store
+        .insert_request(
+            "legacy_oversized",
+            "echo",
+            REPO_A,
+            "claude",
+            &oversized,
+            None,
+        )
+        .await
+        .unwrap();
+    let error = queue.rebuild_from_store().await.unwrap_err();
+    assert!(matches!(error, QueueError::LegacyQueueOversized));
+    assert_eq!(error.cause(), "legacy_queue_oversized");
+    assert!(error.recovery().contains("back up"));
+    assert!(queue.ready_repos().await.is_empty());
+    // Inspection happens deliberately in this test, not on the recovery path.
+    let row = store
+        .get_request("legacy_oversized")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert_eq!(row.args_json.len(), oversized.len());
+}
+
+#[tokio::test]
 async fn pre_gate_admission_is_not_recovered_and_legacy_queued_rows_fail_closed() {
     let (store, queue) = manager().await;
     let env = envelope("before_gate", REPO_A, serde_json::json!({}), None);

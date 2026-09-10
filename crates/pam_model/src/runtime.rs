@@ -174,7 +174,12 @@ pub struct LoadedModel {
     /// Effective context: [`CONTEXT_TOKENS`], or the model's own figure when
     /// that is smaller.
     pub context_length: usize,
-    /// File size — the mapped footprint. No invented KV-cache byte figures.
+    /// Artifact file size. This is NOT the working set: tensors are read
+    /// into owned buffers rather than mapped, and the token embedding is
+    /// dequantized to F32, so measured resident memory runs well above this
+    /// figure — about 15.0 GB on CPU and over 19.3 GB on Metal for a
+    /// 10.5 GB artifact. See docs/model-resource-screen.md. No invented
+    /// KV-cache byte figures.
     pub weight_bytes: u64,
     /// `metal` or `cpu`.
     pub device: String,
@@ -192,7 +197,7 @@ pub struct LoadedModel {
 pub enum RuntimeState {
     /// Nothing loaded; the memory is back with the developer.
     Idle,
-    /// A load is in flight. `phase` is `reading_header`, `mapping_tensors`
+    /// A load is in flight. `phase` is `reading_header`, `reading_tensors`
     /// or `ready` — candle exposes no per-tensor progress, so PAM reports
     /// the phases it can actually observe instead of a fake percentage.
     Loading {
@@ -862,7 +867,7 @@ fn load_model(
     let tokenizer =
         tokenizer::from_gguf(&content).map_err(|err| RuntimeError::LoadFailed(err.to_string()))?;
 
-    set_state(mirror, loading(&entry.id, "mapping_tensors"));
+    set_state(mirror, loading(&entry.id, "reading_tensors"));
     let model = build_model(&architecture, content, &mut file, &device)?;
     set_state(mirror, loading(&entry.id, "ready"));
 
@@ -943,7 +948,7 @@ pub(crate) fn preflight_tensor_dtypes(
         };
         if unsupported {
             return Err(RuntimeError::LoadFailed(format!(
-                "tensor {name:?} uses {:?}, unsupported by PAM's Candle 0.9.2 {backend} inference path; no weights were mapped. Choose a supported quantization/backend and retain this detail when reporting the model",
+                "tensor {name:?} uses {:?}, unsupported by PAM's Candle 0.9.2 {backend} inference path; no weights were read. Choose a supported quantization/backend and retain this detail when reporting the model",
                 tensor.ggml_dtype,
             )));
         }

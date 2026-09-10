@@ -158,6 +158,35 @@ The margin over artifact bytes is large and backend-dependent: roughly 4.5 GB on
 CPU and over 8.8 GB on Metal for the same 10.51 GB file. Weight bytes therefore
 underestimate demand, which is the eligibility question raised in issue #12.
 
+### Where the working set goes
+
+The artifact's own GGUF header accounts for nearly all of the gap. Tensor
+payload is 10.509 GB, and candle reads each tensor into an owned buffer rather
+than mapping it, so all of it becomes dirty anonymous memory. On top of that
+`token_embd.weight` — 5,120 x 151,936 at Q5_K, 0.535 GB on disk — is
+**dequantized to F32 at load**, which is 3.112 GB of new memory, and the
+quantized source tensor stays alive alongside the F32 copy until model
+construction returns.
+
+| Component | Bytes |
+| --- | --- |
+| Tensor payload read into owned buffers | 10.509 GB |
+| `token_embd.weight` dequantized to F32 | 3.112 GB |
+| Quantized embedding retained during load | 0.535 GB |
+| Accounted total during load | 14.156 GB |
+
+Measured `phys_footprint` after load was 15.03 GB, leaving about 0.9 GB for
+allocator retention, the transient per-tensor double buffer, and the
+152,000-entry tokenizer vocabulary. The steady-state prediction once model
+construction returns — 10.509 + 3.112, about 13.6 GB — matches the 13.91 GB dip
+the CPU run actually recorded at 77.5 s.
+
+Embeddings are **not** tied in this artifact: `output.weight` is present
+separately as Q6_K (0.638 GB) and is kept quantized, so a duplicated embedding
+is not part of the total. The F32 embedding copy alone is about 22% of the
+working set; keeping it at F16 would return roughly 1.6 GB, and keeping it
+quantized roughly 2.6 GB. That has not been attempted or measured.
+
 What this does **not** establish: any 32 GB claim, the 2048-token envelope,
 cancellation, recovery or unload behaviour on either backend, answer quality
 under the correct non-thinking framing, or a p95 latency. The challenger

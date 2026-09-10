@@ -227,7 +227,7 @@ describe("polling cadence", () => {
       pollInterval(
         idleStatus({
           runtime: {
-            state: { state: "loading", phase: "mapping_tensors", id: "x" },
+            state: { state: "loading", phase: "reading_tensors", id: "x" },
             busy: true,
           },
         }),

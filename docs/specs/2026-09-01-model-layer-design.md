@@ -180,7 +180,7 @@ Load: `gguf_file::Content::read`, dispatch on `general.architecture`
 (`qwen3` → `quantized_qwen3::ModelWeights`, `qwen3moe` →
 `quantized_qwen3_moe::GGUFQWenMoE`), device = Metal on macOS else CPU,
 tokenizer from metadata. Load progress is reported as phases
-(`reading_header`, `mapping_tensors`, `ready`) — candle does not expose
+(`reading_header`, `reading_tensors`, `ready`) — candle does not expose
 per-tensor progress. Failures are `load_failed` with candle's message.
 
 Generate: `GenerateRequest { system?, prompt, max_tokens, temperature,

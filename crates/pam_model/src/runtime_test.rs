@@ -300,7 +300,7 @@ fn tensor_dtype_preflight_refuses_known_backend_kernel_gaps() {
         if let Err(RuntimeError::LoadFailed(detail)) = result {
             assert!(detail.contains("blk.0.ffn_down_exps.weight"));
             assert!(detail.contains(backend));
-            assert!(detail.contains("no weights were mapped"));
+            assert!(detail.contains("no weights were read"));
         }
     }
 }

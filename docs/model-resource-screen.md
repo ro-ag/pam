@@ -222,10 +222,25 @@ never triggered it — under a 48 GiB ceiling the kernel high-water mark reached
 Once loaded, Metal settles near 17.7 GB resident, close to CPU. But transient
 GPU allocations during generation grow with prompt length and are invisible to
 RSS: while RSS stayed flat at 17.68 GB, the kernel high-water mark climbed to
-58.09 GB on a 64 GiB host. Steady-state headroom therefore does not decide
-whether this artifact fits a 32 GB machine — the transient does, and it does not
-fit. Whether `phys_footprint` attributing unified-memory GPU allocations this
-way reflects pressure identically to anonymous CPU memory has not been
+58.09 GB on a 64 GiB host.
+
+That number is **an upper bound on what this host permitted, not a prediction of
+demand on a smaller one**. With 64 GiB available the allocator and the Metal
+driver take what is there: transient buffers are allocated and cached because
+there is headroom, the compressor stays lazy, and purgeable GPU memory is never
+reclaimed. A 32 GB machine would be forced into different behaviour long before
+58 GB — earlier compression, earlier eviction of purgeable buffers, allocation
+failure, or differently sized driver caches. Which of those happens cannot be
+determined from this host, so no statement about whether the artifact fits a
+32 GB machine follows from these runs, in either direction.
+
+The same caveat applies more weakly to the CPU figures. Anonymous dirty memory
+must be backed somewhere, so the 19.17 GB peak transfers better than a GPU
+transient does — but under a 32 GB budget compression and swap would engage
+earlier and change the timings, so it is still not a 32 GB measurement.
+
+Whether `phys_footprint` attributing unified-memory GPU allocations this way
+reflects pressure identically to anonymous CPU memory has also not been
 independently confirmed.
 
 Those raised-ceiling runs are not routine: they pushed this host into heavy

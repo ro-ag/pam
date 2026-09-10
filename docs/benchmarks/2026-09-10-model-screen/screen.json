@@ -326,7 +326,7 @@
     "Resident set is not an overstatement from evictable mapped weights: phys_footprint tracks ps RSS within about 0.4 GB throughout and peaks HIGHER on both backends (CPU 17.18 GB against RSS 17.16 GB; Metal 19.33 GB against RSS 18.73 GB), because it excludes clean file-backed pages and includes compressed ones. The working set is real anonymous memory: weights are materialized, not mapped.",
     "The working set exceeds artifact bytes by roughly 4.5 GB on CPU and over 8.8 GB on Metal, so weight bytes underestimate demand by a large and backend-dependent margin.",
     "Metal is far faster than CPU once its timings are honest: prefill about 342 tokens per second against 11.3, with load at about 1.9 s on both. Steady state after load is about 17.7 GB.",
-    "Metal's binding constraint is not steady state but transient GPU allocation during generation, which grows with prompt length and drove the kernel high-water mark to 58.09 GB on a 64 GiB host while RSS stayed flat near 17.7 GB. A 32 GB machine cannot absorb that transient.",
+    "Metal's binding constraint is not steady state but transient GPU allocation during generation, which grows with prompt length and drove the kernel high-water mark to 58.09 GB on a 64 GiB host while RSS stayed flat near 17.7 GB. That figure is an upper bound on what this host PERMITTED, not a prediction of demand under a smaller budget: with headroom available the allocator and Metal driver cache freely, the compressor stays lazy and purgeable GPU memory is never reclaimed.",
     "A 2048-token prefill costs over three minutes on CPU (185.7 s), and the widest phase sets the peak: 19.17 GB RSS against the 17.53 GB seen when a run stopped after 1024 tokens.",
     "Cancellation is not bounded: a signal sent at 100 ms returned only after 185,050 ms, the entire prefill, with worker preemption unproven. Recovery after cancel did succeed.",
     "Unload does not return the working set: it reports success in 64 ms while about 17.8 GB stays resident."
@@ -340,7 +340,8 @@
     "One synthetic build-record fixture with a 64-token output cap and ambient host load. No task quality, incident, fidelity or benefit qualification.",
     "The second pinned candidate, Qwen3-Coder-30B-A3B-Instruct-Q3_K_S, has not been downloaded or screened.",
     "Whether phys_footprint attributing unified-memory GPU allocations this way reflects pressure the same as anonymous CPU memory has not been independently confirmed.",
-    "The complete run is CPU only and used a 22 GiB ceiling. Metal still has no 2048-token, cancellation, recovery or unload measurement, because its transient GPU allocation stops the run first."
+    "The complete run is CPU only and used a 22 GiB ceiling. Metal still has no 2048-token, cancellation, recovery or unload measurement, because its transient GPU allocation stops the run first.",
+    "No behaviour observed here predicts a 32 GB machine, in either direction. Memory management is budget-dependent: a constrained host compresses, evicts purgeable buffers, fails allocations or sizes driver caches differently, and none of those paths are exercised when 64 GiB is available. Only the real target hardware, or a genuinely memory-constrained environment, can answer admission."
   ],
   "corrections": [
     {

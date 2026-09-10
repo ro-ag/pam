@@ -163,6 +163,11 @@ const JENKINS_CALLS: &[CallSpec] = &[
         args: &[("job", true), ("build", true)],
         yields_log: false,
     },
+    CallSpec {
+        name: "node_evidence",
+        args: &[("job", true), ("build", true), ("node_id", true)],
+        yields_log: false,
+    },
 ];
 
 const SONARQUBE_CALLS: &[CallSpec] = &[

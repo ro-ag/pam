@@ -43,6 +43,9 @@ pub(crate) async fn call(
         "investigate" => {
             crate::jenkins_investigation::investigate(conn, args, transport, deadline).await
         }
+        "node_evidence" => {
+            crate::jenkins_investigation::node_evidence(conn, args, transport, deadline).await
+        }
         other => Err(unknown_call(ID, other)),
     }
 }

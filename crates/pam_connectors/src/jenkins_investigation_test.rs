@@ -799,3 +799,17 @@ async fn timed_out_parent_preserves_actionable_abstention_within_budget() {
             <= MAX_TOTAL_BYTES
     );
 }
+
+#[tokio::test]
+async fn parents_reported_only_by_stage_detail_are_collected() {
+    let phase = stage(5, "FAILED", "Build");
+    let mut detail = phase.clone();
+    detail["parentNodes"] = json!(["70"]);
+    let transport = script("FAILURE", vec![phase])
+        .json(200, &description(detail, vec![]).to_string())
+        .json(200, &stage(70, "SUCCESS", "Earlier context").to_string());
+    let report = invoke(&transport).await.unwrap();
+    assert_eq!(report["supplemental_nodes"][0]["id"], "70");
+    assert_eq!(report["attribution"], "unresolved");
+    assert_eq!(transport.requests().len(), 4);
+}

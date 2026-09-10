@@ -117,6 +117,13 @@ fn product_targets_and_broad_searches_have_explicit_boundaries() {
         (ConnectorId::Github, "run", "repo", "team/app", "team/app"),
         (
             ConnectorId::Jenkins,
+            "node_evidence",
+            "job",
+            "folder/app",
+            "folder/app",
+        ),
+        (
+            ConnectorId::Jenkins,
             "investigate",
             "job",
             "folder/app",

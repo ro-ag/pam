@@ -32,6 +32,38 @@ fn log_identity_uses_validated_request_arguments_without_json_response() {
         );
     }
 }
+
+#[test]
+fn explicit_jenkins_node_keeps_build_source_and_distinct_node_identity() {
+    let mut report = reported();
+    report["job"] = json!("team/build");
+    report["build"] = json!(41);
+    report["node_id"] = json!("6");
+    assert!(
+        evaluate(
+            &target(),
+            ConnectorId::Jenkins,
+            "node_evidence",
+            Some(&report)
+        )
+        .is_matched()
+    );
+    let first = product_identity(
+        ConnectorId::Jenkins,
+        "node_evidence",
+        &BTreeMap::new(),
+        Some(&report),
+    );
+    report["node_id"] = json!("7");
+    let second = product_identity(
+        ConnectorId::Jenkins,
+        "node_evidence",
+        &BTreeMap::new(),
+        Some(&report),
+    );
+    assert_ne!(first, second);
+    assert_eq!(second["build"], 41);
+}
 fn reported() -> Value {
     json!({"source_identity":{"status":"unambiguous","repository_urls":["https://git.example/team/app.git"],"revisions":["a".repeat(40)],"partial":false,"invalid_metadata":false}})
 }

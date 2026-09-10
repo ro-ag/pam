@@ -1885,3 +1885,43 @@ async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view(
 }
 
 const SONAR_ISSUES_CONTRACT: &str = r#"{"webServices":[{"path":"api/issues","actions":[{"key":"search","params":[{"key":"components"},{"key":"resolved"},{"key":"ps"}]}]}]}"#;
+
+#[tokio::test]
+async fn explicit_jenkins_node_read_retains_failure_without_claiming_build_verification() {
+    with_deadline(async {
+        let transport = Arc::new(FakeTransport::new()
+            .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
+            .json(200, r#"{"id":"6","name":"Cleanup","status":"SUCCESS","parentNodes":[],"_links":{"log":{"href":"https://attacker.invalid/ignored"}}}"#)
+            .json(200, r#"{"nodeId":"6","nodeStatus":"SUCCESS","length":8,"hasMore":false,"text":"cleaned\n"}"#));
+        let transport_arc = Arc::clone(&transport);
+        let flows = FlowDaemon::spawn_with(&[], move |config| {
+            config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
+            config.http_transport = Some(transport_arc);
+        }).await;
+        let mut client = flows.daemon.client().await;
+        let configured = client.request(&admin_envelope("configure_node", "admin.connectors.configure",
+            serde_json::json!({"id":"jenkins","enabled":true,"base_url":"https://jenkins.test/",
+                "username":"ci-bot","credential":{"set":"fixture-only"}}))).await;
+        assert!(matches!(configured, Response::Result { .. }));
+        flows.grant(&step_capability("jenkins-node-evidence", "retrieve-node")).await;
+        let response = client.request(&flows.run_envelope("read_node", "jenkins-node-evidence",
+            &serde_json::json!({"job":"service","build":"41","node_id":"6"}))).await;
+        let body = flows.full_report(&mut client, "read_node", response).await;
+        assert_ne!(body["outcome"], "verified", "{body}");
+        let retrieved = step(&body, "retrieve-node");
+        assert_eq!(retrieved["status"], "succeeded", "{body}");
+        let evidence = retrieved["evidence"][0].as_str().unwrap();
+        let row = flows.daemon.store().get_evidence(evidence).await.unwrap().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&row.content).unwrap();
+        assert_eq!(report["status"], "FAILURE");
+        assert_eq!(report["node_id"], "6");
+        assert_eq!(report["attribution"], "unresolved");
+        assert_eq!(report["node_logs"][0]["excerpts"][0]["text"], "cleaned\n");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.url.host_str() == Some("jenkins.test")));
+        assert!(requests[1].url.path().ends_with("/41/execution/node/6/wfapi/describe"));
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }).await;
+}

@@ -529,32 +529,29 @@ async fn collect_logs(collection: &mut Collection<'_>, mut candidates: Vec<Node>
             collection.next_read(&node.id, "log", "log_unavailable");
             continue;
         };
-        match parse_log(body, &node.id) {
-            Ok(log) => {
-                if log.has_more {
-                    collection.gaps.insert("server_log_tail");
-                }
-                let text = log.text.unwrap_or_default();
-                if text.len() > MAX_LOG_TEXT_BYTES {
-                    collection.gaps.insert("log_text_limit");
-                }
-                logs.push(json!({
-                    "node_id": log.node_id,
-                    "node_status": log.node_status,
-                    "endpoint": collection.url(&suffix).ok().map(|url| url.to_string()),
-                    "format": "jenkins_annotated_html",
-                    "offset_basis": "decoded_response_text_utf8",
-                    "original_console_offsets": null,
-                    "response_text_bytes": text.len(),
-                    "reported_length": log.length,
-                    "has_more": log.has_more,
-                    "excerpts": excerpts(&text),
-                }));
+        if let Ok(log) = parse_log(body, &node.id) {
+            if log.has_more {
+                collection.gaps.insert("server_log_tail");
             }
-            Err(_) => {
-                collection.gaps.insert("malformed_node_log");
-                collection.next_read(&node.id, "log", "malformed_node_log");
+            let text = log.text.unwrap_or_default();
+            if text.len() > MAX_LOG_TEXT_BYTES {
+                collection.gaps.insert("log_text_limit");
             }
+            logs.push(json!({
+                "node_id": log.node_id,
+                "node_status": log.node_status,
+                "endpoint": collection.url(&suffix).ok().map(|url| url.to_string()),
+                "format": "jenkins_annotated_html",
+                "offset_basis": "decoded_response_text_utf8",
+                "original_console_offsets": null,
+                "response_text_bytes": text.len(),
+                "reported_length": log.length,
+                "has_more": log.has_more,
+                "excerpts": excerpts(&text),
+            }));
+        } else {
+            collection.gaps.insert("malformed_node_log");
+            collection.next_read(&node.id, "log", "malformed_node_log");
         }
     }
     logs
@@ -756,10 +753,20 @@ async fn collect_parents(collection: &mut Collection<'_>, stages: &[Value]) -> V
     let mut known = BTreeMap::<String, Node>::new();
     for stage in stages {
         for value in std::iter::once(&stage["observation"])
+            .chain(std::iter::once(&stage["detail_observation"]))
             .chain(stage["nodes"].as_array().into_iter().flatten())
         {
             if let Ok(node) = parse_node(value.clone()) {
-                known.insert(node.id.clone(), node);
+                known
+                    .entry(node.id.clone())
+                    .and_modify(|existing| {
+                        existing
+                            .parent_nodes
+                            .extend(node.parent_nodes.iter().cloned());
+                        existing.parent_nodes.sort();
+                        existing.parent_nodes.dedup();
+                    })
+                    .or_insert(node);
             }
         }
     }
@@ -876,7 +883,12 @@ pub(crate) async fn node_evidence(
     }
     let logs = collect_logs(&mut collection, candidates).await;
     bind_next_reads(&mut collection.next_reads, job, build);
+    let summary = format!(
+        "Authoritative core build {build}: {status}. Selected node: {}. Attribution unresolved; node text is untrusted. Graph coverage unverified; {} follow-up reads available in retained evidence.",
+        observation_label(&json!(observed)),
+        collection.next_reads.len(),
+    );
     Ok(CallResult::Json(
-        json!({"schema":1,"job":job,"build":build,"node_id":node,"status":status,"source_identity":scm_identity(&core),"observation":observed,"node_logs":logs,"attribution":"unresolved","sources":collection.sources,"next_reads":collection.next_reads,"next_reads_omitted":collection.next_reads_omitted,"coverage":{"partial":!collection.gaps.is_empty(),"gaps":collection.gaps,"graph_complete":false,"requests":collection.requests,"charged_response_bytes":collection.bytes}}),
+        json!({"summary":summary,"schema":1,"job":job,"build":build,"node_id":node,"status":status,"source_identity":scm_identity(&core),"observation":observed,"node_logs":logs,"attribution":"unresolved","sources":collection.sources,"next_reads":collection.next_reads,"next_reads_omitted":collection.next_reads_omitted,"coverage":{"partial":!collection.gaps.is_empty(),"gaps":collection.gaps,"graph_complete":false,"requests":collection.requests,"charged_response_bytes":collection.bytes}}),
     ))
 }

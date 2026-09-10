@@ -2132,7 +2132,9 @@ impl RunState<'_> {
         else {
             return;
         };
-        if *connector == ConnectorId::Jenkins && call == "investigate" {
+        if *connector == ConnectorId::Jenkins
+            && matches!(call.as_str(), "investigate" | "node_evidence")
+        {
             report.summary = result
                 .get("summary")
                 .and_then(Value::as_str)
@@ -2415,7 +2417,7 @@ fn product_observations(
                 call,
                 ..
             } = &step.action
-                && call == "investigate"
+                && matches!(call.as_str(), "investigate" | "node_evidence")
             {
                 let status = vars.resolve(&format!("steps.{}.result.status", step.id))?;
                 if [

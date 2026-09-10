@@ -74,7 +74,7 @@ pub(crate) fn evaluate(
     }
     if !matches!(
         (connector, call),
-        (ConnectorId::Github, "run") | (ConnectorId::Jenkins, "investigate")
+        (ConnectorId::Github, "run") | (ConnectorId::Jenkins, "investigate" | "node_evidence")
     ) {
         return decision(
             Status::Unbound,
@@ -225,7 +225,7 @@ pub(crate) fn product_identity(
         job_ids.sort_unstable();
         job_ids.dedup();
         identity["job_ids"] = json!(job_ids);
-    } else if connector == ConnectorId::Jenkins && call == "investigate" {
+    } else if connector == ConnectorId::Jenkins && matches!(call, "investigate" | "node_evidence") {
         if let Some(job) = result
             .get("job")
             .and_then(Value::as_str)
@@ -234,6 +234,9 @@ pub(crate) fn product_identity(
             identity["job"] = json!(job);
         }
         identity["build"] = positive_id(result.get("build"));
+        if call == "node_evidence" {
+            identity["node_id"] = result.get("node_id").cloned().unwrap_or(Value::Null);
+        }
     }
     if let Some(source) = result.get("source_identity") {
         identity["source_identity"] = bounded_source(source);

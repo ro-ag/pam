@@ -187,6 +187,51 @@ is not part of the total. The F32 embedding copy alone is about 22% of the
 working set; keeping it at F16 would return roughly 1.6 GB, and keeping it
 quantized roughly 2.6 GB. That has not been attempted or measured.
 
+### Corrections found while measuring
+
+Three defects in the measurement chain were found and fixed; the figures above
+are the corrected ones.
+
+**Metal prefill timing was fabricated, in production code.** `prompt_ms` stopped
+its clock immediately after the forward pass, but Metal only *enqueues* GPU
+work there, so the reported prefill was enqueue latency — 6 to 11 ms for a
+1000-token prompt — and its real cost silently reappeared inside `decode_ms`.
+That figure is returned in `GenerateResult` and shown by diagnostics, so the GUI
+was reporting a fake prefill time. The device is now synchronized before the
+clock stops: 509 framed tokens cost 1,487 ms and 1,019 cost 3,094 ms, which is
+about 342 tokens per second against CPU's 11.3.
+
+**`phys_footprint` readings carried false precision.** `footprint -p` rounds
+large processes to whole GB, so early readings were exact whole GiB values
+dressed up with two decimals. The probe now uses `footprint -j`, which is
+byte-exact and also exposes `phys_footprint_peak` — a kernel high-water mark
+that, unlike a sampled maximum, cannot miss a transient between samples.
+
+**The record was lost exactly when a run was most extreme.** A child inside an
+uninterruptible GPU call survived both signals, and the unhandled second `wait`
+raised, killing the supervisor before it wrote its `finished` record.
+`terminate` no longer raises and the record reports `child_reaped`.
+
+A fourth problem followed from the third: the soft stop tested only the current
+sampled footprint, so an allocation that spiked and subsided between samples
+never triggered it — under a 48 GiB ceiling the kernel high-water mark reached
+58.09 GB. The stop now tests the kernel peak as well.
+
+### Metal's constraint is the transient, not the steady state
+
+Once loaded, Metal settles near 17.7 GB resident, close to CPU. But transient
+GPU allocations during generation grow with prompt length and are invisible to
+RSS: while RSS stayed flat at 17.68 GB, the kernel high-water mark climbed to
+58.09 GB on a 64 GiB host. Steady-state headroom therefore does not decide
+whether this artifact fits a 32 GB machine — the transient does, and it does not
+fit. Whether `phys_footprint` attributing unified-memory GPU allocations this
+way reflects pressure identically to anonymous CPU memory has not been
+independently confirmed.
+
+Those raised-ceiling runs are not routine: they pushed this host into heavy
+swapping, growing swap from 1.03 GB used of a 2 GB file to 15.1 GB of a 16 GB
+file. Do not repeat them without cause.
+
 What this does **not** establish: any 32 GB claim, the 2048-token envelope,
 cancellation, recovery or unload behaviour on either backend, answer quality
 under the correct non-thinking framing, or a p95 latency. The challenger

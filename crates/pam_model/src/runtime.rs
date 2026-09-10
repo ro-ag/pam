@@ -1016,6 +1016,11 @@ pub(crate) fn check_output_budget(
 /// `prompt_ms` is the prefill: framing, encoding and the one forward pass
 /// over the whole prompt. Clearing the cache costs nothing measurable on
 /// either architecture, so nothing else hides in that number.
+///
+/// The device is synchronized before the prefill clock stops. Metal only
+/// enqueues the forward pass, so without this the number was enqueue time —
+/// single-digit milliseconds for a 1000-token prompt — and the real prefill
+/// cost silently reappeared inside `decode_ms`.
 fn generate_on_thread(
     loaded: &mut Loaded,
     request: &GenerateRequest,
@@ -1060,6 +1065,12 @@ fn generate_on_thread(
         .and_then(|tensor| tensor.unsqueeze(0))
         .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
     let logits = loaded.forward(&input, 0)?;
+    // Metal enqueues rather than completes; without this the prefill figure is
+    // enqueue latency and its real cost is attributed to decoding instead.
+    loaded
+        .device
+        .synchronize()
+        .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
     let prompt_ms = millis(started.elapsed());
     if *cancel.borrow() {
         return Err(RuntimeError::Cancelled);

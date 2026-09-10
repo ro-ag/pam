@@ -1188,6 +1188,31 @@ impl Store {
         outcome: Option<&str>,
         audit: AuditEntry<'_>,
     ) -> Result<bool, StoreError> {
+        let uncertain = self.terminal_flow_uncertainty_locked(id).await?;
+        let uncertainty_detail = uncertain.then(|| {
+            serde_json::json!({
+                "cause": "flow_effect_uncertain",
+                "requested_state": state.as_str(),
+                "requested_cause": outcome,
+                "requested_decision": audit.decision.as_str(),
+                "requested_detail": audit.detail,
+                "reconciliation_required": true,
+            })
+            .to_string()
+        });
+        let (state, outcome, audit) = if uncertain {
+            (
+                RequestState::Failed,
+                Some("flow_effect_uncertain"),
+                AuditEntry {
+                    decision: Decision::Refuse,
+                    detail: uncertainty_detail.as_deref(),
+                    ..audit
+                },
+            )
+        } else {
+            (state, outcome, audit)
+        };
         let changed = self
             .conn
             .execute(
@@ -1226,6 +1251,31 @@ impl Store {
             )
             .await?;
         Ok(true)
+    }
+
+    /// The caller owns the connection lock and terminal transaction. Seal an
+    /// unresolved effect before any terminal writer can hide it behind success,
+    /// cancellation, or a deadline. A terminal row remains an idempotent no-op.
+    async fn terminal_flow_uncertainty_locked(&self, id: &str) -> Result<bool, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE flow_journal SET state='uncertain',revision=revision+1
+                 WHERE request_id=?1 AND state='prepared' AND effectful=1
+                   AND EXISTS(SELECT 1 FROM request WHERE id=?1
+                     AND state IN ('queued','running','waiting_approval'))",
+                params![id],
+            )
+            .await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM flow_journal j JOIN request r ON r.id=j.request_id
+                 WHERE j.request_id=?1 AND j.state='uncertain'
+                   AND r.state IN ('queued','running','waiting_approval')",
+                params![id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     /// Ids of terminal requests with **no** audit row whose action is in

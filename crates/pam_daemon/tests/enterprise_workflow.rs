@@ -20,7 +20,7 @@ const SHA: &str = "abcdef1234567890abcdef1234567890abcdef12";
 const OTHER: &str = "fedcba1234567890fedcba1234567890fedcba12";
 const SOURCE: &str = "https://git.example/team/repo.git";
 const SITE: &str = "tenant.sharepoint.com,site,web";
-const FLOW: &str = r#"schema: 1
+const FLOW: &str = r"schema: 1
 id: enterprise
 name: Enterprise evidence
 correlation:
@@ -70,7 +70,7 @@ steps:
     needs: [confluence]
     role: observe
     output: compact
-"#;
+";
 const CONNECTIONS: [(&str, &str, &str); 6] = [
     ("github", "https://github.test/", "team/repo"),
     ("jenkins", "https://jenkins.test/", "team/build"),

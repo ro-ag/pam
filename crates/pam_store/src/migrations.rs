@@ -41,6 +41,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: SCHEMA_V6,
     },
+    Migration {
+        version: 7,
+        sql: SCHEMA_V7,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -242,4 +246,31 @@ const SCHEMA_V6: &str = "
 ALTER TABLE request ADD COLUMN expires_at_ms INTEGER;
 ALTER TABLE request ADD COLUMN authorization_revision INTEGER;
 ALTER TABLE request ADD COLUMN queue_authorized INTEGER NOT NULL DEFAULT 0 CHECK (queue_authorized IN (0, 1));
+";
+
+/// Immutable public views survive source retention as metadata-only tombstones.
+const SCHEMA_V7: &str = "
+CREATE TABLE evidence_view (
+ evidence_id TEXT PRIMARY KEY,
+ request_id TEXT NOT NULL REFERENCES request(id),
+ repository TEXT NOT NULL,
+ origin_json TEXT NOT NULL,
+ identity_json TEXT NOT NULL,
+ map_json TEXT NOT NULL,
+ view_id TEXT NOT NULL UNIQUE,
+ view_sha256 TEXT NOT NULL,
+ view_bytes INTEGER NOT NULL,
+ view_blob BLOB,
+ expired_at INTEGER
+);
+CREATE INDEX evidence_view_request_idx ON evidence_view(request_id);
+CREATE TABLE evidence_read_allowance (
+ request_id TEXT NOT NULL REFERENCES request(id),
+ repository TEXT NOT NULL,
+ started_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL,
+ remaining_bytes INTEGER NOT NULL,
+ remaining_pages INTEGER NOT NULL,
+ PRIMARY KEY(request_id, repository)
+);
 ";

@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 6);
+    assert_eq!(store.schema_version().await.unwrap(), 7);
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 6
+            supported: 7
         }
     ));
     let message = err.to_string();
@@ -103,7 +103,7 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 6);
+    assert_eq!(store.schema_version().await.unwrap(), 7);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -135,7 +135,7 @@ async fn v3_database_gains_meta_json() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 6);
+    assert_eq!(store.schema_version().await.unwrap(), 7);
     assert!(
         evidence_columns(&store)
             .await
@@ -175,7 +175,7 @@ async fn v4_database_upgrades_to_v5() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 6);
+    assert_eq!(store.schema_version().await.unwrap(), 7);
 
     let mut rows = store
         .conn

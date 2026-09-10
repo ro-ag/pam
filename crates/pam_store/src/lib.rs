@@ -38,8 +38,9 @@ pub use error::StoreError;
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, DEFAULT_REQUEST_LIST_LIMIT, Decision, EVIDENCE_KIND_LOG_COMPACT,
-    EvidenceMeta, EvidencePrune, EvidenceRow, GrantRow, MAX_REQUEST_LIST_LIMIT, ModelJobRow,
-    PendingApproval, RequestPrune, RequestRow, RequestState, Store,
+    EvidenceMeta, EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest,
+    EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, GrantRow, MAX_REQUEST_LIST_LIMIT,
+    ModelJobRow, PendingApproval, RequestPrune, RequestRow, RequestState, Store,
 };
 
 #[cfg(test)]

@@ -4,6 +4,10 @@
 //! alongside their own tasks; only helpers the spine needs today live
 //! here.
 
+#[path = "evidence_views.rs"]
+mod evidence_views;
+pub use evidence_views::*;
+
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1944,6 +1948,10 @@ impl Store {
             )
             .await?;
         if rows > 0 {
+            self.conn.execute(
+                &format!("UPDATE evidence_view SET view_blob = NULL, expired_at = ?3 WHERE evidence_id IN (SELECT id FROM evidence WHERE {filter})"),
+                params![cutoff_ts, keep_kind, now_ts()],
+            ).await?;
             self.conn
                 .execute(
                     &format!("DELETE FROM evidence WHERE {filter}"),
@@ -2003,6 +2011,8 @@ impl Store {
         if requests > 0 {
             // Children first: the foreign keys point at `request`.
             for sql in [
+                format!("DELETE FROM evidence_view WHERE {children}"),
+                format!("DELETE FROM evidence_read_allowance WHERE {children}"),
                 format!("DELETE FROM evidence WHERE {children}"),
                 format!("DELETE FROM approval WHERE {children}"),
                 format!("DELETE FROM audit WHERE {children}"),

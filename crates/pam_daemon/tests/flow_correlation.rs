@@ -563,3 +563,54 @@ async fn matched_remote_evidence_does_not_authorize_unassociated_local_verificat
         fx.finish().await;
     }).await;
 }
+
+#[tokio::test]
+async fn inspection_reports_target_validity_without_collecting_or_freezing() {
+    with_deadline(async {
+        let transport = Arc::new(FakeTransport::new());
+        let fx = Fixture::new(FLOW, transport.clone()).await;
+        let mut client = fx.daemon.client().await;
+        for (ticket, sha, status) in [
+            ("inspect_valid", SHA, "declared"),
+            ("inspect_invalid", "abc123", "unresolved"),
+        ] {
+            let mut request = fx.request(0, ticket, sha, 9);
+            request.capability = "flow.inspect".to_owned();
+            let response = client.request(&request).await;
+            let Response::Result { body, .. } = response else {
+                panic!("{response:?}")
+            };
+            assert_eq!(body["correlation"]["status"], status, "{body}");
+            assert_eq!(body["live"], "unknown");
+            assert_eq!(body["admission_rechecked"], true);
+            if status == "declared" {
+                assert_eq!(body["correlation"]["target"]["repository"], SOURCE);
+                assert_eq!(body["correlation"]["target"]["commit"], SHA);
+                assert_eq!(body["correlation"]["frozen_on_execution"], true);
+            } else {
+                assert_eq!(body["readiness"], "blocked");
+                assert!(
+                    body["blockers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|blocker| blocker["cause"] == "correlation_invalid")
+                );
+            }
+            assert!(
+                fx.daemon
+                    .store()
+                    .read_correlation_target(ticket)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            transport.requests().is_empty(),
+            "inspection must not collect product state"
+        );
+        fx.finish().await;
+    })
+    .await;
+}

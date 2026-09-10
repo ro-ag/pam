@@ -16,6 +16,7 @@ const repository: LandingRepository = {
   base: "main",
   branches: ["feature/work"],
   workspace_root: "/private/landing",
+  read_cache_roots: [],
   checks: [{ name: "unit", argv: ["cargo", "test"], timeout_seconds: 300 }],
   required_checks: ["ci"],
   main_checks: ["ci"],
@@ -127,4 +128,35 @@ it("CAS rejection requires reload and does not silently retry authority", async 
   expect(screen.getByRole("button", { name: "Save landing policy" })).toBeDisabled();
   expect(screen.getByLabelText("Landing repository 1: Squash merge")).toBeChecked();
   expect(mocks.landingSet).toHaveBeenCalledTimes(1);
+});
+
+it("cache access requires explicit exact directories in the saved recipe", async () => {
+  await setup();
+  const label = "Landing repository 1 read-only cache directories (maximum 8) (one per line)";
+  expect(screen.getByLabelText(label)).toHaveValue("");
+  fireEvent.change(screen.getByLabelText(label), {
+    target: { value: "/home/dev/.cargo/registry\n/home/dev/.npm/_cacache" },
+  });
+  expect(mocks.landingSet).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
+  await waitFor(() =>
+    expect(mocks.landingSet).toHaveBeenCalledWith("revision-a", [
+      {
+        ...repository,
+        read_cache_roots: ["/home/dev/.cargo/registry", "/home/dev/.npm/_cacache"],
+      },
+    ]),
+  );
+});
+it("refuses more than eight cache roots before an admin save", async () => {
+  await setup();
+  fireEvent.change(
+    screen.getByLabelText(
+      "Landing repository 1 read-only cache directories (maximum 8) (one per line)",
+    ),
+    { target: { value: Array.from({ length: 9 }, (_, i) => `/cache/${i}`).join("\n") } },
+  );
+  expect(screen.getByRole("button", { name: "Save landing policy" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
+  expect(mocks.landingSet).not.toHaveBeenCalled();
 });

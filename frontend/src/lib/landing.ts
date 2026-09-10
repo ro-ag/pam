@@ -13,6 +13,7 @@ export interface LandingRepository {
   base: string;
   branches: string[];
   workspace_root: string;
+  read_cache_roots?: string[];
   checks: LandingCheck[];
   required_checks: string[];
   main_checks: string[];
@@ -40,6 +41,7 @@ export function emptyLandingRepository(): LandingRepository {
     base: "main",
     branches: [],
     workspace_root: "",
+    read_cache_roots: [],
     checks: [{ name: "", argv: [""], timeout_seconds: 300 }],
     required_checks: [],
     main_checks: [],

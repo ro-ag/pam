@@ -109,6 +109,7 @@ function RepositoryEditor({
   ] as const;
   const lists = [
     ["branches", "allowed branches"],
+    ["read_cache_roots", "read-only cache directories (maximum 8)"],
     ["required_checks", "required PR contexts"],
     ["main_checks", "required main contexts"],
   ] as const;
@@ -131,7 +132,7 @@ function RepositoryEditor({
         <TextField
           key={name}
           label={`${prefix} ${label} (one per line)`}
-          value={repository[name].join("\n")}
+          value={(repository[name] ?? []).join("\n")}
           multiline
           onChange={(value) => onChange({ ...repository, [name]: value.split("\n") })}
         />
@@ -139,6 +140,12 @@ function RepositoryEditor({
       <p className="text-xs text-ink-muted">
         Every listed context must report success for the exact commit. Missing, unknown or
         cancelled checks cannot pass.
+      </p>
+      <p className="text-xs text-ink-muted">
+        Cache access is optional and read-only. List at most eight existing canonical cache
+        directories; never the whole home directory, keychains or PAM state. Nothing is added
+        automatically. Checks run without network access and write only to their private
+        workspace.
       </p>
       <h5 className="text-sm text-ink">Required local checks</h5>
       {repository.checks.map((check, position) => (
@@ -217,18 +224,22 @@ export function LandingSettings() {
   const pendingRef = useRef(false);
   const current = draft?.repositories ?? query.data?.repositories ?? [];
   const stale = conflicted || (draft !== null && draft.revision !== query.data?.revision);
+  const cacheOverflow = current.some(
+    (repo) => (repo.read_cache_roots ?? []).filter((path) => path.trim()).length > 8,
+  );
   function edit(repositories: LandingRepository[]) {
     if (pendingRef.current || !query.data || stale) return;
     setDraft({ revision: draft?.revision ?? query.data.revision, repositories });
     setFailure(null);
   }
   async function save() {
-    if (pendingRef.current || !draft || stale) return;
+    if (pendingRef.current || !draft || stale || cacheOverflow) return;
     pendingRef.current = true;
     setPending(true);
     setFailure(null);
     const repositories = draft.repositories.map((repo) => ({
       ...repo,
+      read_cache_roots: (repo.read_cache_roots ?? []).map((s) => s.trim()).filter(Boolean),
       branches: repo.branches.map((s) => s.trim()).filter(Boolean),
       required_checks: repo.required_checks.map((s) => s.trim()).filter(Boolean),
       main_checks: repo.main_checks.map((s) => s.trim()).filter(Boolean),
@@ -291,6 +302,11 @@ export function LandingSettings() {
           changes.
         </p>
       )}
+      {cacheOverflow && (
+        <p role="alert" className="text-sm text-danger">
+          Limit each landing recipe to eight read-only cache directories.
+        </p>
+      )}
       <fieldset disabled={pending || !query.data || stale} className="space-y-3">
         {current.map((repo, index) => (
           <RepositoryEditor
@@ -308,7 +324,7 @@ export function LandingSettings() {
         >
           Add landing repository
         </Button>
-        <Button size="sm" disabled={!draft} onClick={() => void save()}>
+        <Button size="sm" disabled={!draft || cacheOverflow} onClick={() => void save()}>
           Save landing policy
         </Button>
       </fieldset>

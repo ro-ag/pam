@@ -8,6 +8,17 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- A straight answer to "can PAM reach the keychain?", in three places:
+  `pam status` prints a `keyring:` line with the recovery sentence when it
+  is blocked, Settings → Connectors carries a banner with a Re-check
+  button, and Home flags a blocked keychain in the workspace overview. New
+  admin op `admin.connectors.keyring { fresh? }`, and the daemon's `status`
+  capability publishes a read-only `keyring` block. Reachability only — no
+  capability can read a credential, and the probe reads an account nothing
+  ever writes.
+
+### Added
+
 - Partial downloads can be thrown away from the Models screen: a preset
   card that has bytes on disk offers Resume and Start over, says how much
   is already here, and confirms before discarding. New admin op

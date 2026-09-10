@@ -11,15 +11,15 @@ use crate::admin::{
     ACTION_ADMIN, ADMIN_CALLER_AGENT, AdminService, CAUSE_ADMIN_DENIED, CAUSE_INVALID_ADMIN_ARGS,
 };
 use crate::admin_connectors::{
-    ACTION_CONNECTOR_CONFIGURE, CONNECTOR_ADMIN_OPS, OP_CONNECTORS_CONFIGURE, OP_CONNECTORS_LIST,
-    OP_CONNECTORS_TEST,
+    ACTION_CONNECTOR_CONFIGURE, CONNECTOR_ADMIN_OPS, OP_CONNECTORS_CONFIGURE,
+    OP_CONNECTORS_KEYRING, OP_CONNECTORS_LIST, OP_CONNECTORS_TEST,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::{CAUSE_BAD_URL, ConnectorService};
 use crate::daemon::TERMINAL_ACTIONS;
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
-use crate::secrets::{FakeSecretBackend, SecretBackend, SecretStore, account_for};
+use crate::secrets::{FakeSecretBackend, SecretBackend, SecretError, SecretStore, account_for};
 use crate::transport::EventPublisher;
 
 /// The credential a human pastes into the Connectors screen. No audit
@@ -464,10 +464,37 @@ fn the_op_list_names_every_connector_op() {
         [
             OP_CONNECTORS_LIST,
             OP_CONNECTORS_CONFIGURE,
-            OP_CONNECTORS_TEST
+            OP_CONNECTORS_TEST,
+            OP_CONNECTORS_KEYRING
         ]
     );
     for op in CONNECTOR_ADMIN_OPS {
         assert!(op.starts_with("admin.connectors."), "op {op}");
     }
+}
+
+#[tokio::test]
+async fn the_keyring_op_answers_reachable_and_denied_without_refusing() {
+    let fx = fixture().await;
+
+    let (_, healthy) = fx.run(OP_CONNECTORS_KEYRING, json!({})).await;
+    let body = body_of(healthy, Outcome::Verified);
+    assert_eq!(body["state"], "reachable");
+    assert_eq!(body["cause"], Value::Null);
+
+    // A blocked keychain is an answer, not a refusal: the screen has to
+    // be able to say what is wrong and how to fix it.
+    *fx.backend.fail_with.lock().unwrap() = Some(SecretError::Denied);
+    let (_, blocked) = fx
+        .run(OP_CONNECTORS_KEYRING, json!({ "fresh": true }))
+        .await;
+    let denied = body_of(blocked, Outcome::Verified);
+    assert_eq!(denied["state"], "denied");
+    assert_eq!(denied["cause"], "store_denied");
+    assert!(
+        denied["recovery"]
+            .as_str()
+            .is_some_and(|line| !line.is_empty()),
+        "a denial names the way out: {denied}"
+    );
 }

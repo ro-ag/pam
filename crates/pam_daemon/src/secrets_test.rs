@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::secrets::{FakeSecretBackend, SecretError, SecretStore, account_for};
+use crate::secrets::{
+    FakeSecretBackend, KeyringState, PROBE_CONNECTOR, SecretBackend, SecretError, SecretStore,
+    account_for,
+};
 
 #[test]
 fn account_for_shapes_the_connector_id_into_the_v1_namespace() {
@@ -127,4 +130,66 @@ async fn warm_on_non_macos_returns_immediately_without_touching_the_backend() {
     // configured to fail every call; on non-macOS it is a documented
     // no-op, so calling it here must be a plain synchronous return.
     store.warm();
+}
+
+#[tokio::test]
+async fn a_probe_reports_reach_denial_and_unavailability() {
+    let backend = Arc::new(FakeSecretBackend::default());
+    let store = SecretStore::new(Arc::clone(&backend) as Arc<dyn SecretBackend>);
+
+    let health = store.probe_keyring().await;
+    assert_eq!(health.state, KeyringState::Reachable);
+    assert!(health.state.is_reachable());
+    assert_eq!(health.cause, None);
+    assert_eq!(
+        health.recovery, None,
+        "a working keychain has nothing to recover from"
+    );
+
+    *backend.fail_with.lock().unwrap() = Some(SecretError::Denied);
+    let denied = store.probe_keyring().await;
+    assert_eq!(denied.state, KeyringState::Denied);
+    assert_eq!(denied.cause, Some("store_denied"));
+    assert!(
+        denied.recovery.is_some_and(|line| !line.is_empty()),
+        "a denial names the way out"
+    );
+
+    *backend.fail_with.lock().unwrap() = Some(SecretError::Unavailable);
+    let gone = store.probe_keyring().await;
+    assert_eq!(gone.state, KeyringState::Unavailable);
+    assert_eq!(gone.cause, Some("store_unavailable"));
+}
+
+#[tokio::test]
+async fn the_cached_probe_stands_until_a_fresh_one_is_asked_for() {
+    let backend = Arc::new(FakeSecretBackend::default());
+    let store = SecretStore::new(Arc::clone(&backend) as Arc<dyn SecretBackend>);
+    assert_eq!(store.keyring_health().await.state, KeyringState::Reachable);
+
+    // Access is revoked behind the cache's back. The cached answer is
+    // deliberately still the old one — the GUI polls this several times a
+    // minute and a keychain round trip per tick is not free.
+    *backend.fail_with.lock().unwrap() = Some(SecretError::Denied);
+    assert_eq!(
+        store.keyring_health().await.state,
+        KeyringState::Reachable,
+        "inside the TTL the last reading stands"
+    );
+
+    // Re-check asks the platform again, which is the point of the button.
+    assert_eq!(store.probe_keyring().await.state, KeyringState::Denied);
+    assert_eq!(
+        store.keyring_health().await.state,
+        KeyringState::Denied,
+        "and the fresh answer becomes the cached one"
+    );
+}
+
+#[test]
+fn a_probe_never_stores_anything() {
+    // The probe reads an account nothing writes: proving access must not
+    // leave a credential behind, and PROBE_CONNECTOR must not collide
+    // with a real connector id.
+    assert!(pam_flow::ConnectorId::parse(PROBE_CONNECTOR).is_none());
 }

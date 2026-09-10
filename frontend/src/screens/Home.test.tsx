@@ -159,6 +159,43 @@ describe("Home shell", () => {
     expect(await screen.findByText("Active requests: Unavailable")).toBeInTheDocument();
   });
 
+  it("flags a blocked keychain in the overview and stays quiet when it works", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: {
+        daemon_version: "0.1.0",
+        protocol: 1,
+        uptime_s: 10,
+        active_requests: 0,
+        keyring: { state: "denied", cause: "store_denied", recovery: "Allow the prompt." },
+      },
+    });
+    renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() =>
+      expect(
+        within(overview).getByText(/Keychain denied — connector credentials cannot be used/),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("says nothing about the keychain when it answers", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: {
+        daemon_version: "0.1.0",
+        protocol: 1,
+        uptime_s: 10,
+        active_requests: 0,
+        keyring: { state: "reachable", cause: null, recovery: null },
+      },
+    });
+    renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() => expect(within(overview).getByText(/Active requests/)).toBeInTheDocument());
+    expect(within(overview).queryByText(/Keychain/)).not.toBeInTheDocument();
+  });
+
   it("shows unavailable state instead of inventing zero counts and keeps workspace links usable", async () => {
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
     mocks.approvalsPending.mockRejectedValue(new Error("unavailable"));

@@ -138,6 +138,40 @@ fn status_prints_one_model_line_per_runtime_state() {
 }
 
 #[test]
+fn status_says_whether_the_keyring_answers_and_how_to_fix_it() {
+    let line = |keyring: serde_json::Value| {
+        let body = serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol": 1,
+            "uptime_s": 1,
+            "active_requests": 0,
+            "keyring": keyring,
+        });
+        render_status(&body)
+    };
+
+    let healthy = line(serde_json::json!({
+        "state": "reachable", "cause": null, "recovery": null
+    }));
+    assert!(healthy.contains("keyring:         reachable"), "{healthy}");
+
+    // A blocked keychain prints the way out under the verdict: a terminal
+    // is exactly where someone asks this question, and "denied" alone
+    // tells them nothing to do.
+    let denied = line(serde_json::json!({
+        "state": "denied",
+        "cause": "store_denied",
+        "recovery": "Allow the access prompt.",
+    }));
+    assert!(denied.contains("keyring:         denied"), "{denied}");
+    assert!(denied.contains("Allow the access prompt."), "{denied}");
+
+    // An older daemon publishes no block at all.
+    let missing = render_status(&serde_json::json!({ "daemon_version": "0.1.0" }));
+    assert!(missing.contains("keyring:         ?"), "{missing}");
+}
+
+#[test]
 fn status_degrades_to_question_marks_on_missing_fields() {
     let text = render_status(&serde_json::json!({}));
     assert!(text.contains('?'), "text: {text}");

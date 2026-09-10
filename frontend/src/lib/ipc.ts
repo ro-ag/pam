@@ -69,6 +69,31 @@ function bridged<T>(command: string, args?: Record<string, unknown>): Promise<T>
 /** What the `status` capability reports (loosely typed on purpose). */
 export type StatusBody = Record<string, unknown>;
 
+/** Whether PAM can reach the platform credential store, and the way out. */
+export interface KeyringHealth {
+  state: "reachable" | "denied" | "unavailable";
+  cause: string | null;
+  recovery: string | null;
+}
+
+/**
+ * The `keyring` block of a daemon status body, when the daemon publishes
+ * one. An older daemon has none, and the caller shows nothing rather than
+ * inventing a verdict.
+ */
+export function keyringHealth(status: StatusBody | null | undefined): KeyringHealth | null {
+  const block = status?.keyring;
+  if (typeof block !== "object" || block === null) return null;
+  const health = block as Record<string, unknown>;
+  const state = health.state;
+  if (state !== "reachable" && state !== "denied" && state !== "unavailable") return null;
+  return {
+    state,
+    cause: typeof health.cause === "string" ? health.cause : null,
+    recovery: typeof health.recovery === "string" ? health.recovery : null,
+  };
+}
+
 export interface DaemonStatusReply {
   connected: boolean;
   status: StatusBody | null;
@@ -165,6 +190,7 @@ export type AdminOp =
   | "admin.connectors.list"
   | "admin.connectors.configure"
   | "admin.connectors.test"
+  | "admin.connectors.keyring"
   | "admin.retention.get"
   | "admin.retention.set"
   | "admin.retention.prune";
@@ -1128,6 +1154,15 @@ export function connectorsTest(
   id: string,
 ): Promise<{ status: "passed" | "failed"; detail: string; ts: number }> {
   return adminCall("admin.connectors.test", { id });
+}
+
+/**
+ * Whether PAM can reach the platform credential store. Never refuses —
+ * "the keychain said no" is the answer, not an error. `fresh` bypasses
+ * the daemon's cached reading, which is what a Re-check asks for.
+ */
+export function connectorsKeyring(fresh = false): Promise<KeyringHealth> {
+  return adminCall("admin.connectors.keyring", { fresh });
 }
 
 // --- daemon log ------------------------------------------------------------

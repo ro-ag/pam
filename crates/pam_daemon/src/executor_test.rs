@@ -15,6 +15,7 @@ use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::policy::{CapabilityClass, classify};
 use crate::queue::{ACTION_CANCEL, AdmitOutcome, CAUSE_CANCELLED, QueueManager};
+use crate::secrets::{FakeSecretBackend, SecretStore};
 use crate::transport::EventPublisher;
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -25,6 +26,9 @@ struct Fixture {
     models: Arc<ModelService>,
     approvals: Arc<ApprovalService>,
     flows: Arc<FlowService>,
+    /// Over a fake backend: no test in this codebase touches a real
+    /// keychain, so `status` reports a reachable one here.
+    secrets: Arc<SecretStore>,
     router: CompletionRouter,
     events: EventPublisher,
     events_rx: mpsc::Receiver<(String, Event)>,
@@ -56,6 +60,7 @@ async fn fixture() -> Fixture {
         models,
         approvals,
         flows,
+        secrets: Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default()))),
         router: CompletionRouter::new(),
         events,
         events_rx,
@@ -80,6 +85,7 @@ impl Fixture {
             router: self.router.clone(),
             approvals: Arc::clone(&self.approvals),
             flows: Arc::clone(&self.flows),
+            secrets: Arc::clone(&self.secrets),
             caller: Caller {
                 agent: "claude".to_owned(),
                 repo: "/repo/test".to_owned(),

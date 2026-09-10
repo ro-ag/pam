@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   connectorsList: vi.fn(),
   connectorsConfigure: vi.fn(),
   connectorsTest: vi.fn(),
+  connectorsKeyring: vi.fn(),
 }));
 vi.mock("../lib/ipc", async (original) => ({
   ...(await original<typeof import("../lib/ipc")>()),
@@ -48,6 +49,11 @@ beforeEach(() => {
       credential_present: false,
     },
   ];
+  mocks.connectorsKeyring.mockResolvedValue({
+    state: "reachable" as const,
+    cause: null,
+    recovery: null,
+  });
   mocks.connectorsList.mockImplementation(async () => ({ connectors: current }));
   mocks.connectorsConfigure.mockImplementation(async (id, patch) => {
     const { credential, ...fields } = patch;
@@ -294,4 +300,27 @@ it("does not report cached Ready when the current read failed", async () => {
   expect(await row().findByText("Readiness unavailable")).toBeInTheDocument();
   expect(row().queryByText("Ready")).not.toBeInTheDocument();
   expect(row().getByRole("button", { name: "Save and test" })).toBeDisabled();
+});
+
+it("says the keychain is reachable, and re-checks on demand", async () => {
+  await setup();
+  const banner = within(await screen.findByLabelText("keychain access"));
+  expect(banner.getByText("keychain · reachable")).toBeInTheDocument();
+
+  fireEvent.click(banner.getByRole("button", { name: "Re-check" }));
+  // A Re-check asks the platform again rather than reading the daemon's
+  // cached answer.
+  await waitFor(() => expect(mocks.connectorsKeyring).toHaveBeenCalledWith(true));
+});
+
+it("names a blocked keychain and carries its recovery", async () => {
+  mocks.connectorsKeyring.mockResolvedValue({
+    state: "denied" as const,
+    cause: "store_denied",
+    recovery: "Allow the access prompt when Pam asks.",
+  });
+  await setup();
+  const banner = within(await screen.findByLabelText("keychain access"));
+  expect(banner.getByText("keychain · denied")).toBeInTheDocument();
+  expect(banner.getByText("Allow the access prompt when Pam asks.")).toBeInTheDocument();
 });

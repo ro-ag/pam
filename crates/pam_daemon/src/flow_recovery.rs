@@ -69,19 +69,44 @@ impl Snapshot {
             || snapshot.reports.len() > flow.steps.len()
             || snapshot.all_origins.len() > 256
             || snapshot.origins.len() > flow.steps.len()
-            || snapshot.evidence.len() > 4096
+            || snapshot.evidence.len() > pam_store::MAX_FLOW_JOURNAL_EVIDENCE
         {
             return Err(failure());
         }
         snapshot.restore_reports(flow)?;
         Ok(snapshot)
     }
-    pub async fn authorize(&self, store: &Store, repo: &Path) -> Result<(), CapabilityFailure> {
+    pub async fn authorize(
+        &self,
+        store: &Store,
+        ticket: &str,
+        repo: &Path,
+    ) -> Result<(), CapabilityFailure> {
         let policy = ScopePolicy::load(store).await.map_err(|_| failure())?;
-        policy.authorize_repo(repo).map_err(|_| failure())?;
+        let repo = policy.authorize_repo(repo).map_err(|_| failure())?;
         let mut targets = self.all_origins.clone();
         targets.extend(self.origins.values().cloned());
-        authorize_origin(store, &policy, repo, &EvidenceOrigin { targets }).await
+        authorize_origin(store, &policy, &repo, &EvidenceOrigin { targets }).await?;
+        if self.evidence.len() > pam_store::MAX_FLOW_JOURNAL_EVIDENCE {
+            return Err(failure());
+        }
+        for id in &self.evidence {
+            if id.is_empty() || id.len() > 128 {
+                return Err(failure());
+            }
+            let view = store
+                .evidence_view_meta(ticket, id, &repo.to_string_lossy())
+                .await
+                .map_err(|_| failure())?
+                .ok_or_else(failure)?;
+            if view.expired_at.is_some() {
+                return Err(failure());
+            }
+            let origin: EvidenceOrigin =
+                serde_json::from_str(&view.origin_json).map_err(|_| failure())?;
+            authorize_origin(store, &policy, &repo, &origin).await?;
+        }
+        Ok(())
     }
     pub fn restore_reports(&self, flow: &Flow) -> Result<Vec<StepReport>, CapabilityFailure> {
         self.reports
@@ -89,7 +114,11 @@ impl Snapshot {
             .zip(&flow.steps)
             .map(|(value, step)| {
                 let dto: Report = serde_json::from_value(value.clone()).map_err(|_| failure())?;
-                if dto.id != step.id || dto.kind != step.kind() {
+                if dto.id != step.id
+                    || dto.kind != step.kind()
+                    || dto.evidence.len() > pam_store::MAX_FLOW_JOURNAL_EVIDENCE
+                    || dto.evidence.iter().any(|id| !self.evidence.contains(id))
+                {
                     return Err(failure());
                 }
                 let mut report = StepReport::new(&dto.id, step.kind(), status(&dto.status)?);
@@ -210,7 +239,7 @@ impl Recovery {
         if snapshot.reports.len() != cursor.next_step {
             return Err(failure());
         }
-        snapshot.authorize(store, repo).await?;
+        snapshot.authorize(store, ticket, repo).await?;
         Ok((
             Self {
                 fingerprint,

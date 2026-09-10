@@ -167,3 +167,126 @@ async fn missing_checkpoint_and_changed_connector_configuration_refuse_restore()
             .is_err()
     );
 }
+
+async fn retained_source(store: &Store, repo: &std::path::Path, ticket: &str, id: &str) {
+    store
+        .insert_evidence(id, ticket, "log.source", b"verified source", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence_view(&pam_store::EvidenceViewInsert {
+            evidence_id: id.to_owned(),
+            request_id: ticket.to_owned(),
+            repository: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+            origin_json: r#"{"targets":[]}"#.to_owned(),
+            identity_json: "{}".to_owned(),
+            map_json: "[]".to_owned(),
+            view_id: format!("view-{id}"),
+            view_bytes: b"verified source".to_vec(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pruned_source_and_expired_view_cannot_restore_verified_variables() {
+    let (store, repo, flow, vars) = fixture().await;
+    retained_source(&store, repo.path(), "r", "source").await;
+    let (mut recovery, mut snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    recovery
+        .prepare(&store, "r", &flow.steps[0], true)
+        .await
+        .unwrap();
+    snapshot
+        .vars
+        .set_step("first", json!({"result":{"verified":true}}));
+    snapshot.evidence.push("source".to_owned());
+    let mut report = StepReport::new("first", "command", StepStatus::Succeeded);
+    report.evidence.push("source".to_owned());
+    snapshot.reports.push(serde_json::to_value(report).unwrap());
+    recovery
+        .settle(&store, "r", &snapshot, false)
+        .await
+        .unwrap();
+    assert!(
+        Recovery::open(&store, "r", &flow, repo.path(), &vars)
+            .await
+            .is_ok()
+    );
+    store
+        .finish_request(
+            "r",
+            pam_store::RequestState::Done,
+            Some("verified"),
+            pam_store::AuditEntry {
+                action: "fixture",
+                decision: pam_store::Decision::Allow,
+                actor: pam_store::Actor::System,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .prune_evidence_before(i64::MAX, "flow.checkpoint")
+        .await
+        .unwrap();
+    assert!(store.get_evidence("source").await.unwrap().is_none());
+    let view = store
+        .evidence_view_meta(
+            "r",
+            "source",
+            repo.path().canonicalize().unwrap().to_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(view.expired_at.is_some());
+    // The checkpoint itself remains, but its retained fact dependencies do not.
+    assert!(
+        Recovery::open(&store, "r", &flow, repo.path(), &vars)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn foreign_or_unpublished_evidence_and_unlisted_report_refs_refuse_restore() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (_, mut snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    store
+        .insert_request(
+            "other",
+            "flow.run",
+            repo.path().to_str().unwrap(),
+            "test",
+            "{}",
+            None,
+        )
+        .await
+        .unwrap();
+    retained_source(&store, repo.path(), "other", "foreign").await;
+    store
+        .insert_evidence("unpublished", "r", "log.source", b"private", None)
+        .await
+        .unwrap();
+    for id in ["foreign", "unpublished", "missing"] {
+        snapshot.evidence = vec![id.to_owned()];
+        assert!(
+            snapshot.authorize(&store, "r", repo.path()).await.is_err(),
+            "{id}"
+        );
+    }
+    snapshot.evidence.clear();
+    let mut report = StepReport::new("first", "command", StepStatus::Succeeded);
+    report.evidence.push("not-in-snapshot".to_owned());
+    snapshot.reports.push(serde_json::to_value(report).unwrap());
+    assert!(Snapshot::decode(&encode(&snapshot).unwrap(), &snapshot.fingerprint, &flow).is_err());
+    snapshot.reports.clear();
+    snapshot.evidence = vec!["id".to_owned(); 129];
+    assert!(Snapshot::decode(&encode(&snapshot).unwrap(), &snapshot.fingerprint, &flow).is_err());
+}

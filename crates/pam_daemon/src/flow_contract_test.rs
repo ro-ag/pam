@@ -188,3 +188,46 @@ fn inspection_does_not_resolve_git_or_prior_step_outputs() {
     assert!(vars.resolve("repo.origin").is_none());
     assert!(vars.resolve("steps.status.exit_status").is_none());
 }
+
+#[test]
+fn inspection_distinguishes_admission_auto_grants_and_manual_approvals() {
+    use crate::flow_contract::inspect_gate;
+    use crate::policy::{CapabilityClass as Class, Profile};
+    for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
+        for granted in [false, true] {
+            assert_eq!(inspect_gate(profile, granted, Class::ReadOnly), "allowed");
+        }
+    }
+    assert_eq!(
+        inspect_gate(Profile::Relaxed, false, Class::NonDestructive),
+        "auto_grant_on_execution"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Relaxed, true, Class::External),
+        "allowed"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Relaxed, false, Class::External),
+        "approval_required"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Standard, false, Class::NonDestructive),
+        "not_granted"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Standard, true, Class::NonDestructive),
+        "allowed"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Standard, true, Class::External),
+        "approval_required"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Strict, false, Class::NonDestructive),
+        "not_granted"
+    );
+    assert_eq!(
+        inspect_gate(Profile::Strict, true, Class::NonDestructive),
+        "approval_required"
+    );
+}

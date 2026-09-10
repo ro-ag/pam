@@ -592,6 +592,19 @@ impl FlowService {
             )
         })?;
         let mut blockers = Vec::new();
+        let run_granted = self
+            .store
+            .active_grant(CAP_FLOW_RUN)
+            .await
+            .map_err(|error| store_note(&error))?;
+        let run_admission = crate::flow_contract::inspect_gate(
+            self.gate.profile(),
+            run_granted,
+            CapabilityClass::NonDestructive,
+        );
+        if matches!(run_admission, "not_granted" | "approval_required") {
+            blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": run_admission, "recovery": "review flow.run in GUI Permissions"}));
+        }
         let repo = PathBuf::from(&ctx.caller.repo);
         if let Err(error) = self.approved_repo(&repo).await {
             blockers.push(json!({"cause": error.cause, "recovery": RECOVERY_SCOPE}));
@@ -624,10 +637,17 @@ impl FlowService {
                     .active_grant(&step_capability(&flow.id, &step.id))
                     .await
                     .map_err(|error| store_note(&error))?;
+                let class = if matches!(step.action, Action::Connector { .. }) {
+                    CapabilityClass::External
+                } else {
+                    CapabilityClass::Destructive
+                };
+                let admission =
+                    crate::flow_contract::inspect_gate(self.gate.profile(), granted, class);
                 item["grant"] = json!(if granted { "present" } else { "missing" });
-                item["approval"] = json!("rechecked_at_execution");
-                if !granted {
-                    blockers.push(json!({"step": step.id, "cause": "step_not_granted", "recovery": "review this flow step in GUI Permissions"}));
+                item["admission"] = json!(admission);
+                if matches!(admission, "not_granted" | "approval_required") {
+                    blockers.push(json!({"step": step.id, "cause": admission, "recovery": "review this flow step in GUI Permissions"}));
                 }
             }
             match &step.action {
@@ -687,7 +707,7 @@ impl FlowService {
             "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
             "steps":steps, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
             "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
-            "output_schema":"pam.flow.result.v1","admission_rechecked":true});
+            "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
         let body = crate::evidence_view::redact_json(&body).map_err(|_| {
             contract_refusal(crate::flow_contract::ContractError(
                 "inspection cannot be redacted",

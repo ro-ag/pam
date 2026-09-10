@@ -216,3 +216,25 @@ pub(crate) fn inspect_vars(
     }
     (vars, missing)
 }
+
+/// Read-only preview of PolicyGate's classification rules; does not auto-grant.
+/// This snapshot never substitutes for the execution-time gate.
+pub(crate) fn inspect_gate(
+    profile: crate::policy::Profile,
+    granted: bool,
+    class: crate::policy::CapabilityClass,
+) -> &'static str {
+    use crate::policy::{CapabilityClass, Profile};
+    if class == CapabilityClass::ReadOnly {
+        return "allowed";
+    }
+    match (profile, granted, class) {
+        (Profile::Relaxed, true, _)
+        | (Profile::Standard, true, CapabilityClass::NonDestructive) => "allowed",
+        (Profile::Relaxed, false, CapabilityClass::NonDestructive) => "auto_grant_on_execution",
+        (Profile::Standard | Profile::Strict, false, _) => "not_granted",
+        (Profile::Relaxed, false, _) | (Profile::Standard | Profile::Strict, true, _) => {
+            "approval_required"
+        }
+    }
+}

@@ -32,6 +32,7 @@ use pam_daemon::admin_flows::{
     OP_FLOWS_DELETE, OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_RUN, OP_FLOWS_SAVE,
 };
 use pam_daemon::approval::Resolution;
+use pam_daemon::command_containment::CommandContainment;
 use pam_daemon::daemon::{
     ACTION_EXECUTION_REFUSAL, CAUSE_APPROVAL_DENIED, DAEMON_VERSION, DaemonConfig,
 };
@@ -391,7 +392,6 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
                 .request(&flows.run_envelope("req_run", "two-step", &serde_json::json!({})))
                 .await,
         );
-        assert_eq!(outcome, Outcome::Verified);
         let body = flows
             .full_report(
                 &mut client,
@@ -404,6 +404,13 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
                 },
             )
             .await;
+        if assert_unsupported_flow(&body) {
+            assert_eq!(outcome, Outcome::Blocked);
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
+        assert_eq!(outcome, Outcome::Verified);
         assert_eq!(body["outcome"], "verified");
         assert_eq!(body["flow"]["id"], "two-step");
         assert_eq!(body["flow"]["source"], "library");
@@ -495,6 +502,11 @@ async fn a_failing_step_is_unresolved_with_its_exit_status_and_attempts() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "failing").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         let bad = step(&body, "bad");
         assert_eq!(bad["status"], "failed");
@@ -532,6 +544,11 @@ async fn a_when_failed_step_runs_only_after_a_failure() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "conditional").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(step(&body, "bad")["status"], "failed");
         assert_eq!(step(&body, "rescue")["status"], "succeeded");
         assert_eq!(step(&body, "never")["status"], "skipped");
@@ -553,6 +570,11 @@ async fn a_step_that_outlives_its_timeout_ends_the_run_unresolved() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "slow").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         let nap = step(&body, "nap");
         assert_eq!(nap["status"], "failed");
@@ -584,6 +606,11 @@ async fn a_step_past_the_output_cap_is_killed() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "loud").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(body["outcome"], "unresolved");
         assert_eq!(step(&body, "spew")["error"]["cause"], CAUSE_OUTPUT_LIMIT);
 
@@ -602,6 +629,13 @@ async fn cancelling_mid_step_stops_the_run_and_the_child() {
                     \x20   timeout: 300s\n";
         let flows = FlowDaemon::spawn(&[("napping", yaml)]).await;
         let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "napping").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let mut cancel_client = flows.daemon.client().await;
 
         // Start the run without waiting, so the cancel has a client of
@@ -735,6 +769,11 @@ async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
         let mut events = flows.daemon.subscribe(&["req_run"]).await;
 
         let body = flows.run(&mut client, "req_run", "two-step").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         assert_eq!(step(&body, "version")["status"], "succeeded");
         assert_eq!(step(&body, "prove")["status"], "succeeded");
 
@@ -805,7 +844,14 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
             .wait_for_row("req_run", |row| row.state.is_terminal())
             .await;
         assert_eq!(row.state, RequestState::Done);
-        assert_eq!(row.outcome.as_deref(), Some("changed"));
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "changed"
+            } else {
+                "blocked"
+            })
+        );
 
         let seen: Vec<Event> = events.until_terminal("req_run").await;
         assert!(seen.contains(&Event::ApprovalPending));
@@ -813,8 +859,10 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
 
         // Remembered: the second run never pauses.
         let body = flows.run(&mut client, "req_again", "stateful").await;
-        assert_eq!(body["outcome"], "changed");
-        assert_eq!(step(&body, "change")["status"], "succeeded");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(body["outcome"], "changed");
+            assert_eq!(step(&body, "change")["status"], "succeeded");
+        }
         flows
             .daemon
             .assert_row_state("req_again", RequestState::Done)
@@ -953,7 +1001,7 @@ async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
         flows.grant(&step_capability("connected", "runs")).await;
 
         let body = flows.run(&mut client, "req_run", "connected").await;
-        assert_eq!(body["outcome"], "solved");
+        assert_eq!(body["outcome"], if cfg!(target_os = "macos") { "solved" } else { "blocked" });
         assert_eq!(body["inputs"]["repo"], "ro-ag/pam");
 
         let runs = step(&body, "runs");
@@ -978,7 +1026,9 @@ async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
         assert_eq!(meta["call"], "runs");
 
         // `${steps.runs.result.runs[0].id}` reached the second step's env.
-        assert_eq!(step(&body, "echo")["status"], "succeeded");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(step(&body, "echo")["status"], "succeeded");
+        }
         assert!(transport.url(0).contains("/repos/ro-ag/pam/actions/runs"));
         assert!(
             backend
@@ -1047,7 +1097,14 @@ async fn admin_flows_run_submits_through_the_pipeline_as_the_gui() {
             .wait_for_row(&ticket, |row| row.state.is_terminal())
             .await;
         assert_eq!(row.state, RequestState::Done);
-        assert_eq!(row.outcome.as_deref(), Some("verified"));
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "verified"
+            } else {
+                "blocked"
+            })
+        );
         assert_eq!(row.capability, CAP_FLOW_RUN);
         assert_eq!(row.caller_agent, ADMIN_CALLER_AGENT);
         assert_eq!(row.repo, flows.repo());
@@ -1139,26 +1196,84 @@ fn live_cancel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
-/// A spec that runs the helper.
-fn helper_spec(argv: &[&str], timeout: Duration) -> CommandSpec {
-    CommandSpec {
-        program: helper(),
+/// Retain private and repository siblings for the entire contained workload.
+fn helper_spec(argv: &[&str], timeout: Duration) -> (tempfile::TempDir, CommandSpec) {
+    let fixture = short_tempdir();
+    let repository = fixture.path().join("repository");
+    let protected_base = fixture.path().join("private");
+    std::fs::create_dir(&repository).unwrap();
+    std::fs::create_dir(&protected_base).unwrap();
+    let program = helper().canonicalize().unwrap();
+    let read_only_roots = vec![program.parent().unwrap().to_path_buf()];
+    let spec = CommandSpec {
+        program,
         argv: argv.iter().map(|part| (*part).to_owned()).collect(),
-        cwd: std::env::temp_dir(),
+        cwd: repository.clone(),
         env: Vec::new(),
         timeout,
+        containment: CommandContainment {
+            protected_base,
+            repository,
+            read_only_roots,
+            allow_repository_writes: false,
+        },
+    };
+    (fixture, spec)
+}
+
+fn assert_unsupported_command(outcome: &CommandOutcome) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
     }
+    assert!(
+        matches!(outcome, CommandOutcome::ContainmentUnavailable { detail }
+            if detail.contains("supported only on macOS")),
+        "expected unsupported containment refusal, got {outcome:?}"
+    );
+    true
+}
+
+/// Platform refusal is a blocked verdict, with no invented output or retry.
+fn assert_unsupported_flow(body: &serde_json::Value) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+    assert_eq!(body["outcome"], "blocked", "{body}");
+    let command = body["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["kind"] == "command")
+        .expect("command report");
+    assert_eq!(command["status"], "blocked", "{body}");
+    assert_eq!(
+        command["error"]["cause"], "command_containment_unavailable",
+        "{body}"
+    );
+    assert!(
+        command["exit_status"].is_null(),
+        "no workload exit is invented"
+    );
+    assert_eq!(
+        command["attempts"], 1,
+        "unavailable containment is not retried"
+    );
+    assert!(
+        command["evidence"].as_array().unwrap().is_empty(),
+        "no workload log exists"
+    );
+    true
 }
 
 #[tokio::test]
 async fn run_command_kills_a_child_that_outlives_its_timeout() {
     with_deadline(async {
         let (_alive, mut cancel) = live_cancel();
-        let outcome = run_command(
-            helper_spec(&["sleep", "600000"], Duration::from_millis(200)),
-            &mut cancel,
-        )
-        .await;
+        let (_fixture, spec) = helper_spec(&["sleep", "600000"], Duration::from_millis(200));
+        let outcome = run_command(spec, &mut cancel).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         assert!(
             matches!(outcome, CommandOutcome::TimedOut { .. }),
             "expected a timeout, got {outcome:?}"
@@ -1171,11 +1286,11 @@ async fn run_command_kills_a_child_that_outlives_its_timeout() {
 async fn run_command_stops_a_child_past_the_output_cap() {
     with_deadline(async {
         let bytes = MAX_SOURCE_BYTES + 1;
-        let outcome = run_command(
-            helper_spec(&["spew", &bytes.to_string()], Duration::from_mins(2)),
-            &mut live_cancel().1,
-        )
-        .await;
+        let (_fixture, spec) = helper_spec(&["spew", &bytes.to_string()], Duration::from_mins(2));
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         match outcome {
             CommandOutcome::OutputLimit { output } => assert_eq!(output.len(), MAX_SOURCE_BYTES),
             other => panic!("expected the output cap, got {other:?}"),
@@ -1188,15 +1303,20 @@ async fn run_command_stops_a_child_past_the_output_cap() {
 async fn run_command_stops_on_the_cancel_signal() {
     with_deadline(async {
         let (alive, mut cancel) = live_cancel();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let _ = alive.send(true);
-        });
-        let outcome = run_command(
-            helper_spec(&["sleep", "600000"], Duration::from_mins(5)),
-            &mut cancel,
-        )
-        .await;
+        let _unsupported_alive = if cfg!(target_os = "macos") {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = alive.send(true);
+            });
+            None
+        } else {
+            Some(alive)
+        };
+        let (_fixture, spec) = helper_spec(&["sleep", "600000"], Duration::from_mins(5));
+        let outcome = run_command(spec, &mut cancel).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
         assert_eq!(outcome, CommandOutcome::Cancelled);
     })
     .await;
@@ -1205,9 +1325,13 @@ async fn run_command_stops_on_the_cancel_signal() {
 #[tokio::test]
 async fn the_helper_reads_the_environment_a_step_gives_it() {
     with_deadline(async {
-        let mut spec = helper_spec(&["echo-env", "PAM_FLOW"], Duration::from_secs(30));
+        let (_fixture, mut spec) = helper_spec(&["echo-env", "PAM_FLOW"], Duration::from_secs(30));
         spec.env = vec![("PAM_FLOW".to_owned(), "two-step".to_owned())];
-        match run_command(spec, &mut live_cancel().1).await {
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        if assert_unsupported_command(&outcome) {
+            return;
+        }
+        match outcome {
             CommandOutcome::Exited { status, output } => {
                 assert_eq!(status, 0);
                 assert_eq!(String::from_utf8_lossy(&output).trim(), "two-step");
@@ -1244,6 +1368,11 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
         let mut client = flows.daemon.client().await;
 
         let body = flows.run(&mut client, "req_run", "summarized").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let version = step(&body, "version");
         assert_eq!(version["status"], "succeeded");
         assert!(
@@ -1476,6 +1605,11 @@ async fn pam_readiness_any_gate_failure_prevents_verified_and_skips_dependents()
             let flows = FlowDaemon::spawn(&[("pam-pr-readiness", &yaml)]).await;
             let mut client = flows.daemon.client().await;
             let body = flows.run(&mut client, "req_run", "pam-pr-readiness").await;
+            if assert_unsupported_flow(&body) {
+                flows.daemon.assert_invariant_clean().await;
+                flows.daemon.stop().await;
+                return;
+            }
             assert_eq!(
                 body["outcome"],
                 if fail_at.is_none() {
@@ -1572,6 +1706,9 @@ async fn pam_readiness_runs_all_real_project_gates() {
         serde_json::to_string(&body).unwrap()
     );
     daemon.stop().await;
+    if assert_unsupported_flow(&body) {
+        return;
+    }
     assert_eq!(body["outcome"], "verified", "{body}");
     let steps = body["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 7);
@@ -1635,18 +1772,27 @@ async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_fai
 
 #[tokio::test]
 async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() {
-    assert!(
-        tokio::process::Command::new(helper())
-            .args(["exit", "0"])
-            .status()
-            .await
-            .unwrap()
-            .success()
-    );
+    // macOS assesses newly linked executables once. Warm up through the same
+    // containment path outside the deadline being tested, never via raw exec.
+    if cfg!(target_os = "macos") {
+        let (_fixture, spec) = helper_spec(&["exit", "0"], Duration::from_mins(2));
+        let outcome = run_command(spec, &mut live_cancel().1).await;
+        assert!(
+            matches!(outcome, CommandOutcome::Exited { status: 0, .. }),
+            "{outcome:?}"
+        );
+    }
     with_deadline(async {
         let yaml = "schema: 1\nid: retained-retry\nname: Retained retry\nsteps:\n  - id: failing\n    run: [pam-flow-helper, unknown-operation]\n    retry: { attempts: 2, backoff: 10s }\n";
         let flows = FlowDaemon::spawn(&[("retained-retry", yaml)]).await;
         let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "retained-retry").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let mut request = flows.run_envelope("req_retained_retry", "retained-retry", &serde_json::json!({}));
         request.deadline_ms = 2_000;
         let response = client.request(&request).await;
@@ -1665,6 +1811,13 @@ async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view(
         let yaml = "schema: 1\nid: safe-evidence\nname: Safe evidence\nsteps:\n  - id: failing\n    run: [pam-flow-helper, 'password=private-sentinel-726']\n";
         let flows = FlowDaemon::spawn(&[("safe-evidence", yaml)]).await;
         let mut client = flows.daemon.client().await;
+        if !cfg!(target_os = "macos") {
+            let body = flows.run(&mut client, "req_run", "safe-evidence").await;
+            assert!(assert_unsupported_flow(&body));
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
         let original = flows.run_envelope("req_safe_source", "safe-evidence", &serde_json::json!({}));
         let response = client.request(&original).await;
         assert!(matches!(response, Response::Result { .. }), "{response:?}");

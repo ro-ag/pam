@@ -264,6 +264,18 @@ pub enum RequestError {
         /// How long the client waited.
         waited: Duration,
     },
+    /// Scoped ticket lookup refused access; following stops without retrying.
+    #[error("cannot follow request {ticket}: {cause}: {detail}; {recovery}")]
+    FollowRefused {
+        /// The original ticket, retained for later authorized recovery.
+        ticket: String,
+        /// Stable daemon refusal cause.
+        cause: String,
+        /// Safe refusal explanation.
+        detail: String,
+        /// Authorized next step.
+        recovery: String,
+    },
     /// [`send_request`] was handed a GUI-only `admin.*` capability —
     /// the structural guard keeping every CLI code path out of the
     /// admin surface (see [`send_admin`]).
@@ -467,8 +479,8 @@ const RECONCILE_MAX: Duration = Duration::from_secs(30);
 ///
 /// The store is the authority on request state, so the follow never
 /// trusts the event stream with the *termination* decision alone:
-/// subscribe first, then reconcile by asking the daemon (read-only
-/// `query` capability) whether the ticket is already terminal —
+/// authorize through the scoped `query` capability before subscribing, then
+/// reconcile whether the ticket is already terminal —
 /// immediately after subscribing (catches a follower that joined after
 /// the finish), and again on a backing-off interval while events are
 /// quiet (catches a terminal event lost to the subscription race). A
@@ -485,6 +497,19 @@ pub async fn follow_ticket(
     mut on_event: impl FnMut(&Event),
 ) -> Result<Event, RequestError> {
     ensure_daemon(base_dir)?;
+    let deadline = Instant::now() + timeout;
+    let timed_out = || RequestError::FollowTimeout {
+        ticket: ticket.to_owned(),
+        waited: timeout,
+    };
+    // Authorize before subscribing: unavailable tickets never consume PUB data.
+    if let Some(event) = tokio::time::timeout(timeout, query_terminal(base_dir, ticket))
+        .await
+        .map_err(|_| timed_out())??
+    {
+        on_event(&event);
+        return Ok(event);
+    }
     let dirs = RuntimeDir::at_base(base_dir)?;
     let endpoint = dirs.events_endpoint();
     let mut sub = SubSocket::new();
@@ -495,11 +520,6 @@ pub async fn follow_ticket(
         .await
         .map_err(|source| RequestError::Transport { source })?;
 
-    let deadline = Instant::now() + timeout;
-    let timed_out = || RequestError::FollowTimeout {
-        ticket: ticket.to_owned(),
-        waited: timeout,
-    };
     let mut reconcile_pause = RECONCILE_MIN;
     let mut next_reconcile = Instant::now();
     loop {
@@ -534,9 +554,12 @@ pub async fn follow_ticket(
         };
         let event: Event =
             serde_json::from_slice(payload).map_err(|source| RequestError::Parse { source })?;
-        on_event(&event);
         if matches!(event, Event::Done | Event::Refused) {
-            return Ok(event);
+            // PUB is only a hint; recheck current scope and durable state before
+            // exposing a terminal event or deciding the follow has finished.
+            next_reconcile = Instant::now();
+        } else {
+            on_event(&event);
         }
     }
 }
@@ -546,22 +569,43 @@ pub async fn follow_ticket(
 /// stored state. `Some(event)` maps a terminal state to the terminal
 /// event a subscriber would have seen (`done` → [`Event::Done`],
 /// `refused`/`failed` → [`Event::Refused`], matching what the daemon
-/// publishes); `None` means not terminal yet — or not answerable (a
-/// refusal, e.g. an unknown ticket), in which case the follow keeps
-/// waiting on events and times out as before rather than guessing.
+/// publishes). Only an explicitly pending state returns `None`; refusals and
+/// malformed responses fail closed instead of repeatedly querying or watching.
 async fn query_terminal(base_dir: &Path, ticket: &str) -> Result<Option<Event>, RequestError> {
     let args = serde_json::json!({ "ticket": ticket });
     let response = send_request(base_dir, "query", args, true, QUERY_DEADLINE_MS, None).await?;
-    let Response::Result { body, .. } = response else {
-        return Ok(None);
-    };
-    Ok(
-        match body.get("state").and_then(serde_json::Value::as_str) {
-            Some("done") => Some(Event::Done),
-            Some("refused" | "failed") => Some(Event::Refused),
-            _ => None,
-        },
-    )
+    match response {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => Err(RequestError::FollowRefused {
+            ticket: ticket.to_owned(),
+            cause,
+            detail,
+            recovery,
+        }),
+        Response::Result { body, .. } => {
+            match body.get("state").and_then(serde_json::Value::as_str) {
+                Some("done") => Ok(Some(Event::Done)),
+                Some("refused" | "failed") => Ok(Some(Event::Refused)),
+                Some("queued" | "running" | "waiting_approval") => Ok(None),
+                _ => Err(unavailable_follow(ticket)),
+            }
+        }
+        Response::Ticket { .. } => Err(unavailable_follow(ticket)),
+    }
+}
+
+fn unavailable_follow(ticket: &str) -> RequestError {
+    RequestError::FollowRefused {
+        ticket: ticket.to_owned(),
+        cause: "request_unavailable".to_owned(),
+        detail: "The daemon did not return an authorized request state.".to_owned(),
+        recovery: "Check the original ticket and current repository access in the PAM GUI."
+            .to_owned(),
+    }
 }
 
 /// What the daemon-lock probe found, for `pam daemon stop`.

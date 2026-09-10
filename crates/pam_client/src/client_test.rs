@@ -238,3 +238,55 @@ async fn send_admin_requires_the_private_channel_even_when_public_daemon_is_read
         crate::client::RequestError::AdminTransport { .. }
     ));
 }
+
+#[tokio::test]
+async fn refused_follow_queries_once_and_never_subscribes_to_events() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = RuntimeDir::at_base(tmp.path()).unwrap();
+    let _lock = acquire_instance_lock(dirs.run_dir()).unwrap();
+    let mut router = RouterSocket::new();
+    router.bind(&dirs.router_endpoint()).await.unwrap();
+    // Deliberately no events endpoint: an unauthorized follow must not connect.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let server = tokio::spawn(async move {
+        loop {
+            let frames = router.recv().await.unwrap().into_vec();
+            observed.fetch_add(1, Ordering::SeqCst);
+            let request: serde_json::Value =
+                serde_json::from_slice(frames.last().unwrap()).unwrap();
+            assert_eq!(request["capability"], "query");
+            let reply = Response::Refusal {
+                id: request["id"].as_str().unwrap().to_owned(),
+                cause: "request_unavailable".to_owned(),
+                detail: "Ticket is unavailable in this repository.".to_owned(),
+                recovery: "Check repository access in the PAM GUI.".to_owned(),
+            };
+            let payload = serde_json::to_vec(&reply).unwrap();
+            let mut message = ZmqMessage::from(payload);
+            message.push_front(frames[0].clone());
+            router.send(message).await.unwrap();
+        }
+    });
+    let mut events = Vec::new();
+    let result = crate::client::follow_ticket(
+        tmp.path(),
+        "original-ticket",
+        Duration::from_secs(5),
+        |event| events.push(event.clone()),
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(crate::client::RequestError::FollowRefused { ticket, cause, .. }) if ticket == "original-ticket" && cause == "request_unavailable"),
+        "{result:?}"
+    );
+    assert!(events.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "denial is never retried");
+    server.abort();
+    let _ = server.await;
+}

@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use url::Url;
 
-use crate::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError, excerpt};
+use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError, excerpt};
 
 fn untrusted_curl() -> TransportError {
     TransportError::Policy {
@@ -148,6 +148,17 @@ impl CurlTransport {
             "url = \"{}\"\nmax-time = {deadline_secs}\n",
             escape(request.url.as_str())
         );
+        if request.method != Method::Get {
+            writeln!(config, "request = \"{}\"", request.method.as_str()).expect("String writer");
+        }
+        if let Some(body) = &request.body {
+            writeln!(
+                config,
+                "data-binary = \"{}\"",
+                escape(&String::from_utf8_lossy(body))
+            )
+            .expect("String writer");
+        }
         for (name, value) in &request.headers {
             writeln!(config, "header = \"{}: {}\"", escape(name), escape(value))
                 .expect("writing into a String cannot fail");
@@ -211,12 +222,21 @@ impl CurlTransport {
                 }
             };
         match status.code() {
+            Some(0) if request.method != Method::Get => parse_response(&body).map_err(|_| {
+                TransportError::Network(
+                    "curl mutation returned an unreadable response; reconcile before retrying"
+                        .to_owned(),
+                )
+            }),
             Some(0) => parse_response(&body),
             Some(28) => Err(TransportError::Timeout),
             Some(35 | 51 | 58 | 59 | 60) => Err(TransportError::Certificate),
             Some(63) => Err(TransportError::TooLarge {
                 maximum: request.max_bytes,
             }),
+            Some(code) if request.method != Method::Get => Err(TransportError::Network(format!(
+                "curl mutation failed with exit {code}; reconcile before retrying"
+            ))),
             Some(code) => Err(TransportError::Network(format!(
                 "curl exited {code}: {}",
                 excerpt(&stderr_bytes, 512)
@@ -235,11 +255,15 @@ impl HttpTransport for CurlTransport {
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>> {
         Box::pin(async move {
+            validate_request_body(&request)?;
             let deadline_secs = deadline
                 .saturating_duration_since(Instant::now())
                 .as_secs()
                 .max(1);
             let response = Box::pin(self.run(&request, deadline_secs)).await?;
+            if request.method != Method::Get && (300..400).contains(&response.status) {
+                return Err(TransportError::Policy { cause: "mutation_redirect_refused", detail: "Mutation redirects are refused; reconcile the original operation before retrying.".to_owned() });
+            }
             if !request.follow_one_https_redirect_without_auth
                 || !matches!(response.status, 301 | 302 | 307 | 308)
             {
@@ -318,7 +342,11 @@ async fn kill(child: &mut Child) {
 
 /// Escapes a value for a double-quoted curl config field.
 fn escape(raw: &str) -> String {
-    raw.replace('\\', "\\\\").replace('"', "\\\"")
+    raw.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 /// Turns `--include` output into a response.
@@ -388,4 +416,23 @@ fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), TransportErro
         .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
         .collect();
     Ok((status, headers))
+}
+
+fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
+    let valid = match (request.method, &request.body) {
+        (Method::Get, None) => true,
+        (Method::Post | Method::Put, Some(body)) if body.len() <= 16 * 1024 => {
+            serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
+                && !request.follow_one_https_redirect_without_auth
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(TransportError::Policy {
+            cause: "mutation_body_invalid",
+            detail: "HTTP mutation requires bounded JSON and disabled redirects.".to_owned(),
+        })
+    }
 }

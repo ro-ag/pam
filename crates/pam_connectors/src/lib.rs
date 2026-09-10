@@ -39,6 +39,9 @@ mod curl;
 mod descriptor;
 mod error;
 mod github;
+pub mod github_landing;
+#[cfg(test)]
+mod github_landing_test;
 mod jenkins;
 mod jenkins_investigation;
 mod jira;

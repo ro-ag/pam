@@ -154,6 +154,7 @@ async fn capture(
         .send(
             HttpRequest {
                 method: Method::Get,
+                body: None,
                 url: target,
                 headers: vec![(
                     "Accept".into(),

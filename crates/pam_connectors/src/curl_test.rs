@@ -80,6 +80,7 @@ fn a_body_holding_a_blank_line_survives_the_split() {
 fn request() -> HttpRequest {
     HttpRequest {
         method: Method::Get,
+        body: None,
         url: Url::parse("https://api.github.com/user").expect("the test URL parses"),
         headers: vec![
             ("Authorization".to_owned(), "Bearer ghp_secret".to_owned()),
@@ -187,4 +188,65 @@ async fn hostile_environment_child() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn mutation_body_and_credentials_stay_in_escaped_stdin_config() {
+    let mut req = request();
+    req.method = Method::Post;
+    req.body = Some(b"{\n\"title\":\"secret body\\nurl = evil\"\n}".to_vec());
+    let config = CurlTransport::config_for(&req, 5);
+    assert!(config.contains("request = \"POST\""));
+    assert_eq!(
+        config
+            .lines()
+            .filter(|line| line.starts_with("url ="))
+            .count(),
+        1
+    );
+    assert!(config.contains("data-binary = \"{\\n"));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
+        let command = transport.command(&req, 5).unwrap();
+        let argv = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!argv.contains("secret body"));
+        assert!(!argv.contains("ghp_secret"));
+    }
+}
+
+#[tokio::test]
+async fn mutation_invalid_body_or_redirect_policy_refuses_before_process_start() {
+    use crate::HttpTransport;
+    let transport = CurlTransport::new(std::path::PathBuf::from("untrusted-unused"));
+    for (body, follow) in [
+        (Some(vec![b'x'; 16 * 1024 + 1]), false),
+        (Some(b"[]".to_vec()), false),
+        (Some(b"{}".to_vec()), true),
+        (None, false),
+    ] {
+        let mut req = request();
+        req.method = Method::Put;
+        req.body = body;
+        req.follow_one_https_redirect_without_auth = follow;
+        let error = transport
+            .send(
+                req,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::TransportError::Policy {
+                cause: "mutation_body_invalid",
+                ..
+            }
+        ));
+    }
 }

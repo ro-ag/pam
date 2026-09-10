@@ -1,6 +1,6 @@
 //! Opt-in classifier smoke test, not diagnostic-quality qualification.
 //! Run with `PAM_COMPRESSION_MODEL_DIR` pointing to the verified asset directory.
-use std::{path::PathBuf, time::Instant};
+use std::{fmt::Write as _, path::PathBuf, time::Instant};
 
 use pam_model::compression;
 use sha2::{Digest, Sha256};
@@ -16,9 +16,9 @@ fn official_classifier_preserves_jenkins_failure_and_recovery_evidence() {
         "Started by upstream project delivery/service build 482\n[Pipeline] stage (Compile)\n[Pipeline] sh\n+ cargo build --locked\n",
     );
     for index in 0..40 {
-        source.push_str(&format!(
-            "dependency build progress {index}: checking cached crate metadata and incremental workspace objects\n"
-        ));
+        writeln!(source,
+            "dependency build progress {index}: checking cached crate metadata and incremental workspace objects"
+        ).unwrap();
     }
     source.push_str(
         "[Pipeline] stage (Upload artifact)\n[Pipeline] retry\nAttempt 1 of 2\nERROR: upload returned HTTP 503 from artifact repository\nRetrying upload after 5 seconds\nAttempt 2 of 2\nUpload completed: service-482.tar.gz sha256=8a019c\n[Pipeline] stage (Quality gate)\nAnalysis task AZ-482 completed\nERROR: quality gate failed: new_coverage=63.2, required=80.0\n[Pipeline] catchError\nRetaining artifact; marking this workflow unsuccessful\nFinished: FAILURE\n",

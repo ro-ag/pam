@@ -1549,6 +1549,13 @@ impl RunState<'_> {
         else {
             return;
         };
+        if *connector == ConnectorId::Jenkins && call == "investigate" {
+            report.summary = result
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|text| text.len() <= 6000)
+                .map(str::to_owned);
+        }
         let meta = json!({
             "connector": connector.as_str(),
             "call": call,
@@ -1625,6 +1632,7 @@ impl RunState<'_> {
             Some(compressed.source.id.clone()),
             Some(compressed.compact.id.clone()),
             compressed.summary.as_ref().map(|row| row.id.clone()),
+            compressed.semantic.as_ref().map(|row| row.id.clone()),
         ]
         .into_iter()
         .flatten()

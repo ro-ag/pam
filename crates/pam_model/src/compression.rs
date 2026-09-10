@@ -114,7 +114,7 @@ pub fn installed(directory: &Path) -> bool {
 }
 
 fn check_cancel(cancel: &watch::Receiver<bool>) -> Result<(), CompressionError> {
-    if *cancel.borrow() {
+    if *cancel.borrow() || cancel.has_changed().is_err() {
         Err(CompressionError::Cancelled)
     } else {
         Ok(())

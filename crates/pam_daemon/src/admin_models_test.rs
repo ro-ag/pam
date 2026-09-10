@@ -261,7 +261,7 @@ fn tiny_gguf() -> Vec<u8> {
 async fn every_model_op_is_dispatched_and_none_is_unknown() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        assert_eq!(MODEL_ADMIN_OPS.len(), 16, "the spec's sixteen ops");
+        assert_eq!(MODEL_ADMIN_OPS.len(), 19, "model and compressor ops");
         for op in MODEL_ADMIN_OPS {
             assert!(op.starts_with("admin."), "{op} is under the admin prefix");
             // Called with no arguments: whatever comes back, it must not
@@ -833,4 +833,25 @@ async fn discarding_an_unknown_preset_is_an_argument_refusal() {
     })
     .await
     .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn compressor_setup_defaults_off_and_refuses_missing_assets() {
+    use crate::admin_compressor::{OP_SET, OP_STATUS, SETTING_ENABLED};
+    let f = fixture().await;
+    let status = f.run(OP_STATUS, json!({})).await;
+    let Response::Result { body, .. } = status else {
+        panic!("status succeeds")
+    };
+    assert_eq!(body["installed"], false);
+    assert_eq!(body["enabled"], false);
+    assert!(matches!(
+        f.run(OP_SET, json!({"enabled": true})).await,
+        Response::Refusal { .. }
+    ));
+    assert_eq!(f.store.get_setting(SETTING_ENABLED).await.unwrap(), None);
+    assert!(matches!(
+        f.run(OP_SET, json!({"enabled": false})).await,
+        Response::Result { .. }
+    ));
 }

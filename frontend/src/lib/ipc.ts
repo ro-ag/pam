@@ -171,6 +171,9 @@ export type AdminOp =
   | "admin.models.status"
   | "admin.models.defaults.set"
   | "admin.models.settings.set"
+  | "admin.models.compressor.status"
+  | "admin.models.compressor.install"
+  | "admin.models.compressor.set"
   | "admin.models.try"
   | "admin.curator.list"
   | "admin.curator.set"
@@ -608,6 +611,9 @@ export interface ModelUse {
 
 /** Everything one compression produced. */
 export interface CompressReport {
+  semantic?: EvidenceRef | null;
+  semantic_text?: string | null;
+  compression_skipped?: { cause: string; detail: string } | null;
   source: EvidenceRef;
   compact: EvidenceRef;
   /** Null when no model answered; `model_skipped` then says why. */

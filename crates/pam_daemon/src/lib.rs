@@ -3,6 +3,7 @@
 //! and communicating over typed channels.
 
 pub mod admin;
+pub mod admin_compressor;
 pub mod admin_connectors;
 pub mod admin_flows;
 pub mod admin_logs;
@@ -15,6 +16,7 @@ pub mod executor;
 pub mod flow_exec;
 pub mod flow_service;
 pub mod lifecycle;
+mod log_semantic;
 pub mod log_service;
 pub mod model_service;
 pub mod policy;

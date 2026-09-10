@@ -211,6 +211,7 @@ pub struct ModelService {
     /// hold a stale one.
     models_dir: RwLock<PathBuf>,
     runtime: Runtime,
+    pub(crate) operation: Mutex<()>,
     downloads: Downloads,
     host_ram_bytes: u64,
 }
@@ -249,6 +250,7 @@ impl ModelService {
             store,
             models_dir: RwLock::new(models_dir),
             runtime: Runtime::new(),
+            operation: Mutex::new(()),
             downloads: Downloads::default(),
             host_ram_bytes: host_ram_bytes(),
         });
@@ -317,17 +319,37 @@ impl ModelService {
         tier: Tier,
         request: GenerateRequest,
     ) -> Result<GenerateResult, ModelUnavailable> {
+        self.generate_bounded(tier, request, pam_model::runtime::CONTEXT_TOKENS)
+            .await
+    }
+
+    /// Applies a task-specific prefill limit using the generator's exact tokenizer.
+    pub async fn generate_bounded(
+        &self,
+        tier: Tier,
+        request: GenerateRequest,
+        input_limit: usize,
+    ) -> Result<GenerateResult, ModelUnavailable> {
+        let _operation = self.operation.lock().await;
         let entry = self.resolve(tier).await?;
-        self.ensure_loaded(&entry).await?;
+        self.ensure_loaded_inner(&entry).await?;
         // The daemon-internal path has no cancel surface yet: the sender
         // lives as long as the call and never fires.
         let (_never, cancel) = watch::channel(false);
-        Ok(self.runtime.generate(request, cancel).await?)
+        Ok(self
+            .runtime
+            .generate_bounded(request, cancel, input_limit)
+            .await?)
     }
 
     /// Makes `entry` the loaded model, unloading whatever else was in
     /// memory first. A no-op when it is already loaded.
     pub async fn ensure_loaded(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
+        let _operation = self.operation.lock().await;
+        self.ensure_loaded_inner(entry).await
+    }
+
+    async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
         match self.runtime.snapshot().state {
             RuntimeState::Loaded(loaded) if loaded.id == entry.id => return Ok(loaded),
             RuntimeState::Loaded(loaded) => {
@@ -566,6 +588,9 @@ impl ModelService {
 
     /// Drops the weights if the runtime has been idle long enough.
     async fn maybe_idle_unload(&self) {
+        let Ok(_operation) = self.operation.try_lock() else {
+            return;
+        };
         let Ok(idle_min) = self.idle_unload_min().await else {
             return;
         };

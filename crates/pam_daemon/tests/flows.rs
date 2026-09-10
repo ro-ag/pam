@@ -1509,6 +1509,9 @@ async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_fai
         assert_ne!(body["outcome"], "solved");
         let investigation = step(&body, "investigate-build");
         assert_eq!(investigation["status"], "failed");
+        let summary = investigation["summary"].as_str().expect("CLI gets bounded observations");
+        assert!(summary.contains("FAILURE") && summary.contains("unresolved"));
+        assert!(summary.len() <= 6000);
         let evidence = investigation["evidence"].as_array().unwrap();
         assert_eq!(evidence.len(), 1);
         let row = flows.daemon.store().get_evidence(evidence[0].as_str().unwrap()).await.unwrap().unwrap();

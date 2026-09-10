@@ -9,7 +9,7 @@ use tokio::time::timeout;
 
 use crate::log_service::{
     CAUSE_NO_DEFAULT, CompressInput, EVIDENCE_KIND_LOG_SOURCE, EVIDENCE_KIND_LOG_SUMMARY, LogError,
-    LogService, PROMPT_BUDGET_BYTES, fit_prompt, new_evidence_id,
+    LogService, PROMPT_BUDGET_BYTES, new_evidence_id,
 };
 use crate::model_service::{ModelService, SETTING_DEFAULT_HEAVY, SETTING_MODELS_DIR};
 
@@ -189,50 +189,33 @@ async fn oversized_input_is_refused_before_any_row_exists() {
     .unwrap();
 }
 
-#[test]
-fn fit_prompt_keeps_short_text_and_trims_long_text_at_line_boundaries() {
-    let short = "line\n".repeat(200);
-    assert_eq!(short.len(), 1_000);
-    assert_eq!(
-        fit_prompt(&short),
-        short,
-        "a text under budget is untouched"
-    );
-
-    let mut long = String::new();
-    let mut index = 0;
-    while long.len() < 60_000 {
-        writeln!(long, "line {index}").unwrap();
-        index += 1;
+#[tokio::test]
+async fn oversized_evidence_is_not_truncated_or_sent_for_generation() {
+    let (store, logs) = service("req_oversized").await;
+    let mut text = String::new();
+    for index in 0..2000 {
+        writeln!(text, "error: diagnostic {index}").unwrap();
     }
-    let fitted = fit_prompt(&long);
-    assert!(
-        fitted.len() <= PROMPT_BUDGET_BYTES + 80,
-        "fitted to {} bytes",
-        fitted.len()
-    );
-    assert!(fitted.starts_with("line 0\n"), "the head survives");
-    let last_line = long.lines().next_back().expect("a last line");
-    assert!(
-        fitted.trim_end().ends_with(last_line),
-        "the tail survives: {last_line:?}"
-    );
-    let marker_at = fitted
-        .find("[... ")
-        .expect("the elision marker is in the middle");
-    assert!(fitted[marker_at..].contains(" bytes elided for the model prompt ...]"));
+    let report = logs
+        .compress(
+            "req_oversized",
+            CompressInput {
+                name: "long.log".to_owned(),
+                bytes: text.as_bytes().to_vec(),
+                exit_status: Some(1),
+                use_model: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.compact_text.len() > PROMPT_BUDGET_BYTES);
+    assert!(report.compact_text.contains("diagnostic 1000"));
     assert_eq!(
-        &fitted[marker_at - 1..marker_at],
-        "\n",
-        "the marker starts a line"
+        report.model_skipped.unwrap().cause,
+        "evidence_exceeds_budget"
     );
-    let marker_end =
-        marker_at + fitted[marker_at..].find("...]").expect("the marker closes") + "...]".len();
-    assert_eq!(
-        fitted.as_bytes()[marker_end],
-        b'\n',
-        "the marker ends its line"
-    );
+    assert!(report.summary.is_none());
+    drop(store);
 }
 
 #[test]
@@ -378,4 +361,38 @@ async fn bench_model_writes_a_summary_row() {
     );
     println!("{text}");
     println!("--- end summary ---");
+}
+
+#[tokio::test]
+async fn enabled_compressor_skips_before_loading_when_no_investigator_exists() {
+    let (store, logs) = service("req_compressor_skip").await;
+    store
+        .set_setting(crate::admin_compressor::SETTING_ENABLED, "true")
+        .await
+        .unwrap();
+    let report = logs
+        .compress(
+            "req_compressor_skip",
+            CompressInput {
+                name: "build.log".to_owned(),
+                bytes: b"build complete\n".to_vec(),
+                exit_status: Some(0),
+                use_model: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.compression_skipped.unwrap().cause,
+        "investigator_unavailable"
+    );
+    assert!(report.semantic.is_none());
+    assert_eq!(
+        store
+            .list_evidence("req_compressor_skip")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }

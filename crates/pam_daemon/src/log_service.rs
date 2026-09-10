@@ -31,21 +31,11 @@
 //! Only the bound check, the compaction itself, and the two evidence
 //! writes that carry the deterministic result can fail the call.
 //!
-//! # Why the prompt is fitted, not truncated
+//! # Bounded summaries
 //!
-//! A reduced log is still allowed to be megabytes. The summary runs on the
-//! heavy tier under an 8192-token context, so [`fit_prompt`] keeps the
-//! head and the tail — where a build log puts its invocation and its
-//! verdict — and says in the middle how many bytes it dropped. Cutting at
-//! line boundaries keeps the model from reading half a line as a whole
-//! one.
-//!
-//! # Who calls this
-//!
-//! Today: [`crate::admin_logs`], a GUI-only admin op, so a human can drive
-//! a log through the pipeline and inspect every row it left. Later: flow
-//! steps and connector diagnoses, which call the service directly. There
-//! is deliberately no `pam` subcommand and no agent capability.
+//! Optional Microsoft extraction selects source-mapped records after deterministic
+//! compaction. Oversized evidence is refused before generation, never head/tail
+//! truncated. Flow steps and the GUI log observatory both call this service.
 
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -63,17 +53,8 @@ pub const EVIDENCE_KIND_LOG_SOURCE: &str = "log.source";
 /// Evidence kind holding the model's plain-text summary of a compact log.
 pub const EVIDENCE_KIND_LOG_SUMMARY: &str = "log.summary";
 
-/// Largest prompt [`fit_prompt`] hands the model, in bytes.
-///
-/// Roughly 6k tokens: comfortably under the 8192-token context with the
-/// system turn framed in and [`SUMMARY_MAX_TOKENS`] left to answer with.
-pub const PROMPT_BUDGET_BYTES: usize = 24_000;
-
-/// Bytes of the reduced log kept from the front when it does not fit.
-pub const PROMPT_HEAD_BYTES: usize = 16_000;
-
-/// Bytes of the reduced log kept from the end when it does not fit.
-pub const PROMPT_TAIL_BYTES: usize = 8_000;
+/// Conservative byte ceiling before the exact 2,048-token summary preflight.
+pub const PROMPT_BUDGET_BYTES: usize = 6_000;
 
 /// Hard ceiling on the summary's length, in tokens.
 pub const SUMMARY_MAX_TOKENS: usize = 400;
@@ -82,11 +63,10 @@ pub const SUMMARY_MAX_TOKENS: usize = 400;
 pub const SUMMARY_TEMPERATURE: f64 = 0.0;
 
 /// The system turn framing every summary generation.
-pub const SUMMARY_SYSTEM: &str = "You are PAM's log summarizer. You receive a build or test log that was already reduced \
-     deterministically; bracketed markers say how many records were omitted and why. Answer in \
-     plain text, at most eight lines: the outcome first (pass, fail, or unknown), then the failing \
-     step and the exact error lines that explain it, quoted verbatim, then what a developer must \
-     fix. Never invent lines that are not in the log.";
+pub const SUMMARY_SYSTEM: &str = "You receive selected build evidence. Report observations in at most eight lines, \
+    quoting exact diagnostics. The supplied exit status is authoritative; error text alone is not a final failure. \
+    Errors may be retried, caught, or followed by cleanup. Selected evidence may omit decisive context. \
+    Say unknown when the failed stage or cause cannot be established. Do not invent fixes or override the reported status.";
 
 /// [`ModelSkipped::cause`] when no model is configured for the tier.
 pub const CAUSE_NO_DEFAULT: &str = "no_default";
@@ -100,8 +80,8 @@ pub const CAUSE_STORE_ERROR: &str = "store_error";
 /// The daemon's log compression service (see the module docs).
 #[derive(Debug)]
 pub struct LogService {
-    store: Arc<Store>,
-    models: Arc<ModelService>,
+    pub(crate) store: Arc<Store>,
+    pub(crate) models: Arc<ModelService>,
 }
 
 /// One log offered for compression.
@@ -197,6 +177,12 @@ pub struct CompressReport {
     pub model: Option<ModelUse>,
     /// Why none did, when none did.
     pub model_skipped: Option<ModelSkipped>,
+    /// Source-mapped Microsoft selection over the deterministic rendering.
+    pub semantic: Option<EvidenceRef>,
+    /// The selected rendering; exact source remains in compact/source evidence.
+    pub semantic_text: Option<String>,
+    /// Why optional semantic compression did not run or could not fit.
+    pub compression_skipped: Option<ModelSkipped>,
 }
 
 /// Why a compression could not produce its deterministic result.
@@ -325,9 +311,14 @@ impl LogService {
             stats,
             model: None,
             model_skipped: None,
+            semantic: None,
+            semantic_text: None,
+            compression_skipped: None,
         };
 
         if use_model {
+            self.semantic_prompt(request_id, &name, &compact_id, &mut report)
+                .await;
             self.summarize(request_id, &name, &source_id, &compact_id, &mut report)
                 .await;
         }
@@ -358,6 +349,17 @@ impl LogService {
         compact_id: &str,
         report: &mut CompressReport,
     ) {
+        let prompt = report
+            .semantic_text
+            .clone()
+            .unwrap_or_else(|| report.compact_text.clone());
+        if prompt.len() > PROMPT_BUDGET_BYTES {
+            report.model_skipped = Some(ModelSkipped {
+                cause: "evidence_exceeds_budget".to_owned(),
+                detail: "The evidence exceeds the bounded summary input; inspect a specific stage or node. No head/tail truncation was sent to the model.".to_owned(),
+            });
+            return;
+        }
         // Resolved once, up front: `generate` resolves for itself, but the
         // report has to name the model that answered and the entry is the
         // only place that id lives.
@@ -370,12 +372,16 @@ impl LogService {
         };
         let request = GenerateRequest {
             system: Some(SUMMARY_SYSTEM.to_owned()),
-            prompt: fit_prompt(&report.compact_text),
+            prompt,
             max_tokens: SUMMARY_MAX_TOKENS,
             temperature: SUMMARY_TEMPERATURE,
             stop: Vec::new(),
         };
-        let result = match self.models.generate(Tier::Heavy, request).await {
+        let result = match self
+            .models
+            .generate_bounded(Tier::Heavy, request, 2048)
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 report.model_skipped = Some(skipped(&err));
@@ -393,6 +399,7 @@ impl LogService {
             "tokens_per_sec": result.tokens_per_sec,
             "source_evidence": source_id,
             "compact_evidence": compact_id,
+            "semantic_evidence": report.semantic.as_ref().map(|evidence| &evidence.id),
         });
         if let Err(err) = self
             .store
@@ -484,39 +491,6 @@ fn skipped(err: &ModelUnavailable) -> ModelSkipped {
         cause: cause.to_owned(),
         detail: err.to_string(),
     }
-}
-
-/// Fits a reduced log to [`PROMPT_BUDGET_BYTES`].
-///
-/// Short enough, and the text goes through untouched. Otherwise the head
-/// and the tail are kept — where a build log puts its invocation and its
-/// verdict — with one marker between them saying how much went. Both cuts
-/// land on line boundaries so the model never reads half a line as a whole
-/// one, and the marker sits on its own line.
-#[must_use]
-pub fn fit_prompt(text: &str) -> String {
-    if text.len() <= PROMPT_BUDGET_BYTES {
-        return text.to_owned();
-    }
-    // Cut back to the last newline inside the head window; if the window
-    // holds no newline at all (one enormous line), the char boundary is
-    // the best cut available.
-    let head_cut = text.floor_char_boundary(PROMPT_HEAD_BYTES);
-    let head_end = text[..head_cut].rfind('\n').map_or(head_cut, |at| at + 1);
-    // Forward to the first newline at or after the tail window's start,
-    // for the same reason in the other direction.
-    let tail_cut = text.ceil_char_boundary(text.len() - PROMPT_TAIL_BYTES);
-    let tail_start = text[tail_cut..]
-        .find('\n')
-        .map_or(tail_cut, |at| tail_cut + at + 1);
-    if tail_start <= head_end {
-        // The two windows met: nothing was actually elided.
-        return text.to_owned();
-    }
-    let head = &text[..head_end];
-    let tail = &text[tail_start..];
-    let elided = text.len() - head.len() - tail.len();
-    format!("{head}[... {elided} bytes elided for the model prompt ...]\n{tail}")
 }
 
 /// A fresh `ev_<ulid>` evidence id.

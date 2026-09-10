@@ -5,6 +5,7 @@
 //! bytes, and `StageNodeExt` may silently cap its child list on the server.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::time::Instant;
 
 use pam_flow::{ArgValue, ConnectorId};
@@ -314,19 +315,22 @@ pub(crate) fn investigation_summary(
             shown_nodes += 1;
         }
     }
-    summary.push_str(&format!(
-        "Summary omitted {} stage and {} node entries; full collected records remain in evidence.\n",
-        stages.len() - shown_stages, nodes.len() - shown_nodes
-    ));
+    let _ = writeln!(
+        summary,
+        "Summary omitted {} stage and {} node entries; full collected records remain in evidence.",
+        stages.len() - shown_stages,
+        nodes.len() - shown_nodes
+    );
     let gap_text = if gaps.is_empty() {
         "none reported for selected requests".to_owned()
     } else {
         gaps.iter().copied().collect::<Vec<_>>().join(", ")
     };
-    summary.push_str(&format!(
-        "Collection gaps: {}.\n",
+    let _ = writeln!(
+        summary,
+        "Collection gaps: {}.",
         summary_field(&gap_text, 1024)
-    ));
+    );
     summary.push_str(
         "Graph coverage is unverified: wfapi can omit children/control-flow boundaries.\n\
         Attribution unresolved. FAILED observations may be caught/retried; post actions, \

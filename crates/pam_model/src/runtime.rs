@@ -253,8 +253,18 @@ enum Command {
         /// Where the acknowledgement goes.
         reply: oneshot::Sender<()>,
     },
+    /// Run Microsoft extraction after releasing the generator weights.
+    Compress {
+        directory: std::path::PathBuf,
+        text: String,
+        target_bytes: usize,
+        cancel: watch::Receiver<bool>,
+        reply: oneshot::Sender<Result<crate::compression::CompressionReport, RuntimeError>>,
+    },
     /// Run one generation to completion.
     Generate {
+        /// Maximum admitted input tokens for this task.
+        input_limit: usize,
         /// What to generate.
         request: Box<GenerateRequest>,
         /// Flips to true to stop between tokens.
@@ -376,8 +386,19 @@ impl Runtime {
         request: GenerateRequest,
         cancel: watch::Receiver<bool>,
     ) -> Result<GenerateResult, RuntimeError> {
+        self.generate_bounded(request, cancel, CONTEXT_TOKENS).await
+    }
+
+    /// Generates only when the fully framed input fits the task-specific limit.
+    pub async fn generate_bounded(
+        &self,
+        request: GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<GenerateResult, RuntimeError> {
         let (reply, answer) = oneshot::channel();
         let command = Command::Generate {
+            input_limit,
             request: Box::new(request),
             cancel,
             reply,
@@ -390,6 +411,32 @@ impl Runtime {
             } else {
                 RuntimeError::NoModelLoaded
             });
+        }
+        self.await_reply(answer).await?
+    }
+
+    /// Runs bounded extraction on the same worker as generation. The outgoing
+    /// generator is dropped before the compressor loads; compressor weights
+    /// are released before the reply and any subsequent generator load.
+    pub async fn compress(
+        &self,
+        directory: std::path::PathBuf,
+        text: String,
+        target_bytes: usize,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<crate::compression::CompressionReport, RuntimeError> {
+        let (reply, answer) = oneshot::channel();
+        if !self.send(
+            Command::Compress {
+                directory,
+                text,
+                target_bytes,
+                cancel,
+                reply,
+            },
+            true,
+        ) {
+            return Err(RuntimeError::Crashed);
         }
         self.await_reply(answer).await?
     }
@@ -567,7 +614,24 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
             settle(mirror, RuntimeState::Idle);
             let _ = reply.send(());
         }
+        Command::Compress {
+            directory,
+            text,
+            target_bytes,
+            cancel,
+            reply,
+        } => {
+            *loaded = None;
+            set_state(mirror, RuntimeState::Idle);
+            let result = crate::compression::compress(&directory, &text, target_bytes, &cancel)
+                .map_err(|error| {
+                    RuntimeError::GenerationFailed(format!("{}: {error}", error.cause()))
+                });
+            settle(mirror, RuntimeState::Idle);
+            drop(reply.send(result));
+        }
         Command::Generate {
+            input_limit,
             request,
             cancel,
             reply,
@@ -577,7 +641,7 @@ fn handle(command: Command, loaded: &mut Option<Loaded>, mirror: &Mutex<RuntimeS
                 drop(reply.send(Err(RuntimeError::NoModelLoaded)));
                 return;
             };
-            let result = generate_on_thread(model, &request, &cancel);
+            let result = generate_on_thread(model, &request, &cancel, input_limit);
             if let Ok(generated) = &result {
                 model.meta.last_used_at = now();
                 model.meta.last_tokens_per_sec = Some(generated.tokens_per_sec);
@@ -784,6 +848,7 @@ fn generate_on_thread(
     loaded: &mut Loaded,
     request: &GenerateRequest,
     cancel: &watch::Receiver<bool>,
+    input_limit: usize,
 ) -> Result<GenerateResult, RuntimeError> {
     if *cancel.borrow() {
         return Err(RuntimeError::Cancelled);
@@ -803,6 +868,12 @@ fn generate_on_thread(
         ids.insert(0, bos);
     }
     let prompt_tokens = ids.len();
+    if prompt_tokens > input_limit {
+        return Err(RuntimeError::PromptTooLong {
+            tokens: prompt_tokens,
+            limit: input_limit,
+        });
+    }
     if prompt_tokens + request.max_tokens > CONTEXT_TOKENS {
         return Err(RuntimeError::PromptTooLong {
             tokens: prompt_tokens,

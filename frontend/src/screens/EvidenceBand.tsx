@@ -74,6 +74,17 @@ function CompressedNote({ report }: { report: CompressReport }) {
         {formatBytes(report.stats.source_bytes)} → {formatBytes(report.stats.compact_bytes)} · ~
         {report.stats.tokens_avoided_est.toLocaleString()} tokens avoided
       </p>
+      {report.semantic && (
+        <p className="text-sm text-ink-muted">
+          Microsoft selected records are stored as evidence {report.semantic.id}. Original
+          evidence is unchanged.
+        </p>
+      )}
+      {report.compression_skipped && (
+        <p className="text-sm text-ink-muted">
+          Microsoft compression skipped: {report.compression_skipped.detail}
+        </p>
+      )}
       {report.model_skipped && (
         <p className="font-sans text-sm text-ink-muted">
           No summary this time — {report.model_skipped.detail}.

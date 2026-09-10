@@ -105,6 +105,9 @@ pub const OP_CURATOR_TEST: &str = "admin.curator.test";
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const MODEL_ADMIN_OPS: &[&str] = &[
+    crate::admin_compressor::OP_STATUS,
+    crate::admin_compressor::OP_INSTALL,
+    crate::admin_compressor::OP_SET,
     OP_MODELS_LIST,
     OP_MODELS_CATALOG,
     OP_MODELS_DOWNLOAD,
@@ -238,6 +241,9 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
+            crate::admin_compressor::OP_STATUS => self.compressor_status().await,
+            crate::admin_compressor::OP_INSTALL => self.compressor_install(args).await,
+            crate::admin_compressor::OP_SET => self.compressor_set(args).await,
             OP_MODELS_LIST => self.models_list().await,
             OP_MODELS_CATALOG => self.models_catalog().await,
             OP_MODELS_DOWNLOAD => self.models_download(args).await,
@@ -546,6 +552,7 @@ impl AdminService {
 
     /// Drops the weights. Already idle is a success, not a refusal.
     async fn models_unload(&self) -> Result<AdminOk, AdminRefusal> {
+        let _operation = self.models.operation.lock().await;
         let previous = self.loaded_id();
         self.models
             .runtime()
@@ -649,6 +656,11 @@ impl AdminService {
     /// Deliberately works on `test_only` models: proving the wiring is the
     /// whole point of this op.
     async fn models_try(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let _operation = self.models.operation.try_lock().map_err(|_| AdminRefusal {
+            cause: "runtime_busy",
+            detail: "The model worker is reserved.".to_owned(),
+            recovery: RECOVERY_RETRY_LATER,
+        })?;
         let prompt = required_str(args, "prompt", OP_MODELS_TRY)?;
         let max_tokens = args
             .get("max_tokens")

@@ -1902,3 +1902,37 @@ async fn stale_lane_cannot_restart_a_terminal_or_expired_request() {
         RequestState::Failed
     );
 }
+
+#[tokio::test]
+async fn bounded_setting_cas_preserves_concurrent_changes() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert!(
+        store
+            .get_setting_bounded("map", 32)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (a, b) = tokio::join!(
+        store.compare_exchange_setting("map", None, "a"),
+        store.compare_exchange_setting("map", None, "b")
+    );
+    assert_ne!(a.unwrap(), b.unwrap());
+    assert!(
+        !store
+            .compare_exchange_setting("map", Some("stale"), "other")
+            .await
+            .unwrap()
+    );
+    store
+        .set_setting("large", &"x".repeat(32769))
+        .await
+        .unwrap();
+    assert!(store.get_setting_bounded("large", 32768).await.is_err());
+    assert!(
+        store
+            .compare_exchange_setting("large", None, "replacement")
+            .await
+            .is_err()
+    );
+}

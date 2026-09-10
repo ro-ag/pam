@@ -1631,6 +1631,60 @@ impl Store {
         }
     }
 
+    /// Reads a setting with its byte bound applied before allocation.
+    pub async fn get_setting_bounded(
+        &self,
+        key: &str,
+        maximum: usize,
+    ) -> Result<Option<String>, StoreError> {
+        let maximum = i64::try_from(maximum).unwrap_or(i64::MAX).min(32768);
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=?2 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key,maximum]).await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        row.get::<Option<String>>(0)?
+            .map(Some)
+            .ok_or_else(|| StoreError::UnexpectedValue {
+                column: "setting",
+                value: "value exceeds bounded read".to_owned(),
+            })
+    }
+
+    /// Compare exact prior bytes and update under the single connection lock.
+    /// Returns false on conflict; no implicit retry or overwrite.
+    pub async fn compare_exchange_setting(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, StoreError> {
+        if value.len() > 32768 || expected.is_some_and(|prior| prior.len() > 32768) {
+            return Err(StoreError::UnexpectedValue {
+                column: "setting",
+                value: "CAS value exceeds 32 KiB".to_owned(),
+            });
+        }
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=32768 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key]).await?;
+        let prior =
+            match rows.next().await? {
+                Some(row) => Some(row.get::<Option<String>>(0)?.ok_or_else(|| {
+                    StoreError::UnexpectedValue {
+                        column: "setting",
+                        value: "stored CAS value exceeds 32 KiB".to_owned(),
+                    }
+                })?),
+                None => None,
+            };
+        drop(rows);
+        if prior.as_deref() != expected {
+            return Ok(false);
+        }
+        self.conn.execute("INSERT INTO setting(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value]).await?;
+        Ok(true)
+    }
+
     /// Writes a setting value (JSON text), replacing any previous value.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let _guard = self.conn_lock.lock().await;

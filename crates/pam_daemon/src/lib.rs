@@ -104,3 +104,7 @@ mod scope_policy_test;
 mod admission_rate;
 #[cfg(test)]
 mod admission_rate_test;
+
+pub(crate) mod sonar_mapping;
+#[cfg(test)]
+mod sonar_mapping_test;

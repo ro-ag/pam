@@ -590,13 +590,9 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
             "stdout: {}\nstderr: {}",
             run.stdout, run.stderr
         );
+        assert!(run.stdout.contains("succeeded"), "stdout: {}", run.stdout);
         assert!(
-            run.stdout.contains("\u{2713} fetch  succeeded"),
-            "stdout: {}",
-            run.stdout
-        );
-        assert!(
-            run.stdout.contains("3 steps: 3 succeeded"),
+            run.stdout.contains("not_attempted"),
             "stdout: {}",
             run.stdout
         );
@@ -614,7 +610,7 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
         assert_eq!(response["outcome"], "verified", "response: {response}");
         assert_eq!(
-            response["body"]["outcome"], "verified",
+            response["body"]["workflow"]["outcome"], "verified",
             "response: {response}"
         );
         assert_eq!(
@@ -647,14 +643,9 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
         assert_eq!(run.code, 0, "stderr: {}", run.stderr);
         let response: serde_json::Value =
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
-        assert_eq!(
-            response["body"]["inputs"]["label"], "carried",
-            "response: {response}"
-        );
-        assert_eq!(
-            response["body"]["flow"]["source"], "library",
-            "response: {response}"
-        );
+        let report = protected_flow_report(&daemon.handle.store(), &response).await;
+        assert_eq!(report["inputs"]["label"], "carried", "response: {response}");
+        assert_eq!(report["flow"]["source"], "library", "response: {response}");
 
         // With no argument the flow's declared default stands instead.
         let run = run_pam(
@@ -667,10 +658,8 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
         assert_eq!(run.code, 0, "stderr: {}", run.stderr);
         let response: serde_json::Value =
             serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
-        assert_eq!(
-            response["body"]["inputs"]["label"], "unset",
-            "response: {response}"
-        );
+        let report = protected_flow_report(&daemon.handle.store(), &response).await;
+        assert_eq!(report["inputs"]["label"], "unset", "response: {response}");
 
         daemon.stop().await;
     })
@@ -767,7 +756,8 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
                 "unresolved"
             };
             assert_eq!(response["outcome"], outcome, "{state}: {response}");
-            let step = response["body"]["steps"]
+            let report = protected_flow_report(&store, &response).await;
+            let step = report["steps"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -850,7 +840,7 @@ async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
         let run = run_pam(&base, repo.path(), &["flow", "run", "copied", "--json"]).await;
         assert_eq!(run.code, 0, "{}", run.stderr);
         let result: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
-        assert_eq!(result["body"]["flow"]["source"], "library");
+        assert_eq!(result["body"]["flow"]["id"], "copied");
         let deleted = flow_admin(&base, "admin.flows.delete", serde_json::json!({"id":"copied"})).await;
         assert_eq!(deleted["revealed_builtin"], false);
         flow_admin(&base, "admin.flows.save", serde_json::json!({
@@ -979,4 +969,85 @@ async fn seed_cli_evidence(store: &Store, repo: &Path, request_id: &str) {
         map_json: serde_json::json!([{"view":{"start":0,"end":3},"parent":{"start":0,"end":3},"relation":"identity"}]).to_string(),
         view_id: "view_cli".into(), view_bytes: b"x\xff\n".to_vec(),
     }).await.unwrap());
+}
+
+/// The compact public result deliberately omits inputs and full step details.
+/// Fixture access to protected evidence keeps these execution assertions exact.
+async fn protected_flow_report(store: &Store, response: &serde_json::Value) -> serde_json::Value {
+    for id in response["evidence"].as_array().unwrap() {
+        let row = store
+            .get_evidence(id.as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        if row.kind == pam_daemon::flow_service::EVIDENCE_KIND_FLOW_RESULT {
+            return serde_json::from_slice(&row.content).unwrap();
+        }
+    }
+    panic!("missing protected full flow report: {response}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_discovery_wait_and_durable_result_use_the_actual_binary() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        let repo = clean_tree_fixture("untracked");
+        seed_repository_scope(&daemon, repo.path()).await;
+        let page = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "list", "--limit", "1", "--json"],
+        )
+        .await;
+        assert_eq!(page.code, 0, "{} {}", page.stdout, page.stderr);
+        let page: serde_json::Value = serde_json::from_str(&page.stdout).unwrap();
+        assert_eq!(page["body"]["flows"].as_array().unwrap().len(), 1);
+        let inspected = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "inspect", "after-merge-checks", "--json"],
+        )
+        .await;
+        assert_eq!(
+            inspected.code, 0,
+            "{} {}",
+            inspected.stdout, inspected.stderr
+        );
+        let inspected: serde_json::Value = serde_json::from_str(&inspected.stdout).unwrap();
+        assert_eq!(inspected["body"]["schema_version"], 1);
+        let started = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "after-merge-checks", "--no-wait", "--json"],
+        )
+        .await;
+        assert_eq!(started.code, 0, "{} {}", started.stdout, started.stderr);
+        let started: serde_json::Value = serde_json::from_str(&started.stdout).unwrap();
+        let ticket = started["ticket"].as_str().unwrap();
+        let waited = run_pam(&daemon.base(), repo.path(), &["wait", ticket, "--json"]).await;
+        assert_eq!(waited.code, 4, "{} {}", waited.stdout, waited.stderr);
+        let waited: serde_json::Value = serde_json::from_str(&waited.stdout).unwrap();
+        let fetched = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "result", ticket, "--json"],
+        )
+        .await;
+        assert_eq!(fetched.code, 4, "{} {}", fetched.stdout, fetched.stderr);
+        let fetched: serde_json::Value = serde_json::from_str(&fetched.stdout).unwrap();
+        assert_eq!(waited["body"], fetched["body"]);
+        assert_eq!(
+            fetched["body"]["agent_result"]["workflow"]["outcome"],
+            "unresolved"
+        );
+        assert_eq!(
+            fetched["body"]["agent_result"]["diagnosis"]["status"],
+            "not_attempted"
+        );
+        assert!(serde_json::to_vec(&fetched).unwrap().len() <= 16_384);
+        daemon.stop().await;
+    })
+    .await
+    .expect("workflow CLI contract within deadline");
 }

@@ -198,7 +198,7 @@ pub fn render_flow_list(body: &Value) -> String {
         .max()
         .unwrap_or_default();
 
-    flows
+    let mut rendered = flows
         .iter()
         .map(|flow| {
             let tail = if is_valid(flow) {
@@ -217,7 +217,11 @@ pub fn render_flow_list(body: &Value) -> String {
             )
         })
         .collect::<Vec<String>>()
-        .join("\n")
+        .join("\n");
+    if let Some(offset) = body.get("next_offset").and_then(Value::as_u64) {
+        rendered.push_str(&format!("\nmore: pam flow list --offset {offset}"));
+    }
+    rendered
 }
 
 /// The `pam flow show` output: the flow's canonical YAML, verbatim.
@@ -250,6 +254,20 @@ pub fn render_flow_show(body: &Value) -> String {
 /// [`render_body`] rather than rendering nothing.
 #[must_use]
 pub fn render_flow_result(body: &Value) -> String {
+    if let Some(result) = body.get("agent_result").filter(|value| value.is_object()) {
+        return format!(
+            "state: {}\n{}",
+            field(body, "state"),
+            render_flow_result(result)
+        );
+    }
+    if body.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && body.get("workflow").is_some()
+    {
+        // JSON escaping preserves hostile observations without terminal controls;
+        // the typed headings keep workflow authority separate from diagnosis.
+        return render_body(body);
+    }
     let Some(steps) = body.get("steps").and_then(Value::as_array) else {
         return render_body(body);
     };

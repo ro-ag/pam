@@ -81,6 +81,9 @@ enum Cmd {
     },
     /// Block until a ticket reaches its terminal event (quiet).
     Wait {
+        /// Print the durable terminal response as JSON.
+        #[arg(long)]
+        json: bool,
         /// The ticket to wait for.
         ticket: String,
         /// Give up after this many milliseconds.
@@ -156,7 +159,24 @@ enum ServiceCmd {
 enum FlowCmd {
     /// List the flows this machine has: id, source, steps, and name.
     List {
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=50))]
+        limit: u32,
         /// Print the raw response JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect inputs and readiness without running the flow.
+    Inspect {
+        id: String,
+        inputs: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retrieve the durable result of a flow ticket.
+    Result {
+        ticket: String,
         #[arg(long)]
         json: bool,
     },
@@ -385,8 +405,14 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             let args = serde_json::json!({ "ticket": ticket });
             request(base, "cancel", args, true, None, json).await
         }
-        Cmd::Wait { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, false).await,
-        Cmd::Subscribe { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, true).await,
+        Cmd::Wait {
+            ticket,
+            timeout_ms,
+            json,
+        } => follow(base, &ticket, timeout_ms, false, json).await,
+        Cmd::Subscribe { ticket, timeout_ms } => {
+            follow(base, &ticket, timeout_ms, true, false).await
+        }
         Cmd::Evidence {
             action: EvidenceCmd::Read(args),
         } => match evidence_read_args(&args) {
@@ -449,8 +475,49 @@ fn service_command(action: &ServiceCmd) -> ExitCode {
 /// step, through `pam subscribe`.
 async fn run_flow_command(base: &Path, action: FlowCmd) -> ExitCode {
     match action {
-        FlowCmd::List { json } => {
-            request(base, "flow.list", serde_json::json!({}), true, None, json).await
+        FlowCmd::List {
+            json,
+            offset,
+            limit,
+        } => {
+            request(
+                base,
+                "flow.list",
+                serde_json::json!({"offset": offset, "limit": limit}),
+                true,
+                None,
+                json,
+            )
+            .await
+        }
+        FlowCmd::Result { ticket, json } => {
+            request(
+                base,
+                "flow.result",
+                serde_json::json!({"ticket":ticket}),
+                true,
+                None,
+                json,
+            )
+            .await
+        }
+        FlowCmd::Inspect { id, inputs, json } => {
+            let inputs = match render::parse_flow_inputs(&inputs) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    eprintln!("pam flow inspect: {error}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            };
+            request(
+                base,
+                "flow.inspect",
+                serde_json::json!({"id":id,"inputs":inputs}),
+                true,
+                None,
+                json,
+            )
+            .await
         }
         FlowCmd::Show { id } => {
             let args = serde_json::json!({ "id": id });
@@ -499,7 +566,14 @@ async fn request(
 /// and maps it to the documented exit code either way. Refusals go to
 /// stderr; everything else to stdout.
 fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode {
-    let code = ExitCode::from(render::exit_code(response));
+    let refused_ticket = capability == "query"
+        && matches!(response, Response::Result { body, .. }
+            if body.get("state").and_then(serde_json::Value::as_str) == Some("refused"));
+    let code = ExitCode::from(if refused_ticket {
+        render::EXIT_REFUSED
+    } else {
+        render::exit_code(response)
+    });
     if json {
         println!("{}", render::render_json(response));
         return code;
@@ -523,7 +597,7 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
         Response::Result { body, .. } if capability == "flow.show" => {
             println!("{}", render::render_flow_show(body));
         }
-        Response::Result { body, .. } if capability == "flow.run" => {
+        Response::Result { body, .. } if matches!(capability, "flow.run" | "flow.result") => {
             println!("{}", render::render_flow_result(body));
         }
         Response::Result { body, .. } => println!("{}", render::render_body(body)),
@@ -540,10 +614,9 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
     code
 }
 
-/// `pam wait` / `pam subscribe`: one code path following the ticket's
-/// event stream — subscribe prints every event, wait only the terminal
-/// one. Exit code: `done` → 0, `refused` → 3, timeout or transport → 1.
-async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool) -> ExitCode {
+/// Follow events, then resolve the durable response so workflow failure and
+/// advisory diagnosis cannot be mistaken for successful stream completion.
+async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool, json: bool) -> ExitCode {
     let timeout = Duration::from_millis(timeout_ms);
     let on_event = |event: &Event| {
         if verbose {
@@ -551,18 +624,27 @@ async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool) -> Ex
         }
     };
     match client::follow_ticket(base, ticket, timeout, on_event).await {
-        Ok(terminal) => {
-            if !verbose {
-                println!("{}", render::render_event(&terminal));
-            }
-            if matches!(terminal, Event::Refused) {
-                ExitCode::from(render::EXIT_REFUSED)
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
+        Ok(_) => terminal_result(base, ticket, json).await,
         Err(err) => {
             eprintln!("pam wait: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn terminal_result(base: &Path, ticket: &str, json: bool) -> ExitCode {
+    let args = serde_json::json!({"ticket": ticket});
+    match client::send_request(base, "query", args.clone(), true, DEFAULT_DEADLINE_MS, None).await {
+        Ok(response) => {
+            if matches!(&response, Response::Result { body, .. } if body.get("capability").and_then(serde_json::Value::as_str) == Some("flow.run"))
+            {
+                request(base, "flow.result", args, true, None, json).await
+            } else {
+                print_response("query", &response, json)
+            }
+        }
+        Err(error) => {
+            eprintln!("pam wait: {error}");
             ExitCode::FAILURE
         }
     }

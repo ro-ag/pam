@@ -100,3 +100,49 @@ fn malformed_or_oversized_evidence_is_not_silently_decoded() {
     assert!(render_evidence(&json!({ "encoding": "utf8", "data": "text" })).is_err());
     assert!(render_evidence(&json!({ "encoding": "hex", "data": "00".repeat(65_537) })).is_err());
 }
+
+#[test]
+fn workflow_commands_have_bounded_discovery_and_typed_arguments() {
+    use super::FlowCmd;
+    let Cmd::Flow {
+        action: FlowCmd::List {
+            offset,
+            limit,
+            json,
+        },
+    } = Cli::try_parse_from(["pam", "flow", "list", "--json"])
+        .unwrap()
+        .command
+    else {
+        panic!("list");
+    };
+    assert_eq!((offset, limit, json), (0, 20, true));
+    for limit in ["0", "51", "4294967296"] {
+        assert!(Cli::try_parse_from(["pam", "flow", "list", "--limit", limit]).is_err());
+    }
+    let Cmd::Flow {
+        action: FlowCmd::Inspect { id, inputs, json },
+    } = Cli::try_parse_from(["pam", "flow", "inspect", "ci", "build=123", "--json"])
+        .unwrap()
+        .command
+    else {
+        panic!("inspect");
+    };
+    assert_eq!(id, "ci");
+    assert_eq!(inputs, ["build=123"]);
+    assert!(json);
+    assert!(matches!(
+        Cli::try_parse_from(["pam", "flow", "result", "ticket", "--json"])
+            .unwrap()
+            .command,
+        Cmd::Flow {
+            action: FlowCmd::Result { json: true, .. }
+        }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["pam", "wait", "ticket", "--json"])
+            .unwrap()
+            .command,
+        Cmd::Wait { json: true, .. }
+    ));
+}

@@ -524,3 +524,28 @@ fn service_report_prints_one_fact_per_line() {
     };
     assert!(render::render_service_report(&absent).contains("state     not installed\n"));
 }
+
+#[test]
+fn durable_flow_projection_preserves_workflow_and_advisory_diagnosis() {
+    let result = serde_json::json!({
+        "schema_version":1,"ticket":"ticket","flow":{"id":"ci","digest":"sha"},
+        "workflow":{"outcome":"unresolved"},"diagnosis":{"status":"not_attempted"},
+        "observations":[{"step":"build","status":"failed","text":"error\u{1b}[2J"}],
+        "evidence":["ev_log"],"omitted":{"observations":2,"evidence":1,"observation_bytes":30}
+    });
+    let rendered = super::render::render_flow_result(
+        &serde_json::json!({"state":"done","agent_result":result}),
+    );
+    assert!(rendered.starts_with("state: done"));
+    assert!(rendered.contains("unresolved"));
+    assert!(rendered.contains("not_attempted"));
+    assert!(rendered.contains("ev_log"));
+    assert!(rendered.contains("omitted"));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(
+        super::render::render_flow_result(
+            &serde_json::json!({"state":"running","agent_result":null})
+        )
+        .contains("running")
+    );
+}

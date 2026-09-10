@@ -122,9 +122,14 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         let flows=Arc::new(FlowService::new(base.path(),store.clone(),approvals.clone(),connectors,logs,gate));
         let queue=Arc::new(QueueManager::new(store.clone()));
         let (_cancel,rx)=tokio::sync::watch::channel(false);
-        let ctx=ExecContext{budget:crate::request_budget::RequestBudget::new(Instant::now()+Duration::from_secs(25)),request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
+        for step in ["first","second"] {
+            store.insert_grant(&crate::flow_service::step_capability("resumable",step)).await.unwrap();
+        }
         let expiry=now()+25000;
         store.insert_admitted_request("resume","flow.run",root.to_str().unwrap(),"fixture","{\"id\":\"resumable\"}",None,expiry).await.unwrap();
+        let original_deadline=Instant::now()+Duration::from_secs(25);
+        let budget=crate::request_budget::RequestBudget::load_persistent(store.clone(),"resume",original_deadline).await.unwrap();
+        let mut ctx=ExecContext{budget,request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
         assert!(store.authorize_queued_request("resume",root.to_str().unwrap(),now()).await.unwrap());
         assert!(store.start_queued_request("resume",now()).await.unwrap());
         {
@@ -138,6 +143,11 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         assert_eq!(store.get_request("resume").await.unwrap().unwrap().expires_at_ms,Some(expiry));
         assert_eq!(queue.rebuild_from_store().await.unwrap(),1);
         assert!(store.start_queued_request("resume",now()).await.unwrap());
+        let charged_before=ctx.budget.usage();
+        ctx.budget=crate::request_budget::RequestBudget::load_persistent(store.clone(),"resume",original_deadline).await.unwrap();
+        assert_eq!(ctx.budget.usage().http_calls,charged_before.http_calls);
+        assert_eq!(ctx.budget.usage().attempts,charged_before.attempts);
+        assert!(charged_before.http_calls>=3,"first metadata/jobs and interrupted second metadata remain charged");
         let output=flows.run(&ctx,args()).await.unwrap();
         assert_eq!(reads.first.load(Ordering::SeqCst),1,"completed first read must not repeat");
         assert_eq!(reads.second.load(Ordering::SeqCst),2,"only interrupted read restarts");

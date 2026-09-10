@@ -8,4 +8,4 @@ exported receipt: operation=push attempt=1; commit=99999999999999999999999999999
 exported terminal line: attempt=1 exit=0; remote ref confirmed at the exported commit.
 capture index: no stdout, stderr, remote-ref observation, or completion record exists for attempt=2.
 comparison: exported attempt=1 does not match requested attempt=2; terminal attachment rejected.
-The producer retained the older successful receipt for historical context. It must not be used as the result of the newer request.
+The producer retained the older successful receipt.

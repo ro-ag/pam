@@ -8,4 +8,3 @@ artifact metadata: workflow_run=410; run_attempt=2; head_sha=8888888888888888888
 artifact summary: ESLint failed with no-unused-vars in src/view.ts.
 attachment verdict: rejected; artifact attempt=2 and revision differ from requested attempt=3.
 coverage for attempt=3: no SARIF file, lint exit code, or job completion receipt has been captured.
-The stale diagnostic can be retained as history, but it is not evidence that the requested rerun failed or recovered.

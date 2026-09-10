@@ -11,4 +11,4 @@ staging upload attempt 1: HTTP 502
 staging upload attempt 2: HTTP 201; staging digest matched
 signing stage: configured key alias release-signing-v3 was not found
 promotion to release-local: NOT_EXECUTED
-Live capability: unsupported; staging acceptance is only a synthetic observation and is not final release publication.
+Live capability: unsupported; all records are synthetic offline observations.

@@ -7,5 +7,4 @@ suite: database integration; container backend selected from the fixture environ
 connect(/var/run/docker.sock): Connection refused (ECONNREFUSED).
 backend health receipt: daemon_running=false; socket path exists but has no listening service.
 runner=integration attempt=1 phase=setup exit=2; executed_tests=0; assertion_failures=0
-No image pull or database initialization request was sent. A failing harness setup is not evidence of a database query regression.
-The fixture does not authorize starting a container service or changing socket permissions.
+No image pull or database initialization request was sent.

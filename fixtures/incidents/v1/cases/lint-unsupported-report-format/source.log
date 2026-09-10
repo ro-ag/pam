@@ -8,4 +8,4 @@ adapter support record: accepted report schemas are 3 and 4.
 operation=lint-report-decode state=unsupported; normalized_findings=not-produced; tool_exit=not-exported
 [synthetic Jira DC citation] https://jira.fixture.invalid/browse/TOOLS-19 ; key=TOOLS-19 ; description=Report schema migration tracking.
 cited issue excerpt: A decoder update is planned; migration status is not a substitute for a report verdict.
-The opaque report payload is not attached. No evidence establishes whether lint itself passed or failed.
+The opaque report payload is not attached.

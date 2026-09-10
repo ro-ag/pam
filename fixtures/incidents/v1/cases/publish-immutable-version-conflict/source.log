@@ -10,5 +10,4 @@ Synthetic Artifactory target repository=releases package=example version=2.4.0 r
 PUT observation: HTTP 409; immutable version 2.4.0 already exists
 existing artifact digest differs from the proposed payload digest
 No overwrite or delete was attempted.
-Live capability: unsupported; this file is an offline authored snapshot only.
-The package was not established as newly published.
+Live capability: unsupported; all records are synthetic offline observations.

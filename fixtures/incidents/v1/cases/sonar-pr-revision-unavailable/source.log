@@ -10,5 +10,4 @@ project=example pullRequest=72 ce_task=ce-506 status=SUCCESS analysisId=a-506
 qualitygate analysisId=a-506 status=OK
 revision_basis=pull_request_unsupported
 revision=null
-PR number is known, but its head can change between analyses.
 No authenticated CI artifact or history row linking this analysis to 1234567890abcdef1234567890abcdef12345678 is included.

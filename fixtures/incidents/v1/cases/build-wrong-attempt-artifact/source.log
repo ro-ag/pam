@@ -10,6 +10,4 @@ Requested GitHub run=9001 run_attempt=2 revision=1234567890abcdef1234567890abcde
 Attached log metadata: run=9001 run_attempt=1 revision=1234567890abcdef1234567890abcdef12345678
 attached attempt 1: compiler error: missing route registration
 requested attempt 2 detail endpoint: capture absent
-Both attempts share a commit, but their execution outcomes are not interchangeable.
 The bundle contains no status or log for the requested attempt.
-Task remains unresolved for run_attempt=2.

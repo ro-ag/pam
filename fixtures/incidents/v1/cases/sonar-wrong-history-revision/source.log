@@ -11,4 +11,3 @@ ce_task=ce-505 status=SUCCESS analysisId=a-505
 history analysis=a-505 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 qualitygate analysisId=a-505 status=OK
 No history row binds a-505 to the requested revision.
-The product result is retained as unrelated evidence, not promoted to target verification.

@@ -46,6 +46,6 @@
     "author": "candidate_quality",
     "reviewer": "compatibility",
     "status": "agent_adjudicated",
-    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations. Corrected the snapshot to bind the successful formatting check and failing clippy run to the requested source instead of uncommitted formatting changes."
+    "notes": "Independent agent review of synthetic evidence only; not human adjudication or qualification. Label checked against full snapshot; target identity and decisive causal records are required citations. Corrected the snapshot to bind the successful formatting check and failing clippy run to the requested source instead of uncommitted formatting changes. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
   }
 }

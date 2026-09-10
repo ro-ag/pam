@@ -11,4 +11,4 @@ client sent complete request body
 client timeout while awaiting final HTTP response
 upload acceptance receipt: missing
 No exact path+digest reconciliation read is included.
-Live capability: unsupported; do not automatically repeat a potentially accepted publication.
+Live capability: unsupported; all records are synthetic offline observations.

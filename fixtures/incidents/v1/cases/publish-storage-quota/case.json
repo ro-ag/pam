@@ -42,6 +42,6 @@
     "author": "compatibility",
     "reviewer": "candidate_quality",
     "status": "agent_adjudicated",
-    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Preserved unsupported live-capability status separately from the diagnosis of synthetic observations."
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Preserved unsupported live-capability status separately from the diagnosis of synthetic observations. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
   }
 }

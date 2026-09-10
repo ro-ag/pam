@@ -11,5 +11,4 @@ stage=compile node=132 status=FAILED
 compiler internal exception: invariant block_owner != null
 compiler version=7.4.1 target=linux-x86_64
 No successful run with the same inputs, flags, toolchain and environment is included.
-The word intermittent appears in a user note, not in measured replay evidence.
 Final build result: FAILURE

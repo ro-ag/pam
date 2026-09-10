@@ -7,5 +7,5 @@ prepared intent: update refs/heads/feature/limits to the capture target with an 
 client trace: request body completed; waiting for receive-pack status.
 transport diagnostic: unexpected EOF while reading the status response.
 operation=push attempt=1 local_exit=128; remote_effect=unconfirmed; reconciliation=not-collected
-No independent ls-remote read was performed after the disconnect. A client transport exit does not establish whether the server installed the update.
+No independent ls-remote read was performed after the disconnect.
 The frozen intent remains retained; automatic replay has not been authorized.

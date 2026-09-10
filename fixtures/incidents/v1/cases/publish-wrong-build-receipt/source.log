@@ -10,5 +10,4 @@ Requested synthetic GitHub publish run=8200 attempt=3 revision=1234567890abcdef1
 artifact receipt provenance: run=8200 attempt=2 revision=1234567890abcdef1234567890abcdef12345678
 attempt 2 upload response: HTTP 201
 attempt 3 upload response: missing
-Matching revisions do not make separate attempts interchangeable.
-Live capability: unsupported; the requested attempt has no authenticated publication receipt.
+Live capability: unsupported; all records are synthetic offline observations.

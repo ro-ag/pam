@@ -7,5 +7,3 @@ parallel branch=rust-format node=31: diff found in src/codec.rs; command exit=1.
 parallel branch=web-lint node=32: cannot open tool cache: Read-only file system (EROFS); command exit=2.
 graph receipt: node31 and node32 are siblings; neither depends on the other.
 stage=lint result=failure; failed_branches=rust-format,web-lint; decisive_parent=parallel-join
-Chronological log order places web-lint last, but the graph does not mark it as the cause of rust-format failure.
-Each branch needs its own diagnosis; the supplied record cannot justify collapsing the formatting issue and storage restriction into one category.

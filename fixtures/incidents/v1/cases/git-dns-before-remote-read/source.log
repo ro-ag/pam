@@ -8,4 +8,4 @@ git ls-remote --exit-code origin refs/heads/feature/limits
 curl diagnostic: Could not resolve host: git.fixture.invalid
 network probe: resolver returned EAI_AGAIN; no TCP connection was established.
 operation=remote-ref-read attempt=1 exit=128; response_bytes=0; write_admitted=false
-No subsequent attempt is present. The captured resolver result is local to this invocation, not a report of global GitHub availability.
+No subsequent attempt is present.

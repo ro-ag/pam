@@ -11,4 +11,4 @@ upload response: HTTP 507; repository storage quota exceeded
 service quota diagnostic: limit_bytes=104857600 used_bytes=104857600
 artifact acceptance receipt: absent
 Client retry was not attempted because capacity had not changed.
-Live capability: unsupported; these are authored offline observations, not a measured outage.
+Live capability: unsupported; all records are synthetic offline observations.

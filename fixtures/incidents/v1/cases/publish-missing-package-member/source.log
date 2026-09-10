@@ -11,4 +11,4 @@ required package members: bin/example, LICENSE, schema/catalog.json
 archive inventory: bin/example, LICENSE
 package assertion: schema/catalog.json is missing from generated archive
 upload stage: NOT_EXECUTED
-Live capability: unsupported; this authored fixture establishes a local packaging defect, not a remote repository outage.
+Live capability: unsupported; all records are synthetic offline observations.

@@ -11,4 +11,3 @@ ce error: analysis persistence failed: database storage volume is full
 analysisId: absent
 scanner upload receipt: accepted task ce-503
 quality gate endpoint: not queried because this task produced no analysis
-An older project's green gate is not evidence about this failed analysis computation.

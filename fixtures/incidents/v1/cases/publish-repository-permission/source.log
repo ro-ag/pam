@@ -10,5 +10,4 @@ Synthetic Jenkins publish build=610 revision=1234567890abcdef1234567890abcdef123
 Artifactory observation: HTTP 403; deploy permission missing for repository release-local
 payload preparation completed; upload acceptance receipt absent
 No credential material is present in this snapshot.
-Live capability: unsupported; no actual connector request has been executed.
-Build packaging success does not imply publication success.
+Live capability: unsupported; all records are synthetic offline observations.

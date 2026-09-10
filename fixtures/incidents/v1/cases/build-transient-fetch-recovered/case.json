@@ -47,6 +47,6 @@
     "author": "compatibility",
     "reviewer": "candidate_quality",
     "status": "agent_adjudicated",
-    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Changed flake to unresolved: one failed fetch followed by one success does not establish a reproducible flake family; authoritative build success is preserved."
+    "notes": "Independent machine review of authored synthetic evidence; not human adjudication or model qualification. Removed descriptive case identity from task/header; retained source observations. Quotes include outcome, execution identity, and relevant recovery relationships. Changed flake to unresolved: one failed fetch followed by one success does not establish a reproducible flake family; authoritative build success is preserved. Removed authored answer/remediation annotations from model-visible source; factual tool observations, missing captures, and hostile input retained. Exact quotes revalidated; no compaction-based tuning."
   }
 }

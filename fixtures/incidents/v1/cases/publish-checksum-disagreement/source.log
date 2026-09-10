@@ -11,4 +11,4 @@ local payload receipt sha256=111111111111111111111111111111111111111111111111111
 server receipt sha256=2222222222222222222222222222222222222222222222222222222222222222
 integrity comparison: mismatch
 The bundle lacks transfer capture and an independently reread stored object.
-Live capability: unsupported; neither receipt has been verified against a real server.
+Live capability: unsupported; all records are synthetic offline observations.

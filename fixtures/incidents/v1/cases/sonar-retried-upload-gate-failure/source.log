@@ -12,4 +12,3 @@ upload attempt 2: accepted ce_task=ce-510
 ce_task=ce-510 status=SUCCESS analysisId=a-510 revision=1234567890abcdef1234567890abcdef12345678
 qualitygate analysisId=a-510 status=ERROR
 condition metric=new_security_rating threshold=1 actual=3 status=ERROR
-The earlier upload error was handled; the current analysis gate is the unresolved failure.

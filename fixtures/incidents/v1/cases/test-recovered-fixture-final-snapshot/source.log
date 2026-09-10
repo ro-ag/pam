@@ -8,4 +8,3 @@ fixture download attempt=2: exit=0; downloaded bytes match the pinned fixture di
 case=render_loading_state: snapshot mismatch; expected aria-busy="true", received aria-busy="false".
 runner=jest attempt=1 exit=1; failed_case=render_loading_state; fixture_setup=successful
 The comparison uses the same pinned fixture digest named in the successful setup receipt. No later retry or accepted snapshot update is present.
-The older gateway timeout is retained to show recovery, not to replace the final assertion result.

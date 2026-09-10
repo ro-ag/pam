@@ -8,4 +8,4 @@ case=wait_for_background_flush outcomes by independent invocation: 1=pass, 2=fai
 all four failures: completion flag remained false at the test-owned 10ms wait; no external I/O is used.
 runner=repeatability invocation=8 exit=1; controlled_repetitions=8; passed=4; failed=4
 [synthetic SharePoint 365 citation] https://tenant.fixture.invalid/sites/testing/Shared%20Documents/repeatability.txt ; item_id=repeat-8 ; etag=fixture-r8.
-cited context: The experiment records intermittent behavior only; no stack trace identifying the scheduling defect was captured.
+cited context: No stack trace was captured during the repeatability experiment.

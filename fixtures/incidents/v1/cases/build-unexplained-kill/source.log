@@ -11,5 +11,5 @@ stage=compile node=90 compiler terminated by signal 9
 runner memory telemetry: unavailable
 scheduler eviction reason: unavailable
 No kernel event excerpt was captured for the termination interval.
-A wrapper printed 'probably OOM'; this is a guess, not a kernel or scheduler observation.
+wrapper stdout: probably OOM
 Final build result: FAILURE

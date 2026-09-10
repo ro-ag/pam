@@ -10,5 +10,4 @@ Synthetic artifact revision=1234567890abcdef1234567890abcdef12345678 primary upl
 Confluence Cloud synthetic page=920 version=2 policy: both primary and mirror acknowledgments required
 replication job rep-44 state=FAILED reason=mirror storage unavailable
 mirror digest verification: absent
-Primary-only acceptance does not meet the stated offline release policy.
-Live capability: unsupported; no real primary or mirror state was queried.
+Live capability: unsupported; all records are synthetic offline observations.

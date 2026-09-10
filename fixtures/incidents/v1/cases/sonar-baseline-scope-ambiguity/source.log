@@ -11,4 +11,3 @@ condition metric=new_duplicated_lines_density threshold=3 actual=12 status=ERROR
 observed new-code baseline=previous_version
 Confluence Cloud synthetic page=910 version=4 says release branches use reference_branch
 The bundle does not contain the effective approved baseline policy for feature/work.
-Gate failure is authoritative; whether the remediation is code or baseline configuration is unresolved.

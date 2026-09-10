@@ -11,4 +11,3 @@ history analysis=a-501 revision=1234567890abcdef1234567890abcdef12345678
 qualitygate analysisId=a-501 status=ERROR
 condition metric=new_coverage comparator=LT threshold=80 actual=54 status=ERROR
 condition metric=new_reliability_rating actual=1 status=OK
-The CE task completed; that completion does not mean the quality gate passed.

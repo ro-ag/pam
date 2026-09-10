@@ -8,4 +8,4 @@ configuration entry: eslint.config.mjs
 Error [ERR_MODULE_NOT_FOUND]: Cannot find package @fixture/eslint-rules imported from eslint.config.mjs
 package manifest inspection: @fixture/eslint-rules is not declared in dependencies or devDependencies.
 operation=eslint phase=config-load attempt=1 exit=2; analyzed_files=0
-The local node runtime started normally. This snapshot contains no JavaScript source-rule violation because configuration initialization failed first.
+The local node runtime started normally.

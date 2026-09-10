@@ -8,4 +8,3 @@ assertion `left == right` failed at src/pagination.rs:118
 left: [10, 11, 12, 13]; right: [10, 11, 12]
 fixture parameters: start=10; count=3; no clock, network, or random input used.
 runner=test-unit attempt=1 exit=101; passed=27; failed=1; failed_case=pagination::exclusive_upper_bound
-An earlier successful compile only establishes that the tests could run. It does not override the failed assertion or its terminal runner result.

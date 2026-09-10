@@ -11,4 +11,3 @@ history paging pageIndex=1 pageSize=100 total=230
 history page 1 contains analyses a-600 through a-699; a-508 is absent
 qualitygate analysisId=a-508 status=ERROR
 history pages 2 and 3 were not captured
-The analysis gate is known, but its revision cannot be established from this partial history.

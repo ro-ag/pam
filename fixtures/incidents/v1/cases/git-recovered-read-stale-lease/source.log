@@ -8,4 +8,3 @@ attempt=2 operation=remote-ref-read exit=0; refs/heads/feature/limits=1111111111
 approval froze expected_old=1111111111111111111111111111111111111111.
 Before push, another actor advanced that remote branch to 2222222222222222222222222222222222222222; actor identity is not included.
 operation=push attempt=1 exit=1; remote-reply=stale-lease; proposed commit not installed
-The logs establish a concurrency conflict, but do not establish whether the advance was an intended teammate update, another automation, or a mistaken target.

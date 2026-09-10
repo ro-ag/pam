@@ -8,5 +8,5 @@ legacy fixture operation: materialize assets from an already downloaded reposito
 configured filter command: git-lfs filter-process
 launcher diagnostic: git-lfs: executable not found in the configured tool installation.
 operation=checkout attempt=1 exit=128; filter=lfs; lint=not-started; tests=not-started
-The source object for assets/reference.bin is an LFS pointer. No LFS server response is captured, so this record says nothing about whether the remote object exists.
+The source object for assets/reference.bin is an LFS pointer. No LFS server response is captured.
 This is an authored legacy-product fixture, not a claim that PAM enables checkout filters.

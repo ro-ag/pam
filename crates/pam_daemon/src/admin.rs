@@ -54,7 +54,10 @@
 //! Audit rows reference `request.id` by foreign key, so every admin
 //! operation inserts a real `request` row (capability = the `admin.*`
 //! op name, repo = [`ADMIN_REPO`], `caller_agent` from the envelope)
-//! and finishes it immediately through the store's terminal choke point
+//! with arguments omitted: credentials and other sensitive admin inputs must
+//! never enter the request ledger, including refused requests. Operation-specific
+//! audit fields retain the non-secret change description. The service
+//! finishes the row immediately through the store's terminal choke point
 //! ([`pam_store::Store::finish_request`]) — terminal state and audit
 //! row in one transaction, same invariant as every other request:
 //!
@@ -343,7 +346,9 @@ impl AdminService {
                 &envelope.capability,
                 ADMIN_REPO,
                 &envelope.caller.agent,
-                &envelope.args.to_string(),
+                // Admin arguments can carry credentials. Never persist them,
+                // even before caller validation; each operation owns safe audit fields.
+                "{}",
                 envelope.idempotency_key.as_deref(),
             )
             .await;

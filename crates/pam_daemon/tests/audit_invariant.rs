@@ -287,7 +287,7 @@ async fn approval_timeout_writes_one_gate_row() {
 }
 
 #[tokio::test]
-async fn deadline_teardown_writes_one_cancel_row_plus_the_deadline_row() {
+async fn deadline_teardown_writes_one_expiry_row_plus_the_deadline_row() {
     with_deadline(async {
         let daemon = TestDaemon::spawn().await;
         let mut client = daemon.client().await;
@@ -308,13 +308,15 @@ async fn deadline_teardown_writes_one_cancel_row_plus_the_deadline_row() {
         let row = daemon
             .wait_for_row("req_late", |row| row.state == RequestState::Failed)
             .await;
-        assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
 
-        // Exactly one terminal cancellation row; the deadline row is its
+        // Exactly one terminal expiry row; the deadline row is its
         // documented companion recording the refusal sent to the caller.
         let mut actions = daemon.terminal_audit_actions("req_late").await;
         actions.sort_unstable();
-        assert_eq!(actions, [ACTION_CANCEL, ACTION_DEADLINE_REFUSAL]);
+        let mut expected = [ACTION_LEASE_REAPED, ACTION_DEADLINE_REFUSAL];
+        expected.sort_unstable();
+        assert_eq!(actions, expected);
         daemon.assert_invariant_clean().await;
 
         daemon.stop().await;

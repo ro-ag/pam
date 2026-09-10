@@ -61,6 +61,12 @@ capability and arguments. Caller labels do not provide a separate authorization
 boundary. A new invocation after completion is new work, not durable exactly-once
 execution; the landing/watch plans must add their own reconciliation contracts.
 
+The original caller, approval wait and queue lease share that persisted expiry;
+moving between phases never starts a fresh request clock. Public expiry replies
+use `deadline_exceeded`; the queue records `lease_expired` internally, separately
+from an explicit `cancelled` request. An attached caller's observation timeout
+does not cancel the underlying work.
+
 ## Enforced limits
 
 | Resource | Ceiling |

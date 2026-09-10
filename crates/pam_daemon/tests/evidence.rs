@@ -306,3 +306,94 @@ async fn expired_first_read_allowance_is_not_renewed_by_the_daemon() {
     );
     fixture.stop().await;
 }
+
+#[tokio::test]
+async fn every_captured_connector_target_is_reauthorized_before_bytes_or_tombstones() {
+    let mut fixture = Fixture::new().await;
+    let store = fixture.daemon.store();
+    let base = "https://jenkins.example.test/";
+    store
+        .upsert_connector(
+            "jenkins",
+            pam_store::ConnectorPatch {
+                enabled: Some(true),
+                base_url: Some(Some(base)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut policy = json!({
+        "version": 1,
+        "repositories": [{"root": fixture.repo, "connectors": [{
+            "connector": "jenkins", "base_url": base, "access": "targets",
+            "targets": ["team/first", "team/second"]
+        }]}]
+    });
+    store
+        .set_setting("flows.scope_policy", &policy.to_string())
+        .await
+        .unwrap();
+    let original = b"ok protected diagnostics from two Jenkins jobs";
+    store
+        .insert_evidence("ev_multi_origin", ORIGINAL, "log_source", original, None)
+        .await
+        .unwrap();
+    let targets: Vec<_> = ["team/first", "team/second"]
+        .into_iter()
+        .map(|job| {
+            json!({
+                "connector": "jenkins", "base_url": base, "call": "builds",
+                "args": {"job": pam_connectors::ArgValue::Text(job.to_owned())}
+            })
+        })
+        .collect();
+    assert!(store.insert_evidence_view(&EvidenceViewInsert {
+        evidence_id: "ev_multi_origin".into(), request_id: ORIGINAL.into(), repository: fixture.repo.clone(),
+        origin_json: json!({"targets": targets}).to_string(),
+        identity_json: json!({"schema_version": 1}).to_string(),
+        map_json: json!([{"view":{"start":0,"end":2},"parent":{"start":0,"end":2},"relation":"identity"}]).to_string(),
+        view_id: "view_multi_origin".into(), view_bytes: b"ok".to_vec(),
+    }).await.unwrap());
+    let read = json!({"request_id": ORIGINAL, "evidence_id": "ev_multi_origin", "length": 2});
+    assert_eq!(
+        result(fixture.read("both-targets-approved", read.clone()).await)["data"],
+        "6f6b"
+    );
+    policy["repositories"][0]["connectors"][0]["targets"] = json!(["team/first"]);
+    store
+        .set_setting("flows.scope_policy", &policy.to_string())
+        .await
+        .unwrap();
+    refusal(
+        fixture.read("second-target-removed", read.clone()).await,
+        "evidence_unavailable",
+    );
+    assert_eq!(
+        store
+            .get_evidence("ev_multi_origin")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        original
+    );
+    store
+        .prune_evidence_before(i64::MAX, "verdict")
+        .await
+        .unwrap();
+    refusal(
+        fixture.read("unauthorized-tombstone", read.clone()).await,
+        "evidence_unavailable",
+    );
+    policy["repositories"][0]["connectors"][0]["targets"] = json!(["team/first", "team/second"]);
+    store
+        .set_setting("flows.scope_policy", &policy.to_string())
+        .await
+        .unwrap();
+    refusal(
+        fixture.read("authorized-tombstone", read).await,
+        "evidence_expired",
+    );
+    fixture.stop().await;
+}

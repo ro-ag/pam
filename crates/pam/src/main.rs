@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use pam::client::{self, StopOutcome};
 use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
@@ -94,6 +94,11 @@ enum Cmd {
         /// Give up after this many milliseconds.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS)]
         timeout_ms: u64,
+    },
+    /// Read bounded evidence retained for an authorized request.
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceCmd,
     },
     /// List, read, and run the flows this machine has.
     Flow {
@@ -181,6 +186,111 @@ enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCmd {
+    /// Read one byte range; use returned view/digest with next_offset to continue.
+    Read(EvidenceReadArgs),
+}
+
+#[derive(Args)]
+struct EvidenceReadArgs {
+    /// Evidence id from the originating result.
+    evidence_id: String,
+    /// The originating request ticket, not this read's request id.
+    #[arg(long)]
+    request: String,
+    /// Byte offset in the immutable evidence view.
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// Requested bytes, from 1 through 65536 (default 16384).
+    #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..=65_536))]
+    length: u32,
+    /// View identity returned by the first read; required for continuation.
+    #[arg(long, requires = "digest")]
+    view: Option<String>,
+    /// SHA-256 returned with that view; required together with --view.
+    #[arg(long, requires = "view")]
+    digest: Option<String>,
+    /// Print unchanged response JSON, including exact hex-encoded bytes.
+    #[arg(long)]
+    json: bool,
+}
+
+fn evidence_read_args(args: &EvidenceReadArgs) -> Result<serde_json::Value, &'static str> {
+    if args.evidence_id.is_empty() || args.request.is_empty() {
+        return Err("evidence id and originating request must be nonempty");
+    }
+    if args.offset > 0 && args.view.is_none() {
+        return Err("continuation requires --view and --digest from the previous read");
+    }
+    if args.view.as_ref().is_some_and(String::is_empty) {
+        return Err("the view identity must be nonempty");
+    }
+    if args.digest.as_ref().is_some_and(|digest| {
+        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err("--digest must be the view's 64 hexadecimal SHA-256 characters");
+    }
+    let mut value = serde_json::json!({
+        "evidence_id": args.evidence_id,
+        "request_id": args.request,
+        "offset": args.offset,
+        "length": args.length,
+    });
+    if let (Some(view), Some(digest)) = (&args.view, &args.digest) {
+        value["expected_view_id"] = serde_json::json!(view);
+        value["expected_sha256"] = serde_json::json!(digest.to_ascii_lowercase());
+    }
+    Ok(value)
+}
+
+fn render_evidence(body: &serde_json::Value) -> Result<String, &'static str> {
+    if body.get("encoding").and_then(serde_json::Value::as_str) != Some("hex") {
+        return Err("unsupported evidence encoding");
+    }
+    let data = body
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing evidence bytes")?;
+    if data.len() > 2 * 65_536
+        || !data.len().is_multiple_of(2)
+        || !data.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid or oversized hex evidence bytes");
+    }
+    let mut escaped = String::new();
+    for pair in data.as_bytes().chunks_exact(2) {
+        let digit = |byte: u8| {
+            if byte.is_ascii_digit() {
+                byte - b'0'
+            } else {
+                byte.to_ascii_lowercase() - b'a' + 10
+            }
+        };
+        let byte = digit(pair[0]) * 16 + digit(pair[1]);
+        escaped.extend(std::ascii::escape_default(byte).map(char::from));
+    }
+    let mut metadata = body.clone();
+    metadata
+        .as_object_mut()
+        .ok_or("invalid evidence response")?
+        .remove("data");
+    let metadata =
+        serde_json::to_string_pretty(&metadata).map_err(|_| "invalid evidence metadata")?;
+    // Preserve JSON formatting, while escaping non-ASCII controls and bidi marks.
+    let mut safe_metadata = String::new();
+    for ch in metadata.chars() {
+        if ch.is_ascii() {
+            safe_metadata.push(ch);
+        } else {
+            safe_metadata.extend(ch.escape_default());
+        }
+    }
+    Ok(format!(
+        "{safe_metadata}\ndata (escaped bytes): b\"{escaped}\""
+    ))
 }
 
 fn main() -> ExitCode {
@@ -277,6 +387,15 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
         }
         Cmd::Wait { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, false).await,
         Cmd::Subscribe { ticket, timeout_ms } => follow(base, &ticket, timeout_ms, true).await,
+        Cmd::Evidence {
+            action: EvidenceCmd::Read(args),
+        } => match evidence_read_args(&args) {
+            Ok(body) => request(base, "evidence.read", body, true, None, args.json).await,
+            Err(error) => {
+                eprintln!("pam evidence read: {error}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
         Cmd::Flow { action } => run_flow_command(base, action).await,
         Cmd::Daemon { .. } | Cmd::Gui | Cmd::Service { .. } => unreachable!("handled in main"),
     }
@@ -388,6 +507,15 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
     match response {
         Response::Result { body, .. } if capability == "status" => {
             println!("{}", render::render_status(body));
+        }
+        Response::Result { body, .. } if capability == "evidence.read" => {
+            match render_evidence(body) {
+                Ok(text) => println!("{text}"),
+                Err(error) => {
+                    eprintln!("pam evidence read: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         Response::Result { body, .. } if capability == "flow.list" => {
             println!("{}", render::render_flow_list(body));
@@ -573,3 +701,6 @@ fn respawn_daemon() -> std::io::Result<()> {
         .spawn()
         .map(|_child| ())
 }
+
+#[cfg(test)]
+mod main_test;

@@ -6,6 +6,8 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-09
+
 ### Fixed
 
 - Model downloads no longer hang on a dead connection: curl now carries a

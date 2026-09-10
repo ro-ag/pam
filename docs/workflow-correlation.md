@@ -34,10 +34,12 @@ GitHub compares the run's reported head repository and full source revision,
 including fork identity. Optional PR number/head pins are checked separately.
 A job log must belong to a job listed by an already matched run attempt on the
 same configured server and repository. Job names and latest-run discovery cannot
-establish that association. Job IDs are sorted before immutable comparison, so
-status-driven ordering changes do not alter identity. A changed returned job set
-currently requires a new request; durable watch reconciliation must handle this
-explicitly rather than substituting a later attempt.
+establish that association. Observed job IDs are a separate durable union capped
+at 256 per step; changing membership does not change immutable run identity.
+Only an identical matched server/repository/run/attempt binding can append jobs.
+Overflow rejects the collection without a partial append. Legacy bindings with
+embedded `job_ids` refuse recovery explicitly and require a new request after
+upgrade. See [job watches](job-watches.md).
 
 Jenkins uses structured SCM actions from the explicitly requested build. Missing,
 invalid, partial or multiple SCM identities remain unresolved. Log text cannot

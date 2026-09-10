@@ -84,8 +84,9 @@ request expiry remain explicit terminal causes in JSON; observation timeout does
 not cancel the original request. Keep the ticket to inspect it later.
 
 See [agent workflow](agent-workflow-contract.md), [evidence retrieval](evidence-retrieval.md)
-and [admission budgets](scoped-admission-and-budgets.md). Durable remote-job
-watching and guarded landing remain separate roadmap work.
+and [admission budgets](scoped-admission-and-budgets.md). Embedded
+[exact job watches](job-watches.md) use the same run/wait/result commands; guarded
+landing remains separate roadmap work.
 
 ## Restart continuation
 
@@ -96,4 +97,16 @@ A prepared state-changing step without a durable receipt stops with
 `flow_effect_uncertain`, including cancellation or lease expiry at that boundary.
 Inspect retained evidence and reconcile the effect before submitting new work.
 See [workflow recovery](workflow-recovery.md) for retention and authorization
-checks. Remote job polling and typed landing reconciliation remain separate work.
+checks. Remote polling uses [durable parking](job-watches.md), which frees the
+repository lane without resetting admission. Typed landing reconciliation remains
+separate work.
+
+## Remote-job watch progress
+
+Use `watch-github-run`, `watch-jenkins-build` or `watch-sonar-analysis` with exact
+execution inputs. `flow inspect` exposes each step's watch policy. Pending work
+parks as `queued`; `flow result` can include a scoped `watch` projection even
+while `agent_result` is unavailable. Its poll count and next-poll time come from
+the committed checkpoint; its evidence reference points to the last changed
+redacted observation. Unchanged polls do not duplicate notifications or invoke
+a model. Detailed limits and stop causes are in [job watches](job-watches.md).

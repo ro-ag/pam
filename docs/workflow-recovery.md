@@ -1,8 +1,8 @@
 # Workflow restart recovery
 
 Task #133 extends the existing flow engine. It does not introduce another
-workflow service or change the CLI/Unix IPC boundary. Job polling and guarded
-landing remain tasks #134 and #135.
+workflow service or change the CLI/Unix IPC boundary. [Job watches](job-watches.md)
+add durable queued parking on this journal; guarded landing remains task #135.
 
 ## Durable boundary
 

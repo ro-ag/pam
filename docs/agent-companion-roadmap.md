@@ -92,8 +92,9 @@ Explicit revision-bound GitHub and Jenkins flows now use immutable
 [workflow correlation](workflow-correlation.md). Missing or conflicting source
 identity blocks downstream use while retaining evidence. The separate
 [Sonar analysis flow](sonar-analysis.md) adds an exact historical gate and
-GUI-owned repository mapping. Durable watches and guarded local verification
-remain separate work.
+GUI-owned repository mapping. [Durable exact-job watches](job-watches.md) now
+use cheap status reads and terminal-only evidence collection. Guarded local
+verification remains separate work.
 
 Explicit issue/page/document flows provide [cited enterprise context](enterprise-context.md)
 with bounded excerpts and clear unsupported or partial states. SharePoint text
@@ -227,5 +228,20 @@ features nor authorizes a push, merge, release, or production rollout.
 [Workflow recovery](workflow-recovery.md) documents private bounded checkpoints,
 intent-before-step ordering, durable budgets, retained ticket/deadline and
 fail-closed uncertain effects. Ordinary failed stateful commands execute once;
-completed step prefixes restore under current access checks. Product-specific
-remote reconciliation and polling remain tasks 134–135, not generic retries.
+completed step prefixes restore under current access checks. Task 134 adds
+[durable job polling](job-watches.md); product-specific remote-effect
+reconciliation remains task 135, not a generic retry.
+
+### Task 134: exact remote-job watches
+
+The existing flow runtime now calls cheap GitHub run-attempt, Jenkins build and
+Sonar compute-task status operations. Pending watches commit bounded progress
+and park outside ready repository lanes while retaining their ticket, expiry,
+authority and cumulative budget. Only terminal observations trigger the full
+collector. Unchanged observations produce no duplicate watch-change notification
+and polling makes no inference calls. Exact pins, separate bounded GitHub job
+membership, outage limits and terminal-collection headroom prevent latest-result
+substitution and unbounded waiting. The [watch contract](job-watches.md) records
+CLI usage, limits and the legacy membership recovery refusal. Local fixtures do
+not claim live product compatibility or model qualification. Guarded landing
+and publication remain separate work.

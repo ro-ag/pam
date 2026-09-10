@@ -182,7 +182,9 @@ pam evidence read <evidence-id> --request <ticket> --json
 
 The build/job values are examples; use an authorized explicit build. Settings
 and grants are configured by the human through the GUI. `subscribe` follows the
-submitted request; it is not yet the durable remote-job watcher proposed above.
+submitted request. The embedded `watch-github-run`, `watch-jenkins-build` and
+`watch-sonar-analysis` recipes implement [durable exact-job polling](job-watches.md)
+through that same request pipeline; `flow result` exposes scoped committed progress.
 Scoped redacted evidence retrieval is available through `pam evidence read`.
 Bounded results and scoped durable inspection are available through the
 [flow CLI contract](flow-cli-contract.md); a `land-watch` flow remains future work. Microsoft setup lives in Models → Catalog;

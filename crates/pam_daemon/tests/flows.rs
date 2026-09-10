@@ -728,7 +728,7 @@ async fn an_existing_but_unapproved_repo_runs_no_steps() {
 }
 
 #[tokio::test]
-async fn every_step_publishes_a_running_note_then_its_settle_note() {
+async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
     with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
@@ -746,15 +746,7 @@ async fn every_step_publishes_a_running_note_then_its_settle_note() {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            notes,
-            vec![
-                "version: running (1/2)".to_owned(),
-                "version: succeeded".to_owned(),
-                "prove: running (2/2)".to_owned(),
-                "prove: succeeded".to_owned(),
-            ]
-        );
+        assert_eq!(notes, vec!["Task progress updated".to_owned(); 4]);
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;

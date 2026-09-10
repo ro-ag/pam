@@ -228,7 +228,7 @@ async fn subscriber_receives_only_its_topic() {
         event,
         Event::Progress {
             pct: Some(50),
-            note: "halfway".to_owned(),
+            note: "Task progress updated".to_owned(),
         }
     );
 

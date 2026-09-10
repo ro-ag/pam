@@ -4,6 +4,12 @@ PAM's daemon owns admission. Agent labels are attribution; changing a label neve
 creates another rate allowance or grants access to another target. Private GUI
 administration is described in [admin-boundary.md](admin-boundary.md).
 
+Repository and product scopes are global permissions for public clients, not
+per-agent identity boundaries. A client may select any globally approved root.
+Ticket ownership binds evidence to the original canonical target; it does not
+prevent another globally authorized public client from requesting that target.
+See [administration boundary](admin-boundary.md#global-target-authority).
+
 ## Configure a repository in the GUI
 
 Open Settings → Flows and add the repository's exact existing absolute path.

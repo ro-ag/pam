@@ -28,9 +28,37 @@ exclude an unrestricted process running as the same user. Unrestricted same-user
 code execution, debugger/process injection access, and replacement of trusted
 program files are outside this boundary's protection.
 
+The exclusions must also cover indirect control: launching the trusted GUI through
+LaunchServices or other process brokers, AppleEvents/UI automation, task ports,
+debugging, inherited private descriptors and replacement of trusted frontend
+assets. A writable development server serving the GUI is part of the trusted
+execution surface. Production verification must use the embedded frontend or
+separately protect that server. Blocking a direct child process is not proof that
+a system broker cannot launch an unsandboxed process on its behalf.
+
+OS keychain isolation requires restricting the credential service as well as
+keychain files. A fake credential backend verifies PAM behavior, not OS credential
+isolation. Negative deployment tests must establish absence of privileged effects,
+not merely a nonzero client exit code.
+
 PAM does not automatically install or verify the agent's sandbox policy. The
 deployment must establish and maintain these exclusions. An executable name,
 argv value, or self-reported PID is not a substitute for that isolation.
+
+## Global target authority
+
+GUI grants and repository/product scopes apply globally to public PAM clients.
+Caller labels and PIDs provide attribution; clients may select any approved
+repository. Binding a ticket to its original canonical repository prevents
+relabeling that ticket under another root. It does not isolate agents or keep
+evidence confidential from another public client authorized through the same
+global policy. Per-agent repository authentication is not implemented.
+
+Public events expose lifecycle timing, opaque request IDs and progress percentages.
+They do not carry step names, repository/product details or diagnostic text;
+progress notes are fixed generic text. Raw subscribers can observe all these
+public events. Topic filtering and CLI authorization are not event access control.
+Use scoped result/evidence reads for details.
 
 ## Failure behavior
 

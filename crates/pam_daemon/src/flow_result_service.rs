@@ -121,8 +121,13 @@ pub(crate) async fn authorized_metadata(
     if crate::executor::BuiltinCapability::from_name(&status.capability).is_none() {
         return Err(unavailable());
     }
+    // Stored admission identity is immutable; never reinterpret it through a
+    // symlink that may have been retargeted since the request was accepted.
+    if Path::new(&status.repository) != repo {
+        return Err(unavailable());
+    }
     let owner = std::fs::canonicalize(&status.repository).map_err(|_| unavailable())?;
-    if owner != repo {
+    if owner != Path::new(&status.repository) {
         return Err(unavailable());
     }
     let revision = store

@@ -20,6 +20,7 @@ pub(crate) enum Kind {
     ModelFilesystem,
     LogCompaction,
     AgentDetection,
+    RepositoryIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -149,7 +150,7 @@ impl BlockingJobs {
         let lane = match kind {
             Kind::Keychain => Some(Arc::clone(&self.keychain).lock_owned().await),
             Kind::ModelFilesystem => Some(Arc::clone(&self.models).lock_owned().await),
-            Kind::LogCompaction | Kind::AgentDetection => None,
+            Kind::LogCompaction | Kind::AgentDetection | Kind::RepositoryIdentity => None,
         };
         let execution = Arc::clone(&self.permits)
             .acquire_owned()

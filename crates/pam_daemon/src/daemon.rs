@@ -918,6 +918,50 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
     }
 }
 
+/// Freeze an existing repository path before admission, dedupe and execution.
+/// Missing paths remain usable by global capabilities but cannot confer ownership.
+pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envelope, Response> {
+    let started = Instant::now();
+    let budget = Duration::from_millis(envelope.deadline_ms).min(crate::queue::MAX_LEASE);
+    let repo = envelope.caller.repo.clone();
+    let operation =
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+            std::fs::canonicalize(repo)
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok())
+        });
+    let normalized = match tokio::time::timeout(budget, operation).await {
+        Ok(Ok(repository)) => repository,
+        Ok(Err(error)) => {
+            return Err(Response::Refusal {
+                id: envelope.id,
+                cause: error.cause().to_owned(),
+                detail: error.to_string(),
+                recovery: error.recovery().to_owned(),
+            });
+        }
+        Err(_) => return Err(repository_deadline_refusal(envelope.id)),
+    };
+    let remaining = budget.saturating_sub(started.elapsed());
+    envelope.deadline_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    if envelope.deadline_ms == 0 {
+        return Err(repository_deadline_refusal(envelope.id));
+    }
+    if let Some(repository) = normalized {
+        envelope.caller.repo = repository;
+    }
+    Ok(envelope)
+}
+
+fn repository_deadline_refusal(id: String) -> Response {
+    Response::Refusal {
+        id,
+        cause: "deadline_exceeded".to_owned(),
+        detail: "The request deadline expired while resolving its repository.".to_owned(),
+        recovery: crate::request_budget::RECOVERY_BUDGET.to_owned(),
+    }
+}
+
 impl Pipeline {
     /// Runs one request through classify → admit → gate → queue/execute
     /// and answers `reply` with its single [`Response`]. Takes the
@@ -960,6 +1004,14 @@ impl Pipeline {
             });
             return;
         }
+
+        let envelope = match normalize_repository(envelope).await {
+            Ok(envelope) => envelope,
+            Err(response) => {
+                let _ = reply.send(response);
+                return;
+            }
+        };
 
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.

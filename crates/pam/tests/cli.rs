@@ -861,3 +861,131 @@ async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
         daemon.stop().await;
     }).await.expect("admin CRUD and actual CLI finish before deadline");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evidence_read_binary_binds_origin_and_view_and_preserves_exact_bytes() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+        let original = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["echo", r#"{"fixture":"evidence-read"}"#, "--json"],
+        )
+        .await;
+        assert_eq!(original.code, 0, "{}", original.stderr);
+        let original: serde_json::Value = serde_json::from_str(&original.stdout).unwrap();
+        let request_id = original["id"].as_str().expect("echo response id");
+        let store = daemon.handle.store();
+        store
+            .insert_evidence("ev_cli", request_id, "log_source", b"private source", None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .insert_evidence_view(&pam_store::EvidenceViewInsert {
+                    evidence_id: "ev_cli".into(),
+                    request_id: request_id.into(),
+                    repository: repo
+                        .path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    origin_json: serde_json::json!({"targets": []}).to_string(),
+                    identity_json: serde_json::json!({"schema_version": 1}).to_string(),
+                    map_json: serde_json::json!({"schema_version": 1}).to_string(),
+                    view_id: "view_cli".into(),
+                    view_bytes: b"x\xff\n".to_vec(),
+                })
+                .await
+                .unwrap()
+        );
+        let page = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "evidence",
+                "read",
+                "ev_cli",
+                "--request",
+                request_id,
+                "--length",
+                "1",
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(page.code, 0, "{}", page.stderr);
+        let page: serde_json::Value = serde_json::from_str(&page.stdout).unwrap();
+        let body = &page["body"];
+        assert_eq!(body["request_id"], request_id);
+        assert_eq!(body["evidence_id"], "ev_cli");
+        assert_eq!(body["view_id"], "view_cli");
+        assert_eq!(body["encoding"], "hex");
+        assert_eq!(body["data"], "78");
+        assert_eq!(body["next_offset"], 1);
+        let digest = body["view_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        let unpinned = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "evidence",
+                "read",
+                "ev_cli",
+                "--request",
+                request_id,
+                "--offset",
+                "1",
+            ],
+        )
+        .await;
+        assert_eq!(unpinned.code, 2);
+        assert!(unpinned.stderr.contains("--view and --digest"));
+        let tail = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "evidence",
+                "read",
+                "ev_cli",
+                "--request",
+                request_id,
+                "--offset",
+                "1",
+                "--view",
+                "view_cli",
+                "--digest",
+                digest,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(tail.code, 0, "{}", tail.stderr);
+        let tail: serde_json::Value = serde_json::from_str(&tail.stdout).unwrap();
+        assert_eq!(tail["body"]["data"], "ff0a");
+        assert_eq!(tail["body"]["next_offset"], serde_json::Value::Null);
+        let wrong = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "evidence",
+                "read",
+                "ev_cli",
+                "--request",
+                "unknown-origin",
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(wrong.code, 3);
+        let wrong: serde_json::Value = serde_json::from_str(&wrong.stdout).unwrap();
+        assert_eq!(wrong["cause"], "evidence_unavailable");
+        daemon.stop().await;
+    })
+    .await
+    .expect("evidence CLI test within deadline");
+}

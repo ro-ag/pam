@@ -76,6 +76,8 @@ mod flow_service_test;
 #[cfg(test)]
 mod lifecycle_test;
 #[cfg(test)]
+mod lifecycle_recovery_test;
+#[cfg(test)]
 mod log_service_test;
 #[cfg(test)]
 mod model_service_test;

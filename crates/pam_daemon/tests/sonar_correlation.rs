@@ -23,10 +23,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(transport: Arc<dyn HttpTransport>) -> Self {
+        Self::with_flow(transport, FLOW).await
+    }
+    async fn with_flow(transport: Arc<dyn HttpTransport>, yaml: &str) -> Self {
         let tmp = short_tempdir();
         let repo = short_tempdir();
         seed_relaxed(&tmp).await;
-        drop(seed_flow(&tmp, "sonar-correlated", FLOW));
+        drop(seed_flow(&tmp, "sonar-correlated", yaml));
         open_store(&tmp).await.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":repo.path().canonicalize().unwrap(),"connectors":[{"connector":"sonarqube","base_url":"https://sonar.test/","access":"targets","targets":["p"]}]}]}).to_string()).await.unwrap();
         let daemon = TestDaemon::spawn_at_with(tmp, move |config| {
             config.secret_backend = Some(Arc::new(FakeSecretBackend::default()));
@@ -256,4 +259,62 @@ async fn mapping_change_during_collection_cannot_publish_verified() {
         fx.finish().await;
     })
     .await;
+}
+
+struct LaterGithub {
+    sonar: Sonar,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl HttpTransport for LaterGithub {
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            if request.url.host_str() == Some("github.test") {
+                assert_eq!(request.url.path(), "/repos/team/repo/actions/runs");
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: br#"{"total_count":0,"workflow_runs":[]}"#.to_vec(),
+                })
+            } else {
+                self.sonar.send(request, deadline).await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn mapping_change_after_sonar_association_invalidates_final_publication() {
+    with_deadline(async {
+        let entered=Arc::new(tokio::sync::Notify::new());
+        let release=Arc::new(tokio::sync::Notify::new());
+        let transport=Arc::new(LaterGithub { sonar:Sonar {entered:None,release:None},entered:entered.clone(),release:release.clone() });
+        let yaml=format!("{FLOW}  - id: later\n    connector: github\n    call: runs\n    with: {{ repo: 'team/repo' }}\n    needs: [inspect]\n    role: observe\n    output: compact\n");
+        let fx=Fixture::with_flow(transport,&yaml).await;
+        fx.daemon.store().set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":fx.repo.path().canonicalize().unwrap(),"connectors":[{"connector":"sonarqube","base_url":"https://sonar.test/","access":"targets","targets":["p"]},{"connector":"github","base_url":"https://github.test/","access":"targets","targets":["team/repo"]}]}]}).to_string()).await.unwrap();
+        fx.daemon.store().insert_grant(&step_capability("sonar-correlated","later")).await.unwrap();
+        fx.admin("github","admin.connectors.configure",json!({"id":"github","enabled":true,"base_url":"https://github.test/","credential":{"set":"fixture-only"}})).await;
+        fx.mapping("initial",Some("https://git.example/team/repo")).await;
+        let run=fx.run("late_change",SHA);
+        let change=async {
+            entered.notified().await;
+            let bindings=fx.daemon.store().read_correlation_steps("late_change").await.unwrap();
+            let prior:Value=serde_json::from_str(&bindings.iter().find(|binding|binding.step_id=="inspect").unwrap().canonical_json).unwrap();
+            assert_eq!(prior["decision"]["status"],"matched");
+            fx.mapping("late",Some("https://git.example/team/other")).await;
+            release.notify_one();
+        };
+        let (response,())=tokio::join!(run,change);
+        let (outcome,body)=result(response);
+        assert_ne!(outcome,Outcome::Verified,"{body}");
+        assert_eq!(body["correlation"]["status"],"conflicting");
+        fx.retained("late_change").await;
+        fx.finish().await;
+    }).await;
 }

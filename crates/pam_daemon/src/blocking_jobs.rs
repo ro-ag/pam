@@ -47,7 +47,7 @@ pub(crate) struct Snapshot {
     completed: Vec<Observation>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("blocking job capacity exhausted; existing work may still be running")]
     Busy,
@@ -56,13 +56,13 @@ pub(crate) enum Error {
 }
 
 impl Error {
-    pub(crate) fn cause(&self) -> &'static str {
+    pub(crate) fn cause(self) -> &'static str {
         match self {
             Self::Busy => "blocking_capacity_exhausted",
             Self::Join => "blocking_job_failed",
         }
     }
-    pub(crate) fn recovery(&self) -> &'static str {
+    pub(crate) fn recovery(self) -> &'static str {
         match self {
             Self::Busy => {
                 "This operation did not start. Wait for outstanding work to finish before trying again."

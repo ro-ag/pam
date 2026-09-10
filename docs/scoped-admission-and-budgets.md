@@ -54,7 +54,7 @@ gating to remain unchanged, including during an approval wait. Revocation
 invalidates stale admissions even if a grant is subsequently restored. This is
 conservative: an unrelated grant revocation can also require a fresh submission.
 
-Recovery preserves the original expiry and rejects stale or legacy queued rows
+Startup recovery reads pages of at most 16 rows and 8 MiB of text. SQL byte guards refuse oversized legacy fields before materializing them; the rows remain intact and startup gives an explicit backup/repair error. Recovery preserves the original expiry and rejects stale or legacy queued rows
 without authorization metadata. Running/interrupted work is not automatically
 replayed. Idempotency attachment requires the same key (when supplied), repository,
 capability and arguments. Caller labels do not provide a separate authorization
@@ -80,7 +80,7 @@ execution; the landing/watch plans must add their own reconciliation contracts.
 | Physical HTTP calls per request | 128 |
 | Accepted HTTP bodies per request | 128 MiB cumulative |
 | Command capture per request | 128 MiB cumulative |
-| Accounted blocking jobs | Eight outstanding, including waiting resource lanes |
+| Accounted blocking jobs | Eight executing; 128 outstanding including waiting lanes |
 
 Individual adapter and step ceilings can be smaller. Identity and payload checks
 happen before retaining a decoded request for execution. The patched existing
@@ -106,7 +106,7 @@ work, not frontier-token savings or diagnosis accuracy.
 Blocking work retains its permit inside the actual closure after callers time
 out. Keychain operations and model filesystem operations use serialized resource
 lanes. `status.blocking_jobs` exposes a bounded history with fixed operation
-labels and no arguments or secrets. `returned` means the closure returned, not
+labels and no arguments or secrets. Saturation returns `blocking_capacity_exhausted`; it does not imply a missing model or unhealthy keychain. `returned` means the closure returned, not
 that its business operation succeeded. Cancellation cannot undo a completed
 filesystem/keychain effect. Existing asynchronous download workers have their
 own lifecycle; the blocking counter must not be presented as a count of all

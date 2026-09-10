@@ -597,9 +597,9 @@ pub async fn run_daemon_with(
     let lock = acquire_instance_lock(dirs.run_dir())?;
     let store = Arc::new(Store::open(&base.join("state.sqlite3")).await?);
     let recovered = recover_stuck_rows(&store).await?;
-    if !recovered.is_empty() {
+    if recovered != 0 {
         tracing::info!(
-            count = recovered.len(),
+            count = recovered,
             "crash recovery failed stuck in-flight rows from a previous daemon"
         );
     }

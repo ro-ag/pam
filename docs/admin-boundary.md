@@ -71,8 +71,11 @@ Shutdown stops acceptance and gives owned asynchronous handlers five seconds to
 drain. This is not a cancellation guarantee for already-started blocking work
 (such as an OS keychain call or weight-file deletion): Rust cannot abort that
 work. Its effects can remain uncertain after a timeout, and runtime shutdown may
-wait longer. The connection cap is not a bound on detached blocking jobs. Work
-budget qualification must include these jobs before claiming a total-work bound.
+wait longer. A separate process-owned runner now bounds accounted blocking work to eight
+executing jobs and 128 outstanding admissions. Permits remain inside the actual
+closures, including after caller cancellation. Native keychain/model filesystem
+work is serialized by resource lane; existing asynchronous downloads retain their
+own lifecycle. See [scoped admission and budgets](scoped-admission-and-budgets.md).
 
 The daemon validates the canonical base and its ancestor ownership/write modes
 before opening state. Root-owned sticky temporary directories are allowed;

@@ -1002,7 +1002,7 @@ impl Store {
          + COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0)
          + COALESCE(LENGTH(CAST(outcome AS BLOB)), 0)";
 
-    /// Metadata-only page; called with conn_lock held by the page reader.
+    /// Metadata-only page; called with `conn_lock` held by the page reader.
     async fn recovery_ids(
         &self,
         subset: RecoveryRows,

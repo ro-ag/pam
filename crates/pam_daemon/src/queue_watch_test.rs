@@ -333,3 +333,76 @@ async fn full_terminal_notice_buffer_retains_new_parked_admissions_until_drain()
         Some("lease_expired")
     );
 }
+
+#[tokio::test]
+async fn awakened_watch_revoked_behind_busy_lane_delivers_terminal_notice_once() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    enqueue(&queue, "watch").await;
+    enqueue(&queue, "busy").await;
+    queue.take_next("/repo").await.unwrap().unwrap();
+    ready_checkpoint(&store, "watch").await;
+    let resume = now_ms() + 10_000;
+    assert!(queue.park("watch", resume).await.unwrap());
+    assert_eq!(
+        queue.take_next("/repo").await.unwrap().unwrap().request_id,
+        "busy"
+    );
+    assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 1);
+    store.insert_grant("flow.run").await.unwrap();
+    store.revoke_grant("flow.run").await.unwrap();
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    queue
+        .complete("busy", RequestState::Done, Some("ok"), audit())
+        .await
+        .unwrap();
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert_eq!(queue.take_parked_terminals().await, ["watch"]);
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert!(queue.take_parked_terminals().await.is_empty());
+    assert!(queue.ready_repos().await.is_empty());
+    assert_eq!(
+        store
+            .request_status_meta("watch")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .as_deref(),
+        Some("authorization_changed")
+    );
+}
+
+#[tokio::test]
+async fn full_notice_buffer_retains_revoked_ready_entry_until_drain() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    for index in 0..crate::queue::MAX_PARKED_TERMINALS {
+        let id = format!("old-{index}");
+        let (deadline, resume) = park_for_notice(&queue, &store, &id).await;
+        queue.wake_due(deadline, resume).await.unwrap();
+    }
+    enqueue(&queue, "retained").await;
+    store.insert_grant("flow.run").await.unwrap();
+    store.revoke_grant("flow.run").await.unwrap();
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert_eq!(
+        store
+            .request_status_meta("retained")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Queued
+    );
+    assert_eq!(store.admission_usage().await.unwrap().0, 1);
+    assert_eq!(
+        queue.take_parked_terminals().await.len(),
+        crate::queue::MAX_PARKED_TERMINALS
+    );
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert_eq!(queue.take_parked_terminals().await, ["retained"]);
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert!(queue.take_parked_terminals().await.is_empty());
+    assert_eq!(store.admission_usage().await.unwrap().0, 0);
+}

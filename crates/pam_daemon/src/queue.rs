@@ -448,47 +448,52 @@ impl QueueManager {
         if inner.busy.contains_key(repo) {
             return Ok(None);
         }
-        let Some(entry) = inner.lanes.get_mut(repo).and_then(VecDeque::pop_front) else {
+        // Capacity is reserved before any terminal write; admission remains in
+        // its lane on every database failure or notification backpressure.
+        let Some(entry) = inner.lanes.get(repo).and_then(VecDeque::front) else {
             return Ok(None);
         };
-        if entry.deadline <= Instant::now() {
-            self.fail_recovered(&entry.id, CAUSE_LEASE_EXPIRED).await?;
+        let entry = QueuedEntry {
+            id: entry.id.clone(),
+            deadline: entry.deadline,
+        };
+        let cause = if entry.deadline <= Instant::now() {
+            Some(CAUSE_LEASE_EXPIRED)
+        } else if self
+            .store
+            .start_queued_request(&entry.id, wall_clock_ms())
+            .await?
+        {
+            None
+        } else if self
+            .store
+            .request_admission_expired(&entry.id, wall_clock_ms())
+            .await?
+        {
+            Some(CAUSE_LEASE_EXPIRED)
+        } else {
+            Some("authorization_changed")
+        };
+        if let Some(cause) = cause {
+            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
+                self.work.notify_one();
+                return Ok(None);
+            }
+            let finished = self.fail_recovered(&entry.id, cause).await?;
+            if let Some(lane) = inner.lanes.get_mut(repo) {
+                lane.pop_front();
+            }
             if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
                 inner.lanes.remove(repo);
             }
+            if finished {
+                inner.parked_terminals.push(entry.id);
+                self.work.notify_one();
+            }
             return Ok(None);
         }
-        match self
-            .store
-            .start_queued_request(&entry.id, wall_clock_ms())
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                let cause = match self.store.get_request(&entry.id).await? {
-                    Some(row)
-                        if row
-                            .expires_at_ms
-                            .is_some_and(|expiry| expiry <= wall_clock_ms()) =>
-                    {
-                        CAUSE_LEASE_EXPIRED
-                    }
-                    _ => "authorization_changed",
-                };
-                self.fail_recovered(&entry.id, cause).await?;
-                if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
-                    inner.lanes.remove(repo);
-                }
-                return Ok(None);
-            }
-            Err(err) => {
-                inner
-                    .lanes
-                    .entry(repo.to_owned())
-                    .or_default()
-                    .push_front(entry);
-                return Err(err.into());
-            }
+        if let Some(lane) = inner.lanes.get_mut(repo) {
+            lane.pop_front();
         }
         if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
             inner.lanes.remove(repo);

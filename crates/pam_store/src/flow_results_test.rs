@@ -177,3 +177,82 @@ async fn origin_overflow_refuses_whole_set_instead_of_authorizing_prefix() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn private_checkpoint_does_not_block_public_result_but_other_missing_views_do() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("r", "flow.run", "/repo", "test", "{}", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence(
+            "result",
+            "r",
+            "flow.result",
+            b"public",
+            Some(r#"{"agent_result":{}}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .insert_evidence_view(&EvidenceViewInsert {
+            evidence_id: "result".into(),
+            request_id: "r".into(),
+            repository: "/repo".into(),
+            origin_json: r#"{"targets":[]}"#.into(),
+            identity_json: "{}".into(),
+            map_json: "[]".into(),
+            view_id: "result-view".into(),
+            view_bytes: b"public".to_vec(),
+        })
+        .await
+        .unwrap();
+    store
+        .insert_evidence(
+            "private",
+            "r",
+            "flow.checkpoint",
+            b"private checkpoint sentinel",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .flow_result_meta("r", "/repo")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.request_evidence_origins("r", "/repo").await.unwrap(),
+        Some(vec![r#"{"targets":[]}"#.to_owned()])
+    );
+    // A known protected handle is insufficient: evidence.read requires a view.
+    assert!(
+        store
+            .evidence_view_meta("r", "private", "/repo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The exception is the exact private checkpoint kind, not all flow-prefixed evidence.
+    store
+        .insert_evidence(
+            "missing",
+            "r",
+            "flow.checkpoint.other",
+            b"unpublished",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .request_evidence_origins("r", "/repo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

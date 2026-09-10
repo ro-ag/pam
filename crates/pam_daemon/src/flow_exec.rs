@@ -580,8 +580,10 @@ pub async fn run_command_budgeted(
     cancel: &mut watch::Receiver<bool>,
     budget: &std::sync::Arc<crate::request_budget::RequestBudget>,
 ) -> Result<CommandOutcome, crate::request_budget::BudgetError> {
-    budget.attempt()?;
-    let reservation = budget.command(u64::try_from(MAX_SOURCE_BYTES).unwrap_or(u64::MAX))?;
+    budget.attempt_persisted().await?;
+    let reservation = budget
+        .command_persisted(u64::try_from(MAX_SOURCE_BYTES).unwrap_or(u64::MAX))
+        .await?;
     spec.timeout = spec.timeout.min(budget.remaining()?);
     let outcome = run_command(spec, cancel).await;
     match &outcome {

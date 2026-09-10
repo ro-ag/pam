@@ -1,7 +1,8 @@
 //! One request's cumulative work allowance. Retries share this object.
 //!
 //! Reservations stay spent if a future is cancelled or fails without an exact
-//! byte count. Completed bounded captures refund only unused reserved bytes.
+//! byte count. Persistent reservations remain fully charged even after success;
+//! only the legacy in-memory test mode refunds unused capture bytes.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pam_connectors::{HttpRequest, HttpResponse, HttpTransport, TransportError};
+use pam_store::{RequestBudgetCharge, RequestBudgetUsage, Store};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -71,6 +73,7 @@ pub struct RequestBudget {
     deadline: Instant,
     limits: Limits,
     usage: Mutex<Usage>,
+    persistent: Option<(Arc<Store>, String)>,
 }
 
 impl RequestBudget {
@@ -93,7 +96,100 @@ impl RequestBudget {
                 command_bytes: limits.command_bytes.min(ceiling.command_bytes),
             },
             usage: Mutex::new(Usage::default()),
+            persistent: None,
         })
+    }
+
+    /// Restore durable counters before execution. Never renew a request allowance.
+    pub async fn load_persistent(
+        store: Arc<Store>,
+        request_id: &str,
+        deadline: Instant,
+    ) -> Result<Arc<Self>, BudgetError> {
+        let usage = store
+            .load_request_budget(request_id)
+            .await
+            .map_err(|_| persistence_error())?;
+        Ok(Arc::new(Self {
+            deadline: deadline.min(Instant::now() + MAX_REQUEST_TIME),
+            limits: Limits::default(),
+            usage: Mutex::new(from_stored(usage)),
+            persistent: Some((store, request_id.to_owned())),
+        }))
+    }
+
+    /// Commit an attempt before external work.
+    pub async fn attempt_persisted(&self) -> Result<(), BudgetError> {
+        if self.persistent.is_none() {
+            return self.attempt();
+        }
+        self.charge_persisted(RequestBudgetCharge::Attempt).await
+    }
+
+    /// Commit a command's full capture reservation before spawning it.
+    pub async fn command_persisted(
+        self: &Arc<Self>,
+        maximum: u64,
+    ) -> Result<Reservation, BudgetError> {
+        self.reserve_persisted(maximum, false).await
+    }
+
+    /// Commit a physical HTTP send and its full capture before sending.
+    pub async fn http_persisted(
+        self: &Arc<Self>,
+        maximum: u64,
+    ) -> Result<Reservation, BudgetError> {
+        self.reserve_persisted(maximum, true).await
+    }
+
+    async fn reserve_persisted(
+        self: &Arc<Self>,
+        maximum: u64,
+        http: bool,
+    ) -> Result<Reservation, BudgetError> {
+        if self.persistent.is_none() {
+            return self.reserve(maximum, http);
+        }
+        self.charge_persisted(if http {
+            RequestBudgetCharge::Http(maximum)
+        } else {
+            RequestBudgetCharge::Command(maximum)
+        })
+        .await?;
+        Ok(Reservation {
+            budget: Arc::clone(self),
+            maximum,
+            http,
+        })
+    }
+
+    async fn charge_persisted(&self, charge: RequestBudgetCharge) -> Result<(), BudgetError> {
+        self.remaining()?;
+        let (store, id) = self.persistent.as_ref().expect("persistent mode checked");
+        let usage = store
+            .reserve_request_budget(id, charge)
+            .await
+            .map_err(|_| persistence_error())?
+            .ok_or_else(|| exhausted("durable_allowance"))?;
+        // Two awaiting callers may complete out of order. Never move the snapshot backwards.
+        let mut current = self.usage.lock().expect("budget counter mutex");
+        current.attempts = current.attempts.max(usage.attempts);
+        current.http_calls = current.http_calls.max(usage.http_calls);
+        current.http_bytes = current.http_bytes.max(usage.http_bytes);
+        current.command_bytes = current.command_bytes.max(usage.command_bytes);
+        drop(current);
+        self.remaining()?;
+        Ok(())
+    }
+
+    fn require_memory_mode(&self) -> Result<(), BudgetError> {
+        if self.persistent.is_some() {
+            return Err(BudgetError {
+                cause: "request_budget_persistence_required",
+                resource: "persistent_reservation",
+            });
+        }
+        Ok(())
     }
 
     /// Remaining request wall time; does not reset between attempts.
@@ -115,6 +211,7 @@ impl RequestBudget {
 
     /// Reserve an attempt before any subprocess, connector or preliminary read.
     pub fn attempt(&self) -> Result<(), BudgetError> {
+        self.require_memory_mode()?;
         self.remaining()?;
         let mut usage = self.usage.lock().expect("budget counter mutex");
         if usage.attempts >= self.limits.attempts {
@@ -135,6 +232,7 @@ impl RequestBudget {
     }
 
     fn reserve(self: &Arc<Self>, maximum: u64, http: bool) -> Result<Reservation, BudgetError> {
+        self.require_memory_mode()?;
         self.remaining()?;
         let mut usage = self.usage.lock().expect("budget counter mutex");
         let (used, limit, resource) = if http {
@@ -186,6 +284,9 @@ impl Reservation {
         if actual > self.maximum {
             return Err(exhausted("capture_exceeded_reservation"));
         }
+        if self.budget.persistent.is_some() {
+            return Ok(());
+        }
         let mut usage = self.budget.usage.lock().expect("budget counter mutex");
         let unused = self.maximum - actual;
         if self.http {
@@ -225,13 +326,14 @@ impl HttpTransport for BudgetTransport<'_> {
                     detail: "An unmetered redirect is not permitted".to_owned(),
                 });
             }
-            let reservation =
-                self.budget
-                    .http(request.max_bytes)
-                    .map_err(|error| TransportError::Policy {
-                        cause: error.cause,
-                        detail: error.to_string(),
-                    })?;
+            let reservation = self
+                .budget
+                .http_persisted(request.max_bytes)
+                .await
+                .map_err(|error| TransportError::Policy {
+                    cause: error.cause,
+                    detail: error.to_string(),
+                })?;
             let deadline = deadline.min(self.budget.deadline());
             let response = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -250,5 +352,20 @@ impl HttpTransport for BudgetTransport<'_> {
                 })?;
             Ok(response)
         })
+    }
+}
+
+fn persistence_error() -> BudgetError {
+    BudgetError {
+        cause: "request_budget_store_unavailable",
+        resource: "durable_reservation",
+    }
+}
+fn from_stored(value: RequestBudgetUsage) -> Usage {
+    Usage {
+        attempts: value.attempts,
+        http_calls: value.http_calls,
+        http_bytes: value.http_bytes,
+        command_bytes: value.command_bytes,
     }
 }

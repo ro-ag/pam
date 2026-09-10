@@ -2,8 +2,8 @@
 //!
 //! Two layers live here. The public types ([`Flow`], [`Step`], [`Action`],
 //! …) are what the rest of pam works with: every default is already
-//! resolved, durations are real [`Duration`]s, and an action is either a
-//! command or a connector call — never both and never neither. The private
+//! resolved, durations are real [`Duration`]s, and an action is a command,
+//! connector call, or typed landing operation. The private
 //! `Raw*` types mirror the YAML file one key at a time, reject unknown keys,
 //! and keep `timeout`/`retry.backoff` as strings; [`crate::validate::parse`]
 //! turns one into the other and is the only place the conversion happens.
@@ -102,6 +102,11 @@ impl fmt::Display for ArgValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    /// A typed operation using GUI-owned landing policy and frozen target state.
+    Landing {
+        /// Fixed operation; no recipe-supplied command or remote arguments.
+        operation: crate::landing::LandingOperation,
+    },
     /// Run a local program. `argv[0]` is a bare program name, never a shell
     /// string.
     Command {
@@ -279,7 +284,7 @@ pub struct Input {
 pub struct Step {
     /// Unique within the flow, `[a-z0-9-]{1,64}`.
     pub id: String,
-    /// The command or connector call.
+    /// The command, connector call, or typed landing operation.
     pub action: Action,
     /// Wall-clock limit for one attempt.
     #[serde(serialize_with = "serialize_duration")]
@@ -316,23 +321,27 @@ pub struct Step {
 }
 
 impl Step {
-    /// `"command"` or `"connector"` — the word the verdict body uses.
+    /// The action kind used by the verdict body.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self.action {
+            Action::Landing { .. } => "landing",
             Action::Command { .. } => "command",
             Action::Connector { .. } => "connector",
         }
     }
 
     /// Whether the step goes through the policy gate before it runs: every
-    /// stateful step, every step that asks for approval, and every connector
-    /// step (it leaves the machine).
+    /// stateful step, every step that asks for approval, every connector
+    /// step (it leaves the machine), and every typed landing operation.
     #[must_use]
     pub fn gated(&self) -> bool {
         self.effect == Effect::Stateful
             || self.approval == Approval::Required
-            || matches!(self.action, Action::Connector { .. })
+            || matches!(
+                self.action,
+                Action::Connector { .. } | Action::Landing { .. }
+            )
     }
 }
 
@@ -392,6 +401,8 @@ pub(crate) struct RawStep {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) run: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) landing: Option<crate::landing::LandingOperation>,
     #[serde(default)]
     pub(crate) connector: Option<String>,
     #[serde(default)]

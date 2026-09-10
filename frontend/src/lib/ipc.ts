@@ -190,6 +190,8 @@ export type AdminOp =
   | "admin.flows.normalize"
   | "admin.flows.settings.get"
   | "admin.flows.settings.set"
+  | "admin.flows.landing.get"
+  | "admin.flows.landing.set"
   | "admin.connectors.list"
   | "admin.connectors.configure"
   | "admin.connectors.test"
@@ -758,7 +760,11 @@ export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
 /** A connector call argument: YAML scalars only, string or integer. */
 export type FlowArgValue = string | number;
 
+export type LandingOperation =
+  "freeze" | "validate" | "push" | "ensure_pr" | "verify_pr" | "merge" | "verify_main" | "sync";
+
 export type FlowAction =
+  | { kind: "landing"; operation: LandingOperation }
   | { kind: "command"; argv: string[] }
   | {
       kind: "connector";
@@ -800,11 +806,19 @@ export interface FlowSpecInput {
   default: string | null;
 }
 
+export interface FlowCorrelation {
+  repository: string;
+  commit: string;
+  pull_request?: FlowArgValue;
+  pull_request_head?: string;
+}
+
 export interface FlowSpec {
   id: string;
   name: string;
   description: string;
   inputs: Record<string, FlowSpecInput>;
+  correlation?: FlowCorrelation | null;
   steps: FlowStep[];
 }
 
@@ -812,6 +826,7 @@ export interface FlowSpec {
 export interface RawFlowStep {
   id: string;
   run?: string[];
+  landing?: LandingOperation;
   connector?: FlowConnectorId;
   call?: string;
   with?: Record<string, FlowArgValue>;
@@ -837,6 +852,7 @@ export interface RawFlow {
   name: string;
   description?: string;
   inputs?: Record<string, { description?: string; default?: string | null }>;
+  correlation?: FlowCorrelation;
   steps: RawFlowStep[];
 }
 
@@ -999,7 +1015,7 @@ export type FlowStepStatus = "succeeded" | "failed" | "skipped" | "blocked" | "c
 /** One step of a finished run, as the step table reads it. */
 export interface FlowStepReport {
   id: string;
-  kind: "command" | "connector";
+  kind: "command" | "connector" | "landing";
   status: FlowStepStatus;
   attempts: number;
   duration_ms: number;

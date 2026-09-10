@@ -466,3 +466,45 @@ it("preserves an existing watch policy when a canvas note is changed and saved",
   expect(original.steps[0].watch).toEqual(watch);
   expect(raw.steps[1]).not.toHaveProperty("watch");
 });
+
+it("round-trips typed landing stages and correlation without command defaults", () => {
+  const landing: FlowSpec = {
+    ...spec(),
+    correlation: {
+      repository: "${inputs.repository}",
+      commit: "${inputs.commit}",
+      pull_request: "${inputs.pr}",
+      pull_request_head: "${inputs.commit}",
+    },
+    steps: [
+      {
+        ...defaultStep("freeze", "command"),
+        action: { kind: "landing", operation: "freeze" },
+      },
+    ],
+  };
+  const raw = toRaw(landing);
+  expect(raw.correlation).toEqual(landing.correlation);
+  expect(raw.steps[0].landing).toBe("freeze");
+  for (const key of [
+    "run",
+    "connector",
+    "call",
+    "with",
+    "env",
+    "retry",
+    "expect_empty_output",
+    "expect_status",
+  ]) {
+    expect(raw.steps[0]).not.toHaveProperty(key);
+  }
+  expect(toGraph(landing).nodes.find((node) => node.id === "freeze")?.data).toMatchObject({
+    step: { action: { kind: "landing", operation: "freeze" } },
+  });
+  landing.steps[0].env = { FORBIDDEN: "true" };
+  landing.steps[0].retry = { attempts: 2, backoff: "500ms" };
+  expect(toRaw(landing).steps[0]).toMatchObject({
+    env: { FORBIDDEN: "true" },
+    retry: { attempts: 2 },
+  });
+});

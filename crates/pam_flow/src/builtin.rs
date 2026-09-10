@@ -33,6 +33,10 @@ const BUILTINS: &[BuiltinFlow] = &[
         yaml: include_str!("../flows/dependency-audit.yaml"),
     },
     BuiltinFlow {
+        id: "guarded-land",
+        yaml: include_str!("../flows/guarded-land.yaml"),
+    },
+    BuiltinFlow {
         id: "jenkins-build-investigation",
         yaml: include_str!("../flows/jenkins-build-investigation.yaml"),
     },

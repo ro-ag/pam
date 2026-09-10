@@ -15,6 +15,7 @@ fn pam_ships_the_starter_flows() {
             "ci-failure-triage",
             "confluence-page-context",
             "dependency-audit",
+            "guarded-land",
             "jenkins-build-investigation",
             "jenkins-node-evidence",
             "jira-issue-context",
@@ -97,7 +98,7 @@ fn the_command_starters_match_the_spec_table() {
             .iter()
             .filter_map(|step| match &step.action {
                 Action::Command { argv } => Some(argv.clone()),
-                Action::Connector { .. } => None,
+                Action::Connector { .. } | Action::Landing { .. } => None,
             })
             .collect()
     };
@@ -211,7 +212,7 @@ fn the_connector_starters_call_the_spec_table() {
                 Action::Connector {
                     connector, call, ..
                 } => Some((*connector, call.clone())),
-                Action::Command { .. } => None,
+                Action::Command { .. } | Action::Landing { .. } => None,
             })
             .collect()
     };
@@ -291,7 +292,9 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
         .skip(1)
         .map(|step| match &step.action {
             Action::Command { argv } => argv.clone(),
-            Action::Connector { .. } => panic!("local gates must be commands"),
+            Action::Connector { .. } | Action::Landing { .. } => {
+                panic!("local gates must be commands")
+            }
         })
         .collect();
     assert_eq!(required.len(), 7);
@@ -306,7 +309,7 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
     assert!(generic.name.contains("Rust"));
     assert!(generic.steps.iter().all(|step| match &step.action {
         Action::Command { argv } => argv[0] != "npm",
-        Action::Connector { .. } => true,
+        Action::Connector { .. } | Action::Landing { .. } => true,
     }));
 }
 

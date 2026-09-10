@@ -512,6 +512,7 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
             "watch verification requires an explicit revision target",
         ));
     }
+    crate::landing::sequence(&steps, correlation.is_some())?;
     Ok(Flow {
         id: raw.id,
         name: raw.name,
@@ -584,6 +585,10 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         ));
     }
 
+    if raw.landing.is_some() {
+        return crate::landing::step(raw, &at, &scope.earlier);
+    }
+
     let action = match (raw.run, raw.connector) {
         (Some(_), Some(_)) => {
             return Err(FlowError::invalid(
@@ -594,7 +599,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         (None, None) => {
             return Err(FlowError::invalid(
                 &at,
-                "a step needs `run` (a command) or `connector` (a connector call)",
+                "a step needs `run`, `connector`, or a typed `landing` operation",
             ));
         }
         (Some(argv), None) => {
@@ -685,7 +690,7 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
 
 /// A note is trimmed — whitespace alone is no note — bounded like the
 /// description, and refused when it looks like a credential.
-fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
+pub(crate) fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
     let note = note.map(str::trim).unwrap_or_default();
     let path = format!("{at}.note");
     check_length(&path, note.len(), MAX_DESCRIPTION_BYTES)?;
@@ -693,7 +698,7 @@ fn validate_note(note: Option<&str>, at: &str) -> Result<String, FlowError> {
     Ok(note.to_string())
 }
 
-fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowError> {
+pub(crate) fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowError> {
     let Some(text) = timeout else {
         return Ok(DEFAULT_TIMEOUT);
     };
@@ -711,7 +716,7 @@ fn validate_timeout(timeout: Option<&str>, at: &str) -> Result<Duration, FlowErr
     Ok(value)
 }
 
-fn validate_retry(retry: Option<RawRetry>, at: &str) -> Result<Retry, FlowError> {
+pub(crate) fn validate_retry(retry: Option<RawRetry>, at: &str) -> Result<Retry, FlowError> {
     let Some(raw) = retry else {
         return Ok(Retry::default());
     };

@@ -487,6 +487,21 @@ function rawStep(step: FlowStep): RawFlowStep {
     ...(note ? { note } : {}),
     ...(watch ? { watch: { ...watch } } : {}),
   };
+  if (action.kind === "landing") {
+    // Resolved default fields are not explicit recipe overrides. Preserve actual
+    // edits so the daemon rejects forbidden fields instead of silently losing them.
+    const { env, retry, expect_empty_output, expect_status, ...landingBase } = base;
+    return {
+      ...landingBase,
+      landing: action.operation,
+      ...(env && Object.keys(env).length ? { env } : {}),
+      ...(retry && (retry.attempts !== 1 || (retry.backoff ?? "500ms") !== "500ms")
+        ? { retry }
+        : {}),
+      ...(expect_empty_output ? { expect_empty_output } : {}),
+      ...(expect_status !== undefined ? { expect_status } : {}),
+    };
+  }
   if (action.kind === "command") return { ...base, run: action.argv };
   return { ...base, connector: action.connector, call: action.call, with: action.with };
 }
@@ -499,6 +514,7 @@ export function toRaw(spec: FlowSpec): RawFlow {
     name: spec.name,
     description: spec.description,
     inputs: spec.inputs,
+    ...(spec.correlation ? { correlation: { ...spec.correlation } } : {}),
     steps: spec.steps.map(rawStep),
   };
 }

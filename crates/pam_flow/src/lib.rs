@@ -26,7 +26,9 @@
 pub mod builtin;
 pub mod correlation;
 pub mod duration;
+pub mod landing;
 pub mod library;
+pub use landing::LandingOperation;
 pub mod normalize;
 pub mod schema;
 pub mod validate;
@@ -72,3 +74,6 @@ mod vars_test;
 mod watch;
 #[cfg(test)]
 mod watch_test;
+
+#[cfg(test)]
+mod landing_test;

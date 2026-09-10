@@ -26,6 +26,7 @@ fn fixture() -> Fixture {
             repository,
             read_only_roots: vec![tools],
             allow_repository_writes: false,
+            artifact_roots: Vec::new(),
         },
         program,
     }
@@ -201,6 +202,7 @@ fn unsupported_platform_refuses_without_even_resolving_paths() {
         repository: "missing".into(),
         read_only_roots: vec![],
         allow_repository_writes: false,
+        artifact_roots: Vec::new(),
     };
     let error = config
         .prepare(

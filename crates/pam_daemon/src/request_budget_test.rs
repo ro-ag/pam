@@ -85,6 +85,7 @@ async fn a_transport_that_ignores_its_deadline_is_stopped_and_keeps_its_reservat
     };
     let request = pam_connectors::HttpRequest {
         method: pam_connectors::Method::Get,
+        body: None,
         url: pam_connectors::validate_base_url(
             pam_flow::ConnectorId::Jenkins,
             "https://jenkins.example/",
@@ -188,6 +189,7 @@ async fn exhausted_persistent_transport_never_reaches_network() {
     };
     let request = pam_connectors::HttpRequest {
         method: pam_connectors::Method::Get,
+        body: None,
         url: pam_connectors::validate_base_url(
             pam_flow::ConnectorId::Jenkins,
             "https://jenkins.example/",

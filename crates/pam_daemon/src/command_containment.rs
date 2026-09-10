@@ -31,6 +31,8 @@ pub struct CommandContainment {
     pub read_only_roots: Vec<PathBuf>,
     /// Repository writes are allowed only for declared stateful operations.
     pub allow_repository_writes: bool,
+    /// Explicit private build outputs, separate from immutable source and toolchains.
+    pub artifact_roots: Vec<PathBuf>,
 }
 
 /// The trusted launcher and arguments preceding the original workload's argv.
@@ -146,7 +148,7 @@ pub(crate) fn profile(
     {
         return Err("repository, program or private boundary is invalid".to_owned());
     }
-    if config.read_only_roots.len() > 16 {
+    if config.read_only_roots.len() > 16 || config.artifact_roots.len() > 8 {
         return Err("too many command read roots".to_owned());
     }
     let mut roots = Vec::new();
@@ -163,6 +165,35 @@ pub(crate) fn profile(
     }
     if !program.starts_with(&repo) && !roots.iter().any(|root| program.starts_with(root)) {
         return Err("command executable is outside declared read roots".to_owned());
+    }
+    let mut artifacts = Vec::new();
+    for path in &config.artifact_roots {
+        let root = canonical(path)?;
+        if !root.is_dir()
+            || overlap(&root, &protected)
+            || overlap(&root, &repo)
+            || roots.iter().any(|read| overlap(&root, read))
+            || SYSTEM_READ_ROOTS
+                .iter()
+                .any(|read| overlap(&root, std::path::Path::new(read)))
+        {
+            return Err(
+                "artifact roots must be separate from source, protected data and toolchains"
+                    .to_owned(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata =
+                std::fs::metadata(&root).map_err(|_| "artifact directory unavailable")?;
+            let private =
+                std::fs::metadata(&protected).map_err(|_| "private directory unavailable")?;
+            if metadata.uid() != private.uid() || metadata.mode() & 0o077 != 0 {
+                return Err("artifact directory must be private and owned by PAM's user".to_owned());
+            }
+        }
+        artifacts.push(root);
     }
     // Do not import system/app profiles: they grant services beyond this contract.
     let mut text = String::from(
@@ -189,6 +220,13 @@ pub(crate) fn profile(
     }
     if config.allow_repository_writes {
         let _ = writeln!(text, "(allow file-write* (subpath {}))", quoted(&repo));
+    }
+    for root in &artifacts {
+        let _ = writeln!(
+            text,
+            "(allow file-read* file-write* file-map-executable (subpath {}))",
+            quoted(root)
+        );
     }
     let _ = writeln!(
         text,

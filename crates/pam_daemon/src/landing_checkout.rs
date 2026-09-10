@@ -340,6 +340,7 @@ impl Git<'_> {
                     .to_owned(),
             ],
             allow_repository_writes: true,
+            artifact_roots: Vec::new(),
         };
         let prepared = containment
             .prepare(
@@ -402,7 +403,7 @@ impl Git<'_> {
         command.args(args);
         still_active(cancel, self.deadline)?;
         let mut child = command.spawn().map_err(io_error)?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| invalid("Git stdin unavailable"))?;
@@ -415,10 +416,7 @@ impl Git<'_> {
             .take()
             .ok_or_else(|| invalid("Git stderr unavailable"))?;
         let operation = async {
-            let send = async {
-                stdin.write_all(input).await?;
-                stdin.shutdown().await
-            };
+            let send = write_input(stdin, input);
             let read_out = read_pipe(stdout, cap);
             let read_err = read_pipe(stderr, MAX_STDERR);
             let (_, output, diagnostics) =
@@ -594,6 +592,17 @@ impl Git<'_> {
         Ok(())
     }
 }
+// Own and close the pipe before waiting for output: Git's batch commands do
+// not exit until EOF, and ChildStdin::shutdown alone does not close the handle.
+async fn write_input(
+    mut writer: impl tokio::io::AsyncWrite + Unpin,
+    input: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(input).await?;
+    drop(writer);
+    Ok(())
+}
+
 async fn read_pipe(
     reader: impl tokio::io::AsyncRead + Unpin,
     cap: usize,

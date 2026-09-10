@@ -356,3 +356,19 @@ fn manifest_metadata_limit_includes_final_hashes_before_export() {
     assert_eq!(serde_json::to_vec(&accepted).unwrap().len(), reserved);
     assert!(reserved <= MAX_MANIFEST_BYTES);
 }
+
+#[tokio::test]
+async fn input_writer_delivers_eof_before_waiting_for_batch_output() {
+    let (writer, mut reader) = tokio::io::duplex(8);
+    let mut received = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::try_join!(
+            write_input(writer, b"batch input"),
+            reader.read_to_end(&mut received)
+        )
+        .unwrap();
+    })
+    .await
+    .expect("batch reader receives EOF after the last input byte");
+    assert_eq!(received, b"batch input");
+}

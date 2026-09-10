@@ -1237,6 +1237,7 @@ fn helper_spec(argv: &[&str], timeout: Duration) -> (tempfile::TempDir, CommandS
             repository,
             read_only_roots,
             allow_repository_writes: false,
+            artifact_roots: Vec::new(),
         },
     };
     (fixture, spec)

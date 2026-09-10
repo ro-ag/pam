@@ -391,6 +391,10 @@ pub struct FlowService {
 }
 
 impl FlowService {
+    pub(crate) fn protected_base(&self) -> &Path {
+        &self.protected_base
+    }
+
     /// Builds the engine over the library at `<base_dir>/flows`.
     #[must_use]
     pub fn new(
@@ -691,6 +695,11 @@ impl FlowService {
                 }
             }
             match &step.action {
+                Action::Landing { operation } => {
+                    item["landing"] = json!(operation);
+                    item["admission"] = json!("landing_runtime_pending");
+                    blockers.push(json!({"step":step.id,"cause":"landing_runtime_pending","recovery":"Guarded landing runtime integration is not complete."}));
+                }
                 Action::Command { argv } => {
                     item["containment"] = json!(if cfg!(target_os = "macos") {
                         "checked_before_execution"
@@ -1111,6 +1120,7 @@ fn flow_references(flow: &Flow) -> Vec<String> {
     }
     for step in &flow.steps {
         match &step.action {
+            Action::Landing { .. } => {}
             Action::Command { argv } => {
                 for argument in argv {
                     found.extend(references(argument));
@@ -1563,6 +1573,12 @@ impl RunState<'_> {
         }
         let started = Instant::now();
         match &step.action {
+            Action::Landing { .. } => report.fail(
+                StepStatus::Blocked,
+                "landing_runtime_pending",
+                "Guarded landing runtime integration is not complete.".to_owned(),
+                "Inspect the configured landing recipe after runtime integration.".to_owned(),
+            ),
             Action::Command { argv } => self.run_command_step(step, argv, &mut report).await?,
             Action::Connector {
                 connector,
@@ -2653,5 +2669,6 @@ fn command_boundary(
         repository: repo.to_path_buf(),
         read_only_roots: roots,
         allow_repository_writes,
+        artifact_roots: Vec::new(),
     }
 }

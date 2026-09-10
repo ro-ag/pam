@@ -1269,13 +1269,14 @@ impl Store {
     /// unresolved effect before any terminal writer can hide it behind success,
     /// cancellation, or a deadline. A terminal row remains an idempotent no-op.
     async fn terminal_flow_uncertainty_locked(&self, id: &str) -> Result<bool, StoreError> {
+        let landing_intent = self.landing_prepared_intent_locked(id).await?;
         self.conn
             .execute(
                 "UPDATE flow_journal SET state='uncertain',revision=revision+1
-                 WHERE request_id=?1 AND state='prepared' AND effectful=1
+                 WHERE request_id=?1 AND (state='prepared' OR (state='ready' AND ?2=1)) AND effectful=1
                    AND EXISTS(SELECT 1 FROM request WHERE id=?1
                      AND state IN ('queued','running','waiting_approval'))",
-                params![id],
+                params![id, i64::from(landing_intent)],
             )
             .await?;
         let mut rows = self

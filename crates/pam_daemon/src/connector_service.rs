@@ -816,6 +816,12 @@ impl ScopedTransport<'_> {
         mut request: HttpRequest,
         deadline: Instant,
     ) -> Result<HttpResponse, TransportError> {
+        if request.method != pam_connectors::Method::Get || request.body.is_some() {
+            return Err(TransportError::Policy {
+                cause: "connector_read_only",
+                detail: "Read-only connector scope cannot authorize an HTTP mutation.".to_owned(),
+            });
+        }
         if Instant::now() >= deadline {
             return Err(TransportError::Timeout);
         }

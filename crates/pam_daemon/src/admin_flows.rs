@@ -74,6 +74,11 @@ pub const OP_FLOWS_SETTINGS_GET: &str = "admin.flows.settings.get";
 /// settings as they now stand.
 pub const OP_FLOWS_SETTINGS_SET: &str = "admin.flows.settings.set";
 
+/// GUI-only landing recipe and mutation-scope inspection.
+pub const OP_LANDING_GET: &str = "admin.flows.landing.get";
+/// GUI-only compare-and-swap update of landing authority.
+pub const OP_LANDING_SET: &str = "admin.flows.landing.set";
+
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const FLOW_ADMIN_OPS: &[&str] = &[
@@ -85,6 +90,8 @@ pub const FLOW_ADMIN_OPS: &[&str] = &[
     OP_FLOWS_RUN,
     OP_FLOWS_SETTINGS_GET,
     OP_FLOWS_SETTINGS_SET,
+    OP_LANDING_GET,
+    OP_LANDING_SET,
 ];
 
 /// The deadline an `admin.flows.run` envelope carries: half an hour,
@@ -119,6 +126,10 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, OwnedRefusal>> {
         Some(match op {
+            OP_LANDING_GET | OP_LANDING_SET => self
+                .landing_settings(op, args)
+                .await
+                .map_err(OwnedRefusal::from),
             OP_FLOWS_LIST => self.flows_list().map_err(OwnedRefusal::from),
             OP_FLOWS_GET => self.flows_get(args).map_err(OwnedRefusal::from),
             OP_FLOWS_SAVE => self.flows_save(args).map_err(OwnedRefusal::from),
@@ -131,6 +142,26 @@ impl AdminService {
                 .await
                 .map_err(OwnedRefusal::from),
             _ => return None,
+        })
+    }
+
+    async fn landing_settings(&self, op: &str, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let snapshot = if op == OP_LANDING_SET {
+            crate::landing_policy::Snapshot::save(&self.store, args, self.flows.protected_base()).await
+        } else {
+            crate::landing_policy::Snapshot::load(&self.store).await
+        }.map_err(|error| AdminRefusal {
+            cause: error.cause, detail: error.to_string(),
+            recovery: "Open PAM Settings → Flows → Landing; reload and correct the approved recipe and targets.",
+        })?;
+        Ok(AdminOk {
+            outcome: if op == OP_LANDING_SET {
+                Outcome::Changed
+            } else {
+                Outcome::Verified
+            },
+            body: snapshot.response(),
+            audit: json!({"op":op,"revision":snapshot.revision}),
         })
     }
 

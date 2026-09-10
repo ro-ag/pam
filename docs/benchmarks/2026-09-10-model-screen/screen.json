@@ -28,7 +28,9 @@
     "sample_interval_seconds": 0.5,
     "deadline_seconds": 1200,
     "stop_kind": "sampled soft stop, not an OS hard cap",
-    "rss_is_metal_total": false
+    "rss_is_metal_total": false,
+    "phys_footprint_sampled_since_run3": true,
+    "phys_footprint_note": "Runs 1 and 2 on each backend recorded ps RSS only. Run 3 records phys_footprint, the metric macOS uses for pressure and jetsam, alongside RSS."
   },
   "framing": {
     "template": "production_chatml",
@@ -40,8 +42,28 @@
   "metal": {
     "outcome": "terminated_during_load_before_any_phase",
     "runs": [
-      {"run": 1, "elapsed_seconds": 25.904, "peak_sampled_rss_bytes": 17528012800, "reason": "sampled_rss_limit", "samples": 50},
-      {"run": 2, "elapsed_seconds": 23.085, "peak_sampled_rss_bytes": 18354438144, "reason": "sampled_rss_limit", "samples": 45}
+      {
+        "run": 1,
+        "elapsed_seconds": 25.904,
+        "peak_sampled_rss_bytes": 17528012800,
+        "reason": "sampled_rss_limit",
+        "samples": 50
+      },
+      {
+        "run": 2,
+        "elapsed_seconds": 23.085,
+        "peak_sampled_rss_bytes": 18354438144,
+        "reason": "sampled_rss_limit",
+        "samples": 45
+      },
+      {
+        "run": 3,
+        "elapsed_seconds": 21.755,
+        "peak_sampled_rss_bytes": 18732000000,
+        "peak_sampled_phys_footprint_bytes": 19330000000,
+        "reason": "sampled_rss_limit",
+        "instrumentation": "phys_footprint sampled"
+      }
     ],
     "load_completed": false,
     "prefill_measured": false,
@@ -70,10 +92,50 @@
         "samples": 881,
         "added_swapout_pages": 0,
         "phases": [
-          {"phase": "first_at_length", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44159, "decode_ms": 9670, "completion_tokens": 64, "tokens_per_sec": 6.617898727764735, "wall_ms": 53830, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
-          {"phase": "warm_repeat", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44753, "decode_ms": 9420, "completion_tokens": 64, "tokens_per_sec": 6.793845478861928, "wall_ms": 54174, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
-          {"phase": "first_at_length", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 90085, "decode_ms": 11934, "completion_tokens": 64, "tokens_per_sec": 5.362636697839836, "wall_ms": 102020, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"},
-          {"phase": "warm_repeat", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 91342, "decode_ms": 11773, "completion_tokens": 64, "tokens_per_sec": 5.4361286386474985, "wall_ms": 103115, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"}
+          {
+            "phase": "first_at_length",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44159,
+            "decode_ms": 9670,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.617898727764735,
+            "wall_ms": 53830,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44753,
+            "decode_ms": 9420,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.793845478861928,
+            "wall_ms": 54174,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "first_at_length",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 90085,
+            "decode_ms": 11934,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.362636697839836,
+            "wall_ms": 102020,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 91342,
+            "decode_ms": 11773,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.4361286386474985,
+            "wall_ms": 103115,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          }
         ]
       },
       {
@@ -86,14 +148,65 @@
         "samples": 896,
         "added_swapout_pages": 0,
         "phases": [
-          {"phase": "first_at_length", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44292, "decode_ms": 9336, "completion_tokens": 64, "tokens_per_sec": 6.86, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
-          {"phase": "warm_repeat", "input_cap": 512, "actual_prompt_tokens": 509, "prompt_ms": 44210, "decode_ms": 9347, "completion_tokens": 64, "tokens_per_sec": 6.85, "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"},
-          {"phase": "first_at_length", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 91060, "decode_ms": 12662, "completion_tokens": 64, "tokens_per_sec": 5.05, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"},
-          {"phase": "warm_repeat", "input_cap": 1024, "actual_prompt_tokens": 1019, "prompt_ms": 101696, "decode_ms": 11706, "completion_tokens": 64, "tokens_per_sec": 5.47, "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"}
+          {
+            "phase": "first_at_length",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44292,
+            "decode_ms": 9336,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.86,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 512,
+            "actual_prompt_tokens": 509,
+            "prompt_ms": 44210,
+            "decode_ms": 9347,
+            "completion_tokens": 64,
+            "tokens_per_sec": 6.85,
+            "output_sha256": "cd258bc949bcfc450d3d86ac1e68e2fd819644655b47cc42988c04bb47d7d781"
+          },
+          {
+            "phase": "first_at_length",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 91060,
+            "decode_ms": 12662,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.05,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          },
+          {
+            "phase": "warm_repeat",
+            "input_cap": 1024,
+            "actual_prompt_tokens": 1019,
+            "prompt_ms": 101696,
+            "decode_ms": 11706,
+            "completion_tokens": 64,
+            "tokens_per_sec": 5.47,
+            "output_sha256": "fe6feab6d087bfe4aab5f377cb39623b081f25b082bf935c4ed3033ad70cf24e"
+          }
         ]
+      },
+      {
+        "run": 3,
+        "elapsed_seconds": 455.805,
+        "peak_sampled_rss_bytes": 17194713088,
+        "peak_sampled_phys_footprint_bytes": 17180000000,
+        "reason": "sampled_rss_limit",
+        "added_swapout_pages": 0,
+        "instrumentation": "phys_footprint sampled in parallel at 2 s cadence",
+        "note": "Same phases as runs 1 and 2; terminated during the 2048-token phase."
       }
     ],
-    "phases_never_reached": ["2048_token_prefill", "cancellation", "recovery", "unload"]
+    "phases_never_reached": [
+      "2048_token_prefill",
+      "cancellation",
+      "recovery",
+      "unload"
+    ]
   },
   "findings": [
     "The artifact is Candle-compatible on CPU: it loads reporting architecture qwen3, quant Q5_K_M and context_length 8192, and it generates.",
@@ -101,7 +214,9 @@
     "Both backends exceeded the 16 GiB sampled screening ceiling. Metal exceeded it during load alone, in both runs, without producing any load time, prefill, decode or unload measurement.",
     "CPU resident set was about 1.5x artifact bytes after load and then climbed monotonically from about 16.0 GB to about 17.2 GB across the 2048-token phase, never returning.",
     "CPU prefill is roughly linear at about 11.3 tokens per second: 44 s at 509 framed tokens and 90 s at 1019.",
-    "Pressure remained normal and no swapout pages were added in any run on this 64 GiB host."
+    "Pressure remained normal and no swapout pages were added in any run on this 64 GiB host.",
+    "Resident set is not an overstatement from evictable mapped weights: phys_footprint tracks ps RSS within about 0.4 GB throughout and peaks HIGHER on both backends (CPU 17.18 GB against RSS 17.16 GB; Metal 19.33 GB against RSS 18.73 GB), because it excludes clean file-backed pages and includes compressed ones. The working set is real anonymous memory: weights are materialized, not mapped.",
+    "The working set exceeds artifact bytes by roughly 4.5 GB on CPU and over 8.8 GB on Metal, so weight bytes underestimate demand by a large and backend-dependent margin."
   ],
   "limitations": [
     "This is capped resource screening on 64 GiB hardware. It is not a 32 GB qualification and no 32 GB claim follows from it.",

@@ -19,6 +19,25 @@ class SupervisionTests(unittest.TestCase):
         sample["swapout_pages"] += 1
         self.assertEqual(screen.stop_reason(sample, baseline, 1), "added_system_swapouts")
 
+    def test_footprint_is_parsed_with_its_unit_and_refused_when_unrecognized(self):
+        report = "Auxiliary data:\n    phys_footprint: 15,032,385 KB\n    phys_footprint_peak: 16 GB\n"
+        self.assertEqual(screen.parse_footprint(report), 15_032_385 * 1024)
+        self.assertEqual(screen.parse_footprint("  phys_footprint: 1.5 GB\n"), int(1.5 * 1024**3))
+        for bad in ("phys_footprint: 12 QB\n", "phys_footprint_peak: 12 GB\n", "nothing here"):
+            with self.assertRaises(ValueError):
+                screen.parse_footprint(bad)
+
+    def test_footprint_over_the_limit_stops_the_run_even_when_rss_fits(self):
+        # phys_footprint counts compressed pages that ps RSS does not, so it can
+        # cross the ceiling first; a missing reading must never imply zero.
+        sample = {"swapout_pages": 0, "pressure": 1, "rss_bytes": 1024,
+                  "phys_footprint_bytes": screen.FOOTPRINT_LIMIT}
+        self.assertIsNone(screen.stop_reason(sample, sample, 1))
+        sample["phys_footprint_bytes"] += 1
+        self.assertEqual(screen.stop_reason(sample, sample, 1), "sampled_footprint_limit")
+        del sample["phys_footprint_bytes"]
+        self.assertIsNone(screen.stop_reason(sample, sample, 1))
+
     def test_stop_thresholds(self):
         sample = {"swapout_pages": 0, "pressure": 1, "rss_bytes": screen.RSS_LIMIT}
         self.assertIsNone(screen.stop_reason(sample, sample, 1))

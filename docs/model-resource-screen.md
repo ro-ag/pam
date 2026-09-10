@@ -58,7 +58,8 @@ that the executable is trustworthy. Use the binary from the preceding build.
 Required artifact environment variables are inherited; the supervisor does not
 print them or download weights.
 
-It samples child RSS (`ps`, KiB converted to bytes), system pressure
+It samples child RSS (`ps`, KiB converted to bytes), child `phys_footprint`
+(`footprint -p`, the metric macOS uses for pressure and jetsam), system pressure
 (`kern.memorystatus_vm_pressure_level`) and cumulative `vm_stat` swapouts at a
 0.5-second target cadence. Probe latency adds to that interval; timestamps record
 the actual cadence. It terminates on sampled RSS above 16 GiB, pressure other than
@@ -139,6 +140,23 @@ runs were terminated. Prefill is roughly linear at about 11.3 tokens per second:
 44 s at 509 framed tokens and 90 s at 1019, making a 512-token frame cost about
 54 s end to end. Pressure stayed normal and no swapout pages were added in any
 run on this host.
+
+### Resident set is not an overstatement
+
+The supervisor now samples `phys_footprint` — the metric macOS itself uses for
+pressure and jetsam — alongside `ps` RSS, and stops on either. This was added to
+test whether RSS was inflating the figures by counting clean file-backed pages
+from the mapped GGUF, which the kernel can evict for free.
+
+It is not. `phys_footprint` tracks RSS within about 0.4 GB across the whole run
+and peaks **higher** on both backends — CPU 17.18 GB against RSS 17.16 GB, Metal
+19.33 GB against RSS 18.73 GB — because it excludes clean file-backed pages and
+includes compressed ones. The working set is real anonymous memory: weights are
+materialized rather than mapped, and the ceiling breach is genuine demand.
+
+The margin over artifact bytes is large and backend-dependent: roughly 4.5 GB on
+CPU and over 8.8 GB on Metal for the same 10.51 GB file. Weight bytes therefore
+underestimate demand, which is the eligibility question raised in issue #12.
 
 What this does **not** establish: any 32 GB claim, the 2048-token envelope,
 cancellation, recovery or unload behaviour on either backend, answer quality

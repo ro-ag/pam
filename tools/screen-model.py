@@ -12,9 +12,11 @@ import sys
 import time
 
 RSS_LIMIT = 16 * 1024**3
+FOOTPRINT_LIMIT = 16 * 1024**3
 OUTPUT_LIMIT = 16 * 1024**2
 DEADLINE = 1200
 INTERVAL = 0.5
+FOOTPRINT_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
 
 
 def command(argv):
@@ -34,11 +36,27 @@ def host_sample():
             "page_bytes": int(pages[1])}
 
 
+def parse_footprint(text):
+    """phys_footprint from `footprint -p`, the metric macOS itself uses for
+    pressure and jetsam. Unlike ps RSS it excludes clean file-backed pages and
+    includes compressed ones, so it is recorded next to RSS rather than
+    replacing it: neither one alone describes the working set."""
+    found = re.search(r"^\s*phys_footprint:\s+([\d.,]+)\s*([A-Za-z]+)\s*$", text, re.M)
+    if not found:
+        raise ValueError("unrecognized footprint format")
+    scale = FOOTPRINT_UNITS.get(found[2].upper())
+    if scale is None:
+        raise ValueError(f"unrecognized footprint unit {found[2]}")
+    return int(float(found[1].replace(",", "")) * scale)
+
+
 def stop_reason(sample, baseline, elapsed):
     if elapsed >= DEADLINE:
         return "deadline"
     if sample["rss_bytes"] > RSS_LIMIT:
         return "sampled_rss_limit"
+    if sample.get("phys_footprint_bytes", 0) > FOOTPRINT_LIMIT:
+        return "sampled_footprint_limit"
     if sample["pressure"] != 1:
         return "system_pressure"
     if sample["swapout_pages"] > baseline["swapout_pages"]:
@@ -70,6 +88,7 @@ def supervise(binary, destination):
     start = time.monotonic()
     child = None
     maximum = 0
+    peak_footprint = 0
     reason = None
     counts = {"stdout": 0, "stderr": 0}
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
@@ -89,11 +108,13 @@ def supervise(binary, destination):
         try:
             baseline = host_sample()
             emit("baseline", **baseline, rss_limit_bytes=RSS_LIMIT,
+                 phys_footprint_limit_bytes=FOOTPRINT_LIMIT,
                  deadline_seconds=DEADLINE, sample_interval_seconds=INTERVAL,
                  macos_version=command(["/usr/bin/sw_vers", "-productVersion"]).strip(),
                  host_memory_bytes=int(command(["/usr/sbin/sysctl", "-n", "hw.memsize"])),
                  attribution="ambient system activity cannot be attributed to PAM",
-                 cap="sampled soft stop, not an OS hard cap", rss_is_metal_total=False)
+                 cap="sampled soft stop, not an OS hard cap", rss_is_metal_total=False,
+                 footprint_excludes_clean_file_pages_and_includes_compressed=True)
             if baseline["pressure"] != 1:
                 reason = "baseline_system_pressure"
                 return 1
@@ -118,7 +139,15 @@ def supervise(binary, destination):
                             break
                         raise
                     state["rss_bytes"] = int(rss) * 1024  # ps RSS is KiB on macOS.
+                    try:
+                        state["phys_footprint_bytes"] = parse_footprint(
+                            command(["/usr/bin/footprint", "-p", str(child.pid)]))
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                        if child.poll() is not None:
+                            break
+                        raise
                     maximum = max(maximum, state["rss_bytes"])
+                    peak_footprint = max(peak_footprint, state["phys_footprint_bytes"])
                     emit("sample", **state,
                          added_swapout_pages=max(0, state["swapout_pages"] - baseline["swapout_pages"]))
                     reason = stop_reason(state, baseline, time.monotonic() - start)
@@ -167,7 +196,8 @@ def supervise(binary, destination):
                             pass
                     key.fileobj.close()
             emit("finished", reason=reason, exit_code=None if child is None else child.returncode,
-                 max_sampled_rss_bytes=maximum, output_bytes=counts,
+                 max_sampled_rss_bytes=maximum,
+                 max_sampled_phys_footprint_bytes=peak_footprint, output_bytes=counts,
                  children_ru_maxrss=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
                  children_ru_maxrss_before=usage_before, ru_maxrss_units="bytes_on_macos",
                  ru_maxrss_scope="all supervisor children including measurement commands",

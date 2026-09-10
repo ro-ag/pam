@@ -568,6 +568,56 @@ impl Store {
         args_json: &str,
         idempotency_key: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.insert_request_in_state(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            RequestState::Queued,
+        )
+        .await
+    }
+
+    /// Inserts a request already executing outside the queue, such as an admin op.
+    ///
+    /// The initial `running` state is written by the same INSERT as the identity
+    /// and arguments. A crash cannot expose an intermediate queued request to
+    /// queue recovery. Duplicate IDs fail exactly as in [`Self::insert_request`].
+    pub async fn insert_running_request(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.insert_request_in_state(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            RequestState::Running,
+        )
+        .await
+    }
+
+    // Keep the six public insertion fields intact; only the initial state differs.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_request_in_state(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+        state: RequestState,
+    ) -> Result<(), StoreError> {
         let _guard = self.conn_lock.lock().await;
         let now = now_ts();
         self.conn
@@ -583,7 +633,7 @@ impl Store {
                     caller_agent,
                     args_json,
                     idempotency_key,
-                    RequestState::Queued.as_str(),
+                    state.as_str(),
                     now
                 ],
             )

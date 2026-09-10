@@ -1565,3 +1565,46 @@ async fn connector_identity_changes_invalidate_all_test_fields() {
     assert_eq!(row.last_test_detail.as_deref(), Some("passed"));
     assert!(row.last_test_ts.is_some());
 }
+
+#[tokio::test]
+async fn running_request_insertion_is_atomic_and_rejects_duplicate_ids() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_running_request(
+            "req_admin",
+            "admin.connectors.configure",
+            "gui",
+            "pam-gui",
+            "{}",
+            Some("admin-key"),
+        )
+        .await
+        .unwrap();
+    let row = store.get_request("req_admin").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Running);
+    assert_eq!(row.capability, "admin.connectors.configure");
+    assert_eq!(row.repo, "gui");
+    assert_eq!(row.caller_agent, "pam-gui");
+    assert_eq!(row.args_json, "{}");
+    assert_eq!(row.idempotency_key.as_deref(), Some("admin-key"));
+    assert_eq!(row.outcome, None);
+    assert_eq!(row.created_ts, row.updated_ts);
+    assert!(store.list_queued_ordered().await.unwrap().is_empty());
+
+    let duplicate = store
+        .insert_running_request(
+            "req_admin",
+            "replacement",
+            "other",
+            "other",
+            "{\"changed\":true}",
+            None,
+        )
+        .await;
+    assert!(matches!(duplicate, Err(StoreError::Database(_))));
+    let unchanged = store.get_request("req_admin").await.unwrap().unwrap();
+    assert_eq!(unchanged.state, RequestState::Running);
+    assert_eq!(unchanged.capability, row.capability);
+    assert_eq!(unchanged.args_json, row.args_json);
+    assert_eq!(unchanged.idempotency_key, row.idempotency_key);
+}

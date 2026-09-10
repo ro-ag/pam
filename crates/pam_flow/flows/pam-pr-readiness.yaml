@@ -21,7 +21,7 @@ steps:
     needs: [fmt]
     timeout: 20m
   - id: transport-tests
-    run: [cargo, test, --manifest-path, vendor/zeromq/Cargo.toml, --lib, --offline]
+    run: [cargo, test, --manifest-path, vendor/zeromq/Cargo.toml, --lib, --locked]
     role: verify
     needs: [clippy]
     timeout: 10m

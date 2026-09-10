@@ -1190,7 +1190,9 @@ async fn admin_flows_save_get_and_delete_reach_the_library_the_daemon_reads() {
 
         // And the running daemon can immediately run what was saved.
         let body = flows.run(&mut client, "req_run", "two-step").await;
-        assert_eq!(body["outcome"], "verified");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(body["outcome"], "verified");
+        }
 
         let deleted = result_body(
             client

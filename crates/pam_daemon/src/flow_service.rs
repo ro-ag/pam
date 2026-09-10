@@ -53,6 +53,12 @@
 //! finished run without re-running it and `pam flow run --no-wait`
 //! callers can fetch the verdict off the ticket later.
 
+#[path = "flow_watch_runtime.rs"]
+mod watch_runtime;
+#[cfg(test)]
+#[path = "flow_watch_runtime_test.rs"]
+mod watch_runtime_test;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -664,7 +670,7 @@ impl FlowService {
         let mut blockers = Vec::new();
         let mut steps = Vec::new();
         for step in &flow.steps {
-            let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "live": "unknown"});
+            let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "watch": step.watch, "live": "unknown"});
             if step.gated() {
                 let granted = self
                     .store
@@ -1321,6 +1327,7 @@ struct RunState<'a> {
     observed: Vars,
     correlation: crate::correlation::Frozen,
     recovery: crate::flow_recovery::Recovery,
+    watch_grant_stamp: Option<(String, i64)>,
     cancel: watch::Receiver<bool>,
     reports: Vec<StepReport>,
     evidence: Vec<String>,
@@ -1357,6 +1364,7 @@ impl<'a> RunState<'a> {
             observed: restored.observed,
             vars: restored.vars,
             recovery,
+            watch_grant_stamp: None,
             correlation,
             cancel,
             reports: restored_reports,
@@ -1391,6 +1399,7 @@ impl RunState<'_> {
         }
         for (index, step) in self.flow.steps.iter().enumerate().skip(self.reports.len()) {
             let will_run = self.should_run(step);
+            self.watch_due(step)?;
             self.recovery
                 .prepare(&self.service.store, &self.ctx.request_id, step, will_run)
                 .await?;
@@ -1402,8 +1411,23 @@ impl RunState<'_> {
                     .await;
                 continue;
             }
-            self.publish_progress(index, total, &step.id).await;
-            let report = self.run_step(step).await?;
+            if self.recovery.watch.is_none() {
+                self.publish_progress(index, total, &step.id).await;
+            }
+            let mut report = self.run_step(step).await?;
+            if step.watch.is_some()
+                && let Some(watch) = &self.recovery.watch
+            {
+                if !report.evidence.contains(&watch.last_evidence) {
+                    report.evidence.push(watch.last_evidence.clone());
+                }
+                if !self.evidence.contains(&watch.last_evidence) {
+                    self.evidence.push(watch.last_evidence.clone());
+                }
+                if !self.all_origins.contains(&watch.origin) {
+                    self.all_origins.push(watch.origin.clone());
+                }
+            }
             if step.effect == pam_flow::Effect::Stateful
                 && (!report.evidence_unavailable.is_empty()
                     || report
@@ -1524,8 +1548,16 @@ impl RunState<'_> {
             );
             return Ok(report);
         }
+        if step.watch.is_some() {
+            self.watch_grant_stamp = Some(self.watch_stamp().await?);
+        }
         if step.gated()
             && let Some(blocked) = self.gate_step(step, &mut report).await?
+        {
+            return Ok(blocked);
+        }
+        if step.watch.is_some()
+            && let Some(blocked) = self.advance_watch(step).await?
         {
             return Ok(blocked);
         }
@@ -1580,9 +1612,16 @@ impl RunState<'_> {
         } else {
             CapabilityClass::Destructive
         };
-        let decision = self
-            .service
-            .gate
+        let current_gate;
+        let gate = if step.watch.is_some() {
+            current_gate = crate::policy::PolicyGate::new(Arc::clone(&self.service.store))
+                .await
+                .map_err(failed)?;
+            &current_gate
+        } else {
+            &self.service.gate
+        };
+        let decision = gate
             .evaluate_classified(&self.ctx.request_id, &name, class)
             .await
             .map_err(failed)?;
@@ -1597,6 +1636,9 @@ impl RunState<'_> {
                 Ok(Some(report.clone()))
             }
             GateDecision::RequireApproval { reason } => {
+                if self.watch_approval_valid(step).await? {
+                    return Ok(None);
+                }
                 let outcome = self
                     .service
                     .approvals
@@ -1663,7 +1705,21 @@ pub(crate) fn apply_connector_assertion(
         return;
     };
     let actual = result
-        .and_then(|value| value.get("status"))
+        .and_then(|value| {
+            if step.watch.is_some()
+                && matches!(
+                    step.action,
+                    Action::Connector {
+                        connector: ConnectorId::Github,
+                        ..
+                    }
+                )
+            {
+                value.pointer("/run/conclusion")
+            } else {
+                value.get("status")
+            }
+        })
         .and_then(Value::as_str);
     if actual != Some(expected.as_str()) {
         report.fail(StepStatus::Failed, CAUSE_STATUS_ASSERTION,
@@ -2061,6 +2117,7 @@ impl RunState<'_> {
                 retry_after: rate_limit_wait(&error),
             },
         };
+        let attempt = self.check_watch_pins(step, connector, attempt);
         let attempt = self.correlate_attempt(step, attempt).await;
         Some(assert_connector_attempt(step, attempt))
     }

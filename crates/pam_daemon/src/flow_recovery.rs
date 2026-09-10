@@ -172,9 +172,29 @@ fn status(value: &str) -> Result<StepStatus, CapabilityFailure> {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WatchState {
+    pub step: String,
+    pub args_fingerprint: String,
+    pub origin: ConnectorTarget,
+    pub profile_stamp: String,
+    pub authorization_revision: i64,
+    pub polls: u32,
+    pub errors: u32,
+    pub next_poll_ms: i64,
+    pub collecting: bool,
+    pub observation: Value,
+    pub pins: Value,
+    pub last_digest: String,
+    pub last_evidence: String,
+}
+
 pub(crate) struct Recovery {
     pub fingerprint: String,
     pub revision: i64,
+    pub watch: Option<WatchState>,
+    cursor: Cursor,
 }
 impl Recovery {
     pub async fn open(
@@ -240,10 +260,13 @@ impl Recovery {
             return Err(failure());
         }
         snapshot.authorize(store, ticket, repo).await?;
+        cursor.authorize_watch(store, ticket, repo, flow).await?;
         Ok((
             Self {
                 fingerprint,
                 revision: row.revision,
+                watch: cursor.watch.clone(),
+                cursor,
             },
             snapshot,
         ))
@@ -271,6 +294,39 @@ impl Recovery {
         self.revision += 1;
         Ok(())
     }
+    pub async fn settle_watch(
+        &mut self,
+        store: &Store,
+        ticket: &str,
+        watch: WatchState,
+        evidence: &[String],
+    ) -> Result<(), CapabilityFailure> {
+        if encode(&watch)?.len() > 16 * 1024 {
+            return Err(failure());
+        }
+        let cursor = Cursor {
+            evidence_id: self.cursor.evidence_id.clone(),
+            next_step: self.cursor.next_step,
+            watch: Some(watch.clone()),
+            last_watch_evidence: Some(watch.last_evidence.clone()),
+        };
+        let json = serde_json::to_string(&cursor).map_err(|_| failure())?;
+        let mut refs = evidence.to_vec();
+        if !refs.contains(&watch.last_evidence) {
+            refs.push(watch.last_evidence.clone());
+        }
+        if !store
+            .settle_flow_attempt(ticket, self.revision, &json, &refs, false)
+            .await
+            .map_err(|_| failure())?
+        {
+            return Err(failure());
+        }
+        self.revision += 1;
+        self.watch = Some(watch);
+        self.cursor = cursor;
+        Ok(())
+    }
     pub async fn settle(
         &mut self,
         store: &Store,
@@ -278,7 +334,14 @@ impl Recovery {
         snapshot: &Snapshot,
         completed: bool,
     ) -> Result<(), CapabilityFailure> {
-        let cursor = file(store, ticket, snapshot).await?;
+        let mut cursor: Cursor =
+            serde_json::from_str(&file(store, ticket, snapshot).await?).map_err(|_| failure())?;
+        cursor.last_watch_evidence = self
+            .watch
+            .as_ref()
+            .map(|w| w.last_evidence.clone())
+            .or_else(|| self.cursor.last_watch_evidence.clone());
+        let cursor = serde_json::to_string(&cursor).map_err(|_| failure())?;
         if !store
             .settle_flow_attempt(
                 ticket,
@@ -293,6 +356,8 @@ impl Recovery {
             return Err(failure());
         }
         self.revision += 1;
+        self.cursor = serde_json::from_str(&cursor).map_err(|_| failure())?;
+        self.watch = None;
         Ok(())
     }
 }
@@ -301,6 +366,54 @@ impl Recovery {
 struct Cursor {
     evidence_id: String,
     next_step: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch: Option<WatchState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_watch_evidence: Option<String>,
+}
+impl Cursor {
+    async fn authorize_watch(
+        &self,
+        store: &Store,
+        ticket: &str,
+        repo: &Path,
+        flow: &Flow,
+    ) -> Result<(), CapabilityFailure> {
+        if let Some(watch) = &self.watch {
+            if encode(watch)?.len() > 16 * 1024
+                || flow
+                    .steps
+                    .get(self.next_step)
+                    .is_none_or(|step| step.id != watch.step || step.watch.is_none())
+                || watch.polls > 100
+            {
+                return Err(failure());
+            }
+            let policy = ScopePolicy::load(store).await.map_err(|_| failure())?;
+            authorize_origin(
+                store,
+                &policy,
+                repo,
+                &EvidenceOrigin {
+                    targets: vec![watch.origin.clone()],
+                },
+            )
+            .await?;
+            let view = store
+                .evidence_view_meta(ticket, &watch.last_evidence, &repo.to_string_lossy())
+                .await
+                .map_err(|_| failure())?
+                .ok_or_else(failure)?;
+            if view.expired_at.is_some()
+                || view.authorization_revision != Some(watch.authorization_revision)
+            {
+                return Err(failure());
+            }
+            let origin = serde_json::from_str(&view.origin_json).map_err(|_| failure())?;
+            authorize_origin(store, &policy, repo, &origin).await?;
+        }
+        Ok(())
+    }
 }
 async fn file(
     store: &Store,
@@ -316,6 +429,8 @@ async fn file(
     serde_json::to_string(&Cursor {
         evidence_id,
         next_step: snapshot.reports.len(),
+        watch: None,
+        last_watch_evidence: None,
     })
     .map_err(|_| failure())
 }

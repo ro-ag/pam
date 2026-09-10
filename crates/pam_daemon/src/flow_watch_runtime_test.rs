@@ -198,3 +198,38 @@ async fn substituted_run_is_committed_as_conflict_without_replacing_valid_pins()
             .any(|evidence| evidence.id == "ev_conflict")
     );
 }
+
+#[test]
+fn only_transient_connector_errors_consume_watch_outage_allowance() {
+    use crate::connector_service::InvokeError;
+    use pam_connectors::ConnectorError;
+    for error in [
+        ConnectorError::Auth,
+        ConnectorError::Forbidden,
+        ConnectorError::NotFound,
+        ConnectorError::BadArgs("bad selector".into()),
+        ConnectorError::BadResponse("wrong identity".into()),
+        ConnectorError::Certificate,
+        ConnectorError::TooLarge {
+            bytes: 2,
+            maximum: 1,
+        },
+    ] {
+        assert!(!super::watch_runtime::watch_retryable(
+            &InvokeError::Connector(error)
+        ));
+    }
+    for error in [
+        ConnectorError::Timeout,
+        ConnectorError::Network("offline".into()),
+        ConnectorError::RateLimited { retry_after: None },
+        ConnectorError::Remote { status: 503 },
+    ] {
+        assert!(super::watch_runtime::watch_retryable(
+            &InvokeError::Connector(error)
+        ));
+    }
+    assert!(!super::watch_runtime::watch_retryable(
+        &InvokeError::CredentialMissing
+    ));
+}

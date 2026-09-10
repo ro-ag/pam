@@ -44,7 +44,18 @@ async fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
     let (status, result) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
-    result_output(&ctx.request_id, &ticket, &status, result.as_ref())
+    let mut output = result_output(&ctx.request_id, &ticket, &status, result.as_ref())?;
+    if let Some(progress) = ctx
+        .store
+        .flow_watch_progress(&ticket, &status.repository)
+        .await
+        .map_err(|_| unavailable())?
+    {
+        output.body["watch"] = serde_json::from_str(&progress).map_err(|_| unavailable())?;
+        // Progress may have been published after the first origin snapshot.
+        authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+    }
+    bounded_output(&ctx.request_id, output.outcome, output.body)
 }
 
 /// Preserve lifecycle state even when no final agent projection exists yet.

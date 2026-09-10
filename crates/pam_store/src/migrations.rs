@@ -53,6 +53,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: SCHEMA_V9,
     },
+    Migration {
+        version: 10,
+        sql: SCHEMA_V10,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -318,5 +322,16 @@ CREATE TABLE flow_journal (
  effectful INTEGER NOT NULL CHECK(effectful IN (0,1)),
  checkpoint_json TEXT NOT NULL CHECK(length(CAST(checkpoint_json AS BLOB))<=131072),
  evidence_refs_json TEXT NOT NULL CHECK(length(CAST(evidence_refs_json AS BLOB))<=16384)
+);
+";
+
+const SCHEMA_V10: &str = "
+ALTER TABLE request ADD COLUMN resume_at_ms INTEGER;
+CREATE TABLE correlation_membership (
+ request_id TEXT NOT NULL,
+ step_id TEXT NOT NULL,
+ members_json TEXT NOT NULL CHECK(length(CAST(members_json AS BLOB))<=16384),
+ PRIMARY KEY(request_id,step_id),
+ FOREIGN KEY(request_id,step_id) REFERENCES correlation_step(request_id,step_id) ON DELETE CASCADE
 );
 ";

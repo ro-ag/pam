@@ -109,9 +109,9 @@ refuse recovery explicitly; inspect their evidence and start a new request after
 upgrading rather than rewriting the original association.
 
 Three consecutive unavailable observations stop with `watch_outage_limit`.
-PAM policy, credential-availability and configuration refusals stop directly, as
-do observations rejected by the watch normalizer. Other adapter errors currently
-consume the outage allowance, including rejected credentials or product access. Target
+Only transient transport, timeout, server and rate-limit errors consume this
+allowance. Policy, credential, access, configuration, missing-resource, malformed
+response and size refusals stop directly, as do rejected observations. Target
 changes retain conflicting evidence and stop with `watch_target_changed`;
 accepted pins are not replaced. Poll, collection-budget and scheduling limits
 produce `watch_poll_limit`, `watch_collection_budget` or `watch_deadline`.

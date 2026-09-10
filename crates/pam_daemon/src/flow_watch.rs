@@ -211,8 +211,8 @@ pub(crate) fn next_delay(
     polls: u32,
     retry_after: Option<Duration>,
 ) -> Duration {
-    let base = interval.clamp(Duration::from_secs(5), Duration::from_secs(300));
-    let cap = max_interval.clamp(base, Duration::from_secs(300));
+    let base = interval.clamp(Duration::from_secs(5), Duration::from_mins(5));
+    let cap = max_interval.clamp(base, Duration::from_mins(5));
     base.saturating_mul(1_u32 << polls.saturating_sub(1).min(6))
         .min(cap)
         .max(retry_after.unwrap_or_default())

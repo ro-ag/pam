@@ -1,7 +1,14 @@
 //! One bounded remote poll per existing flow journal lease.
-use super::*;
+use super::{
+    Action, Arc, ArgValue, Attempt, BTreeMap, CallResult, CapabilityFailure, ConnectorId, Duration,
+    Instant, RunState, Step, StepReport, StepStatus, Value, cancelled, json, rate_limit_wait,
+};
 use crate::flow_recovery::{WatchState, failure};
 use crate::flow_watch::{self, State, WatchError};
+
+pub(super) fn watch_retryable(error: &crate::connector_service::InvokeError) -> bool {
+    matches!(error, crate::connector_service::InvokeError::Connector(error) if error.retryable())
+}
 
 fn now_ms() -> i64 {
     i64::try_from(
@@ -284,7 +291,7 @@ impl RunState<'_> {
             },
             Ok(_) => return Err(failure()),
             Err(error) => {
-                if blocks_the_run(&error) {
+                if !watch_retryable(&error) {
                     return Ok(Err(Box::new(blocked(step, error.cause(), error.detail()))));
                 }
                 let value = json!({"watch_state":"unavailable", "status":"unavailable"});

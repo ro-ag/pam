@@ -64,7 +64,7 @@ pub(crate) fn validate(
     if !(1..=100).contains(&max_polls)
         || interval < Duration::from_secs(5)
         || max_interval < interval
-        || max_interval > Duration::from_secs(300)
+        || max_interval > Duration::from_mins(5)
     {
         return Err(invalid());
     }

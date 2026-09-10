@@ -65,3 +65,12 @@ mod request_budget_test;
 
 #[cfg(test)]
 mod terminal_uncertainty_test;
+
+#[cfg(test)]
+mod watch_schedule_test;
+
+#[cfg(test)]
+mod watch_progress_test;
+
+#[cfg(test)]
+mod correlation_membership_test;

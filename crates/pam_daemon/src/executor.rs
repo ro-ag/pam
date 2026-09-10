@@ -123,6 +123,12 @@ pub struct CapabilityOutput {
 /// Why a capability did not produce an output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityFailure {
+    /// Internal continuation: a bounded watch saved its checkpoint and yields its lane.
+    /// Never serialized as a failure or accepted from an agent response.
+    Parked {
+        /// Earliest next poll in UTC milliseconds, under the original request expiry.
+        resume_at_ms: i64,
+    },
     /// The cancel signal fired (cancellation or lease reaping) and the
     /// capability stopped cooperatively.
     Cancelled,

@@ -474,10 +474,7 @@ async fn run_status(
     let mut observed = reported_run(&run);
     // Watch observations retain bounded reported identity, never arbitrary run fields.
     for key in ["name", "html_url", "head_sha", "created_at"] {
-        if !observed[key]
-            .as_str()
-            .is_some_and(|text| text.len() <= 2048)
-        {
+        if observed[key].as_str().is_none_or(|text| text.len() > 2048) {
             observed
                 .as_object_mut()
                 .expect("run projection")

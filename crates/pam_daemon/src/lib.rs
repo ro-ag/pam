@@ -120,3 +120,16 @@ mod flow_recovery_test;
 
 #[cfg(test)]
 mod flow_resume_integration_test;
+
+#[cfg(test)]
+mod queue_watch_test;
+
+mod flow_watch;
+#[cfg(test)]
+mod flow_watch_test;
+
+#[cfg(test)]
+mod correlation_test;
+
+#[cfg(test)]
+mod watch_integration_test;

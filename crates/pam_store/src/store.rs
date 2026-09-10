@@ -18,9 +18,13 @@ pub use flow_journal::*;
 #[path = "correlation.rs"]
 mod correlation;
 pub use correlation::*;
+#[path = "correlation_membership.rs"]
+mod correlation_membership;
 #[path = "flow_results.rs"]
 mod flow_results;
 pub use flow_results::*;
+#[path = "watch_progress.rs"]
+mod watch_progress;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2149,6 +2153,7 @@ impl Store {
             for sql in [
                 format!("DELETE FROM request_budget WHERE {children}"),
                 format!("DELETE FROM flow_journal WHERE {children}"),
+                format!("DELETE FROM correlation_membership WHERE {children}"),
                 format!("DELETE FROM correlation_step WHERE {children}"),
                 format!("DELETE FROM correlation_target WHERE {children}"),
                 format!("DELETE FROM evidence_view WHERE {children}"),

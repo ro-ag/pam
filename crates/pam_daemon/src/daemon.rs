@@ -902,6 +902,9 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
     let mut ticker = tokio::time::interval(EXECUTOR_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        for id in pipeline.queue.take_parked_terminals().await {
+            pipeline.finish_parked_terminal(&id).await;
+        }
         for repo in pipeline.queue.ready_repos().await {
             if let Ok(Some(work)) = pipeline.queue.take_next(&repo).await {
                 let pipeline = Arc::clone(&pipeline);
@@ -913,6 +916,7 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
         tokio::select! {
             () = signalled(&mut shutdown) => break,
             () = pipeline.work.notified() => {}
+            () = pipeline.queue.work_available() => {}
             _ = ticker.tick() => {}
         }
     }
@@ -1329,20 +1333,10 @@ impl Pipeline {
                     evidence: output.evidence,
                 }
             }
-            Ok(Err(CapabilityFailure::Cancelled)) => {
-                // Unreachable without a lease, but handled legibly.
-                let detail = cancelled_detail();
-                let _ = self
-                    .store
-                    .finish_request(
-                        id,
-                        RequestState::Failed,
-                        Some(CAUSE_CANCELLED),
-                        cancelled_entry(&detail),
-                    )
-                    .await;
-                let _ = self.events.publish(id, Event::Refused).await;
-                cancelled_refusal(id)
+            Ok(Err(CapabilityFailure::Cancelled)) => self.cancel_bypass(id).await,
+            Ok(Err(CapabilityFailure::Parked { .. })) => {
+                self.fail_bypass(id, &envelope.capability, "only a leased flow can park")
+                    .await
             }
             Ok(Err(CapabilityFailure::Failed { detail })) => {
                 self.fail_bypass(id, &envelope.capability, &detail).await
@@ -1377,6 +1371,22 @@ impl Pipeline {
         }
     }
 
+    async fn cancel_bypass(&self, id: &str) -> Response {
+        // Unreachable without a lease, but handled legibly.
+        let detail = cancelled_detail();
+        let _ = self
+            .store
+            .finish_request(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_CANCELLED),
+                cancelled_entry(&detail),
+            )
+            .await;
+        let _ = self.events.publish(id, Event::Refused).await;
+        cancelled_refusal(id)
+    }
+
     /// Executes one leased (laned) request and records its terminal
     /// state, audit row, events, and router completion.
     async fn execute_leased(&self, work: LeasedWork) {
@@ -1403,7 +1413,25 @@ impl Pipeline {
             self.work.notify_one();
             return;
         }
-        let _ = self.events.publish(&id, Event::Started).await;
+        let continuing_watch = row.capability == "flow.run"
+            && self
+                .store
+                .read_flow_journal(&id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|journal| {
+                    serde_json::from_str::<serde_json::Value>(&journal.checkpoint_json)
+                        .ok()
+                        .is_some_and(|cursor| {
+                            cursor
+                                .get("watch")
+                                .is_some_and(serde_json::Value::is_object)
+                        })
+                });
+        if !continuing_watch {
+            let _ = self.events.publish(&id, Event::Started).await;
+        }
 
         let result = match BuiltinCapability::from_name(&row.capability) {
             Some(capability) => {
@@ -1487,6 +1515,9 @@ impl Pipeline {
         let result = self.reconcile_flow_terminal(id, capability, result).await;
         match result {
             Ok(output) => self.complete_succeeded(id, capability, output).await,
+            Err(CapabilityFailure::Parked { resume_at_ms }) => {
+                self.complete_parked(id, capability, resume_at_ms).await;
+            }
             Err(CapabilityFailure::Cancelled) => {
                 let audit_detail = cancelled_detail();
                 let terminal = self
@@ -1502,7 +1533,7 @@ impl Pipeline {
                 if matches!(terminal, Ok(true)) {
                     let _ = self.events.publish(id, Event::Refused).await;
                     self.router.finish(id, cancelled_refusal(id)).await;
-                } else {
+                } else if matches!(terminal, Ok(false)) {
                     self.finish_reaped(id).await;
                 }
             }
@@ -1521,7 +1552,7 @@ impl Pipeline {
                 if matches!(terminal, Ok(true)) {
                     let _ = self.events.publish(id, Event::Refused).await;
                     self.router.finish(id, failure_refusal(id, detail)).await;
-                } else {
+                } else if matches!(terminal, Ok(false)) {
                     self.finish_reaped(id).await;
                 }
             }
@@ -1530,35 +1561,64 @@ impl Pipeline {
                 detail,
                 recovery,
             }) => {
-                let audit_detail = execution_refusal_detail(capability, &cause, &detail);
-                let terminal = self
-                    .queue
-                    .complete(
-                        id,
-                        RequestState::Refused,
-                        Some(&cause),
-                        execution_refusal_entry(&audit_detail),
-                    )
+                self.complete_refused_leased(id, capability, cause, detail, recovery)
                     .await;
-                log_terminal_failure(id, &terminal);
-                if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(id, Event::Refused).await;
-                    self.router
-                        .finish(
-                            id,
-                            Response::Refusal {
-                                id: id.to_owned(),
-                                cause,
-                                detail,
-                                recovery,
-                            },
-                        )
-                        .await;
-                } else {
-                    self.finish_reaped(id).await;
-                }
             }
         }
+    }
+
+    async fn complete_refused_leased(
+        &self,
+        id: &str,
+        capability: &str,
+        cause: String,
+        detail: String,
+        recovery: String,
+    ) {
+        let audit_detail = execution_refusal_detail(capability, &cause, &detail);
+        let terminal = self
+            .queue
+            .complete(
+                id,
+                RequestState::Refused,
+                Some(&cause),
+                execution_refusal_entry(&audit_detail),
+            )
+            .await;
+        log_terminal_failure(id, &terminal);
+        if matches!(terminal, Ok(true)) {
+            let _ = self.events.publish(id, Event::Refused).await;
+            self.router
+                .finish(
+                    id,
+                    Response::Refusal {
+                        id: id.to_owned(),
+                        cause,
+                        detail,
+                        recovery,
+                    },
+                )
+                .await;
+        } else if matches!(terminal, Ok(false)) {
+            self.finish_reaped(id).await;
+        }
+    }
+
+    async fn complete_parked(&self, id: &str, capability: &str, resume_at_ms: i64) {
+        if capability == "flow.run" && matches!(self.queue.park(id, resume_at_ms).await, Ok(true)) {
+            self.work.notify_one();
+            return;
+        }
+        self.complete_refused_leased(
+            id,
+            capability,
+            "watch_resume_unavailable".to_owned(),
+            "The watch could not retain its original authorization, deadline or checkpoint."
+                .to_owned(),
+            "Inspect the last retained observation and current access before submitting new work."
+                .to_owned(),
+        )
+        .await;
     }
 
     /// The success arm of [`Self::complete_leased`].
@@ -1587,7 +1647,7 @@ impl Pipeline {
                     },
                 )
                 .await;
-        } else {
+        } else if matches!(terminal, Ok(false)) {
             // The lease was reaped first: the reaper wrote the terminal
             // row and audit; release any waiters.
             self.finish_reaped(id).await;
@@ -1608,6 +1668,12 @@ impl Pipeline {
             )
             .await;
         log_terminal_failure(id, &terminal);
+        if matches!(terminal, Ok(true)) {
+            let _ = self.events.publish(id, Event::Refused).await;
+            self.router.finish(id, internal_refusal(id)).await;
+        } else if matches!(terminal, Ok(false)) {
+            self.finish_reaped(id).await;
+        }
         self.work.notify_one();
     }
 
@@ -1815,6 +1881,10 @@ impl Pipeline {
     /// Releases waiters of a request whose lease was reaped mid-flight
     /// (the reaper already wrote the terminal row and audit).
     async fn finish_reaped(&self, id: &str) {
+        if !matches!(self.store.request_status_meta(id).await, Ok(Some(row)) if row.state.is_terminal())
+        {
+            return;
+        }
         let _ = self.events.publish(id, Event::Refused).await;
         let response = self
             .preserve_terminal_uncertainty(
@@ -1827,6 +1897,20 @@ impl Pipeline {
                 },
             )
             .await;
+        self.router.finish(id, response).await;
+    }
+
+    async fn finish_parked_terminal(&self, id: &str) {
+        let response = match self.store.request_status_meta(id).await {
+            Ok(Some(row)) if row.state.is_terminal() => Response::Refusal {
+                id: id.to_owned(),
+                cause: row.outcome.unwrap_or_else(|| "watch_stopped".to_owned()),
+                detail: "The request stopped before execution resumed; this does not establish a remote job failure.".to_owned(),
+                recovery: "Read retained evidence and inspect the original deadline and current access.".to_owned(),
+            },
+            Ok(_) | Err(_) => internal_refusal(id),
+        };
+        let _ = self.events.publish(id, Event::Refused).await;
         self.router.finish(id, response).await;
     }
 

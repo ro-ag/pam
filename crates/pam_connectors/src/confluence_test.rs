@@ -70,20 +70,23 @@ async fn a_next_link_or_a_bigger_total_makes_the_answer_partial() {
 }
 
 #[tokio::test]
-async fn page_expands_the_storage_body() {
+async fn page_uses_v2_storage_and_keeps_space_identity_distinct() {
     let transport = FakeTransport::new().json(
         200,
-        r#"{"id":"42","type":"page","title":"Runbook","space":{"key":"OPS"},
-            "version":{"number":7},"body":{"storage":{"value":"<p>steps</p>"}}}"#,
+        r#"{"id":"42","title":"Runbook","spaceId":"900","status":"current",
+            "version":{"number":7},"body":{"storage":{"representation":"storage","value":"<p>steps</p>"}}}"#,
     );
     let result = run("page", &[("id", "42")], &transport).await.unwrap();
 
     let url = transport.url(0);
     assert!(
-        url.starts_with("https://acme.atlassian.net/wiki/rest/api/content/42?"),
+        url.starts_with("https://acme.atlassian.net/wiki/api/v2/pages/42?"),
         "{url}"
     );
-    assert!(url.contains("body.storage"), "{url}");
+    assert_eq!(
+        url,
+        "https://acme.atlassian.net/wiki/api/v2/pages/42?body-format=storage"
+    );
 
     let CallResult::Json(value) = result else {
         panic!("page answers with JSON");
@@ -91,6 +94,10 @@ async fn page_expands_the_storage_body() {
     assert_eq!(value["partial"], false);
     assert_eq!(value["page"]["body"], "<p>steps</p>");
     assert_eq!(value["page"]["title"], "Runbook");
+    assert_eq!(value["page"]["space_id"], "900");
+    assert!(value["page"]["space"].is_null());
+    assert_eq!(value["page"]["version"], 7);
+    assert_eq!(value["page"]["type"], "page");
 }
 
 #[tokio::test]
@@ -110,7 +117,16 @@ async fn a_long_page_body_is_cut_and_the_answer_says_so() {
 #[tokio::test]
 async fn a_content_id_that_is_not_an_id_is_refused() {
     let transport = FakeTransport::new();
-    for id in ["../secrets", "42/child", "", "a b"] {
+    for id in [
+        "../secrets",
+        "42/child",
+        "",
+        "a b",
+        "abc",
+        "0",
+        "+42",
+        "18446744073709551616",
+    ] {
         let error = run("page", &[("id", id)], &transport).await.unwrap_err();
         assert_eq!(error.cause(), "connector_bad_args", "{id}");
     }
@@ -214,4 +230,49 @@ fn connection() -> Connection {
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+
+#[tokio::test]
+async fn page_refuses_missing_or_mismatched_identity_and_storage_body() {
+    for response in [
+        serde_json::json!({"id":"other","body":{"storage":{"value":"wrong page"}}}),
+        serde_json::json!({"body":{"storage":{"value":"unidentified"}}}),
+        serde_json::json!({"id":42,"body":{"storage":{"value":"wrong id type"}}}),
+        serde_json::json!({"id":"42"}),
+        serde_json::json!({"id":"42","body":{"atlas_doc_format":{"value":"unsupported representation"}}}),
+        serde_json::json!({"id":"42","body":{"storage":{"value":null}}}),
+    ] {
+        let transport = FakeTransport::new().json(200, &response.to_string());
+        assert_eq!(
+            run("page", &[("id", "42")], &transport)
+                .await
+                .unwrap_err()
+                .cause(),
+            "connector_bad_response"
+        );
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "no deprecated endpoint fallback"
+        );
+    }
+    let transport =
+        FakeTransport::new().json(200, r#"{"id":"42","body":{"storage":{"value":""}}}"#);
+    let CallResult::Json(value) = run("page", &[("id", "42")], &transport).await.unwrap() else {
+        panic!("JSON");
+    };
+    assert_eq!(value["page"]["body"], "");
+    assert_eq!(value["partial"], false, "explicit empty content is valid");
+}
+
+#[tokio::test]
+async fn page_truncation_preserves_utf8_at_the_byte_boundary() {
+    let body = format!("{}érest", "x".repeat(65_535));
+    let response = serde_json::json!({"id":"42","body":{"storage":{"value":body}}});
+    let transport = FakeTransport::new().json(200, &response.to_string());
+    let CallResult::Json(value) = run("page", &[("id", "42")], &transport).await.unwrap() else {
+        panic!("JSON");
+    };
+    assert_eq!(value["partial"], true);
+    assert_eq!(value["page"]["body"].as_str().unwrap(), "x".repeat(65_535));
 }

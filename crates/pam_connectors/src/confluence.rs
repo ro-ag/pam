@@ -74,7 +74,8 @@ async fn search(
     })))
 }
 
-/// `GET /rest/api/content/{id}?expand=body.storage,space,version`.
+/// `GET /wiki/api/v2/pages/{id}?body-format=storage` (base includes `/wiki/`).
+/// V2 page reads are separate from the still-v1 CQL search representation.
 async fn page(
     conn: &Connection,
     args: &BTreeMap<String, ArgValue>,
@@ -82,21 +83,40 @@ async fn page(
     deadline: Instant,
 ) -> Result<CallResult, ConnectorError> {
     let id = content_id(args)?;
-    let mut url = endpoint(&conn.base_url, &["rest", "api", "content", &id])?;
-    url.query_pairs_mut()
-        .append_pair("expand", "body.storage,space,version");
+    let mut url = endpoint(&conn.base_url, &["api", "v2", "pages", &id])?;
+    url.query_pairs_mut().append_pair("body-format", "storage");
     let response = get_json(conn, ID, url, transport, deadline).await?;
 
+    if response.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+        return Err(ConnectorError::BadResponse(
+            "Confluence page identity does not match the requested id".to_owned(),
+        ));
+    }
     let raw = response
         .get("body")
         .and_then(|body| body.get("storage"))
         .and_then(|storage| storage.get("value"))
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            ConnectorError::BadResponse(
+                "Confluence v2 page carries no storage body value".to_owned(),
+            )
+        })?;
     let (body, cut) = cut_at(raw, MAX_BODY_BYTES);
     let mut page = summarize(&response);
     if let Some(object) = page.as_object_mut() {
         object.insert("body".to_owned(), Value::String(body));
+        object.insert("type".to_owned(), Value::String("page".to_owned()));
+        // V2 exposes an opaque space ID, not the v1 space key. Never substitute
+        // it into `space`, which remains null for this page representation.
+        object.insert("space".to_owned(), Value::Null);
+        object.insert(
+            "space_id".to_owned(),
+            response
+                .get("spaceId")
+                .and_then(Value::as_str)
+                .map_or(Value::Null, |id| Value::String(id.to_owned())),
+        );
     }
     Ok(CallResult::Json(json!({
         "partial": cut,
@@ -151,7 +171,10 @@ fn summarize(content: &Value) -> Value {
 /// Checks the `id` argument is a content id and not a path.
 fn content_id(args: &BTreeMap<String, ArgValue>) -> Result<String, ConnectorError> {
     let raw = text_arg(args, "id")?;
-    let ok = raw.len() <= 64 && raw.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    let ok = !raw.is_empty()
+        && raw.len() <= 20
+        && raw.bytes().all(|byte| byte.is_ascii_digit())
+        && raw.parse::<u64>().is_ok_and(|id| id > 0);
     if !ok {
         return Err(ConnectorError::BadArgs(format!(
             "`id` must be a Confluence content id, not `{raw}`"

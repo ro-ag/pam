@@ -110,6 +110,18 @@ async fn issue(
             "Jira Data Center description must be present as text or null; other representations are unsupported".to_owned(),
         )),
     };
+    let source_bytes = fields
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::len);
+    let content = content_metadata(&description, source_bytes, cut);
+    let updated = citation_text(fields.get("updated"), 128)?;
+    let source_url = citation_url(endpoint(&conn.base_url, &["browse", &key])?)?;
+    let citation = json!({
+        "provider": "jira_dc", "key": key, "source_url": source_url,
+        "url_basis": "configured_site", "revision_basis": "provider_updated",
+        "updated": updated, "representation": "text",
+    });
     let mut issue = summarize(&body);
     if let Some(object) = issue.as_object_mut() {
         object.insert("description".to_owned(), description);
@@ -117,6 +129,8 @@ async fn issue(
     Ok(CallResult::Json(json!({
         "partial": cut,
         "issue": issue,
+        "citation": citation,
+        "content": content,
     })))
 }
 
@@ -197,4 +211,51 @@ pub(crate) fn cut_at(text: &str, maximum: usize) -> (String, bool) {
         end -= 1;
     }
     (text[..end].to_owned(), true)
+}
+
+/// Provider timestamps/IDs are observations, never instruction-bearing URLs.
+pub(crate) fn citation_text(
+    value: Option<&Value>,
+    maximum: usize,
+) -> Result<Value, ConnectorError> {
+    match value {
+        None | Some(Value::Null) => Ok(Value::Null),
+        Some(Value::String(text))
+            if !text.is_empty() && text.len() <= maximum && !text.chars().any(char::is_control) =>
+        {
+            Ok(Value::String(text.clone()))
+        }
+        _ => Err(ConnectorError::BadResponse(
+            "invalid or oversized citation metadata".to_owned(),
+        )),
+    }
+}
+
+/// Reconstructed from configured site and validated identity, never `_links`.
+pub(crate) fn citation_url(url: url::Url) -> Result<String, ConnectorError> {
+    if url.as_str().len() > 4096
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConnectorError::BadResponse(
+            "invalid or oversized citation URL".to_owned(),
+        ));
+    }
+    Ok(url.to_string())
+}
+
+/// Describes the retained text without treating a missing response as empty.
+pub(crate) fn content_metadata(value: &Value, source_bytes: Option<usize>, cut: bool) -> Value {
+    let retained = value.as_str().map_or(0, str::len);
+    let state = if cut {
+        "truncated"
+    } else if value.is_null() {
+        "null"
+    } else if retained == 0 {
+        "empty"
+    } else {
+        "present"
+    };
+    json!({"state":state,"source_bytes":source_bytes,"retained_bytes":retained})
 }

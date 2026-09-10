@@ -11,7 +11,7 @@ use pam_flow::{ArgValue, ConnectorId};
 use serde_json::{Value, json};
 
 use crate::error::ConnectorError;
-use crate::jira::cut_at;
+use crate::jira::{citation_text, citation_url, content_metadata, cut_at};
 use crate::transport::{
     Connection, HttpTransport, array_field, endpoint, get_json, int_arg, text_arg,
 };
@@ -102,7 +102,16 @@ async fn page(
                 "Confluence v2 page carries no storage body value".to_owned(),
             )
         })?;
+    if let Some(representation) = response.pointer("/body/storage/representation")
+        && representation.as_str() != Some("storage")
+    {
+        return Err(ConnectorError::BadResponse(
+            "Confluence returned a conflicting body representation".to_owned(),
+        ));
+    }
     let (body, cut) = cut_at(raw, MAX_BODY_BYTES);
+    let content = content_metadata(&Value::String(body.clone()), Some(raw.len()), cut);
+    let citation = page_citation(conn, &id, &response)?;
     let mut page = summarize(&response);
     if let Some(object) = page.as_object_mut() {
         object.insert("body".to_owned(), Value::String(body));
@@ -121,6 +130,8 @@ async fn page(
     Ok(CallResult::Json(json!({
         "partial": cut,
         "page": page,
+        "citation": citation,
+        "content": content,
     })))
 }
 
@@ -181,4 +192,28 @@ fn content_id(args: &BTreeMap<String, ArgValue>) -> Result<String, ConnectorErro
         )));
     }
     Ok(raw.to_owned())
+}
+
+/// A current page URL identifies the page; the reported version identifies the
+/// captured response. Neither promises that opening the URL replays that version.
+fn page_citation(conn: &Connection, id: &str, response: &Value) -> Result<Value, ConnectorError> {
+    let mut url = endpoint(&conn.base_url, &["pages", "viewpage.action"])?;
+    url.query_pairs_mut().clear().append_pair("pageId", id);
+    let version = match response.get("version") {
+        None | Some(Value::Null) => Value::Null,
+        Some(version) => match version.get("number") {
+            Some(value) if value.as_u64().is_some_and(|number| number > 0) => value.clone(),
+            _ => {
+                return Err(ConnectorError::BadResponse(
+                    "Confluence version must contain a positive number".to_owned(),
+                ));
+            }
+        },
+    };
+    Ok(json!({
+        "provider":"confluence_cloud", "id":id, "source_url":citation_url(url)?,
+        "url_basis":"configured_site", "revision_basis":"provider_version",
+        "version":version, "space_id":citation_text(response.get("spaceId"),128)?,
+        "representation":"storage",
+    }))
 }

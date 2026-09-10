@@ -651,6 +651,32 @@ impl FlowService {
             "steps": report.steps,
         });
 
+        let capture = crate::evidence_service::CaptureScope {
+            repository: state.repo.to_string_lossy().into_owned(),
+            origin: crate::evidence_service::EvidenceOrigin {
+                targets: state.all_origins,
+            },
+        };
+        let (verdict_id, body) = self
+            .file_verdict(ctx, flow, &report, &body, &capture)
+            .await?;
+        let mut evidence = state.evidence;
+        evidence.push(verdict_id);
+        Ok(CapabilityOutput {
+            outcome: report.outcome,
+            body,
+            evidence,
+        })
+    }
+
+    async fn file_verdict(
+        &self,
+        ctx: &ExecContext,
+        flow: &Flow,
+        report: &RunReport,
+        body: &Value,
+        capture: &crate::evidence_service::CaptureScope,
+    ) -> Result<(String, Value), CapabilityFailure> {
         let failed = report
             .steps
             .iter()
@@ -663,55 +689,43 @@ impl FlowService {
             "steps": report.steps.len(),
             "failed": failed,
         });
+        let bytes = serde_json::to_vec(body).map_err(|error| CapabilityFailure::Failed {
+            detail: error.to_string(),
+        })?;
         self.store
             .insert_evidence(
                 &verdict_id,
                 &ctx.request_id,
                 EVIDENCE_KIND_FLOW_RESULT,
-                &serde_json::to_vec(&body).map_err(|error| CapabilityFailure::Failed {
-                    detail: format!("the flow verdict did not serialize: {error}"),
-                })?,
+                &bytes,
                 Some(&meta.to_string()),
             )
             .await
             .map_err(failed_store)?;
 
-        let view = crate::evidence_view::redact(&serde_json::to_vec(&body).map_err(|error| {
-            CapabilityFailure::Failed {
+        let mut body =
+            crate::evidence_view::redact_json(body).map_err(|error| CapabilityFailure::Failed {
                 detail: error.to_string(),
+            })?;
+        let published = match crate::evidence_service::prepare(bytes).await {
+            Ok(view) => {
+                crate::evidence_service::publish(
+                    &self.store,
+                    capture,
+                    &ctx.request_id,
+                    &verdict_id,
+                    view,
+                    json!({"kind": "protected_flow_result"}),
+                )
+                .await
             }
-        })?)
-        .map_err(|error| CapabilityFailure::Failed {
-            detail: error.to_string(),
-        })?;
-        let capture = crate::evidence_service::CaptureScope {
-            repository: state.repo.to_string_lossy().into_owned(),
-            origin: crate::evidence_service::EvidenceOrigin {
-                targets: state.all_origins,
-            },
+            Err(error) => Err(error),
         };
-        crate::evidence_service::publish(
-            &self.store,
-            &capture,
-            &ctx.request_id,
-            &verdict_id,
-            view,
-            json!({"kind": "protected_flow_result"}),
-        )
-        .await
-        .map_err(|detail| CapabilityFailure::Failed { detail })?;
-        let body = crate::evidence_view::redact_json(&body).map_err(|error| {
-            CapabilityFailure::Failed {
-                detail: error.to_string(),
-            }
-        })?;
-        let mut evidence = state.evidence;
-        evidence.push(verdict_id);
-        Ok(CapabilityOutput {
-            outcome: report.outcome,
-            body,
-            evidence,
-        })
+        if let Err(error) = published {
+            tracing::warn!(%error, "flow result view unavailable");
+            body["evidence_unavailable"] = json!([format!("{verdict_id}: view_unavailable")]);
+        }
+        Ok((verdict_id, body))
     }
 
     /// Builds the `${…}` values a run starts with: `repo.*` first, then

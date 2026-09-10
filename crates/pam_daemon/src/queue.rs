@@ -653,14 +653,18 @@ impl QueueManager {
             return Err(QueueError::NotTerminal { state: final_state });
         }
         let mut inner = self.inner.lock().await;
-        let Some(lease) = inner.leases.remove(request_id) else {
+        let Some(lease) = inner.leases.get(request_id) else {
             return Ok(false);
         };
-        inner.busy.remove(&lease.repo);
+        let repo = lease.repo.clone();
+        // A failed terminal write must retain ownership so completion can be
+        // retried or reaped; it is not evidence that another writer finished.
         let finished = self
             .store
             .finish_request(request_id, final_state, outcome, audit)
             .await?;
+        inner.leases.remove(request_id);
+        inner.busy.remove(&repo);
         Ok(finished)
     }
 

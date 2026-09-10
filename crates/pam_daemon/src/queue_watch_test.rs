@@ -406,3 +406,37 @@ async fn full_notice_buffer_retains_revoked_ready_entry_until_drain() {
     assert!(queue.take_parked_terminals().await.is_empty());
     assert_eq!(store.admission_usage().await.unwrap().0, 0);
 }
+
+#[tokio::test]
+async fn terminal_store_error_keeps_lease_and_blocks_next_repository_work() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = QueueManager::new(Arc::clone(&store));
+    enqueue(&queue, "running").await;
+    enqueue(&queue, "next").await;
+    queue.take_next("/repo").await.unwrap().unwrap();
+    // Existing store APIs supply a deterministic failure inside the terminal
+    // transaction: simulate a missing row without adding a fault-injection API.
+    store
+        .finish_request("running", RequestState::Done, Some("fixture"), audit())
+        .await
+        .unwrap();
+    store.prune_requests_before(i64::MAX).await.unwrap();
+    assert!(
+        queue
+            .complete("running", RequestState::Done, Some("ok"), audit())
+            .await
+            .is_err()
+    );
+    assert_eq!(queue.leased_ids().await, ["running"]);
+    assert!(queue.take_next("/repo").await.unwrap().is_none());
+    assert_eq!(
+        store
+            .request_status_meta("next")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Queued
+    );
+    assert!(queue.take_parked_terminals().await.is_empty());
+}

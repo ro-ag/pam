@@ -109,21 +109,15 @@ pub(crate) async fn call(
         report["revision_basis"] = json!("pull_request_unsupported");
         report["gaps"] = json!(["pull_request_revision_unavailable"]);
     } else {
-        let mut params = vec!["project", "p", "ps"];
-        if request.selector.is_some() {
-            params.push("branch");
+        match read_history(&request, conn, &catalog, transport, deadline).await? {
+            History::Page(history) => {
+                apply_history(&mut report, &history, &analysis, request.page)?
+            }
+            History::Unavailable(cause) => {
+                report["revision_basis"] = json!("missing");
+                report["gaps"] = json!([format!("history_{cause}")]);
+            }
         }
-        require(&catalog, "api/project_analyses", "search", &params)?;
-        let mut url = endpoint(&conn.base_url, &["api", "project_analyses", "search"])?;
-        url.query_pairs_mut()
-            .append_pair("project", request.project)
-            .append_pair("p", &request.page.to_string())
-            .append_pair("ps", "100");
-        if let Some((key, value)) = request.selector {
-            url.query_pairs_mut().append_pair(key, value);
-        }
-        let history = get_json(conn, ID, url, transport, deadline).await?;
-        apply_history(&mut report, &history, &analysis, request.page)?;
     }
     let mut url = endpoint(&conn.base_url, &["api", "qualitygates", "project_status"])?;
     url.query_pairs_mut().append_pair("analysisId", &analysis);
@@ -131,6 +125,52 @@ pub(crate) async fn call(
     apply_gate(&mut report, &gate, &analysis)?;
     report["summary"] = json!(summary(&report));
     Ok(CallResult::Json(report))
+}
+
+/// Optional revision history must not erase an available pinned gate. Policy
+/// refusals and malformed identities still fail closed; no unfiltered retry.
+enum History {
+    Page(Value),
+    Unavailable(&'static str),
+}
+
+async fn read_history(
+    request: &Request<'_>,
+    conn: &Connection,
+    catalog: &Value,
+    transport: &dyn HttpTransport,
+    deadline: Instant,
+) -> Result<History, ConnectorError> {
+    let mut params = vec!["project", "p", "ps"];
+    if request.selector.is_some() {
+        params.push("branch");
+    }
+    if require(catalog, "api/project_analyses", "search", &params).is_err() {
+        return Ok(History::Unavailable("contract_unavailable"));
+    }
+    let mut url = endpoint(&conn.base_url, &["api", "project_analyses", "search"])?;
+    url.query_pairs_mut()
+        .append_pair("project", request.project)
+        .append_pair("p", &request.page.to_string())
+        .append_pair("ps", "100");
+    if let Some((key, value)) = request.selector {
+        url.query_pairs_mut().append_pair(key, value);
+    }
+    match get_json(conn, ID, url, transport, deadline).await {
+        Ok(history) => Ok(History::Page(history)),
+        Err(
+            error @ (ConnectorError::Forbidden
+            | ConnectorError::NotFound
+            | ConnectorError::Auth
+            | ConnectorError::Network(_)
+            | ConnectorError::Timeout
+            | ConnectorError::Certificate
+            | ConnectorError::Remote { .. }
+            | ConnectorError::RateLimited { .. }
+            | ConnectorError::TooLarge { .. }),
+        ) => Ok(History::Unavailable(error.cause())),
+        Err(error) => Err(error),
+    }
 }
 
 fn task_report(request: &Request<'_>, task: &Value) -> Result<Value, ConnectorError> {

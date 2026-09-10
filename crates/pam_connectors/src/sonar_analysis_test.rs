@@ -266,3 +266,50 @@ async fn no_gate_and_conflicting_gate_project_remain_distinct() {
     );
     assert!(run(&args(), &transport).await.is_err());
 }
+
+#[tokio::test]
+async fn unavailable_scoped_history_keeps_the_pinned_gate_without_an_unfiltered_retry() {
+    let catalog_without_branch = json!({"webServices":[
+        {"path":"api/ce","actions":[{"key":"task","params":[{"key":"id"}]}]},
+        {"path":"api/project_analyses","actions":[{"key":"search","params":[{"key":"project"},{"key":"p"},{"key":"ps"}]}]},
+        {"path":"api/qualitygates","actions":[{"key":"project_status","params":[{"key":"analysisId"}]}]}
+    ]});
+    let transport = FakeTransport::new()
+        .json(200, &catalog_without_branch.to_string())
+        .json(200, &task("SUCCESS").to_string())
+        .json(200, &gate().to_string());
+    let result = run(&args(), &transport).await.unwrap();
+    assert_eq!(result["status"], "ERROR");
+    assert_eq!(result["analysis_id"], "analysis-1");
+    assert!(result["revision"].is_null());
+    assert_eq!(result["gaps"], json!(["history_contract_unavailable"]));
+    assert_eq!(transport.requests().len(), 3);
+    assert!(transport.url(2).ends_with("?analysisId=analysis-1"));
+}
+
+#[tokio::test]
+async fn history_permissions_and_transport_failures_retain_exact_gate_evidence() {
+    for (status, cause) in [
+        (403, "history_connector_forbidden"),
+        (404, "history_connector_not_found"),
+    ] {
+        let transport = catalog()
+            .json(200, &task("SUCCESS").to_string())
+            .json(status, "{}")
+            .json(200, &gate().to_string());
+        let result = run(&args(), &transport).await.unwrap();
+        assert_eq!(result["ce_task"], "task-1");
+        assert_eq!(result["status"], "ERROR");
+        assert_eq!(result["partial"], true);
+        assert!(result["revision"].is_null());
+        assert_eq!(result["gaps"], json!([cause]));
+        assert_eq!(transport.requests().len(), 4);
+    }
+    let transport = catalog()
+        .json(200, &task("SUCCESS").to_string())
+        .failure(crate::TransportError::Network("unreachable".to_owned()))
+        .json(200, &gate().to_string());
+    let result = run(&args(), &transport).await.unwrap();
+    assert_eq!(result["status"], "ERROR");
+    assert_eq!(result["gaps"], json!(["history_connector_network"]));
+}

@@ -124,9 +124,8 @@ impl LogService {
                 return;
             }
         };
-        let safe_text = match String::from_utf8(view.bytes.clone()) {
-            Ok(text) => text,
-            Err(_) => return,
+        let Ok(safe_text) = String::from_utf8(view.bytes.clone()) else {
+            return;
         };
         let bytes = match serde_json::to_vec(&selection) {
             Ok(bytes) => bytes,
@@ -153,8 +152,8 @@ impl LogService {
             record_skip(report, "compression_store_failed", error.to_string());
             return;
         }
-        if let Some(capture) = capture {
-            if let Err(error) = crate::evidence_service::publish(
+        if let Some(capture) = capture
+            && let Err(error) = crate::evidence_service::publish(
                 &self.store,
                 capture,
                 request_id,
@@ -164,10 +163,9 @@ impl LogService {
                     "offset_basis": "compact_view_bytes"}),
             )
             .await
-            {
-                record_skip(report, "compression_view_unavailable", error);
-                return;
-            }
+        {
+            record_skip(report, "compression_view_unavailable", error);
+            return;
         }
         report.semantic = Some(EvidenceRef {
             id,

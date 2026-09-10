@@ -235,3 +235,107 @@ fn idle_unload_waits_out_the_window_and_zero_means_never() {
     // A clock that jumped backwards is not idleness.
     assert!(!should_unload(now + 3_600, now, 10));
 }
+
+fn diagnostic_request() -> pam_model::runtime::GenerateRequest {
+    pam_model::runtime::GenerateRequest {
+        system: None,
+        prompt: "Diagnostic only".into(),
+        max_tokens: 1,
+        temperature: 0.0,
+        stop: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_requires_installed_id_and_does_not_resolve_or_load_a_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    touch_model(dir.path(), "qwen", "requested.gguf");
+    touch_model(dir.path(), "qwen", "other.gguf");
+    service
+        .set_default(Tier::Light, Some("qwen/other"))
+        .await
+        .unwrap();
+    let error = service
+        .generate_diagnostic("qwen/requested", diagnostic_request())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelUnavailable::Runtime(pam_model::RuntimeError::NoModelLoaded)
+    ));
+    let missing = service
+        .generate_diagnostic("qwen/missing", diagnostic_request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, ModelUnavailable::Service(ModelServiceError::UnknownModel(id)) if id == "qwen/missing")
+    );
+    assert_eq!(
+        service.runtime().snapshot().state,
+        pam_model::RuntimeState::Idle
+    );
+}
+
+#[tokio::test]
+async fn reserved_model_operation_refuses_diagnostic_without_waiting_or_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let _reservation = service.operation.lock().await;
+    let error = service
+        .generate_diagnostic("qwen/requested", diagnostic_request())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelUnavailable::Runtime(pam_model::RuntimeError::Busy)
+    ));
+    assert_eq!(
+        service.runtime().snapshot().state,
+        pam_model::RuntimeState::Idle
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn diagnostic_deadline_drop_signals_the_worker_receiver() {
+    let (guard, receiver) = crate::model_service::DiagnosticCancellation::new();
+    let waiting = async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), waiting).await;
+    assert!(result.is_err());
+    assert!(
+        *receiver.borrow(),
+        "closing an unchanged sender alone would leave false"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    touch_model(first.path(), "qwen", "same.gguf");
+    touch_model(second.path(), "qwen", "same.gguf");
+    let service = service(first.path()).await;
+    let stale = service.find("qwen/same").await.unwrap().unwrap();
+    service.set_models_dir(second.path()).await.unwrap();
+    let error = service.ensure_loaded(&stale).await.unwrap_err();
+    assert!(
+        matches!(error, pam_model::RuntimeError::LoadFailed(detail) if detail.contains("entry changed"))
+    );
+    let current = service.find("qwen/same").await.unwrap().unwrap();
+    assert_ne!(current.path, stale.path);
+    let refused = service
+        .generate_diagnostic("qwen/same", diagnostic_request())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        ModelUnavailable::Runtime(pam_model::RuntimeError::NoModelLoaded)
+    ));
+    assert_eq!(
+        service.runtime().snapshot().state,
+        pam_model::RuntimeState::Idle
+    );
+}

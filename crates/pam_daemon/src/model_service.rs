@@ -209,6 +209,23 @@ pub enum ModelServiceError {
     Registry(#[from] RegistryError),
 }
 
+/// Owns the cancellation sender while an admin diagnostic future is alive.
+/// Dropping a watch sender alone would leave its final `false` value unchanged.
+pub(crate) struct DiagnosticCancellation(watch::Sender<bool>);
+
+impl DiagnosticCancellation {
+    pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self(sender), receiver)
+    }
+}
+
+impl Drop for DiagnosticCancellation {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 /// The live download handles, keyed by job id, with the destination each
 /// is writing to.
 type Downloads = Arc<Mutex<HashMap<String, (PathBuf, DownloadHandle)>>>;
@@ -222,7 +239,7 @@ pub struct ModelService {
     /// hold a stale one.
     models_dir: RwLock<PathBuf>,
     runtime: Runtime,
-    pub(crate) operation: Mutex<()>,
+    pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
     host_ram_bytes: u64,
 }
@@ -261,7 +278,7 @@ impl ModelService {
             store,
             models_dir: RwLock::new(models_dir),
             runtime: Runtime::new(),
-            operation: Mutex::new(()),
+            operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
             host_ram_bytes: host_ram_bytes(),
         });
@@ -353,10 +370,52 @@ impl ModelService {
             .await?)
     }
 
+    /// Diagnose on one explicitly requested installed model without loading or swapping.
+    /// Dropping the caller signals cancellation; an in-progress forward pass finishes
+    /// before the worker observes that signal, so cancellation is cooperative.
+    pub async fn generate_diagnostic(
+        &self,
+        model_id: &str,
+        request: GenerateRequest,
+    ) -> Result<GenerateResult, ModelUnavailable> {
+        let _operation = self.operation.try_lock().map_err(|_| RuntimeError::Busy)?;
+        if self.runtime.has_pending_work() {
+            return Err(RuntimeError::Busy.into());
+        }
+        let entry = self
+            .find(model_id)
+            .await?
+            .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
+        let (guard, cancel) = DiagnosticCancellation::new();
+        let result = self
+            .runtime
+            .generate_for(
+                &entry.id,
+                request,
+                cancel,
+                pam_model::runtime::CONTEXT_TOKENS,
+            )
+            .await;
+        drop(guard);
+        Ok(result?)
+    }
+
     /// Makes `entry` the loaded model, unloading whatever else was in
     /// memory first. A no-op when it is already loaded.
     pub async fn ensure_loaded(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
         let _operation = self.operation.lock().await;
+        let current = self
+            .find(&entry.id)
+            .await
+            .map_err(|error| RuntimeError::LoadFailed(error.to_string()))?;
+        if current
+            .as_ref()
+            .is_none_or(|current| current.path != entry.path)
+        {
+            return Err(RuntimeError::LoadFailed(
+                "The installed model entry changed before loading; select it again.".to_owned(),
+            ));
+        }
         self.ensure_loaded_inner(entry).await
     }
 
@@ -570,7 +629,17 @@ impl ModelService {
     }
 
     /// Persists a new models directory and rebuilds the registry over it.
-    pub(crate) async fn set_models_dir(&self, dir: &Path) -> Result<(), StoreError> {
+    pub(crate) async fn set_models_dir(&self, dir: &Path) -> Result<(), ModelUnavailable> {
+        let _operation = self.operation.lock().await;
+        if self.models_dir().as_path() == dir {
+            return Ok(());
+        }
+        if self.runtime.has_pending_work() {
+            return Err(RuntimeError::Busy.into());
+        }
+        // Registry IDs repeat across directories. Never leave the previous root's
+        // loaded snapshot available under an ID now resolved in a different root.
+        self.runtime.unload().await?;
         let encoded = json!(dir.display().to_string()).to_string();
         self.store.set_setting(SETTING_MODELS_DIR, &encoded).await?;
         *self

@@ -78,6 +78,7 @@ use crate::flow_exec::{
 };
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
 use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
+use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 
 /// `setting` key holding the programs a command step may run.
 pub const SETTING_ALLOWED_PROGRAMS: &str = "flows.allowed_programs";
@@ -420,6 +421,25 @@ impl FlowService {
         })
     }
 
+    /// Current GUI-approved scopes, independently of capability grants.
+    pub async fn scope_policy(&self) -> Result<ScopePolicy, FlowRefusal> {
+        ScopePolicy::load(&self.store).await.map_err(scope_refusal)
+    }
+
+    /// Replace the scope policy through private administration only.
+    pub async fn set_scope_policy(&self, policy: ScopePolicy) -> Result<ScopePolicy, FlowRefusal> {
+        let policy = policy.normalize().map_err(scope_refusal)?;
+        policy.save(&self.store).await.map_err(scope_refusal)?;
+        Ok(policy)
+    }
+
+    async fn approved_repo(&self, repo: &Path) -> Result<PathBuf, FlowRefusal> {
+        self.scope_policy()
+            .await?
+            .authorize_repo(repo)
+            .map_err(scope_refusal)
+    }
+
     /// One string-list setting, persisted from `default` when unset (or
     /// when what is stored is not a list of strings at all).
     async fn setting_list(&self, key: &str, default: &[String]) -> Result<Vec<String>, StoreError> {
@@ -581,6 +601,8 @@ impl FlowService {
             .into());
         }
 
+        // Scope precedes variable resolution: repo.origin itself runs git.
+        let repo = self.approved_repo(&repo).await?;
         let mut cancel = ctx.cancel.clone();
         let (vars, inputs) = self
             .resolve_vars(&flow, &args.inputs, &repo, &settings, &mut cancel)
@@ -906,6 +928,10 @@ fn entry_digest(entry: &Entry) -> String {
 }
 
 /// A store failure a flow surface reports as a refusal.
+fn scope_refusal(error: ScopeError) -> FlowRefusal {
+    FlowRefusal::new(error.cause(), error.to_string(), RECOVERY_SCOPE)
+}
+
 fn store_note(error: &StoreError) -> FlowRefusal {
     FlowRefusal::new(
         CAUSE_INTERNAL,
@@ -1015,6 +1041,16 @@ impl RunState<'_> {
     /// Gates one step, then runs it.
     async fn run_step(&mut self, step: &Step) -> Result<StepReport, CapabilityFailure> {
         let mut report = StepReport::new(&step.id, step.kind(), StepStatus::Failed);
+        // Do not request or remember a grant for an out-of-scope target.
+        if let Err(refusal) = self.check_step_scope(step).await {
+            report.fail(
+                StepStatus::Blocked,
+                refusal.cause,
+                refusal.detail,
+                refusal.recovery,
+            );
+            return Ok(report);
+        }
         if step.gated()
             && let Some(blocked) = self.gate_step(step, &mut report).await?
         {
@@ -1034,6 +1070,26 @@ impl RunState<'_> {
         }
         report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(report)
+    }
+
+    async fn check_step_scope(&self, step: &Step) -> Result<(), FlowRefusal> {
+        self.service.approved_repo(&self.repo).await?;
+        if let Action::Connector {
+            connector,
+            call,
+            with,
+        } = &step.action
+        {
+            let args = self.substitute_args(with).map_err(|detail| {
+                FlowRefusal::new(CAUSE_VARIABLE_UNAVAILABLE, detail, RECOVERY_FLOW_EDIT)
+            })?;
+            self.service
+                .connectors
+                .authorize_scope(&self.repo, *connector, call, &args)
+                .await
+                .map_err(|error| FlowRefusal::new(error.cause(), error.detail(), RECOVERY_SCOPE))?;
+        }
+        Ok(())
     }
 
     /// The step gate (see the module docs). `Some(report)` means the step
@@ -1275,8 +1331,14 @@ impl RunState<'_> {
             let Some(outcome) = self.attempt_command(&spec, step).await else {
                 return Err(CapabilityFailure::Cancelled);
             };
-            let done =
-                matches!(outcome, Attempt::Succeeded { .. }) || number == step.retry.attempts;
+            let done = matches!(
+                outcome,
+                Attempt::Succeeded { .. }
+                    | Attempt::Failed {
+                        status: StepStatus::Blocked,
+                        ..
+                    }
+            ) || number == step.retry.attempts;
             attempt = Some(outcome);
             if done {
                 break;
@@ -1292,6 +1354,18 @@ impl RunState<'_> {
     /// One child-process attempt, as an [`Attempt`]. `None` means the
     /// request was cancelled.
     async fn attempt_command(&mut self, spec: &CommandSpec, step: &Step) -> Option<Attempt> {
+        if let Err(refusal) = self.service.approved_repo(&self.repo).await {
+            return Some(Attempt::Failed {
+                result: None,
+                exit_status: None,
+                output: Vec::new(),
+                status: StepStatus::Blocked,
+                cause: refusal.cause,
+                detail: refusal.detail,
+                recovery: refusal.recovery,
+                retry_after: None,
+            });
+        }
         match run_command(spec.clone(), &mut self.cancel).await {
             CommandOutcome::Exited { status: 0, output }
                 if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
@@ -1431,7 +1505,7 @@ impl RunState<'_> {
             () = cancelled(&mut self.cancel) => return None,
             called = tokio::time::timeout(
                 step.timeout,
-                self.service.connectors.invoke(connector, call, args, deadline),
+                self.service.connectors.invoke(&self.repo, connector, call, args, deadline),
             ) => called,
         };
         Some(assert_connector_attempt(
@@ -1705,6 +1779,8 @@ fn blocks_the_run(error: &InvokeError) -> bool {
     matches!(
         error,
         InvokeError::Disabled
+            | InvokeError::Scope(_)
+            | InvokeError::Connector(pam_connectors::ConnectorError::Policy { .. })
             | InvokeError::CredentialMissing
             | InvokeError::BaseUrlMissing
             | InvokeError::BadUrl(_)

@@ -33,6 +33,9 @@
 //! drives the local `aws` CLI, not `curl`, so it keeps working.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -45,6 +48,7 @@ use pam_store::{ConnectorPatch, ConnectorRow, Store, StoreError};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 use crate::secrets::{KeyringHealth, SecretBackend, SecretError, SecretStore};
 
 /// How long a credential test may take before it counts as failed.
@@ -182,6 +186,9 @@ pub struct ConfigurePatch {
 /// edit that fixes it — never a security command.
 #[derive(Debug, Error)]
 pub enum InvokeError {
+    /// The repository, connector identity or remote target is not approved.
+    #[error("{0}")]
+    Scope(#[from] ScopeError),
     /// The connector's row says it is disabled.
     #[error("the connector is disabled")]
     Disabled,
@@ -216,6 +223,7 @@ impl InvokeError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
+            Self::Scope(error) => error.cause(),
             Self::Disabled => CAUSE_CONNECTOR_DISABLED,
             Self::CredentialMissing => CAUSE_CREDENTIAL_MISSING,
             Self::BaseUrlMissing => CAUSE_BASE_URL_MISSING,
@@ -261,6 +269,7 @@ impl InvokeError {
     pub fn recovery_line(&self, id: ConnectorId) -> &'static str {
         let lines = recoveries(id);
         match self {
+            Self::Scope(_) => RECOVERY_SCOPE,
             Self::Disabled => &lines.disabled,
             Self::CredentialMissing => &lines.credential_missing,
             Self::BaseUrlMissing | Self::BadUrl(_) => &lines.base_url,
@@ -516,26 +525,54 @@ impl ConnectorService {
     /// ever reaches the network.
     pub async fn invoke(
         &self,
+        repo: &Path,
         id: ConnectorId,
         call: &str,
         args: &BTreeMap<String, ArgValue>,
         deadline: Instant,
     ) -> Result<CallResult, InvokeError> {
+        let row = self.scoped_row(repo, id, call, args).await?;
+        let connection = self.connection(id, row.as_ref()).await?;
+        self.ensure_transport(id)?;
+        let transport = ScopedTransport {
+            service: self,
+            repo,
+            connector: id,
+            call,
+            args,
+            base_url: connection.base_url.to_string(),
+        };
+        let result = pam_connectors::call(id, &connection, call, args, &transport, deadline).await;
+        Ok(result?)
+    }
+
+    /// Scope-only preflight, before a step asks for grants or credentials.
+    pub async fn authorize_scope(
+        &self,
+        repo: &Path,
+        id: ConnectorId,
+        call: &str,
+        args: &BTreeMap<String, ArgValue>,
+    ) -> Result<(), InvokeError> {
+        self.scoped_row(repo, id, call, args).await.map(|_| ())
+    }
+
+    async fn scoped_row(
+        &self,
+        repo: &Path,
+        id: ConnectorId,
+        call: &str,
+        args: &BTreeMap<String, ArgValue>,
+    ) -> Result<Option<ConnectorRow>, InvokeError> {
+        let policy = ScopePolicy::load(&self.store).await?;
+        policy.authorize_repo(repo)?;
         let row = self.store.get_connector(id.as_str()).await?;
         if !row.as_ref().is_some_and(|row| row.enabled) {
             return Err(InvokeError::Disabled);
         }
-        let connection = self.connection(id, row.as_ref()).await?;
-        self.ensure_transport(id)?;
-        Ok(pam_connectors::call(
-            id,
-            &connection,
-            call,
-            args,
-            self.transport.as_ref(),
-            deadline,
-        )
-        .await?)
+        let base_url = configured_url(id, row.as_ref())?;
+        policy.authorize_connector(repo, id, &base_url, call, args)?;
+        Ok(row)
     }
 
     /// Builds the connection one call runs over, refusing whatever the
@@ -679,8 +716,105 @@ fn last_test(row: &ConnectorRow) -> Option<LastTest> {
     })
 }
 
-/// The credential backend a daemon whose keychain would not open runs on:
-/// every call refuses the way the real store does when it is unreachable.
+/// Every physical HTTP request rechecks revocation and the connection snapshot.
+/// The configured inner transport receives no automatic redirect permission.
+struct ScopedTransport<'a> {
+    service: &'a ConnectorService,
+    repo: &'a Path,
+    connector: ConnectorId,
+    call: &'a str,
+    args: &'a BTreeMap<String, ArgValue>,
+    base_url: String,
+}
+
+impl ScopedTransport<'_> {
+    async fn send_once(
+        &self,
+        mut request: HttpRequest,
+        deadline: Instant,
+    ) -> Result<HttpResponse, TransportError> {
+        if Instant::now() >= deadline {
+            return Err(TransportError::Timeout);
+        }
+        let checked = self
+            .service
+            .scoped_row(self.repo, self.connector, self.call, self.args)
+            .await
+            .and_then(|row| {
+                if configured_url(self.connector, row.as_ref())? == self.base_url {
+                    Ok(())
+                } else {
+                    Err(
+                        ScopeError::Denied("connector URL changed during the read".to_owned())
+                            .into(),
+                    )
+                }
+            });
+        if let Err(error) = checked {
+            return Err(TransportError::Policy {
+                cause: error.cause(),
+                detail: error.detail(),
+            });
+        }
+        request.follow_one_https_redirect_without_auth = false;
+        self.service.transport.send(request, deadline).await
+    }
+}
+
+impl HttpTransport for ScopedTransport<'_> {
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            let follow = request.follow_one_https_redirect_without_auth;
+            let response = self.send_once(request.clone(), deadline).await?;
+            if !follow || !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            let location = response.header("location").ok_or_else(|| {
+                TransportError::Network("log redirect omitted Location".to_owned())
+            })?;
+            let target = request.url.join(location).map_err(|_| {
+                TransportError::Network("log redirect has an invalid target".to_owned())
+            })?;
+            if target.scheme() != "https"
+                || target.host_str().is_none()
+                || !target.username().is_empty()
+                || target.password().is_some()
+                || target.fragment().is_some()
+            {
+                return Err(TransportError::Network(
+                    "log redirect requires HTTPS without user information or a fragment".to_owned(),
+                ));
+            }
+            let mut next = request;
+            next.url = target;
+            next.headers.retain(|(name, _)| {
+                !["authorization", "proxy-authorization", "cookie"]
+                    .iter()
+                    .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+            });
+            self.send_once(next, deadline).await
+        })
+    }
+}
+
+fn configured_url(id: ConnectorId, row: Option<&ConnectorRow>) -> Result<String, InvokeError> {
+    let raw = if descriptor(id).needs_base_url {
+        row.and_then(|row| row.base_url.as_deref())
+            .filter(|raw| !raw.trim().is_empty())
+            .ok_or(InvokeError::BaseUrlMissing)?
+    } else {
+        ""
+    };
+    validate_base_url(id, raw)
+        .map(|url| url.to_string())
+        .map_err(|error| InvokeError::BadUrl(error.detail()))
+}
+
+/// The credential backend used when the keychain could not be opened.
 struct UnavailableBackend;
 
 impl SecretBackend for UnavailableBackend {

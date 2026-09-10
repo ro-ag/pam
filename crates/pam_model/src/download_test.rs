@@ -441,6 +441,7 @@ fn every_cause_carries_its_own_recovery_sentence() {
         "locked",
         "daemon_restart",
         "verify_failed",
+        "lock_release_failed",
     ] {
         let line = failure_recovery(cause);
         assert_ne!(line, fallback, "{cause} deserves better than the fallback");
@@ -642,4 +643,34 @@ async fn terminal_notification_releases_the_transfer_lock_before_waking_observer
     );
     drop(lock);
     assert_eq!(discard_partial(&fixture.dest).unwrap(), 64 * 1024);
+}
+
+#[test]
+fn terminal_publication_unlocks_even_while_a_duplicate_handle_survives() {
+    let fixture = fixture();
+    let paths = sidecar_paths(&fixture.dest);
+    let owner = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&paths.lock)
+        .unwrap();
+    owner.try_lock().unwrap();
+    // File::try_clone shares the underlying file description, just as an
+    // inherited descriptor does before exec. No unsafe fork/test hooks needed.
+    let duplicate = owner.try_clone().unwrap();
+    std::fs::write(&paths.part, b"partial").unwrap();
+    let (sender, observer) =
+        tokio::sync::watch::channel(DownloadState::Running(DownloadProgress {
+            bytes: 7,
+            total: None,
+        }));
+    crate::download::publish_terminal(&sender, owner, DownloadState::Cancelled);
+    assert_eq!(*observer.borrow(), DownloadState::Cancelled);
+    assert!(
+        !inspect_partial(&fixture.dest).unwrap().locked,
+        "terminal notification must relinquish ownership, even with duplicate handles"
+    );
+    drop(duplicate);
+    assert_eq!(discard_partial(&fixture.dest).unwrap(), 7);
 }

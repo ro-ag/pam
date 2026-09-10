@@ -8,3 +8,4 @@ frontend/coverage/
 
 # agent worktrees
 .claude/worktrees/
+__pycache__/

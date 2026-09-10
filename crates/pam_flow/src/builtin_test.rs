@@ -18,6 +18,8 @@ fn pam_ships_the_starter_flows() {
             "pam-pr-readiness",
             "pr-readiness",
             "release-readiness",
+            "revision-ci-triage",
+            "revision-jenkins-check",
             "sonar-gate-check",
             "summarize-build-log",
         ]
@@ -321,4 +323,66 @@ fn jenkins_investigation_targets_one_build_and_checks_only_its_core_status() {
     assert_eq!(call, "investigate");
     assert_eq!(with["job"].to_string(), "${inputs.job}");
     assert_eq!(with["build"].to_string(), "${inputs.build}");
+}
+
+#[test]
+fn revision_starters_require_explicit_source_and_run_identity() {
+    for (id, required) in [
+        (
+            "revision-jenkins-check",
+            vec!["repository", "commit", "job", "build"],
+        ),
+        (
+            "revision-ci-triage",
+            vec![
+                "repository",
+                "commit",
+                "repo",
+                "run_id",
+                "run_attempt",
+                "job_id",
+            ],
+        ),
+    ] {
+        let flow = parse(builtin_yaml(id).unwrap()).unwrap();
+        assert!(flow.correlation.is_some());
+        for input in required {
+            assert!(
+                flow.inputs[input].default.is_none(),
+                "{id} silently defaults {input}"
+            );
+        }
+        let yaml = to_normalized_yaml(&flow);
+        assert!(yaml.contains("${inputs.repository}"));
+        assert!(yaml.contains("${inputs.commit}"));
+        for step in &flow.steps {
+            let Action::Connector { call, .. } = &step.action else {
+                panic!("brokered connector");
+            };
+            assert_ne!(call, "runs", "revision recipes never discover a latest run");
+            assert_eq!(step.output, OutputPolicy::Compact);
+        }
+    }
+    let flow = parse(builtin_yaml("revision-jenkins-check").unwrap()).unwrap();
+    assert_eq!(flow.steps.len(), 1);
+    assert_eq!(flow.steps[0].role, Role::Verify);
+    assert_eq!(flow.steps[0].expect_status.as_deref(), Some("SUCCESS"));
+    let flow = parse(builtin_yaml("revision-ci-triage").unwrap()).unwrap();
+    assert_eq!(flow.inputs["page"].default.as_deref(), Some("1"));
+    assert!(
+        flow.steps
+            .iter()
+            .all(|step| step.role == Role::Observe && step.expect_status.is_none())
+    );
+    assert_eq!(flow.steps[1].needs, ["run-jobs"]);
+    let Action::Connector { with, .. } = &flow.steps[0].action else {
+        panic!("run");
+    };
+    assert_eq!(with["run_id"].to_string(), "${inputs.run_id}");
+    assert_eq!(with["run_attempt"].to_string(), "${inputs.run_attempt}");
+    assert_eq!(with["page"].to_string(), "${inputs.page}");
+    let Action::Connector { with, .. } = &flow.steps[1].action else {
+        panic!("job log");
+    };
+    assert_eq!(with["job_id"].to_string(), "${inputs.job_id}");
 }

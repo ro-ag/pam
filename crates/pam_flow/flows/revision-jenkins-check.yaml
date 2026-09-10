@@ -1,0 +1,30 @@
+schema: 1
+id: revision-jenkins-check
+name: Revision Jenkins check
+description: >-
+  Verify one explicit Jenkins build only when its structured SCM evidence
+  matches the declared HTTPS repository and full commit. Requires Pipeline
+  REST. Missing or conflicting association cannot establish a passing check.
+inputs:
+  repository:
+    description: exact HTTPS source clone URL, including its .git suffix when present
+  commit:
+    description: full 40 or 64 hexadecimal source commit
+  job:
+    description: explicit Jenkins job path, including folders
+  build:
+    description: explicit positive build number; never latest
+correlation:
+  repository: "${inputs.repository}"
+  commit: "${inputs.commit}"
+steps:
+  - id: investigate-build
+    connector: jenkins
+    call: investigate
+    with:
+      job: "${inputs.job}"
+      build: "${inputs.build}"
+    timeout: 120s
+    role: verify
+    expect_status: SUCCESS
+    output: compact

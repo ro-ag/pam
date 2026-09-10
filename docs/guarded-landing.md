@@ -4,7 +4,9 @@ Task #135 adds `guarded-land` to the existing flow executor. It uses no model.
 The CLI submits a ticket through PAM's internal Unix socket; the daemon owns
 approval, credentials, bounded execution, evidence and recovery. This document
 describes the implementation under qualification. Until the sync adapter and
-end-to-end checkpoint pass, the complete recipe is not ready for use.
+end-to-end checkpoint pass, the complete recipe is not ready for use. Inspection
+reports `landing_sync_unavailable`; running a recipe that contains sync refuses
+before any checkout capture, validation command or remote operation.
 
 ## Configure and inspect
 

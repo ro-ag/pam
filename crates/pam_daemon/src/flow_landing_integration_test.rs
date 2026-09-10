@@ -114,7 +114,7 @@ impl HttpTransport for Github {
     }
 }
 struct Fixture {
-    _dirs: tempfile::TempDir,
+    dirs: tempfile::TempDir,
     ctx: ExecContext,
     flow: Flow,
     repo: PathBuf,
@@ -266,7 +266,7 @@ impl Fixture {
             started_at: Instant::now(),
         };
         Self {
-            _dirs: dirs,
+            dirs,
             ctx,
             flow,
             repo,
@@ -475,7 +475,7 @@ async fn full_landing_refuses_unavailable_sync_before_any_work() {
                     .is_none()
             );
             assert!(
-                std::fs::read_dir(fixture._dirs.path().join("workspaces"))
+                std::fs::read_dir(fixture.dirs.path().join("workspaces"))
                     .unwrap()
                     .next()
                     .is_none()

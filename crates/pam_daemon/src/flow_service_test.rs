@@ -204,7 +204,10 @@ async fn a_program_with_a_path_separator_is_refused() {
 #[tokio::test]
 async fn the_list_body_carries_every_builtin_with_its_shape() {
     let (_tmp, _store, flows) = service().await;
-    let body = flows.list().expect("the list is readable").body;
+    let body = flows
+        .list_page(&serde_json::json!({"limit":50}))
+        .expect("the list is readable")
+        .body;
     let entries = body["flows"].as_array().expect("flows is an array");
     assert_eq!(entries.len(), pam_flow::builtin().len());
     for entry in entries {

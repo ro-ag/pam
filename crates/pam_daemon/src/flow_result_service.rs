@@ -41,26 +41,44 @@ fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx)?;
     let (status, result) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
-    if status.capability != "flow.run" || !status.state.is_terminal() {
+    result_output(&ctx.request_id, &ticket, &status, result.as_ref())
+}
+
+/// Preserve lifecycle state even when no final agent projection exists yet.
+pub(crate) fn result_output(
+    id: &str,
+    ticket: &str,
+    status: &RequestStatusMeta,
+    result: Option<&FlowResultMeta>,
+) -> Result<CapabilityOutput, CapabilityFailure> {
+    if status.capability != "flow.run" {
         return Err(unavailable());
     }
-    let result = result.ok_or_else(unavailable)?;
-    let metadata: Value = serde_json::from_str(&result.metadata_json).map_err(|_| unavailable())?;
-    let projection = metadata.get("agent_result").ok_or_else(unavailable)?;
-    let projection = validated_projection(projection, &ticket)?;
-    if projection["workflow"]["outcome"].as_str() != status.outcome.as_deref() {
-        return Err(unavailable());
-    }
+    let projection = if status.state.is_terminal() {
+        result
+            .and_then(|result| serde_json::from_str::<Value>(&result.metadata_json).ok())
+            .and_then(|metadata| metadata.get("agent_result").cloned())
+            .and_then(|value| validated_projection(&value, ticket).ok())
+            .filter(|value| value["workflow"]["outcome"].as_str() == status.outcome.as_deref())
+    } else {
+        None
+    };
     let outcome = status
         .outcome
         .as_deref()
         .and_then(parse_outcome)
-        .ok_or_else(unavailable)?;
+        .unwrap_or(Outcome::Blocked);
+    let unavailable = projection.is_none().then(|| {
+        json!({"cause":if status.state.is_terminal() {
+        "projection_unavailable"
+    } else {"not_ready"}})
+    });
     bounded_output(
-        &ctx.request_id,
+        id,
         outcome,
         json!({"schema_version":1,"ticket":ticket,
-        "state":status.state.as_str(),"outcome":status.outcome,"agent_result":projection}),
+        "state":status.state.as_str(),"outcome":status.outcome,"agent_result":projection,
+        "result_unavailable":unavailable}),
     )
 }
 
@@ -118,23 +136,27 @@ pub(crate) async fn authorized_metadata(
         .flow_result_meta(ticket, &repo.to_string_lossy())
         .await
         .map_err(|_| unavailable())?;
-    let origin = match &result {
-        Some(meta) => {
-            serde_json::from_str::<EvidenceOrigin>(&meta.origin_json).map_err(|_| unavailable())?
-        }
-        None if status.capability == "flow.run" && status.state.is_terminal() => {
-            return Err(unavailable());
-        }
-        None => EvidenceOrigin::default(),
-    };
-    authorize_origin(store, &policy, &repo, &origin)
+    let origins = store
+        .request_evidence_origins(ticket, &repo.to_string_lossy())
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    let origins: Vec<EvidenceOrigin> = origins
+        .into_iter()
+        .map(|origin| serde_json::from_str(&origin).map_err(|_| unavailable()))
+        .collect::<Result<_, _>>()?;
+    for origin in &origins {
+        authorize_origin(store, &policy, &repo, origin)
+            .await
+            .map_err(|_| unavailable())?;
+    }
     let current = ScopePolicy::load(store).await.map_err(|_| unavailable())?;
     current.authorize_repo(&repo).map_err(|_| unavailable())?;
-    authorize_origin(store, &current, &repo, &origin)
-        .await
-        .map_err(|_| unavailable())?;
+    for origin in &origins {
+        authorize_origin(store, &current, &repo, origin)
+            .await
+            .map_err(|_| unavailable())?;
+    }
     if store
         .grant_revocation_revision()
         .await

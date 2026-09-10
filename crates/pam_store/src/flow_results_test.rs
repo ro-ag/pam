@@ -77,3 +77,103 @@ async fn result_lookup_is_scoped_and_refuses_large_legacy_metadata() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("r", "flow.run", "/repo", "test", "{}", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.request_evidence_origins("r", "/repo").await.unwrap(),
+        Some(vec![])
+    );
+    store
+        .insert_evidence("partial", "r", "log.source", b"private partial", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .request_evidence_origins("r", "/repo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .insert_evidence_view(&EvidenceViewInsert {
+            evidence_id: "partial".into(),
+            request_id: "r".into(),
+            repository: "/repo".into(),
+            origin_json: "{\"targets\":[]}".into(),
+            identity_json: "{}".into(),
+            map_json: "[]".into(),
+            view_id: "partial-view".into(),
+            view_bytes: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .request_evidence_origins("r", "/repo")
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .request_evidence_origins("r", "/other")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn origin_overflow_refuses_whole_set_instead_of_authorizing_prefix() {
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("r", "flow.run", "/repo", "test", "{}", None)
+        .await
+        .unwrap();
+    for index in 0..257 {
+        let id = format!("e{index}");
+        store
+            .insert_evidence(&id, "r", "log.source", b"input", None)
+            .await
+            .unwrap();
+        store
+            .insert_evidence_view(&EvidenceViewInsert {
+                evidence_id: id.clone(),
+                request_id: "r".into(),
+                repository: "/repo".into(),
+                origin_json: serde_json::json!({"tag":index}).to_string(),
+                identity_json: "{}".into(),
+                map_json: "[]".into(),
+                view_id: format!("v{index}"),
+                view_bytes: vec![],
+            })
+            .await
+            .unwrap();
+        if index == 255 {
+            assert_eq!(
+                store
+                    .request_evidence_origins("r", "/repo")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                256
+            );
+        }
+    }
+    assert!(
+        store
+            .request_evidence_origins("r", "/repo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

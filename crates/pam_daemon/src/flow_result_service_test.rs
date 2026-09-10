@@ -96,3 +96,46 @@ async fn captured_product_scope_is_required_even_for_persisted_status() {
         .unwrap();
     assert!(authorized_metadata(&store, &repo, "r").await.is_err());
 }
+
+#[tokio::test]
+async fn admitted_flow_lifecycle_survives_missing_final_projection() {
+    let (_dir, store, repo) = fixture().await;
+    store
+        .insert_admitted_request("flow", "flow.run", &repo, "test", "{}", None, i64::MAX)
+        .await
+        .unwrap();
+    let (status, result) = authorized_metadata(&store, &repo, "flow").await.unwrap();
+    let output =
+        crate::flow_result_service::result_output("read", "flow", &status, result.as_ref())
+            .unwrap();
+    assert_eq!(output.body["state"], "running");
+    assert_eq!(output.body["ticket"], "flow");
+    assert_eq!(output.body["result_unavailable"]["cause"], "not_ready");
+    assert_eq!(output.outcome, Outcome::Blocked);
+    store
+        .finish_request(
+            "flow",
+            pam_store::RequestState::Failed,
+            Some("cancelled"),
+            pam_store::AuditEntry {
+                action: "cancel",
+                decision: pam_store::Decision::Refuse,
+                actor: pam_store::Actor::System,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, result) = authorized_metadata(&store, &repo, "flow").await.unwrap();
+    let output =
+        crate::flow_result_service::result_output("read", "flow", &status, result.as_ref())
+            .unwrap();
+    assert_eq!(output.body["state"], "failed");
+    assert_eq!(output.body["outcome"], "cancelled");
+    assert_eq!(
+        output.body["result_unavailable"]["cause"],
+        "projection_unavailable"
+    );
+    assert!(output.body["agent_result"].is_null());
+    assert_eq!(output.outcome, Outcome::Blocked);
+}

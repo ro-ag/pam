@@ -47,6 +47,40 @@ impl Store {
         }))
     }
 
+    /// All captured origins, including retained tombstones. Missing ownership,
+    /// oversized metadata, or overflow refuses the complete set, never a prefix.
+    /// Empty means no evidence has yet been captured for this request.
+    pub async fn request_evidence_origins(
+        &self,
+        ticket: &str,
+        repository: &str,
+    ) -> Result<Option<Vec<String>>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut missing=self.conn.query(
+            "SELECT EXISTS(SELECT 1 FROM evidence e WHERE e.request_id=?1 AND NOT EXISTS(SELECT 1 FROM evidence_view v WHERE v.evidence_id=e.id AND v.request_id=e.request_id AND v.repository=?2)) OR EXISTS(SELECT 1 FROM evidence_view WHERE request_id=?1 AND repository!=?2)",params![ticket,repository]).await?;
+        if let Some(row) = missing.next().await?
+            && row.get::<i64>(0)? != 0
+        {
+            return Ok(None);
+        }
+        drop(missing);
+        let mut rows=self.conn.query(
+            "SELECT DISTINCT CASE WHEN LENGTH(CAST(origin_json AS BLOB))<=16384 THEN origin_json ELSE NULL END FROM evidence_view WHERE request_id=?1 AND repository=?2 LIMIT 257",params![ticket,repository]).await?;
+        let mut origins = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next().await? {
+            let Some(origin) = row.get::<Option<String>>(0)? else {
+                return Ok(None);
+            };
+            bytes = bytes.saturating_add(origin.len());
+            if origins.len() == 256 || bytes > 65536 {
+                return Ok(None);
+            }
+            origins.push(origin);
+        }
+        Ok(Some(origins))
+    }
+
     /// Reads no source/view blobs. The view ownership tuple authenticates the
     /// canonical repository; tombstones retain origin until request retention.
     pub async fn flow_result_meta(

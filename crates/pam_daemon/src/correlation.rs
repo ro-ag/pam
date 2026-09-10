@@ -87,6 +87,24 @@ impl Frozen {
             .map_err(storage)?
         {
             let binding: Value = serde_json::from_str(&row.canonical_json).map_err(storage)?;
+            let decision = &binding["decision"];
+            if binding["schema_version"] != 1
+                || binding["target_id"] != frozen.target_id
+                || !flow.steps.iter().any(|step| step.id == row.step_id)
+                || !matches!(
+                    decision["status"].as_str(),
+                    Some("matched" | "missing" | "conflicting" | "unbound")
+                )
+                || decision["detail"]
+                    .as_str()
+                    .is_none_or(|detail| detail.len() > 4096)
+            {
+                return Err(Failure {
+                    cause: STORAGE,
+                    detail: "invalid retained product association".to_owned(),
+                });
+            }
+            frozen.decisions.insert(row.step_id, decision.clone());
             frozen.remember_jobs(&binding);
         }
         Ok(frozen)

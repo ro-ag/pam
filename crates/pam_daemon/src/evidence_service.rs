@@ -155,7 +155,8 @@ fn read_args(value: &serde_json::Value) -> Result<ReadArgs, CapabilityFailure> {
 pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let args = read_args(&ctx.args)?;
     ctx.budget
-        .attempt()
+        .attempt_persisted()
+        .await
         .map_err(|err| refusal(err.cause, "The evidence request exhausted its work budget."))?;
     let policy = ScopePolicy::load(&ctx.store)
         .await

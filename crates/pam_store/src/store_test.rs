@@ -46,7 +46,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 8);
+    assert_eq!(store.schema_version().await.unwrap(), 9);
 
     // WAL is the engine's native journal mode.
     let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();

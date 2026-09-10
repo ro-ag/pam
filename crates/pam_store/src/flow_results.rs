@@ -57,7 +57,7 @@ impl Store {
     ) -> Result<Option<Vec<String>>, StoreError> {
         let _guard = self.conn_lock.lock().await;
         let mut missing=self.conn.query(
-            "SELECT EXISTS(SELECT 1 FROM evidence e WHERE e.request_id=?1 AND NOT EXISTS(SELECT 1 FROM evidence_view v WHERE v.evidence_id=e.id AND v.request_id=e.request_id AND v.repository=?2)) OR EXISTS(SELECT 1 FROM evidence_view WHERE request_id=?1 AND repository!=?2)",params![ticket,repository]).await?;
+            "SELECT EXISTS(SELECT 1 FROM evidence e WHERE e.request_id=?1 AND e.kind!='flow.checkpoint' AND NOT EXISTS(SELECT 1 FROM evidence_view v WHERE v.evidence_id=e.id AND v.request_id=e.request_id AND v.repository=?2)) OR EXISTS(SELECT 1 FROM evidence_view WHERE request_id=?1 AND repository!=?2)",params![ticket,repository]).await?;
         if let Some(row) = missing.next().await?
             && row.get::<i64>(0)? != 0
         {

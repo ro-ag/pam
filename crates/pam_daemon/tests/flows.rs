@@ -462,6 +462,7 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             .list_evidence("req_run")
             .await
             .expect("evidence list ok");
+        let rows = public_step_evidence(&rows);
         let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
         assert_eq!(
             kinds,
@@ -1924,4 +1925,17 @@ async fn explicit_jenkins_node_read_retains_failure_without_claiming_build_verif
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
     }).await;
+}
+
+fn public_step_evidence(rows: &[pam_store::EvidenceMeta]) -> Vec<&pam_store::EvidenceMeta> {
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == pam_store::EVIDENCE_KIND_FLOW_CHECKPOINT)
+            .count(),
+        3,
+        "initial state and both settled steps have private checkpoints"
+    );
+    rows.iter()
+        .filter(|row| row.kind != pam_store::EVIDENCE_KIND_FLOW_CHECKPOINT)
+        .collect()
 }

@@ -597,7 +597,7 @@ pub async fn run_daemon_with(
     if recovered != 0 {
         tracing::info!(
             count = recovered,
-            "crash recovery failed stuck in-flight rows from a previous daemon"
+            "crash recovery reconciled in-flight rows from a previous daemon"
         );
     }
     let gate = Arc::new(PolicyGate::new(Arc::clone(&store)).await?);
@@ -1295,14 +1295,15 @@ impl Pipeline {
         let Some(deadline) = request_deadline(&row) else {
             return self.deadline_refusal(envelope).await;
         };
-        let ctx = self.exec_context(
-            id.clone(),
-            envelope.capability.clone(),
-            envelope.caller.clone(),
-            envelope.args.clone(),
-            cancel,
-            deadline,
-        );
+        let ctx = self.bypass_context(envelope, cancel, deadline).await;
+        let ctx = match ctx {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                return self
+                    .fail_bypass(id, &envelope.capability, &format!("{error:?}"))
+                    .await;
+            }
+        };
         match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             capability.execute(ctx),
@@ -1415,15 +1416,20 @@ impl Pipeline {
                     repo: row.repo.clone(),
                     pid: 0,
                 };
-                let ctx = self.exec_context(
-                    id.clone(),
-                    row.capability.clone(),
-                    caller,
-                    args,
-                    cancel,
-                    lease_deadline.into_std(),
-                );
-                capability.execute(ctx).await
+                let ctx = self
+                    .exec_context(
+                        id.clone(),
+                        row.capability.clone(),
+                        caller,
+                        args,
+                        cancel,
+                        lease_deadline.into_std(),
+                    )
+                    .await;
+                match ctx {
+                    Ok(ctx) => capability.execute(ctx).await,
+                    Err(error) => Err(error),
+                }
             }
             // The gate classified it, so this only fires on registry
             // drift between classify() and from_name().
@@ -1437,6 +1443,37 @@ impl Pipeline {
         self.work.notify_one();
     }
 
+    /// A failed/cancelled execution may have left an effect without a receipt.
+    /// The store repeats this check atomically for lease reapers and terminal races.
+    async fn reconcile_flow_terminal(
+        &self,
+        id: &str,
+        capability: &str,
+        result: Result<CapabilityOutput, CapabilityFailure>,
+    ) -> Result<CapabilityOutput, CapabilityFailure> {
+        if capability != "flow.run" {
+            return result;
+        }
+        let journal =
+            self.store
+                .read_flow_journal(id)
+                .await
+                .map_err(|error| CapabilityFailure::Failed {
+                    detail: format!("could not reconcile workflow completion: {error}"),
+                })?;
+        if journal.is_some_and(|row| {
+            row.state == pam_store::FlowJournalState::Uncertain
+                || (row.state == pam_store::FlowJournalState::Prepared && row.effectful)
+        }) {
+            return Err(CapabilityFailure::Refused {
+                cause: "flow_effect_uncertain".to_owned(),
+                detail: "A state-changing step may have executed without a durable completion receipt.".to_owned(),
+                recovery: "Inspect retained evidence and reconcile the effect before submitting new work; PAM will not replay it.".to_owned(),
+            });
+        }
+        result
+    }
+
     /// Records one leased execution's terminal state: the row and its
     /// single audit entry through the queue, the event, and the waiters'
     /// response. Each arm is one of the four documented terminal paths
@@ -1447,6 +1484,7 @@ impl Pipeline {
         capability: &str,
         result: Result<CapabilityOutput, CapabilityFailure>,
     ) {
+        let result = self.reconcile_flow_terminal(id, capability, result).await;
         match result {
             Ok(output) => self.complete_succeeded(id, capability, output).await,
             Err(CapabilityFailure::Cancelled) => {
@@ -1573,8 +1611,25 @@ impl Pipeline {
         self.work.notify_one();
     }
 
+    async fn bypass_context(
+        &self,
+        envelope: &Envelope,
+        cancel: watch::Receiver<bool>,
+        deadline: std::time::Instant,
+    ) -> Result<ExecContext, CapabilityFailure> {
+        self.exec_context(
+            envelope.id.clone(),
+            envelope.capability.clone(),
+            envelope.caller.clone(),
+            envelope.args.clone(),
+            cancel,
+            deadline,
+        )
+        .await
+    }
+
     /// Builds the execution context for one request.
-    fn exec_context(
+    async fn exec_context(
         &self,
         request_id: String,
         capability: String,
@@ -1582,9 +1637,18 @@ impl Pipeline {
         args: serde_json::Value,
         cancel: watch::Receiver<bool>,
         deadline: std::time::Instant,
-    ) -> ExecContext {
-        ExecContext {
-            budget: crate::request_budget::RequestBudget::new(deadline),
+    ) -> Result<ExecContext, CapabilityFailure> {
+        let budget = crate::request_budget::RequestBudget::load_persistent(
+            Arc::clone(&self.store),
+            &request_id,
+            deadline,
+        )
+        .await
+        .map_err(|error| CapabilityFailure::Failed {
+            detail: error.to_string(),
+        })?;
+        Ok(ExecContext {
+            budget,
             request_id,
             args,
             cancel,
@@ -1599,7 +1663,7 @@ impl Pipeline {
             caller,
             capability,
             started_at: self.started_at,
-        }
+        })
     }
 
     /// Inserts the row for a request that never passed admission (an
@@ -1741,7 +1805,9 @@ impl Pipeline {
         }
         self.audit_deadline(id, envelope.deadline_ms).await;
         let _ = self.events.publish(id, Event::Refused).await;
-        let response = deadline_refusal_response(id, envelope.deadline_ms);
+        let response = self
+            .preserve_terminal_uncertainty(id, deadline_refusal_response(id, envelope.deadline_ms))
+            .await;
         self.router.finish(id, response.clone()).await;
         response
     }
@@ -1750,8 +1816,8 @@ impl Pipeline {
     /// (the reaper already wrote the terminal row and audit).
     async fn finish_reaped(&self, id: &str) {
         let _ = self.events.publish(id, Event::Refused).await;
-        self.router
-            .finish(
+        let response = self
+            .preserve_terminal_uncertainty(
                 id,
                 Response::Refusal {
                     id: id.to_owned(),
@@ -1761,6 +1827,20 @@ impl Pipeline {
                 },
             )
             .await;
+        self.router.finish(id, response).await;
+    }
+
+    async fn preserve_terminal_uncertainty(&self, id: &str, fallback: Response) -> Response {
+        match self.store.request_status_meta(id).await {
+            Ok(Some(row)) if row.outcome.as_deref() == Some("flow_effect_uncertain") => Response::Refusal {
+                id: id.to_owned(),
+                cause: "flow_effect_uncertain".to_owned(),
+                detail: "A state-changing step may have executed without a durable completion receipt.".to_owned(),
+                recovery: "Inspect retained evidence and reconcile the effect before submitting new work; PAM will not replay it.".to_owned(),
+            },
+            Ok(Some(_)) => fallback,
+            Ok(None) | Err(_) => internal_refusal(id),
+        }
     }
 
     /// Audit row for a deadline refusal sent to a waiting caller.

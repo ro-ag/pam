@@ -577,7 +577,7 @@ impl ConnectorService {
         ),
         InvokeError,
     > {
-        budget.attempt().map_err(|error| {
+        budget.attempt_persisted().await.map_err(|error| {
             InvokeError::Connector(pam_connectors::ConnectorError::Policy {
                 cause: error.cause,
                 detail: error.to_string(),
@@ -590,10 +590,11 @@ impl ConnectorService {
         let _aws_capture = if id == ConnectorId::Aws {
             Some(
                 budget
-                    .command(
+                    .command_persisted(
                         pam_connectors::aws::MAX_STDOUT_BYTES
                             + pam_connectors::aws::MAX_STDERR_BYTES,
                     )
+                    .await
                     .map_err(|error| {
                         InvokeError::Connector(pam_connectors::ConnectorError::Policy {
                             cause: error.cause,

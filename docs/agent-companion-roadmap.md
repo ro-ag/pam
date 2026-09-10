@@ -220,3 +220,12 @@ module or a passing prompt parser alone does not complete an integration task.
 Use ptrack notes for decisions and task links for dependencies; update the rolling
 summary for the next session. This planning change neither implements the queued
 features nor authorizes a push, merge, release, or production rollout.
+
+
+### Task 133: restart-safe flow continuation
+
+[Workflow recovery](workflow-recovery.md) documents private bounded checkpoints,
+intent-before-step ordering, durable budgets, retained ticket/deadline and
+fail-closed uncertain effects. Ordinary failed stateful commands execute once;
+completed step prefixes restore under current access checks. Product-specific
+remote reconciliation and polling remain tasks 134–135, not generic retries.

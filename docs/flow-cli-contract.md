@@ -86,3 +86,14 @@ not cancel the original request. Keep the ticket to inspect it later.
 See [agent workflow](agent-workflow-contract.md), [evidence retrieval](evidence-retrieval.md)
 and [admission budgets](scoped-admission-and-budgets.md). Durable remote-job
 watching and guarded landing remain separate roadmap work.
+
+## Restart continuation
+
+A journaled flow resumes under its original ticket, deadline and spent budget.
+Use the existing `pam wait` and `pam flow result` commands after reconnecting;
+resumption does not create a new request. Completed steps are not executed again.
+A prepared state-changing step without a durable receipt stops with
+`flow_effect_uncertain`, including cancellation or lease expiry at that boundary.
+Inspect retained evidence and reconcile the effect before submitting new work.
+See [workflow recovery](workflow-recovery.md) for retention and authorization
+checks. Remote job polling and typed landing reconciliation remain separate work.

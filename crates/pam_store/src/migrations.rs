@@ -49,6 +49,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: SCHEMA_V8,
     },
+    Migration {
+        version: 9,
+        sql: SCHEMA_V9,
+    },
 ];
 
 /// Highest schema version this binary can produce.
@@ -290,5 +294,29 @@ CREATE TABLE correlation_step (
  step_id TEXT NOT NULL CHECK(LENGTH(CAST(step_id AS BLOB)) BETWEEN 1 AND 256),
  canonical_json TEXT NOT NULL CHECK(LENGTH(CAST(canonical_json AS BLOB))<=8192),
  PRIMARY KEY(request_id,step_id)
+);
+";
+
+const SCHEMA_V9: &str = r"
+CREATE TABLE request_budget (
+ request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE,
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 256),
+ http_calls INTEGER NOT NULL DEFAULT 0 CHECK(http_calls BETWEEN 0 AND 128),
+ http_bytes INTEGER NOT NULL DEFAULT 0 CHECK(http_bytes BETWEEN 0 AND 134217728),
+ command_bytes INTEGER NOT NULL DEFAULT 0 CHECK(command_bytes BETWEEN 0 AND 134217728)
+);
+CREATE TABLE flow_journal (
+ request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE,
+ schema_version INTEGER NOT NULL CHECK(schema_version=1),
+ flow_digest TEXT NOT NULL CHECK(length(CAST(flow_digest AS BLOB))=64),
+ repository TEXT NOT NULL CHECK(length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096),
+ input_fingerprint TEXT NOT NULL CHECK(length(CAST(input_fingerprint AS BLOB))=64),
+ revision INTEGER NOT NULL CHECK(revision>=0),
+ state TEXT NOT NULL CHECK(state IN ('ready','prepared','completed','uncertain')),
+ step_id TEXT CHECK(step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256),
+ attempt INTEGER NOT NULL CHECK(attempt BETWEEN 0 AND 256),
+ effectful INTEGER NOT NULL CHECK(effectful IN (0,1)),
+ checkpoint_json TEXT NOT NULL CHECK(length(CAST(checkpoint_json AS BLOB))<=131072),
+ evidence_refs_json TEXT NOT NULL CHECK(length(CAST(evidence_refs_json AS BLOB))<=16384)
 );
 ";

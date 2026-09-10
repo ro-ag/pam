@@ -86,7 +86,10 @@ async fn recover_fails_stuck_rows_and_leaves_queued_alone() {
             assert_eq!(audit[0].decision, Decision::Timeout);
             assert_eq!(audit[0].actor, Actor::System);
             let detail = audit[0].detail.as_deref().expect("detail present");
-            assert!(detail.contains("retry"), "retry hint in {detail}");
+            assert!(
+                detail.contains("inspect evidence"),
+                "reconciliation hint in {detail}"
+            );
         }
 
         // The queued row is restart-safe and untouched.

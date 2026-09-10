@@ -74,9 +74,9 @@ mod flow_exec_test;
 #[cfg(test)]
 mod flow_service_test;
 #[cfg(test)]
-mod lifecycle_test;
-#[cfg(test)]
 mod lifecycle_recovery_test;
+#[cfg(test)]
+mod lifecycle_test;
 #[cfg(test)]
 mod log_service_test;
 #[cfg(test)]
@@ -113,3 +113,10 @@ mod admission_rate_test;
 pub(crate) mod sonar_mapping;
 #[cfg(test)]
 mod sonar_mapping_test;
+
+mod flow_recovery;
+#[cfg(test)]
+mod flow_recovery_test;
+
+#[cfg(test)]
+mod flow_resume_integration_test;

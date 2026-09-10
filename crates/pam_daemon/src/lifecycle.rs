@@ -26,7 +26,8 @@
 //! # Crash recovery
 //!
 //! On boot — after the lock, before the lanes are rebuilt —
-//! [`recover_stuck_rows`] fails every `running` / `waiting_approval`
+//! [`recover_stuck_rows`] requeues safe journaled flows under their original
+//! admission and expiry, and fails legacy `running` / `waiting_approval`
 //! row a dead daemon left mid-flight: terminal `failed`, outcome
 //! [`CAUSE_DAEMON_RESTART`], audited through the
 //! [`pam_store::Store::finish_request`] choke point (action
@@ -204,17 +205,30 @@ pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> 
         after = Some((last.created_ts, last.id.clone()));
         for row in stuck {
             let was_waiting = row.state == RequestState::WaitingApproval;
+            let recovery = recover_journal(store, &row).await?;
+            if recovery == JournalRecovery::Requeued {
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
+            let cause = if recovery == JournalRecovery::Uncertain {
+                "flow_effect_uncertain"
+            } else {
+                CAUSE_DAEMON_RESTART
+            };
             let detail = serde_json::json!({
-                "cause": CAUSE_DAEMON_RESTART,
-                "note": "the daemon restarted while this request was in flight; \
-                         re-run the pam command to retry",
+                "cause": cause,
+                "note": if recovery == JournalRecovery::Uncertain {
+                    "A state-changing step may have executed. Inspect the retained checkpoint and reconcile its effects before submitting new work; PAM will not replay it."
+                } else {
+                    "The daemon restarted without a recoverable checkpoint; inspect evidence before submitting new work."
+                },
             })
             .to_string();
             let finished = store
                 .finish_request(
                     &row.id,
                     RequestState::Failed,
-                    Some(CAUSE_DAEMON_RESTART),
+                    Some(cause),
                     AuditEntry {
                         action: ACTION_DAEMON_RESTART,
                         decision: Decision::Timeout,
@@ -243,6 +257,67 @@ pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> 
             }
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum JournalRecovery {
+    Requeued,
+    Uncertain,
+    Legacy,
+}
+
+async fn expire_old_approval(store: &Store, id: &str) -> Result<(), StoreError> {
+    match store
+        .resolve_approval(id, ApprovalResolution::Timeout, Some(CAUSE_DAEMON_RESTART))
+        .await
+    {
+        Ok(()) | Err(StoreError::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Startup holds the instance lock, so no worker can race these transitions.
+/// An interrupted write is never downgraded to a read, even if spawn was not reached.
+async fn recover_journal(
+    store: &Store,
+    row: &pam_store::RequestRow,
+) -> Result<JournalRecovery, StoreError> {
+    use pam_store::FlowJournalState;
+    if row.capability != "flow.run" {
+        return Ok(JournalRecovery::Legacy);
+    }
+    let Some(journal) = store.read_flow_journal(&row.id).await? else {
+        return Ok(JournalRecovery::Legacy);
+    };
+    match journal.state {
+        FlowJournalState::Uncertain => return Ok(JournalRecovery::Uncertain),
+        FlowJournalState::Prepared if journal.effectful => {
+            store.mark_flow_uncertain(&row.id, journal.revision).await?;
+            return Ok(JournalRecovery::Uncertain);
+        }
+        FlowJournalState::Prepared => {
+            if !store
+                .abandon_read_attempt(&row.id, journal.revision)
+                .await?
+            {
+                return Ok(JournalRecovery::Legacy);
+            }
+        }
+        FlowJournalState::Ready | FlowJournalState::Completed => {}
+    }
+    if row.state == RequestState::WaitingApproval {
+        expire_old_approval(store, &row.id).await?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    Ok(if store.requeue_journaled_flow(&row.id, now).await? {
+        JournalRecovery::Requeued
+    } else {
+        JournalRecovery::Legacy
+    })
 }
 
 /// Builds the non-blocking writer for the daemon's own log:

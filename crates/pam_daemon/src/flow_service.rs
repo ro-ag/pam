@@ -840,37 +840,7 @@ impl FlowService {
             )
             .await?;
 
-        let correlation = self.freeze_correlation(ctx, &repo, flow, &vars).await?;
-        let (recovery, restored) =
-            crate::flow_recovery::Recovery::open(&self.store, &ctx.request_id, flow, &repo, &vars)
-                .await?;
-        let restored_reports = restored.restore_reports(flow)?;
-        let mut state = RunState {
-            service: self,
-            ctx,
-            flow,
-            settings: &settings,
-            repo,
-            observed: restored.observed,
-            vars: restored.vars,
-            recovery,
-            correlation,
-            cancel,
-            reports: restored_reports,
-            evidence: restored.evidence,
-            origins: restored.origins,
-            all_origins: restored.all_origins,
-        };
-        for report in &state.reports {
-            if let Some(error) = &report.error
-                && error.cause.starts_with("correlation_")
-            {
-                state.correlation.invalidate(&crate::correlation::Failure {
-                    cause: crate::correlation::CONFLICT,
-                    detail: error.detail.clone(),
-                });
-            }
-        }
+        let mut state = RunState::restore(self, ctx, flow, &settings, repo, vars, cancel).await?;
         state.execute().await?;
 
         if let Err(error) = state.correlation.check_mapping(&self.store).await {
@@ -1358,6 +1328,56 @@ struct RunState<'a> {
     all_origins: Vec<crate::evidence_service::ConnectorTarget>,
 }
 
+impl<'a> RunState<'a> {
+    async fn restore(
+        service: &'a FlowService,
+        ctx: &'a ExecContext,
+        flow: &'a Flow,
+        settings: &'a FlowSettings,
+        repo: PathBuf,
+        vars: Vars,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Self, CapabilityFailure> {
+        let correlation = service.freeze_correlation(ctx, &repo, flow, &vars).await?;
+        let (recovery, restored) = crate::flow_recovery::Recovery::open(
+            &service.store,
+            &ctx.request_id,
+            flow,
+            &repo,
+            &vars,
+        )
+        .await?;
+        let restored_reports = restored.restore_reports(flow)?;
+        let mut state = RunState {
+            service,
+            ctx,
+            flow,
+            settings,
+            repo,
+            observed: restored.observed,
+            vars: restored.vars,
+            recovery,
+            correlation,
+            cancel,
+            reports: restored_reports,
+            evidence: restored.evidence,
+            origins: restored.origins,
+            all_origins: restored.all_origins,
+        };
+        for report in &state.reports {
+            if let Some(error) = &report.error
+                && error.cause.starts_with("correlation_")
+            {
+                state.correlation.invalidate(&crate::correlation::Failure {
+                    cause: crate::correlation::CONFLICT,
+                    detail: error.detail.clone(),
+                });
+            }
+        }
+        Ok(state)
+    }
+}
+
 impl RunState<'_> {
     /// Walks the steps in file order, stopping at the first blocked one.
     async fn execute(&mut self) -> Result<(), CapabilityFailure> {
@@ -1384,11 +1404,22 @@ impl RunState<'_> {
             }
             self.publish_progress(index, total, &step.id).await;
             let report = self.run_step(step).await?;
+            if step.effect == pam_flow::Effect::Stateful
+                && (!report.evidence_unavailable.is_empty()
+                    || report
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.cause.starts_with("request_budget_")))
+            {
+                // No trustworthy completion receipt: retain prepared intent so the
+                // terminal choke point records uncertainty instead of completion.
+                return Err(crate::flow_recovery::failure());
+            }
             let blocked = report.status == StepStatus::Blocked;
-            self.publish_settled(index, total, &step.id, report.status)
-                .await;
+            let status = report.status;
             self.reports.push(report);
             self.checkpoint(blocked || index + 1 == total).await?;
+            self.publish_settled(index, total, &step.id, status).await;
             if blocked {
                 break;
             }

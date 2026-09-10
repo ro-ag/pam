@@ -28,18 +28,21 @@ fn unavailable() -> CapabilityFailure {
     }
 }
 
-fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
+async fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
     let args: Args = serde_json::from_value(ctx.args.clone()).map_err(|_| unavailable())?;
     if args.ticket.is_empty() || args.ticket.len() > 128 {
         return Err(unavailable());
     }
-    ctx.budget.attempt().map_err(|_| unavailable())?;
+    ctx.budget
+        .attempt_persisted()
+        .await
+        .map_err(|_| unavailable())?;
     Ok(args.ticket)
 }
 
 /// Return only selected durable metadata, never the protected verdict body.
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    let ticket = ticket(ctx)?;
+    let ticket = ticket(ctx).await?;
     let (status, result) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
     result_output(&ctx.request_id, &ticket, &status, result.as_ref())
 }
@@ -84,7 +87,7 @@ pub(crate) fn result_output(
 
 /// Scoped replacement for the former unrestricted status lookup.
 pub(crate) async fn scoped_query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    let ticket = ticket(ctx)?;
+    let ticket = ticket(ctx).await?;
     let (status, _) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
     let outcome = if status.state.is_terminal() {
         status

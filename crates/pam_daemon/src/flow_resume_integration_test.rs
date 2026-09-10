@@ -1,4 +1,4 @@
-//! Real FlowService, journal, lifecycle and evidence paths; only HTTP/keychain fake.
+//! Real `FlowService`, journal, lifecycle and evidence paths; only HTTP/keychain fake.
 use crate::{
     approval::ApprovalService,
     connector_service::{ConfigurePatch, ConnectorService, CredentialAction},
@@ -28,7 +28,7 @@ use std::{
 };
 const SHA: &str = "abcdef1234567890abcdef1234567890abcdef12";
 const SOURCE: &str = "https://git.example/team/repo.git";
-const FLOW: &str = r#"schema: 1
+const FLOW: &str = r"schema: 1
 id: resumable
 name: Resumable
 correlation:
@@ -46,7 +46,7 @@ steps:
     with: {repo: team/repo, run_id: 10, run_attempt: 1}
     needs: [first]
     output: compact
-"#;
+";
 #[derive(Default)]
 struct Reads {
     first: AtomicUsize,

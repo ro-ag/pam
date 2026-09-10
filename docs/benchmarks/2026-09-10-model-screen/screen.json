@@ -245,7 +245,76 @@
       "cancellation",
       "recovery",
       "unload"
-    ]
+    ],
+    "complete_run": {
+      "ceiling_bytes": 23622320128,
+      "ceiling_is_default": false,
+      "outcome": "every phase completed",
+      "exit_code": 0,
+      "elapsed_seconds": 1119.502,
+      "peak_sampled_rss_bytes": 19170000000,
+      "kernel_peak_phys_footprint_bytes": 19240000000,
+      "added_swapout_pages": 0,
+      "pressure": "normal throughout",
+      "load_wall_ms": 1712,
+      "phases": [
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 44391,
+          "decode_ms": 9155
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 509,
+          "prompt_ms": 44188,
+          "decode_ms": 9208
+        },
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 89407,
+          "decode_ms": 11340
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 1019,
+          "prompt_ms": 89287,
+          "decode_ms": 11265
+        },
+        {
+          "phase": "first_at_length",
+          "actual_prompt_tokens": 2045,
+          "prompt_ms": 185741,
+          "decode_ms": 15715
+        },
+        {
+          "phase": "warm_repeat",
+          "actual_prompt_tokens": 2045,
+          "prompt_ms": 185231,
+          "decode_ms": 15702
+        }
+      ],
+      "cancellation": {
+        "signal_sent": true,
+        "outcome": "cancelled",
+        "signal_to_return_ms": 185050,
+        "worker_preemption_proven": false,
+        "phase_at_signal": "not_observable",
+        "reading": "The signal was sent after 100 ms and the call returned only after the whole prefill. Cancellation is not honoured within any useful bound."
+      },
+      "recovery_after_cancel": {
+        "succeeded": true,
+        "actual_prompt_tokens": 2045,
+        "prompt_ms": 185603,
+        "decode_ms": 15748
+      },
+      "unload": {
+        "wall_ms": 64,
+        "external_rss_after_unload_bytes": 17800000000,
+        "reading": "Unload reports success but the working set stays resident: RSS held near 17.8 GB for the final ten seconds of sampling. Allocator retention could explain some of it, but large tensor allocations would normally be munmapped on free, so this needs a dedicated check."
+      }
+    }
   },
   "findings": [
     "The artifact is Candle-compatible on CPU: it loads reporting architecture qwen3, quant Q5_K_M and context_length 8192, and it generates.",
@@ -257,7 +326,10 @@
     "Resident set is not an overstatement from evictable mapped weights: phys_footprint tracks ps RSS within about 0.4 GB throughout and peaks HIGHER on both backends (CPU 17.18 GB against RSS 17.16 GB; Metal 19.33 GB against RSS 18.73 GB), because it excludes clean file-backed pages and includes compressed ones. The working set is real anonymous memory: weights are materialized, not mapped.",
     "The working set exceeds artifact bytes by roughly 4.5 GB on CPU and over 8.8 GB on Metal, so weight bytes underestimate demand by a large and backend-dependent margin.",
     "Metal is far faster than CPU once its timings are honest: prefill about 342 tokens per second against 11.3, with load at about 1.9 s on both. Steady state after load is about 17.7 GB.",
-    "Metal's binding constraint is not steady state but transient GPU allocation during generation, which grows with prompt length and drove the kernel high-water mark to 58.09 GB on a 64 GiB host while RSS stayed flat near 17.7 GB. A 32 GB machine cannot absorb that transient."
+    "Metal's binding constraint is not steady state but transient GPU allocation during generation, which grows with prompt length and drove the kernel high-water mark to 58.09 GB on a 64 GiB host while RSS stayed flat near 17.7 GB. A 32 GB machine cannot absorb that transient.",
+    "A 2048-token prefill costs over three minutes on CPU (185.7 s), and the widest phase sets the peak: 19.17 GB RSS against the 17.53 GB seen when a run stopped after 1024 tokens.",
+    "Cancellation is not bounded: a signal sent at 100 ms returned only after 185,050 ms, the entire prefill, with worker preemption unproven. Recovery after cancel did succeed.",
+    "Unload does not return the working set: it reports success in 64 ms while about 17.8 GB stays resident."
   ],
   "limitations": [
     "This is capped resource screening on 64 GiB hardware. It is not a 32 GB qualification and no 32 GB claim follows from it.",
@@ -267,8 +339,8 @@
     "Framing is the production generic ChatML, which is not the upstream-equivalent framing for this artifact in non-thinking mode, so answer quality was neither measured nor compared.",
     "One synthetic build-record fixture with a 64-token output cap and ambient host load. No task quality, incident, fidelity or benefit qualification.",
     "The second pinned candidate, Qwen3-Coder-30B-A3B-Instruct-Q3_K_S, has not been downloaded or screened.",
-    "The 2048-token phase, cancellation, recovery and unload were still never reached on either backend: on Metal the run now stops on the transient footprint instead of the load ceiling.",
-    "Whether phys_footprint attributing unified-memory GPU allocations this way reflects pressure the same as anonymous CPU memory has not been independently confirmed."
+    "Whether phys_footprint attributing unified-memory GPU allocations this way reflects pressure the same as anonymous CPU memory has not been independently confirmed.",
+    "The complete run is CPU only and used a 22 GiB ceiling. Metal still has no 2048-token, cancellation, recovery or unload measurement, because its transient GPU allocation stops the run first."
   ],
   "corrections": [
     {

@@ -232,6 +232,41 @@ Those raised-ceiling runs are not routine: they pushed this host into heavy
 swapping, growing swap from 1.03 GB used of a 2 GB file to 15.1 GB of a 16 GB
 file. Do not repeat them without cause.
 
+### The complete CPU run
+
+Raising the per-phase limit to 6 minutes let one run finish every phase for the
+first time on either backend: exit 0 after 1,119 s at a 22 GiB ceiling, with
+pressure normal and no swapouts added.
+
+| Framed tokens | Prefill | Decode (64 tokens) |
+| --- | --- | --- |
+| 509 | 44,391 / 44,188 ms | 9,155 / 9,208 ms |
+| 1,019 | 89,407 / 89,287 ms | 11,340 / 11,265 ms |
+| 2,045 | 185,741 / 185,231 ms | 15,715 / 15,702 ms |
+
+A 2048-token prompt therefore costs over three minutes of prefill on CPU. The
+widest phase also sets the peak: 19.17 GB resident and a 19.24 GB kernel
+footprint, against the 17.53 GB a run reached when it stopped after 1,024
+tokens. Any envelope taken from a narrower phase understates the real one.
+
+**Cancellation is not bounded.** The probe signalled after 100 ms; the call
+returned 185,050 ms later — the entire prefill — with `worker_preemption_proven`
+false and the phase at signal not observable. The prose limitation recorded for
+task #100 is now quantified: a caller who cancels a 2048-token CPU request waits
+over three minutes. Recovery after cancel did succeed, with the same token count
+and valid output.
+
+**Unload does not return the working set.** It reports success in 64 ms, but
+external sampling shows resident memory holding near 17.8 GB for the remaining
+ten seconds — essentially the whole working set. Allocator retention could
+account for part of it, though large tensor allocations would normally be
+unmapped on free, so this needs a dedicated check before it is settled. As it
+stands, `idle_unload_min` would report a model unloaded while returning nothing
+the machine can use.
+
+Metal still has none of these four measurements: its transient GPU allocation
+stops a run before the 2048-token phase is reached.
+
 What this does **not** establish: any 32 GB claim, the 2048-token envelope,
 cancellation, recovery or unload behaviour on either backend, answer quality
 under the correct non-thinking framing, or a p95 latency. The challenger

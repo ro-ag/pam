@@ -122,6 +122,14 @@ async fn seed_allowed_programs(tmp: &tempfile::TempDir, programs: &[&str]) {
         .expect("the allowlist persists");
 }
 
+/// Approves only the real repository named by this CLI fixture; no remote scope.
+async fn seed_repository_scope(daemon: &TestDaemon, repo: &std::path::Path) {
+    daemon.handle.store().set_setting("flows.scope_policy", &serde_json::json!({
+        "version": 1,
+        "repositories": [{"root": repo.canonicalize().expect("fixture repo exists"), "connectors": []}]
+    }).to_string()).await.expect("explicit fixture repository approval");
+}
+
 /// Polls the store until the request row satisfies `pred`.
 async fn wait_for_row(store: &Store, id: &str, pred: impl Fn(&RequestRow) -> bool) -> RequestRow {
     loop {
@@ -568,6 +576,7 @@ async fn flow_run_verifies_after_merge_checks_inside_a_git_repo() {
     timeout(FLOW_DEADLINE, async {
         let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
         let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
 
         let run = run_pam(
             &daemon.base(),
@@ -626,6 +635,7 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
         let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
         seed_flow(&daemon.tmp, "input-echo", INPUT_ECHO_FLOW);
         let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
 
         let run = run_pam(
             &daemon.base(),
@@ -733,6 +743,7 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
             .unwrap();
         for state in ["clean", "staged", "unstaged", "untracked"] {
             let repo = clean_tree_fixture(state);
+            seed_repository_scope(&daemon, repo.path()).await;
             let run = run_pam(
                 &daemon.base(),
                 repo.path(),
@@ -835,6 +846,7 @@ async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
         assert_eq!(got["flow"]["name"], "Renamed flow");
         assert_eq!(got["flow"]["id"], "copied");
         let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
         let run = run_pam(&base, repo.path(), &["flow", "run", "copied", "--json"]).await;
         assert_eq!(run.code, 0, "{}", run.stderr);
         let result: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();

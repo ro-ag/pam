@@ -456,13 +456,20 @@ async fn lease_reaping_fails_the_row_audits_and_frees_the_lane() {
 
 #[tokio::test(start_paused = true)]
 async fn background_reaper_collects_expired_leases() {
-    timeout(DEADLINE, async {
-        let (store, queue) = manager().await;
-        let mut env = envelope("req_1", REPO_A, serde_json::json!({}), None);
-        env.deadline_ms = 20;
-        enqueue(&queue, &env).await;
-        queue.take_next(REPO_A).await.unwrap().unwrap();
+    // Admission uses real wall time, while the reaper uses Tokio's paused clock.
+    // Admit and obtain the lease before starting the observation timeout.
+    let (store, queue) = manager().await;
+    let env = envelope("req_1", REPO_A, serde_json::json!({}), None);
+    enqueue(&queue, &env).await;
+    let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+    advance(
+        work.lease_deadline
+            .saturating_duration_since(Instant::now())
+            + Duration::from_millis(1),
+    )
+    .await;
 
+    timeout(DEADLINE, async {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = Arc::clone(&queue).run_reaper(Duration::from_millis(50), shutdown_rx);
 

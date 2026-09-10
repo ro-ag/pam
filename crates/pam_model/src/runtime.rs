@@ -1047,12 +1047,18 @@ fn generate_on_thread(
         loaded.meta.context_length,
     )?;
 
+    if *cancel.borrow() {
+        return Err(RuntimeError::Cancelled);
+    }
     loaded.reset_cache();
     let input = Tensor::new(ids.as_slice(), &loaded.device)
         .and_then(|tensor| tensor.unsqueeze(0))
         .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
     let logits = loaded.forward(&input, 0)?;
     let prompt_ms = millis(started.elapsed());
+    if *cancel.borrow() {
+        return Err(RuntimeError::Cancelled);
+    }
 
     let decode_started = Instant::now();
     let decoded = decode_loop(loaded, request, logits, prompt_tokens, cancel)?;

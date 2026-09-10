@@ -880,7 +880,7 @@ async fn evidence_read_binary_binds_origin_and_view_and_preserves_exact_bytes() 
         let request_id = original["id"].as_str().expect("echo response id");
         let store = daemon.handle.store();
         store
-            .insert_evidence("ev_cli", request_id, "log_source", b"private source", None)
+            .insert_evidence("ev_cli", request_id, "log_source", b"x\xff\n", None)
             .await
             .unwrap();
         assert!(
@@ -896,7 +896,7 @@ async fn evidence_read_binary_binds_origin_and_view_and_preserves_exact_bytes() 
                         .into_owned(),
                     origin_json: serde_json::json!({"targets": []}).to_string(),
                     identity_json: serde_json::json!({"schema_version": 1}).to_string(),
-                    map_json: serde_json::json!({"schema_version": 1}).to_string(),
+                    map_json: serde_json::json!([{"view":{"start":0,"end":3},"parent":{"start":0,"end":3},"relation":"identity"}]).to_string(),
                     view_id: "view_cli".into(),
                     view_bytes: b"x\xff\n".to_vec(),
                 })

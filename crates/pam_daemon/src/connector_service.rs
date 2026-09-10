@@ -556,6 +556,26 @@ impl ConnectorService {
         deadline: Instant,
         budget: Arc<crate::request_budget::RequestBudget>,
     ) -> Result<CallResult, InvokeError> {
+        self.invoke_captured(repo, id, call, args, deadline, budget)
+            .await?
+            .0
+    }
+
+    pub(crate) async fn invoke_captured(
+        &self,
+        repo: &Path,
+        id: ConnectorId,
+        call: &str,
+        args: &BTreeMap<String, ArgValue>,
+        deadline: Instant,
+        budget: Arc<crate::request_budget::RequestBudget>,
+    ) -> Result<
+        (
+            Result<CallResult, InvokeError>,
+            crate::evidence_service::ConnectorTarget,
+        ),
+        InvokeError,
+    > {
         budget.attempt().map_err(|error| {
             InvokeError::Connector(pam_connectors::ConnectorError::Policy {
                 cause: error.cause,
@@ -594,7 +614,15 @@ impl ConnectorService {
             budget,
         };
         let result = pam_connectors::call(id, &connection, call, args, &transport, deadline).await;
-        Ok(result?)
+        Ok((
+            result.map_err(InvokeError::from),
+            crate::evidence_service::ConnectorTarget {
+                connector: id,
+                base_url: connection.base_url.to_string(),
+                call: call.to_owned(),
+                args: args.clone(),
+            },
+        ))
     }
 
     /// Scope-only preflight, before a step asks for grants or credentials.
@@ -858,7 +886,10 @@ impl HttpTransport for ScopedTransport<'_> {
     }
 }
 
-fn configured_url(id: ConnectorId, row: Option<&ConnectorRow>) -> Result<String, InvokeError> {
+pub(crate) fn configured_url(
+    id: ConnectorId,
+    row: Option<&ConnectorRow>,
+) -> Result<String, InvokeError> {
     let raw = if descriptor(id).needs_base_url {
         row.and_then(|row| row.base_url.as_deref())
             .filter(|raw| !raw.trim().is_empty())

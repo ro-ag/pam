@@ -145,7 +145,8 @@ pub fn classify(capability: &str) -> Option<CapabilityClass> {
         | "cancel"
         | "query"
         | crate::flow_service::CAP_FLOW_LIST
-        | crate::flow_service::CAP_FLOW_SHOW => Some(CapabilityClass::ReadOnly),
+        | crate::flow_service::CAP_FLOW_SHOW
+        | crate::evidence_service::CAP_EVIDENCE_READ => Some(CapabilityClass::ReadOnly),
         "echo" | crate::flow_service::CAP_FLOW_RUN => Some(CapabilityClass::NonDestructive),
         _ => None,
     }

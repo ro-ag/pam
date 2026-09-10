@@ -169,6 +169,8 @@ pub enum BuiltinCapability {
     FlowList,
     /// Read one flow's YAML, canonical rendering and digest.
     FlowShow,
+    /// Read one scoped, bounded redacted evidence range.
+    EvidenceRead,
 }
 
 impl BuiltinCapability {
@@ -185,6 +187,7 @@ impl BuiltinCapability {
             crate::flow_service::CAP_FLOW_RUN => Some(Self::FlowRun),
             crate::flow_service::CAP_FLOW_LIST => Some(Self::FlowList),
             crate::flow_service::CAP_FLOW_SHOW => Some(Self::FlowShow),
+            crate::evidence_service::CAP_EVIDENCE_READ => Some(Self::EvidenceRead),
             _ => None,
         }
     }
@@ -200,6 +203,7 @@ impl BuiltinCapability {
             Self::FlowRun => crate::flow_service::CAP_FLOW_RUN,
             Self::FlowList => crate::flow_service::CAP_FLOW_LIST,
             Self::FlowShow => crate::flow_service::CAP_FLOW_SHOW,
+            Self::EvidenceRead => crate::evidence_service::CAP_EVIDENCE_READ,
         }
     }
 
@@ -213,6 +217,7 @@ impl BuiltinCapability {
             Self::FlowRun => flow_run(&ctx).await,
             Self::FlowList => flow_list(&ctx),
             Self::FlowShow => flow_show(&ctx),
+            Self::EvidenceRead => crate::evidence_service::read(&ctx).await,
         }
     }
 }

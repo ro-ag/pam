@@ -132,6 +132,9 @@ pub struct StepReport {
     pub exit_status: Option<i32>,
     /// Evidence rows this step left, in write order.
     pub evidence: Vec<String>,
+    /// Explicit source/view omissions, separate from the step's real outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_unavailable: Vec<String>,
     /// The model's summary, for an `output: summarize` step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -152,6 +155,7 @@ impl StepReport {
             duration_ms: 0,
             exit_status: None,
             evidence: Vec::new(),
+            evidence_unavailable: Vec::new(),
             summary: None,
             error: None,
         }

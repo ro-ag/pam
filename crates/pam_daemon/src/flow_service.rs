@@ -626,6 +626,8 @@ impl FlowService {
             cancel,
             reports: Vec::with_capacity(flow.steps.len()),
             evidence: Vec::new(),
+            origins: BTreeMap::new(),
+            all_origins: Vec::new(),
         };
         state.execute().await?;
 
@@ -674,6 +676,35 @@ impl FlowService {
             .await
             .map_err(failed_store)?;
 
+        let view = crate::evidence_view::redact(&serde_json::to_vec(&body).map_err(|error| {
+            CapabilityFailure::Failed {
+                detail: error.to_string(),
+            }
+        })?)
+        .map_err(|error| CapabilityFailure::Failed {
+            detail: error.to_string(),
+        })?;
+        let capture = crate::evidence_service::CaptureScope {
+            repository: state.repo.to_string_lossy().into_owned(),
+            origin: crate::evidence_service::EvidenceOrigin {
+                targets: state.all_origins,
+            },
+        };
+        crate::evidence_service::publish(
+            &self.store,
+            &capture,
+            &ctx.request_id,
+            &verdict_id,
+            view,
+            json!({"kind": "protected_flow_result"}),
+        )
+        .await
+        .map_err(|detail| CapabilityFailure::Failed { detail })?;
+        let body = crate::evidence_view::redact_json(&body).map_err(|error| {
+            CapabilityFailure::Failed {
+                detail: error.to_string(),
+            }
+        })?;
         let mut evidence = state.evidence;
         evidence.push(verdict_id);
         Ok(CapabilityOutput {
@@ -980,6 +1011,8 @@ struct RunState<'a> {
     cancel: watch::Receiver<bool>,
     reports: Vec<StepReport>,
     evidence: Vec<String>,
+    origins: BTreeMap<String, crate::evidence_service::ConnectorTarget>,
+    all_origins: Vec<crate::evidence_service::ConnectorTarget>,
 }
 
 impl RunState<'_> {
@@ -1530,9 +1563,18 @@ impl RunState<'_> {
             () = cancelled(&mut self.cancel) => return None,
             called = tokio::time::timeout(
                 step.timeout,
-                self.service.connectors.invoke_with_budget(&self.repo, connector, call, args, deadline.min(self.ctx.budget.deadline()), Arc::clone(&self.ctx.budget)),
+                self.service.connectors.invoke_captured(&self.repo, connector, call, args, deadline.min(self.ctx.budget.deadline()), Arc::clone(&self.ctx.budget)),
             ) => called,
         };
+        let called = called.map(|result| {
+            result.and_then(|(result, origin)| {
+                if !self.all_origins.contains(&origin) {
+                    self.all_origins.push(origin.clone());
+                }
+                self.origins.insert(step.id.clone(), origin);
+                result
+            })
+        });
         Some(assert_connector_attempt(
             step,
             match called {
@@ -1656,6 +1698,25 @@ impl RunState<'_> {
     }
 
     /// Files a connector's JSON answer as `connector.result` evidence.
+    fn capture_scope(&self, step: &Step) -> Result<crate::evidence_service::CaptureScope, String> {
+        use crate::evidence_service::{CaptureScope, EvidenceOrigin};
+        if matches!(step.action, Action::Connector { .. }) {
+            self.origins
+                .get(&step.id)
+                .ok_or("connector capture identity unavailable")?;
+        }
+        // Later local steps can consume earlier connector values. Conservatively
+        // retain every preceding target rather than downgrade derived evidence.
+        let origin = EvidenceOrigin {
+            targets: self.all_origins.clone(),
+        };
+        Ok(CaptureScope {
+            repository: self.repo.to_string_lossy().into_owned(),
+            origin,
+        })
+    }
+
+    /// Keep raw connector answers protected and publish their redacted views.
     async fn file_connector_result(
         &mut self,
         step: &Step,
@@ -1665,7 +1726,7 @@ impl RunState<'_> {
         let Action::Connector {
             connector,
             call,
-            with,
+            with: _,
         } = &step.action
         else {
             return;
@@ -1675,14 +1736,14 @@ impl RunState<'_> {
                 .get("summary")
                 .and_then(Value::as_str)
                 .filter(|text| text.len() <= 6000)
-                .map(str::to_owned);
+                .and_then(|text| crate::evidence_view::redact(text.as_bytes()).ok())
+                .and_then(|view| String::from_utf8(view.bytes).ok());
         }
         let meta = json!({
             "connector": connector.as_str(),
             "attempt": report.attempts,
             "call": call,
-            "args": with.iter().map(|(name, value)| (name.clone(), value.to_string()))
-                .collect::<BTreeMap<String, String>>(),
+            "args": self.origins.get(&step.id).map(|origin| &origin.args),
         });
         let content = match serde_json::to_vec(result) {
             Ok(content) => content,
@@ -1705,11 +1766,41 @@ impl RunState<'_> {
             .await
         {
             Ok(()) => {
+                let capture = self.capture_scope(step);
+                let view = crate::evidence_service::prepare(content).await;
+                match (capture, view) {
+                    (Ok(capture), Ok(view)) => {
+                        if let Err(error) = crate::evidence_service::publish(
+                            &self.service.store,
+                            &capture,
+                            &self.ctx.request_id,
+                            &id,
+                            view,
+                            json!({"kind": "protected_connector_result"}),
+                        )
+                        .await
+                        {
+                            tracing::warn!(step = %step.id, %error, "connector evidence view unavailable");
+                            report
+                                .evidence_unavailable
+                                .push(format!("{id}: view_unavailable"));
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(step = %step.id, "connector evidence view could not be prepared");
+                        report
+                            .evidence_unavailable
+                            .push(format!("{id}: view_unavailable"));
+                    }
+                }
                 report.evidence.push(id.clone());
                 self.evidence.push(id);
             }
             Err(error) => {
                 tracing::warn!(step = %step.id, %error, "a connector result could not be filed");
+                report
+                    .evidence_unavailable
+                    .push("connector_source_unavailable".to_owned());
             }
         }
     }
@@ -1730,10 +1821,20 @@ impl RunState<'_> {
             return;
         }
         let summarize = step.output == OutputPolicy::Summarize;
+        let capture = match self.capture_scope(step) {
+            Ok(capture) => capture,
+            Err(error) => {
+                tracing::warn!(step = %step.id, %error, "evidence scope could not be captured");
+                report
+                    .evidence_unavailable
+                    .push("capture_scope_unavailable".to_owned());
+                return;
+            }
+        };
         let compressed = self
             .service
             .logs
-            .compress(
+            .compress_scoped(
                 &self.ctx.request_id,
                 CompressInput {
                     name: format!("{}/{}/attempt-{}", self.flow.id, step.id, report.attempts),
@@ -1741,12 +1842,16 @@ impl RunState<'_> {
                     exit_status,
                     use_model: summarize,
                 },
+                Some(&capture),
             )
             .await;
         let compressed = match compressed {
             Ok(compressed) => compressed,
             Err(error) => {
                 tracing::warn!(step = %step.id, %error, "a step's output could not be compressed");
+                report
+                    .evidence_unavailable
+                    .push(format!("log_view_unavailable: {}", error.cause()));
                 return;
             }
         };

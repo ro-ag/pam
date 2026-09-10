@@ -250,6 +250,15 @@ impl LogService {
         request_id: &str,
         input: CompressInput,
     ) -> Result<CompressReport, LogError> {
+        self.compress_scoped(request_id, input, None).await
+    }
+
+    pub(crate) async fn compress_scoped(
+        &self,
+        request_id: &str,
+        input: CompressInput,
+        capture: Option<&crate::evidence_service::CaptureScope>,
+    ) -> Result<CompressReport, LogError> {
         let CompressInput {
             name,
             bytes,
@@ -266,24 +275,6 @@ impl LogService {
             });
         }
 
-        // The reduction is pure CPU over up to 64 MiB; it does not belong
-        // on a runtime thread that is also serving the socket. The bytes
-        // travel with the closure and come back so the source row can be
-        // written from them without a second copy.
-        let (bytes, compacted) =
-            crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
-                let compacted = compact(&bytes, exit_status, &Policy::default());
-                (bytes, compacted)
-            })
-            .await
-            .map_err(|err| LogError::Blocking {
-                cause: err.cause(),
-                detail: err.to_string(),
-            })?;
-        let compacted = compacted?;
-
-        let stats = CompressStats::of(&compacted);
-
         let source_id = new_evidence_id();
         self.store
             .insert_evidence(
@@ -294,6 +285,53 @@ impl LogService {
                 Some(&json!({ "name": name, "exit_status": exit_status }).to_string()),
             )
             .await?;
+
+        // The reduction is pure CPU over up to 64 MiB; it does not belong
+        // on a runtime thread that is also serving the socket. The bytes
+        // travel with the closure and come back so the source row can be
+        // written from them without a second copy.
+        let (bytes, prepared) =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
+                let prepared = (|| {
+                    let safe =
+                        crate::evidence_view::redact(&bytes).map_err(|error| error.to_string())?;
+                    let compacted = compact(&safe.bytes, exit_status, &Policy::default())
+                        .map_err(|error| error.to_string())?;
+                    let compact_map =
+                        crate::evidence_view::compact_segments(&compacted, &safe.bytes)
+                            .map_err(|error| error.to_string())?;
+                    let mut view = crate::evidence_view::redact(compacted.rendered_text.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    view.segments =
+                        crate::evidence_view::compose_segments(&view.segments, &compact_map)
+                            .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((safe, compacted, view))
+                })();
+                (bytes, prepared)
+            })
+            .await
+            .map_err(|err| LogError::Blocking {
+                cause: err.cause(),
+                detail: err.to_string(),
+            })?;
+        let (safe, compacted, compact_view) = prepared.map_err(LogError::Join)?;
+        let compact_text = String::from_utf8(compact_view.bytes.clone())
+            .map_err(|error| LogError::Join(error.to_string()))?;
+
+        let stats = CompressStats::of(&compacted);
+
+        if let Some(capture) = capture {
+            crate::evidence_service::publish(
+                &self.store,
+                capture,
+                request_id,
+                &source_id,
+                safe,
+                json!({"kind": "protected_source"}),
+            )
+            .await
+            .map_err(LogError::Join)?;
+        }
 
         let compact_json = serde_json::to_vec(&compacted).map_err(|err| {
             LogError::Join(format!("the compaction report did not serialize: {err}"))
@@ -309,17 +347,31 @@ impl LogService {
             )
             .await?;
 
+        if let Some(capture) = capture {
+            crate::evidence_service::publish(
+                &self.store,
+                capture,
+                request_id,
+                &compact_id,
+                compact_view,
+                json!({"evidence_id": source_id, "source_sha256": compacted.source_sha256,
+                    "offset_basis": "redacted_source_bytes", "relation": "covering_record"}),
+            )
+            .await
+            .map_err(LogError::Join)?;
+        }
+
         let mut report = CompressReport {
             source: EvidenceRef {
                 id: source_id.clone(),
-                bytes: stats.source_bytes,
+                bytes: as_u64(bytes.len()),
             },
             compact: EvidenceRef {
                 id: compact_id.clone(),
                 bytes: as_u64(compact_json.len()),
             },
             summary: None,
-            compact_text: compacted.rendered_text,
+            compact_text,
             summary_text: None,
             stats,
             model: None,
@@ -330,10 +382,17 @@ impl LogService {
         };
 
         if use_model {
-            self.semantic_prompt(request_id, &name, &compact_id, &mut report)
+            self.semantic_prompt(request_id, &name, &compact_id, &mut report, capture)
                 .await;
-            self.summarize(request_id, &name, &source_id, &compact_id, &mut report)
-                .await;
+            self.summarize(
+                request_id,
+                &name,
+                &source_id,
+                &compact_id,
+                &mut report,
+                capture,
+            )
+            .await;
         }
 
         tracing::info!(
@@ -361,6 +420,7 @@ impl LogService {
         source_id: &str,
         compact_id: &str,
         report: &mut CompressReport,
+        capture: Option<&crate::evidence_service::CaptureScope>,
     ) {
         let prompt = report
             .semantic_text
@@ -403,6 +463,20 @@ impl LogService {
         };
 
         let summary_id = new_evidence_id();
+        let view = match crate::evidence_view::redact(result.text.as_bytes()) {
+            Ok(view) => view,
+            Err(error) => {
+                report.model_skipped = Some(ModelSkipped {
+                    cause: "redaction_unavailable".to_owned(),
+                    detail: error.to_string(),
+                });
+                return;
+            }
+        };
+        let safe_text = match String::from_utf8(view.bytes.clone()) {
+            Ok(text) => text,
+            Err(_) => return,
+        };
         let meta = json!({
             "name": name,
             "model_id": entry.id,
@@ -435,6 +509,13 @@ impl LogService {
             return;
         }
 
+        if let Some(capture) = capture {
+            if let Err(error) = crate::evidence_service::publish(&self.store, capture, request_id, &summary_id, view,
+                json!({"kind": "untrusted_model_output", "input_evidence_id": compact_id, "quotation_support": "not_asserted"})).await {
+                report.model_skipped = Some(ModelSkipped { cause: "evidence_view_unavailable".to_owned(), detail: error });
+                return;
+            }
+        }
         report.summary = Some(EvidenceRef {
             id: summary_id,
             bytes: as_u64(result.text.len()),
@@ -446,7 +527,7 @@ impl LogService {
             completion_tokens: result.completion_tokens,
             tokens_per_sec: result.tokens_per_sec,
         });
-        report.summary_text = Some(result.text);
+        report.summary_text = Some(safe_text);
     }
 }
 

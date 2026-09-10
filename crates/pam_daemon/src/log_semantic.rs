@@ -18,6 +18,7 @@ impl LogService {
         name: &str,
         compact_id: &str,
         report: &mut CompressReport,
+        capture: Option<&crate::evidence_service::CaptureScope>,
     ) {
         match self.store.get_setting(SETTING_ENABLED).await {
             Ok(Some(value)) if value == "true" => {}
@@ -92,7 +93,7 @@ impl LogService {
                 return;
             }
         };
-        self.store_selection(request_id, name, compact_id, report, selection)
+        self.store_selection(request_id, name, compact_id, report, selection, capture)
             .await;
     }
 
@@ -103,7 +104,30 @@ impl LogService {
         compact_id: &str,
         report: &mut CompressReport,
         selection: pam_model::compression::CompressionReport,
+        capture: Option<&crate::evidence_service::CaptureScope>,
     ) {
+        let view = (|| {
+            let mapping =
+                crate::evidence_view::semantic_segments(&selection, &report.compact_text)?;
+            let mut view = crate::evidence_view::redact(selection.text.as_bytes())?;
+            view.segments = crate::evidence_view::compose_segments(&view.segments, &mapping)?;
+            Ok::<_, crate::evidence_view::ViewError>(view)
+        })();
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                record_skip(
+                    report,
+                    "compression_provenance_unavailable",
+                    error.to_string(),
+                );
+                return;
+            }
+        };
+        let safe_text = match String::from_utf8(view.bytes.clone()) {
+            Ok(text) => text,
+            Err(_) => return,
+        };
         let bytes = match serde_json::to_vec(&selection) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -129,11 +153,27 @@ impl LogService {
             record_skip(report, "compression_store_failed", error.to_string());
             return;
         }
+        if let Some(capture) = capture {
+            if let Err(error) = crate::evidence_service::publish(
+                &self.store,
+                capture,
+                request_id,
+                &id,
+                view,
+                json!({"evidence_id": compact_id, "source_sha256": selection.source_sha256,
+                    "offset_basis": "compact_view_bytes"}),
+            )
+            .await
+            {
+                record_skip(report, "compression_view_unavailable", error);
+                return;
+            }
+        }
         report.semantic = Some(EvidenceRef {
             id,
             bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         });
-        report.semantic_text = Some(selection.text);
+        report.semantic_text = Some(safe_text);
     }
 }
 

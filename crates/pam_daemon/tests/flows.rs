@@ -1601,3 +1601,47 @@ async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() 
         flows.daemon.stop().await;
     }).await;
 }
+
+#[tokio::test]
+async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view() {
+    with_deadline(async {
+        let yaml = "schema: 1\nid: safe-evidence\nname: Safe evidence\nsteps:\n  - id: failing\n    run: [pam-flow-helper, 'password=private-sentinel-726']\n";
+        let flows = FlowDaemon::spawn(&[("safe-evidence", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        let original = flows.run_envelope("req_safe_source", "safe-evidence", &serde_json::json!({}));
+        let response = client.request(&original).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let rows = flows.daemon.store().list_evidence(&original.id).await.unwrap();
+        let source = rows.iter().find(|row| row.kind == EVIDENCE_KIND_LOG_SOURCE).unwrap();
+        let protected = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&protected.content).contains("private-sentinel-726"));
+        let mut read = original.clone();
+        read.capability = "evidence.read".to_owned();
+        let mut collected = Vec::new();
+        let mut offset = 0;
+        let mut view_id = None;
+        let mut digest = None;
+        loop {
+            read.id = format!("req_safe_page_{offset}");
+            read.args = serde_json::json!({"evidence_id":source.id,"request_id":original.id,
+                "offset":offset,"length":8,"expected_view_id":view_id,"expected_sha256":digest});
+            let response = client.request(&read).await;
+            let Response::Result { body, .. } = response else { panic!("{response:?}") };
+            let data = body["data"].as_str().unwrap();
+            for pair in data.as_bytes().chunks_exact(2) {
+                collected.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+            }
+            assert!(body["provenance"].is_array());
+            view_id = Some(body["view_id"].as_str().unwrap().to_owned());
+            digest = Some(body["view_sha256"].as_str().unwrap().to_owned());
+            let Some(next) = body["next_offset"].as_u64() else { break };
+            offset = next;
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(!text.contains("private-sentinel-726"), "{text}");
+        assert!(text.contains("REDACTED"), "{text}");
+        let hash = pam_compact::compact(&collected, None, &pam_compact::Policy::default()).unwrap().source_sha256;
+        assert_eq!(digest.as_deref(), Some(hash.as_str()));
+        flows.daemon.stop().await;
+    }).await;
+}

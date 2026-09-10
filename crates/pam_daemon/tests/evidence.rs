@@ -45,13 +45,7 @@ impl Fixture {
         );
         let store = daemon.store();
         store
-            .insert_evidence(
-                EVIDENCE,
-                ORIGINAL,
-                "log_source",
-                b"private original bytes",
-                None,
-            )
+            .insert_evidence(EVIDENCE, ORIGINAL, "log_source", BYTES, None)
             .await
             .unwrap();
         assert!(
@@ -63,7 +57,7 @@ impl Fixture {
                     origin_json: json!({"targets": []}).to_string(),
                     identity_json: json!({"schema_version": 1, "source_kind": "fixture"})
                         .to_string(),
-                    map_json: json!({"schema_version": 1, "offset_basis": "view_bytes"})
+                    map_json: json!([{"view":{"start":0,"end":BYTES.len()},"parent":{"start":0,"end":BYTES.len()},"relation":"identity"}])
                         .to_string(),
                     view_id: VIEW.into(),
                     view_bytes: BYTES.to_vec(),

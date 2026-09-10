@@ -13,6 +13,10 @@ pub mod admin_transport;
 pub mod approval;
 pub mod connector_service;
 pub mod daemon;
+mod evidence_service;
+mod evidence_view;
+#[cfg(test)]
+mod evidence_view_test;
 pub mod executor;
 pub mod flow_exec;
 pub mod flow_service;

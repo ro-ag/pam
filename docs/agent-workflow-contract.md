@@ -106,11 +106,12 @@ that ticket and any evidence already acquired.
 
 ## Evidence retrieval must be useful without the GUI
 
-A future read-only evidence command/capability must retrieve one authorized
-source or range, not expose `admin.*` to the agent. Return source identity,
+The read-only `pam evidence read` command retrieves one authorized redacted
+view range. See [evidence retrieval](evidence-retrieval.md) for identity,
+scope and persistent allowance rules. It returns source identity,
 digest, content kind, offset basis, retained/omitted ranges, capture/version data
-and redaction state. Proposed page default: 16 KiB, maximum 64 KiB; retain a
-cursor/reference so further reads consume the same authorized scope and budgets.
+and redaction state. Pages default to 16 KiB, maximum 64 KiB; subsequent reads
+pin the returned view ID and digest and consume the same authorized scope and budgets.
 
 Return an explicit expired or unavailable response when retention removed the
 source. Treat handles as opaque references, not capabilities that bypass access
@@ -173,6 +174,7 @@ pam flow run jenkins-build-investigation job=platform/nightly build=41 --no-wait
 pam subscribe <ticket>
 pam wait <ticket>
 pam cancel <ticket> --json
+pam evidence read <evidence-id> --request <ticket> --json
 ```
 
 The build/job values are examples; use an authorized explicit build. Settings

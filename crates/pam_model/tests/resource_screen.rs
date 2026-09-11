@@ -38,7 +38,10 @@ fn digest(value: &str) -> bool {
 fn framed_tokens(tokenizer: &GgufTokenizer, prompt: &str) -> usize {
     let encoded = tokenizer
         .inner
-        .encode(tokenizer::chatml(Some(SYSTEM), prompt), true)
+        .encode(
+            tokenizer::chatml(Some(SYSTEM), prompt, tokenizer.framing),
+            true,
+        )
         .unwrap();
     let add_bos = tokenizer.add_bos
         && tokenizer
@@ -193,13 +196,14 @@ async fn screen_pinned_artifact_resources() {
         .into_iter()
         .map(|limit| (limit, request(&tokenizer, limit)))
         .collect();
+    let framing = tokenizer.framing;
     drop(tokenizer);
     drop(content);
     emit(
         &json!({"schema_version":1,"phase":"identity","sha256":expected_sha,"bytes":expected_bytes,
         "revision_declared":revision,"license_sha256_declared":license_sha,"license_verified_by_harness":false,
         "backend_requested":backend_name,"host_label":required("PAM_SCREEN_HOST_LABEL"),"os":std::env::consts::OS,
-        "arch":std::env::consts::ARCH,"template":"production_chatml","template_qualified":false,
+        "arch":std::env::consts::ARCH,"template":framing.label(),"template_qualified":framing.template_qualified(),
         "production_memory_admission":false,"temperature":0,"output_cap":OUTPUT,"pid":std::process::id()}),
     );
     tokio::time::sleep(Duration::from_secs(2)).await;

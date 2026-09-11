@@ -1031,7 +1031,11 @@ fn generate_on_thread(
         return Err(RuntimeError::Cancelled);
     }
     let started = Instant::now();
-    let framed = tokenizer::chatml(request.system.as_deref(), &request.prompt);
+    let framed = tokenizer::chatml(
+        request.system.as_deref(),
+        &request.prompt,
+        loaded.tokenizer.framing,
+    );
     let encoding = loaded
         .tokenizer
         .inner

@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use candle_core::quantized::gguf_file;
 
-use crate::tokenizer::{TokenizerError, chatml, from_gguf};
+use crate::tokenizer::{ChatFraming, TokenizerError, chatml, framing_from_declared, from_gguf};
 
 /// GGUF metadata value types, by their wire ids.
 const TYPE_U32: u32 = 4;
@@ -19,6 +19,7 @@ const TYPE_STRING: u32 = 8;
 const TYPE_ARRAY: u32 = 9;
 
 /// A metadata value the fixtures need.
+#[derive(Clone)]
 enum Value {
     U32(u32),
     Bool(bool),
@@ -245,7 +246,7 @@ fn names_the_missing_key() {
 #[test]
 fn chatml_is_byte_exact_with_a_system_prompt() {
     assert_eq!(
-        chatml(Some("You are Pam."), "hi there"),
+        chatml(Some("You are Pam."), "hi there", ChatFraming::Qwen3Plain),
         "<|im_start|>system\nYou are Pam.<|im_end|>\n\
          <|im_start|>user\nhi there<|im_end|>\n\
          <|im_start|>assistant\n"
@@ -255,9 +256,149 @@ fn chatml_is_byte_exact_with_a_system_prompt() {
 #[test]
 fn chatml_omits_the_system_turn_when_there_is_none() {
     assert_eq!(
-        chatml(None, "hi there"),
+        chatml(None, "hi there", ChatFraming::Qwen3Plain),
         "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n"
     );
+}
+
+#[test]
+fn chatml_appends_the_empty_think_block_when_thinking_is_disabled() {
+    assert_eq!(
+        chatml(None, "hi there", ChatFraming::Qwen3ThinkingDisabled),
+        "<|im_start|>user\nhi there<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+}
+
+#[test]
+fn undeclared_framing_is_generic_chatml_and_never_qualified() {
+    assert_eq!(ChatFraming::Undeclared.assistant_suffix(), "");
+    assert!(!ChatFraming::Undeclared.template_qualified());
+    assert!(ChatFraming::Qwen3Plain.template_qualified());
+    assert!(ChatFraming::Qwen3ThinkingDisabled.template_qualified());
+}
+
+// --- Frozen framing bytes ------------------------------------------------------
+//
+// The generation-prompt tails that decide framing, byte-exact from the pinned
+// upstream tokenizer_config files. The `\n` sequences inside the Jinja string
+// literals are backslash-n in the template SOURCE — the classifier matches
+// these source bytes, and `chatml` renders the real-newline form.
+//
+// The classification of the FULL pinned templates was verified against the
+// upstream files themselves (task #108, note 417 hashes): dense upstream
+// tokenizer_config template string SHA-256 a55ee1b1660128b7098723e0abcd92caa0
+// 788061051c62d51cbe87d9cf1974d8 and the older revision embedded in the pinned
+// Qwen3-14B-Q5_K_M.gguf (57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c
+// 897e24d0361) both carry this exact dense tail; the Coder upstream template
+// (5a38bfa05833266240066aedc497decc9b00cc0d3e3b8cceea98cf530196ab06) carries
+// the exact plain tail below.
+const DENSE_GENERATION_TAIL: &str = r"{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}";
+
+const CODER_GENERATION_TAIL: &str = r"{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
+";
+
+#[test]
+fn classifies_the_dense_generation_tail_as_thinking_disabled() {
+    assert_eq!(
+        framing_from_declared(DENSE_GENERATION_TAIL).expect("the dense tail is classifiable"),
+        ChatFraming::Qwen3ThinkingDisabled
+    );
+}
+
+#[test]
+fn classifies_the_coder_generation_tail_as_plain() {
+    assert_eq!(
+        framing_from_declared(CODER_GENERATION_TAIL).expect("the Coder tail is classifiable"),
+        ChatFraming::Qwen3Plain
+    );
+}
+
+#[test]
+fn refuses_a_template_that_thinks_unconditionally() {
+    let template = concat!(
+        "{%- if add_generation_prompt %}",
+        "{{- '<|im_start|>assistant\\n<think>\\n' }}",
+        "{%- endif %}"
+    );
+    match framing_from_declared(template) {
+        Err(TokenizerError::UnsupportedChatTemplate(reason)) => {
+            assert_eq!(reason, "emits a think block unconditionally");
+        }
+        other => panic!("expected UnsupportedChatTemplate, got {other:?}"),
+    }
+}
+
+#[test]
+fn refuses_a_template_that_is_not_chatml() {
+    match framing_from_declared("[INST] {Messages} [/INST]") {
+        Err(TokenizerError::UnsupportedChatTemplate(reason)) => {
+            assert_eq!(reason, "not a ChatML template");
+        }
+        other => panic!("expected UnsupportedChatTemplate, got {other:?}"),
+    }
+}
+
+#[test]
+fn refuses_a_template_that_declares_thinking_without_the_empty_block() {
+    let template = concat!(
+        "{%- if add_generation_prompt %}",
+        "{{- '<|im_start|>assistant\\n' }}",
+        "{%- if enable_thinking %}{{- '<think>\\n' }}{%- endif %}",
+        "{%- endif %}"
+    );
+    match framing_from_declared(template) {
+        Err(TokenizerError::UnsupportedChatTemplate(reason)) => assert_eq!(
+            reason,
+            "declares enable_thinking but not the empty think block PAM renders"
+        ),
+        other => panic!("expected UnsupportedChatTemplate, got {other:?}"),
+    }
+}
+
+#[test]
+fn declares_generic_chatml_when_the_file_declares_none() {
+    let bytes = fixture_bytes();
+    let tokenizer = from_gguf(&content(&bytes)).expect("the fixture builds a tokenizer");
+    assert_eq!(tokenizer.framing, ChatFraming::Undeclared);
+    assert!(!tokenizer.framing.template_qualified());
+}
+
+#[test]
+fn derives_the_framing_from_the_declared_template_at_load() {
+    let tokens = vocabulary();
+    let types = token_types(tokens.len());
+    let base = [
+        ("general.architecture", Value::Str("qwen3")),
+        ("tokenizer.ggml.model", Value::Str("gpt2")),
+        ("tokenizer.ggml.tokens", Value::StrArray(tokens.clone())),
+        ("tokenizer.ggml.merges", Value::StrArray(merge_rules())),
+        ("tokenizer.ggml.token_type", Value::U32Array(types.clone())),
+        ("tokenizer.ggml.eos_token_id", Value::U32(2)),
+        ("tokenizer.ggml.add_bos_token", Value::Bool(false)),
+    ];
+
+    let mut dense_kv = base.to_vec();
+    dense_kv.push(("tokenizer.chat_template", Value::Str(DENSE_GENERATION_TAIL)));
+    let tokenizer = from_gguf(&content(&synth(&dense_kv))).expect("dense fixture builds");
+    assert_eq!(tokenizer.framing, ChatFraming::Qwen3ThinkingDisabled);
+    assert!(tokenizer.framing.template_qualified());
+
+    let mut coder_kv = base.to_vec();
+    coder_kv.push(("tokenizer.chat_template", Value::Str(CODER_GENERATION_TAIL)));
+    let tokenizer = from_gguf(&content(&synth(&coder_kv))).expect("coder fixture builds");
+    assert_eq!(tokenizer.framing, ChatFraming::Qwen3Plain);
+
+    let bytes = synth(&base);
+    let tokenizer = from_gguf(&content(&bytes)).expect("bare fixture builds");
+    assert_eq!(tokenizer.framing, ChatFraming::Undeclared);
 }
 
 #[test]
@@ -267,5 +408,10 @@ fn debug_prints_the_error_cases() {
     assert_eq!(
         TokenizerError::MissingKey("tokenizer.ggml.tokens").to_string(),
         "the model file has no `tokenizer.ggml.tokens` metadata key"
+    );
+    assert_eq!(
+        TokenizerError::UnsupportedChatTemplate("emits a think block unconditionally".into())
+            .to_string(),
+        "the declared chat template is not one PAM can frame: emits a think block unconditionally"
     );
 }

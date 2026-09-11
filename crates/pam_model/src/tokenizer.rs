@@ -26,12 +26,25 @@
 //!
 //! # Chat format
 //!
-//! [`chatml`] hard-codes the Qwen3 `ChatML` template rather than reading
-//! `tokenizer.chat_template` and rendering Jinja. The runtime only ever
-//! loads `qwen3` and `qwen3moe` — every other architecture is refused before
-//! candle is touched — so there is exactly one template to get right, and
-//! hard-coding it means a malformed template string in a downloaded file
-//! cannot change how PAM frames a prompt.
+//! [`chatml`] frames the prompt from the chat template the model file itself
+//! declares (`tokenizer.chat_template` in the GGUF metadata), classified at
+//! load into a [`ChatFraming`] — never by rendering Jinja. The runtime only
+//! ever loads `qwen3` and `qwen3moe`, and within that family there are two
+//! framings that matter: the instruct templates carry a Qwen3
+//! `enable_thinking` branch whose disabled rendering appends an empty
+//! `<think>\n\n</think>\n\n` block after the assistant handoff, and the
+//! Coder templates end the generation prompt at the assistant newline. The
+//! distinction is load-bearing, not cosmetic: hand the dense model the bare
+//! assistant newline and it runs in *thinking* mode — it spends tokens on
+//! its own `<think>` block and the deterministic-answer contract is gone,
+//! so any quality score measures the template mistake instead of the model.
+//!
+//! Classification recognises those two constructs in the declared template
+//! and refuses everything else rather than guessing, so a malformed or
+//! unfamiliar template string in a downloaded file fails the load instead of
+//! quietly changing how PAM frames a prompt. A file that declares no
+//! template at all falls back to generic `ChatML` and is reported as not
+//! template-qualified.
 
 use candle_core::quantized::gguf_file;
 use tokenizers::{
@@ -81,6 +94,10 @@ pub struct GgufTokenizer {
     /// `tokenizer.ggml.add_bos_token`, defaulting to false, which is what
     /// the Qwen files say.
     pub add_bos: bool,
+    /// The chat framing derived from the file's declared chat template.
+    /// Framing lives with the tokenizer because that is where the declared
+    /// template is read, and every framed prompt must agree with it.
+    pub framing: ChatFraming,
 }
 
 /// Everything rebuilding a tokenizer from GGUF metadata can fail on.
@@ -92,9 +109,110 @@ pub enum TokenizerError {
     /// `tokenizer.ggml.model` names something other than `gpt2`.
     #[error("tokenizer model {0:?} is not supported (gpt2)")]
     UnsupportedModel(String),
+    /// The declared chat template is not one of the framings PAM knows how
+    /// to render, so framing the prompt would be a guess.
+    #[error("the declared chat template is not one PAM can frame: {0}")]
+    UnsupportedChatTemplate(String),
     /// The metadata was present but did not assemble into a tokenizer.
     #[error("could not build the tokenizer: {0}")]
     Build(String),
+}
+
+/// The chat framing PAM renders for an artifact, derived at load from the
+/// chat template the file itself declares.
+///
+/// The rendered prompt for every variant shares the `ChatML` body —
+/// `<|im_start|>role\n…<|im_end|>\n` — and differs only in what follows the
+/// assistant handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatFraming {
+    /// The declared template carries the Qwen3 `enable_thinking` branch.
+    /// PAM renders it disabled — the deterministic-answer contract runs
+    /// non-thinking — which appends the empty think block after the
+    /// assistant handoff.
+    Qwen3ThinkingDisabled,
+    /// The declared template ends the generation prompt at the assistant
+    /// newline (Qwen3-Coder family); nothing follows the handoff.
+    Qwen3Plain,
+    /// The file declares no chat template at all. PAM falls back to generic
+    /// `ChatML`, which is exactly right for the Coder family and wrong for the
+    /// instruct family — so the artifact is not template-qualified and must
+    /// not be used for quality measurement.
+    Undeclared,
+}
+
+impl ChatFraming {
+    /// What follows `<|im_start|>assistant\n` in a framed prompt.
+    ///
+    /// Note these are *rendered* bytes: real newlines. The template source
+    /// spells the same block with Jinja `\n` escapes, which is what the
+    /// classifier matches against.
+    #[must_use]
+    pub fn assistant_suffix(self) -> &'static str {
+        match self {
+            Self::Qwen3ThinkingDisabled => "<think>\n\n</think>\n\n",
+            Self::Qwen3Plain | Self::Undeclared => "",
+        }
+    }
+
+    /// Whether the framing is known to match what the file declares.
+    /// False only for [`ChatFraming::Undeclared`].
+    #[must_use]
+    pub fn template_qualified(self) -> bool {
+        !matches!(self, Self::Undeclared)
+    }
+
+    /// A stable name for records and screens.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Qwen3ThinkingDisabled => "qwen3_thinking_disabled",
+            Self::Qwen3Plain => "qwen3_plain",
+            Self::Undeclared => "undeclared_generic_chatml",
+        }
+    }
+}
+
+/// The Jinja-source literal the Qwen3 templates render as the empty think
+/// block: backslash-`n` escapes inside the template string, not newlines.
+const EMPTY_THINK_BLOCK_ESCAPED: &str = r"<think>\n\n</think>\n\n";
+
+/// Classifies a declared chat template into the [`ChatFraming`] PAM renders.
+///
+/// The rules, in order:
+///
+/// 1. The template must be `ChatML` (`<|im_start|>`), because that is the only
+///    body PAM knows how to emit for the architectures it loads.
+/// 2. If it carries the Qwen3 construct — an `enable_thinking` branch that
+///    renders the empty think block — PAM claims the disabled-thinking
+///    rendering. Both the current upstream revision and the revision older
+///    GGUF exporters embedded spell this tail byte for byte, which is why
+///    classification keys on the construct rather than a template hash.
+/// 3. If it mentions no `<think>` at all, it ends at the assistant newline.
+/// 4. Anything else — a template that thinks unconditionally, or a shape PAM
+///    does not recognise — is refused. Framing a prompt the template did not
+///    declare is how a model gets quietly run in the wrong mode.
+pub fn framing_from_declared(template: &str) -> Result<ChatFraming, TokenizerError> {
+    if !template.contains("<|im_start|>") {
+        return Err(TokenizerError::UnsupportedChatTemplate(
+            "not a ChatML template".to_string(),
+        ));
+    }
+    if template.contains("enable_thinking") {
+        if template.contains(EMPTY_THINK_BLOCK_ESCAPED) {
+            Ok(ChatFraming::Qwen3ThinkingDisabled)
+        } else {
+            Err(TokenizerError::UnsupportedChatTemplate(
+                "declares enable_thinking but not the empty think block PAM renders".to_string(),
+            ))
+        }
+    } else if template.contains("<think>") {
+        Err(TokenizerError::UnsupportedChatTemplate(
+            "emits a think block unconditionally".to_string(),
+        ))
+    } else {
+        Ok(ChatFraming::Qwen3Plain)
+    }
 }
 
 /// Reads a metadata key, or names it in a [`TokenizerError::MissingKey`].
@@ -240,24 +358,37 @@ pub fn from_gguf(content: &gguf_file::Content) -> Result<GgufTokenizer, Tokenize
         .and_then(|value| value.to_bool().ok())
         .unwrap_or(false);
 
+    let framing = match content.metadata.get("tokenizer.chat_template") {
+        Some(value) => {
+            let template = value.to_string().cloned().map_err(|_| {
+                TokenizerError::Build("`tokenizer.chat_template` is not a string".into())
+            })?;
+            framing_from_declared(&template)?
+        }
+        None => ChatFraming::Undeclared,
+    };
+
     Ok(GgufTokenizer {
         inner,
         bos_id,
         eos_id,
         add_bos,
+        framing,
     })
 }
 
-/// Frames a prompt in the Qwen3 `ChatML` template.
+/// Frames a prompt in the `ChatML` body with the artifact's declared framing.
 ///
 /// The system turn is emitted only when there is a system prompt: Qwen's own
-/// template omits it rather than sending an empty one, and an empty system
+/// templates omit it rather than sending an empty one, and an empty system
 /// turn measurably shifts short answers.
 ///
 /// The trailing `<|im_start|>assistant\n` is the handoff — the model
-/// continues from there, which is why nothing follows it.
+/// continues from there. What follows it is [`ChatFraming`]'s decision: the
+/// empty think block for a thinking-disabled instruct template, nothing for
+/// the Coder family.
 #[must_use]
-pub fn chatml(system: Option<&str>, user: &str) -> String {
+pub fn chatml(system: Option<&str>, user: &str, framing: ChatFraming) -> String {
     let mut out = String::new();
     if let Some(system) = system {
         out.push_str("<|im_start|>system\n");
@@ -267,5 +398,6 @@ pub fn chatml(system: Option<&str>, user: &str) -> String {
     out.push_str("<|im_start|>user\n");
     out.push_str(user);
     out.push_str("<|im_end|>\n<|im_start|>assistant\n");
+    out.push_str(framing.assistant_suffix());
     out
 }

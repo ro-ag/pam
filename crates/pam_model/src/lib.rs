@@ -85,7 +85,7 @@ pub use runtime::{
     CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, Runtime, RuntimeError,
     RuntimeSnapshot, RuntimeState,
 };
-pub use tokenizer::{GgufTokenizer, TokenizerError, chatml};
+pub use tokenizer::{ChatFraming, GgufTokenizer, TokenizerError, chatml};
 
 #[cfg(test)]
 mod catalog_test;

@@ -1,0 +1,12 @@
+# Byte-stable checkouts on every platform. Digests are pinned against
+# fixture bytes (fixtures/incidents manifest case/source SHA-256s) and
+# against this tree's own files (include_bytes! identities in screening
+# reports), so line endings must never vary with core.autocrlf or a
+# platform's default checkout behaviour.
+* text=auto eol=lf
+
+# Genuinely binary assets: never normalize, never merge.
+*.png binary
+*.webp binary
+*.ico binary
+*.icns binary

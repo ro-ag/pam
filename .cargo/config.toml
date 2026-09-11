@@ -16,8 +16,8 @@ rustflags = ["-C", "target-feature=+fp16", "-C", "link-arg=/STACK:16777216"]
 
 # Windows reserves 1 MiB for the main thread (PE /STACK) where macOS and
 # Linux give it 8 MiB, and the daemon's startup poll chain — store open
-# replays the WAL through turso — overflows that reserve (issue #23). The
-# same reserve is the default for every thread the EXE spawns, so this also
-# lifts Rust's std threads that inherit it on the msvc toolchain.
+# replays the WAL through turso — overflows that reserve (issue #23). This
+# lifts the main thread to 16 MiB; Rust's std and tokio threads request
+# their own explicit sizes, so other threads are unaffected.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:16777216"]

@@ -129,7 +129,32 @@ fn caller_supplied_executable_cannot_replace_the_connector_bridge() {
     ));
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_resolves_the_operating_system_curl_from_system32() {
+    let path = CurlTransport::trusted_path().unwrap();
+    assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("curl.exe")));
+    assert_eq!(
+        path.parent().and_then(std::path::Path::file_name),
+        Some(std::ffi::OsStr::new("System32"))
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_child_keeps_the_os_roots_and_a_neutral_working_directory() {
+    let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
+    let command = transport.command(&request(), 12).unwrap();
+    let command = command.as_std();
+    assert!(command
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new("SystemRoot")));
+    assert!(command
+        .get_current_dir()
+        .is_some_and(|dir| dir.has_root() && dir.parent().is_none()));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[test]
 fn platforms_without_a_verified_system_binary_fail_closed() {
     assert!(matches!(

@@ -4,9 +4,12 @@
 //! without a gigabyte on disk: the architecture refusal, the idle answers,
 //! the state the mirror shows after a failed load, and the cause table the
 //! GUI matches on. What is left — a real forward pass — is the opt-in bench
-//! in `tests/bench.rs`, because there is no honest way to fake one.
+//! in `tests/bench.rs`, because there is no honest way to fake one. The one
+//! deliberate exception is `chunked_prefill_matches_whole_prompt_prefill`:
+//! prefill segmentation is only proven equivalent to the forward it replaced
+//! by loading real weights, so it is opt-in in exactly the same way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::watch;
 
@@ -375,6 +378,94 @@ fn queued_and_running_work_prevent_exclusive_diagnostic_admission() {
     assert!(CommandReservation::acquire(count.clone(), true).is_none());
     drop(diagnostic);
     assert_eq!(count.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn pending_commands_are_bounded_and_a_dropped_reservation_frees_a_slot() {
+    use crate::runtime::CommandReservation;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        held.push(CommandReservation::acquire(count.clone(), false).expect("within the cap"));
+    }
+    assert!(
+        CommandReservation::acquire(count.clone(), false).is_none(),
+        "the seventeenth pending command must be refused, not queued"
+    );
+    drop(held.pop().expect("a held reservation"));
+    assert!(
+        CommandReservation::acquire(count.clone(), false).is_some(),
+        "dropping a reservation must free its slot"
+    );
+}
+
+/// Chunked prefill must be behaviourally identical to the single
+/// whole-prompt forward it replaced: byte-identical outputs at temperature 0
+/// across chunk sizes on a real artifact. The one deliberate exception to
+/// this module's no-weights rule, because the equivalence cannot be measured
+/// without real attention; opt in exactly like the benches.
+#[tokio::test]
+#[ignore = "requires a pinned local GGUF at PAM_EQUIV_MODEL in registry layout"]
+async fn chunked_prefill_matches_whole_prompt_prefill() {
+    use crate::registry::Registry;
+    use crate::runtime::Backend;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::Ordering;
+
+    let raw = std::env::var("PAM_EQUIV_MODEL").expect("set PAM_EQUIV_MODEL");
+    let path = PathBuf::from(&raw);
+    let models_dir = path
+        .parent()
+        .and_then(Path::parent)
+        .expect("PAM_EQUIV_MODEL must sit under <models dir>/<vendor>/");
+    let entry = Registry::new(models_dir)
+        .scan()
+        .expect("the models dir scans")
+        .into_iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("{raw} was not found by a scan"));
+
+    let runtime = Runtime::new();
+    runtime
+        .load_on_backend(&entry, Backend::Cpu)
+        .await
+        .expect("load");
+    let record = "stage compile: exit=0\n".repeat(48);
+    let request = GenerateRequest {
+        system: None,
+        prompt: record,
+        max_tokens: 16,
+        temperature: 0.0,
+        stop: vec![],
+    };
+    let digest = |text: &str| hex::encode(Sha256::digest(text.as_bytes()));
+
+    let mut digests = Vec::new();
+    for chunk in [usize::MAX, 128, 64] {
+        crate::runtime::PREFILL_CHUNK.store(chunk, Ordering::Relaxed);
+        let (_sender, cancel) = watch::channel(false);
+        let result = runtime
+            .generate_bounded(request.clone(), cancel, 1024)
+            .await
+            .expect("generation");
+        assert!(
+            result.prompt_tokens > 64,
+            "the prompt must span more than the smallest chunk to prove multi-segment prefill"
+        );
+        digests.push(digest(&result.text));
+    }
+    crate::runtime::PREFILL_CHUNK.store(128, Ordering::Relaxed);
+    assert_eq!(
+        digests[0], digests[1],
+        "default chunking diverged from the whole-prompt forward"
+    );
+    assert_eq!(
+        digests[1], digests[2],
+        "64-token chunking diverged from the default"
+    );
 }
 
 #[test]

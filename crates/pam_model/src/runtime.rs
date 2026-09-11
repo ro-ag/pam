@@ -324,11 +324,16 @@ enum Command {
 /// Includes accepted-but-not-started work and outlives abandoned reply receivers.
 pub(crate) struct CommandReservation(Arc<AtomicUsize>);
 
+/// The queued-work envelope: commands accepted but not yet started. Bounding
+/// it turns overload into a typed refusal at admission instead of unbounded
+/// request bytes piling up behind a slow generation.
+const MAX_PENDING_COMMANDS: usize = 16;
+
 impl CommandReservation {
     pub(crate) fn acquire(counter: Arc<AtomicUsize>, exclusive: bool) -> Option<Self> {
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                if exclusive && pending != 0 {
+                if (exclusive && pending != 0) || pending >= MAX_PENDING_COMMANDS {
                     None
                 } else {
                     pending.checked_add(1)
@@ -1021,6 +1026,12 @@ pub(crate) fn check_output_budget(
 /// enqueues the forward pass, so without this the number was enqueue time —
 /// single-digit milliseconds for a 1000-token prompt — and the real prefill
 /// cost silently reappeared inside `decode_ms`.
+///
+/// Prefill segments are this many tokens; `usize::MAX` is the single
+/// whole-prompt forward this replaced. The knob exists so the equivalence
+/// between segmented and whole-prompt prefill can be measured, not assumed.
+pub(crate) static PREFILL_CHUNK: AtomicUsize = AtomicUsize::new(128);
+
 fn generate_on_thread(
     loaded: &mut Loaded,
     request: &GenerateRequest,
@@ -1065,10 +1076,29 @@ fn generate_on_thread(
         return Err(RuntimeError::Cancelled);
     }
     loaded.reset_cache();
-    let input = Tensor::new(ids.as_slice(), &loaded.device)
-        .and_then(|tensor| tensor.unsqueeze(0))
-        .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
-    let logits = loaded.forward(&input, 0)?;
+    // The prompt is prefilled in segments so cancellation is honoured within
+    // one segment instead of within the whole prefill: a single forward over
+    // 2048 tokens cannot be interrupted, and a 100 ms signal measured 185 s
+    // to return on CPU. Chunks are the decode loop's own mechanism with
+    // larger steps — forward extends the same KV cache from `offset` — and
+    // the equivalence with a single whole-prompt forward is measured on a
+    // real artifact, not assumed: `runtime_test`'s opt-in run compares
+    // output digests across chunk sizes.
+    let chunk = PREFILL_CHUNK.load(Ordering::Relaxed);
+    let mut offset = 0;
+    let mut logits = None;
+    while offset < prompt_tokens {
+        if *cancel.borrow() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let end = (offset + chunk).min(prompt_tokens);
+        let input = Tensor::new(&ids[offset..end], &loaded.device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|err| RuntimeError::GenerationFailed(err.to_string()))?;
+        logits = Some(loaded.forward(&input, offset)?);
+        offset = end;
+    }
+    let logits = logits.expect("a non-empty prompt runs at least one segment");
     // Metal enqueues rather than completes; without this the prefill figure is
     // enqueue latency and its real cost is attributed to decoding instead.
     loaded

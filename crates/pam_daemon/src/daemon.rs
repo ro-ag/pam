@@ -405,9 +405,12 @@ impl CompletionRouter {
     /// nobody is listening, and the map entry itself only clears on
     /// [`Self::finish`].
     pub async fn has_waiters(&self, request_id: &str) -> bool {
-        self.inner.lock().await.waiting.get(request_id).is_some_and(
-            |waiters| waiters.iter().any(|tx| !tx.is_closed()),
-        )
+        self.inner
+            .lock()
+            .await
+            .waiting
+            .get(request_id)
+            .is_some_and(|waiters| waiters.iter().any(|tx| !tx.is_closed()))
     }
 
     /// Delivers `response` to every waiter registered for `request_id`
@@ -1434,13 +1437,13 @@ impl Pipeline {
                 .ok()
                 .flatten()
                 .is_some_and(|journal| {
-                    serde_json::from_str::<serde_json::Value>(&journal.checkpoint_json)
-                        .ok()
-                        .is_some_and(|cursor| {
+                    serde_json::from_str::<serde_json::Value>(&journal.checkpoint_json).is_ok_and(
+                        |cursor| {
                             cursor
                                 .get("watch")
                                 .is_some_and(serde_json::Value::is_object)
-                        })
+                        },
+                    )
                 });
         if !continuing_watch {
             let _ = self.events.publish(&id, Event::Started).await;
@@ -1920,8 +1923,7 @@ impl Pipeline {
                     .outcome
                     .clone()
                     .unwrap_or_else(|| "watch_stopped".to_owned());
-                if outcome == crate::queue::CAUSE_LEASE_EXPIRED
-                    && self.router.has_waiters(id).await
+                if outcome == crate::queue::CAUSE_LEASE_EXPIRED && self.router.has_waiters(id).await
                 {
                     // A queued request the reaper collected expired for its
                     // waiter exactly like one the reaper collects

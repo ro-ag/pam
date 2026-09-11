@@ -1870,7 +1870,7 @@ async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view(
             let response = client.request(&read).await;
             let Response::Result { body, .. } = response else { panic!("{response:?}") };
             let data = body["data"].as_str().unwrap();
-            for pair in data.as_bytes().chunks_exact(2) {
+            for pair in data.as_bytes().as_chunks::<2>().0 {
                 collected.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
             }
             assert!(body["provenance"].is_array());

@@ -281,7 +281,7 @@ fn render_evidence(body: &serde_json::Value) -> Result<String, &'static str> {
         return Err("invalid or oversized hex evidence bytes");
     }
     let mut escaped = String::new();
-    for pair in data.as_bytes().chunks_exact(2) {
+    for pair in data.as_bytes().as_chunks::<2>().0 {
         let digit = |byte: u8| {
             if byte.is_ascii_digit() {
                 byte - b'0'

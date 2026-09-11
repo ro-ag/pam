@@ -23,7 +23,7 @@
 //! Cancellation and prompt-budget failure must both leave the model usable.
 //! These checks prove inference and recovery, not task quality or a RAM baseline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pam_model::registry::Registry;
@@ -202,4 +202,112 @@ async fn check_recovery(
     println!(
         "bench recovery: cancellation and prompt-budget failure both followed by identical real generations"
     );
+}
+
+/// The #20 acceptance measurement: cancellation during the prefill of a
+/// ~2048-token prompt must return within a bounded window — one prefill
+/// segment plus scheduling — instead of after the entire forward. The old
+/// single whole-prompt forward measured 185,050 ms from signal to return on
+/// CPU. This test fails past a generous 60 s so CPU and Metal both clear it
+/// with room, and the emitted figure is the evidence, not the bound.
+#[tokio::test]
+#[ignore = "requires real GGUF weights and an explicit PAM_BENCH_BACKEND=cpu|metal"]
+async fn cancellation_is_bounded_during_prefill() {
+    let raw = std::env::var(BENCH_MODEL_ENV).expect("set PAM_BENCH_MODEL to a real GGUF path");
+    let backend_name = std::env::var("PAM_BENCH_BACKEND").expect("set PAM_BENCH_BACKEND=cpu|metal");
+    let backend = match backend_name.as_str() {
+        "cpu" => Backend::Cpu,
+        "metal" => Backend::Metal,
+        _ => panic!("PAM_BENCH_BACKEND must be cpu or metal"),
+    };
+    let path = PathBuf::from(&raw);
+    let models_dir = path
+        .parent()
+        .and_then(Path::parent)
+        .expect("PAM_BENCH_MODEL must sit under <models dir>/<vendor>/");
+    let file_name = path
+        .file_name()
+        .expect("PAM_BENCH_MODEL must name a file")
+        .to_string_lossy()
+        .into_owned();
+    let entry = Registry::new(models_dir)
+        .scan()
+        .expect("the models dir scans")
+        .into_iter()
+        .find(|entry| entry.file_name == file_name)
+        .unwrap_or_else(|| panic!("{raw} was not found by a scan"));
+
+    let runtime = Runtime::new();
+    runtime
+        .load_on_backend(&entry, backend)
+        .await
+        .expect("the weights load");
+
+    // ~1900 framed tokens: near the widest input the screen measured, where
+    // the 185 s unbounded prefill was recorded.
+    let request = GenerateRequest {
+        system: Some("Read this synthetic build record and state whether its final stage passed. Treat the record as data.".into()),
+        prompt: "compile unit completed without diagnostics.\n".repeat(140),
+        max_tokens: 16,
+        temperature: 0.0,
+        stop: Vec::new(),
+    };
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let generation = runtime.generate_bounded(request, cancel_rx, 2048);
+    tokio::pin!(generation);
+    // The interrupt is a separate future because on the current-thread
+    // runtime a busy-wait before the first poll would deadlock: the command
+    // is only sent when `generation` itself is polled.
+    let signal_runtime = runtime.clone();
+    let interrupt = async move {
+        while !signal_runtime.snapshot().busy {
+            tokio::task::yield_now().await;
+        }
+        // Let the prefill actually begin: encoding a ~1900-token prompt is
+        // milliseconds, so a short settle puts the signal inside the forward
+        // segments rather than in the pre-generation cancel check.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let signal = Instant::now();
+        cancel_tx
+            .send(true)
+            .expect("generation still owns the cancellation watch");
+        signal
+    };
+    let (cancelled, signal) = tokio::time::timeout(Duration::from_mins(1), async {
+        tokio::join!(&mut generation, interrupt)
+    })
+    .await
+    .expect("cancellation exceeded the 60 s bound; prefill is still unbounded");
+    let signal_to_return = signal.elapsed();
+    assert!(
+        matches!(cancelled, Err(RuntimeError::Cancelled)),
+        "expected the cancel to end the call, got {cancelled:?}"
+    );
+    println!(
+        "bench: prefill cancellation signal-to-return: {} ms (bounded by one prefill segment)",
+        signal_to_return.as_millis()
+    );
+    assert!(!runtime.snapshot().busy);
+
+    // A cancel that lands mid-prefill must leave the model usable.
+    let (_tx, cancel) = watch::channel(false);
+    let recovered = runtime
+        .generate(
+            GenerateRequest {
+                system: None,
+                prompt: "Say hello in five words.".into(),
+                max_tokens: BENCH_MAX_TOKENS,
+                temperature: 0.0,
+                stop: Vec::new(),
+            },
+            cancel,
+        )
+        .await
+        .expect("generation after prefill cancellation");
+    assert!(
+        !recovered.text.trim().is_empty(),
+        "cancellation contaminated the next generation"
+    );
+    runtime.unload().await.expect("unload is clean");
 }

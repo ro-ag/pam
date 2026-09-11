@@ -104,13 +104,21 @@ single forward call, so a timeout/cancel cannot preempt that call; the external
 supervisor is essential. Recovery requires an identical subsequent greedy result.
 Unload completion alone does not prove memory returned to the OS.
 
-The template is explicitly **unqualified**: current production ChatML is used
-without adding a harness-only non-thinking template. There is no fresh daemon
-working-set admission in this direct runtime path. Record OS/architecture, backend,
-GGUF architecture/quantization and source revision of the PAM checkout with the
-results. A successful screen on a 64 GiB host remains a 64 GiB measurement, even
-when its workload is capped. Run the independent incident benchmark only after
-resource and template limitations have been adjudicated.
+Framing is derived per artifact at load from the chat template the file itself
+declares (`tokenizer.chat_template`): instruct templates carrying the Qwen3
+`enable_thinking` branch run thinking-disabled (the empty think block is
+appended), Coder-family templates end at the assistant newline, and anything
+else is refused rather than guessed. The screen records the derived framing as
+`template` with `template_qualified` true only when the file declared a
+template PAM recognised. Behavioural proof for a pinned artifact — generated
+output contains no think block and temperature-0 repeats match — is a separate
+opt-in run: `crates/pam_model/tests/framing_verification.rs`. There is no fresh
+daemon working-set admission in this direct runtime path. Record
+OS/architecture, backend, GGUF architecture/quantization and source revision of
+the PAM checkout with the results. A successful screen on a 64 GiB host remains
+a 64 GiB measurement, even when its workload is capped. Run the independent
+incident benchmark only after resource and template limitations have been
+adjudicated.
 
 ## First screened artifact
 

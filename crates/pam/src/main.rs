@@ -699,14 +699,37 @@ fn daemon_mode() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
+    // Startup runs the store open, and replaying a store's WAL nests a deep
+    // async poll chain on whichever thread `block_on` drives. Windows
+    // reserves only 1 MiB for the main thread where macOS and Linux give
+    // 8 MiB, so serve on a thread with an explicit stack instead of the
+    // platform default (issue #23). The log guard stays here and flushes
+    // after the join.
+    let worker = std::thread::Builder::new()
+        .name("pam-daemon-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("pam daemon: cannot start the async runtime: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(serve(base))
+        });
+    let code = match worker {
+        Ok(worker) => match worker.join() {
+            Ok(code) => code,
+            // The serve thread panicked; the daemon log and the failing
+            // child's exit code carry the diagnosis.
+            Err(_) => ExitCode::FAILURE,
+        },
         Err(err) => {
-            eprintln!("pam daemon: cannot start the async runtime: {err}");
-            return ExitCode::FAILURE;
+            eprintln!("pam daemon: cannot start the daemon thread: {err}");
+            ExitCode::FAILURE
         }
     };
-    let code = runtime.block_on(serve(base));
     // Flush the daemon log before exit.
     drop(guard);
     code

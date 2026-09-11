@@ -49,9 +49,28 @@ fn trusted_curl_path() -> Result<PathBuf, TransportError> {
     Ok(path)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn trusted_curl_path() -> Result<PathBuf, TransportError> {
     Err(untrusted_curl())
+}
+
+/// Windows has no root-owned file model readable without unsafe or a
+/// platform crate, so trust comes from the one path the operating system
+/// itself owns and services: `%SystemRoot%\System32\curl.exe`. The fixed
+/// location is what rules out a planted lookalike — PATH is never searched
+/// — and the canonicalized file must still resolve inside the
+/// canonicalized System32 directory.
+#[cfg(target_os = "windows")]
+fn trusted_curl_path() -> Result<PathBuf, TransportError> {
+    let system_root = std::env::var_os("SystemRoot").ok_or_else(untrusted_curl)?;
+    let system32 = std::fs::canonicalize(std::path::Path::new(&system_root).join("System32"))
+        .map_err(|_| untrusted_curl())?;
+    let candidate = system32.join("curl.exe");
+    let canonical = std::fs::canonicalize(&candidate).map_err(|_| untrusted_curl())?;
+    if !canonical.is_file() {
+        return Err(untrusted_curl());
+    }
+    Ok(canonical)
 }
 
 /// How much room over `max_bytes` the status line and headers may take.
@@ -87,7 +106,8 @@ impl CurlTransport {
     }
 
     /// The fixed trusted operating-system executable, without searching PATH.
-    /// Unsupported platforms or unsafe filesystem ownership fail closed.
+    /// Platforms without a verifiable operating-system curl, or unsafe
+    /// filesystem ownership, fail closed.
     pub fn trusted_path() -> Result<PathBuf, TransportError> {
         trusted_curl_path()
     }
@@ -118,11 +138,33 @@ impl CurlTransport {
             .arg("--proto")
             .arg(self.proto())
             .env_clear()
-            .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The cleared environment keeps nothing the daemon holds, but a
+        // Windows child cannot initialize WinSock or the crypto stack
+        // without the system roots, and `/` is not a working directory
+        // there — the drive root is the neutral equivalent.
+        #[cfg(target_os = "windows")]
+        {
+            for key in [
+                "SystemRoot",
+                "SystemDrive",
+                "windir",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            command.current_dir(format!("{drive}\\"));
+        }
+        #[cfg(not(target_os = "windows"))]
+        command.current_dir("/");
         Ok(command)
     }
 

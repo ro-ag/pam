@@ -449,13 +449,16 @@ async fn lease_reaping_writes_one_reaped_row_and_the_late_executor_no_ops() {
 
         // A short deadline earns a short lease; nobody waits, so the
         // reaper is the only teardown. The echo keeps running past it.
+        // The deadline still has to survive submission on a loaded runner,
+        // where admission alone can cost hundreds of milliseconds, so it is
+        // sized against that rather than against the machine's fast path.
         let mut request = envelope(
             "req_reaped",
             "echo",
             serde_json::json!({ "delay_ms": 8000 }),
             false,
         );
-        request.deadline_ms = 300;
+        request.deadline_ms = 2000;
         let response = client.request(&request).await;
         assert!(matches!(response, Response::Ticket { .. }));
 

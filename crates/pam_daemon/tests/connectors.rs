@@ -395,7 +395,12 @@ async fn save_and_test_uses_current_credentials_against_a_local_http_service() {
                     .await,
                 Outcome::Verified,
             );
-            assert_eq!(tested["status"], expected);
+            assert_eq!(
+                tested["status"],
+                expected,
+                "connector test body: {}",
+                serde_json::to_string(&tested).unwrap()
+            );
             let listed = body_of(
                 client
                     .request(&admin_envelope(

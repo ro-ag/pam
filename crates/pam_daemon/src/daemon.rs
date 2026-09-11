@@ -397,6 +397,19 @@ impl CompletionRouter {
         Registration::Pending(rx)
     }
 
+    /// Whether anyone is still waiting for `request_id`'s terminal
+    /// response. A reaped expiry reads this before choosing the refusal a
+    /// waiter receives: a caller that is still parked gets its elapsed
+    /// deadline, while an unobserved request records only the reaper's own
+    /// teardown. Entries whose receiver the caller dropped do not count —
+    /// nobody is listening, and the map entry itself only clears on
+    /// [`Self::finish`].
+    pub async fn has_waiters(&self, request_id: &str) -> bool {
+        self.inner.lock().await.waiting.get(request_id).is_some_and(
+            |waiters| waiters.iter().any(|tx| !tx.is_closed()),
+        )
+    }
+
     /// Delivers `response` to every waiter registered for `request_id`
     /// and remembers it for late registrants (see [`FINISHED_TTL`]).
     pub async fn finish(&self, request_id: &str, response: Response) {
@@ -1901,13 +1914,50 @@ impl Pipeline {
     }
 
     async fn finish_parked_terminal(&self, id: &str) {
-        let response = match self.store.request_status_meta(id).await {
-            Ok(Some(row)) if row.state.is_terminal() => Response::Refusal {
-                id: id.to_owned(),
-                cause: row.outcome.unwrap_or_else(|| "watch_stopped".to_owned()),
-                detail: "The request stopped before execution resumed; this does not establish a remote job failure.".to_owned(),
-                recovery: "Read retained evidence and inspect the original deadline and current access.".to_owned(),
-            },
+        let response = match self.store.get_request(id).await {
+            Ok(Some(row)) if row.state.is_terminal() => {
+                let outcome = row
+                    .outcome
+                    .clone()
+                    .unwrap_or_else(|| "watch_stopped".to_owned());
+                if outcome == crate::queue::CAUSE_LEASE_EXPIRED
+                    && self.router.has_waiters(id).await
+                {
+                    // A queued request the reaper collected expired for its
+                    // waiter exactly like one the reaper collects
+                    // mid-flight: the caller's fact is its elapsed deadline
+                    // (finish_reaped), while the row keeps the reaper's
+                    // outcome. Whoever observes the expiry first, the waiter
+                    // must not receive the bookkeeping cause, and the
+                    // refusal the caller receives is audited like the
+                    // waiter-timeout path's.
+                    let detail =
+                        serde_json::json!({ "expires_at_ms": row.expires_at_ms }).to_string();
+                    let _ = self
+                        .store
+                        .append_audit(
+                            id,
+                            ACTION_DEADLINE_REFUSAL,
+                            Decision::Timeout,
+                            Actor::System,
+                            Some(&detail),
+                        )
+                        .await;
+                    Response::Refusal {
+                        id: id.to_owned(),
+                        cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
+                        detail: format!("request {id} exceeded its admitted deadline"),
+                        recovery: RECOVERY_DEADLINE.to_owned(),
+                    }
+                } else {
+                    Response::Refusal {
+                        id: id.to_owned(),
+                        cause: outcome,
+                        detail: "The request stopped before execution resumed; this does not establish a remote job failure.".to_owned(),
+                        recovery: "Read retained evidence and inspect the original deadline and current access.".to_owned(),
+                    }
+                }
+            }
             Ok(_) | Err(_) => internal_refusal(id),
         };
         let _ = self.events.publish(id, Event::Refused).await;

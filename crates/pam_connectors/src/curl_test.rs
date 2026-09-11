@@ -146,12 +146,16 @@ fn windows_child_keeps_the_os_roots_and_a_neutral_working_directory() {
     let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
     let command = transport.command(&request(), 12).unwrap();
     let command = command.as_std();
-    assert!(command
-        .get_envs()
-        .any(|(key, _)| key == std::ffi::OsStr::new("SystemRoot")));
-    assert!(command
-        .get_current_dir()
-        .is_some_and(|dir| dir.has_root() && dir.parent().is_none()));
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, _)| key == std::ffi::OsStr::new("SystemRoot"))
+    );
+    assert!(
+        command
+            .get_current_dir()
+            .is_some_and(|dir| dir.has_root() && dir.parent().is_none())
+    );
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

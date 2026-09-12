@@ -49,6 +49,9 @@ pub mod compression;
 #[cfg(test)]
 mod compression_test;
 pub mod curator;
+pub mod diagnosis;
+#[cfg(test)]
+mod diagnosis_test;
 pub mod download;
 pub mod error;
 pub mod gguf;

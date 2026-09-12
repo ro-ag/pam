@@ -1,6 +1,7 @@
 # Local investigation prompt contract
 
-Status: proposed templates, revised 2026-09-10. Supersedes the previous
+Status: templates implemented 2026-09-11 (see Implementation status at the
+end); live-model qualification remains pending. Supersedes the previous
 `digest`/`classify`/model-owned `check` prompts. Companion to
 [local investigation](2026-09-09-local-model-triage.md).
 
@@ -106,3 +107,32 @@ malicious quotes, fabricated citations, wrong-attempt evidence, omitted decisive
 lines, unnecessary reads, changed target scope, and budget exhaustion. Measure
 unsupported conclusions as well as useful explanations. A parser pass alone
 does not qualify a model; use the admission companion's investigation suite.
+
+## Implementation status (2026-09-11)
+
+The contract is implemented; live-model qualification is not. `pam_model::diagnosis`
+renders the system/task templates above and validates one response against them:
+exact field set, closed hypothesis set, character-bounded summary, at most three
+citations whose byte spans must equal the named evidence item's text exactly, and
+read requests limited to the offered operation/target pairs. Refusals carry
+stable causes (`empty_response`, `not_json`, `schema_violation`,
+`hypothesis_not_listed`, `confidence_invalid`, `summary_too_long`,
+`too_many_citations`, `evidence_not_in_scope`, `offset_out_of_range`,
+`quote_mismatch`, `read_not_offered`); nothing is repaired, retried, or
+salvaged into an answer.
+
+`pam_daemon::diagnosis_service` runs the bounded recipe: stateless advisory
+calls with no chat history, at most one dispatched read per response inside
+run-wide read/call budgets, dispatch strictly by host-bound observe-only
+connector call (model text never becomes an argument, and the dispatch type has
+no merge/publish/rerun/command variant), per-hypothesis authority bars requiring
+the cited evidence to carry host-assigned tags, a completeness gate on terminal
+claims, and escalation computed in code — unknown, low confidence, malformed
+output, unavailable model, exhausted budget, and failed or repeated reads all
+produce an unresolved handoff with the cause attached. The shipped recipe is
+`jenkins-build-failure/v1`.
+
+Not in this delivery: the adapter that executes a bound read through the real
+connector/flow runtime, live-artifact runs, and the paired-arm measurements —
+those belong to #140 and #108. The prose summarizer path in `LogService` is
+unchanged and remains a different, weaker contract.

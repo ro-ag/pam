@@ -56,7 +56,12 @@ fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
         return Err(denied());
     }
     let mut url = Url::parse(remote_url).map_err(|_| denied())?;
-    if url.scheme() != "https" || url.query().is_some() || url.fragment().is_some() {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(denied());
     }
     let path = format!("{}/git-upload-pack", url.path().trim_end_matches('/'));

@@ -936,3 +936,27 @@ async fn sync_refuses_a_checked_out_base_and_a_non_fast_forward() {
         base
     );
 }
+
+#[test]
+fn a_journalled_sync_intent_reconciles_like_a_push_intent() {
+    // The runtime journals the sync lease with snake_case state, the pack
+    // bounds and later the pack name; the shared reconcile rule must read it.
+    let intent = serde_json::json!({
+        "ref_name": "refs/heads/main",
+        "expected_old": "a".repeat(40),
+        "requested_commit": "b".repeat(40),
+        "state": "uncertain",
+        "bounds": {"objects": 3, "deltas": 1, "compressed_bytes": 300, "decoded_bytes": 200, "expanded_bytes": 250},
+        "pack": "pack-cafe",
+    });
+    let prepared: PushObservation = serde_json::from_value(intent).unwrap();
+    assert_eq!(prepared.state, PushState::Uncertain);
+    let observed = RemoteRef {
+        ref_name: "refs/heads/main".into(),
+        oid: Some("b".repeat(40)),
+    };
+    assert_eq!(
+        reconcile(&observed, &prepared).unwrap(),
+        Reconciliation::Matched
+    );
+}

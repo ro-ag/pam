@@ -34,6 +34,11 @@ composition coverage without replacing individual adapter and boundary tests.
 
 Remaining work is tracked in ptrack: restart reconciliation, durable watches,
 guarded landing, model admission/qualification and task-focused GUI completion.
-No release or push is implied by this checkpoint. The strict no-C GUI conflict
-in issue #16 remains unresolved, as do any deployment-specific compatibility
-claims until the documented live protocol is run with authorized credentials.
+No release or push is implied by this checkpoint. The no-C constraint is
+settled (issue #16, 2026-09-12): PAM's own dependency choices stay pure Rust —
+no C libraries, no cmake, no vendored C code (turso rather than rusqlite, the
+zeromq crate rather than libzmq) — while the platform binding shims Tauri and
+objc2 compile on macOS (the Objective-C exception helper, also required by the
+Metal inference kernels) are an accepted exception, not PAM code. Deployment-
+specific compatibility claims still wait until the documented live protocol is
+run with authorized credentials.

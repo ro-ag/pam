@@ -4,6 +4,7 @@
 //! Raw Git diagnostics are discarded because a server can echo credentials.
 use crate::{
     landing_checkout::{self, CheckoutError, CheckoutReceipt, CheckoutRequest, Workspace},
+    landing_pack::PackBounds,
     request_budget::RequestBudget,
 };
 use pam_connectors::Secret;
@@ -50,6 +51,18 @@ pub(crate) struct GitTarget {
 pub(crate) struct RemoteRef {
     pub ref_name: String,
     pub oid: Option<String>,
+}
+/// One guarded local synchronization that provably happened: the base ref
+/// moved from `expected_old` to `requested_commit` through a pack whose
+/// bounds were measured before Git indexed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncObservation {
+    pub ref_name: String,
+    pub expected_old: String,
+    pub requested_commit: String,
+    /// The installed pack's name (`pack-<hash>`), as Git reported it.
+    pub pack: String,
+    pub bounds: PackBounds,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,6 +184,10 @@ fn validate_installation(
         return Err(invalid("HTTPS Git helper escapes its trusted installation"));
     }
     trusted_path(&helper, request, false)
+}
+/// The `Basic` credential GitHub accepts for Git over HTTPS with a token.
+pub(crate) fn basic_token(token: &str) -> String {
+    base64(format!("x-access-token:{token}").as_bytes())
 }
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -494,6 +511,143 @@ fn uncertain() -> CheckoutError {
         "landing_git_effect_uncertain",
         "push completion is unconfirmed; inspect the exact remote ref before any further write",
     )
+}
+fn sync_uncertain() -> CheckoutError {
+    error(
+        "landing_git_effect_uncertain",
+        "sync completion is unconfirmed; inspect the exact local base ref before any further write",
+    )
+}
+/// The `pack\t<hash>` line `index-pack --stdin` reports, as `pack-<hash>`.
+fn indexed_pack_name(capture: &Capture) -> Result<String, CheckoutError> {
+    if capture.code != Some(0) {
+        return Err(error(
+            "landing_sync_pack_invalid",
+            "Git refused the synchronization pack",
+        ));
+    }
+    let text = std::str::from_utf8(&capture.output)
+        .map_err(|_| invalid("index-pack report is malformed"))?;
+    let mut names = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("pack\t"))
+        .filter(|hash| oid(hash));
+    let name = names
+        .next()
+        .ok_or_else(|| invalid("index-pack did not report the pack identity"))?;
+    if names.next().is_some() {
+        return Err(invalid("index-pack reported more than one pack"));
+    }
+    Ok(format!("pack-{name}"))
+}
+/// Copies the verified `.pack` then `.idx` into the canonical pack directory
+/// through temporary names, so the source repository only ever sees a
+/// complete pack. A pack already present under the same content hash is
+/// left alone.
+fn install_pack(source: &Path, target: &Path, name: &str) -> Result<(), CheckoutError> {
+    let failed = || {
+        error(
+            "landing_sync_install_failed",
+            "the verified pack could not be installed into the source object store",
+        )
+    };
+    fs::create_dir_all(target).map_err(|_| failed())?;
+    for extension in ["pack", "idx"] {
+        let installed = target.join(format!("{name}.{extension}"));
+        if installed.exists() {
+            continue;
+        }
+        let temporary = target.join(format!("tmp_pam_{}.{extension}", ulid::Ulid::new()));
+        let copied =
+            fs::copy(source.join(format!("{name}.{extension}")), &temporary).and_then(|_| {
+                let mut permissions = fs::metadata(&temporary)?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&temporary, permissions)?;
+                fs::rename(&temporary, &installed)
+            });
+        if copied.is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err(failed());
+        }
+    }
+    Ok(())
+}
+/// Moves one branch ref from `old` to `new` with Git's own lock protocol:
+/// the `.lock` file is created exclusively, the current value is re-read
+/// under the lock and must still be `old`, then the lock is renamed over the
+/// ref. Nothing else in the repository is written; the reflog line is
+/// appended afterwards on a best-effort basis, as Git does for a plain ref
+/// update.
+fn update_ref_exact(
+    request: &CheckoutRequest,
+    reference: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), CheckoutError> {
+    use std::io::Write as _;
+    let git = request.repository.join(".git");
+    let path = git.join(reference);
+    let lock = git.join(format!("{reference}.lock"));
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("base ref has no parent directory"))?;
+    fs::create_dir_all(parent).map_err(|_| {
+        error(
+            "landing_sync_install_failed",
+            "the base ref directory could not be prepared",
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .map_err(|_| {
+            error(
+                "landing_sync_install_failed",
+                "the base ref is locked by another Git process",
+            )
+        })?;
+    let committed = (|| {
+        if landing_checkout::resolve_local_ref(request, reference)? != old {
+            return Err(error(
+                "landing_checkout_changed",
+                "the base ref moved after it was observed",
+            ));
+        }
+        file.write_all(format!("{new}\n").as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&lock, &path))
+            .map_err(|_| {
+                error(
+                    "landing_sync_install_failed",
+                    "the base ref could not be written",
+                )
+            })
+    })();
+    if committed.is_err() {
+        let _ = fs::remove_file(&lock);
+    }
+    committed?;
+    let log = git.join("logs").join(reference);
+    if let Some(parent) = log.parent() {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let _ = fs::create_dir_all(parent).and_then(|()| {
+            fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&log)?
+                .write_all(
+                    format!(
+                        "{old} {new} PAM <pam@localhost> {seconds} +0000\tpam guarded-land sync\n"
+                    )
+                    .as_bytes(),
+                )
+        });
+    }
+    Ok(())
 }
 fn active(cancel: &watch::Receiver<bool>, deadline: Instant) -> Result<(), CheckoutError> {
     if *cancel.borrow() || cancel.has_changed().is_err() {
@@ -883,7 +1037,204 @@ impl GitTransport {
         })
     }
 }
+impl GitTransport {
+    /// Caller must persist a prepared sync intent and hold current approval.
+    /// Indexes one preflighted pack in the private workspace, proves the
+    /// merge commit fast-forwards the leased base commit, installs the pack
+    /// into the canonical object store and moves the base ref with an exact
+    /// old-value lease. Never touches the working tree; never retries.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the lease, pack, bounds, budget and cancellation explicit"
+    )]
+    pub(crate) async fn sync_exact(
+        &self,
+        target: &GitTarget,
+        merge_commit: &str,
+        pack: Vec<u8>,
+        bounds: PackBounds,
+        budget: Arc<RequestBudget>,
+        cancel: &mut watch::Receiver<bool>,
+        deadline: Instant,
+        authorization: Arc<dyn GitAuthorization>,
+    ) -> Result<SyncObservation, CheckoutError> {
+        let GitTarget {
+            request,
+            receipt,
+            branch,
+            ..
+        } = target;
+        validate_target(request, receipt)?;
+        let reference = reference(branch)?;
+        let Some(expected_old) = target.expected_old.clone() else {
+            return Err(invalid(
+                "sync requires the observed base commit as its lease",
+            ));
+        };
+        if reference != request.base_ref
+            || !oid(&expected_old)
+            || !oid(merge_commit)
+            || expected_old == merge_commit
+        {
+            return Err(invalid(
+                "sync ref, lease or merge commit differs from the approved shape",
+            ));
+        }
+        let merge_commit = merge_commit.to_owned();
+        let request = request.clone();
+        let config = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        let result = landing_checkout::owned_worker(cancel, move |mut cancelled| {
+            active(&cancelled, deadline)?;
+            landing_checkout::validate_layout(&request)?;
+            validate_installation(&config, &request)?;
+            let workspace = Workspace::create(&request.checkouts_root, &request.repository)?;
+            let session = Session {
+                config: &config,
+                request: &request,
+                workspace,
+                credential: Secret::new(String::new()),
+                budget,
+                deadline,
+                started: worker_started,
+                authorization,
+            };
+            runtime.block_on(session.sync(
+                &reference,
+                &expected_old,
+                &merge_commit,
+                &pack,
+                bounds,
+                &mut cancelled,
+            ))
+        })
+        .await;
+        result.map_err(|failure| {
+            if started.load(Ordering::SeqCst) {
+                sync_uncertain()
+            } else {
+                failure
+            }
+        })
+    }
+}
 impl Session<'_> {
+    async fn sync(
+        &self,
+        reference: &str,
+        expected_old: &str,
+        merge_commit: &str,
+        pack: &[u8],
+        bounds: PackBounds,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<SyncObservation, CheckoutError> {
+        // The stage never writes the working tree, so the base branch must
+        // not be the checked-out branch.
+        if landing_checkout::head_branch(self.request)? == reference {
+            return Err(error(
+                "landing_sync_base_checked_out",
+                "the base branch is checked out; sync never writes the working tree",
+            ));
+        }
+        if landing_checkout::resolve_local_ref(self.request, reference)? != expected_old {
+            return Err(error(
+                "landing_checkout_changed",
+                "the base ref moved after it was observed",
+            ));
+        }
+        let directory = self.workspace.root.join("metadata/objects/pack");
+        fs::create_dir(&directory)
+            .map_err(|_| invalid("private object pack directory unavailable"))?;
+        // Thin deltas complete against the source object store through the
+        // workspace alternates; --strict runs Git's own object checks.
+        let indexed = self
+            .run_input(
+                &[
+                    "index-pack".into(),
+                    "--strict".into(),
+                    "--fix-thin".into(),
+                    "--stdin".into(),
+                ],
+                pack,
+                false,
+                false,
+                cancel,
+            )
+            .await?;
+        let name = indexed_pack_name(&indexed)?;
+        let kind = self
+            .run(
+                &["cat-file".into(), "-t".into(), merge_commit.into()],
+                false,
+                false,
+                cancel,
+            )
+            .await?;
+        if kind.code != Some(0) || kind.output.trim_ascii() != b"commit" {
+            return Err(error(
+                "landing_sync_ancestry_unproven",
+                "the merge commit is not a commit in the synchronization pack",
+            ));
+        }
+        let ancestry = self
+            .run(
+                &[
+                    "merge-base".into(),
+                    "--is-ancestor".into(),
+                    expected_old.into(),
+                    merge_commit.into(),
+                ],
+                false,
+                false,
+                cancel,
+            )
+            .await?;
+        if ancestry.code != Some(0) {
+            return Err(error(
+                "landing_sync_ancestry_unproven",
+                "the leased base commit is not an ancestor of the merge commit; sync only fast-forwards",
+            ));
+        }
+        // Every new object must be reachable and countable; rev-list fails
+        // on a missing object and the id parser bounds the count.
+        let listed = self
+            .run(
+                &[
+                    "rev-list".into(),
+                    "--objects".into(),
+                    "--no-object-names".into(),
+                    format!("{expected_old}..{merge_commit}"),
+                    "--".into(),
+                ],
+                false,
+                false,
+                cancel,
+            )
+            .await?;
+        if outbound_ids(&listed)?.is_empty() {
+            return Err(error(
+                "landing_sync_ancestry_unproven",
+                "the merge commit adds no objects over the leased base commit",
+            ));
+        }
+        active(cancel, self.deadline)?;
+        self.started.store(true, Ordering::SeqCst);
+        install_pack(
+            &directory,
+            &self.request.repository.join(".git/objects/pack"),
+            &name,
+        )?;
+        update_ref_exact(self.request, reference, expected_old, merge_commit)?;
+        Ok(SyncObservation {
+            ref_name: reference.to_owned(),
+            expected_old: expected_old.to_owned(),
+            requested_commit: merge_commit.to_owned(),
+            pack: name,
+            bounds,
+        })
+    }
     async fn project_history(
         &self,
         old: Option<&str>,

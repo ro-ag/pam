@@ -1,4 +1,5 @@
 use super::landing_git_broker::GitGuard;
+use super::landing_git_broker::GitRole;
 use crate::{
     landing_checkout::{CheckoutReceipt, CheckoutRequest},
     landing_git::{GitAuthorization, GitTarget},
@@ -84,14 +85,14 @@ async fn fixture() -> (tempfile::TempDir, Arc<Store>, GitTarget, String) {
         revision,
     )
 }
-fn guard(store: Arc<Store>, target: &GitTarget, revision: &str, push: bool) -> GitGuard {
+fn guard(store: Arc<Store>, target: &GitTarget, revision: &str, role: GitRole) -> GitGuard {
     GitGuard::new(
         store,
         &target.request.repository,
         "r",
         revision,
         target,
-        push,
+        role,
     )
     .unwrap()
 }
@@ -99,7 +100,7 @@ fn guard(store: Arc<Store>, target: &GitTarget, revision: &str, push: bool) -> G
 async fn owned_network_guard_rechecks_grants_without_capturing_service_or_secrets() {
     let (_temp, store, target, revision) = fixture().await;
     let authorization: Arc<dyn GitAuthorization> =
-        Arc::new(guard(store.clone(), &target, &revision, true));
+        Arc::new(guard(store.clone(), &target, &revision, GitRole::Push));
     authorization.authorize().await.unwrap();
     store.insert_grant("flow.run").await.unwrap();
     store.revoke_grant("flow.run").await.unwrap();
@@ -110,7 +111,7 @@ async fn owned_network_guard_rechecks_grants_without_capturing_service_or_secret
 async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
     let (_temp, store, target, revision) = fixture().await;
     assert!(
-        guard(store.clone(), &target, "stale", true)
+        guard(store.clone(), &target, "stale", GitRole::Push)
             .authorize_row()
             .await
             .is_err()
@@ -119,7 +120,7 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
     changed.request.remote_url = "https://github.com/other/repo".into();
     changed.receipt.remote_url = changed.request.remote_url.clone();
     assert!(
-        guard(store.clone(), &changed, &revision, true)
+        guard(store.clone(), &changed, &revision, GitRole::Push)
             .authorize_row()
             .await
             .is_err()
@@ -128,14 +129,14 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
     changed.request.base_ref = "main".into();
     changed.receipt.base_ref = "main".into();
     assert!(
-        guard(store.clone(), &changed, &revision, true)
+        guard(store.clone(), &changed, &revision, GitRole::Push)
             .authorize_row()
             .await
             .is_err()
     );
     let mut base = target.clone();
     base.branch = "main".into();
-    guard(store.clone(), &base, &revision, false)
+    guard(store.clone(), &base, &revision, GitRole::Observe)
         .authorize_row()
         .await
         .unwrap();
@@ -146,14 +147,14 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
             "r",
             &revision,
             &base,
-            true
+            GitRole::Push
         )
         .is_err()
     );
     let mut changed = target.clone();
     changed.request.checkouts_root = changed.request.repository.clone();
     assert!(
-        guard(store.clone(), &changed, &revision, true)
+        guard(store.clone(), &changed, &revision, GitRole::Push)
             .authorize_row()
             .await
             .is_err()
@@ -163,7 +164,7 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
         .await
         .unwrap();
     assert!(
-        guard(store, &target, &revision, true)
+        guard(store, &target, &revision, GitRole::Push)
             .authorize_row()
             .await
             .is_err()
@@ -229,11 +230,11 @@ async fn captured_full_branch_receipt_reaches_current_guard_without_network() {
     assert_eq!(snapshot.receipt.branch, "refs/heads/feature/work");
     assert_eq!(snapshot.receipt.commit, target.request.expected_commit);
     target.receipt = snapshot.receipt;
-    guard(store.clone(), &target, &revision, false)
+    guard(store.clone(), &target, &revision, GitRole::Observe)
         .authorize_row()
         .await
         .unwrap();
-    guard(store.clone(), &target, &revision, true)
+    guard(store.clone(), &target, &revision, GitRole::Push)
         .authorize_row()
         .await
         .unwrap();
@@ -245,7 +246,7 @@ async fn captured_full_branch_receipt_reaches_current_guard_without_network() {
     store.insert_grant("flow.run").await.unwrap();
     store.revoke_grant("flow.run").await.unwrap();
     assert!(
-        guard(store, &target, &revision, false)
+        guard(store, &target, &revision, GitRole::Observe)
             .authorize_row()
             .await
             .is_err()

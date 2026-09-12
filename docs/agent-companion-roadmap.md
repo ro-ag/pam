@@ -46,7 +46,7 @@ for access, evidence, polling, validation, or landing decisions.
 | Enterprise access | Existing Jira, Confluence, SharePoint, Jenkins, GitHub, Sonar adapters | Deployment-specific acceptance and exact cross-product correlations |
 | Jenkins | Explicit build investigation, bounded stages/nodes/logs, CLI observation summary, coverage gaps | Decisive-evidence follow-up and CLI retrieval; root cause remains unresolved |
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
-| Orchestration | Flows, checks, approvals, retries, tickets | Durable remote polling, resume/reconciliation and guarded landing orchestration |
+| Orchestration | Flows, checks, approvals, retries, tickets, durable remote polling, guarded landing through sync (bounds-proven pack transfer, exact-lease fast-forward) | Enterprise checkpoint of the complete recipe (#94) |
 | Models | Candle GGUF runtime and prose summary with honest skips | Task-qualified structured investigation, validated reads, measured admission |
 | Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency, held-out qualification (keyword-anchored classes proven, non-keyword classes restricted out) | Default stays off; citation-offset gap closed host-side (issue #25), enablement waits on #108 gates and #123 |
 
@@ -140,7 +140,7 @@ upload, metadata and verification outcomes even before a JFrog adapter exists.
 | --- | --- | --- |
 | #133 | Durable workflow state and effect reconciliation | Restart at each effect boundary never blindly repeats push/merge; uncertain outcomes stop or reconcile |
 | #134 | Model-free correlated polling | 100 unchanged polls make zero inference calls and no duplicate notifications; cancel/revoke/deadline work |
-| #135 | Project-aware landing and post-merge checks | Exact revision gates, current-head recheck, remote reconciliation and main-commit verification prevent false success |
+| #135 | Project-aware landing and post-merge checks | Exact revision gates, current-head recheck, remote reconciliation, main-commit verification and bounds-proven local sync prevent false success; the complete recipe runs end to end against fixtures |
 | #122 | Recovery checkpoint | Full failure/restart matrix passes using existing CLI tickets and flows |
 
 Use each repository's existing validation/landing recipe where available. Persist

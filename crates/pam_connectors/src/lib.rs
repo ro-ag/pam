@@ -64,6 +64,7 @@ pub use transport::{
     AWS_BASE_URL, Connection, HttpRequest, HttpResponse, HttpTransport, MAX_JSON_BYTES,
     MAX_LOG_BYTES, Method, Secret, TransportError, validate_base_url,
 };
+pub use url::Url;
 
 #[cfg(test)]
 mod aws_test;

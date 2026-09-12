@@ -460,11 +460,12 @@ fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), TransportErro
     Ok((status, headers))
 }
 
-fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
+pub(crate) fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
     let valid = match (request.method, &request.body) {
         (Method::Get, None) => true,
         (Method::Post | Method::Put, Some(body)) if body.len() <= 16 * 1024 => {
-            serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
+            (serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
+                || exact_upload_pack(request, body))
                 && !request.follow_one_https_redirect_without_auth
         }
         _ => false,
@@ -477,4 +478,61 @@ fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {
             detail: "HTTP mutation requires bounded JSON and disabled redirects.".to_owned(),
         })
     }
+}
+
+// The only non-JSON body admitted is a fixed read-only Git upload-pack request.
+// No arbitrary packet, capability, revision expression or remote mutation body.
+fn exact_upload_pack(request: &HttpRequest, body: &[u8]) -> bool {
+    // "0033want <sha> \n" "0000" then at most two "0032have <sha>\n" then "0009done\n".
+    let Some(rest) = body.strip_prefix(b"0033want ") else {
+        return false;
+    };
+    let Some((sha, mut rest)) = rest.split_first_chunk::<40>() else {
+        return false;
+    };
+    let Some(after_want) = rest.strip_prefix(b" \n0000") else {
+        return false;
+    };
+    rest = after_want;
+    let mut haves = 0;
+    while let Some(after_have) = rest.strip_prefix(b"0032have ") {
+        let Some((have, tail)) = after_have.split_first_chunk::<40>() else {
+            return false;
+        };
+        let Some(tail) = tail.strip_prefix(b"\n") else {
+            return false;
+        };
+        if !exact_sha(have) || haves == 2 {
+            return false;
+        }
+        haves += 1;
+        rest = tail;
+    }
+    rest == b"0009done\n"
+        && exact_sha(sha)
+        && request.method == Method::Post
+        && request.url.scheme() == "https"
+        && request.url.username().is_empty()
+        && request.url.password().is_none()
+        && request.url.query().is_none()
+        && request.url.fragment().is_none()
+        && request.url.path().ends_with("/git-upload-pack")
+        && request
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .count()
+            == 1
+        && request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value == "application/x-git-upload-pack-request"
+        })
+}
+
+fn exact_sha(sha: &[u8]) -> bool {
+    sha.len() == 40
+        && sha
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        && sha.iter().any(|byte| *byte != b'0')
 }

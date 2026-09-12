@@ -6,10 +6,33 @@ use super::{
 };
 use crate::{
     landing_checkout::CheckoutError,
-    landing_git::{GitAuthorization, GitTarget, GitTransport, PushObservation, RemoteRef},
+    landing_git::{
+        GitAuthorization, GitTarget, GitTransport, PushObservation, RemoteRef, SyncObservation,
+    },
+    landing_pack::{self, PackBounds, PackLimits},
     request_budget::RequestBudget,
 };
+use pam_connectors::{HttpRequest, HttpTransport, Method, Url};
 use tokio::sync::watch;
+
+/// What a Git broker call may do; each role has its own policy gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitRole {
+    /// Read one remote ref.
+    Observe,
+    /// Push the frozen head to its own feature branch.
+    Push,
+    /// Fetch and install the merge commit on the base branch.
+    Sync,
+}
+/// Bounds every synchronization pack must prove before Git indexes it.
+pub(crate) const SYNC_PACK_LIMITS: PackLimits = PackLimits {
+    max_objects: 16_384,
+    max_object_bytes: 4 * 1024 * 1024,
+    max_expanded_bytes: 64 * 1024 * 1024,
+};
+/// The most compressed pack bytes the transport accepts.
+const SYNC_PACK_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 fn denied() -> InvokeError {
     InvokeError::Connector(ConnectorError::Policy { cause:"landing_git_denied", detail:"The current ticket, landing policy or exact Git remote/ref does not authorize this operation.".into() })
@@ -19,6 +42,31 @@ fn git_error(error: CheckoutError) -> InvokeError {
         cause: error.cause,
         detail: error.detail.into(),
     })
+}
+fn pack_error(error: landing_pack::PackError) -> InvokeError {
+    InvokeError::Connector(ConnectorError::Policy {
+        cause: error.cause,
+        detail: error.detail,
+    })
+}
+/// `<remote>/git-upload-pack` for the exact approved HTTPS remote.
+fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
+    let canonical = pam_flow::canonical_repository_url(remote_url).map_err(|_| denied())?;
+    if canonical != remote_url {
+        return Err(denied());
+    }
+    let mut url = Url::parse(remote_url).map_err(|_| denied())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(denied());
+    }
+    let path = format!("{}/git-upload-pack", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(url)
 }
 fn sha(value: &str) -> bool {
     value.len() == 40
@@ -36,7 +84,7 @@ pub(super) struct GitGuard {
     branch: String,
     source_branch: String,
     workspace: std::path::PathBuf,
-    push: bool,
+    role: GitRole,
 }
 impl GitGuard {
     pub(super) fn new(
@@ -45,7 +93,7 @@ impl GitGuard {
         ticket: &str,
         revision: &str,
         target: &GitTarget,
-        push: bool,
+        role: GitRole,
     ) -> Result<Self, InvokeError> {
         let source_branch = target
             .receipt
@@ -59,7 +107,10 @@ impl GitGuard {
             || target.request.expected_commit != target.receipt.commit
             || !sha(&target.receipt.commit)
             || target.expected_old.as_ref().is_some_and(|oid| !sha(oid))
-            || (push && target.branch != source_branch)
+            || (role == GitRole::Push && target.branch != source_branch)
+            || (role == GitRole::Sync
+                && (target.request.base_ref != format!("refs/heads/{}", target.branch)
+                    || target.expected_old.is_none()))
         {
             return Err(denied());
         }
@@ -73,7 +124,7 @@ impl GitGuard {
             branch: target.branch.clone(),
             source_branch: source_branch.to_owned(),
             workspace: target.request.checkouts_root.clone(),
-            push,
+            role,
         })
     }
     pub(super) async fn authorize_row(&self) -> Result<Option<ConnectorRow>, InvokeError> {
@@ -89,7 +140,10 @@ impl GitGuard {
             || self.base != format!("refs/heads/{}", policy.base)
             || !policy.branches.contains(&self.source_branch)
             || (self.branch != policy.base && !policy.branches.contains(&self.branch))
-            || (self.push && (!policy.permissions.push || self.branch == policy.base))
+            || (self.role == GitRole::Push
+                && (!policy.permissions.push || self.branch == policy.base))
+            || (self.role == GitRole::Sync
+                && (!policy.permissions.sync || self.branch != policy.base))
         {
             return Err(denied());
         }
@@ -174,7 +228,7 @@ impl ConnectorService {
                 Arc::clone(&budget),
                 cancel,
                 deadline,
-                false,
+                GitRole::Observe,
             )
             .await?;
         transport
@@ -205,11 +259,141 @@ impl ConnectorService {
                 Arc::clone(&budget),
                 cancel,
                 deadline,
-                true,
+                GitRole::Push,
             )
             .await?;
         transport
             .push_exact(target, &secret, budget, cancel, deadline, guard)
+            .await
+            .map_err(git_error)
+    }
+    /// Fetches the synchronization pack for `merge_commit` through the fixed
+    /// HTTP broker (never Git) and proves its bounds before returning it.
+    /// `haves` name commits the canonical repository already holds, so the
+    /// server sends a thin pack of only what is new.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep original request identity, policy revision, budget and bounds explicit"
+    )]
+    pub(crate) async fn landing_fetch_pack(
+        &self,
+        repo: &Path,
+        ticket: &str,
+        policy_revision: &str,
+        target: &GitTarget,
+        merge_commit: &str,
+        haves: &[&str],
+        budget: Arc<RequestBudget>,
+        deadline: Instant,
+    ) -> Result<(Vec<u8>, PackBounds), InvokeError> {
+        let guard = GitGuard::new(
+            Arc::clone(&self.store),
+            repo,
+            ticket,
+            policy_revision,
+            target,
+            GitRole::Sync,
+        )?;
+        let row = guard.authorize_row().await?;
+        let body = landing_pack::upload_pack_request(merge_commit, haves).map_err(pack_error)?;
+        budget.attempt_persisted().await.map_err(|error| {
+            InvokeError::Connector(ConnectorError::Policy {
+                cause: error.cause,
+                detail: error.to_string(),
+            })
+        })?;
+        if Instant::now() >= deadline.min(budget.deadline()) {
+            return Err(ConnectorError::Timeout.into());
+        }
+        self.ensure_transport(ConnectorId::Github)?;
+        let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
+        let secret = connection.secret.ok_or(InvokeError::CredentialMissing)?;
+        let url = upload_pack_url(&target.request.remote_url)?;
+        let request = HttpRequest {
+            method: Method::Post,
+            body: Some(body),
+            url,
+            headers: vec![
+                (
+                    "Authorization".into(),
+                    format!("Basic {}", crate::landing_git::basic_token(secret.expose())),
+                ),
+                (
+                    "Content-Type".into(),
+                    "application/x-git-upload-pack-request".into(),
+                ),
+                (
+                    "Accept".into(),
+                    "application/x-git-upload-pack-result".into(),
+                ),
+            ],
+            max_bytes: SYNC_PACK_MAX_BYTES,
+            follow_one_https_redirect_without_auth: false,
+        };
+        // Authority is rechecked immediately before the credential leaves.
+        guard.authorize_row().await?;
+        let response = crate::request_budget::BudgetTransport {
+            inner: self.transport.as_ref(),
+            budget,
+        }
+        .send(request, deadline)
+        .await
+        .map_err(ConnectorError::from)?;
+        if response.status != 200 {
+            return Err(InvokeError::Connector(ConnectorError::Policy {
+                cause: "landing_sync_remote_error",
+                detail: format!(
+                    "the Git server answered the pack request with HTTP {}",
+                    response.status
+                ),
+            }));
+        }
+        let pack = landing_pack::strip_upload_pack_preamble(&response.body).map_err(pack_error)?;
+        let bounds = landing_pack::preflight_pack(pack, SYNC_PACK_LIMITS).map_err(pack_error)?;
+        Ok((pack.to_vec(), bounds))
+    }
+    /// Installs a preflighted pack and fast-forwards the base ref; see
+    /// [`GitTransport::sync_exact`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep original request identity, policy revision, budget and cancellation explicit"
+    )]
+    pub(crate) async fn landing_git_sync(
+        &self,
+        repo: &Path,
+        ticket: &str,
+        policy_revision: &str,
+        target: &GitTarget,
+        merge_commit: &str,
+        pack: Vec<u8>,
+        bounds: PackBounds,
+        budget: Arc<RequestBudget>,
+        cancel: &mut watch::Receiver<bool>,
+        deadline: Instant,
+    ) -> Result<SyncObservation, InvokeError> {
+        let (transport, _secret, guard) = self
+            .landing_git_context(
+                repo,
+                ticket,
+                policy_revision,
+                target,
+                Arc::clone(&budget),
+                cancel,
+                deadline,
+                GitRole::Sync,
+            )
+            .await?;
+        transport
+            .sync_exact(
+                target,
+                merge_commit,
+                pack,
+                bounds,
+                budget,
+                cancel,
+                deadline,
+                guard,
+            )
             .await
             .map_err(git_error)
     }
@@ -226,7 +410,7 @@ impl ConnectorService {
         budget: Arc<RequestBudget>,
         cancel: &mut watch::Receiver<bool>,
         deadline: Instant,
-        push: bool,
+        role: GitRole,
     ) -> Result<(GitTransport, CallSecret, Arc<dyn GitAuthorization>), InvokeError> {
         let guard = Arc::new(GitGuard::new(
             Arc::clone(&self.store),
@@ -234,7 +418,7 @@ impl ConnectorService {
             ticket,
             revision,
             target,
-            push,
+            role,
         )?);
         guard.authorize_row().await?;
         let transport =

@@ -48,6 +48,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "ipc-transport"] }
 thiserror = "2"
 tempfile = "3"
+# pure-Rust deflate/zlib for pack preflight decoding (rust_backend ->
+# miniz_oxide); never the C-backed zlib-ng/cloudflare_zlib backends.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 # CLI surface: derive-style argument parsing. Pure Rust (clap_builder,
 # anstyle, proc-macro derive) — no C compile step.
 clap = { version = "4", features = ["derive"] }

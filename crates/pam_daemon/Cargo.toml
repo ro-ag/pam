@@ -14,6 +14,8 @@ pam_compact.workspace = true
 pam_connectors.workspace = true
 # the flow schema, validator and library the engine runs (`flow_service.rs`).
 pam_flow.workspace = true
+# pack preflight decoding (`landing_pack.rs`): pure-Rust miniz_oxide backend.
+flate2.workspace = true
 pam_model.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true

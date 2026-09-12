@@ -74,8 +74,15 @@ It defaults off and remains unqualified for logs; see
 `pam-old` considered the approximately 713 MB LLMLingua-2 mBERT candidate, but its
 later task-25 decision restricted proposed use to prose and explicitly excluded
 logs, code, SQL, JSON, diffs, diagnostics, identifiers, and numbers until fidelity
-is demonstrated. That unresolved evidence gap carries forward. Do not introduce
-a Python service, native build dependency, or remote inference to bypass it.
+is demonstrated. That unresolved evidence gap carries forward for
+non-keyword-anchored facts: the 2026-09-12 held-out qualification proved
+decisive-fact retention for keyword-anchored classes and lost a non-keyword
+negation line at the product budget, so those classes stay restricted out and
+compression stays off by default
+([records](../benchmarks/2026-09-12-compression-qualification/compressor.json),
+[sequence](../benchmarks/2026-09-12-compression-qualification/sequence.json)).
+Do not introduce a Python service, native build dependency, or remote inference
+to bypass it.
 
 Qualification must bind an exact licensed artifact to a supported pure-Rust
 backend and prove source-span mapping and decisive-fact retention for each input

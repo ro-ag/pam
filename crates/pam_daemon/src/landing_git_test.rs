@@ -626,3 +626,313 @@ async fn incremental_projection_cuts_history_preserves_merge_trees_and_exact_lea
     .await
     .unwrap();
 }
+
+/// A source repository on `feature/work` (base `main` at one commit), a
+/// remote clone that advanced `main` by one squash commit, and a thin pack
+/// carrying exactly that advance — the shape sync sees after `verify_main`.
+#[cfg(target_os = "macos")]
+fn sync_fixture(parent: &Path) -> (CheckoutRequest, CheckoutReceipt, String, String, Vec<u8>) {
+    let request = local_object_fixture(parent);
+    let git = request.git_program.clone();
+    let run = |dir: &Path, args: &[&str], stdin: &str| -> Vec<u8> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(&git)
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap().trim().to_owned();
+    let repo = request.repository.clone();
+    let base = request.expected_commit.clone();
+    // The frozen head: one commit on feature/work, checked out.
+    run(&repo, &["checkout", "-q", "-b", "feature/work"], "");
+    fs::write(repo.join("file"), "tracked\nchanged\n").unwrap();
+    run(&repo, &["add", "file"], "");
+    run(
+        &repo,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "feature"],
+        "",
+    );
+    let head = text(run(&repo, &["rev-parse", "HEAD"], ""));
+    let tree = text(run(&repo, &["rev-parse", "HEAD^{tree}"], ""));
+    // The remote: main advanced by a squash of that tree onto base.
+    let remote = parent.join("remote");
+    run(
+        parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            repo.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+        "",
+    );
+    let merge = text(run(
+        &remote,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "squash",
+        ],
+        "",
+    ));
+    run(&remote, &["update-ref", "refs/heads/main", &merge], "");
+    let pack = run(
+        &remote,
+        &["pack-objects", "--revs", "--thin", "--stdout", "-q"],
+        &format!("{merge}\n^{base}\n^{head}\n"),
+    );
+    let request = CheckoutRequest {
+        expected_commit: head.clone(),
+        ..request
+    };
+    let receipt = CheckoutReceipt {
+        repository: repo,
+        remote_url: request.remote_url.clone(),
+        branch: "refs/heads/feature/work".into(),
+        commit: head,
+        base_ref: "refs/heads/main".into(),
+        base_commit: base.clone(),
+        tree,
+        manifest: Vec::new(),
+        manifest_sha256: String::new(),
+    };
+    (request, receipt, base, merge, pack)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_limits() -> crate::landing_pack::PackLimits {
+    crate::landing_pack::PackLimits {
+        max_objects: 16_384,
+        max_object_bytes: 4 * 1024 * 1024,
+        max_expanded_bytes: 64 * 1024 * 1024,
+    }
+}
+/// Runs the source repository's own Git (scrubbed environment) and reports success.
+#[cfg(target_os = "macos")]
+fn source_git_ok(request: &CheckoutRequest, args: &[&str]) -> bool {
+    std::process::Command::new(&request.git_program)
+        .args(args)
+        .current_dir(&request.repository)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sync_installs_the_pack_and_fast_forwards_only_the_base_ref() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let (request, receipt, base, merge, pack) = sync_fixture(&parent);
+    let bounds = crate::landing_pack::preflight_pack(&pack, sync_limits()).unwrap();
+    assert!(bounds.objects > 0);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let budget = RequestBudget::new(deadline);
+    let (_sender, mut cancel) = watch::channel(false);
+    let config = GitTransport::resolve(&request, budget.clone(), &mut cancel, deadline)
+        .await
+        .unwrap();
+    let target = GitTarget {
+        request: request.clone(),
+        receipt,
+        branch: "main".into(),
+        expected_old: Some(base.clone()),
+    };
+
+    // A stale lease refuses before any effect.
+    let stale = GitTarget {
+        expected_old: Some("1".repeat(40)),
+        ..target.clone()
+    };
+    let refused = config
+        .sync_exact(
+            &stale,
+            &merge,
+            pack.clone(),
+            bounds.clone(),
+            budget.clone(),
+            &mut cancel,
+            deadline,
+            Arc::new(Allow),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.cause, "landing_checkout_changed");
+    assert_eq!(
+        landing_checkout::resolve_local_ref(&request, "refs/heads/main").unwrap(),
+        base
+    );
+
+    let observed = config
+        .sync_exact(
+            &target,
+            &merge,
+            pack.clone(),
+            bounds.clone(),
+            budget.clone(),
+            &mut cancel,
+            deadline,
+            Arc::new(Allow),
+        )
+        .await
+        .unwrap();
+    assert_eq!(observed.requested_commit, merge);
+    assert_eq!(observed.expected_old, base);
+    assert!(observed.pack.starts_with("pack-"));
+    assert_eq!(observed.bounds, bounds);
+    // Exactly the two promised effects: the pack and the base ref.
+    let pack_dir = request.repository.join(".git/objects/pack");
+    assert!(pack_dir.join(format!("{}.pack", observed.pack)).is_file());
+    assert!(pack_dir.join(format!("{}.idx", observed.pack)).is_file());
+    assert!(
+        !fs::read_dir(&pack_dir).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("tmp_"))
+    );
+    assert_eq!(
+        landing_checkout::resolve_local_ref(&request, "refs/heads/main").unwrap(),
+        merge
+    );
+    assert_eq!(
+        landing_checkout::head_branch(&request).unwrap(),
+        "refs/heads/feature/work"
+    );
+    assert_eq!(
+        fs::read_to_string(request.repository.join("file")).unwrap(),
+        "tracked\nchanged\n"
+    );
+    let reflog = fs::read_to_string(request.repository.join(".git/logs/refs/heads/main")).unwrap();
+    assert!(reflog.ends_with("\tpam guarded-land sync\n"));
+    assert!(reflog.contains(&format!("{base} {merge} ")));
+    assert_eq!(
+        budget.usage().http_calls,
+        0,
+        "sync installation never opens a network transaction"
+    );
+    // The source repository can read the merge commit through its own Git.
+    assert!(source_git_ok(
+        &request,
+        &["merge-base", "--is-ancestor", &base, &merge]
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sync_refuses_a_checked_out_base_and_a_non_fast_forward() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let (request, receipt, base, merge, pack) = sync_fixture(&parent);
+    let bounds = crate::landing_pack::preflight_pack(&pack, sync_limits()).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let budget = RequestBudget::new(deadline);
+    let (_sender, mut cancel) = watch::channel(false);
+    let config = GitTransport::resolve(&request, budget.clone(), &mut cancel, deadline)
+        .await
+        .unwrap();
+    let target = GitTarget {
+        request: request.clone(),
+        receipt,
+        branch: "main".into(),
+        expected_old: Some(base.clone()),
+    };
+
+    // The frozen head is not an ancestor of the base: no fast-forward, no effect.
+    let backwards = GitTarget {
+        expected_old: Some(request.expected_commit.clone()),
+        ..target.clone()
+    };
+    fs::write(
+        request.repository.join(".git/refs/heads/main"),
+        format!("{}\n", request.expected_commit),
+    )
+    .unwrap();
+    let refused = config
+        .sync_exact(
+            &backwards,
+            &merge,
+            pack.clone(),
+            bounds.clone(),
+            budget.clone(),
+            &mut cancel,
+            deadline,
+            Arc::new(Allow),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.cause, "landing_sync_ancestry_unproven");
+    assert!(
+        !request.repository.join(".git/objects/pack").exists()
+            || fs::read_dir(request.repository.join(".git/objects/pack"))
+                .unwrap()
+                .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".idx"))
+    );
+    fs::write(
+        request.repository.join(".git/refs/heads/main"),
+        format!("{base}\n"),
+    )
+    .unwrap();
+
+    // The base branch checked out: sync never writes the working tree.
+    fs::write(
+        request.repository.join(".git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+    let refused = config
+        .sync_exact(
+            &target,
+            &merge,
+            pack,
+            bounds,
+            budget,
+            &mut cancel,
+            deadline,
+            Arc::new(Allow),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.cause, "landing_sync_base_checked_out");
+    assert_eq!(
+        landing_checkout::resolve_local_ref(&request, "refs/heads/main").unwrap(),
+        base
+    );
+}

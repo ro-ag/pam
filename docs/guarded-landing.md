@@ -3,10 +3,12 @@
 Task #135 adds `guarded-land` to the existing flow executor. It uses no model.
 The CLI submits a ticket through PAM's internal Unix socket; the daemon owns
 approval, credentials, bounded execution, evidence and recovery. This document
-describes the implementation under qualification. Until the sync adapter and
-end-to-end checkpoint pass, the complete recipe is not ready for use. Inspection
-reports `landing_sync_unavailable`; running a recipe that contains sync refuses
-before any checkout capture, validation command or remote operation.
+describes the implementation under qualification. The sync adapter landed on
+2026-09-12 (see the [guarded sync contract](specs/2026-09-12-guarded-sync.md));
+the complete recipe runs end to end against the fixtures, and the enterprise
+checkpoint (#94) is what still separates it from a supported claim. Inspection
+reports `landing_permission_missing` for any stage the GUI policy has not
+granted, sync included.
 
 ## Configure and inspect
 
@@ -47,7 +49,7 @@ profile and per-stage approval rules still apply at execution time.
 | `verify_pr` | Every declared required check is successful for that exact head SHA |
 | `merge` | Fresh PR and check evidence, separate permission and GitHub's expected-head-SHA merge condition |
 | `verify_main` | Every declared main check succeeds for the merge SHA returned by GitHub |
-| `sync` | Guarded local synchronization confirmed by a typed receipt; currently pending adapter qualification |
+| `sync` | The verified merge commit fetched as a bounds-proven thin pack through the HTTP broker, indexed privately, installed into the source object store, and the base branch fast-forwarded under an exact old-value lease; working tree untouched |
 
 The YAML parser accepts only this ordered sequence or an ordered prefix, with
 successful direct prerequisites. It rejects custom commands, URLs, retries or
@@ -103,8 +105,12 @@ not exposed as public evidence pages.
 Native Git accounting reserves a conservative transfer allowance; it does not
 claim to count every HTTP exchange inside Git. Object, metadata, output and time
 limits remain independent of that reservation. Insufficient budget refuses work
-before its external effect. Large-history projection and bounded synchronization
-are still under qualification in task #135.
+before its external effect. Synchronization never runs Git against the network:
+the pack arrives through the bounded HTTP transport (64 MiB), every entry is
+inflated by the pure-Rust decoder to prove object count, per-object and expanded
+totals before `index-pack`, and the only writes to the source repository are one
+complete pack and one ref file. Large-history projection remains under
+qualification in task #135.
 
 ## Completion evidence
 

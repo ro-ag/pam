@@ -28,8 +28,37 @@ const PROMPT_LABELS: Record<string, string> = {
   daemon_status: "Daemon status",
   login_start: "Start at login",
   flows: "Available flows",
+  start_task: "Start a task",
   tokens_saved: "Tokens saved",
 };
+
+/**
+ * Home's starters: no qualified model required, a run overview before
+ * anything executes. Each opens its flow's run tab directly, the same
+ * destination a bounded Ask Pam task request resolves to.
+ */
+const START_TASKS: ReadonlyArray<{ id: string; title: string; needs: string }> = [
+  {
+    id: "summarize-build-log",
+    title: "Summarize a build log",
+    needs: "needs a repository to build",
+  },
+  {
+    id: "ci-failure-triage",
+    title: "Triage a CI failure",
+    needs: "needs the GitHub connector",
+  },
+  {
+    id: "pr-readiness",
+    title: "Check PR readiness",
+    needs: "needs a Rust repository",
+  },
+  {
+    id: "watch-github-run",
+    title: "Watch a GitHub run",
+    needs: "needs the GitHub connector and a run id",
+  },
+];
 /** How many exchanges Pam keeps — the number the placeholder promises. */
 export const MEMORY_DEPTH = 3;
 
@@ -177,6 +206,26 @@ export function HomeScreen() {
               </Link>
             )}
           </aside>
+          <section aria-labelledby="start-task-heading" className="space-y-3">
+            <h2 id="start-task-heading" className="text-lg font-semibold">
+              Start a task
+            </h2>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {START_TASKS.map((task) => (
+                <Link
+                  key={task.id}
+                  to="/flows"
+                  search={{ flow: task.id, tab: "run" }}
+                  className="block space-y-1 rounded-card border border-line bg-surface-raised p-4 transition-colors hover:bg-accent-soft"
+                >
+                  <span className="block font-sans text-sm font-medium text-ink">
+                    {task.title}
+                  </span>
+                  <span className="block text-xs text-ink-muted">{task.needs}</span>
+                </Link>
+              ))}
+            </div>
+          </section>
           <Panel ground="command" className="min-w-0 overflow-hidden" aria-busy={asking}>
             <div className="space-y-4 p-5">
               <div className="flex items-center gap-3">

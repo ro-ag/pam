@@ -136,6 +136,29 @@ describe("Home shell", () => {
     expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
   });
 
+  it("leads with the four starter tasks, each linking to its flow's run overview", async () => {
+    renderHome();
+    const tasks = await screen.findByRole("region", { name: "Home content" });
+    const heading = within(tasks).getByRole("heading", { name: "Start a task" });
+    expect(heading).toBeInTheDocument();
+    const cases: Array<[string, string]> = [
+      ["Summarize a build log", "/flows?flow=summarize-build-log&tab=run"],
+      ["Triage a CI failure", "/flows?flow=ci-failure-triage&tab=run"],
+      ["Check PR readiness", "/flows?flow=pr-readiness&tab=run"],
+      ["Watch a GitHub run", "/flows?flow=watch-github-run&tab=run"],
+    ];
+    for (const [name, href] of cases) {
+      // The link's accessible name is its title plus the "needs…" line
+      // below it, so match the title as a prefix rather than in full.
+      expect(within(tasks).getByRole("link", { name: new RegExp(`^${name}`) })).toHaveAttribute(
+        "href",
+        href,
+      );
+    }
+    // No qualified model is needed to see or use any of them.
+    expect(screen.queryByText(/no light model is set/)).not.toBeInTheDocument();
+  });
+
   it("greets a raised hand, and says so when the daemon is silent", async () => {
     mocks.approvalsPending.mockResolvedValue({
       pending: [

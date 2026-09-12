@@ -20,6 +20,7 @@ export type IntentId =
   | "daemon_status"
   | "login_start"
   | "flows"
+  | "start_task"
   | "tokens_saved"
   | "fallback";
 

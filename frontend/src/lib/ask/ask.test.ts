@@ -69,6 +69,10 @@ describe("matchIntent", () => {
     ["does pam start at login?", "login_start"],
     ["which flows do I have?", "flows"],
     ["run pr-readiness", "flows"],
+    ["Summarize a build log", "start_task"],
+    ["triage the CI failure", "start_task"],
+    ["check PR readiness", "start_task"],
+    ["watch this GitHub run", "start_task"],
     ["how many tokens did I save?", "tokens_saved"],
     ["tell me a joke", "fallback"],
     ["", "fallback"],
@@ -93,7 +97,7 @@ describe("matchIntent", () => {
     expect(matchIntent("tokens saved today").id).toBe("tokens_saved");
   });
 
-  it("exposes the nine pills in table order", () => {
+  it("exposes the ten pills in table order", () => {
     expect(INTENTS.map((i) => i.id)).toEqual([
       "approvals_waiting",
       "why_refused",
@@ -103,6 +107,7 @@ describe("matchIntent", () => {
       "daemon_status",
       "login_start",
       "flows",
+      "start_task",
       "tokens_saved",
     ]);
   });
@@ -279,6 +284,30 @@ describe("ask", () => {
     expect((await ask("how many tokens did I save?", ctx, fakeSources(), off)).sentence).toBe(
       "This week I avoided about 67,500 tokens across 3 compressions (293 KB → 29 KB).",
     );
+  });
+
+  it("points a bounded task request at the starter flow's run overview, not the flow list", async () => {
+    const log = await ask("Summarize a build log", ctx, fakeSources(), off);
+    expect(log.intent).toBe("start_task");
+    expect(log.sentence).toMatch(/^Summarize a build log starts from its own card/);
+    expect(log.links).toEqual([
+      {
+        label: "Open Summarize a build log",
+        to: "/flows",
+        search: { flow: "summarize-build-log", tab: "run" },
+      },
+    ]);
+
+    const triage = await ask("triage the CI failure", ctx, fakeSources(), off);
+    expect(triage.intent).toBe("start_task");
+    expect(triage.sentence).toMatch(/^Triage a CI failure starts from its own card/);
+    expect(triage.links).toEqual([
+      {
+        label: "Open Triage a CI failure",
+        to: "/flows",
+        search: { flow: "ci-failure-triage", tab: "run" },
+      },
+    ]);
   });
 
   it("answers honestly when nothing matches, and when the daemon is down", async () => {

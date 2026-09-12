@@ -456,6 +456,60 @@ async function flows(args: Args, sources: Sources): Promise<Answer> {
   };
 }
 
+/**
+ * Home's starter flows, and the wording that names each one. A bounded
+ * task request ("summarize a build log") should land here rather than
+ * `flows`'s "you have N flows" list — one link straight to that flow's
+ * run overview, not a naming exercise.
+ *
+ * `readiness`'s `(^|\s)` guard (instead of `\b`) keeps a bare "run
+ * pr-readiness" — a flow id, hyphen and all — reading as the `flows`
+ * intent's own run command rather than this one.
+ */
+const START_TASKS: ReadonlyArray<{ id: string; title: string; match: RegExp }> = [
+  {
+    id: "summarize-build-log",
+    title: "Summarize a build log",
+    match: /(?=.*\bsummari[sz]e\b)(?=.*\blog\b)/i,
+  },
+  {
+    id: "ci-failure-triage",
+    title: "Triage a CI failure",
+    match: /(?=.*\btriage\b)(?=.*\b(?:ci|build|failure)\b)/i,
+  },
+  {
+    id: "pr-readiness",
+    title: "Check PR readiness",
+    match: /(?:^|\s)readiness\b|\bpr ready\b/i,
+  },
+  {
+    id: "watch-github-run",
+    title: "Watch a GitHub run",
+    match: /(?=.*\bwatch\b)(?=.*\b(?:run|build|workflow)\b)/i,
+  },
+];
+
+async function startTask(
+  _args: Args,
+  _sources: Sources,
+  _ctx: AskContext,
+  question: string,
+): Promise<Answer> {
+  const task = START_TASKS.find((candidate) => candidate.match.test(question)) ?? START_TASKS[0];
+  return {
+    intent: "start_task",
+    sentence: `${task.title} starts from its own card: open it to see what it needs before it runs.`,
+    facts: [["starter", task.title]],
+    links: [
+      {
+        label: `Open ${task.title}`,
+        to: "/flows",
+        search: { flow: task.id, tab: "run" },
+      },
+    ],
+  };
+}
+
 async function tokensSaved(_args: Args, sources: Sources, ctx: AskContext): Promise<Answer> {
   const links = [{ label: "Open Activity", to: "/activity" as const }];
   let stats;
@@ -493,7 +547,7 @@ export async function fallbackAnswer(): Promise<Answer> {
     intent: "fallback",
     sentence:
       "I can answer about pam itself: approvals, refusals, today's activity, the model, " +
-      "settings, the daemon, login, flows, tokens saved.",
+      "settings, the daemon, login, flows, tokens saved. Tasks start from the cards on Home.",
     facts: [],
     links: [],
   });
@@ -570,6 +624,13 @@ export const SPEC_ORDER: Intent[] = [
     answer: flows,
   },
   {
+    id: "start_task",
+    label: "start a task",
+    canonical: "check PR readiness",
+    patterns: START_TASKS.map((task) => task.match),
+    answer: startTask,
+  },
+  {
     id: "tokens_saved",
     label: "tokens saved",
     canonical: "how many tokens did I save?",
@@ -592,6 +653,7 @@ const MATCH_IDS: IntentId[] = [
   "approvals_waiting",
   "model_status",
   "daemon_status",
+  "start_task",
   "flows",
 ];
 

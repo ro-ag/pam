@@ -48,14 +48,21 @@ for access, evidence, polling, validation, or landing decisions.
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
 | Orchestration | Flows, checks, approvals, retries, tickets | Durable remote polling, resume/reconciliation and guarded landing orchestration |
 | Models | Candle GGUF runtime and prose summary with honest skips | Task-qualified structured investigation, validated reads, measured admission |
-| Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency | Optimized latency, decisive-fact retention and incremental benefit qualification |
+| Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency, held-out qualification (keyword-anchored classes proven, non-keyword classes restricted out) | Default stays off; enablement blocked on the citation-offset contract decision |
 
 The Microsoft smoke preserved evidence and reduced 1,017 tokens to 459, but took
-70.88 seconds in an unoptimized CPU build. It exceeds the 30-second caller budget;
-it does not justify enabling compression by default. No 9–14 GB investigator
-has been qualified. Current weight-size eligibility remains disputed in #96.
+70.88 seconds in an unoptimized CPU build. Release-build qualification has since
+landed: optimized latency meets the caller budget, held-out decisive-fact
+retention is proven for keyword-anchored classes and disproven for
+non-keyword-anchored ones (restricted out), and the full compressor/unload/
+investigator sequence shows compression is the only path that fits oversized
+evidence inside the 2,048-token envelope. Compression stays off by default; the
+real artifact's verdicts are refused today by the byte-offset citation contract
+in every arm, so enablement waits on that contract decision, not compressor work.
 See [implementation notes](microsoft-compression.md) and
 [Jenkins behavior](jenkins-investigation.md) for shipped limits.
+No 9–14 GB investigator has been qualified. Current weight-size eligibility
+remains disputed in #96.
 
 ## Dependency-ordered plans
 
@@ -154,7 +161,7 @@ must preserve user changes; releases and artifact publishing remain separate.
 | #137 | Exact 9–14 GB artifact screen | Pinned artifact/backend/template, measured cold/warm working set and realistic concurrent workload |
 | #138 | Measured runtime admission | Framed tokens, output reserve, current memory, bounded queues and responsive prefill cancellation |
 | #139 | Structured advisory diagnosis and scoped reads | Invalid/hostile/unsupported claims fail safely; quotes, target membership and run-wide budgets enforced |
-| #140 | Microsoft compression qualification | Decisive relationships survive and net benefit exceeds deterministic-only preparation |
+| #140 | Microsoft compression qualification | DONE 2026-09-12: held-out retention proven and restricted per class; sequence measured against deterministic-only; decision recorded (default off, enablement blocked on the citation-offset contract) |
 | #108 | Paired end-to-end qualification | Published acceptance report, per-product coverage/errors/abstention/resources and realized frontier savings |
 | #96 | Artifact/task/backend eligibility | Evidence-backed promotion replaces the size floor; configured unqualified models stay visible |
 | #123 | Qualification checkpoint | Explicit qualified envelope or no-go decision; no invented readiness |

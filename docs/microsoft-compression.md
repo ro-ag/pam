@@ -73,3 +73,49 @@ The earlier 70.88-second debug timing is not a release latency estimate.
 include the source revision and limitations. This supports further evaluation,
 not default enablement: one protected-fact fixture, three ambient-load runs and
 warmed file caches cannot establish log fidelity, p95 latency or frontier savings.
+
+## Held-out qualification and sequence measurement (task 140)
+
+September 12, 2026, release build, pinned assets, 64 GiB M4 Max (not a 32 GB
+measurement). [Compressor record](benchmarks/2026-09-12-compression-qualification/compressor.json)
+and [sequence record](benchmarks/2026-09-12-compression-qualification/sequence.json).
+
+Held-out authored families (disjoint from the dev records) at the product
+selection budget, gated per class:
+
+- Proven classes — identifiers, numbers, operators, retry boundaries, cleanup
+  boundaries, parallel branches, multibyte spans, and a 21 KB near-cap record —
+  retained 21 of 21 decisive facts. Wall time 3.9–4.6 s per 8–9.5 KB record and
+  8.2 s at 21 KB, inside the 30-second caller budget; steady-state peak RSS
+  about 1.68 GB.
+- Restricted classes — decisive facts anchored outside the retention keyword
+  net (for example a negation line with no `error`/`failed`-family keyword) —
+  are not dependable: the qualification run lost
+  `deploy did not start: manifest rejected by admission` at the product budget.
+  Those classes stay excluded from any enablement.
+- Failure paths hold: missing or tampered assets refuse on size and SHA-256
+  before any inference, cancellation lands mid-verification in about 0.4 s,
+  inputs over 64 KiB or 8,192 tokens refuse before inference, and a
+  within-budget record is returned unchanged.
+
+The full sequence — compressor, fresh-admission investigator load, then the
+structured investigator on the real Qwen3-14B artifact (CPU) — measured the
+compression arm against deterministic-only preparation:
+
+- Oversized evidence (framed 3,736–4,569 tokens against the 2,048-token
+  envelope) cannot be investigated deterministically; the runtime refuses and
+  the run escalates. Compressed to 3,600 bytes it fits (1,941/1,983 prompt
+  tokens) and the model reached the gold hypothesis (infra, code) with every
+  citation quote verbatim in the evidence it was given.
+- The within-envelope packet diagnosed directly at 1,165 prompt tokens with no
+  compressor involvement — no benefit class below the selection budget.
+- On every arm, compressed or not, the shipped citation contract refused the
+  verdict on byte offsets (`quote_mismatch` / `offset_out_of_range`): the model
+  supplies verbatim quotes but cannot count bytes. The product path therefore
+  escalates honestly for this artifact today, independent of compression.
+
+Decision: compression stays off by default. Proven input classes are
+keyword-anchored decisive facts in 8–64 KB evidence; non-keyword-anchored
+facts are restricted out; and any enablement additionally depends on the
+citation-offset contract decision recorded for #139/#108 — host-side
+quote→offset resolution or a prompt-contract change, not a compressor change.

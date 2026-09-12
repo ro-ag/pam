@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-12-compression-qualification/sequence",
+  "purpose": "task_140_full_sequence_compressor_unload_investigator_vs_deterministic",
+  "host": "Apple M4 Max, 64 GiB, ambient load (not a 32 GB measurement)",
+  "backend": "cpu",
+  "investigator": {
+    "artifact": "Qwen3-14B-Q5_K_M.gguf",
+    "sha256": "e7c9aba1129ca2936be9eca01419d9f86af40e08caa01230d5574b34d08e3e31",
+    "bytes": 10514569568,
+    "diagnosis_envelope_input_tokens": 2048,
+    "load_wall_ms": 2281,
+    "rss_after_load_bytes": 13144113152
+  },
+  "compressor": {
+    "assets": "pinned microsoft/llmlingua-2 @ 5f0c82792b7ea14c6484e015b6a072009496b7f2",
+    "target_bytes": 3600
+  },
+  "arms": {
+    "arm_c_compressed": [
+      {
+        "advisory_hypothesis": "infra",
+        "calls_wall_ms": 224889,
+        "citations": 2,
+        "completion_tokens": 164,
+        "compress_input_tokens": 2974,
+        "compress_output_tokens": 1200,
+        "label": "oversized-infra",
+        "offsets_exact": false,
+        "phase": "arm_c",
+        "prompt_tokens": 1941,
+        "quotes_verbatim": true,
+        "strict_outcome": "unresolved:quote_mismatch"
+      },
+      {
+        "advisory_hypothesis": "code",
+        "calls_wall_ms": 225114,
+        "citations": 1,
+        "completion_tokens": 130,
+        "compress_input_tokens": 2367,
+        "compress_output_tokens": 1257,
+        "label": "oversized-code",
+        "offsets_exact": false,
+        "phase": "arm_c",
+        "prompt_tokens": 1983,
+        "quotes_verbatim": true,
+        "strict_outcome": "unresolved:offset_out_of_range"
+      }
+    ],
+    "arm_d_deterministic_oversized": [
+      {
+        "cause": "model_unavailable",
+        "detail": "prompt is 4569 tokens; the context allows 2048",
+        "label": "oversized-infra",
+        "phase": "arm_d_refused"
+      },
+      {
+        "cause": "model_unavailable",
+        "detail": "prompt is 3736 tokens; the context allows 2048",
+        "label": "oversized-code",
+        "phase": "arm_d_refused"
+      }
+    ],
+    "fits_within_envelope": [
+      {
+        "advisory_hypothesis": "config",
+        "calls_wall_ms": 127965,
+        "citations": 1,
+        "completion_tokens": 110,
+        "input_bytes": 1778,
+        "label": "fits-config",
+        "offsets_exact": false,
+        "phase": "fits_arm",
+        "prompt_tokens": 1165,
+        "quotes_verbatim": true,
+        "strict_outcome": "unresolved:quote_mismatch"
+      }
+    ]
+  },
+  "findings": {
+    "advisory_level": "the real artifact chose the gold hypothesis (infra, code, config) on every arm and every citation quote was verbatim in the evidence it was given \u2014 decisive relationships survive record selection",
+    "strict_contract": "every arm \u2014 compressed AND the uncompressed within-envelope packet \u2014 was refused by the shipped citation contract on byte offsets (quote_mismatch / offset_out_of_range); the model supplies verbatim quotes but cannot count bytes. The product path therefore escalates honestly (unresolved) for this artifact today, independent of compression",
+    "benefit": "for oversized evidence (framed 3736-4569 tokens vs the 2048 envelope), compression is the only path to investigation at all: deterministic-only refuses and escalates; compressed evidence fits (1941/1983 prompt tokens). For within-envelope evidence, compression has no benefit class (1778 bytes diagnose directly at 1165 prompt tokens; the product bypasses the classifier there)",
+    "cost": "compressor 3.9-4.6 s per packet (inside the 30 s caller budget), 3600-byte output, transient RSS under 1.7 GB returned after the run; diagnosis itself is CPU-bound (~225 s per arm on this host) \u2014 that latency belongs to the admitted-runtime work (#108), not the compressor",
+    "residency": "compressor ran on an idle worker, its working set returned before the investigator loaded (fresh admission snapshot); single-worker serialization contract exercised end to end"
+  },
+  "decision": "compression stays off by default; proven input classes only (keyword-anchored decisive facts); enablement additionally blocked on the citation-offset contract decision (#139/#108 scope)",
+  "raw_outputs": "captured in the run log; greedy (temperature 0), deterministic"
+}

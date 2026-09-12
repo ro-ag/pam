@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-12-compression-qualification/sequence-resolved",
+  "purpose": "task_146_rerun_of_the_task_140_sequence_after_host_side_citation_offset_resolution",
+  "supersedes_strict_outcomes_of": "2026-09-12-compression-qualification/sequence",
+  "host": "Apple M4 Max, 64 GiB, ambient load (not a 32 GB measurement)",
+  "backend": "cpu",
+  "revision": "ed27850+issue25-wip",
+  "investigator": {
+    "artifact": "Qwen3-14B-Q5_K_M.gguf",
+    "sha256": "e7c9aba1129ca2936be9eca01419d9f86af40e08caa01230d5574b34d08e3e31",
+    "bytes": 10514569568,
+    "diagnosis_envelope_input_tokens": 2048,
+    "load_wall_ms": 2907,
+    "rss_after_load_bytes": 7537885184
+  },
+  "compressor": {
+    "assets": "pinned microsoft/llmlingua-2 @ 5f0c82792b7ea14c6484e015b6a072009496b7f2",
+    "target_bytes": 3600
+  },
+  "change_under_test": "pam_model::diagnosis::resolve_citation_offsets runs before validate() in pam_daemon::diagnosis_service (ptrack issue #25): citation start/end are derived from the verbatim quote; validate() byte equality unchanged",
+  "arms": {
+    "compress": [
+      {
+        "after_rss_bytes": 409124864,
+        "idle_rss_bytes": 8683520,
+        "input_bytes": 10402,
+        "input_tokens": 2974,
+        "label": "oversized-infra",
+        "output_bytes": 3600,
+        "output_tokens": 1200,
+        "phase": "compress",
+        "wall_ms": 4632
+      },
+      {
+        "after_rss_bytes": 410140672,
+        "idle_rss_bytes": 8683520,
+        "input_bytes": 8162,
+        "input_tokens": 2367,
+        "label": "oversized-code",
+        "output_bytes": 3595,
+        "output_tokens": 1257,
+        "phase": "compress",
+        "wall_ms": 3926
+      }
+    ],
+    "arm_c_compressed": [
+      {
+        "advisory_hypothesis": "infra",
+        "calls_wall_ms": 226985,
+        "citations": 2,
+        "completion_tokens": 164,
+        "compress_input_tokens": 2974,
+        "compress_output_tokens": 1200,
+        "label": "oversized-infra",
+        "offsets_exact": false,
+        "phase": "arm_c",
+        "prompt_tokens": 1941,
+        "quotes_verbatim": true,
+        "strict_outcome": "diagnosed:infra"
+      },
+      {
+        "advisory_hypothesis": "code",
+        "calls_wall_ms": 220215,
+        "citations": 1,
+        "completion_tokens": 130,
+        "compress_input_tokens": 2367,
+        "compress_output_tokens": 1257,
+        "label": "oversized-code",
+        "offsets_exact": false,
+        "phase": "arm_c",
+        "prompt_tokens": 1983,
+        "quotes_verbatim": true,
+        "strict_outcome": "diagnosed:code"
+      }
+    ],
+    "arm_d_deterministic_oversized": [
+      {
+        "cause": "model_unavailable",
+        "detail": "prompt is 4569 tokens; the context allows 2048",
+        "label": "oversized-infra",
+        "phase": "arm_d_refused"
+      },
+      {
+        "cause": "model_unavailable",
+        "detail": "prompt is 3736 tokens; the context allows 2048",
+        "label": "oversized-code",
+        "phase": "arm_d_refused"
+      }
+    ],
+    "fits_within_envelope": [
+      {
+        "advisory_hypothesis": "config",
+        "calls_wall_ms": 129339,
+        "citations": 1,
+        "completion_tokens": 110,
+        "input_bytes": 1778,
+        "label": "fits-config",
+        "offsets_exact": false,
+        "phase": "fits_arm",
+        "prompt_tokens": 1165,
+        "quotes_verbatim": true,
+        "strict_outcome": "diagnosed:config"
+      }
+    ]
+  },
+  "findings": {
+    "strict_contract": "every arm that reached the model - both compressed oversized packets and the uncompressed within-envelope packet - now passes the shipped contract (diagnosed:infra, diagnosed:code, diagnosed:config, the gold hypotheses); the model's own offsets were still wrong on every citation (offsets_exact=false) and every quote was verbatim (quotes_verbatim=true), so host-side resolution is what turned refusals into verdicts",
+    "unchanged": "deterministic oversized evidence still refuses on the 2048-token envelope (model_unavailable) and only fits after compression; latency is unchanged (CPU, ~220 s per oversized diagnosis, ~129 s within envelope)",
+    "scope": "a contract repair, not a quality claim: three packets, one artifact, one backend; quality gates remain #108's"
+  },
+  "decision": "issue #25 closed by host-side quote-to-offset resolution; compression default unchanged (off); enablement now waits on the #108 capability gates and the #123 publication",
+  "raw_outputs": "emitted PAM_COMPRESSION_SEQUENCE lines; full-text raw completions were not retained for this rerun"
+}

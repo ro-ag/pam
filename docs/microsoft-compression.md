@@ -115,7 +115,9 @@ compression arm against deterministic-only preparation:
   escalated honestly for this artifact at measurement time, independent of
   compression. Repaired 2026-09-12 (ptrack issue #25): the daemon now resolves
   citation offsets host-side from the verbatim quote before the byte-exact
-  check; see the prompts spec's implementation status.
+  check; see the prompts spec's implementation status. Rerun record:
+  `docs/benchmarks/2026-09-12-compression-qualification/sequence-resolved.json`
+  — every arm that reached the model now diagnoses the gold hypothesis.
 
 Decision: compression stays off by default. Proven input classes are
 keyword-anchored decisive facts in 8–64 KB evidence; non-keyword-anchored

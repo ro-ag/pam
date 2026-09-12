@@ -8,6 +8,7 @@ import type {
   ActivityRow,
   EvidenceContent,
   EvidenceMeta,
+  FlowInspection,
   FlowListEntry,
   FlowNormalizeReply,
   FlowResult,
@@ -35,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   flowsDelete: vi.fn(),
   flowsNormalize: vi.fn(),
   flowsRun: vi.fn(),
+  flowsInspect: vi.fn(),
   callersList: vi.fn(),
   activityList: vi.fn(),
   evidenceList: vi.fn(),
@@ -97,6 +99,7 @@ const FLOWS: FlowListEntry[] = [
     digest: "",
     steps: 0,
   }),
+  entry({ id: "summarize-build-log", name: "Summarize the build log", steps: 1 }),
 ];
 
 /** The parsed shape of pr-readiness: three commands, a needs edge, a when edge. */
@@ -205,6 +208,22 @@ function activity(overrides: Partial<ActivityRow>): ActivityRow {
     outcome: "verified",
     created_ts: nowSec - 60,
     updated_ts: nowSec - 10,
+    ...overrides,
+  };
+}
+
+function inspection(overrides: Partial<FlowInspection>): FlowInspection {
+  return {
+    schema_version: 1,
+    flow: { id: "pr-readiness", digest: "sha256:abcd" },
+    inputs: [],
+    steps: [],
+    correlation: null,
+    readiness: "admission_required",
+    blockers: [],
+    live: null,
+    model: { required: false, qualification: null },
+    run_admission: null,
     ...overrides,
   };
 }
@@ -353,6 +372,21 @@ describe("the library column", () => {
       await screen.findByRole("region", { name: "flow pr-readiness" }),
     ).toBeInTheDocument();
   });
+
+  it("opens a starter's run overview directly from a Home task card's deep link", async () => {
+    const router = createAppRouter(
+      createMemoryHistory({ initialEntries: ["/flows?flow=summarize-build-log&tab=run"] }),
+    );
+    render(<App router={router} />);
+    expect(
+      await screen.findByRole("region", { name: "flow summarize-build-log" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Run flow" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByLabelText("run this flow")).toBeVisible();
+  });
 });
 
 describe("the YAML tab", () => {
@@ -499,6 +533,49 @@ describe("the run card", () => {
     await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
     feed({ ticket: "req_run", event: { kind: "refused" } });
     expect(await screen.findByText(/run · refused/)).toBeInTheDocument();
+  });
+
+  it("checks readiness and shows a connector blocker linking to its settings panel", async () => {
+    mocks.flowsInspect.mockResolvedValue(
+      inspection({
+        readiness: "blocked",
+        blockers: [
+          {
+            cause: "connector_not_configured",
+            step: "run-jobs",
+            detail: "The GitHub connector has no credential.",
+            recovery: "Add one in Settings.",
+          },
+        ],
+      }),
+    );
+    // A `Link` needs a live router, which the bare `renderFlows()` helper
+    // does not mount — the readiness blocker's destination link does, so
+    // this test (and the one below) render the whole App instead.
+    const router = createAppRouter(createMemoryHistory({ initialEntries: ["/flows"] }));
+    render(<App router={router} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Check readiness" }));
+    await waitFor(() =>
+      expect(mocks.flowsInspect).toHaveBeenCalledWith("pr-readiness", "/tmp/x", {}),
+    );
+    expect(await card.findByText("Blocked")).toBeInTheDocument();
+    expect(card.getByText("connector_not_configured")).toBeInTheDocument();
+    const link = card.getByRole("link", { name: "Open Settings" });
+    expect(link).toHaveAttribute("href", "/settings#connectors");
+  });
+
+  it("shows Ready to run when the inspection reports admission_required", async () => {
+    mocks.flowsInspect.mockResolvedValue(inspection({}));
+    const router = createAppRouter(createMemoryHistory({ initialEntries: ["/flows"] }));
+    render(<App router={router} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Check readiness" }));
+    expect(await card.findByText("Ready to run")).toBeInTheDocument();
   });
 });
 

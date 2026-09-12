@@ -10,7 +10,7 @@ import { Shell } from "./components/shell/Shell";
 import { ActivityScreen } from "./screens/Activity";
 import { parseActivitySearch } from "./screens/activitySearch";
 import { ApprovalsScreen } from "./screens/Approvals";
-import { FlowsScreen } from "./screens/Flows";
+import { FlowsScreen, TABS as FLOW_TABS, type Tab as FlowTab } from "./screens/Flows";
 import { HomeScreen } from "./screens/Home";
 import { ModelsScreen } from "./screens/Models";
 import { SettingsScreen } from "./screens/Settings";
@@ -48,16 +48,23 @@ const approvalsRoute = createRoute({
 const flowsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/flows",
-  // `?flow=<id>` preselects a flow so Ask Pam (and any shared link) can
-  // land on one; an empty or non-string value is dropped rather than
-  // refused, and an unknown id falls back to the top of the shelf.
-  validateSearch: (search: Record<string, unknown>): { flow?: string } =>
-    typeof search.flow === "string" && search.flow !== "" ? { flow: search.flow } : {},
+  // `?flow=<id>` preselects a flow and `?tab=` opens it on that tab, so
+  // Ask Pam (and any shared link, or a starter card on Home) can land
+  // directly on a flow's run overview; an empty, non-string or unknown
+  // value is dropped rather than refused, and an unknown flow id falls
+  // back to the top of the shelf.
+  validateSearch: (search: Record<string, unknown>): { flow?: string; tab?: FlowTab } => {
+    const out: { flow?: string; tab?: FlowTab } = {};
+    if (typeof search.flow === "string" && search.flow !== "") out.flow = search.flow;
+    if (typeof search.tab === "string" && (FLOW_TABS as readonly string[]).includes(search.tab))
+      out.tab = search.tab as FlowTab;
+    return out;
+  },
   component: FlowsRoute,
 });
 
 function FlowsRoute() {
-  const { flow } = flowsRoute.useSearch();
+  const { flow, tab } = flowsRoute.useSearch();
   const [dirty, setDirty] = useState(false);
   const shouldBlock = useCallback(() => dirty, [dirty]);
   const blocker = useBlocker({
@@ -68,6 +75,7 @@ function FlowsRoute() {
   return (
     <FlowsScreen
       initialFlow={flow}
+      initialTab={tab}
       onDirtyChange={setDirty}
       navigation={{
         pending: blocker.status === "blocked",

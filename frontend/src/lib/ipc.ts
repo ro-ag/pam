@@ -188,6 +188,7 @@ export type AdminOp =
   | "admin.flows.delete"
   | "admin.flows.run"
   | "admin.flows.normalize"
+  | "admin.flows.inspect"
   | "admin.flows.settings.get"
   | "admin.flows.settings.set"
   | "admin.flows.landing.get"
@@ -1096,6 +1097,58 @@ export function flowsRun(
   inputs: Record<string, string> = {},
 ): Promise<{ ticket: string; position: number }> {
   return adminCall("admin.flows.run", { id, repo, inputs });
+}
+
+/** One declared input as `admin.flows.inspect` reports it. */
+export interface FlowInspectInput {
+  name: string;
+  type: string;
+  required: boolean;
+}
+
+/**
+ * One reason a run cannot go straight to admission. `step`, `detail`,
+ * `input` and `capability` are present only when that blocker names one;
+ * a run card reads whichever are there to point at a fix.
+ */
+export interface FlowInspectBlocker {
+  cause: string;
+  recovery?: string;
+  step?: string;
+  detail?: string;
+  input?: string;
+  capability?: string;
+}
+
+/** Whether a run of this flow, as inspected, would be admitted or stopped. */
+export type FlowReadiness = "admission_required" | "blocked";
+
+/**
+ * The `flow.inspect` body (`admin.flows.inspect { id, repo, inputs? }`):
+ * a dry run of admission without starting one. Read loosely — the daemon
+ * may add fields this type does not name, and callers should tolerate
+ * that rather than break on them.
+ */
+export interface FlowInspection {
+  schema_version: number;
+  flow: { id: string; digest: string };
+  inputs: FlowInspectInput[];
+  steps: unknown[];
+  correlation: unknown;
+  readiness: FlowReadiness;
+  blockers: FlowInspectBlocker[];
+  live: unknown;
+  model: { required: boolean; qualification: unknown };
+  run_admission: unknown;
+}
+
+/** A dry run of admission: what would block this flow, without starting it. */
+export function flowsInspect(
+  id: string,
+  repo: string,
+  inputs: Record<string, string> = {},
+): Promise<FlowInspection> {
+  return adminCall("admin.flows.inspect", { id, repo, inputs });
 }
 
 export function flowsSettingsGet(): Promise<FlowSettings> {

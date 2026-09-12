@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { LoaderCircle, Play } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -11,10 +12,13 @@ import {
   callersList,
   evidenceGet,
   evidenceList,
+  flowsInspect,
   flowsRun,
   subscribeEvents,
   toBridgeFailure,
   type BridgeFailure,
+  type FlowInspectBlocker,
+  type FlowInspection,
   type FlowListEntry,
   type FlowResult,
   type FlowStepReport,
@@ -185,6 +189,100 @@ export function FlowVerdictPanel({ requestId }: { requestId: string }) {
   return <FlowVerdict result={verdict.data} />;
 }
 
+// --- readiness ---------------------------------------------------------------
+
+/** Where a blocker's cause is best fixed, read off the cause's own wording. */
+function destinationFor(cause: string): { to: "/settings" | "/models"; hash?: string } | null {
+  if (cause.includes("connector")) return { to: "/settings", hash: "connectors" };
+  if (cause === "landing_permission_missing" || cause.startsWith("landing_"))
+    return { to: "/settings", hash: "landing" };
+  if (
+    cause === "program_missing" ||
+    cause === "program_not_allowed" ||
+    cause.startsWith("program") ||
+    cause.startsWith("scope_")
+  )
+    return { to: "/settings", hash: "flows" };
+  if (cause.includes("model")) return { to: "/models" };
+  return null;
+}
+
+/** One reason this run would not be admitted, and the way to fix it. */
+function BlockerRow({
+  blocker,
+  onFocusInput,
+}: {
+  blocker: FlowInspectBlocker;
+  onFocusInput: (name: string) => void;
+}) {
+  const focusInput = blocker.cause === "input_unavailable" ? blocker.input : undefined;
+  const destination = focusInput ? null : destinationFor(blocker.cause);
+  const text = [blocker.detail, blocker.recovery].filter(Boolean).join(" — ");
+  return (
+    <li className="space-y-1.5 rounded-card border border-line bg-surface-raised p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {blocker.step && <Badge tone="neutral">{blocker.step}</Badge>}
+        <span className="font-data text-xs text-ink">{blocker.cause}</span>
+      </div>
+      {text && <p className="font-sans text-sm text-ink-muted">{text}</p>}
+      {focusInput && (
+        <Button size="sm" variant="ghost" onClick={() => onFocusInput(focusInput)}>
+          Go to {focusInput}
+        </Button>
+      )}
+      {destination && (
+        <Link
+          to={destination.to}
+          hash={destination.hash}
+          className="block font-sans text-sm text-accent-strong underline"
+        >
+          {destination.to === "/models" ? "Open Models" : "Open Settings"}
+        </Link>
+      )}
+    </li>
+  );
+}
+
+/** The dry-run verdict: ready or blocked, why, and the declared inputs. */
+function ReadinessPanel({
+  inspection,
+  onFocusInput,
+}: {
+  inspection: FlowInspection;
+  onFocusInput: (name: string) => void;
+}) {
+  const ready = inspection.readiness === "admission_required";
+  return (
+    <div aria-label="flow readiness" className="space-y-3">
+      <Badge tone={ready ? "success" : "danger"}>{ready ? "Ready to run" : "Blocked"}</Badge>
+      {inspection.blockers.length > 0 && (
+        <ul aria-label="readiness blockers" className="space-y-2">
+          {inspection.blockers.map((blocker, index) => (
+            <BlockerRow
+              key={`${blocker.cause}-${index}`}
+              blocker={blocker}
+              onFocusInput={onFocusInput}
+            />
+          ))}
+        </ul>
+      )}
+      {inspection.inputs.length > 0 && (
+        <dl className="flex flex-wrap gap-x-4 gap-y-1 border-t border-line pt-2">
+          {inspection.inputs.map((input) => (
+            <div key={input.name} className="font-data text-xs text-ink-muted">
+              <dt className="inline">
+                {input.name}
+                {input.required ? " (required)" : ""}
+              </dt>
+              <dd className="inline text-ink-faint"> · {input.type}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  );
+}
+
 // --- starting a run --------------------------------------------------------
 
 /** The refusal shape a mid-run `refused` event stands for. */
@@ -224,9 +322,36 @@ export function FlowRunCard({
   const [refused, setRefused] = useState(false);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
   const [starting, setStarting] = useState(false);
+  const [inspection, setInspection] = useState<FlowInspection | null>(null);
+  const [inspecting, setInspecting] = useState(false);
+  const [inspectFailure, setInspectFailure] = useState<BridgeFailure | null>(null);
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+
+  // Read wherever an effect fires without wanting `repo` itself as a
+  // trigger — the auto-check below cares whether one is already there,
+  // not about every keystroke that changes it.
+  const repoRef = useRef(repo);
+  repoRef.current = repo;
+
+  const runInspection = useCallback(
+    (repoValue: string, inputValues: Record<string, string>) => {
+      const trimmed = repoValue.trim();
+      if (!trimmed) return;
+      setInspecting(true);
+      setInspectFailure(null);
+      flowsInspect(flow.id, trimmed, inputValues)
+        .then((reply) => setInspection(reply))
+        .catch((error) => setInspectFailure(toBridgeFailure(error)))
+        .finally(() => setInspecting(false));
+    },
+    [flow.id],
+  );
 
   // Every flow declares its own inputs; switching flows resets the card
   // to that flow's defaults rather than carrying a neighbour's answers.
+  // A repo the human already typed survives the switch, so this is also
+  // where the readiness check re-runs for the newly selected flow — once,
+  // not on every keystroke that follows.
   useEffect(() => {
     const defaults: Record<string, string> = {};
     for (const input of flow.inputs) defaults[input.name] = input.default ?? "";
@@ -236,7 +361,10 @@ export function FlowRunCard({
     setSettled(null);
     setRefused(false);
     setFailure(null);
-  }, [flow.id, flow.inputs]);
+    setInspection(null);
+    setInspectFailure(null);
+    runInspection(repoRef.current, defaults);
+  }, [flow.id, flow.inputs, runInspection]);
 
   // Whoever listens gets every change, through a ref so a new callback
   // identity never re-announces an unchanged run.
@@ -336,6 +464,9 @@ export function FlowRunCard({
               <span className="block font-data text-xs text-ink-faint">{input.name}</span>
               <input
                 aria-label={input.name}
+                ref={(el) => {
+                  inputRefs.current[input.name] = el;
+                }}
                 value={values[input.name] ?? ""}
                 onChange={(event) =>
                   setValues((prev) => ({ ...prev, [input.name]: event.target.value }))
@@ -351,6 +482,25 @@ export function FlowRunCard({
           ))}
         </div>
       )}
+
+      <div className="space-y-3 border-t border-line pt-3">
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={inspecting || !repo.trim()}
+          onClick={() => runInspection(repo, values)}
+        >
+          {inspecting && <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />}
+          Check readiness
+        </Button>
+        {inspectFailure && <FailureNote failure={inspectFailure} label="readiness" />}
+        {inspection && (
+          <ReadinessPanel
+            inspection={inspection}
+            onFocusInput={(name) => inputRefs.current[name]?.focus()}
+          />
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center gap-3 border-t border-line pt-3">
         <Button size="sm" disabled={starting || !repo.trim()} onClick={start}>

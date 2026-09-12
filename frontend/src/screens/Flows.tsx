@@ -45,9 +45,9 @@ import { FlowRuns } from "./FlowRuns";
  */
 
 /** The tabs of the detail pane; the canvas comes first. */
-const TABS = ["canvas", "yaml", "run", "runs"] as const;
+export const TABS = ["canvas", "yaml", "run", "runs"] as const;
 
-type Tab = (typeof TABS)[number];
+export type Tab = (typeof TABS)[number];
 
 /** How long the canvas waits after an edit before asking the daemon. */
 export const CANVAS_QUIET_MS = 150;
@@ -545,16 +545,19 @@ function FlowDetailPane({
 
 export function FlowsScreen({
   initialFlow,
+  initialTab,
   onDirtyChange,
   navigation,
 }: {
   initialFlow?: string;
+  /** The tab `?flow=<id>&tab=` names; canvas when absent. */
+  initialTab?: Tab;
   onDirtyChange?: (dirty: boolean) => void;
   navigation?: { pending: boolean; proceed?: () => void; cancel?: () => void };
 } = {}) {
   const flows = useQuery({ queryKey: ["flows"], queryFn: flowsList });
   const [picked, setPicked] = useState<string | null>(initialFlow ?? null);
-  const [tab, setTab] = useState<Tab>("canvas");
+  const [tab, setTab] = useState<Tab>(initialTab ?? "canvas");
   const [draft, setDraft] = useState<LibraryDraft | null>(null);
   const [revision, setRevision] = useState(0);
   const discard = useCallback(() => {
@@ -598,9 +601,12 @@ export function FlowsScreen({
   useEffect(() => {
     if (initialFlow && initialFlow !== previousInitialFlow.current) {
       previousInitialFlow.current = initialFlow;
-      controls.requestNavigation(() => setPicked(initialFlow));
+      controls.requestNavigation(() => {
+        setPicked(initialFlow);
+        if (initialTab) setTab(initialTab);
+      });
     }
-  }, [initialFlow, controls.requestNavigation]);
+  }, [initialFlow, initialTab, controls.requestNavigation]);
 
   return (
     <div className="page-workspace">

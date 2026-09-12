@@ -571,6 +571,88 @@ fn reject(cause: &'static str, detail: String) -> Rejection {
     Rejection { cause, detail }
 }
 
+/// The outcome of [`resolve_citation_offsets`]: the completion to validate
+/// and how many citation spans the host rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedResponse {
+    /// The completion, with every resolvable citation's `start`/`end`
+    /// replaced by the offsets of its verbatim quote. Byte-identical to the
+    /// input when nothing was resolved.
+    pub text: String,
+    /// How many citations had their offsets rewritten.
+    pub resolved: usize,
+}
+
+/// Resolves citation offsets host-side from verbatim quotes.
+///
+/// Models quote exactly but cannot count bytes. For each citation that
+/// respects the schema (a known evidence id, unsigned `start`/`end`, a
+/// non-empty `quote`), the quote is searched in that evidence item's text.
+/// When it occurs, `start`/`end` become the byte span of the occurrence
+/// nearest the claimed start; the quote itself is never altered. Nothing
+/// else is touched: absent quotes, foreign evidence, wrong field types and
+/// malformed JSON pass through byte-for-byte so [`validate`] refuses them
+/// with the same causes as before. The result must still pass [`validate`]'s
+/// byte-equality check — resolution derives offsets, it does not relax them.
+pub fn resolve_citation_offsets(raw: &str, task: &DiagnosisTask) -> ResolvedResponse {
+    let unchanged = || ResolvedResponse {
+        text: raw.to_owned(),
+        resolved: 0,
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return unchanged();
+    };
+    let Some(citations) = value
+        .get_mut("citations")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return unchanged();
+    };
+    let mut resolved = 0;
+    for citation in citations.iter_mut() {
+        let Some(record) = citation.as_object_mut() else {
+            continue;
+        };
+        let (Some(evidence), Some(quote), Some(start), Some(end)) = (
+            record.get("evidence").and_then(serde_json::Value::as_str),
+            record.get("quote").and_then(serde_json::Value::as_str),
+            record.get("start").and_then(serde_json::Value::as_u64),
+            record.get("end").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        if quote.is_empty() {
+            continue;
+        }
+        let Some(item) = task.data.evidence.iter().find(|item| item.id == evidence) else {
+            continue;
+        };
+        let claimed = usize::try_from(start).unwrap_or(usize::MAX);
+        let Some(found) = item
+            .text
+            .match_indices(quote)
+            .map(|(offset, _)| offset)
+            .min_by_key(|offset| offset.abs_diff(claimed))
+        else {
+            continue;
+        };
+        let span_end = found + quote.len();
+        if u64::try_from(found) == Ok(start) && u64::try_from(span_end) == Ok(end) {
+            continue;
+        }
+        record.insert("start".into(), serde_json::Value::from(found));
+        record.insert("end".into(), serde_json::Value::from(span_end));
+        resolved += 1;
+    }
+    if resolved == 0 {
+        return unchanged();
+    }
+    ResolvedResponse {
+        text: value.to_string(),
+        resolved,
+    }
+}
+
 /// Validates one raw completion against the task's contract.
 ///
 /// Order of refusal: whitespace-trim, parse as exactly one JSON object,

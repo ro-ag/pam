@@ -112,10 +112,13 @@ compression arm against deterministic-only preparation:
 - On every arm, compressed or not, the shipped citation contract refused the
   verdict on byte offsets (`quote_mismatch` / `offset_out_of_range`): the model
   supplies verbatim quotes but cannot count bytes. The product path therefore
-  escalates honestly for this artifact today, independent of compression.
+  escalated honestly for this artifact at measurement time, independent of
+  compression. Repaired 2026-09-12 (ptrack issue #25): the daemon now resolves
+  citation offsets host-side from the verbatim quote before the byte-exact
+  check; see the prompts spec's implementation status.
 
 Decision: compression stays off by default. Proven input classes are
 keyword-anchored decisive facts in 8–64 KB evidence; non-keyword-anchored
-facts are restricted out; and any enablement additionally depends on the
-citation-offset contract decision recorded for #139/#108 — host-side
-quote→offset resolution or a prompt-contract change, not a compressor change.
+facts are restricted out. The citation-offset gap that also blocked enablement
+was closed by host-side quote-to-offset resolution (issue #25); enablement now
+waits only on the #108 capability gates and the #123 publication.

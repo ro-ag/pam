@@ -38,7 +38,8 @@ use crate::admin::{
 };
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
-    CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal, RECOVERY_FLOW_EDIT, SettingsPatch,
+    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal, RECOVERY_FLOW_EDIT,
+    SettingsPatch,
 };
 use crate::scope_policy::{CAUSE_SCOPE_INVALID, RECOVERY_SCOPE, ScopePolicy};
 use crate::transport::IncomingRequest;
@@ -67,6 +68,12 @@ pub const OP_FLOWS_NORMALIZE: &str = "admin.flows.normalize";
 /// `admin.flows.run { id, repo, inputs? }` → `{ ticket, position }`.
 pub const OP_FLOWS_RUN: &str = "admin.flows.run";
 
+/// `admin.flows.inspect { id, repo, inputs? }` → the `flow.inspect`
+/// body (`readiness`, `blockers`, `steps`, `inputs`, …) for that
+/// repository, exactly as the CLI's `pam flow inspect` sees it. A read:
+/// the run overview shows what would block before anyone presses Run.
+pub const OP_FLOWS_INSPECT: &str = "admin.flows.inspect";
+
 /// `admin.flows.settings.get` → `{ allowed_programs, extra_path }`.
 pub const OP_FLOWS_SETTINGS_GET: &str = "admin.flows.settings.get";
 
@@ -88,6 +95,7 @@ pub const FLOW_ADMIN_OPS: &[&str] = &[
     OP_FLOWS_NORMALIZE,
     OP_FLOWS_DELETE,
     OP_FLOWS_RUN,
+    OP_FLOWS_INSPECT,
     OP_FLOWS_SETTINGS_GET,
     OP_FLOWS_SETTINGS_SET,
     OP_LANDING_GET,
@@ -97,6 +105,10 @@ pub const FLOW_ADMIN_OPS: &[&str] = &[
 /// The deadline an `admin.flows.run` envelope carries: half an hour,
 /// because a flow that runs `cargo test` is not a sixty second request.
 pub const FLOW_RUN_DEADLINE_MS: u64 = 1_800_000;
+/// The deadline an `admin.flows.inspect` envelope carries: inspection
+/// is a bounded read the GUI waits for, and it must expire before the
+/// GUI bridge's own 30 s admin deadline so the refusal reaches the human.
+pub const FLOW_INSPECT_DEADLINE_MS: u64 = 20_000;
 
 /// Refusal cause: the YAML declares a different id than it is saved as.
 pub const CAUSE_ID_MISMATCH: &str = "id_mismatch";
@@ -136,6 +148,7 @@ impl AdminService {
             OP_FLOWS_DELETE => self.flows_delete(args).map_err(OwnedRefusal::from),
             OP_FLOWS_NORMALIZE => Self::flows_normalize(args).map_err(OwnedRefusal::from),
             OP_FLOWS_RUN => self.flows_run(args).await,
+            OP_FLOWS_INSPECT => self.flows_inspect(args).await,
             OP_FLOWS_SETTINGS_GET => self.flows_settings_get().await.map_err(OwnedRefusal::from),
             OP_FLOWS_SETTINGS_SET => self
                 .flows_settings_set(args)
@@ -360,6 +373,68 @@ impl AdminService {
                 recovery,
             }),
             Ok(Response::Result { .. }) | Err(_) => Err(submit_failed()),
+        }
+    }
+
+    /// Submits a genuine `flow.inspect` request for the GUI and waits for
+    /// its body, so the run overview shows the same readiness and blockers
+    /// an agent's `pam flow inspect` would.
+    async fn flows_inspect(&self, args: &Value) -> Result<AdminOk, OwnedRefusal> {
+        let id = required_str(args, "id", OP_FLOWS_INSPECT)?;
+        let repo = required_str(args, "repo", OP_FLOWS_INSPECT)?;
+        let inputs = args.get("inputs").cloned().unwrap_or_else(|| json!({}));
+        if !inputs.is_object() {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!(
+                    "{OP_FLOWS_INSPECT} needs \"inputs\" to be an object of name → value"
+                ),
+                recovery: RECOVERY_FIX_ARGS,
+            }
+            .into());
+        }
+        let request_id = format!("req_{}", ulid::Ulid::new());
+        let envelope = Envelope {
+            v: PROTOCOL_VERSION,
+            id: request_id,
+            capability: CAP_FLOW_INSPECT.to_owned(),
+            client_version: DAEMON_VERSION.to_owned(),
+            caller: Caller {
+                agent: ADMIN_CALLER_AGENT.to_owned(),
+                repo: repo.to_owned(),
+                pid: std::process::id(),
+            },
+            args: json!({ "id": id, "inputs": inputs }),
+            idempotency_key: None,
+            deadline_ms: FLOW_INSPECT_DEADLINE_MS,
+            wait: true,
+        };
+        let (reply, answer) = oneshot::channel();
+        self.submit
+            .send(IncomingRequest {
+                identity: Vec::new(),
+                envelope,
+                reply,
+            })
+            .await
+            .map_err(|_| submit_failed())?;
+        match answer.await {
+            Ok(Response::Result { body, .. }) => Ok(AdminOk {
+                outcome: Outcome::Verified,
+                body,
+                audit: json!({ "op": OP_FLOWS_INSPECT, "id": id, "repo": repo }),
+            }),
+            Ok(Response::Refusal {
+                cause,
+                detail,
+                recovery,
+                ..
+            }) => Err(OwnedRefusal {
+                cause,
+                detail,
+                recovery,
+            }),
+            Ok(Response::Ticket { .. }) | Err(_) => Err(submit_failed()),
         }
     }
 

@@ -16,14 +16,16 @@ use tokio::sync::mpsc;
 
 use crate::admin::{ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService, CAUSE_INVALID_ADMIN_ARGS};
 use crate::admin_flows::{
-    CAUSE_ID_MISMATCH, CAUSE_NOT_FOUND, FLOW_ADMIN_OPS, FLOW_RUN_DEADLINE_MS, OP_FLOWS_DELETE,
-    OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_NORMALIZE, OP_FLOWS_RUN, OP_FLOWS_SAVE,
-    OP_FLOWS_SETTINGS_GET, OP_FLOWS_SETTINGS_SET,
+    CAUSE_ID_MISMATCH, CAUSE_NOT_FOUND, FLOW_ADMIN_OPS, FLOW_INSPECT_DEADLINE_MS,
+    FLOW_RUN_DEADLINE_MS, OP_FLOWS_DELETE, OP_FLOWS_GET, OP_FLOWS_INSPECT, OP_FLOWS_LIST,
+    OP_FLOWS_NORMALIZE, OP_FLOWS_RUN, OP_FLOWS_SAVE, OP_FLOWS_SETTINGS_GET, OP_FLOWS_SETTINGS_SET,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::daemon::DAEMON_VERSION;
-use crate::flow_service::{CAP_FLOW_RUN, CAUSE_FLOW_INVALID, CAUSE_PROGRAM_NOT_ALLOWED};
+use crate::flow_service::{
+    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, CAUSE_PROGRAM_NOT_ALLOWED,
+};
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
 use crate::transport::{EventPublisher, IncomingRequest};
@@ -126,7 +128,7 @@ fn the_bridge_whitelist_names_every_op_once() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), FLOW_ADMIN_OPS.len());
-    assert_eq!(FLOW_ADMIN_OPS.len(), 10);
+    assert_eq!(FLOW_ADMIN_OPS.len(), 11);
     assert!(FLOW_ADMIN_OPS.contains(&"admin.flows.landing.get"));
     assert!(FLOW_ADMIN_OPS.contains(&"admin.flows.landing.set"));
     for op in FLOW_ADMIN_OPS {
@@ -397,6 +399,59 @@ async fn run_submits_a_flow_run_envelope_and_forwards_the_ticket() {
         .expect("get_request ok")
         .expect("the admin op has a row");
     assert_eq!(row.state, RequestState::Done);
+}
+
+#[tokio::test]
+async fn inspect_submits_a_waiting_flow_inspect_envelope_and_returns_its_body() {
+    let (_tmp, _store, admin, mut ingress) = service().await;
+    let pipeline = tokio::spawn(async move {
+        let request = ingress
+            .recv()
+            .await
+            .expect("the inspection reaches the ingress");
+        request
+            .reply
+            .send(Response::Result {
+                id: request.envelope.id.clone(),
+                outcome: Outcome::Verified,
+                body: serde_json::json!({
+                    "readiness": "blocked",
+                    "blockers": [{"step": "capture", "cause": "connector_missing", "recovery": "configure Jenkins"}],
+                }),
+                evidence: Vec::new(),
+            })
+            .expect("the reply is delivered");
+        request.envelope
+    });
+
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_inspect",
+                OP_FLOWS_INSPECT,
+                serde_json::json!({
+                    "id": "jenkins-build-investigation",
+                    "repo": "/work/pam",
+                    "inputs": { "job": "platform/nightly" },
+                }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["readiness"], "blocked");
+    assert_eq!(body["blockers"][0]["cause"], "connector_missing");
+
+    let envelope = pipeline.await.expect("the stand-in pipeline finishes");
+    assert_eq!(envelope.capability, CAP_FLOW_INSPECT);
+    assert_eq!(envelope.caller.agent, ADMIN_CALLER_AGENT);
+    assert_eq!(envelope.caller.repo, "/work/pam");
+    assert_eq!(envelope.deadline_ms, FLOW_INSPECT_DEADLINE_MS);
+    assert!(
+        envelope.wait,
+        "inspection is a bounded read the GUI waits for"
+    );
+    assert_eq!(envelope.args["id"], "jenkins-build-investigation");
+    assert_eq!(envelope.args["inputs"]["job"], "platform/nightly");
 }
 
 #[tokio::test]

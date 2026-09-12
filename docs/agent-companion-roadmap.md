@@ -141,7 +141,7 @@ upload, metadata and verification outcomes even before a JFrog adapter exists.
 | #133 | Durable workflow state and effect reconciliation | Restart at each effect boundary never blindly repeats push/merge; uncertain outcomes stop or reconcile |
 | #134 | Model-free correlated polling | 100 unchanged polls make zero inference calls and no duplicate notifications; cancel/revoke/deadline work |
 | #135 | Project-aware landing and post-merge checks | Exact revision gates, current-head recheck, remote reconciliation, main-commit verification and bounds-proven local sync prevent false success; the complete recipe runs end to end against fixtures |
-| #122 | Recovery checkpoint | Full failure/restart matrix passes using existing CLI tickets and flows |
+| #122 | Recovery checkpoint | DONE 2026-09-12: failure/restart matrix covers push, PR, merge and sync intents (prepared-then-crashed, effect landed, effect never landed, base moved), watch parking across restart, cancel/expiry/revocation; sync reconciliation after a landed effect required accepting the merge commit as the base ref in the live check |
 
 Use each repository's existing validation/landing recipe where available. Persist
 recipe version/digest, scoped targets, evidence references, deadlines, remaining

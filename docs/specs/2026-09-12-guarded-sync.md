@@ -36,6 +36,13 @@ source repository, in this order:
 - The source repository is still an ordinary SHA-1 repository without
   alternates, linked worktrees or shallow state (`validate_layout`).
 
+Every stage's live check compares the base ref with the frozen base commit.
+Once the `merge` receipt exists, the live check also accepts the base ref at
+that merge commit — the one value this ticket's own sync can move it to — so a
+sync that landed just before a crash reconciles on resume instead of being
+refused as a changed source identity. Any other base value still refuses with
+`landing_checkout_changed` before any transfer.
+
 ## Transfer
 
 The pack is fetched by the fixed broker HTTP transport (`pam_connectors::curl`),

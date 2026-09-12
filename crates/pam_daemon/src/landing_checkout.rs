@@ -807,13 +807,28 @@ pub(crate) async fn revalidate(
     cancel: &mut watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<(), CheckoutError> {
+    revalidate_accepting(request, receipt, &[], budget, cancel, deadline).await
+}
+/// [`revalidate`] that also accepts the base ref at one of `landed_bases`:
+/// the merge commit a confirmed sync legitimately moved it to. Any other
+/// value is still a changed source identity.
+pub(crate) async fn revalidate_accepting(
+    request: &CheckoutRequest,
+    receipt: &CheckoutReceipt,
+    landed_bases: &[String],
+    budget: Arc<RequestBudget>,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<(), CheckoutError> {
     let request = request.clone();
     let receipt = receipt.clone();
+    let landed_bases = landed_bases.to_vec();
     let runtime = tokio::runtime::Handle::current();
     owned_worker(cancel, move |mut worker_cancel| {
         runtime.block_on(revalidate_worker(
             &request,
             &receipt,
+            &landed_bases,
             budget,
             &mut worker_cancel,
             deadline,
@@ -906,17 +921,20 @@ async fn capture_worker(
 async fn revalidate_worker(
     request: &CheckoutRequest,
     receipt: &CheckoutReceipt,
+    landed_bases: &[String],
     budget: Arc<RequestBudget>,
     cancel: &mut watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<(), CheckoutError> {
     still_active(cancel, deadline)?;
     validate_layout(request)?;
+    let (branch, base) = ref_state(request)?;
     if receipt.repository != request.repository
         || receipt.remote_url != request.remote_url
         || receipt.commit != request.expected_commit
         || receipt.base_ref != request.base_ref
-        || ref_state(request)? != (receipt.branch.clone(), receipt.base_commit.clone())
+        || branch != receipt.branch
+        || (base != receipt.base_commit && !landed_bases.contains(&base))
     {
         return Err(error(
             "landing_checkout_changed",
@@ -932,7 +950,9 @@ async fn revalidate_worker(
     };
     git.remote(cancel).await?;
     git.clean(cancel).await?;
-    if ref_state(request)? != (receipt.branch.clone(), receipt.base_commit.clone()) {
+    // The refs must not have moved while the checks ran: the same value as
+    // observed above, not merely another acceptable one.
+    if ref_state(request)? != (branch, base) {
         return Err(error(
             "landing_checkout_changed",
             "source changed during revalidation",

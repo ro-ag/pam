@@ -23,6 +23,9 @@ mod correlation_eval;
 #[cfg(test)]
 mod correlation_eval_test;
 pub mod daemon;
+pub mod diagnosis_service;
+#[cfg(test)]
+mod diagnosis_service_test;
 mod evidence_service;
 mod evidence_view;
 #[cfg(test)]

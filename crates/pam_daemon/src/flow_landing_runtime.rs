@@ -96,34 +96,11 @@ fn permitted(policy: &Repository, operation: Op) -> bool {
         _ => true,
     }
 }
-/// Reject statically unavailable stages before any recipe operation can run.
-pub(super) fn available(operation: Op) -> Result<(), FlowRefusal> {
-    if operation == Op::Sync {
-        return Err(FlowRefusal::new(
-            "landing_sync_unavailable",
-            "Guarded local synchronization is unavailable; this flow cannot complete safely."
-                .to_owned(),
-            "Use an explicitly reviewed prefix ending before sync, or wait for supported guarded synchronization; a prefix does not complete landing.",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn preflight(flow: &pam_flow::Flow) -> Result<(), FlowRefusal> {
-    for step in &flow.steps {
-        if let Action::Landing { operation } = step.action {
-            available(operation)?;
-        }
-    }
-    Ok(())
-}
-
 pub(super) async fn inspect_policy(
     store: &Store,
     repo: &Path,
     operation: Op,
 ) -> Result<(), FlowRefusal> {
-    available(operation)?;
     let policy = Policy::load(store)
         .await
         .map_err(|e| FlowRefusal::new(e.cause, e.detail.to_owned(), RECOVERY))?;
@@ -449,12 +426,7 @@ impl RunState<'_> {
                     .await?
             }
             Op::Merge => self.landing_merge(step, &mut loaded, deadline).await?,
-            Op::Sync => {
-                return Err(refused(
-                    "landing_sync_unavailable",
-                    "The guarded local synchronization adapter is unavailable; confirmed remote merge receipts remain retained",
-                ));
-            }
+            Op::Sync => self.landing_sync(step, &mut loaded, deadline).await?,
         };
         loaded
             .session
@@ -904,6 +876,96 @@ impl RunState<'_> {
             json!({"number":number,"sha":response["sha"],"head_sha":target.head_sha,"base_sha_observed":pr.base_sha}),
         )
     }
+    /// Brings the verified merge commit into the canonical repository and
+    /// fast-forwards the base branch. Local ref observation is a plain file
+    /// read; the pack fetch and the install are separate broker operations,
+    /// with the prepared intent journalled between them exactly like push.
+    async fn landing_sync(
+        &mut self,
+        step: &Step,
+        loaded: &mut Loaded,
+        deadline: Instant,
+    ) -> Result<Value, CapabilityFailure> {
+        self.landing_live(loaded, deadline).await?;
+        let merge_commit = merge_commit(loaded)?;
+        let mut target = crate::landing_git::GitTarget {
+            request: self.checkout_request(&loaded.policy, &loaded.receipt.commit)?,
+            receipt: loaded.receipt.clone(),
+            branch: loaded.policy.base.clone(),
+            expected_old: None,
+        };
+        let observed = observe_base(&target)?;
+        let receipt = |pack: Value, bounds: Value| json!({"ref_name":observed.ref_name,"commit":merge_commit,"pack":pack,"bounds":bounds,"confirmed_by":"exact_local_ref"});
+        if has_intent(loaded, step, Op::Sync)? {
+            let intent = reconciled_sync_intent(loaded, &observed, &merge_commit)?;
+            return Ok(receipt(intent["pack"].clone(), intent["bounds"].clone()));
+        }
+        if observed.oid.as_deref() == Some(merge_commit.as_str()) {
+            return Ok(receipt(Value::Null, Value::Null));
+        }
+        let base = observed.oid.clone().ok_or_else(failure)?;
+        if landing_checkout::head_branch(&target.request).map_err(checkout_error)?
+            == target.request.base_ref
+        {
+            return Err(refused(
+                "landing_sync_base_checked_out",
+                "The base branch is checked out in the source repository; sync never writes the working tree",
+            ));
+        }
+        target.expected_old = Some(base.clone());
+        let (pack, bounds) = self
+            .service
+            .connectors
+            .landing_fetch_pack(
+                &self.repo,
+                &self.ctx.request_id,
+                &loaded.session.policy_revision,
+                &target,
+                &merge_commit,
+                &[base.as_str(), loaded.receipt.commit.as_str()],
+                Arc::clone(&self.ctx.budget),
+                deadline,
+            )
+            .await
+            .map_err(|e| refused(e.cause(), e.detail()))?;
+        let bounds = serde_json::to_value(&bounds).map_err(|_| failure())?;
+        self.intent(
+            loaded,
+            step,
+            Op::Sync,
+            json!({"ref_name":observed.ref_name,"expected_old":base,"requested_commit":merge_commit,"state":"uncertain","bounds":bounds}),
+        )
+        .await?;
+        self.landing_live(loaded, deadline).await?;
+        let installed = self
+            .service
+            .connectors
+            .landing_git_sync(
+                &self.repo,
+                &self.ctx.request_id,
+                &loaded.session.policy_revision,
+                &target,
+                &merge_commit,
+                pack,
+                serde_json::from_value(bounds.clone()).map_err(|_| failure())?,
+                Arc::clone(&self.ctx.budget),
+                &mut self.cancel,
+                deadline,
+            )
+            .await
+            .map_err(|e| refused(e.cause(), e.detail()))?;
+        if let Some(intent) = loaded.session.intent.as_mut() {
+            intent.expected["pack"] = json!(installed.pack);
+        }
+        let observed = observe_base(&target)?;
+        if observed.oid.as_deref() != Some(merge_commit.as_str()) {
+            return Err(refused(
+                "landing_effect_uncertain",
+                "Synchronization did not yield the merge commit on the exact local base ref",
+            ));
+        }
+        Ok(receipt(json!(installed.pack), bounds))
+    }
     async fn landing_checks(
         &mut self,
         step: &Step,
@@ -1126,6 +1188,67 @@ fn github_target(loaded: &Loaded) -> Result<Target, CapabilityFailure> {
             .into(),
         base: loaded.policy.base.clone(),
         head_sha: loaded.receipt.commit.clone(),
+    })
+}
+/// On resume with a prepared sync intent nothing is repeated: the local base
+/// ref either already names the merge commit (matched) or the run refuses.
+fn reconciled_sync_intent(
+    loaded: &Loaded,
+    observed: &crate::landing_git::RemoteRef,
+    merge_commit: &str,
+) -> Result<Value, CapabilityFailure> {
+    let intent = loaded
+        .session
+        .intent
+        .as_ref()
+        .ok_or_else(failure)?
+        .expected
+        .clone();
+    let prepared: crate::landing_git::PushObservation =
+        serde_json::from_value(intent.clone()).map_err(|_| failure())?;
+    if prepared.requested_commit != merge_commit {
+        return Err(failure());
+    }
+    if crate::landing_git::reconcile(observed, &prepared).map_err(checkout_error)?
+        != crate::landing_git::Reconciliation::Matched
+    {
+        return Err(refused(
+            "landing_effect_uncertain",
+            "The prepared synchronization is not confirmed by the exact local base ref; PAM will not repeat it",
+        ));
+    }
+    Ok(intent)
+}
+/// The merge commit GitHub reported, once `verify_main` has confirmed it.
+fn merge_commit(loaded: &Loaded) -> Result<String, CapabilityFailure> {
+    if !loaded.session.receipts.contains_key("verify_main") {
+        return Err(failure());
+    }
+    loaded
+        .session
+        .receipts
+        .get("merge")
+        .and_then(|v| v["sha"].as_str())
+        .filter(|sha| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .map(str::to_owned)
+        .ok_or_else(failure)
+}
+/// The canonical repository's base ref, read from its files: no process,
+/// no network, no credential.
+fn observe_base(
+    target: &crate::landing_git::GitTarget,
+) -> Result<crate::landing_git::RemoteRef, CapabilityFailure> {
+    landing_checkout::validate_layout(&target.request).map_err(checkout_error)?;
+    let oid = landing_checkout::resolve_local_ref(&target.request, &target.request.base_ref)
+        .map_err(checkout_error)?;
+    Ok(crate::landing_git::RemoteRef {
+        ref_name: target.request.base_ref.clone(),
+        oid: Some(oid),
     })
 }
 fn pr_number(loaded: &Loaded) -> Result<u64, CapabilityFailure> {

@@ -483,13 +483,34 @@ pub(crate) fn validate_request_body(request: &HttpRequest) -> Result<(), Transpo
 // The only non-JSON body admitted is a fixed read-only Git upload-pack request.
 // No arbitrary packet, capability, revision expression or remote mutation body.
 fn exact_upload_pack(request: &HttpRequest, body: &[u8]) -> bool {
-    let Some(sha) = body
-        .strip_prefix(b"0033want ")
-        .and_then(|tail| tail.strip_suffix(b" \n00000009done\n"))
-    else {
+    // "0033want <sha> \n" "0000" then at most two "0032have <sha>\n" then "0009done\n".
+    let Some(rest) = body.strip_prefix(b"0033want ") else {
         return false;
     };
-    request.method == Method::Post
+    let Some((sha, mut rest)) = rest.split_first_chunk::<40>() else {
+        return false;
+    };
+    let Some(after_want) = rest.strip_prefix(b" \n0000") else {
+        return false;
+    };
+    rest = after_want;
+    let mut haves = 0;
+    while let Some(after_have) = rest.strip_prefix(b"0032have ") {
+        let Some((have, tail)) = after_have.split_first_chunk::<40>() else {
+            return false;
+        };
+        let Some(tail) = tail.strip_prefix(b"\n") else {
+            return false;
+        };
+        if !exact_sha(have) || haves == 2 {
+            return false;
+        }
+        haves += 1;
+        rest = tail;
+    }
+    rest == b"0009done\n"
+        && exact_sha(sha)
+        && request.method == Method::Post
         && request.url.scheme() == "https"
         && request.url.username().is_empty()
         && request.url.password().is_none()
@@ -506,7 +527,10 @@ fn exact_upload_pack(request: &HttpRequest, body: &[u8]) -> bool {
             name.eq_ignore_ascii_case("content-type")
                 && value == "application/x-git-upload-pack-request"
         })
-        && sha.len() == 40
+}
+
+fn exact_sha(sha: &[u8]) -> bool {
+    sha.len() == 40
         && sha
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))

@@ -301,6 +301,35 @@ fn upload_pack_exception_accepts_only_the_fixed_read_only_packet() {
         request.body = Some(invalid);
         assert!(crate::curl::validate_request_body(&request).is_err());
     }
+    // Up to two exact have lines after the flush are the only extension.
+    let want = format!("0033want {} \n0000", "a".repeat(40));
+    let have = |sha: &str| format!("0032have {sha}\n");
+    for valid in [
+        format!("{want}{}0009done\n", have(&"b".repeat(40))),
+        format!(
+            "{want}{}{}0009done\n",
+            have(&"b".repeat(40)),
+            have(&"c".repeat(40))
+        ),
+    ] {
+        request.body = Some(valid.into_bytes());
+        assert!(crate::curl::validate_request_body(&request).is_ok());
+    }
+    for invalid in [
+        format!(
+            "{want}{}{}{}0009done\n",
+            have(&"b".repeat(40)),
+            have(&"c".repeat(40)),
+            have(&"d".repeat(40))
+        ),
+        format!("{want}{}0009done\n", have(&"0".repeat(40))),
+        format!("{want}{}0009done\n", have(&"B".repeat(40))),
+        format!("{want}0032have {}\n", "b".repeat(40)),
+        format!("{want}{}\n0009done\n", have(&"b".repeat(40))),
+    ] {
+        request.body = Some(invalid.into_bytes());
+        assert!(crate::curl::validate_request_body(&request).is_err());
+    }
     request.body = Some(body);
     request.url.set_path("/team/repo.git/git-receive-pack");
     assert!(crate::curl::validate_request_body(&request).is_err());

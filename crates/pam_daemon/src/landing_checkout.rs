@@ -146,14 +146,27 @@ fn resolve_ref(git: &Path, reference: &str) -> Result<String, CheckoutError> {
     }
     Ok(value.to_ascii_lowercase())
 }
-pub(crate) fn ref_state(request: &CheckoutRequest) -> Result<(String, String), CheckoutError> {
-    let git = request.repository.join(".git");
-    let head = bounded_read(&git.join("HEAD"), 512)?;
-    let branch = text(&head)?
+/// The branch `HEAD` points at (`refs/heads/…`); detached heads are refused.
+pub(crate) fn head_branch(request: &CheckoutRequest) -> Result<String, CheckoutError> {
+    let head = bounded_read(&request.repository.join(".git/HEAD"), 512)?;
+    text(&head)?
         .trim()
         .strip_prefix("ref: ")
         .filter(|r| r.starts_with("refs/heads/"))
-        .ok_or_else(|| invalid("detached HEAD is unsupported"))?;
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("detached HEAD is unsupported"))
+}
+/// The full SHA-1 a canonical-repository ref currently names (loose or packed).
+pub(crate) fn resolve_local_ref(
+    request: &CheckoutRequest,
+    reference: &str,
+) -> Result<String, CheckoutError> {
+    resolve_ref(&request.repository.join(".git"), reference)
+}
+pub(crate) fn ref_state(request: &CheckoutRequest) -> Result<(String, String), CheckoutError> {
+    let git = request.repository.join(".git");
+    let branch = head_branch(request)?;
+    let branch = branch.as_str();
     if resolve_ref(&git, branch)? != request.expected_commit {
         return Err(error(
             "landing_checkout_changed",

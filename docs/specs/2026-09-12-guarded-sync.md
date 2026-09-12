@@ -28,6 +28,9 @@ source repository, in this order:
 - `HEAD` of the canonical repository is a branch other than the base branch
   (`landing_sync_base_checked_out` otherwise: fast-forwarding a checked-out
   branch would have to touch the working tree, which this stage never does).
+  Through the orchestrator this is a second guard: the live check every stage
+  runs already requires HEAD to remain the frozen feature branch and refuses
+  with `landing_checkout_changed` first.
 - `refs/heads/<base>` resolves to `B0`. If `B0 == M` the stage is already
   complete and returns the receipt without any transfer.
 - The source repository is still an ordinary SHA-1 repository without

@@ -25,20 +25,72 @@ use std::{
 
 const SOURCE: &str = "https://github.test/team/repo.git";
 const SERVER: &str = "https://api.github.test/";
-const MERGED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
+
+/// One HTTP call the fixture answered, kept in full so a test can assert on
+/// headers and body, not just method and path.
+#[derive(Clone, Debug)]
+struct Recorded {
+    method: Method,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
 
 struct Github {
     sha: String,
     base: String,
+    /// The real squash-merge commit: same tree as `sha`, one parent `base`,
+    /// built once on `remote`'s `main` and served everywhere GitHub would
+    /// report a merge SHA.
+    merge: String,
+    /// A local bare clone of the fixture repository that plays the GitHub
+    /// remote: it holds the merge commit and answers `git-upload-pack`.
+    remote: PathBuf,
     existing: AtomicBool,
     merged: AtomicBool,
-    requests: Mutex<Vec<(Method, String)>>,
+    requests: Mutex<Vec<Recorded>>,
 }
 impl Github {
+    /// Clones `repo` (bare) into `root/remote.git`, then builds the
+    /// squash-merge commit on `main` there. The source repository's own
+    /// `main` never moves except through a real `sync`.
+    fn new(root: &Path, repo: &Path, base: &str, sha: &str) -> Self {
+        let remote = root.join("remote.git");
+        git(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--bare",
+                "-q",
+                repo.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(&remote, &["config", "user.name", "Fixture"]);
+        git(
+            &remote,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(&remote, &["config", "commit.gpgsign", "false"]);
+        let tree = git(repo, &["rev-parse", &format!("{sha}^{{tree}}")]);
+        let merge = git(&remote, &["commit-tree", &tree, "-p", base, "-m", "squash"]);
+        git(&remote, &["update-ref", "refs/heads/main", &merge]);
+        Self {
+            sha: sha.to_owned(),
+            base: base.to_owned(),
+            merge,
+            remote,
+            existing: AtomicBool::new(false),
+            merged: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
     fn pr(&self) -> Value {
         let merged = self.merged.load(Ordering::SeqCst);
-        json!({"number":7,"state":if merged{"closed"}else{"open"},"merged":merged,"merge_commit_sha":if merged{Some(MERGED)}else{None},
+        json!({"number":7,"state":if merged{"closed"}else{"open"},"merged":merged,"merge_commit_sha":if merged{Some(self.merge.as_str())}else{None},
             "head":{"ref":"feature/work","sha":self.sha,"repo":{"full_name":"team/repo"}},
             "base":{"ref":"main","sha":self.base,"repo":{"full_name":"team/repo"}}})
     }
@@ -47,9 +99,56 @@ impl Github {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(m, _)| *m == method)
+            .filter(|call| call.method == method)
             .count()
     }
+    /// Every recorded call whose path names the upload-pack service.
+    fn upload_pack_calls(&self) -> Vec<Recorded> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.path.ends_with("/git-upload-pack"))
+            .cloned()
+            .collect()
+    }
+}
+/// Runs `git pack-objects --revs --thin --stdout` against `remote` with
+/// `revs` (one positive tip then negative haves) as stdin, and returns the
+/// raw pack bytes it writes to stdout.
+fn pack_objects(remote: &Path, revs: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(GIT)
+        .args([
+            "-C",
+            remote.to_str().unwrap(),
+            "pack-objects",
+            "--revs",
+            "--thin",
+            "--stdout",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(revs.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 impl HttpTransport for Github {
     fn send<'a>(
@@ -59,10 +158,26 @@ impl HttpTransport for Github {
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>> {
         Box::pin(async move {
             let path = request.url.path().to_owned();
-            self.requests
-                .lock()
-                .unwrap()
-                .push((request.method, path.clone()));
+            self.requests.lock().unwrap().push(Recorded {
+                method: request.method,
+                path: path.clone(),
+                headers: request.headers.clone(),
+                body: request.body.clone().unwrap_or_default(),
+            });
+            if path.ends_with("/git-upload-pack") {
+                assert_eq!(request.method, Method::Post);
+                let pack = pack_objects(
+                    &self.remote,
+                    &format!("{}\n^{}\n^{}\n", self.merge, self.base, self.sha),
+                );
+                let mut body = b"0008NAK\n".to_vec();
+                body.extend_from_slice(&pack);
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                });
+            }
             let body = if path.ends_with("/pulls") && request.method == Method::Get {
                 if self.existing.load(Ordering::SeqCst) {
                     json!([self.pr()])
@@ -83,20 +198,20 @@ impl HttpTransport for Github {
                     "mutation must carry original head guard"
                 );
                 self.merged.store(true, Ordering::SeqCst);
-                json!({"merged":true,"sha":MERGED})
+                json!({"merged":true,"sha":self.merge})
             } else if path.ends_with("/pulls/7") {
                 assert_eq!(request.method, Method::Get);
                 self.pr()
             } else if path.ends_with("/check-runs") {
                 let sha = path.split('/').rev().nth(1).unwrap();
                 assert!(
-                    sha == self.sha || sha == MERGED,
+                    sha == self.sha || sha == self.merge,
                     "checks cannot query a substituted SHA"
                 );
                 json!({"total_count":1,"check_runs":[{"name":"ci","head_sha":sha,"status":"completed","conclusion":"success"}]})
             } else if path.ends_with("/status") {
                 let sha = path.split('/').rev().nth(1).unwrap();
-                assert!(sha == self.sha || sha == MERGED);
+                assert!(sha == self.sha || sha == self.merge);
                 json!({"sha":sha,"total_count":0,"statuses":[]})
             } else {
                 panic!("unexpected request {:?} {path}", request.method)
@@ -114,7 +229,7 @@ impl HttpTransport for Github {
     }
 }
 struct Fixture {
-    dirs: tempfile::TempDir,
+    _dirs: tempfile::TempDir,
     ctx: ExecContext,
     flow: Flow,
     repo: PathBuf,
@@ -145,6 +260,21 @@ fn git(repo: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
+/// Runs a git command for its exit status alone (`merge-base --is-ancestor`
+/// and the like, which carry no stdout worth reading).
+fn git_ok(repo: &Path, args: &[&str]) -> bool {
+    std::process::Command::new(GIT)
+        .args(args)
+        .current_dir(repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
 fn now() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -154,12 +284,11 @@ fn now() -> i64 {
     )
     .unwrap()
 }
-fn recipe(sha: &str) -> String {
+fn recipe(sha: &str, sync: bool) -> String {
     let mut yaml = format!(
         "schema: 1\nid: landing\nname: Landing integration\ncorrelation: {{ repository: '{SOURCE}', commit: '{sha}' }}\nsteps:\n"
     );
-    let mut previous = None;
-    for operation in [
+    let mut operations = vec![
         "freeze",
         "validate",
         "push",
@@ -167,7 +296,12 @@ fn recipe(sha: &str) -> String {
         "verify_pr",
         "merge",
         "verify_main",
-    ] {
+    ];
+    if sync {
+        operations.push("sync");
+    }
+    let mut previous = None;
+    for operation in operations {
         let id = operation.replace('_', "-");
         writeln!(yaml, " - id: {id}\n   landing: {operation}").unwrap();
         if let Some(prior) = previous {
@@ -181,7 +315,7 @@ fn recipe(sha: &str) -> String {
     yaml
 }
 impl Fixture {
-    async fn new(failing_check: bool) -> Self {
+    async fn new(failing_check: bool, sync: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let dirs = tempfile::tempdir().unwrap();
         let root = dirs.path().canonicalize().unwrap();
@@ -193,7 +327,7 @@ impl Fixture {
         }
         std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (base_sha, sha) = initialize_repo(&repo);
-        let yaml = recipe(&sha);
+        let yaml = recipe(&sha, sync);
         let flow = pam_flow::parse(&yaml).unwrap();
         std::fs::create_dir(base.join("flows")).unwrap();
         std::fs::write(base.join("flows/landing.yaml"), yaml).unwrap();
@@ -209,13 +343,7 @@ impl Fixture {
         let models = ModelService::new(store.clone()).await.unwrap();
         let logs = LogService::new(store.clone(), models.clone());
         let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
-        let github = Arc::new(Github {
-            sha: sha.clone(),
-            base: base_sha,
-            existing: AtomicBool::new(false),
-            merged: AtomicBool::new(false),
-            requests: Mutex::new(Vec::new()),
-        });
+        let github = Arc::new(Github::new(&root, &repo, &base_sha, &sha));
         let connectors = Arc::new(ConnectorService::new(
             store.clone(),
             secrets.clone(),
@@ -266,7 +394,7 @@ impl Fixture {
             started_at: Instant::now(),
         };
         Self {
-            dirs,
+            _dirs: dirs,
             ctx,
             flow,
             repo,
@@ -299,6 +427,24 @@ impl Fixture {
                 .await
                 .unwrap()
         );
+    }
+    /// Flips the landing policy's `sync` permission, mirroring how a GUI
+    /// edit to the policy would land.
+    async fn set_sync_permission(&self, enabled: bool) {
+        let raw = self
+            .ctx
+            .store
+            .get_setting("flows.landing_policy")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut policy: Value = serde_json::from_str(&raw).unwrap();
+        policy["repositories"][0]["permissions"]["sync"] = json!(enabled);
+        self.ctx
+            .store
+            .set_setting("flows.landing_policy", &policy.to_string())
+            .await
+            .unwrap();
     }
     /// Executes the actual gated prefix then simulates a private, confirmed native
     /// push from the prior process. No GitHub response or local check is fabricated.
@@ -398,25 +544,106 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn full_landing_refuses_unavailable_sync_before_any_work() {
+async fn full_landing_syncs_the_base_branch_after_verify_main() {
     tokio::time::timeout(
         Duration::from_secs(90),
         Box::pin(async {
-            let fixture = Fixture::new(false).await;
-            let yaml = format!(
-                "{} - id: sync\n   landing: sync\n   needs: [verify-main]\n",
-                recipe(&fixture.sha)
+            let fixture = Fixture::new(false, true).await;
+            fixture.prefix(7).await;
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Changed);
+            let (_, session) = fixture.session().await;
+            let receipt = session["receipts"]["sync"].clone();
+            assert_eq!(receipt["ref_name"], "refs/heads/main");
+            assert_eq!(receipt["commit"], fixture.github.merge.as_str());
+            let pack = receipt["pack"].as_str().unwrap();
+            assert!(pack.starts_with("pack-"), "{pack}");
+            assert!(receipt["bounds"]["objects"].as_u64().unwrap() > 0);
+            assert_eq!(receipt["confirmed_by"], "exact_local_ref");
+            let intent = &session["intent"];
+            assert!(!intent.is_null(), "the sync intent is retained");
+            assert_eq!(intent["operation"], "sync");
+            assert_eq!(
+                intent["expected"]["requested_commit"],
+                fixture.github.merge.as_str()
             );
-            pam_flow::parse(&yaml).unwrap();
-            std::fs::write(
-                fixture
-                    .ctx
-                    .flows
-                    .protected_base()
-                    .join("flows/landing.yaml"),
-                yaml,
-            )
-            .unwrap();
+
+            // The base branch fast-forwarded to the merge commit...
+            let main = git(&fixture.repo, &["rev-parse", "refs/heads/main"]);
+            assert_eq!(main, fixture.github.merge);
+            let kind = git(&fixture.repo, &["cat-file", "-t", &fixture.github.merge]);
+            assert_eq!(kind, "commit");
+            assert!(git_ok(
+                &fixture.repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &fixture.github.base,
+                    &fixture.github.merge
+                ]
+            ));
+            let mut saw_pack = false;
+            let mut saw_idx = false;
+            for entry in std::fs::read_dir(fixture.repo.join(".git/objects/pack")).unwrap() {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                let extension = Path::new(&name).extension().and_then(|ext| ext.to_str());
+                saw_pack |= name.starts_with("pack-") && extension == Some("pack");
+                saw_idx |= name.starts_with("pack-") && extension == Some("idx");
+            }
+            assert!(saw_pack && saw_idx, "expected an installed pack and index");
+
+            // ...and nothing else in the repository moved.
+            let head = git(&fixture.repo, &["symbolic-ref", "HEAD"]);
+            assert_eq!(head, "refs/heads/feature/work");
+            let content = std::fs::read_to_string(fixture.repo.join("file")).unwrap();
+            assert_eq!(content, "feature\n");
+            let status = git(&fixture.repo, &["status", "--porcelain"]);
+            assert!(status.is_empty(), "{status}");
+
+            // Exactly one upload-pack request, shaped exactly as the contract says.
+            let calls = fixture.github.upload_pack_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            let call = &calls[0];
+            assert_eq!(call.method, Method::Post);
+            assert!(call.path.ends_with("/git-upload-pack"), "{}", call.path);
+            let content_type = call
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(content_type, Some("application/x-git-upload-pack-request"));
+            let authorization = call
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str());
+            assert!(
+                authorization.is_some_and(|value| value.starts_with("Basic ")),
+                "{authorization:?}"
+            );
+            let expected_body = format!(
+                "0033want {} \n00000032have {}\n0032have {}\n0009done\n",
+                fixture.github.merge, fixture.github.base, fixture.sha
+            );
+            assert_eq!(call.body, expected_body.into_bytes());
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+// A checked-out base branch cannot reach the sync-specific refusal through
+// the orchestrator: every stage's live check first requires HEAD to remain
+// the frozen feature branch (`landing_checkout_changed`), and a policy never
+// lists the base branch as a feature branch. The broker-level guard is
+// covered directly in landing_git_test.
+#[tokio::test]
+async fn sync_inspection_reports_permission_then_readiness() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, true).await;
+            fixture.set_sync_permission(false).await;
             let inspection = fixture
                 .ctx
                 .flows
@@ -430,55 +657,20 @@ async fn full_landing_refuses_unavailable_sync_before_any_work() {
                     .unwrap()
                     .iter()
                     .any(|blocker| blocker["step"] == "sync"
-                        && blocker["cause"] == "landing_sync_unavailable")
+                        && blocker["cause"] == "landing_permission_missing")
             );
-            let result = fixture
+            fixture.set_sync_permission(true).await;
+            let inspection = fixture
                 .ctx
                 .flows
-                .run(
-                    &fixture.ctx,
-                    RunArgs {
-                        id: "landing".into(),
-                        inputs: BTreeMap::new(),
-                    },
-                )
-                .await;
+                .inspect(&fixture.ctx, &json!({"id":"landing"}))
+                .await
+                .unwrap();
+            assert_eq!(inspection.body["readiness"], "admission_required");
             assert!(
-                matches!(
-                    result,
-                    Err(super::CapabilityFailure::Refused { ref cause, .. })
-                        if cause == "landing_sync_unavailable"
-                ),
-                "{result:?}"
-            );
-            assert!(fixture.github.requests.lock().unwrap().is_empty());
-            let usage = fixture.ctx.budget.usage();
-            assert_eq!(usage.attempts, 0);
-            assert_eq!(usage.command_bytes, 0);
-            assert_eq!(usage.http_calls, 0);
-            assert!(
-                fixture
-                    .ctx
-                    .store
-                    .read_flow_journal(&fixture.ctx.request_id)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                fixture
-                    .ctx
-                    .store
-                    .read_landing_session(&fixture.ctx.request_id)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                std::fs::read_dir(fixture.dirs.path().join("workspaces"))
-                    .unwrap()
-                    .next()
-                    .is_none()
+                inspection.body["blockers"].as_array().unwrap().is_empty(),
+                "{:?}",
+                inspection.body["blockers"]
             );
         }),
     )
@@ -491,7 +683,7 @@ async fn gated_local_prefix_and_fake_github_land_verify_the_exact_merge_sha() {
     tokio::time::timeout(
         Duration::from_secs(90),
         Box::pin(async {
-            let fixture = Fixture::new(false).await;
+            let fixture = Fixture::new(false, false).await;
             fixture.prefix(3).await;
             let output = fixture.run().await;
             assert_eq!(output.outcome, Outcome::Changed);
@@ -499,23 +691,28 @@ async fn gated_local_prefix_and_fake_github_land_verify_the_exact_merge_sha() {
             assert_eq!(fixture.github.count(Method::Post), 1);
             assert_eq!(fixture.github.count(Method::Put), 1);
             let (_, session) = fixture.session().await;
-            assert_eq!(session["receipts"]["merge"]["sha"], MERGED);
-            assert_eq!(session["receipts"]["verify_main"]["sha"], MERGED);
+            assert_eq!(
+                session["receipts"]["merge"]["sha"],
+                fixture.github.merge.as_str()
+            );
+            assert_eq!(
+                session["receipts"]["verify_main"]["sha"],
+                fixture.github.merge.as_str()
+            );
             assert!(
                 session["receipts"].get("sync").is_none(),
                 "prefix must not claim local synchronization"
             );
             let requests = fixture.github.requests.lock().unwrap();
-            assert!(
-                requests
-                    .iter()
-                    .any(|(_, path)| path
-                        == &format!("/repos/team/repo/commits/{MERGED}/check-runs"))
-            );
+            assert!(requests.iter().any(|call| call.path
+                == format!(
+                    "/repos/team/repo/commits/{}/check-runs",
+                    fixture.github.merge
+                )));
             assert!(
                 !requests
                     .iter()
-                    .any(|(_, path)| path.contains("/commits/main/"))
+                    .any(|call| call.path.contains("/commits/main/"))
             );
         }),
     )
@@ -528,7 +725,7 @@ async fn failed_local_check_stops_before_any_remote_operation() {
     tokio::time::timeout(
         Duration::from_secs(90),
         Box::pin(async {
-            let fixture = Fixture::new(true).await;
+            let fixture = Fixture::new(true, false).await;
             let output = fixture.run().await;
             assert_eq!(output.outcome, Outcome::Unresolved);
             assert!(fixture.github.requests.lock().unwrap().is_empty());
@@ -547,7 +744,7 @@ async fn prepared_pr_creation_recovers_by_reading_without_reposting() {
     tokio::time::timeout(
         Duration::from_secs(90),
         Box::pin(async {
-            let fixture = Fixture::new(false).await;
+            let fixture = Fixture::new(false, false).await;
             fixture.prefix(3).await;
             fixture.github.existing.store(true, Ordering::SeqCst);
             fixture
@@ -572,7 +769,7 @@ async fn prepared_merge_recovers_exact_result_without_second_put() {
     tokio::time::timeout(
         Duration::from_secs(90),
         Box::pin(async {
-            let fixture = Fixture::new(false).await;
+            let fixture = Fixture::new(false, false).await;
             fixture.prefix(5).await;
             fixture.github.merged.store(true, Ordering::SeqCst);
             fixture
@@ -584,7 +781,7 @@ async fn prepared_merge_recovers_exact_result_without_second_put() {
             assert_eq!(fixture.github.count(Method::Put), 0);
             assert_eq!(
                 fixture.session().await.1["receipts"]["verify_main"]["sha"],
-                MERGED
+                fixture.github.merge.as_str()
             );
         }),
     )
@@ -635,7 +832,7 @@ async fn revocation_during_first_check_prevents_second_check_spawn() {
             .success()
     );
     tokio::time::timeout(Duration::from_secs(90),Box::pin(async {
-        let fixture=Fixture::new(false).await;
+        let fixture=Fixture::new(false, false).await;
         let program=executable.file_name().unwrap().to_str().unwrap();
         fixture.ctx.store.set_setting("flows.allowed_programs",&json!(["git",program]).to_string()).await.unwrap();
         fixture.ctx.store.set_setting("flows.extra_path",&json!([executable.parent().unwrap(),Path::new(GIT).parent().unwrap(),Path::new("/usr/bin")]).to_string()).await.unwrap();

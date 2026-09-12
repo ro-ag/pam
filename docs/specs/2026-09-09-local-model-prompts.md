@@ -121,6 +121,17 @@ stable causes (`empty_response`, `not_json`, `schema_violation`,
 `quote_mismatch`, `read_not_offered`); nothing is repaired, retried, or
 salvaged into an answer.
 
+Citation offsets are resolved host-side before validation (2026-09-12, ptrack
+issue #25): `resolve_citation_offsets` searches each schema-respecting citation's
+verbatim `quote` in the named evidence item and replaces `start`/`end` with the
+byte span of the occurrence nearest the claimed start. It derives offsets; it
+never relaxes them — the resolved completion still passes `validate`'s byte
+equality check, an absent quote stays `quote_mismatch`, foreign evidence stays
+`evidence_not_in_scope`, and wrong field types or malformed JSON pass through
+untouched. The count of rewritten spans is reported as `citations_resolved` on
+the run's `DiagnosisUse`. Motivation: the screened Qwen3-14B artifact quotes
+exactly but cannot count bytes, so every real verdict was refused on offsets.
+
 `pam_daemon::diagnosis_service` runs the bounded recipe: stateless advisory
 calls with no chat history, at most one dispatched read per response inside
 run-wide read/call budgets, dispatch strictly by host-bound observe-only

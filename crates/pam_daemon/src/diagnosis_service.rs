@@ -318,6 +318,9 @@ pub struct DiagnosisUse {
     pub completion_tokens: usize,
     /// Registry id of the model that answered, when one did.
     pub model_id: Option<String>,
+    /// Citations whose byte span the host derived from the verbatim quote
+    /// because the model's own offsets were wrong.
+    pub citations_resolved: usize,
 }
 
 /// The run's outcome: an advisory diagnosis, or the unresolved handoff.
@@ -484,7 +487,12 @@ where
             .saturating_add(result.completion_tokens);
         use_.model_id = Some(result.model.id.clone());
 
-        let verdict = match diagnosis::validate(&result.text, &task) {
+        // Models quote exactly but miscount bytes: derive each citation's
+        // span from its verbatim quote, then hold the result to the same
+        // byte-exact contract as before.
+        let resolved = diagnosis::resolve_citation_offsets(&result.text, &task);
+        use_.citations_resolved = use_.citations_resolved.saturating_add(resolved.resolved);
+        let verdict = match diagnosis::validate(&resolved.text, &task) {
             Ok(verdict) => verdict,
             Err(rejection) => {
                 return unresolved(

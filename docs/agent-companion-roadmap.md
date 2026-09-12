@@ -48,7 +48,7 @@ for access, evidence, polling, validation, or landing decisions.
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
 | Orchestration | Flows, checks, approvals, retries, tickets | Durable remote polling, resume/reconciliation and guarded landing orchestration |
 | Models | Candle GGUF runtime and prose summary with honest skips | Task-qualified structured investigation, validated reads, measured admission |
-| Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency, held-out qualification (keyword-anchored classes proven, non-keyword classes restricted out) | Default stays off; enablement blocked on the citation-offset contract decision |
+| Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency, held-out qualification (keyword-anchored classes proven, non-keyword classes restricted out) | Default stays off; citation-offset gap closed host-side (issue #25), enablement waits on #108 gates and #123 |
 
 The Microsoft smoke preserved evidence and reduced 1,017 tokens to 459, but took
 70.88 seconds in an unoptimized CPU build. Release-build qualification has since
@@ -57,8 +57,10 @@ retention is proven for keyword-anchored classes and disproven for
 non-keyword-anchored ones (restricted out), and the full compressor/unload/
 investigator sequence shows compression is the only path that fits oversized
 evidence inside the 2,048-token envelope. Compression stays off by default; the
-real artifact's verdicts are refused today by the byte-offset citation contract
-in every arm, so enablement waits on that contract decision, not compressor work.
+real artifact's verdicts were refused at measurement time by the byte-offset
+citation contract in every arm; that gap is closed by host-side quote-to-offset
+resolution (issue #25), so enablement now waits on the #108 gates, not
+compressor work.
 See [implementation notes](microsoft-compression.md) and
 [Jenkins behavior](jenkins-investigation.md) for shipped limits.
 No 9–14 GB investigator has been qualified. Current weight-size eligibility

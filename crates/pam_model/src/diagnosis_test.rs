@@ -418,3 +418,104 @@ fn whitespace_around_the_object_is_tolerated() {
     );
     assert!(validate(&raw, &task()).is_ok());
 }
+
+#[test]
+fn verbatim_quotes_resolve_their_own_offsets() {
+    // `end < start` and a span past the end: the counting is wrong, the
+    // quote is exact. The host resolves the span; validate() still checks it.
+    let miscounted = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":30,"end":12,"quote":"assertion failed"},
+        {"evidence":"ev_utf8","start":900,"end":950,"quote":"décor"}],"next":"finish"}"#;
+    assert_eq!(
+        validate(miscounted, &task()).unwrap_err().cause,
+        "offset_out_of_range"
+    );
+
+    let resolved = resolve_citation_offsets(miscounted, &task());
+    assert_eq!(resolved.resolved, 2);
+    let verdict = validate(&resolved.text, &task()).expect("resolved spans are byte-exact");
+    assert_eq!(
+        verdict.citations[0],
+        Citation {
+            evidence: "ev_ascii".into(),
+            start: 7,
+            end: 23,
+            quote: "assertion failed".into(),
+        }
+    );
+    // Multibyte text resolves to byte offsets, not character offsets.
+    assert_eq!(
+        (verdict.citations[1].start, verdict.citations[1].end),
+        (6, 12)
+    );
+    assert_eq!(verdict.citations[1].quote, "décor");
+}
+
+#[test]
+fn already_exact_offsets_pass_through_untouched() {
+    let honest = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":0,"end":5,"quote":"error"}],"next":"finish"}"#;
+    let resolved = resolve_citation_offsets(honest, &task());
+    assert_eq!(resolved.resolved, 0);
+    assert_eq!(resolved.text, honest);
+}
+
+#[test]
+fn repeated_quotes_resolve_to_the_occurrence_nearest_the_claimed_start() {
+    // 'e' occurs at bytes 0, 10, 21 and 41 of the ASCII item; a claimed
+    // start of 20 lands on 21.
+    let repeated = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":20,"end":20,"quote":"e"}],"next":"finish"}"#;
+    let resolved = resolve_citation_offsets(repeated, &task());
+    assert_eq!(resolved.resolved, 1);
+    let verdict = validate(&resolved.text, &task()).expect("a real occurrence was chosen");
+    assert_eq!(
+        (verdict.citations[0].start, verdict.citations[0].end),
+        (21, 22)
+    );
+}
+
+#[test]
+fn resolution_never_invents_or_repairs_anything_else() {
+    // A quote absent from the evidence stays a quote_mismatch.
+    let absent = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":0,"end":5,"quote":"fatal"}],"next":"finish"}"#;
+    let resolved = resolve_citation_offsets(absent, &task());
+    assert_eq!(resolved.resolved, 0);
+    assert_eq!(resolved.text, absent);
+    assert_eq!(
+        validate(&resolved.text, &task()).unwrap_err().cause,
+        "quote_mismatch"
+    );
+
+    // Evidence outside the call is not searched.
+    let foreign = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_absent","start":0,"end":1,"quote":"error"}],"next":"finish"}"#;
+    let resolved = resolve_citation_offsets(foreign, &task());
+    assert_eq!(resolved.resolved, 0);
+    assert_eq!(
+        validate(&resolved.text, &task()).unwrap_err().cause,
+        "evidence_not_in_scope"
+    );
+
+    // Offsets that do not respect the schema are not rewritten into shape.
+    let typed_wrong = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":"0","end":5,"quote":"error"}],"next":"finish"}"#;
+    let resolved = resolve_citation_offsets(typed_wrong, &task());
+    assert_eq!(resolved.resolved, 0);
+    assert_eq!(
+        validate(&resolved.text, &task()).unwrap_err().cause,
+        "schema_violation"
+    );
+
+    // Empty quotes match nothing.
+    let empty = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[
+        {"evidence":"ev_ascii","start":3,"end":3,"quote":""}],"next":"finish"}"#;
+    assert_eq!(resolve_citation_offsets(empty, &task()).resolved, 0);
+
+    // Non-JSON and non-object completions pass through byte-for-byte.
+    let truncated = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[{"evidence":"ev_ascii","#;
+    assert_eq!(resolve_citation_offsets(truncated, &task()).text, truncated);
+    assert_eq!(resolve_citation_offsets("[1,2]", &task()).text, "[1,2]");
+    assert_eq!(validate(truncated, &task()).unwrap_err().cause, "not_json");
+}

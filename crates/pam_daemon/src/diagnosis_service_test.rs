@@ -343,6 +343,35 @@ async fn a_forged_target_refuses_without_dispatching() {
 }
 
 #[tokio::test]
+async fn a_verbatim_quote_with_miscounted_offsets_is_diagnosed() {
+    // The real screened artifact quotes exactly but cannot count bytes
+    // (ptrack issue #25): the host derives the span from the quote and the
+    // contract still holds it to byte equality.
+    let recipe = DiagnosisRecipe::jenkins_build_failure();
+    let miscounted = r#"{"hypothesis":"code","confidence":"high","summary":"The publish stage asserts.","citations":[{"evidence":"ev_stage","start":40,"end":12,"quote":"assertion failed in publish"}],"next":"finish"}"#;
+    let model = ScriptedModel::text(vec![&miscounted]);
+    let reader = ScriptedReader::scripted(vec![]);
+
+    let outcome = diagnose(
+        &recipe,
+        inputs(),
+        Budgets::default(),
+        |request| model.generate(request),
+        |dispatch| reader.read(dispatch),
+    )
+    .await;
+
+    let DiagnosisOutcome::Diagnosed { advisory, use_, .. } = outcome else {
+        panic!("expected a diagnosis, got {outcome:?}");
+    };
+    assert_eq!(advisory.hypothesis, "code");
+    assert_eq!(use_.citations_resolved, 1);
+    let citation = &advisory.citations[0];
+    assert_eq!((citation.start, citation.end), (7, 34));
+    assert_eq!(citation.quote, "assertion failed in publish");
+}
+
+#[tokio::test]
 async fn a_forged_quote_is_refused() {
     let recipe = DiagnosisRecipe::jenkins_build_failure();
     let fabricated = r#"{"hypothesis":"code","confidence":"high","summary":"s","citations":[{"evidence":"ev_stage","start":0,"end":23,"quote":"totally different bytes"}],"next":"finish"}"#;

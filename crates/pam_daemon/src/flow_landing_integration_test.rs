@@ -947,3 +947,168 @@ async fn admitted_budget(
     .await
     .unwrap()
 }
+
+/// Runs the recipe expecting a refusal and returns its cause.
+async fn run_refused(fixture: &Fixture) -> String {
+    let result = fixture
+        .ctx
+        .flows
+        .run(
+            &fixture.ctx,
+            RunArgs {
+                id: "landing".into(),
+                inputs: BTreeMap::new(),
+            },
+        )
+        .await;
+    match result {
+        Err(super::CapabilityFailure::Refused { cause, .. }) => cause,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn sync_intent(fixture: &Fixture) -> Value {
+    json!({
+        "ref_name": "refs/heads/main",
+        "expected_old": fixture.github.base,
+        "requested_commit": fixture.github.merge,
+        "state": "uncertain",
+        "bounds": {"objects": 3, "deltas": 1, "compressed_bytes": 300, "decoded_bytes": 200, "expanded_bytes": 250},
+    })
+}
+
+#[tokio::test]
+async fn prepared_sync_recovers_from_the_exact_local_ref_without_a_second_fetch() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, true).await;
+            fixture.prefix(7).await;
+            // The effect happened before the crash: main already names the
+            // merge commit (objects arrived through the remote clone).
+            git(
+                &fixture.repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "fetch",
+                    "-q",
+                    fixture.github.remote.to_str().unwrap(),
+                    &fixture.github.merge,
+                ],
+            );
+            git(
+                &fixture.repo,
+                &[
+                    "update-ref",
+                    "refs/heads/main",
+                    &fixture.github.merge,
+                    &fixture.github.base,
+                ],
+            );
+            fixture
+                .interrupt_effect("sync", "sync", sync_intent(&fixture))
+                .await;
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Changed);
+            assert!(
+                fixture.github.upload_pack_calls().is_empty(),
+                "a prepared sync is reconciled by reading, never re-fetched"
+            );
+            let (_, session) = fixture.session().await;
+            assert_eq!(
+                session["receipts"]["sync"]["commit"],
+                fixture.github.merge.as_str()
+            );
+            assert_eq!(
+                session["receipts"]["sync"]["confirmed_by"],
+                "exact_local_ref"
+            );
+            assert_eq!(
+                git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+                fixture.github.merge
+            );
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_sync_whose_effect_never_landed_stays_uncertain_without_replay() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, true).await;
+            fixture.prefix(7).await;
+            fixture
+                .interrupt_effect("sync", "sync", sync_intent(&fixture))
+                .await;
+            assert_eq!(run_refused(&fixture).await, "landing_effect_uncertain");
+            assert!(fixture.github.upload_pack_calls().is_empty());
+            assert_eq!(
+                git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+                fixture.github.base,
+                "an unconfirmed sync is never repeated automatically"
+            );
+            assert!(
+                !fixture.repo.join(".git/objects/pack").exists()
+                    || std::fs::read_dir(fixture.repo.join(".git/objects/pack"))
+                        .unwrap()
+                        .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".idx"))
+            );
+            let (_, session) = fixture.session().await;
+            assert!(session["receipts"].get("sync").is_none());
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sync_refuses_a_moved_base_before_fetching() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, true).await;
+            fixture.prefix(7).await;
+            // Local main moved to a commit the merge does not descend from.
+            git(
+                &fixture.repo,
+                &[
+                    "update-ref",
+                    "refs/heads/main",
+                    &fixture.sha,
+                    &fixture.github.base,
+                ],
+            );
+            // The live identity check blocks the step before any transfer:
+            // only the frozen base or the merge commit itself are acceptable.
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Blocked);
+            let blocked = output.body["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["step"] == "sync")
+                .cloned()
+                .unwrap();
+            assert_eq!(blocked["status"], "blocked");
+            assert_eq!(blocked["text"], "approved source identity changed");
+            assert!(fixture.github.upload_pack_calls().is_empty());
+            assert_eq!(
+                git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+                fixture.sha,
+                "a moved base ref is left where it was"
+            );
+            assert!(
+                !fixture.repo.join(".git/objects/pack").exists()
+                    || std::fs::read_dir(fixture.repo.join(".git/objects/pack"))
+                        .unwrap()
+                        .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".idx"))
+            );
+        }),
+    )
+    .await
+    .unwrap();
+}

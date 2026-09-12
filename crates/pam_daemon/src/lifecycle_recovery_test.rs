@@ -216,10 +216,13 @@ async fn waiting_approval_is_expired_before_requeue_and_legacy_work_stays_failed
 }
 
 async fn landing_intent(store: &Store, id: &str, expiry: i64) {
+    landing_intent_for(store, id, expiry, "push").await;
+}
+async fn landing_intent_for(store: &Store, id: &str, expiry: i64, operation: &str) {
     admitted(store, id, expiry).await;
     let document = serde_json::json!({
         "version":1,"flow_digest":DIGEST,"repository":REPO,
-        "intent":{"step_id":"push","operation":"push","state":"prepared"},
+        "intent":{"step_id":operation,"operation":operation,"state":"prepared"},
         "frozen":{"commit":"c".repeat(40)}
     })
     .to_string();
@@ -231,10 +234,47 @@ async fn landing_intent(store: &Store, id: &str, expiry: i64) {
     );
     assert!(
         store
-            .prepare_flow_attempt(id, 0, "push", 1, true)
+            .prepare_flow_attempt(id, 0, operation, 1, true)
             .await
             .unwrap()
     );
+}
+
+/// A prepared sync intent survives a daemon restart exactly like push and
+/// merge: the original ticket requeues for read-only reconciliation, the
+/// journal stays effectful on the sync step, and nothing is replayed here.
+#[tokio::test]
+async fn prepared_sync_intent_requeues_the_original_ticket_for_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let expiry = future_expiry();
+    {
+        let store = Store::open(&path).await.unwrap();
+        landing_intent_for(&store, "landing", expiry, "sync").await;
+    }
+    let store = Store::open(&path).await.unwrap();
+    let session = store
+        .read_landing_session("landing")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recover_stuck_rows(&store).await.unwrap(), 1);
+    let landing = store.get_request("landing").await.unwrap().unwrap();
+    assert_eq!(landing.state, RequestState::Queued);
+    assert_eq!(landing.expires_at_ms, Some(expiry));
+    assert_eq!(
+        store
+            .read_landing_session("landing")
+            .await
+            .unwrap()
+            .unwrap(),
+        session,
+        "the journalled sync lease is untouched by recovery"
+    );
+    let journal = store.read_flow_journal("landing").await.unwrap().unwrap();
+    assert_eq!(journal.state, FlowJournalState::Ready);
+    assert!(journal.effectful);
+    assert_eq!(journal.step_id.as_deref(), Some("sync"));
 }
 
 #[tokio::test]

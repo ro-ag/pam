@@ -319,9 +319,13 @@ impl RunState<'_> {
             ));
         }
         let request = self.checkout_request(&loaded.policy, &loaded.receipt.commit)?;
-        landing_checkout::revalidate(
+        // Once GitHub reported a merge, the only other base value this
+        // ticket may find is that merge commit: what its own sync installs.
+        let landed: Vec<String> = merge_commit(loaded).ok().into_iter().collect();
+        landing_checkout::revalidate_accepting(
             &request,
             &loaded.receipt,
+            &landed,
             Arc::clone(&self.ctx.budget),
             &mut self.cancel,
             deadline,
@@ -887,6 +891,9 @@ impl RunState<'_> {
         deadline: Instant,
     ) -> Result<Value, CapabilityFailure> {
         self.landing_live(loaded, deadline).await?;
+        if !loaded.session.receipts.contains_key("verify_main") {
+            return Err(failure());
+        }
         let merge_commit = merge_commit(loaded)?;
         let mut target = crate::landing_git::GitTarget {
             request: self.checkout_request(&loaded.policy, &loaded.receipt.commit)?,
@@ -1219,11 +1226,8 @@ fn reconciled_sync_intent(
     }
     Ok(intent)
 }
-/// The merge commit GitHub reported, once `verify_main` has confirmed it.
+/// The merge commit GitHub reported in the `merge` receipt.
 fn merge_commit(loaded: &Loaded) -> Result<String, CapabilityFailure> {
-    if !loaded.session.receipts.contains_key("verify_main") {
-        return Err(failure());
-    }
     loaded
         .session
         .receipts

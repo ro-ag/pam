@@ -203,7 +203,7 @@ not an unauthorized force-close or a lower arbitrary weight floor.
 | #100 | Correct model diagnostics and attribution | Requested artifact is actually used and reported, including concurrent activity; diagnostic success is not qualification |
 | #104 | Actionable escalation and cost accounting | Target, status, citations, missing evidence and next permitted action reach the agent; actual total spend is measured |
 | #105 | Honest model/operator readiness | Configured/installed/available/qualified/admitted states and blockers are distinct; GUI reuses verified administration |
-| #106 | Task-first entry points | User/agent can discover, run, watch and resume useful work without a chatbot or qualified model |
+| #106 | Task-first entry points | DONE 2026-09-12: Home leads with starter task cards and a start_task Ask intent that deep-link to a flow's run overview; the run tab checks readiness through admin.flows.inspect and shows blockers with a destination; no model needed. Resume by ticket stays the Run history tab and `pam wait <ticket>` |
 | #124 | Usability checkpoint | Representative agent completes workflow without guessing operations or fetching raw logs unnecessarily |
 
 #100 is a diagnostic correctness repair, not a conversational feature. #104

@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-12-candidate-accuracy",
+  "purpose": "task_108_accuracy_first_candidate_screen_on_the_frozen_capability_bench",
+  "host": "Apple M4 Max, 64 GiB, CPU backend, ambient load (not a 32 GB measurement; memory was explicitly not a gate for this round)",
+  "case_set_sha256": "a324c2e3c28a933a845b3f6e0655fdb65472696bf4f516782992e2b9cf5dc8c6",
+  "cases": 150,
+  "revision": "61643a6",
+  "gates_confirmed_2026_09_12": {
+    "bounded_task_accuracy": ">=0.95",
+    "false_passes": 0,
+    "warm_p95_short_tasks_ms": 10000,
+    "warm_p95_summaries_ms": 30000,
+    "context_reduction": ">=0.30 at equal quality"
+  },
+  "artifacts": [
+    {
+      "artifact": "Qwen3-14B-Q5_K_M (run 1, 2026-09-11, sha e7c9aba1...)",
+      "accuracy": "0.820",
+      "false_passes": 9,
+      "false_pass_ids": [
+        "bt-019",
+        "bt-029",
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 4,
+      "coverage_on_decidable": "0.877",
+      "warm_p50_ms": 15595,
+      "warm_p95_ms": 19704,
+      "families": {
+        "abstention_trap": {
+          "correct": 8,
+          "total": 22,
+          "false_pass": 7,
+          "false_alarm": 4,
+          "over_abstain": 3
+        },
+        "build_triage": {
+          "correct": 35,
+          "total": 48,
+          "false_pass": 2,
+          "false_alarm": 0,
+          "over_abstain": 11
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "Qwen3-32B-Q4_K_M (sha efd97156...)",
+      "accuracy": "0.840",
+      "false_passes": 8,
+      "false_pass_ids": [
+        "bt-009",
+        "bt-019",
+        "bt-029",
+        "at-001",
+        "at-007",
+        "at-013",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 4,
+      "coverage_on_decidable": "0.895",
+      "warm_p50_ms": 25830,
+      "warm_p95_ms": 35360,
+      "families": {
+        "abstention_trap": {
+          "correct": 10,
+          "total": 22,
+          "false_pass": 5,
+          "false_alarm": 4,
+          "over_abstain": 3
+        },
+        "build_triage": {
+          "correct": 36,
+          "total": 48,
+          "false_pass": 3,
+          "false_alarm": 0,
+          "over_abstain": 9
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "Qwen3-30B-A3B-Q4_K_M (sha 0d003f66...)",
+      "accuracy": "0.740",
+      "false_passes": 8,
+      "false_pass_ids": [
+        "bt-029",
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 11,
+      "coverage_on_decidable": "0.825",
+      "warm_p50_ms": 19182,
+      "warm_p95_ms": 25184,
+      "families": {
+        "abstention_trap": {
+          "correct": 6,
+          "total": 22,
+          "false_pass": 7,
+          "false_alarm": 4,
+          "over_abstain": 5
+        },
+        "build_triage": {
+          "correct": 32,
+          "total": 48,
+          "false_pass": 1,
+          "false_alarm": 0,
+          "over_abstain": 15
+        },
+        "fact_extraction": {
+          "correct": 38,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 2,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 35,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 5,
+          "over_abstain": 0
+        }
+      }
+    }
+  ],
+  "findings": {
+    "gates": "no artifact meets the accuracy or false-pass gate; CPU latency fails the warm p95 gate on all three (Metal met it for the 14B in the partial run)",
+    "scaling": "14B -> 32B (2.3x weights) moved accuracy 0.82 -> 0.84 and false passes 9 -> 8; the MoE regressed to 0.74 with 11 false alarms. The false-pass id set is stable across all three artifacts (bt-029; at-001/007/013/019/021 in every run)",
+    "false_pass_anatomy": "at-001/007/013/019 are abstention_trap variant 1 (a planned stage's result absent while build and deploy exit=0) and the question asks whether the FINAL stage passed - deploy is the final stage and passed, so the case wording is ambiguous; at-003/015/021 ('stage X: SUCCESS' with no exit evidence) and bt-009/019/029 ('PASS (exit=1)') are the text-vs-data class where deterministic exit-code parsing must own truth",
+    "implication": "model choice inside this instrument cannot reach the gates; the gates must be measured on the product contract (structured diagnosis with completeness computed in code and deterministic exit parsing), and variant-1 cases need an unambiguous question before they count as false passes"
+  },
+  "raw": "qwen3-32b-q4km.jsonl and qwen3-30b-a3b-q4km.jsonl hold every emitted PAM_CAPABILITY_BENCH line for this record; run 1 lines are in docs/benchmarks/2026-09-10-model-screen"
+}

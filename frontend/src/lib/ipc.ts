@@ -355,7 +355,7 @@ export function auditRequest(
  * or MCP call reaches any of these ops.
  */
 
-/** Engine class, decided by size against the 18 GB floor. */
+/** Engine class: `engine` once the digest is verified, `test_only` until then. */
 export type ModelClass = "engine" | "test_only";
 
 /** What the bounded GGUF header parser could read out of a file. */
@@ -570,7 +570,6 @@ export function modelsList(): Promise<{ models: ModelEntry[]; models_dir: string
 export function modelsCatalog(): Promise<{
   presets: CatalogPreset[];
   host_ram_bytes: number;
-  floor_bytes: number;
 }> {
   return adminCall("admin.models.catalog");
 }

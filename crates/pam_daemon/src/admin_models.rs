@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use pam_model::catalog::{CATALOG, find_preset};
 use pam_model::curator::{AgentCli, AgentId};
 use pam_model::download::{DownloadError, DownloadRequest, curl_recovery_line};
-use pam_model::registry::{MODEL_FLOOR_BYTES, ModelClass, ModelEntry, RegistryError};
+use pam_model::registry::{ModelClass, ModelEntry, RegistryError};
 use pam_model::runtime::{GenerateRequest, RuntimeState};
 use pam_proto::Outcome;
 use serde_json::{Value, json};
@@ -125,8 +125,9 @@ pub const MODEL_ADMIN_OPS: &[&str] = &[
     OP_CURATOR_TEST,
 ];
 
-/// Refusal cause: a `test_only` model was offered as a tier default.
-pub const CAUSE_BELOW_FLOOR: &str = "below_floor";
+/// Refusal cause: an unverified (`test_only`) model was offered as a tier
+/// default.
+pub const CAUSE_UNVERIFIED: &str = "unverified";
 
 /// Refusal cause: no model in the registry carries that id.
 pub const CAUSE_UNKNOWN_MODEL: &str = "unknown_model";
@@ -180,9 +181,9 @@ const TRY_TEMPERATURE: f64 = 0.7;
 const RECOVERY_LIBRARY: &str =
     "Check the model id against the library on the PAM GUI Models screen.";
 
-/// Recovery line for the engine floor.
-const RECOVERY_FLOOR: &str = "Tier defaults need an engine-class model (18 GB or larger); pick one from the catalog \
-     on the PAM GUI Models screen.";
+/// Recovery line for an unverified model offered as a default.
+const RECOVERY_UNVERIFIED: &str = "Tier defaults need a verified model: run Verify on the PAM GUI Models screen, \
+     or download it from the catalog, which checks the digest.";
 
 /// Recovery line for a transfer that is already running.
 const RECOVERY_DOWNLOAD_RUNNING: &str =
@@ -318,7 +319,6 @@ impl AdminService {
             body: json!({
                 "presets": presets,
                 "host_ram_bytes": host_ram,
-                "floor_bytes": MODEL_FLOOR_BYTES,
             }),
             audit: json!({ "op": OP_MODELS_CATALOG }),
         })
@@ -592,13 +592,12 @@ impl AdminService {
         let entry = self.entry(model_id).await?;
         if entry.class == ModelClass::TestOnly {
             return Err(AdminRefusal {
-                cause: CAUSE_BELOW_FLOOR,
+                cause: CAUSE_UNVERIFIED,
                 detail: format!(
-                    "{model_id} is {} bytes, under the {MODEL_FLOOR_BYTES}-byte engine floor; \
-                     test-only models prove the wiring and never serve a job",
-                    entry.size_bytes
+                    "{model_id} has no verified digest; unverified models prove the wiring \
+                     and never serve a job"
                 ),
-                recovery: RECOVERY_FLOOR,
+                recovery: RECOVERY_UNVERIFIED,
             });
         }
         self.models.set_default(tier, Some(&entry.id)).await?;

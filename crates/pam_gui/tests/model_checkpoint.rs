@@ -7,7 +7,7 @@
 //! small test-only model (the wiring model is Qwen3-0.6B `Q8_0`, 639 MB)
 //! and the test fetches it through the daemon's own download path (a
 //! `file://` URL through system curl — the same code that fetches from
-//! Hugging Face), lists it, refuses it as a tier default (`below_floor`),
+//! Hugging Face), lists it, refuses it as a tier default (`unverified`),
 //! loads it, prompts it, and unloads it. Unset, the test prints how to
 //! run it and passes.
 //!
@@ -219,7 +219,7 @@ async fn the_model_layer_round_trips_through_the_admin_path() {
         json!({ "tier": "light", "model_id": model_id }),
     )
     .await;
-    assert_eq!(cause, "below_floor");
+    assert_eq!(cause, "unverified");
 
     load_prompt_unload(&base, &model_id).await;
 

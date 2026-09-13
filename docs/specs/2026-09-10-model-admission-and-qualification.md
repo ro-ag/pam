@@ -133,6 +133,14 @@ chunked prefill or memory-efficient attention before claiming full-context fit;
 such backend work is a separate implementation task. Weight-size eligibility must
 be replaced by artifact/task/backend qualification, not another arbitrary floor.
 
+**2026-09-13 (plan 37, task #155):** the 18 GB size floor is gone. Admission is
+verification-based: a model whose SHA-256 was checked (a completed Verify job or a
+catalog download) is engine-class and may be a tier default; anything unverified
+stays test-only. Size no longer decides anything — the llama.cpp engine runs
+whatever fits, and quality is the capability bench's verdict (see
+`docs/benchmarks/2026-09-13-llama-engine-screen`), which is what let gpt-oss-20b
+(12.1 GB, the best-scoring artifact) become a default.
+
 ## One paired acceptance experiment
 
 Replay frozen incident bundles from git, lint, tests, builds, Sonar and publishing.

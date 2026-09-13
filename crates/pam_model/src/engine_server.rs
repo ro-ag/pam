@@ -147,6 +147,9 @@ struct Live {
     child: tokio::process::Child,
     api_key: String,
     model: EngineModel,
+    /// The reasoning budget the server was started with; 0 also switches
+    /// thinking off through the chat template for models that gate it there.
+    reasoning_budget: i64,
 }
 
 /// One supervised `llama-server`.
@@ -367,6 +370,7 @@ impl EngineServer {
             child,
             api_key,
             model: model.clone(),
+            reasoning_budget: options.reasoning_budget,
         });
         *self
             .endpoint
@@ -437,12 +441,12 @@ impl EngineServer {
         input_limit: usize,
         deadline: Duration,
     ) -> Result<EngineResult, EngineServerError> {
-        let api_key = self
+        let (api_key, thinking_off) = self
             .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|live| live.api_key.clone())
+            .map(|live| (live.api_key.clone(), live.reasoning_budget == 0))
             .ok_or(EngineServerError::NoModelLoaded)?;
         let endpoint = self.endpoint().ok_or(EngineServerError::NoModelLoaded)?;
         let mut messages = Vec::new();
@@ -500,6 +504,9 @@ impl EngineServer {
                         // of one request on one server identical.
                         "cache_prompt": false,
                         "seed": 7,
+                        // Qwen-style templates gate thinking here; a budget
+                        // of 0 alone leaves them emitting an empty answer.
+                        "chat_template_kwargs": {"enable_thinking": !thinking_off},
                     }),
                     deadline,
                 )

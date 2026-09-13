@@ -40,7 +40,7 @@ import {
  *
  * Administration is GUI-only by design (spine decision): every control
  * here is an `admin.models.*` op that no agent, CLI, or MCP call can
- * reach. The screen is deliberately honest about the engine floor — a
+ * reach. The screen is deliberately honest about admission — a
  * model under 18 GB loads and answers, and is refused as a tier default,
  * and both facts are on screen before anyone earns the refusal.
  *
@@ -60,11 +60,11 @@ export const POLL_IDLE_MS = 10_000;
 export const TRY_DEFAULT_MAX_TOKENS = 64;
 
 /** The sentence a `test_only` model carries wherever it is offered. */
-export const FLOOR_SENTENCE = "wiring checks only — never a tier default";
+export const FLOOR_SENTENCE = "unverified — wiring checks only, never a tier default";
 
-/** The floor itself, said plainly, next to the paste-URL form. */
+/** The admission rule, said plainly, next to the paste-URL form. */
 export const FLOOR_NOTE =
-  "Models under 18 GB load only as test-only: they prove the wiring and never serve a job.";
+  "Unverified models load only as test-only: run Verify and they can serve jobs.";
 
 /** Empty library, in Pam's voice. */
 export const EMPTY_LIBRARY_SENTENCE =
@@ -198,7 +198,7 @@ function RuntimeCard({
   const loaded = runtime?.state === "loaded" ? runtime : null;
   const engine = status?.engine;
   // The try box exists to prove wiring, so test-only weights are loadable
-  // here on purpose; only the tier defaults enforce the floor.
+  // here on purpose; only the tier defaults enforce verification.
   const selectable = models;
   const pick = choice || selectable[0]?.id || "";
 

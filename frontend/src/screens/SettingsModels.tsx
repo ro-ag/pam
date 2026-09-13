@@ -29,7 +29,7 @@ import { FLOOR_SENTENCE } from "./Models";
  * weights live plus how long they stay resident.
  *
  * The engine floor is enforced twice on purpose: the daemon refuses a
- * `test_only` model as a tier default with cause `below_floor`, and the
+ * `test_only` model as a tier default with cause `unverified`, and the
  * select here renders those options disabled with the reason in the
  * label — so the human never has to earn the refusal to learn the rule.
  */

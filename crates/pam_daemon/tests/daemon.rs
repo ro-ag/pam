@@ -322,7 +322,10 @@ async fn status_bypasses_the_lanes_and_verifies() {
             body["model"]["engine"]["tag"],
             pam_model::engine::ENGINE_TAG
         );
-        assert_eq!(body["model"]["engine"]["build_info"], serde_json::Value::Null);
+        assert_eq!(
+            body["model"]["engine"]["build_info"],
+            serde_json::Value::Null
+        );
         assert_eq!(body["model"]["defaults"]["light"], serde_json::Value::Null);
         assert_eq!(body["model"]["defaults"]["heavy"], serde_json::Value::Null);
 

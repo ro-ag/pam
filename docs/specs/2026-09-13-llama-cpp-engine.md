@@ -66,14 +66,42 @@ Evidence: the opt-in test `engine::tests::the_pinned_release_installs_on_this_ho
 installed the real macOS arm64 asset on 2026-09-13 (digest `69f236c8…`,
 version line `version: 0.4.0-dev (build 10938, commit f1e44dcc1)`).
 
-## Next (plan 36)
+## Supervisor (`pam_model::engine_server`, #149)
 
-- Supervisor (#149): spawn `llama-server` on a private Unix socket
-  (`--host <run>/engine.sock`) with `--api-key`, `--no-webui`, `--jinja`,
-  `--reasoning-budget 0` for bounded tasks, context and prediction bounds from
-  the admission envelope, one loaded model at a time; health, load, unload,
-  crash recovery; loopback TCP with the api-key only where a Unix socket is
-  unavailable.
+`EngineServer` runs one `llama-server` for one model:
+
+- Spawned with a scrubbed environment (only `LD_LIBRARY_PATH` to its own
+  directory on Linux, `SystemRoot` on Windows), stdin/stdout/stderr closed, the
+  server log under the engine directory, and `kill_on_drop`.
+- Arguments: `-m <gguf> --host <endpoint> [--port N] --no-webui --jinja -np 1
+  -c <context> --reasoning-budget <n> --log-file <log> [-t threads] [-ngl
+  layers] --api-key <fresh key>`. The GGUF's own chat template owns framing;
+  the reasoning budget is 0 for bounded tasks.
+- Endpoint: the private Unix socket `<run>/engine.sock` where the platform has
+  them; a free loopback TCP port on Windows. Either way the per-load API key
+  (SHA-256 over the model path, pid, time and 32 bytes of OS entropy) gates the
+  peer and never leaves the process.
+- Load polls `/health` until `{"status":"ok"}`, refuses with the log tail when
+  the process exits first, and times out on the load deadline; `/props`
+  supplies `build_info`. Unload kills the process and removes the socket.
+- Generation: `/apply-template` then `/tokenize` count the framed prompt and
+  refuse above the caller's input limit before any decoding; then one
+  non-streaming `/v1/chat/completions` with `max_tokens`, `temperature` and
+  `stop`. A cancel drops the connection, which stops decoding on the server.
+  Results carry the server's token counts and timings.
+- Transport: `pam_model::engine_http`, a minimal HTTP/1.1 client (one request
+  per connection, JSON bodies, 4 MiB response cap, no redirects).
+
+Evidence: `tests/engine_server.rs` drives the supervisor against the shipped
+fake server binary (`pam-fake-llama-server`) for load, bounds, cancel, unload,
+early exit and health timeout; `tests/engine_live.rs` runs on every CI target
+with `PAM_ENGINE_LIVE=1`: it installs the pinned release from GitHub, fetches
+the 1.2 MB `tinyllamas/stories260K.gguf` (digest pinned), loads it and asks for
+one bounded completion — the Windows check runs there, over loopback TCP.
+On this host the real engine loads that model in about 0.2 s (13 s on first
+launch after extraction) and answers in under 20 ms.
+
+## Next (plan 36)
 - API routing (#150): `generate_bounded`, diagnosis and summaries go through
   `/v1/chat/completions` on that socket; the GGUF chat template owns framing.
 - Requalification (#151): the frozen capability bench and the #139 sequence on

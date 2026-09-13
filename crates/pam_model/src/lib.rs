@@ -54,6 +54,8 @@ pub mod diagnosis;
 mod diagnosis_test;
 pub mod download;
 pub mod engine;
+pub mod engine_http;
+pub mod engine_server;
 pub mod error;
 pub mod gguf;
 pub mod qwen3_moe;

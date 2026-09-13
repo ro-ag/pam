@@ -161,13 +161,63 @@
           "over_abstain": 0
         }
       }
+    },
+    {
+      "artifact": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M (unsloth GGUF, sha fadc3e5f..., run 2026-09-12 23:10)",
+      "accuracy": "0.847",
+      "false_passes": 7,
+      "false_pass_ids": [
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 6,
+      "coverage_on_decidable": "0.912",
+      "warm_p50_ms": 18503,
+      "warm_p95_ms": 26538,
+      "families": {
+        "abstention_trap": {
+          "correct": 6,
+          "total": 22,
+          "false_pass": 7,
+          "false_alarm": 4,
+          "over_abstain": 5
+        },
+        "build_triage": {
+          "correct": 41,
+          "total": 48,
+          "false_pass": 0,
+          "false_alarm": 2,
+          "over_abstain": 5
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "false_alarm": 0,
+          "over_abstain": 0
+        }
+      }
     }
   ],
   "findings": {
     "gates": "no artifact meets the accuracy or false-pass gate; CPU latency fails the warm p95 gate on all three (Metal met it for the 14B in the partial run)",
     "scaling": "14B -> 32B (2.3x weights) moved accuracy 0.82 -> 0.84 and false passes 9 -> 8; the MoE regressed to 0.74 with 11 false alarms. The false-pass id set is stable across all three artifacts (bt-029; at-001/007/013/019/021 in every run)",
     "false_pass_anatomy": "at-001/007/013/019 are abstention_trap variant 1 (a planned stage's result absent while build and deploy exit=0) and the question asks whether the FINAL stage passed - deploy is the final stage and passed, so the case wording is ambiguous; at-003/015/021 ('stage X: SUCCESS' with no exit evidence) and bt-009/019/029 ('PASS (exit=1)') are the text-vs-data class where deterministic exit-code parsing must own truth",
-    "implication": "model choice inside this instrument cannot reach the gates; the gates must be measured on the product contract (structured diagnosis with completeness computed in code and deterministic exit parsing), and variant-1 cases need an unambiguous question before they count as false passes"
+    "implication": "model choice inside this instrument cannot reach the gates; the gates must be measured on the product contract (structured diagnosis with completeness computed in code and deterministic exit parsing), and variant-1 cases need an unambiguous question before they count as false passes",
+    "coder": "Qwen3-Coder-30B-A3B-Instruct Q4_K_M is the best artifact so far: 0.847, 7 false passes, fact_extraction and jenkins_label 40/40, build_triage 41/48 with ZERO false passes (the 'PASS (exit=1)' text-vs-data class is solved by the coder tuning). Every remaining false pass is an abstention_trap variant: at-001/007/013/019 (variant 1, ambiguous 'final stage' wording) and at-003/015/021 (variant 3, 'SUCCESS' with no exit evidence). With variant 1 reworded the coder would sit at 3 false passes, all of them the no-exit-evidence class that deterministic parsing must own.",
+    "not_loadable": "Qwen3-Coder-Next (qwen3_next), Qwen3.6/3.8 variants and gpt-oss-20b/120b need architectures the runtime does not have (candle-transformers 0.9.2 ships no gpt-oss or qwen3_next quantized model); the runtime loads only qwen3 and qwen3moe GGUFs."
   },
-  "raw": "qwen3-32b-q4km.jsonl and qwen3-30b-a3b-q4km.jsonl hold every emitted PAM_CAPABILITY_BENCH line for this record; run 1 lines are in docs/benchmarks/2026-09-10-model-screen"
+  "raw": "qwen3-32b-q4km.jsonl, qwen3-30b-a3b-q4km.jsonl and qwen3-coder-30b-a3b-q4km.jsonl hold every emitted PAM_CAPABILITY_BENCH line for this record; run 1 lines are in docs/benchmarks/2026-09-10-model-screen"
 }

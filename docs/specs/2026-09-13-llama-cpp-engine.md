@@ -101,6 +101,29 @@ one bounded completion — the Windows check runs there, over loopback TCP.
 On this host the real engine loads that model in about 0.2 s (13 s on first
 launch after extraction) and answers in under 20 ms.
 
+## Routing (`pam_daemon::model_service`, #150)
+
+When `engine::status(base).installed` is true the model service routes every
+weight-holding operation to the supervisor and keeps the in-process runtime
+idle; when the engine is absent nothing changes. Concretely:
+
+- `ensure_loaded` unloads any candle model first (one copy of the weights),
+  then loads the registry entry into `llama-server` unless it is already the
+  loaded one, and answers a `LoadedModel` whose `device` is `llama.cpp`.
+- `generate_bounded` (diagnosis, summaries) and `generate_diagnostic`
+  (`admin.models.try`) run the same `GenerateRequest` through the engine and
+  return the runtime-shaped `GenerateResult` (server token counts and timings),
+  so no caller changes. The engine's prompt count enforces the caller's
+  `input_limit` before decoding.
+- `unload_all` (behind `admin.models.unload`) stops the engine process and the
+  runtime. `status()` gains an `engine` block: installed, expected tag, cause,
+  and the loaded engine model.
+- One completion may take at most 15 minutes end to end.
+
+Evidence: `model_service_test::an_installed_engine_takes_over_load_generate_status_and_unload`
+installs the fake server as the pinned release and proves load, echo
+completion, the prompt limit, the idle candle runtime and unload.
+
 ## Next (plan 36)
 - API routing (#150): `generate_bounded`, diagnosis and summaries go through
   `/v1/chat/completions` on that socket; the GGUF chat template owns framing.

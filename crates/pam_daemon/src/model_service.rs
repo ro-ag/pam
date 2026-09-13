@@ -46,6 +46,8 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pam_model::download::{DownloadError, DownloadHandle, DownloadRequest, DownloadState};
+use pam_model::engine;
+use pam_model::engine_server::{EngineServer, EngineServerError, ServerOptions};
 use pam_model::registry::{ModelEntry, Registry, RegistryError, default_models_dir};
 use pam_model::runtime::{
     GenerateRequest, GenerateResult, LoadedModel, Runtime, RuntimeError, RuntimeState,
@@ -242,6 +244,9 @@ pub struct ModelService {
     /// the daemon from its base directory. Unset (tests) falls back to a
     /// private directory beside the models.
     engine_base: RwLock<Option<PathBuf>>,
+    /// The llama.cpp supervisor, built the first time an installed engine
+    /// is needed and rebuilt if the installed binary changes.
+    engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
     runtime: Runtime,
     pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
@@ -282,6 +287,7 @@ impl ModelService {
             store,
             models_dir: RwLock::new(models_dir),
             engine_base: RwLock::new(None),
+            engine: std::sync::Mutex::new(None),
             runtime: Runtime::new(),
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
@@ -289,6 +295,76 @@ impl ModelService {
         });
         tokio::spawn(idle_unload_loop(Arc::downgrade(&service)));
         Ok(service)
+    }
+
+    /// The llama.cpp supervisor when the pinned engine is installed under
+    /// the engine base; `None` keeps generation on the in-process runtime.
+    pub fn engine_server(&self) -> Option<Arc<EngineServer>> {
+        let base = self.engine_base();
+        let server = engine::status(&base).server_path?;
+        let mut slot = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = slot.as_ref()
+            && existing.binary() == server
+        {
+            return Some(Arc::clone(existing));
+        }
+        let built = EngineServer::new(server, &base.join("run"), &base.join("engine")).ok()?;
+        let built = Arc::new(built);
+        *slot = Some(Arc::clone(&built));
+        Some(built)
+    }
+
+    /// Unloads whatever holds weights: the engine process and the
+    /// in-process runtime.
+    pub async fn unload_all(&self) -> Result<(), RuntimeError> {
+        if let Some(engine) = self.engine_server() {
+            engine.unload().await;
+        }
+        self.runtime.unload().await
+    }
+
+    /// One bounded completion on the engine, shaped like the in-process
+    /// runtime's result so every caller stays unchanged.
+    async fn engine_generate(
+        &self,
+        engine: &EngineServer,
+        loaded: &LoadedModel,
+        request: &GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<GenerateResult, RuntimeError> {
+        let result = engine
+            .generate(request, cancel, input_limit, ENGINE_GENERATE_DEADLINE)
+            .await
+            .map_err(engine_error)?;
+        let decode_ms = result.predicted_ms.max(0.0);
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "timings are reported to humans in whole milliseconds"
+        )]
+        let (prompt_ms, decode_ms_u64, tokens_per_sec) = (
+            result.prompt_ms.max(0.0) as u64,
+            decode_ms as u64,
+            if decode_ms > 0.0 {
+                result.completion_tokens as f64 / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        );
+        Ok(GenerateResult {
+            model: pam_model::runtime::GenerationModel::from(loaded),
+            text: result.text,
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            prompt_ms,
+            decode_ms: decode_ms_u64,
+            tokens_per_sec,
+        })
     }
 
     /// A registry over the configured models directory.
@@ -385,10 +461,15 @@ impl ModelService {
     ) -> Result<GenerateResult, ModelUnavailable> {
         let _operation = self.operation.lock().await;
         let entry = self.resolve(tier).await?;
-        self.ensure_loaded_inner(&entry).await?;
+        let loaded = self.ensure_loaded_inner(&entry).await?;
         // The daemon-internal path has no cancel surface yet: the sender
         // lives as long as the call and never fires.
         let (_never, cancel) = watch::channel(false);
+        if let Some(engine) = self.engine_server() {
+            return Ok(self
+                .engine_generate(&engine, &loaded, &request, cancel, input_limit)
+                .await?);
+        }
         Ok(self
             .runtime
             .generate_bounded(request, cancel, input_limit)
@@ -412,6 +493,20 @@ impl ModelService {
             .await?
             .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
         let (guard, cancel) = DiagnosticCancellation::new();
+        if let Some(engine) = self.engine_server() {
+            let loaded = self.ensure_loaded_inner(&entry).await?;
+            let result = self
+                .engine_generate(
+                    &engine,
+                    &loaded,
+                    &request,
+                    cancel,
+                    pam_model::runtime::CONTEXT_TOKENS,
+                )
+                .await;
+            drop(guard);
+            return Ok(result?);
+        }
         let result = self
             .runtime
             .generate_for(
@@ -445,6 +540,24 @@ impl ModelService {
     }
 
     async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
+        if let Some(engine) = self.engine_server() {
+            // The engine owns the weights; the in-process runtime must not
+            // hold a second copy.
+            if matches!(self.runtime.snapshot().state, RuntimeState::Loaded(_)) {
+                self.runtime.unload().await?;
+            }
+            if let Some(current) = engine.model()
+                && current.id == entry.id
+                && current.path == entry.path
+            {
+                return Ok(engine_loaded_model(entry, &current));
+            }
+            let current = engine
+                .load(&entry.id, &entry.path, &ServerOptions::default())
+                .await
+                .map_err(engine_error)?;
+            return Ok(engine_loaded_model(entry, &current));
+        }
         match self.runtime.snapshot().state {
             RuntimeState::Loaded(loaded) if loaded.id == entry.id => return Ok(loaded),
             RuntimeState::Loaded(loaded) => {
@@ -598,8 +711,16 @@ impl ModelService {
             .chain(settled.iter().take(STATUS_JOB_HISTORY))
             .map(job_json)
             .collect();
+        let engine_status = engine::status(&self.engine_base());
+        let engine_loaded = self.engine_server().and_then(|engine| engine.model());
         Ok(json!({
             "runtime": self.runtime.snapshot(),
+            "engine": {
+                "installed": engine_status.installed,
+                "expected_tag": engine_status.expected_tag,
+                "cause": engine_status.cause,
+                "loaded": engine_loaded,
+            },
             "jobs": jobs,
             "defaults": { "light": light, "heavy": heavy },
             "idle_unload_min": self.idle_unload_min().await?,
@@ -873,5 +994,43 @@ impl From<crate::blocking_jobs::Error> for ModelServiceError {
             cause: error.cause(),
             detail: error.to_string(),
         }
+    }
+}
+
+/// How long one engine completion may take end to end.
+const ENGINE_GENERATE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(15);
+
+/// The runtime-shaped view of a model the engine holds.
+fn engine_loaded_model(
+    entry: &ModelEntry,
+    model: &pam_model::engine_server::EngineModel,
+) -> LoadedModel {
+    LoadedModel {
+        id: entry.id.clone(),
+        quant: entry
+            .info
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |info| info.quant_label.clone()),
+        architecture: entry
+            .info
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |info| info.architecture.clone()),
+        context_length: model.context_length,
+        weight_bytes: entry.size_bytes,
+        device: "llama.cpp".to_owned(),
+        loaded_at: model.loaded_at_ms,
+        last_used_at: model.loaded_at_ms,
+        last_tokens_per_sec: None,
+    }
+}
+
+fn engine_error(error: EngineServerError) -> RuntimeError {
+    match error {
+        EngineServerError::NoModelLoaded => RuntimeError::NoModelLoaded,
+        EngineServerError::InputTooLong { tokens, limit } => {
+            RuntimeError::PromptTooLong { tokens, limit }
+        }
+        EngineServerError::Cancelled => RuntimeError::Cancelled,
+        other => RuntimeError::LoadFailed(other.to_string()),
     }
 }

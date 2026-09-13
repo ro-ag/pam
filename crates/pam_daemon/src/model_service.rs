@@ -238,6 +238,10 @@ pub struct ModelService {
     /// [`Registry`] is rebuilt from it on every read, so no caller can
     /// hold a stale one.
     models_dir: RwLock<PathBuf>,
+    /// Where the llama.cpp engine is installed (`<base>/engine`); set by
+    /// the daemon from its base directory. Unset (tests) falls back to a
+    /// private directory beside the models.
+    engine_base: RwLock<Option<PathBuf>>,
     runtime: Runtime,
     pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
@@ -277,6 +281,7 @@ impl ModelService {
         let service = Arc::new(Self {
             store,
             models_dir: RwLock::new(models_dir),
+            engine_base: RwLock::new(None),
             runtime: Runtime::new(),
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
@@ -303,6 +308,26 @@ impl ModelService {
     #[must_use]
     pub fn host_ram_bytes(&self) -> u64 {
         self.host_ram_bytes
+    }
+
+    /// Points the engine layout at the daemon's private base directory.
+    pub fn set_engine_base(&self, base: PathBuf) {
+        *self
+            .engine_base
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base);
+    }
+
+    /// The directory `pam_model::engine` installs under: the daemon's
+    /// base directory, or a private directory beside the models when the
+    /// daemon never set one.
+    #[must_use]
+    pub fn engine_base(&self) -> PathBuf {
+        self.engine_base
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| self.models_dir().join(".pam"))
     }
 
     /// The configured models directory.

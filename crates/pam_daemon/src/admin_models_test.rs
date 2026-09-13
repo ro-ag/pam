@@ -261,7 +261,11 @@ fn tiny_gguf() -> Vec<u8> {
 async fn every_model_op_is_dispatched_and_none_is_unknown() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        assert_eq!(MODEL_ADMIN_OPS.len(), 19, "model and compressor ops");
+        assert_eq!(
+            MODEL_ADMIN_OPS.len(),
+            21,
+            "model, compressor and engine ops"
+        );
         for op in MODEL_ADMIN_OPS {
             assert!(op.starts_with("admin."), "{op} is under the admin prefix");
             // Called with no arguments: whatever comes back, it must not
@@ -922,4 +926,36 @@ fn diagnostic_mismatch_refusal_reports_both_actual_and_requested_model() {
     assert!(refusal.detail.contains("qwen/requested"));
     assert!(refusal.detail.contains("qwen/other"));
     assert!(refusal.recovery.contains("Explicitly load"));
+}
+
+#[tokio::test]
+async fn engine_status_reads_files_only_and_install_needs_an_explicit_confirm() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let status = expect_result(
+            fx.run(crate::admin_engine::OP_ENGINE_STATUS, json!({}))
+                .await,
+            Outcome::Verified,
+        );
+        assert_eq!(status["installed"], false);
+        assert_eq!(status["cause"], "not_installed");
+        assert_eq!(status["expected_tag"], pam_model::engine::ENGINE_TAG);
+        assert!(status["target"].is_string(), "{status}");
+        // The engine base is private to this fixture's models dir.
+        assert!(
+            fx.models.engine_base().starts_with(fx.dir.path()),
+            "{}",
+            fx.models.engine_base().display()
+        );
+        // No confirm: refused before any transfer.
+        let detail = expect_refusal(
+            fx.run(crate::admin_engine::OP_ENGINE_INSTALL, json!({}))
+                .await,
+            "invalid_admin_args",
+        );
+        assert!(detail.contains("confirm"));
+        assert!(!fx.models.engine_base().join("engine").exists());
+    })
+    .await
+    .expect("test within deadline");
 }

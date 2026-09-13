@@ -565,8 +565,7 @@ impl AdminService {
         let _operation = self.models.operation.lock().await;
         let previous = self.loaded_id();
         self.models
-            .runtime()
-            .unload()
+            .unload_all()
             .await
             .map_err(|err| runtime_refusal(&err))?;
         Ok(AdminOk {

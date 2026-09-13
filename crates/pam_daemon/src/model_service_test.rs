@@ -339,3 +339,117 @@ async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
         pam_model::RuntimeState::Idle
     );
 }
+
+/// The fake llama-server `cargo test` builds for `pam_model`, found next to
+/// this test binary's directory; `None` when it was not built.
+#[cfg(unix)]
+fn fake_engine_binary() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.parent()?.join("pam-fake-llama-server");
+    path.is_file().then_some(path)
+}
+
+/// Installs the fake server as if it were the pinned release: manifest plus
+/// binary under `<engine base>/engine`, exactly what `engine::status` reads.
+#[cfg(unix)]
+fn install_fake_engine(service: &ModelService, fake: &std::path::Path) {
+    use pam_model::engine::{ENGINE_BUILD, ENGINE_TAG, EngineLayout, EngineManifest, Target};
+    let layout = EngineLayout::new(&service.engine_base());
+    let target = Target::current().unwrap();
+    std::fs::create_dir_all(layout.install_dir(ENGINE_TAG)).unwrap();
+    std::fs::copy(fake, layout.server_path(ENGINE_TAG, target)).unwrap();
+    let manifest = EngineManifest {
+        tag: ENGINE_TAG.into(),
+        build: ENGINE_BUILD,
+        target,
+        asset: target.asset().name.into(),
+        sha256: target.asset().sha256.into(),
+        bytes: target.asset().bytes,
+        version_line: "version: fake".into(),
+        installed_at_ms: 0,
+    };
+    std::fs::write(
+        layout.manifest_path(),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
+    let Some(fake) = fake_engine_binary() else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    // Unix socket paths are capped at 104 bytes: keep the base short.
+    let dir = tempfile::Builder::new()
+        .prefix("pam-ms-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    touch_model(dir.path(), "qwen", "tiny.gguf");
+    service
+        .set_default(Tier::Light, Some("qwen/tiny"))
+        .await
+        .unwrap();
+    assert!(service.engine_server().is_none(), "nothing installed yet");
+    install_fake_engine(&service, &fake);
+    assert!(service.engine_server().is_some());
+
+    let result = service
+        .generate_bounded(
+            Tier::Light,
+            pam_model::runtime::GenerateRequest {
+                system: Some("You echo.".into()),
+                prompt: "one two three".into(),
+                max_tokens: 16,
+                temperature: 0.0,
+                stop: Vec::new(),
+            },
+            4096,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.text, "echo: one two three");
+    assert_eq!(result.model.id, "qwen/tiny");
+    assert_eq!(result.model.device, "llama.cpp");
+    assert_eq!(result.completion_tokens, 4);
+    assert!(result.tokens_per_sec > 0.0);
+
+    let status = service.status().await.unwrap();
+    assert_eq!(status["engine"]["installed"], true);
+    assert_eq!(status["engine"]["loaded"]["id"], "qwen/tiny");
+    assert_eq!(
+        status["runtime"]["state"]["state"], "idle",
+        "candle holds no second copy"
+    );
+
+    // The prompt limit is enforced by the engine's own tokenizer count.
+    let too_long = service
+        .generate_bounded(
+            Tier::Light,
+            pam_model::runtime::GenerateRequest {
+                system: None,
+                prompt: "a b c d e f g h i j".into(),
+                max_tokens: 4,
+                temperature: 0.0,
+                stop: Vec::new(),
+            },
+            4,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            too_long,
+            ModelUnavailable::Runtime(pam_model::runtime::RuntimeError::PromptTooLong { .. })
+        ),
+        "{too_long:?}"
+    );
+
+    service.unload_all().await.unwrap();
+    let status = service.status().await.unwrap();
+    assert!(status["engine"]["loaded"].is_null());
+}

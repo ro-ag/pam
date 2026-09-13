@@ -200,6 +200,12 @@ impl EngineServer {
         &self.socket
     }
 
+    /// The server binary this supervisor spawns.
+    #[must_use]
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
     /// The endpoint the running server listens on, if one runs.
     #[must_use]
     pub fn endpoint(&self) -> Option<Endpoint> {

@@ -325,12 +325,26 @@ async fn model_block(ctx: &ExecContext) -> serde_json::Value {
             loaded.last_tokens_per_sec,
         ),
     };
+    // The llama.cpp engine, when installed, is what holds the weights; the
+    // in-process runtime then stays idle, so report what the engine holds.
+    let engine = pam_model::engine::status(&ctx.models.engine_base());
+    let engine_model = ctx.models.engine_server().and_then(|server| server.model());
+    let (state, id) = match &engine_model {
+        Some(model) => ("loaded", Some(model.id.clone())),
+        None => (state, id),
+    };
     let (light, heavy) = ctx.models.defaults().await.unwrap_or((None, None));
     serde_json::json!({
         "state": state,
         "id": id,
         "tokens_per_sec": tokens_per_sec,
         "defaults": { "light": light, "heavy": heavy },
+        "engine": {
+            "installed": engine.installed,
+            "tag": engine.expected_tag,
+            "cause": engine.cause,
+            "build_info": engine_model.as_ref().map(|model| model.build_info.clone()),
+        },
     })
 }
 

@@ -171,6 +171,8 @@ export type AdminOp =
   | "admin.models.status"
   | "admin.models.defaults.set"
   | "admin.models.settings.set"
+  | "admin.models.engine.status"
+  | "admin.models.engine.install"
   | "admin.models.compressor.status"
   | "admin.models.compressor.install"
   | "admin.models.compressor.set"
@@ -451,6 +453,76 @@ export interface ModelJob {
   updated_ts: number;
 }
 
+/**
+ * Why the pinned llama.cpp engine is not simply "installed": every non-null
+ * cause names a specific, honest reason (`pam_model::engine`).
+ */
+export type EngineCause =
+  | "not_installed"
+  | "manifest_invalid"
+  | "stale_release"
+  | "server_missing"
+  | "unsupported_target"
+  | null;
+
+/** What survived a completed install: the release identity and the digest. */
+export interface EngineManifest {
+  tag: string;
+  build: number;
+  target: string;
+  asset: string;
+  sha256: string;
+  bytes: number;
+  version_line: string | null;
+  installed_at_ms: number;
+}
+
+/**
+ * The pinned llama.cpp engine's install state (`admin.models.engine.status`
+ * and `.install`). Read-only status, or an install the human asked for —
+ * nothing installs on navigation or on a poll.
+ */
+export interface EngineStatus {
+  expected_tag: string;
+  expected_build: number;
+  target: string | null;
+  installed: boolean;
+  server_path: string | null;
+  manifest: EngineManifest | null;
+  cause: EngineCause;
+}
+
+/** Read-only: never installs anything. */
+export function engineStatus(): Promise<EngineStatus> {
+  return adminCall("admin.models.engine.status");
+}
+
+/**
+ * Installs the pinned engine — downloads and verifies it (up to ~2
+ * minutes). Only ever called from an explicit human click, never a poll.
+ */
+export function engineInstall(): Promise<EngineStatus> {
+  return adminCall("admin.models.engine.install", { confirm: true });
+}
+
+/** The model the engine currently holds, as `admin.models.status` reports it. */
+export interface EngineLoadedModel {
+  id: string;
+  path: string;
+  context_length: number;
+  build_info: string;
+  loaded_at_ms: number;
+  pid: number;
+}
+
+/** The engine summary folded into `admin.models.status`. */
+export interface ModelsEngineSummary {
+  installed: boolean;
+  expected_tag: string;
+  cause: EngineCause;
+  loaded: EngineLoadedModel | null;
+}
+
 /** Everything the Models screen polls, in one read. */
 export interface ModelsStatus {
   runtime: { state: RuntimeState; busy: boolean };
@@ -459,6 +531,8 @@ export interface ModelsStatus {
   idle_unload_min: number;
   models_dir: string;
   host_ram_bytes: number;
+  /** Absent on an older daemon that predates the engine — never invented. */
+  engine?: ModelsEngineSummary;
 }
 
 /** What one generation produced, and what it cost. */

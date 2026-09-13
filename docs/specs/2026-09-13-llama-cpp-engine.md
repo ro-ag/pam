@@ -138,6 +138,21 @@ bit-identical, which the bench asserts. First record:
 passes at 574 ms; the latency gate is met, the accuracy gates are not, and every
 remaining false pass is an abstention-trap variant.
 
+## Readiness in the GUI (#152)
+
+The Models page carries an "Inference engine" card above the compressor card.
+It reads `admin.models.engine.status` every 10 s and says exactly what the
+manifest says: installed (tag, target, version line, digest prefix), not
+installed, stale release (installed tag versus the pinned one), broken install
+(server missing or manifest invalid) or no release for this platform. One
+explicit click on "Install engine" / "Reinstall engine" calls
+`admin.models.engine.install { confirm: true }`; the button is disabled while
+installing, failures render with the daemon's cause, detail and recovery, and
+nothing is ever installed by a poll or by navigating. The runtime card shows
+the model the engine holds (id, context, build) with an "engine" badge, or
+"Engine ready, nothing loaded" when the engine is installed and idle; the
+candle badges remain for hosts without an engine.
+
 ## Next (plan 36)
 - API routing (#150): `generate_bounded`, diagnosis and summaries go through
   `/v1/chat/completions` on that socket; the GGUF chat template owns framing.

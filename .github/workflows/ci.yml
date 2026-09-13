@@ -76,6 +76,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --workspace
+        env:
+          # tests/engine_live.rs: install the pinned llama.cpp release for
+          # this target, fetch the 1.2 MB tinyllamas model, load it and ask
+          # for one bounded completion (Unix socket, loopback TCP on Windows).
+          PAM_ENGINE_LIVE: "1"
       - if: matrix.os == 'macos-15'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:

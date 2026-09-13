@@ -36,7 +36,9 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",
     "fs",
     "macros",
+    "net",
 ] }
+
 # every curator invocation runs in a fresh empty directory that dies with
 # the call, so this is a runtime dependency and not only a test one.
 tempfile.workspace = true
@@ -71,3 +73,9 @@ tokio = { version = "1", default-features = false, features = [
 
 [lints]
 workspace = true
+
+# The fake llama-server the engine supervisor tests drive; a few kilobytes
+# of tokio, never part of the pam package (release builds `-p pam`).
+[[bin]]
+name = "pam-fake-llama-server"
+path = "src/bin/fake_llama_server.rs"

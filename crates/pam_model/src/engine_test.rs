@@ -251,12 +251,17 @@ async fn a_server_that_reports_another_build_is_discarded() {
 async fn the_pinned_release_installs_on_this_host() {
     let base = tempfile::tempdir().unwrap();
     let (_cancel, rx) = tokio::sync::watch::channel(false);
-    let installed = install(base.path(), rx).await.expect("the pinned release installs");
+    let installed = install(base.path(), rx)
+        .await
+        .expect("the pinned release installs");
     assert!(installed.installed, "{installed:?}");
     let manifest = installed.manifest.clone().expect("manifest");
     assert_eq!(manifest.tag, ENGINE_TAG);
     assert_eq!(manifest.build, ENGINE_BUILD);
     assert_eq!(manifest.sha256, Target::current().unwrap().asset().sha256);
-    println!("PAM_ENGINE_INSTALL {}", serde_json::to_string(&manifest).unwrap());
+    println!(
+        "PAM_ENGINE_INSTALL {}",
+        serde_json::to_string(&manifest).unwrap()
+    );
     assert_eq!(status(base.path()), installed);
 }

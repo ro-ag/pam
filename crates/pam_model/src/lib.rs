@@ -53,6 +53,7 @@ pub mod diagnosis;
 #[cfg(test)]
 mod diagnosis_test;
 pub mod download;
+pub mod engine;
 pub mod error;
 pub mod gguf;
 pub mod qwen3_moe;

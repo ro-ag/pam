@@ -618,6 +618,7 @@ pub async fn run_daemon_with(
     }
     let gate = Arc::new(PolicyGate::new(Arc::clone(&store)).await?);
     let models = ModelService::new(Arc::clone(&store)).await?;
+    models.set_engine_base(base.clone());
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let secrets = open_secret_store(config.secret_backend);
     // macOS only inside: the first keychain touch of a session can be

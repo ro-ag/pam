@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod admin_compressor;
 pub mod admin_connectors;
+pub mod admin_engine;
 pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;

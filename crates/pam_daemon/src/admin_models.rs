@@ -108,6 +108,8 @@ pub const MODEL_ADMIN_OPS: &[&str] = &[
     crate::admin_compressor::OP_STATUS,
     crate::admin_compressor::OP_INSTALL,
     crate::admin_compressor::OP_SET,
+    crate::admin_engine::OP_ENGINE_STATUS,
+    crate::admin_engine::OP_ENGINE_INSTALL,
     OP_MODELS_LIST,
     OP_MODELS_CATALOG,
     OP_MODELS_DOWNLOAD,
@@ -241,6 +243,8 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
+            crate::admin_engine::OP_ENGINE_STATUS => Ok(self.engine_status()),
+            crate::admin_engine::OP_ENGINE_INSTALL => self.engine_install(args).await,
             crate::admin_compressor::OP_STATUS => self.compressor_status().await,
             crate::admin_compressor::OP_INSTALL => self.compressor_install(args).await,
             crate::admin_compressor::OP_SET => self.compressor_set(args).await,

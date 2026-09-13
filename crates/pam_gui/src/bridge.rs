@@ -41,6 +41,7 @@ use pam_daemon::admin::{
     OP_PROFILE_SET,
 };
 use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
+use pam_daemon::admin_engine::OP_ENGINE_INSTALL;
 use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
@@ -164,7 +165,7 @@ pub fn is_known_admin_op(op: &str) -> bool {
 #[must_use]
 pub fn deadline_for(op: &str) -> u64 {
     match op {
-        OP_MODELS_TRY | OP_LOG_COMPRESS => LONG_DEADLINE_MS,
+        OP_MODELS_TRY | OP_LOG_COMPRESS | OP_ENGINE_INSTALL => LONG_DEADLINE_MS,
         OP_CONNECTORS_TEST => CONNECTOR_TEST_DEADLINE_MS,
         _ => ADMIN_DEADLINE_MS,
     }

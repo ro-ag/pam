@@ -363,62 +363,15 @@ async fn bench_model_writes_a_summary_row() {
     println!("--- end summary ---");
 }
 
-#[tokio::test]
-async fn enabled_compressor_skips_before_loading_when_no_investigator_exists() {
-    let (store, logs) = service("req_compressor_skip").await;
-    store
-        .set_setting(crate::admin_compressor::SETTING_ENABLED, "true")
-        .await
-        .unwrap();
-    let report = logs
-        .compress(
-            "req_compressor_skip",
-            CompressInput {
-                name: "build.log".to_owned(),
-                bytes: b"build complete\n".to_vec(),
-                exit_status: Some(0),
-                use_model: true,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        report.compression_skipped.unwrap().cause,
-        "investigator_unavailable"
-    );
-    assert!(report.semantic.is_none());
-    assert_eq!(
-        store
-            .list_evidence("req_compressor_skip")
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
-}
 #[test]
-fn summary_input_identity_follows_actual_selected_view_bytes() {
-    use crate::log_service::{EvidenceRef, summary_input};
-    let semantic = EvidenceRef {
-        id: "semantic".into(),
-        bytes: 123,
-    };
-    let (prompt, identity) = summary_input(
-        "compact text",
-        "compact",
-        Some(("selected text", &semantic)),
-    );
-    assert_eq!(prompt, "selected text");
-    assert_eq!(identity["evidence_id"], "semantic");
-    assert_eq!(
-        identity["sha256"],
-        pam_compact::sha256_hex(prompt.as_bytes())
-    );
-    assert_eq!(identity["offset_basis"], "view_bytes");
-    let (prompt, identity) = summary_input("compact text", "compact", None);
+fn summary_input_identity_follows_the_compact_view_bytes() {
+    use crate::log_service::summary_input;
+    let (prompt, identity) = summary_input("compact text", "compact");
+    assert_eq!(prompt, "compact text");
     assert_eq!(identity["evidence_id"], "compact");
     assert_eq!(
         identity["sha256"],
         pam_compact::sha256_hex(prompt.as_bytes())
     );
+    assert_eq!(identity["offset_basis"], "view_bytes");
 }

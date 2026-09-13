@@ -48,7 +48,7 @@ async fn replay(
         .await
         .unwrap();
     let elapsed = start.elapsed().as_micros();
-    assert!(report.model.is_none() && report.summary.is_none() && report.semantic.is_none());
+    assert!(report.model.is_none() && report.summary.is_none());
     let stored = store
         .get_evidence(&report.source.id)
         .await

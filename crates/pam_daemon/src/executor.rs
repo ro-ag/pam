@@ -315,7 +315,9 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
 /// [`crate::secrets::PROBE_TTL`], so a polling GUI does not wake the
 /// keychain on every tick.
 async fn model_block(ctx: &ExecContext) -> serde_json::Value {
-    let snapshot = ctx.models.runtime().snapshot();
+    // The llama.cpp engine, when installed, is what holds the weights;
+    // `snapshot` already reports the engine's loaded model directly.
+    let snapshot = ctx.models.snapshot();
     let (state, id, tokens_per_sec) = match &snapshot.state {
         RuntimeState::Idle => ("idle", None, None),
         RuntimeState::Loading { id, .. } => ("loading", Some(id.clone()), None),
@@ -325,14 +327,8 @@ async fn model_block(ctx: &ExecContext) -> serde_json::Value {
             loaded.last_tokens_per_sec,
         ),
     };
-    // The llama.cpp engine, when installed, is what holds the weights; the
-    // in-process runtime then stays idle, so report what the engine holds.
     let engine = pam_model::engine::status(&ctx.models.engine_base());
     let engine_model = ctx.models.engine_server().and_then(|server| server.model());
-    let (state, id) = match &engine_model {
-        Some(model) => ("loaded", Some(model.id.clone())),
-        None => (state, id),
-    };
     let (light, heavy) = ctx.models.defaults().await.unwrap_or((None, None));
     serde_json::json!({
         "state": state,

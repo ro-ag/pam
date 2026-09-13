@@ -18,14 +18,12 @@
 //!   scan, classify, verify, delete.
 //! - [`download`] — resumable transfers through the system `curl`, with
 //!   the integrity check done here rather than trusted to the network.
-//! - [`tokenizer`] — a byte-level BPE rebuilt from the model file's own
-//!   metadata, so a model stays one file on disk.
-//! - [`runtime`] — the candle inference thread: load, unload, generate.
+//! - [`runtime`] — shared inference types (requests, results, snapshots,
+//!   errors). Inference itself runs out of process, in the pinned
+//!   `llama.cpp` release [`engine`] installs and [`engine_server`]
+//!   supervises.
 //! - [`curator`] — the vendor agent CLIs installed on the machine: detect
 //!   them, ask one a single tool-free question.
-//! - [`qwen3_moe`] — candle's mixture-of-experts model, vendored so that its
-//!   KV cache can be cleared between generations instead of the whole model
-//!   being rebuilt.
 //! - [`error`] — one place to reach for the crate's error types.
 //!
 //! # The floor
@@ -45,9 +43,6 @@
 //! that for them.
 
 pub mod catalog;
-pub mod compression;
-#[cfg(test)]
-mod compression_test;
 pub mod curator;
 pub mod diagnosis;
 #[cfg(test)]
@@ -58,13 +53,8 @@ pub mod engine_http;
 pub mod engine_server;
 pub mod error;
 pub mod gguf;
-pub mod qwen3_moe;
 pub mod registry;
 pub mod runtime;
-mod sparse_moe;
-#[cfg(test)]
-mod sparse_moe_test;
-pub mod tokenizer;
 
 /// A range-serving HTTP origin for download tests.
 ///
@@ -88,10 +78,9 @@ pub use registry::{
     VerifyOutcome, classify, default_models_dir,
 };
 pub use runtime::{
-    CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, Runtime, RuntimeError,
-    RuntimeSnapshot, RuntimeState,
+    CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot,
+    RuntimeState,
 };
-pub use tokenizer::{ChatFraming, GgufTokenizer, TokenizerError, chatml};
 
 #[cfg(test)]
 mod catalog_test;
@@ -103,7 +92,3 @@ mod download_test;
 mod gguf_test;
 #[cfg(test)]
 mod registry_test;
-#[cfg(test)]
-mod runtime_test;
-#[cfg(test)]
-mod tokenizer_test;

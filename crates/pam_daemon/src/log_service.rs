@@ -33,8 +33,7 @@
 //!
 //! # Bounded summaries
 //!
-//! Optional Microsoft extraction selects source-mapped records after deterministic
-//! compaction. Oversized evidence is refused before generation, never head/tail
+//! Oversized evidence is refused before generation, never head/tail
 //! truncated. Flow steps and the GUI log observatory both call this service.
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -177,12 +176,6 @@ pub struct CompressReport {
     pub model: Option<ModelUse>,
     /// Why none did, when none did.
     pub model_skipped: Option<ModelSkipped>,
-    /// Source-mapped Microsoft selection over the deterministic rendering.
-    pub semantic: Option<EvidenceRef>,
-    /// The selected rendering; exact source remains in compact/source evidence.
-    pub semantic_text: Option<String>,
-    /// Why optional semantic compression did not run or could not fit.
-    pub compression_skipped: Option<ModelSkipped>,
     /// Optional source/compact views unavailable for bounded agent retrieval.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub view_skipped: Vec<ModelSkipped>,
@@ -340,9 +333,6 @@ impl LogService {
             stats,
             model: None,
             model_skipped: None,
-            semantic: None,
-            semantic_text: None,
-            compression_skipped: None,
             view_skipped: source_view_skip
                 .into_iter()
                 .chain(compact_view_skip)
@@ -350,8 +340,6 @@ impl LogService {
         };
 
         if use_model {
-            self.semantic_prompt(request_id, &name, &compact_id, &mut report, capture)
-                .await;
             self.summarize(
                 request_id,
                 &name,
@@ -478,14 +466,7 @@ impl LogService {
         report: &mut CompressReport,
         capture: Option<&crate::evidence_service::CaptureScope>,
     ) {
-        let (prompt, input) = summary_input(
-            &report.compact_text,
-            compact_id,
-            report
-                .semantic_text
-                .as_deref()
-                .zip(report.semantic.as_ref()),
-        );
+        let (prompt, input) = summary_input(&report.compact_text, compact_id);
         if prompt.len() > PROMPT_BUDGET_BYTES {
             report.model_skipped = Some(ModelSkipped {
                 cause: "evidence_exceeds_budget".to_owned(),
@@ -539,7 +520,6 @@ impl LogService {
             "tokens_per_sec": result.tokens_per_sec,
             "source_evidence": source_id,
             "compact_evidence": compact_id,
-            "semantic_evidence": report.semantic.as_ref().map(|evidence| &evidence.id),
             "input": input,
         });
         if let Err(skip) = self
@@ -636,18 +616,11 @@ fn safe_summary(text: &str) -> Result<(crate::evidence_view::RedactedView, Strin
     Ok((view, safe_text))
 }
 
-pub(crate) fn summary_input(
-    compact_text: &str,
-    compact_id: &str,
-    semantic: Option<(&str, &EvidenceRef)>,
-) -> (String, serde_json::Value) {
-    let (prompt, evidence_id) = semantic.map_or((compact_text, compact_id), |(text, evidence)| {
-        (text, evidence.id.as_str())
-    });
+pub(crate) fn summary_input(compact_text: &str, compact_id: &str) -> (String, serde_json::Value) {
     (
-        prompt.to_owned(),
-        json!({"evidence_id": evidence_id,
-        "sha256": pam_compact::sha256_hex(prompt.as_bytes()), "offset_basis": "view_bytes"}),
+        compact_text.to_owned(),
+        json!({"evidence_id": compact_id,
+        "sha256": pam_compact::sha256_hex(compact_text.as_bytes()), "offset_basis": "view_bytes"}),
     )
 }
 

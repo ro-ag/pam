@@ -47,8 +47,8 @@ for access, evidence, polling, validation, or landing decisions.
 | Jenkins | Explicit build investigation, bounded stages/nodes/logs, CLI observation summary, coverage gaps | Decisive-evidence follow-up and CLI retrieval; root cause remains unresolved |
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
 | Orchestration | Flows, checks, approvals, retries, tickets, durable remote polling, guarded landing through sync (bounds-proven pack transfer, exact-lease fast-forward) | Enterprise checkpoint of the complete recipe (#94) |
-| Models | llama.cpp engine as a pinned, digest-verified external process (b10938; Unix socket, Windows loopback) routing every generation path; candle runtime kept only until parity; frozen bench on the engine (coder 0.853/7 FP @671 ms, gpt-oss-20b 0.867/3 FP @574 ms) | Engine-based admission replacing the 18 GB floor (#96), the abstention-trap gap, candle removal |
-| Microsoft compression | Pinned LLMLingua-2 whole-record scoring, GUI opt-in/repair, sequential residency, held-out qualification (keyword-anchored classes proven, non-keyword classes restricted out) | Default stays off; citation-offset gap closed host-side (issue #25), enablement waits on #108 gates and #123 |
+| Models | llama.cpp engine as a pinned, digest-verified external process (b10938; Unix socket, Windows loopback) routing every generation path; candle removed 2026-09-13 (plan 37); frozen bench on the engine (coder 0.853/7 FP @671 ms, gpt-oss-20b 0.867/3 FP @574 ms) | Engine-based admission replacing the 18 GB floor (#96), the abstention-trap gap |
+| Microsoft compression | Removed 2026-09-13 with the candle runtime (plan 37); qualification records stay under docs/benchmarks | Nothing: evidence reduction is deterministic framing only |
 
 The Microsoft smoke preserved evidence and reduced 1,017 tokens to 459, but took
 70.88 seconds in an unoptimized CPU build. Release-build qualification has since

@@ -1,4 +1,3 @@
-import { CompressorCard } from "./CompressorCard";
 import { EngineCard } from "./EngineCard";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, LoaderCircle } from "lucide-react";
@@ -934,7 +933,6 @@ export function ModelsScreen() {
         >
           <CatalogPanel jobs={jobs} />
           <EngineCard />
-          <CompressorCard />
         </Section>
       </PagePane>
       <PagePane id="models" tab="test" active={tab === "test"}>

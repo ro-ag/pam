@@ -2474,7 +2474,6 @@ impl RunState<'_> {
             Some(compressed.source.id.clone()),
             Some(compressed.compact.id.clone()),
             compressed.summary.as_ref().map(|row| row.id.clone()),
-            compressed.semantic.as_ref().map(|row| row.id.clone()),
         ]
         .into_iter()
         .flatten()

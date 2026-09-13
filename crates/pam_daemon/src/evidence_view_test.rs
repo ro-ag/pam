@@ -1,30 +1,14 @@
 use pam_compact::{Policy, compact, sha256_hex};
-use pam_model::compression::{CompressionReport, SourceSpan};
 
 use crate::evidence_view::{
     ByteRange, MAX_SEGMENTS, POLICY_VERSION, Relation, Segment, ViewError, compact_segments,
-    compose_segments, redact, resolve_segments, semantic_segments,
+    compose_segments, redact, resolve_segments,
 };
 
 fn span(start: usize, end: usize) -> ByteRange {
     ByteRange {
         start: start as u64,
         end: end as u64,
-    }
-}
-
-fn selection(parent: &str, ranges: &[(usize, usize)], text: &str) -> CompressionReport {
-    CompressionReport {
-        text: text.to_owned(),
-        source_sha256: sha256_hex(parent.as_bytes()),
-        source_bytes: parent.len(),
-        retained: ranges
-            .iter()
-            .map(|&(start, end)| SourceSpan { start, end })
-            .collect(),
-        input_tokens: 10,
-        output_tokens: 5,
-        model_id: "test-selection".to_owned(),
     }
 }
 
@@ -216,31 +200,6 @@ fn evidence_view_compact_rejects_forged_parent_and_noncontiguous_map() {
     broken.rendered_text.push_str("invented");
     assert_eq!(
         compact_segments(&broken, source),
-        Err(ViewError::InvalidMap)
-    );
-}
-
-#[test]
-fn evidence_view_semantic_selection_uses_spans_not_repeated_text_search() {
-    let source = "same\nskip\nsame\n";
-    let chosen = selection(source, &[(10, 15)], "[... omitted ...]\nsame\n");
-    let map = semantic_segments(&chosen, source).unwrap();
-    assert_eq!(map[0].relation, Relation::Synthetic);
-    assert!(map[0].parent.is_none());
-    assert_eq!(map[1].parent, Some(span(10, 15)));
-    let mut invalid = selection("é\n", &[(1, 3)], "x");
-    assert_eq!(
-        semantic_segments(&invalid, "é\n"),
-        Err(ViewError::InvalidMap)
-    );
-    invalid.source_sha256 = "forged".to_owned();
-    assert_eq!(
-        semantic_segments(&invalid, "é\n"),
-        Err(ViewError::ParentMismatch)
-    );
-    let invalid = selection(source, &[(0, 5), (0, 5)], "same\nsame\n");
-    assert_eq!(
-        semantic_segments(&invalid, source),
         Err(ViewError::InvalidMap)
     );
 }

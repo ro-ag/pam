@@ -105,9 +105,6 @@ pub const OP_CURATOR_TEST: &str = "admin.curator.test";
 /// Every op this module answers — the GUI bridge's whitelist reads it so
 /// the two can never drift.
 pub const MODEL_ADMIN_OPS: &[&str] = &[
-    crate::admin_compressor::OP_STATUS,
-    crate::admin_compressor::OP_INSTALL,
-    crate::admin_compressor::OP_SET,
     crate::admin_engine::OP_ENGINE_STATUS,
     crate::admin_engine::OP_ENGINE_INSTALL,
     OP_MODELS_LIST,
@@ -219,11 +216,7 @@ const RECOVERY_SHORTEN_PROMPT: &str = "Shorten the prompt; the context holds 819
 /// Recovery line for a busy runtime.
 const RECOVERY_RETRY_LATER: &str = "Another generation is running; retry when it finishes.";
 
-/// Recovery line for an architecture PAM does not implement.
-const RECOVERY_SUPPORTED_ARCH: &str =
-    "PAM runs qwen3 and qwen3moe GGUF models; pick one of those from the catalog.";
-
-/// Recovery line for a load candle refused.
+/// Recovery line for a load the engine refused.
 const RECOVERY_VERIFY_FILE: &str = "Read the load error detail. For an unsupported quantization/backend, choose a supported model/backend and retain the model file and error when reporting it. For a truncated or unreadable GGUF, verify the file on the PAM GUI Models screen.";
 
 /// Recovery line for a curator that is not there.
@@ -245,9 +238,6 @@ impl AdminService {
         Some(match op {
             crate::admin_engine::OP_ENGINE_STATUS => Ok(self.engine_status()),
             crate::admin_engine::OP_ENGINE_INSTALL => self.engine_install(args).await,
-            crate::admin_compressor::OP_STATUS => self.compressor_status().await,
-            crate::admin_compressor::OP_INSTALL => self.compressor_install(args).await,
-            crate::admin_compressor::OP_SET => self.compressor_set(args).await,
             OP_MODELS_LIST => self.models_list().await,
             OP_MODELS_CATALOG => self.models_catalog().await,
             OP_MODELS_DOWNLOAD => self.models_download(args).await,
@@ -454,9 +444,6 @@ impl AdminService {
             .clone()
             .try_lock_owned()
             .map_err(|_| runtime_refusal(&pam_model::RuntimeError::Busy))?;
-        if self.models.runtime().has_pending_work() {
-            return Err(runtime_refusal(&pam_model::RuntimeError::Busy));
-        }
         let entry = self.entry(model_id).await?;
         if self.loaded_id() == Some(entry.id.clone()) {
             return Err(AdminRefusal {
@@ -550,7 +537,7 @@ impl AdminService {
             .map_err(|err| runtime_refusal(&err))?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: json!({ "state": self.models.runtime().snapshot().state }),
+            body: json!({ "state": self.models.snapshot().state }),
             audit: json!({
                 "op": OP_MODELS_LOAD,
                 "model_id": loaded.id,
@@ -570,7 +557,7 @@ impl AdminService {
             .map_err(|err| runtime_refusal(&err))?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: json!({ "state": self.models.runtime().snapshot().state }),
+            body: json!({ "state": self.models.snapshot().state }),
             audit: json!({ "op": OP_MODELS_UNLOAD, "model_id": previous }),
         })
     }
@@ -824,7 +811,7 @@ impl AdminService {
 
     /// The id of the loaded model, if any.
     fn loaded_id(&self) -> Option<String> {
-        match self.models.runtime().snapshot().state {
+        match self.models.snapshot().state {
             RuntimeState::Loaded(loaded) => Some(loaded.id),
             RuntimeState::Idle | RuntimeState::Loading { .. } => None,
         }
@@ -933,10 +920,6 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
 pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
     let recovery = match err {
         pam_model::RuntimeError::NoModelLoaded => RECOVERY_LOAD_A_MODEL,
-        pam_model::RuntimeError::ModelMismatch { .. } => {
-            "Explicitly load the requested model on the PAM GUI Models screen, then retry."
-        }
-        pam_model::RuntimeError::UnsupportedArchitecture(_) => RECOVERY_SUPPORTED_ARCH,
         pam_model::RuntimeError::LoadFailed(_) => RECOVERY_VERIFY_FILE,
         pam_model::RuntimeError::PromptTooLong { .. } => RECOVERY_SHORTEN_PROMPT,
         pam_model::RuntimeError::Busy => RECOVERY_RETRY_LATER,
@@ -944,7 +927,6 @@ pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
         pam_model::RuntimeError::GenerationFailed(_) => {
             "Keep the error detail and report it with the model file, architecture, quantization and backend from model status. Try a supported model/backend; restarting does not repair incompatible inference kernels."
         }
-        pam_model::RuntimeError::Crashed => RECOVERY_INTERNAL,
     };
     AdminRefusal {
         cause: if matches!(err, pam_model::RuntimeError::Busy) {

@@ -1,5 +1,11 @@
 # Opt-in model resource screening
 
+> Historical: the candle memory model this document describes was removed
+> 2026-09-13 (plan 37) along with `tests/resource_screen.rs`. Local inference
+> now runs only through the pinned llama.cpp engine (see
+> [the llama.cpp engine spec](specs/2026-09-13-llama-cpp-engine.md)), whose
+> resident-memory shape differs from what is measured below.
+
 `crates/pam_model/tests/resource_screen.rs` exercises the production GGUF registry,
 tokenizer and Candle runtime. It downloads nothing and adds no dependencies.
 Ordinary tests skip it. Results are resource observations, not model qualification,

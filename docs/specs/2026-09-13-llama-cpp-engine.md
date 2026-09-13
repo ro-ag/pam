@@ -158,5 +158,5 @@ candle badges remain for hosts without an engine.
   `/v1/chat/completions` on that socket; the GGUF chat template owns framing.
 - Requalification (#151): the frozen capability bench and the #139 sequence on
   llama.cpp for Qwen3-Coder-30B-A3B, gpt-oss-20b and Qwen3-Coder-Next.
-- Readiness (#152): engine state in the CLI and the Models page; candle stays
-  only until parity, then is removed.
+- Readiness (#152): engine state in the CLI and the Models page; candle
+  removed 2026-09-13 (plan 37).

@@ -8,9 +8,10 @@
 //!   friends), all persisted in the store so a restart keeps them;
 //! - the **models directory**, rebuilt into a [`Registry`] whenever the
 //!   setting changes, so a `Registry` handed out is always current;
-//! - the **runtime**, one [`Runtime`] for the process — loading a second
-//!   model means unloading the first, strictly old-before-new, because
-//!   two sets of weights do not fit the machines this targets;
+//! - the **engine**, one [`EngineServer`] supervising the pinned
+//!   `llama.cpp` release for the process — loading a second model means
+//!   unloading the first, strictly old-before-new, because two sets of
+//!   weights do not fit the machines this targets;
 //! - the **live download handles**, keyed by job id, so a transfer can be
 //!   cancelled and a second download of the same file refused.
 //!
@@ -35,13 +36,15 @@
 //!
 //! # Memory comes back on its own
 //!
-//! A ticker every [`IDLE_TICK`] compares the runtime's `last_used_at`
-//! against [`SETTING_IDLE_UNLOAD_MIN`] and unloads when the model has
+//! A ticker every [`IDLE_TICK`] compares the service's own `last_used_at`
+//! — updated after every load and every generation — against
+//! [`SETTING_IDLE_UNLOAD_MIN`] and unloads the engine when the model has
 //! been idle that long (`0` means never). The decision itself is
 //! [`should_unload`], a pure function, so it is testable without weights.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +53,7 @@ use pam_model::engine;
 use pam_model::engine_server::{EngineServer, EngineServerError, ServerOptions};
 use pam_model::registry::{ModelEntry, Registry, RegistryError, default_models_dir};
 use pam_model::runtime::{
-    GenerateRequest, GenerateResult, LoadedModel, Runtime, RuntimeError, RuntimeState,
+    GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot, RuntimeState,
 };
 use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
@@ -247,7 +250,13 @@ pub struct ModelService {
     /// The llama.cpp supervisor, built the first time an installed engine
     /// is needed and rebuilt if the installed binary changes.
     engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
-    runtime: Runtime,
+    /// True while a generation is in flight on the engine. Status only —
+    /// serialization comes from `operation`, held for the duration of
+    /// every generate and load.
+    busy: AtomicBool,
+    /// Unix seconds of the last load or generation; what the idle-unload
+    /// ticker compares [`SETTING_IDLE_UNLOAD_MIN`] against.
+    last_used_at: AtomicI64,
     pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
     host_ram_bytes: u64,
@@ -288,7 +297,8 @@ impl ModelService {
             models_dir: RwLock::new(models_dir),
             engine_base: RwLock::new(None),
             engine: std::sync::Mutex::new(None),
-            runtime: Runtime::new(),
+            busy: AtomicBool::new(false),
+            last_used_at: AtomicI64::new(0),
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
             host_ram_bytes: host_ram_bytes(),
@@ -317,17 +327,40 @@ impl ModelService {
         Some(built)
     }
 
-    /// Unloads whatever holds weights: the engine process and the
-    /// in-process runtime.
+    /// Unloads whatever holds weights: the engine process.
     pub async fn unload_all(&self) -> Result<(), RuntimeError> {
         if let Some(engine) = self.engine_server() {
             engine.unload().await;
         }
-        self.runtime.unload().await
+        Ok(())
     }
 
-    /// One bounded completion on the engine, shaped like the in-process
-    /// runtime's result so every caller stays unchanged.
+    /// The current state, read without touching the engine process: `Idle`
+    /// when nothing is loaded, `Loaded` with the model the engine holds.
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        let state = match self.engine_server().and_then(|engine| engine.model()) {
+            Some(model) => RuntimeState::Loaded(engine_snapshot_model(
+                &model,
+                self.last_used_at.load(Ordering::Acquire),
+            )),
+            None => RuntimeState::Idle,
+        };
+        RuntimeSnapshot {
+            state,
+            busy: self.busy.load(Ordering::Acquire),
+        }
+    }
+
+    /// Marks the engine as used just now — called after every successful
+    /// load and every successful generation, and read by the idle-unload
+    /// ticker.
+    fn touch_last_used(&self) {
+        self.last_used_at.store(now_ts(), Ordering::Release);
+    }
+
+    /// One bounded completion on the engine, shaped like the runtime-typed
+    /// result every caller expects.
     async fn engine_generate(
         &self,
         engine: &EngineServer,
@@ -336,10 +369,13 @@ impl ModelService {
         cancel: watch::Receiver<bool>,
         input_limit: usize,
     ) -> Result<GenerateResult, RuntimeError> {
-        let result = engine
+        self.busy.store(true, Ordering::Release);
+        let outcome = engine
             .generate(request, cancel, input_limit, ENGINE_GENERATE_DEADLINE)
-            .await
-            .map_err(engine_error)?;
+            .await;
+        self.busy.store(false, Ordering::Release);
+        self.touch_last_used();
+        let result = outcome.map_err(engine_error)?;
         let decode_ms = result.predicted_ms.max(0.0);
         #[allow(
             clippy::cast_precision_loss,
@@ -371,12 +407,6 @@ impl ModelService {
     #[must_use]
     pub fn registry(&self) -> Registry {
         Registry::new(self.models_dir())
-    }
-
-    /// The inference runtime.
-    #[must_use]
-    pub fn runtime(&self) -> &Runtime {
-        &self.runtime
     }
 
     /// Total physical RAM, measured once at construction — what the
@@ -465,14 +495,9 @@ impl ModelService {
         // The daemon-internal path has no cancel surface yet: the sender
         // lives as long as the call and never fires.
         let (_never, cancel) = watch::channel(false);
-        if let Some(engine) = self.engine_server() {
-            return Ok(self
-                .engine_generate(&engine, &loaded, &request, cancel, input_limit)
-                .await?);
-        }
+        let engine = self.engine_server().ok_or_else(engine_not_installed)?;
         Ok(self
-            .runtime
-            .generate_bounded(request, cancel, input_limit)
+            .engine_generate(&engine, &loaded, &request, cancel, input_limit)
             .await?)
     }
 
@@ -485,33 +510,18 @@ impl ModelService {
         request: GenerateRequest,
     ) -> Result<GenerateResult, ModelUnavailable> {
         let _operation = self.operation.try_lock().map_err(|_| RuntimeError::Busy)?;
-        if self.runtime.has_pending_work() {
-            return Err(RuntimeError::Busy.into());
-        }
         let entry = self
             .find(model_id)
             .await?
             .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
         let (guard, cancel) = DiagnosticCancellation::new();
-        if let Some(engine) = self.engine_server() {
-            let loaded = self.ensure_loaded_inner(&entry).await?;
-            let result = self
-                .engine_generate(
-                    &engine,
-                    &loaded,
-                    &request,
-                    cancel,
-                    pam_model::runtime::CONTEXT_TOKENS,
-                )
-                .await;
-            drop(guard);
-            return Ok(result?);
-        }
+        let loaded = self.ensure_loaded_inner(&entry).await?;
+        let engine = self.engine_server().ok_or_else(engine_not_installed)?;
         let result = self
-            .runtime
-            .generate_for(
-                &entry.id,
-                request,
+            .engine_generate(
+                &engine,
+                &loaded,
+                &request,
                 cancel,
                 pam_model::runtime::CONTEXT_TOKENS,
             )
@@ -540,33 +550,20 @@ impl ModelService {
     }
 
     async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
-        if let Some(engine) = self.engine_server() {
-            // The engine owns the weights; the in-process runtime must not
-            // hold a second copy.
-            if matches!(self.runtime.snapshot().state, RuntimeState::Loaded(_)) {
-                self.runtime.unload().await?;
-            }
-            if let Some(current) = engine.model()
-                && current.id == entry.id
-                && current.path == entry.path
-            {
-                return Ok(engine_loaded_model(entry, &current));
-            }
-            let current = engine
-                .load(&entry.id, &entry.path, &ServerOptions::default())
-                .await
-                .map_err(engine_error)?;
+        let engine = self.engine_server().ok_or_else(engine_not_installed)?;
+        if let Some(current) = engine.model()
+            && current.id == entry.id
+            && current.path == entry.path
+        {
+            self.touch_last_used();
             return Ok(engine_loaded_model(entry, &current));
         }
-        match self.runtime.snapshot().state {
-            RuntimeState::Loaded(loaded) if loaded.id == entry.id => return Ok(loaded),
-            RuntimeState::Loaded(loaded) => {
-                tracing::info!(outgoing = %loaded.id, incoming = %entry.id, "swapping model");
-                self.runtime.unload().await?;
-            }
-            RuntimeState::Idle | RuntimeState::Loading { .. } => {}
-        }
-        self.runtime.load(entry).await
+        let current = engine
+            .load(&entry.id, &entry.path, &ServerOptions::default())
+            .await
+            .map_err(engine_error)?;
+        self.touch_last_used();
+        Ok(engine_loaded_model(entry, &current))
     }
 
     /// Starts a transfer and returns its job id.
@@ -714,7 +711,7 @@ impl ModelService {
         let engine_status = engine::status(&self.engine_base());
         let engine_loaded = self.engine_server().and_then(|engine| engine.model());
         Ok(json!({
-            "runtime": self.runtime.snapshot(),
+            "runtime": self.snapshot(),
             "engine": {
                 "installed": engine_status.installed,
                 "expected_tag": engine_status.expected_tag,
@@ -780,12 +777,9 @@ impl ModelService {
         if self.models_dir().as_path() == dir {
             return Ok(());
         }
-        if self.runtime.has_pending_work() {
-            return Err(RuntimeError::Busy.into());
-        }
         // Registry IDs repeat across directories. Never leave the previous root's
         // loaded snapshot available under an ID now resolved in a different root.
-        self.runtime.unload().await?;
+        self.unload_all().await?;
         let encoded = json!(dir.display().to_string()).to_string();
         self.store.set_setting(SETTING_MODELS_DIR, &encoded).await?;
         *self
@@ -813,17 +807,21 @@ impl ModelService {
         let Ok(idle_min) = self.idle_unload_min().await else {
             return;
         };
-        let snapshot = self.runtime.snapshot();
-        let RuntimeState::Loaded(loaded) = snapshot.state else {
+        if self.busy.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(engine) = self.engine_server() else {
             return;
         };
-        if snapshot.busy || !should_unload(loaded.last_used_at, now_ts(), idle_min) {
+        let Some(loaded) = engine.model() else {
+            return;
+        };
+        let last_used = self.last_used_at.load(Ordering::Acquire);
+        if !should_unload(last_used, now_ts(), idle_min) {
             return;
         }
-        match self.runtime.unload().await {
-            Ok(()) => tracing::info!(model = %loaded.id, idle_min, "idle unload"),
-            Err(err) => tracing::warn!(model = %loaded.id, error = %err, "idle unload failed"),
-        }
+        engine.unload().await;
+        tracing::info!(model = %loaded.id, idle_min, "idle unload");
     }
 }
 
@@ -1032,5 +1030,40 @@ fn engine_error(error: EngineServerError) -> RuntimeError {
         }
         EngineServerError::Cancelled => RuntimeError::Cancelled,
         other => RuntimeError::LoadFailed(other.to_string()),
+    }
+}
+
+/// The refusal every caller sees when the pinned engine is not installed.
+fn engine_not_installed() -> RuntimeError {
+    RuntimeError::LoadFailed(
+        "the llama.cpp engine is not installed; install it from Models".to_owned(),
+    )
+}
+
+/// [`snapshot`](ModelService::snapshot)'s view of the model the engine
+/// holds, without a registry lookup: `snapshot` is polled every couple of
+/// seconds and must never scan the models directory to answer. Quant and
+/// architecture are reported as `unknown` here; a caller that already has
+/// the [`ModelEntry`] (`ensure_loaded_inner`) uses [`engine_loaded_model`]
+/// instead, which fills them in from the registry.
+fn engine_snapshot_model(
+    model: &pam_model::engine_server::EngineModel,
+    last_used_at: i64,
+) -> LoadedModel {
+    let weight_bytes = std::fs::metadata(&model.path).map_or(0, |meta| meta.len());
+    LoadedModel {
+        id: model.id.clone(),
+        quant: "unknown".to_owned(),
+        architecture: "unknown".to_owned(),
+        context_length: model.context_length,
+        weight_bytes,
+        device: "llama.cpp".to_owned(),
+        loaded_at: model.loaded_at_ms,
+        last_used_at: if last_used_at > 0 {
+            last_used_at
+        } else {
+            model.loaded_at_ms
+        },
+        last_tokens_per_sec: None,
     }
 }

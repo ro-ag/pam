@@ -17,7 +17,6 @@ pub const POLICY_VERSION: &str = "pam-evidence-redact-v1";
 pub const MAX_SEGMENTS: usize = 100_000;
 const MASK: &[u8] = b"[REDACTED]";
 const JSON_MASK: &[u8] = b"\"[REDACTED]\"";
-const SEMANTIC_OMISSION: &str = "[... omitted ...]\n";
 
 /// Half-open byte range in the named artifact, never a character index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,76 +693,6 @@ fn resolve_validated(segments: &[Segment], requested: ByteRange) -> Vec<Segment>
             }
         })
         .collect()
-}
-
-/// Validate a whole-record semantic selection against its compact parent and
-/// reconstruct every marker. Repeated text never resolves by substring search.
-/// Retained spans index UTF-8 bytes of `parent`, not raw source offsets.
-pub fn semantic_segments(
-    selection: &pam_model::compression::CompressionReport,
-    parent: &str,
-) -> Result<Vec<Segment>, ViewError> {
-    if selection.source_bytes != parent.len() {
-        return Err(ViewError::ParentMismatch);
-    }
-    let parent_sha256 = &selection.source_sha256;
-    let rendered = &selection.text;
-    let retained = &selection.retained;
-    bounded(parent.len())?;
-    bounded(rendered.len())?;
-    if sha256_hex(parent.as_bytes()) != parent_sha256.as_str() {
-        return Err(ViewError::ParentMismatch);
-    }
-    if retained.len() > MAX_SEGMENTS {
-        return Err(ViewError::TooManySegments);
-    }
-    let mut output = Vec::new();
-    let mut segments = Vec::new();
-    let mut end = 0_usize;
-    for span in retained {
-        let start = span.start;
-        let stop = span.end;
-        if start < end
-            || start >= stop
-            || stop > parent.len()
-            || !parent.is_char_boundary(start)
-            || !parent.is_char_boundary(stop)
-            || (start > 0 && parent.as_bytes()[start - 1] != b'\n')
-            || (stop < parent.len() && parent.as_bytes()[stop - 1] != b'\n')
-        {
-            return Err(ViewError::InvalidMap);
-        }
-        if start > end {
-            append(
-                &mut output,
-                &mut segments,
-                SEMANTIC_OMISSION.as_bytes(),
-                None,
-                Relation::Synthetic,
-            )?;
-        }
-        append(
-            &mut output,
-            &mut segments,
-            &parent.as_bytes()[start..stop],
-            Some(range(start, stop)),
-            Relation::Identity,
-        )?;
-        end = stop;
-    }
-    if end < parent.len() {
-        append(
-            &mut output,
-            &mut segments,
-            SEMANTIC_OMISSION.as_bytes(),
-            None,
-            Relation::Synthetic,
-        )?;
-    }
-    if output != rendered.as_bytes() {
-        return Err(ViewError::InvalidMap);
-    }
-    Ok(segments)
 }
 
 /// Named resolver used by retrieval plumbing; equivalent to [`resolve`].

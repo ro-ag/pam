@@ -24,17 +24,15 @@
 //!
 //! ```text
 //! PAM_BENCH_MODEL=/tmp/pam-candidate-screen/models/qwen/Qwen3-14B-Q5_K_M.gguf \
-//! PAM_BENCH_BACKEND=cpu|metal|llama   (llama: the pinned llama-server, see below) \
+//! PAM_BENCH_BACKEND=llama   (the pinned llama-server, see below; kept for the record) \
 //! PAM_BENCH_HOST_LABEL=m4-max-64gib \
 //!   cargo test -p pam_model --release --test capability_bench -- --ignored --nocapture
 //! ```
 
-use candle_core::quantized::gguf_file;
 use pam_model::engine_server::{EngineServer, ServerOptions};
 use pam_model::{
     registry::{Registry, sha256_file},
-    runtime::{Backend, GenerateRequest, Runtime},
-    tokenizer::{self, ChatFraming},
+    runtime::GenerateRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -530,32 +528,17 @@ fn ratio(numerator: usize, denominator: usize) -> String {
 // Harness
 // ---------------------------------------------------------------------------
 
-/// Reads the artifact's declared framing and refuses to run under an
-/// undeclared one: capability scores on a file that declares no template
-/// measure the fallback, not the model.
-fn declared_framing(path: &Path) -> ChatFraming {
-    let content = gguf_file::Content::read(&mut std::fs::File::open(path).unwrap()).unwrap();
-    let tokenizer = tokenizer::from_gguf(&content).expect("tokenizer builds");
-    assert!(
-        tokenizer.framing.template_qualified(),
-        "capability scores are invalid under an undeclared chat template"
-    );
-    tokenizer.framing
-}
-
 #[tokio::test]
 #[ignore = "requires a pinned local GGUF, an explicit backend and a host label"]
 async fn bounded_task_capability_over_the_frozen_case_set() {
     let path = PathBuf::from(required("PAM_BENCH_MODEL"));
-    // `llama` runs the artifact under the pinned llama-server named by
-    // `PAM_BENCH_ENGINE_SERVER` (Metal by default on Apple Silicon;
-    // `PAM_BENCH_ENGINE_GPU_LAYERS=0` forces CPU); the candle backends stay
-    // for comparison.
-    let (backend, backend_name) = match required("PAM_BENCH_BACKEND").as_str() {
-        "cpu" => (Some(Backend::Cpu), "cpu"),
-        "metal" => (Some(Backend::Metal), "metal"),
-        "llama" => (None, "llama"),
-        _ => panic!("PAM_BENCH_BACKEND must be cpu, metal or llama"),
+    // `PAM_BENCH_BACKEND` is kept for the record even though the engine is
+    // the only backend left: every prior run's summary line names it, so
+    // the value stays a required, recorded field rather than disappearing
+    // silently from later runs.
+    let backend_name = match required("PAM_BENCH_BACKEND").as_str() {
+        "llama" => "llama",
+        _ => panic!("PAM_BENCH_BACKEND must be llama"),
     };
     let host_label = required("PAM_BENCH_HOST_LABEL");
     let revision = std::env::var("PAM_BENCH_REVISION").unwrap_or_else(|_| "unknown".into());
@@ -574,15 +557,10 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         "case_set_sha256":digest}),
     );
 
-    // Under the engine the GGUF's own jinja template frames every request
-    // (llama-server --jinja), so the candle-side template classification
-    // is neither needed nor always possible (MXFP4 artifacts, for one).
-    let (framing_label, template_qualified) = if backend.is_some() {
-        let framing = declared_framing(&path);
-        (framing.label().to_owned(), framing.template_qualified())
-    } else {
-        ("engine_template".to_owned(), true)
-    };
+    // The engine's own jinja template frames every request
+    // (llama-server --jinja); there is no candle-side template
+    // classification to run instead.
+    let (framing_label, template_qualified) = ("engine_template".to_owned(), true);
     let (artifact_sha, artifact_bytes) = sha256_file(&path).expect("artifact readable");
     let directory = path
         .parent()
@@ -596,7 +574,7 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         .expect("artifact in registry");
 
     let started = Instant::now();
-    let runtime = load_generator(backend, &entry, &path).await;
+    let runtime = load_generator(&entry, &path).await;
     emit(
         &json!({"schema_version":1,"phase":"load","wall_ms":started.elapsed().as_millis(),
         "framing":framing_label,"template_qualified":template_qualified,
@@ -674,21 +652,9 @@ struct Timed {
 /// Runs one case cold, then — when `warm` — once more, asserting the two
 /// outputs are byte-identical: a divergence breaks the temperature-0
 /// contract and voids the scores.
-/// Loads the artifact on the requested backend: the in-process candle
-/// runtime, or the pinned llama-server named by `PAM_BENCH_ENGINE_SERVER`.
-async fn load_generator(
-    backend: Option<Backend>,
-    entry: &pam_model::registry::ModelEntry,
-    path: &Path,
-) -> Generator {
-    if let Some(backend) = backend {
-        let runtime = Runtime::new();
-        tokio::time::timeout(CASE_LIMIT, runtime.load_on_backend(entry, backend))
-            .await
-            .expect("load timeout")
-            .expect("load");
-        return Generator::Candle(runtime);
-    }
+/// Loads the artifact on the pinned llama-server named by
+/// `PAM_BENCH_ENGINE_SERVER`.
+async fn load_generator(entry: &pam_model::registry::ModelEntry, path: &Path) -> Generator {
     let server = PathBuf::from(required("PAM_BENCH_ENGINE_SERVER"));
     let run = std::env::temp_dir().join(format!("pam-bench-{}", std::process::id()));
     std::fs::create_dir_all(&run).expect("bench run dir");
@@ -719,10 +685,8 @@ async fn load_generator(
     Generator::Llama(engine)
 }
 
-/// Where a case's completion comes from: the in-process candle runtime or
-/// the supervised llama-server. Both see the same request and limits.
+/// Where a case's completion comes from: the supervised llama-server.
 enum Generator {
-    Candle(Runtime),
     Llama(EngineServer),
 }
 
@@ -743,17 +707,6 @@ impl Generator {
         input_limit: usize,
     ) -> Result<Sample, String> {
         match self {
-            Self::Candle(runtime) => runtime
-                .generate_bounded(request, cancel, input_limit)
-                .await
-                .map(|result| Sample {
-                    text: result.text,
-                    prompt_ms: result.prompt_ms,
-                    decode_ms: result.decode_ms,
-                    prompt_tokens: result.prompt_tokens,
-                    completion_tokens: result.completion_tokens,
-                })
-                .map_err(|error| error.to_string()),
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,

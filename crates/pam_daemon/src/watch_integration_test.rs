@@ -457,7 +457,7 @@ async fn observe_terminal_collection(h: &Harness, ctx: &ExecContext, other: &mut
             .unwrap()
     );
     assert!(matches!(
-        h.models.runtime().snapshot().state,
+        h.models.snapshot().state,
         pam_model::RuntimeState::Idle
     ));
     other.args = json!({"ticket":"watch"});

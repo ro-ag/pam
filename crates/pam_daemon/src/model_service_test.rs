@@ -260,10 +260,10 @@ async fn diagnostic_requires_installed_id_and_does_not_resolve_or_load_a_default
         .generate_diagnostic("qwen/requested", diagnostic_request())
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        ModelUnavailable::Runtime(pam_model::RuntimeError::NoModelLoaded)
-    ));
+    assert!(
+        matches!(error, ModelUnavailable::Runtime(pam_model::RuntimeError::LoadFailed(ref detail)) if detail.contains("engine is not installed")),
+        "{error:?}"
+    );
     let missing = service
         .generate_diagnostic("qwen/missing", diagnostic_request())
         .await
@@ -271,10 +271,7 @@ async fn diagnostic_requires_installed_id_and_does_not_resolve_or_load_a_default
     assert!(
         matches!(missing, ModelUnavailable::Service(ModelServiceError::UnknownModel(id)) if id == "qwen/missing")
     );
-    assert_eq!(
-        service.runtime().snapshot().state,
-        pam_model::RuntimeState::Idle
-    );
+    assert_eq!(service.snapshot().state, pam_model::RuntimeState::Idle);
 }
 
 #[tokio::test]
@@ -290,10 +287,7 @@ async fn reserved_model_operation_refuses_diagnostic_without_waiting_or_loading(
         error,
         ModelUnavailable::Runtime(pam_model::RuntimeError::Busy)
     ));
-    assert_eq!(
-        service.runtime().snapshot().state,
-        pam_model::RuntimeState::Idle
-    );
+    assert_eq!(service.snapshot().state, pam_model::RuntimeState::Idle);
 }
 
 #[tokio::test(start_paused = true)]
@@ -330,14 +324,11 @@ async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
         .generate_diagnostic("qwen/same", diagnostic_request())
         .await
         .unwrap_err();
-    assert!(matches!(
-        refused,
-        ModelUnavailable::Runtime(pam_model::RuntimeError::NoModelLoaded)
-    ));
-    assert_eq!(
-        service.runtime().snapshot().state,
-        pam_model::RuntimeState::Idle
+    assert!(
+        matches!(refused, ModelUnavailable::Runtime(pam_model::RuntimeError::LoadFailed(ref detail)) if detail.contains("engine is not installed")),
+        "{refused:?}"
     );
+    assert_eq!(service.snapshot().state, pam_model::RuntimeState::Idle);
 }
 
 /// The fake llama-server `cargo test` builds for `pam_model`, found next to
@@ -422,9 +413,11 @@ async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
     assert_eq!(status["engine"]["installed"], true);
     assert_eq!(status["engine"]["loaded"]["id"], "qwen/tiny");
     assert_eq!(
-        status["runtime"]["state"]["state"], "idle",
-        "candle holds no second copy"
+        status["runtime"]["state"]["state"], "loaded",
+        "the runtime snapshot mirrors what the engine holds"
     );
+    assert_eq!(status["runtime"]["state"]["id"], "qwen/tiny");
+    assert_eq!(status["runtime"]["busy"], false);
 
     // The prompt limit is enforced by the engine's own tokenizer count.
     let too_long = service
@@ -452,4 +445,5 @@ async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
     service.unload_all().await.unwrap();
     let status = service.status().await.unwrap();
     assert!(status["engine"]["loaded"].is_null());
+    assert_eq!(status["runtime"]["state"]["state"], "idle");
 }

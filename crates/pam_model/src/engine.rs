@@ -665,10 +665,13 @@ async fn verify_build(server: &Path, build: u64) -> Result<String, EngineError> 
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
-    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+    // The first launch of a freshly unpacked binary can take tens of
+    // seconds on macOS (first-run system checks) and on slow CI hosts;
+    // later launches answer in milliseconds.
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output())
         .await
         .map_err(|_| EngineError::Verify {
-            detail: "llama-server --version did not answer within 20 s".to_owned(),
+            detail: "llama-server --version did not answer within 120 s".to_owned(),
         })?
         .map_err(|e| EngineError::Verify {
             detail: format!("llama-server could not start: {e}"),

@@ -211,12 +211,15 @@ function RuntimeCard({
         {runtime?.state === "loading" && (
           <Badge tone="warning">loading · {runtime.phase}</Badge>
         )}
-        {runtime?.state === "idle" && <Badge tone="neutral">idle</Badge>}
+        {runtime?.state === "idle" && engine?.loaded && (
+          <Badge tone="success">engine</Badge>
+        )}
+        {runtime?.state === "idle" && !engine?.loaded && <Badge tone="neutral">idle</Badge>}
       </div>
 
       {failure && <FailureNote failure={failure} label="runtime" />}
 
-      {!failure && runtime?.state === "idle" && (
+      {!failure && runtime?.state === "idle" && !engine?.loaded && (
         <p className="font-sans text-sm text-ink-muted">{IDLE_RUNTIME_SENTENCE}</p>
       )}
 
@@ -285,7 +288,7 @@ function RuntimeCard({
         <Button
           size="sm"
           variant="ghost"
-          disabled={!loaded || unload.isPending}
+          disabled={(!loaded && !engine?.loaded) || unload.isPending}
           onClick={() => unload.mutate()}
         >
           Unload

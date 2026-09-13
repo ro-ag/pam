@@ -295,7 +295,7 @@ describe("runtime card", () => {
     );
     renderModels();
     const card = within(await screen.findByRole("region", { name: "Runtime" }));
-    expect(await card.findByText("engine")).toBeInTheDocument();
+    expect(await card.findAllByText("engine")).toHaveLength(2);
     expect(card.getByText("qwen/Qwen3-Coder-30B-A3B-engine")).toBeInTheDocument();
     expect(card.getByText("8192 tokens")).toBeInTheDocument();
     expect(card.getByText("b1234")).toBeInTheDocument();

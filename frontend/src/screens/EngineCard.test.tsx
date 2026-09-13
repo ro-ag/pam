@@ -81,7 +81,7 @@ describe("not installed", () => {
 });
 
 describe("installed", () => {
-  it("shows the tag, target, version line and sha prefix, without offering Reinstall", async () => {
+  it("shows the tag, target, version line and sha prefix, and offers Reinstall", async () => {
     mockBridge({
       "admin.models.engine.status": () =>
         status({ installed: true, cause: null, manifest: manifest() }),
@@ -92,8 +92,8 @@ describe("installed", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/version: 1234 \(abcdef0\)/)).toBeInTheDocument();
     expect(screen.getByText(/sha abcdef012345/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Install engine" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Reinstall engine" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reinstall engine" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Install engine" })).not.toBeInTheDocument();
   });
 
   it.each([

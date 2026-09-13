@@ -71,9 +71,11 @@ export function EngineCard() {
   const installFailure = install.isError ? toBridgeFailure(install.error) : null;
   const data = status.data;
   const hideButton = data?.cause === "unsupported_target";
-  const buttonLabel = data && REINSTALL_CAUSES.has(data.cause ?? "")
-    ? "Reinstall engine"
-    : "Install engine";
+  // Anything already on disk — healthy, stale or broken — is a reinstall.
+  const buttonLabel =
+    data && (data.installed || REINSTALL_CAUSES.has(data.cause ?? ""))
+      ? "Reinstall engine"
+      : "Install engine";
 
   return (
     <Panel className="space-y-3 p-4">

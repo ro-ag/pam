@@ -315,6 +315,14 @@ async fn status_bypasses_the_lanes_and_verifies() {
         assert_eq!(body["model"]["state"], "idle");
         assert_eq!(body["model"]["id"], serde_json::Value::Null);
         assert_eq!(body["model"]["tokens_per_sec"], serde_json::Value::Null);
+        // The engine block tells a CLI caller whether llama.cpp is on disk
+        // and what it holds; a fresh base has neither.
+        assert_eq!(body["model"]["engine"]["installed"], false);
+        assert_eq!(
+            body["model"]["engine"]["tag"],
+            pam_model::engine::ENGINE_TAG
+        );
+        assert_eq!(body["model"]["engine"]["build_info"], serde_json::Value::Null);
         assert_eq!(body["model"]["defaults"]["light"], serde_json::Value::Null);
         assert_eq!(body["model"]["defaults"]["heavy"], serde_json::Value::Null);
 

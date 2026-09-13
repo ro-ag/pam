@@ -19,10 +19,9 @@
 //! Every entry is Qwen3-Coder-30B-A3B-Instruct — a mixture of experts with
 //! roughly 3B parameters active per token, which is what makes a 30B model
 //! answer at a usable speed on a laptop. The entries differ only in
-//! quantization, and each one clears
-//! [`MODEL_FLOOR_BYTES`](crate::registry::MODEL_FLOOR_BYTES); a unit test
-//! enforces that, because a catalog entry that could not serve a job would
-//! be an invitation to a download that ends in a refusal.
+//! quantization, and each one carries the digest the download verifies; a
+//! unit test enforces that, because a catalog entry without a digest could
+//! never be admitted as a tier default.
 //!
 //! Only K-quants and `Q8_0` are listed. The repository also publishes IQ and
 //! UD variants, and they are smaller — but candle's quantized kernels do not

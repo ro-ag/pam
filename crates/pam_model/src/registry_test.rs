@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::gguf_test::{GGML_F32, GgufValue, synth_gguf, tiny_moe_gguf};
 use crate::registry::{
-    MODEL_FLOOR_BYTES, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, classify,
-    default_models_dir, sha256_file, verified_sidecar_path,
+    ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, classify, default_models_dir,
+    sha256_file, verified_sidecar_path,
 };
 
 /// A models dir with `qwen/<name>` written from `bytes`.
@@ -17,11 +17,15 @@ fn models_dir_with(name: &str, bytes: &[u8]) -> (tempfile::TempDir, Registry) {
 }
 
 #[test]
-fn classify_draws_the_line_at_the_floor() {
-    assert_eq!(classify(MODEL_FLOOR_BYTES), ModelClass::Engine);
-    assert_eq!(classify(MODEL_FLOOR_BYTES + 1), ModelClass::Engine);
-    assert_eq!(classify(MODEL_FLOOR_BYTES - 1), ModelClass::TestOnly);
-    assert_eq!(classify(0), ModelClass::TestOnly);
+fn classify_admits_only_a_verified_digest() {
+    let record = VerifiedRecord {
+        sha256: "a".repeat(64),
+        size_bytes: 1,
+        verified_ts: 0,
+        matches_catalog: None,
+    };
+    assert_eq!(classify(Some(&record)), ModelClass::Engine);
+    assert_eq!(classify(None), ModelClass::TestOnly);
 }
 
 #[test]

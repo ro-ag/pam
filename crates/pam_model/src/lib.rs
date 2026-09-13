@@ -26,14 +26,13 @@
 //!   them, ask one a single tool-free question.
 //! - [`error`] — one place to reach for the crate's error types.
 //!
-//! # The floor
+//! # Admission
 //!
-//! [`registry::MODEL_FLOOR_BYTES`] is the line between a model that may
-//! serve a job and one that may only prove the wiring works. Anything under
-//! 18 GB is [`ModelClass::TestOnly`]: loadable and promptable from the GUI,
-//! refused as a tier default. The catalog never lists anything below it. The
-//! rule lives here rather than in the daemon because it is a property of the
-//! weights, not of the policy around them.
+//! [`registry::classify`] admits a model only once its digest is verified:
+//! a verified file is [`ModelClass::Engine`] and may be a tier default;
+//! anything unverified is [`ModelClass::TestOnly`], loadable and promptable
+//! from the GUI to prove the wiring, refused as a tier default. Size decides
+//! nothing since the llama.cpp engine replaced the in-process runtime.
 //!
 //! # Blocking
 //!
@@ -74,8 +73,8 @@ pub use download::{
 };
 pub use gguf::{GgufError, GgufInfo, read_info};
 pub use registry::{
-    MODEL_FLOOR_BYTES, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord,
-    VerifyOutcome, classify, default_models_dir,
+    ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, VerifyOutcome, classify,
+    default_models_dir,
 };
 pub use runtime::{
     CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot,

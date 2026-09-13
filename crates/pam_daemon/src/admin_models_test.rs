@@ -12,8 +12,8 @@ use crate::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService, CAUSE_INVALID_ADMIN_ARGS, CAUSE_UNKNOWN_ADMIN_OP,
 };
 use crate::admin_models::{
-    CAUSE_ALREADY_INSTALLED, CAUSE_BELOW_FLOOR, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED,
-    CAUSE_UNKNOWN_MODEL, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET, OP_CURATOR_TEST,
+    CAUSE_ALREADY_INSTALLED, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED, CAUSE_UNKNOWN_MODEL,
+    CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET, OP_CURATOR_TEST,
     OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE, OP_MODELS_DOWNLOAD,
     OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST, OP_MODELS_LOAD,
     OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD, OP_MODELS_VERIFY,
@@ -323,7 +323,6 @@ async fn catalog_flags_every_preset_for_this_host() {
         );
         let presets = body["presets"].as_array().unwrap();
         assert_eq!(presets.len(), CATALOG.len());
-        assert_eq!(body["floor_bytes"], pam_model::MODEL_FLOOR_BYTES);
         let host_ram = body["host_ram_bytes"].as_u64().expect("host ram");
 
         for (value, preset) in presets.iter().zip(CATALOG) {
@@ -354,7 +353,7 @@ async fn a_test_only_model_is_refused_as_a_tier_default() {
                 json!({ "tier": "heavy", "model_id": "qwen/tiny" }),
             )
             .await,
-            CAUSE_BELOW_FLOOR,
+            CAUSE_UNVERIFIED,
         );
         assert!(detail.contains("qwen/tiny"), "detail: {detail}");
         assert_eq!(fx.models.defaults().await.unwrap(), (None, None));

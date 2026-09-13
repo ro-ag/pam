@@ -2,20 +2,20 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::catalog::{CATALOG, QWEN_BASE_URL, find_preset};
-use crate::registry::MODEL_FLOOR_BYTES;
 
 const GB: u64 = 1_000_000_000;
 
 #[test]
-fn every_preset_clears_the_engine_floor() {
+fn every_preset_carries_the_digest_its_download_verifies() {
     for preset in CATALOG {
-        assert!(
-            preset.size_bytes >= MODEL_FLOOR_BYTES,
-            "{} is {} bytes, under the {MODEL_FLOOR_BYTES} floor; the catalog \
-             must never offer a model that cannot serve a job",
-            preset.id,
-            preset.size_bytes
+        assert_eq!(
+            preset.sha256.len(),
+            64,
+            "{} has no pinned SHA-256; the catalog must never offer a model \
+             that cannot be verified and admitted",
+            preset.id
         );
+        assert!(preset.size_bytes > 0, "{} declares no size", preset.id);
     }
 }
 

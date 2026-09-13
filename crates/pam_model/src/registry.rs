@@ -13,14 +13,16 @@
 //! not ending in `.gguf` are ignored; so are dotfiles, which is what keeps
 //! a download's own sidecars out of the listing.
 //!
-//! # The floor
+//! # Admission
 //!
-//! [`classify`] is the whole engine/test-only rule:
-//! [`MODEL_FLOOR_BYTES`] and up is an [`ModelClass::Engine`], anything
-//! smaller is [`ModelClass::TestOnly`]. A test-only model loads and answers
-//! prompts — that is how the wiring gets proved — but the daemon refuses it
-//! as a tier default, because a model that small produces confident
-//! nonsense and PAM would be lying by shipping it as an engine.
+//! [`classify`] is the whole engine/test-only rule: a file whose SHA-256
+//! has been verified (a completed Verify job, or a catalog download that
+//! checked its digest) is an [`ModelClass::Engine`]; anything unverified is
+//! [`ModelClass::TestOnly`]. A test-only model loads and answers prompts —
+//! that is how the wiring gets proved — but the daemon refuses it as a tier
+//! default, because a job must never run on bytes nobody has checked. Size
+//! is no longer a criterion: the llama.cpp engine runs whatever fits, and
+//! quality is measured by the capability bench, not guessed from bytes.
 //!
 //! # Verification
 //!
@@ -52,13 +54,6 @@ use crate::gguf::{self, GgufError, GgufInfo};
 /// The line between a model that may serve a job and one that may only
 /// prove the wiring works: 18 GB.
 ///
-/// It is a size rather than a parameter count because size is what the
-/// registry can know about every file without loading it, and because the
-/// quantization is exactly what the figure is meant to capture — a 30B
-/// model squeezed under 18 GB has been squeezed too hard to trust with a
-/// summary the human will act on.
-pub const MODEL_FLOOR_BYTES: u64 = 18_000_000_000;
-
 /// Chunk size for [`sha256_file`]. Big enough that the syscall overhead
 /// disappears, small enough to stay off the stack and out of the way.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
@@ -70,10 +65,10 @@ const VERIFIED_SIDECAR_SUFFIX: &str = ".pam-model.verified";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelClass {
-    /// Large enough to serve a job; may be a tier default.
+    /// Digest verified; may serve a job and be a tier default.
     Engine,
-    /// Loadable and promptable for wiring checks only; refused as a tier
-    /// default.
+    /// Unverified: loadable and promptable for wiring checks only; refused
+    /// as a tier default until a Verify job checks its digest.
     TestOnly,
 }
 
@@ -351,7 +346,7 @@ fn describe(path: &Path, vendor: &str, file_name: &str, size_bytes: u64) -> Mode
         size_bytes,
         info,
         info_error,
-        class: classify(size_bytes),
+        class: classify(read_verified(path).as_ref()),
         verified: read_verified(path),
         catalog_id: CATALOG
             .iter()
@@ -390,10 +385,10 @@ fn now_unix_seconds() -> i64 {
         })
 }
 
-/// Which side of the engine floor a file falls on.
+/// Whether a file may serve jobs: only a verified digest admits it.
 #[must_use]
-pub fn classify(size_bytes: u64) -> ModelClass {
-    if size_bytes >= MODEL_FLOOR_BYTES {
+pub fn classify(verified: Option<&VerifiedRecord>) -> ModelClass {
+    if verified.is_some() {
         ModelClass::Engine
     } else {
         ModelClass::TestOnly

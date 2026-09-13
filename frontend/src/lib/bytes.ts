@@ -1,11 +1,10 @@
 /**
  * Byte sizes, spoken the way the model layer speaks them.
  *
- * Decimal units on purpose: the engine floor is written as 18 GB
- * (`MODEL_FLOOR_BYTES = 18_000_000_000`) and the catalog quotes 18.56 GB
- * for the smallest preset. Binary units would render the same file as
- * "17.3 GiB" and put the number on the wrong side of the floor the
- * sentence next to it names — so the screen and the rule agree here, and
+ * Decimal units on purpose: the catalog and the model layer quote sizes
+ * in GB (18.56 GB for the coder preset), and binary units would render the
+ * same file as "17.3 GiB", a different number next to the same sentence —
+ * so the screen and the rule agree here, and
  * PAM never argues with itself about a size.
  */
 

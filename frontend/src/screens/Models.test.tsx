@@ -177,7 +177,6 @@ beforeEach(() => {
   mocks.modelsCatalog.mockResolvedValue({
     presets: [preset()],
     host_ram_bytes: 64_000_000_000,
-    floor_bytes: 18_000_000_000,
   });
   mocks.modelsLoad.mockResolvedValue({ state: { state: "idle" } });
   mocks.modelsUnload.mockResolvedValue({ state: { state: "idle" } });
@@ -391,7 +390,6 @@ describe("catalog", () => {
         preset({ id: "already-here", label: "Already here", installed: true }),
       ],
       host_ram_bytes: 64_000_000_000,
-      floor_bytes: 18_000_000_000,
     });
     renderModels();
     fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
@@ -445,7 +443,6 @@ describe("catalog", () => {
     mocks.modelsCatalog.mockResolvedValue({
       presets: [preset({ partial_bytes: 9_278_344_784 })],
       host_ram_bytes: 64_000_000_000,
-      floor_bytes: 18_000_000_000,
     });
     mocks.modelsStatus.mockResolvedValue(
       idleStatus({
@@ -511,7 +508,6 @@ describe("catalog", () => {
     mocks.modelsCatalog.mockResolvedValue({
       presets: [preset({ partial_bytes: 9_278_344_784 })],
       host_ram_bytes: 64_000_000_000,
-      floor_bytes: 18_000_000_000,
     });
     renderModels();
     fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
@@ -556,7 +552,7 @@ describe("catalog", () => {
       }),
     );
     expect(catalog.getByText(/stays unverified until you run Verify/)).toBeInTheDocument();
-    expect(catalog.getByText(/under 18 GB load only as test-only/)).toBeInTheDocument();
+    expect(catalog.getByText(/Unverified models load only as test-only/)).toBeInTheDocument();
   });
 });
 

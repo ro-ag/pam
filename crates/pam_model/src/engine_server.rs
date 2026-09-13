@@ -495,7 +495,11 @@ impl EngineServer {
                         "temperature": request.temperature,
                         "stop": request.stop,
                         "stream": false,
-                        "cache_prompt": true,
+                        // Bounded tasks are scored on reproducibility: no
+                        // prompt-cache reuse and a fixed seed keep two runs
+                        // of one request on one server identical.
+                        "cache_prompt": false,
+                        "seed": 7,
                     }),
                     deadline,
                 )

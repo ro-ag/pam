@@ -24,12 +24,13 @@
 //!
 //! ```text
 //! PAM_BENCH_MODEL=/tmp/pam-candidate-screen/models/qwen/Qwen3-14B-Q5_K_M.gguf \
-//! PAM_BENCH_BACKEND=cpu \
+//! PAM_BENCH_BACKEND=cpu|metal|llama   (llama: the pinned llama-server, see below) \
 //! PAM_BENCH_HOST_LABEL=m4-max-64gib \
 //!   cargo test -p pam_model --release --test capability_bench -- --ignored --nocapture
 //! ```
 
 use candle_core::quantized::gguf_file;
+use pam_model::engine_server::{EngineServer, ServerOptions};
 use pam_model::{
     registry::{Registry, sha256_file},
     runtime::{Backend, GenerateRequest, Runtime},
@@ -546,10 +547,15 @@ fn declared_framing(path: &Path) -> ChatFraming {
 #[ignore = "requires a pinned local GGUF, an explicit backend and a host label"]
 async fn bounded_task_capability_over_the_frozen_case_set() {
     let path = PathBuf::from(required("PAM_BENCH_MODEL"));
+    // `llama` runs the artifact under the pinned llama-server named by
+    // `PAM_BENCH_ENGINE_SERVER` (Metal by default on Apple Silicon;
+    // `PAM_BENCH_ENGINE_GPU_LAYERS=0` forces CPU); the candle backends stay
+    // for comparison.
     let (backend, backend_name) = match required("PAM_BENCH_BACKEND").as_str() {
-        "cpu" => (Backend::Cpu, "cpu"),
-        "metal" => (Backend::Metal, "metal"),
-        _ => panic!("PAM_BENCH_BACKEND must be cpu or metal"),
+        "cpu" => (Some(Backend::Cpu), "cpu"),
+        "metal" => (Some(Backend::Metal), "metal"),
+        "llama" => (None, "llama"),
+        _ => panic!("PAM_BENCH_BACKEND must be cpu, metal or llama"),
     };
     let host_label = required("PAM_BENCH_HOST_LABEL");
     let revision = std::env::var("PAM_BENCH_REVISION").unwrap_or_else(|_| "unknown".into());
@@ -568,7 +574,15 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         "case_set_sha256":digest}),
     );
 
-    let framing = declared_framing(&path);
+    // Under the engine the GGUF's own jinja template frames every request
+    // (llama-server --jinja), so the candle-side template classification
+    // is neither needed nor always possible (MXFP4 artifacts, for one).
+    let (framing_label, template_qualified) = if backend.is_some() {
+        let framing = declared_framing(&path);
+        (framing.label().to_owned(), framing.template_qualified())
+    } else {
+        ("engine_template".to_owned(), true)
+    };
     let (artifact_sha, artifact_bytes) = sha256_file(&path).expect("artifact readable");
     let directory = path
         .parent()
@@ -581,15 +595,11 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         .find(|entry| entry.path == path)
         .expect("artifact in registry");
 
-    let runtime = Runtime::new();
     let started = Instant::now();
-    let _loaded = tokio::time::timeout(CASE_LIMIT, runtime.load_on_backend(&entry, backend))
-        .await
-        .expect("load timeout")
-        .expect("load");
+    let runtime = load_generator(backend, &entry, &path).await;
     emit(
         &json!({"schema_version":1,"phase":"load","wall_ms":started.elapsed().as_millis(),
-        "framing":framing.label(),"template_qualified":framing.template_qualified(),
+        "framing":framing_label,"template_qualified":template_qualified,
         "sha256":artifact_sha,"bytes":artifact_bytes,"backend":backend_name,
         "host_label":host_label,"revision":revision}),
     );
@@ -640,7 +650,7 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         &digest,
         backend_name,
         &host_label,
-        framing,
+        &framing_label,
         &revision,
         &artifact_sha,
         &false_pass_ids,
@@ -664,7 +674,107 @@ struct Timed {
 /// Runs one case cold, then — when `warm` — once more, asserting the two
 /// outputs are byte-identical: a divergence breaks the temperature-0
 /// contract and voids the scores.
-async fn score_case(runtime: &Runtime, case: &Case, warm: bool) -> Timed {
+/// Loads the artifact on the requested backend: the in-process candle
+/// runtime, or the pinned llama-server named by `PAM_BENCH_ENGINE_SERVER`.
+async fn load_generator(
+    backend: Option<Backend>,
+    entry: &pam_model::registry::ModelEntry,
+    path: &Path,
+) -> Generator {
+    if let Some(backend) = backend {
+        let runtime = Runtime::new();
+        tokio::time::timeout(CASE_LIMIT, runtime.load_on_backend(entry, backend))
+            .await
+            .expect("load timeout")
+            .expect("load");
+        return Generator::Candle(runtime);
+    }
+    let server = PathBuf::from(required("PAM_BENCH_ENGINE_SERVER"));
+    let run = std::env::temp_dir().join(format!("pam-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&run).expect("bench run dir");
+    let engine = EngineServer::new(server, &run, &run).expect("engine supervisor");
+    let options = ServerOptions {
+        context_tokens: pam_model::runtime::CONTEXT_TOKENS,
+        gpu_layers: std::env::var("PAM_BENCH_ENGINE_GPU_LAYERS")
+            .ok()
+            .map(|v| v.parse().expect("PAM_BENCH_ENGINE_GPU_LAYERS is a number")),
+        // -1 lets a thinking model reason without a budget; 0 (default)
+        // measures the bounded-task product setting.
+        reasoning_budget: std::env::var("PAM_BENCH_ENGINE_REASONING_BUDGET")
+            .ok()
+            .map_or(0, |v| {
+                v.parse()
+                    .expect("PAM_BENCH_ENGINE_REASONING_BUDGET is a number")
+            }),
+        ..ServerOptions::default()
+    };
+    let loaded = tokio::time::timeout(CASE_LIMIT, engine.load(&entry.id, path, &options))
+        .await
+        .expect("engine load timeout")
+        .expect("engine load");
+    emit(
+        &json!({"schema_version":1,"phase":"engine","build_info":loaded.build_info,
+        "endpoint":format!("{:?}", engine.endpoint()),"gpu_layers":options.gpu_layers}),
+    );
+    Generator::Llama(engine)
+}
+
+/// Where a case's completion comes from: the in-process candle runtime or
+/// the supervised llama-server. Both see the same request and limits.
+enum Generator {
+    Candle(Runtime),
+    Llama(EngineServer),
+}
+
+/// The parts of one completion the bench scores and records.
+struct Sample {
+    text: String,
+    prompt_ms: u64,
+    decode_ms: u64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+impl Generator {
+    async fn generate(
+        &self,
+        request: GenerateRequest,
+        cancel: watch::Receiver<bool>,
+        input_limit: usize,
+    ) -> Result<Sample, String> {
+        match self {
+            Self::Candle(runtime) => runtime
+                .generate_bounded(request, cancel, input_limit)
+                .await
+                .map(|result| Sample {
+                    text: result.text,
+                    prompt_ms: result.prompt_ms,
+                    decode_ms: result.decode_ms,
+                    prompt_tokens: result.prompt_tokens,
+                    completion_tokens: result.completion_tokens,
+                })
+                .map_err(|error| error.to_string()),
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "server timings are whole milliseconds for the record"
+            )]
+            Self::Llama(engine) => engine
+                .generate(&request, cancel, input_limit, CASE_LIMIT)
+                .await
+                .map(|result| Sample {
+                    text: result.text,
+                    prompt_ms: result.prompt_ms.max(0.0) as u64,
+                    decode_ms: result.predicted_ms.max(0.0) as u64,
+                    prompt_tokens: result.prompt_tokens,
+                    completion_tokens: result.completion_tokens,
+                })
+                .map_err(|error| error.to_string()),
+        }
+    }
+}
+
+async fn score_case(runtime: &Generator, case: &Case, warm: bool) -> Timed {
     let request = GenerateRequest {
         system: Some(SYSTEM.into()),
         prompt: format!("{}\n\n{}", case.record, case.question),
@@ -676,7 +786,7 @@ async fn score_case(runtime: &Runtime, case: &Case, warm: bool) -> Timed {
     let started = Instant::now();
     let result = tokio::time::timeout(
         CASE_LIMIT,
-        runtime.generate_bounded(request.clone(), cancel, INPUT_LIMIT),
+        runtime.generate(request.clone(), cancel, INPUT_LIMIT),
     )
     .await
     .expect("case timed out")
@@ -688,13 +798,11 @@ async fn score_case(runtime: &Runtime, case: &Case, warm: bool) -> Timed {
     if warm {
         let (_sender, cancel) = watch::channel(false);
         let started = Instant::now();
-        let repeat = tokio::time::timeout(
-            CASE_LIMIT,
-            runtime.generate_bounded(request, cancel, INPUT_LIMIT),
-        )
-        .await
-        .expect("warm case timed out")
-        .expect("warm generation failed");
+        let repeat =
+            tokio::time::timeout(CASE_LIMIT, runtime.generate(request, cancel, INPUT_LIMIT))
+                .await
+                .expect("warm case timed out")
+                .expect("warm generation failed");
         warm_ms = Some(millis(started.elapsed()));
         assert_eq!(
             hex::encode(Sha256::digest(repeat.text.as_bytes())),
@@ -728,7 +836,7 @@ fn summarize(
     digest: &str,
     backend_name: &str,
     host_label: &str,
-    framing: ChatFraming,
+    framing_label: &str,
     revision: &str,
     artifact_sha: &str,
     false_pass_ids: &[String],
@@ -756,7 +864,7 @@ fn summarize(
         "schema_version":1,"phase":"summary","case_set_sha256":digest,
         "cases":total,"backend":backend_name,"host_label":host_label,
         "label":"64 GiB host measurement - not a 32 GB qualification",
-        "framing":framing.label(),"revision":revision,"artifact_sha256":artifact_sha,
+        "framing":framing_label,"revision":revision,"artifact_sha256":artifact_sha,
         "accuracy":ratio(correct, total),
         "coverage_on_decidable":ratio(decidable - over_abstain, decidable),
         "false_pass_count":false_pass,"false_pass_ids":false_pass_ids,

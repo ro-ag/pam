@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-13-llama-engine-screen",
+  "purpose": "task_151_frozen_capability_bench_on_the_llama_cpp_engine",
+  "host": "Apple M4 Max, 64 GiB, ambient load (not a 32 GB measurement)",
+  "engine": {
+    "tag": "b10938",
+    "build_info": "b10938-f1e44dcc1",
+    "backend": "Metal (default offload)",
+    "transport": "Unix socket",
+    "supervisor_settings": {
+      "reasoning_budget": 0,
+      "cache_prompt": false,
+      "seed": 7,
+      "context_tokens": 8192
+    }
+  },
+  "case_set_sha256": "a324c2e3c28a933a845b3f6e0655fdb65472696bf4f516782992e2b9cf5dc8c6",
+  "gates": {
+    "accuracy": ">=0.95",
+    "false_passes": 0,
+    "warm_p95_ms": "<10000 short tasks"
+  },
+  "artifacts": [
+    {
+      "artifact": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M (unsloth GGUF, sha fadc3e5f...)",
+      "note": "same artifact as the candle CPU run of 2026-09-12 (0.847 / 7 FP); on the engine: 0.853 / 7 FP, warm p95 671 ms vs 26.5 s",
+      "accuracy": "0.853",
+      "false_passes": 7,
+      "false_pass_ids": [
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 5,
+      "coverage_on_decidable": "0.912",
+      "contract_violations": 0,
+      "warm_p50_ms": 362,
+      "warm_p95_ms": 671,
+      "cold_p95_ms": 681,
+      "families": {
+        "abstention_trap": {
+          "correct": 6,
+          "total": 22,
+          "false_pass": 7,
+          "contract_violation": 0,
+          "over_abstain": 5
+        },
+        "build_triage": {
+          "correct": 42,
+          "total": 48,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 5
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "gpt-oss-20b-MXFP4 (ggml-org GGUF, 12,109,566,624 B)",
+      "note": "not loadable on candle; on the engine the best false-pass count so far (3) and the best abstention-trap score (11/22)",
+      "accuracy": "0.867",
+      "false_passes": 3,
+      "false_pass_ids": [
+        "at-000",
+        "at-003",
+        "at-021"
+      ],
+      "false_alarms": 4,
+      "coverage_on_decidable": "0.895",
+      "contract_violations": 1,
+      "warm_p50_ms": 487,
+      "warm_p95_ms": 574,
+      "cold_p95_ms": 575,
+      "families": {
+        "abstention_trap": {
+          "correct": 11,
+          "total": 22,
+          "false_pass": 3,
+          "contract_violation": 0,
+          "over_abstain": 4
+        },
+        "build_triage": {
+          "correct": 39,
+          "total": 48,
+          "false_pass": 0,
+          "contract_violation": 1,
+          "over_abstain": 8
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "gpt-oss-20b-MXFP4, reasoning budget -1",
+      "note": "NOT a fair measurement: reasoning consumed the 96-token output cap before an ANSWER line on 89 cases; kept as the reason a reasoning arm needs its own envelope",
+      "accuracy": "0.347",
+      "false_passes": 3,
+      "false_pass_ids": [
+        "bt-019",
+        "at-013",
+        "at-021"
+      ],
+      "false_alarms": 6,
+      "coverage_on_decidable": "1.000",
+      "contract_violations": 89,
+      "warm_p50_ms": 1039,
+      "warm_p95_ms": 1073,
+      "cold_p95_ms": 1076,
+      "families": {
+        "abstention_trap": {
+          "correct": 3,
+          "total": 22,
+          "false_pass": 2,
+          "contract_violation": 11,
+          "over_abstain": 0
+        },
+        "build_triage": {
+          "correct": 37,
+          "total": 48,
+          "false_pass": 1,
+          "contract_violation": 10,
+          "over_abstain": 0
+        },
+        "fact_extraction": {
+          "correct": 7,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 33,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 5,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 35,
+          "over_abstain": 0
+        }
+      }
+    }
+  ],
+  "findings": {
+    "latency": "the warm p95 gate (<10 s) is met by every artifact on the engine by more than an order of magnitude (574-671 ms); a full 150-case run takes about two minutes where candle on CPU took an hour",
+    "accuracy": "neither artifact meets the 0.95 accuracy gate or zero false passes; every remaining false pass is an abstention-trap variant (ambiguous final-stage wording, or a status word with no exit evidence); gpt-oss-20b halves the false passes (3) and doubles the trap score (11/22) relative to the coder",
+    "determinism": "warm repeats are bit-identical on Metal once the supervisor sends cache_prompt=false and a fixed seed; with prompt-cache reuse one case (bt-014) diverged",
+    "engine_only_artifacts": "gpt-oss-20b runs only on the engine (MXFP4 is not readable by candle 0.9.2); the bench skips candle-side template classification under the engine because llama-server --jinja frames requests from the GGUF template"
+  },
+  "not_measured": "the #139 structured-diagnosis sequence on the engine (needs the pinned Microsoft compressor assets re-downloaded after /tmp was wiped); Qwen3-Coder-Next (48 GB, four shards) not fetched yet",
+  "raw": "one JSON line per case and the summary line per artifact, as emitted by capability_bench with PAM_BENCH_BACKEND=llama"
+}

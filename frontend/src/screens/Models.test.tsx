@@ -274,6 +274,42 @@ describe("runtime card", () => {
     fireEvent.click(card.getByRole("button", { name: "Load" }));
     await waitFor(() => expect(mocks.modelsLoad).toHaveBeenCalledWith("qwen/Qwen3-0.6B-Q8_0"));
   });
+
+  it("shows which model the engine holds, badged, when the engine is installed and loaded", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({
+        engine: {
+          installed: true,
+          expected_tag: "b1234",
+          cause: null,
+          loaded: {
+            id: "qwen/Qwen3-Coder-30B-A3B-engine",
+            path: "/Users/dev/llm/qwen/Qwen3-Coder-30B-A3B-engine.gguf",
+            context_length: 8192,
+            build_info: "b1234",
+            loaded_at_ms: Date.now(),
+            pid: 4242,
+          },
+        },
+      }),
+    );
+    renderModels();
+    const card = within(await screen.findByRole("region", { name: "Runtime" }));
+    expect(await card.findByText("engine")).toBeInTheDocument();
+    expect(card.getByText("qwen/Qwen3-Coder-30B-A3B-engine")).toBeInTheDocument();
+    expect(card.getByText("8192 tokens")).toBeInTheDocument();
+    expect(card.getByText("b1234")).toBeInTheDocument();
+  });
+
+  it("says the engine is ready but idle when installed with nothing loaded", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({
+        engine: { installed: true, expected_tag: "b1234", cause: null, loaded: null },
+      }),
+    );
+    renderModels();
+    expect(await screen.findByText("Engine ready, nothing loaded")).toBeInTheDocument();
+  });
 });
 
 describe("library", () => {

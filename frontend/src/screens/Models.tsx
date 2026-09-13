@@ -1,4 +1,5 @@
 import { CompressorCard } from "./CompressorCard";
+import { EngineCard } from "./EngineCard";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -196,6 +197,7 @@ function RuntimeCard({
 
   const runtime = status?.runtime.state;
   const loaded = runtime?.state === "loaded" ? runtime : null;
+  const engine = status?.engine;
   // The try box exists to prove wiring, so test-only weights are loadable
   // here on purpose; only the tier defaults enforce the floor.
   const selectable = models;
@@ -216,6 +218,21 @@ function RuntimeCard({
 
       {!failure && runtime?.state === "idle" && (
         <p className="font-sans text-sm text-ink-muted">{IDLE_RUNTIME_SENTENCE}</p>
+      )}
+
+      {engine?.installed && engine.loaded && (
+        <div className="flex flex-wrap items-center gap-4 rounded-card border border-line p-3">
+          <Badge tone="accent">engine</Badge>
+          <dl className="grid min-w-0 flex-1 grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
+            <Fact label="model" value={engine.loaded.id} />
+            <Fact label="context" value={`${engine.loaded.context_length} tokens`} />
+            <Fact label="build" value={engine.loaded.build_info} />
+          </dl>
+        </div>
+      )}
+
+      {engine?.installed && !engine.loaded && runtime?.state === "idle" && (
+        <p className="font-sans text-sm text-ink-muted">Engine ready, nothing loaded</p>
       )}
 
       {loaded && (
@@ -913,6 +930,7 @@ export function ModelsScreen() {
           blurb="The models I know how to fetch and verify — only the ones this machine can hold."
         >
           <CatalogPanel jobs={jobs} />
+          <EngineCard />
           <CompressorCard />
         </Section>
       </PagePane>

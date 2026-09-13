@@ -124,6 +124,20 @@ Evidence: `model_service_test::an_installed_engine_takes_over_load_generate_stat
 installs the fake server as the pinned release and proves load, echo
 completion, the prompt limit, the idle candle runtime and unload.
 
+## Requalification on the engine (#151)
+
+`crates/pam_model/tests/capability_bench.rs` takes `PAM_BENCH_BACKEND=llama`
+with `PAM_BENCH_ENGINE_SERVER=<llama-server>` (optional
+`PAM_BENCH_ENGINE_GPU_LAYERS`, `PAM_BENCH_ENGINE_REASONING_BUDGET`); the
+candle backends stay for comparison. Under the engine the GGUF's own template
+frames requests, so the candle-side template classification is skipped. The
+supervisor sends `cache_prompt: false` and a fixed seed so warm repeats stay
+bit-identical, which the bench asserts. First record:
+[2026-09-13-llama-engine-screen](../benchmarks/2026-09-13-llama-engine-screen/record.json)
+— coder 0.853 / 7 false passes at warm p95 671 ms, gpt-oss-20b 0.867 / 3 false
+passes at 574 ms; the latency gate is met, the accuracy gates are not, and every
+remaining false pass is an abstention-trap variant.
+
 ## Next (plan 36)
 - API routing (#150): `generate_bounded`, diagnosis and summaries go through
   `/v1/chat/completions` on that socket; the GGUF chat template owns framing.

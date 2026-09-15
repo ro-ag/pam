@@ -28,9 +28,8 @@ use crate::admin::{
     RECOVERY_INTERNAL, required_str,
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
-use crate::model_service::{
-    ModelService, ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier,
-};
+use crate::model_readiness::{Stage, admission_blocker};
+use crate::model_service::{ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier};
 
 /// `admin.models.list` → `{ models, models_dir }`.
 pub const OP_MODELS_LIST: &str = "admin.models.list";
@@ -163,13 +162,6 @@ const TRY_TEMPERATURE: f64 = 0.7;
 /// Recovery line pointing at the library on the Models screen.
 const RECOVERY_LIBRARY: &str =
     "Check the model id against the library on the PAM GUI Models screen.";
-
-/// Recovery line for an unverified model offered as a default.
-const RECOVERY_UNVERIFIED: &str = "Tier defaults need a verified model: run Verify on the PAM GUI Models screen, \
-     or download it from the catalog, which checks the digest.";
-
-/// Recovery line for a verified but unqualified model offered as a default.
-const RECOVERY_UNQUALIFIED: &str = "Tier defaults need a qualified model: one whose exact digest met the capability gates      on this engine and platform (see docs/benchmarks). Unqualified models still answer Try on      the PAM GUI Models screen.";
 
 /// Recovery line for a transfer that is already running.
 const RECOVERY_DOWNLOAD_RUNNING: &str =
@@ -552,7 +544,7 @@ impl AdminService {
     async fn models_status(&self) -> Result<AdminOk, AdminRefusal> {
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: self.models.status().await?,
+            body: self.models.status().await.map_err(diagnostic_refusal)?,
             audit: json!({ "op": OP_MODELS_STATUS }),
         })
     }
@@ -576,28 +568,16 @@ impl AdminService {
         };
 
         let entry = self.entry(model_id).await?;
-        match ModelService::admit(&entry) {
-            Ok(()) => {}
-            Err(ModelUnavailable::Unverified(_)) => {
-                return Err(AdminRefusal {
-                    cause: CAUSE_UNVERIFIED,
-                    detail: format!(
-                        "{model_id} has no verified digest; unverified models prove the wiring \
-                         and never serve a job"
-                    ),
-                    recovery: RECOVERY_UNVERIFIED,
-                });
-            }
-            Err(_) => {
-                return Err(AdminRefusal {
-                    cause: CAUSE_UNQUALIFIED,
-                    detail: format!(
-                        "{model_id} is verified but no qualification record covers its digest \
-                         on this platform; it proves the wiring and never serves a job"
-                    ),
-                    recovery: RECOVERY_UNQUALIFIED,
-                });
-            }
+        if let Some((stage, blocker)) = admission_blocker(&entry) {
+            return Err(AdminRefusal {
+                cause: if stage == Stage::Unverified {
+                    CAUSE_UNVERIFIED
+                } else {
+                    CAUSE_UNQUALIFIED
+                },
+                detail: blocker.detail,
+                recovery: blocker.recovery,
+            });
         }
         self.models.set_default(tier, Some(&entry.id)).await?;
         Ok(AdminOk {

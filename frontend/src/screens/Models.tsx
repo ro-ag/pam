@@ -1,5 +1,7 @@
 import { EngineCard } from "./EngineCard";
+import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { Check, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Badge } from "../components/ui/Badge";
@@ -57,8 +59,7 @@ const TRY_DEFAULT_MAX_TOKENS = 64;
 export const FLOOR_SENTENCE = "unverified — wiring checks only, never a tier default";
 
 /** The sentence a verified but unqualified model carries wherever it is offered. */
-export const UNQUALIFIED_SENTENCE =
-  "verified, not qualified — Try only, never a tier default";
+export const UNQUALIFIED_SENTENCE = "verified, not qualified — Try only, never a tier default";
 
 /** The admission rule, said plainly, next to the paste-URL form. */
 const FLOOR_NOTE =
@@ -894,6 +895,14 @@ export function ModelsScreen() {
   });
   const library = useQuery({ queryKey: ["models", "list"], queryFn: modelsList });
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const repair = (target: RepairTarget) => {
+    if (target === "settings") {
+      void navigate({ to: "/settings", hash: "models" });
+    } else {
+      setTab(target);
+    }
+  };
 
   // A verify or download answers with a job id and finishes later; the
   // library only changes when that job settles. Re-read it whenever the
@@ -931,8 +940,9 @@ export function ModelsScreen() {
           eyebrow="runtime"
           eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
           title="Runtime"
-          blurb="Load or unload a model and see what is in memory."
+          blurb="What each job tier gets, and what is in memory right now."
         >
+          <ReadinessCard status={status.data} failure={statusFailure} onRepair={repair} />
           <RuntimeCard status={status.data} models={models} failure={statusFailure} />
         </Section>
       </PagePane>

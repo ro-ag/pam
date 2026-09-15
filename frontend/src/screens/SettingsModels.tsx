@@ -19,8 +19,10 @@ import {
   type AgentId,
   type BridgeFailure,
   type ModelEntry,
+  type TierReadiness,
 } from "../lib/ipc";
 import { admissionBlocker } from "./Models";
+import { ReadinessLine } from "./Readiness";
 
 /**
  * Settings → Models: the persistent choices, as opposed to the live
@@ -56,12 +58,16 @@ function TierSelect({
   value,
   models,
   disabled,
+  readiness,
+  idleUnloadMin,
   onChange,
 }: {
   tier: Tier;
   value: string | null;
   models: ModelEntry[];
   disabled: boolean;
+  readiness: TierReadiness | undefined;
+  idleUnloadMin: number;
   onChange: (modelId: string | null) => void;
 }) {
   return (
@@ -90,6 +96,7 @@ function TierSelect({
         })}
       </select>
       <span className="block font-sans text-sm text-ink-muted">{TIER_SENTENCES[tier]}</span>
+      <ReadinessLine readiness={readiness} idleUnloadMin={idleUnloadMin} />
     </label>
   );
 }
@@ -140,6 +147,8 @@ function TierDefaultsPanel() {
             value={defaults?.[tier] ?? null}
             models={models}
             disabled={setDefault.isPending || listFailure !== null}
+            readiness={status.data?.readiness?.[tier]}
+            idleUnloadMin={status.data?.idle_unload_min ?? 0}
             onChange={(modelId) => setDefault.mutate({ tier, modelId })}
           />
         ))}

@@ -519,6 +519,59 @@ async fn a_running_transfer_keeps_its_partial() {
     assert!(discard_partial(&fixture.dest).unwrap() > 0);
 }
 
+#[test]
+fn releasing_the_lock_frees_it_even_while_a_duplicate_handle_is_alive() {
+    let fixture = fixture();
+    let paths = sidecar_paths(&fixture.dest);
+    let owner = crate::download::acquire_lock(&paths.lock).unwrap();
+    // The same open file description a forked child holds before its exec.
+    let duplicate = owner.try_clone().unwrap();
+    assert!(crate::download::is_locked(&paths.lock));
+
+    crate::download::release_lock(owner);
+    assert!(
+        !crate::download::is_locked(&paths.lock),
+        "an explicit unlock applies to the whole description, duplicate or not"
+    );
+    drop(duplicate);
+    assert!(
+        crate::download::acquire_lock(&paths.lock).is_ok(),
+        "the next transfer takes the lock cleanly"
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_conflict_leaves_the_lock_free() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(4 * 1024);
+    let paths = sidecar_paths(&fixture.dest);
+    std::fs::write(&paths.part, &bytes[..1024]).unwrap();
+    std::fs::write(
+        &paths.checkpoint,
+        serde_json::to_vec(&Checkpoint {
+            schema_version: 1,
+            canonical_source: "http://127.0.0.1:1/somewhere-else.gguf".to_owned(),
+            expected_digest: format!("sha256:{}", sha256_of(&bytes)),
+            expected_size_bytes: size_of(&bytes),
+            license_digest: String::new(),
+            etag: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    assert!(matches!(
+        start(request),
+        Err(DownloadError::CheckpointConflict(_))
+    ));
+    assert!(
+        !crate::download::is_locked(&paths.lock),
+        "a refused start must not leave the transfer lock held"
+    );
+}
+
 #[tokio::test]
 async fn discarding_clears_a_checkpoint_conflict() {
     require_curl!();

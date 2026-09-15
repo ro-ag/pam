@@ -62,6 +62,8 @@ use crate::flow_exec::{
     resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
 };
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
+use crate::model_readiness::Stage;
+use crate::model_service::Tier;
 use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
 use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 
@@ -718,10 +720,11 @@ impl FlowService {
             .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root)
             .await?;
         blockers.extend(step_blockers);
+        let model = self.inspect_model(flow).await?;
         let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
             "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
             "steps":steps, "correlation":correlation, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
-            "blockers":blockers,"live":"unknown","model":{"required":false,"qualification":"not_assessed"},
+            "blockers":blockers,"live":"unknown","model":model,
             "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
         let body = crate::evidence_view::redact_json(&body).map_err(|_| {
             contract_refusal(crate::flow_contract::ContractError(
@@ -738,6 +741,60 @@ impl FlowService {
             body,
             evidence: Vec::new(),
         })
+    }
+
+    /// What the model will do for this flow, from the heavy tier's readiness record.
+    ///
+    /// A flow needs no model to complete — a summarize step falls back to the
+    /// compact evidence — so `required` stays false; what an agent needs to know
+    /// before running is whether the summary will come (`summary: model`) or be
+    /// skipped with a named cause (`summary: skipped`). A flow with no summarize
+    /// step reports `not_assessed`, as before.
+    async fn inspect_model(&self, flow: &Flow) -> Result<Value, FlowRefusal> {
+        let used_by: Vec<&str> = flow
+            .steps
+            .iter()
+            .filter(|step| step.output == OutputPolicy::Summarize)
+            .map(|step| step.id.as_str())
+            .collect();
+        if used_by.is_empty() {
+            return Ok(json!({"required": false, "used_by": [], "qualification": "not_assessed"}));
+        }
+        let readiness = self
+            .logs
+            .models
+            .readiness_now(Tier::Heavy)
+            .await
+            .map_err(|error| {
+                FlowRefusal::new(
+                    "model_readiness_unavailable",
+                    error.to_string(),
+                    "retry; if it persists, check the daemon log and the Models screen",
+                )
+            })?;
+        let qualification = match readiness.stage {
+            Stage::Unconfigured => "none",
+            Stage::Missing => "missing",
+            Stage::Unverified => "unverified",
+            Stage::Unqualified => "unqualified",
+            Stage::EngineMissing | Stage::Ready => {
+                if readiness.qualification.is_some() {
+                    "qualified"
+                } else {
+                    "unqualified"
+                }
+            }
+        };
+        Ok(json!({
+            "required": false,
+            "used_by": used_by,
+            "tier": readiness.tier,
+            "model_id": readiness.model_id,
+            "qualification": qualification,
+            "stage": readiness.stage,
+            "summary": if readiness.stage == Stage::Ready { "model" } else { "skipped" },
+            "blocker": readiness.blocker,
+        }))
     }
 
     /// Read a recipe's step gates and local connector configuration without execution.

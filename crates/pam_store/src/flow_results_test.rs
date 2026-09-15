@@ -132,6 +132,64 @@ async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
 }
 
 #[tokio::test]
+async fn origins_state_tells_a_missing_view_from_a_foreign_one() {
+    use crate::EvidenceOrigins;
+    let store = Store::open_in_memory().await.unwrap();
+    store
+        .insert_request("r", "flow.run", "/repo", "test", "{}", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .request_evidence_origins_state("r", "/repo")
+            .await
+            .unwrap(),
+        EvidenceOrigins::Ready(vec![])
+    );
+    store
+        .insert_evidence("partial", "r", "log.source", b"just written", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .request_evidence_origins_state("r", "/repo")
+            .await
+            .unwrap(),
+        EvidenceOrigins::Incomplete,
+        "the view comes a moment after the row: incomplete, not foreign"
+    );
+    store
+        .insert_evidence_view(&EvidenceViewInsert {
+            evidence_id: "partial".into(),
+            request_id: "r".into(),
+            repository: "/elsewhere".into(),
+            origin_json: "{\"targets\":[]}".into(),
+            identity_json: "{}".into(),
+            map_json: "[]".into(),
+            view_id: "partial-view".into(),
+            view_bytes: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .request_evidence_origins_state("r", "/repo")
+            .await
+            .unwrap(),
+        EvidenceOrigins::Foreign,
+        "a view under another repository is never readable here"
+    );
+    assert!(
+        store
+            .request_evidence_origins("r", "/repo")
+            .await
+            .unwrap()
+            .is_none(),
+        "the Option form still fails closed for both"
+    );
+}
+
+#[tokio::test]
 async fn origin_overflow_refuses_whole_set_instead_of_authorizing_prefix() {
     let store = Store::open_in_memory().await.unwrap();
     store

@@ -44,6 +44,13 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Fixed
 
+- `pam wait` no longer ends with "no readable result" while a flow is still
+  running. A running request writes each evidence row a moment before its
+  view, and a follower's `query` landing in that window was refused as if
+  the ticket were not the caller's; the daemon now tells an unpublished
+  view (pending, for a request that is not terminal) from a view published
+  under another repository (never readable), and keeps the strict answer for
+  finished requests.
 - A download refused at the checkpoint check (foreign part file, wrong
   digest) now unlocks its transfer lock explicitly instead of merely
   closing the handle, so a curl process another task forked in that

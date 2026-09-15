@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use pam_proto::{Outcome, Response};
-use pam_store::{FlowResultMeta, RequestStatusMeta, Store};
+use pam_store::{EvidenceOrigins, FlowResultMeta, RequestStatusMeta, Store};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -213,11 +213,20 @@ pub(crate) async fn authorized_metadata(
         .flow_result_meta(ticket, &repo.to_string_lossy())
         .await
         .map_err(|_| unavailable())?;
-    let origins = store
-        .request_evidence_origins(ticket, &repo.to_string_lossy())
+    // Evidence published under another repository is never readable here. A
+    // view that is not written yet is a different thing: a running request
+    // inserts each evidence row a moment before its view, and a follower's
+    // query in that window must read as pending, not as "not yours". Once the
+    // request is terminal the set must be complete.
+    let origins = match store
+        .request_evidence_origins_state(ticket, &repo.to_string_lossy())
         .await
         .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
+    {
+        EvidenceOrigins::Ready(origins) => origins,
+        EvidenceOrigins::Incomplete if !status.state.is_terminal() => Vec::new(),
+        EvidenceOrigins::Incomplete | EvidenceOrigins::Foreign => return Err(unavailable()),
+    };
     let origins: Vec<EvidenceOrigin> = origins
         .into_iter()
         .map(|origin| serde_json::from_str(&origin).map_err(|_| unavailable()))

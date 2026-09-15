@@ -100,6 +100,40 @@ async fn captured_product_scope_is_required_even_for_persisted_status() {
 }
 
 #[tokio::test]
+async fn a_running_request_with_an_unpublished_view_reads_as_pending_not_unavailable() {
+    let (_dir, store, repo) = fixture().await;
+    // The window a follower's query can land in: the evidence row exists,
+    // its view is not written yet.
+    store
+        .insert_evidence("src", "r", "log.source", b"captured", None)
+        .await
+        .unwrap();
+    let (status, result) = authorized_metadata(&store, &repo, "r")
+        .await
+        .expect("a running request is readable while its view catches up");
+    assert!(!status.state.is_terminal());
+    assert!(result.is_none());
+
+    // Terminal with the view still missing is the incomplete publication the
+    // strict answer exists for.
+    store
+        .finish_request(
+            "r",
+            pam_store::RequestState::Done,
+            Some("solved"),
+            pam_store::AuditEntry {
+                action: "execute",
+                actor: pam_store::Actor::System,
+                decision: pam_store::Decision::Allow,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+}
+
+#[tokio::test]
 async fn admitted_flow_lifecycle_survives_missing_final_projection() {
     let (_dir, store, repo) = fixture().await;
     store

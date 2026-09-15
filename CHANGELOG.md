@@ -21,6 +21,13 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- Windows builds can be administered: the GUI's private administration
+  channel now exists on Windows as loopback TCP behind an owner-only nonce.
+  The daemon writes the port and a fresh nonce to `<base>\admin\control.json`
+  in the owner's private base, proves it holds the nonce before reading a
+  byte, and admits only a client that presents it. Every `admin.*`
+  operation the macOS and Linux GUI has works on Windows the same way;
+  the threat model is unchanged and documented in `docs/admin-boundary.md`.
 - `admin.models.status` reports one readiness record per tier: the first
   rung of configured → installed → verified → qualified → engine → ready
   that fails, the cause a job would be refused with, a recovery line, the

@@ -3337,6 +3337,8 @@ version = "0.3.1"
 dependencies = [
  "apple-native-keyring-store",
  "flate2",
+ "getrandom 0.3.4",
+ "hex",
  "keyring-core",
  "pam_compact",
  "pam_connectors",
@@ -3347,6 +3349,7 @@ dependencies = [
  "pam_testkit",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.20",

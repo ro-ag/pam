@@ -23,12 +23,12 @@ pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, CorrelationBind, CorrelationStep, DEFAULT_REQUEST_LIST_LIMIT,
     Decision, EVIDENCE_KIND_FLOW_CHECKPOINT, EVIDENCE_KIND_LOG_COMPACT, EvidenceMeta,
-    EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest, EvidenceRow,
-    EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin, FlowJournalIdentity,
-    FlowJournalState, FlowResultMeta, GrantRow, LandingSession, MAX_FLOW_CHECKPOINT_BYTES,
-    MAX_FLOW_JOURNAL_EVIDENCE, MAX_REQUEST_LIST_LIMIT, ModelJobRow, PendingApproval,
-    RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow, RequestState,
-    RequestStatusMeta, Store,
+    EvidenceOrigins, EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest,
+    EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin,
+    FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantRow, LandingSession,
+    MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_REQUEST_LIST_LIMIT, ModelJobRow,
+    PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow,
+    RequestState, RequestStatusMeta, Store,
 };
 
 #[cfg(test)]

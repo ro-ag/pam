@@ -108,10 +108,13 @@ async fn load_generate_bound_cancel_and_unload_through_the_fake_server() {
         "{too_long:?}"
     );
 
-    // max_tokens is honoured and reported as a length stop.
+    // max_tokens is honoured and reported as a length stop; a budget of 2
+    // reaches the server as the 16-token floor (`output_budget`), so a
+    // twenty-word prompt is cut at sixteen.
+    let words: Vec<String> = (1..=20).map(|n| format!("w{n}")).collect();
     let cut = server
         .generate(
-            &request("one two three four", 2),
+            &request(&words.join(" "), 2),
             cancel,
             4096,
             Duration::from_secs(10),
@@ -119,7 +122,7 @@ async fn load_generate_bound_cancel_and_unload_through_the_fake_server() {
         .await
         .unwrap();
     assert_eq!(cut.finish_reason, "length");
-    assert_eq!(cut.text, "echo: one two");
+    assert_eq!(cut.text, format!("echo: {}", words[..16].join(" ")));
 
     // A cancel that is already set never reaches the server.
     let (stop, cancelled) = tokio::sync::watch::channel(true);

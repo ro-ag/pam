@@ -495,7 +495,7 @@ impl EngineServer {
                     "/v1/chat/completions",
                     &serde_json::json!({
                         "messages": messages,
-                        "max_tokens": request.max_tokens,
+                        "max_tokens": output_budget(request.max_tokens),
                         "temperature": request.temperature,
                         "stop": request.stop,
                         "stream": false,
@@ -633,3 +633,25 @@ fn log_tail(log: &Path) -> String {
         })
         .unwrap_or_default()
 }
+
+/// The smallest explicit output budget a generation is given. gpt-oss's
+/// harmony template opens an analysis channel before the answer; under
+/// about sixteen tokens the parser never closes it and the reply is raw
+/// control tokens (`<|channel|>analysis…`). Zero is left alone: it is the
+/// engine's own "no explicit cap".
+pub const MIN_OUTPUT_TOKENS: usize = 16;
+
+/// `requested`, raised to [`MIN_OUTPUT_TOKENS`] when it is a positive
+/// budget below it.
+#[must_use]
+pub fn output_budget(requested: usize) -> usize {
+    if requested == 0 {
+        0
+    } else {
+        requested.max(MIN_OUTPUT_TOKENS)
+    }
+}
+
+#[cfg(test)]
+#[path = "engine_server_test.rs"]
+mod tests;

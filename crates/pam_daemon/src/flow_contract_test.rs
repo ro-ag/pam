@@ -314,6 +314,72 @@ fn handoff_exact_target_is_supplied_only_from_validated_structured_identity() {
 }
 
 #[test]
+fn an_observation_names_the_model_that_wrote_it_and_the_record_that_admitted_it() {
+    let mut run = report(
+        StepStatus::Succeeded,
+        Outcome::Solved,
+        "Build failed at link",
+    );
+    run.steps[0].summary_model = Some(crate::flow_exec::SummaryModel {
+        id: "candidates/gpt-oss-20b-MXFP4".to_owned(),
+        qualification: Some(crate::log_service::ModelQualification {
+            artifact: "gpt-oss-20b-MXFP4".to_owned(),
+            contract: "answer-contract-v2".to_owned(),
+            record: "docs/benchmarks/2026-09-15-answer-contract-v2".to_owned(),
+            engine_tag: "b10938".to_owned(),
+        }),
+    });
+    let result =
+        project_result("ticket", "flow", "digest", &run, &[], &BTreeMap::new()).expect("projects");
+    let model = result.observations[0]
+        .model
+        .as_ref()
+        .expect("the model is named");
+    assert_eq!(model.id, "candidates/gpt-oss-20b-MXFP4");
+    assert_eq!(
+        model
+            .qualification
+            .as_ref()
+            .map(|record| record.record.as_str()),
+        Some("docs/benchmarks/2026-09-15-answer-contract-v2")
+    );
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        json["observations"][0]["model"]["qualification"]["contract"],
+        "answer-contract-v2"
+    );
+    assert!(
+        json["observations"][0]["model"]["qualification"]
+            .get("accuracy")
+            .is_none(),
+        "the observation carries the record's identity, not its figures"
+    );
+
+    // A deterministic observation and an older stored projection carry no model.
+    let plain = project_result(
+        "ticket",
+        "flow",
+        "digest",
+        &report(
+            StepStatus::Failed,
+            Outcome::Unresolved,
+            "model_skipped: no_default",
+        ),
+        &[],
+        &BTreeMap::new(),
+    )
+    .expect("projects");
+    let mut legacy = serde_json::to_value(&plain).unwrap();
+    assert!(legacy["observations"][0].get("model").is_none());
+    legacy["observations"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_refs_omitted");
+    let restored: crate::flow_contract::AgentResult = serde_json::from_value(legacy).unwrap();
+    assert!(restored.observations[0].model.is_none());
+}
+
+#[test]
 fn handoff_projection_survives_the_credential_redaction_pass_unchanged() {
     // Durable reads run the projection through the credential mask, so any
     // handoff key that collides with a sensitive name would make a re-read

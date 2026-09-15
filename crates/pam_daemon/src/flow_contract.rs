@@ -113,12 +113,23 @@ pub struct ProductObservation {
     pub connector: String,
     pub status: String,
 }
+/// Which model wrote an observation's summary text, and on what evidence it
+/// was admitted; absent for deterministic observations and skipped summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<crate::log_service::ModelQualification>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     pub step: String,
     pub status: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ObservationModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<ProductObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,6 +202,10 @@ pub fn project_result(
             step: step.id.clone(),
             status: status.as_str().unwrap_or("unknown").to_owned(),
             text,
+            model: step.summary_model.as_ref().map(|model| ObservationModel {
+                id: model.id.clone(),
+                qualification: model.qualification.clone(),
+            }),
             product: products.get(&step.id).cloned(),
             evidence_refs: step
                 .evidence

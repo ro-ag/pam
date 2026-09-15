@@ -115,11 +115,40 @@ pub struct CompressStats {
     pub tokens_avoided_est: u64,
 }
 
+/// The evidence that admitted the model that answered: the qualification
+/// record's identity, never its figures — an agent reads the record, it does
+/// not re-derive the gates from a summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ModelQualification {
+    /// Human name of the artifact, as the record calls it.
+    pub artifact: String,
+    /// Task contract version the record was measured under.
+    pub contract: String,
+    /// Repository path of the evidence record.
+    pub record: String,
+    /// The llama.cpp release tag the record binds to.
+    pub engine_tag: String,
+}
+
+impl From<&pam_model::Qualification> for ModelQualification {
+    fn from(record: &pam_model::Qualification) -> Self {
+        Self {
+            artifact: record.artifact.to_owned(),
+            contract: record.contract.to_owned(),
+            record: record.record.to_owned(),
+            engine_tag: record.engine_tag.to_owned(),
+        }
+    }
+}
+
 /// The model that wrote a summary, and what the generation cost.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelUse {
     /// Registry id of the model that answered.
     pub id: String,
+    /// The qualification record that admitted it; `None` only for a model
+    /// seeded past the gate in a test harness.
+    pub qualification: Option<ModelQualification>,
     /// Tier the generation ran on.
     pub tier: &'static str,
     /// Tokens in the framed prompt.
@@ -495,9 +524,11 @@ impl LogService {
                 return;
             }
         };
+        let qualification = entry.qualification.as_ref().map(ModelQualification::from);
         let meta = json!({
             "name": name,
             "model_id": entry.id,
+            "model_qualification": qualification,
             "tier": Tier::Heavy.as_str(),
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
@@ -523,7 +554,8 @@ impl LogService {
                 view,
                 json!({"kind": "untrusted_model_output", "input_evidence_id": input["evidence_id"],
                     "input_sha256": input["sha256"], "offset_basis": input["offset_basis"],
-                    "quotation_support": "not_asserted"}),
+                    "quotation_support": "not_asserted",
+                    "model": {"id": entry.id, "qualification": qualification}}),
             )
             .await
         {
@@ -539,6 +571,7 @@ impl LogService {
         });
         report.model = Some(ModelUse {
             id: entry.id,
+            qualification,
             tier: Tier::Heavy.as_str(),
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,

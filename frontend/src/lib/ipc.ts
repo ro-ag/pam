@@ -743,6 +743,13 @@ export interface CompressStats {
 /** The model that wrote a summary, and what the generation cost. */
 export interface ModelUse {
   id: string;
+  /** The qualification record that admitted the model; null only for a test-seeded default. */
+  qualification: {
+    artifact: string;
+    contract: string;
+    record: string;
+    engine_tag: string;
+  } | null;
   tier: string;
   prompt_tokens: number;
   completion_tokens: number;

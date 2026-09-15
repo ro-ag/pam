@@ -31,6 +31,11 @@ All notable changes to pam are documented in this file. The format follows
 - `docs/model-qualification-decisions.md`: the standing record of which
   artifacts qualified, which were screened and rejected, what was not
   measured, and the compression decision.
+- A model summary now names its author: `pam flow result` observations
+  that came from the heavy model carry `model` with the registry id and the
+  qualification record that admitted it, the summary evidence identity
+  carries the same block, and the log-compression report's `model` names
+  the record. Identity only, never figures.
 
 ### Added
 

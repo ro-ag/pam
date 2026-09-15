@@ -273,6 +273,8 @@ impl Drop for Workspace {
 impl Workspace {
     pub(crate) fn create(parent: &Path, source: &Path) -> Result<Self, CheckoutError> {
         let root = parent.join(format!("landing-{}", ulid::Ulid::new()));
+        // Only the unix mode call mutates the builder; Windows has no mode.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

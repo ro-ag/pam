@@ -237,9 +237,17 @@ async fn mutation_json_arrives_exactly_and_redirect_is_never_followed() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
             let mut chunk = [0; 1024];
+            // Read until the declared body has arrived. A client that hangs
+            // up early (curl killed at its deadline on a loaded runner) ends
+            // the read with what came so far: the client-side assertions
+            // then name the real failure instead of this task panicking on
+            // `n > 0` and the join error hiding it (windows-11-arm main run
+            // 34959772710).
             loop {
                 let n = stream.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
+                if n == 0 {
+                    break;
+                }
                 bytes.extend_from_slice(&chunk[..n]);
                 assert!(bytes.len() < 8192);
                 if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -269,9 +277,11 @@ async fn mutation_json_arrives_exactly_and_redirect_is_never_followed() {
         let mut req = request(address, "/mutation", 1024);
         req.method = method;
         req.body = Some(body.clone());
+        // Fifteen seconds, not five: spawning curl.exe on a loaded Windows
+        // runner can eat most of a short deadline before the request is sent.
         let result = CurlTransport::new(curl.clone())
             .allow_http_for_tests()
-            .send(req, deadline(5))
+            .send(req, deadline(15))
             .await;
         if method == Method::Put {
             assert!(matches!(

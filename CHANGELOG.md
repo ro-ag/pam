@@ -44,6 +44,11 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Fixed
 
+- Two Windows-only test flakes on loaded runners are hardened rather than
+  retried: the curl mutation test's stand-in server now reports an early
+  hang-up through the client assertion instead of panicking, with a 15 s
+  curl deadline, and the lease-reaping test gives submission 4 s before
+  its lease. Two Windows-only `unused_mut` warnings in the daemon are gone.
 - `pam wait` no longer ends with "no readable result" while a flow is still
   running. A running request writes each evidence row a moment before its
   view, and a follower's `query` landing in that window was refused as if

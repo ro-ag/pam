@@ -450,17 +450,22 @@ async fn lease_reaping_writes_one_reaped_row_and_the_late_executor_no_ops() {
         // A short deadline earns a short lease; nobody waits, so the
         // reaper is the only teardown. The echo keeps running past it.
         // The deadline still has to survive submission on a loaded runner,
-        // where admission alone can cost hundreds of milliseconds, so it is
-        // sized against that rather than against the machine's fast path.
+        // where admission alone can cost seconds (windows-2025 main run
+        // 34978163448 refused a 2 s deadline before the ticket came back), so
+        // it is sized against that rather than against the machine's fast
+        // path: the echo outlives a 4 s lease by a wide margin either way.
         let mut request = envelope(
             "req_reaped",
             "echo",
-            serde_json::json!({ "delay_ms": 8000 }),
+            serde_json::json!({ "delay_ms": 12_000 }),
             false,
         );
-        request.deadline_ms = 2000;
+        request.deadline_ms = 4000;
         let response = client.request(&request).await;
-        assert!(matches!(response, Response::Ticket { .. }));
+        assert!(
+            matches!(response, Response::Ticket { .. }),
+            "submission must earn a ticket, got {response:?}"
+        );
 
         let row = daemon
             .wait_for_row("req_reaped", |row| row.state == RequestState::Failed)

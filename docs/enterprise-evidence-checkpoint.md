@@ -42,3 +42,54 @@ objc2 compile on macOS (the Objective-C exception helper, also required by the
 Metal inference kernels) are an accepted exception, not PAM code. Deployment-
 specific compatibility claims still wait until the documented live protocol is
 run with authorized credentials.
+
+## Plan 30 final checkpoint (task #94, 2026-09-15)
+
+What was verified on `main` at ac92690 (plus the docs of this checkpoint):
+
+- **Local gate.** `tools/check.sh` on the merged tree: fmt, clippy `-D warnings`
+  across every target, the bounded ZeroMQ codec tests, `cargo test --workspace`,
+  frontend lint, `tsc` + Vite build, and 630 vitest across 38 files — green
+  on 2026-09-15. Main CI is green for b5e6092 (run 34970288211) on the gate, macOS,
+  Ubuntu ARM and both Windows targets; the ac92690 main run is 34974171920.
+- **Agent path, CLI only** (task #124, same day): `flow inspect` named every
+  blocker with a recovery line; `flow run --no-wait`, `wait` and `flow result --json`
+  returned the bounded `AgentResult` with the handoff; `evidence read` followed
+  `next_action` verbatim and returned digested, provenance-bearing rows; the one
+  qualified model (gpt-oss-20b-MXFP4 on llama.cpp b10938, macOS arm64) summarized a
+  real cargo failure and said what it could not determine; with the heavy default
+  cleared the same flow reported `model_skipped: no_default` and ran the
+  deterministic path.
+- **Admission.** Verified but unmeasured weights are refused as a tier default with
+  cause `unqualified`, unverified ones with `unverified`, live on the real models
+  directory; the daemon's readiness record and the GUI agree on the same verdict
+  ([model qualification decisions](model-qualification-decisions.md)).
+- **Broker authority and evidence** stay as recorded above (task #120); no
+  transport, GUI framework, connector framework or chatbot was added.
+
+Named blockers — acceptance is not claimed for these:
+
+- **Native app capture.** The owner denies computer-use control of the PAM app,
+  and a window on another Space captures blank. GUI verification ran through the
+  Vite fixture shim on the daemon's real `admin.models.status` and `list` replies,
+  not on the installed native binary.
+- **32 GB hardware.** No 32 GB machine exists; every memory figure in the
+  benchmarks comes from a 64 GiB M4 Max and is labelled so. Memory is not a gate
+  (owner, 2026-09-13/14) and task #137 stays parked.
+- **Live enterprise connectors.** GitHub, Jenkins, Sonar, Jira, Confluence,
+  SharePoint and JFrog are proven against fake transports and a real-curl local
+  origin; a live run needs the owner's tokens entered in Settings → Connectors.
+- **Windows.** Excluded by the owner on 2026-09-15: issues #22 (no admin adapter),
+  #24 (connector save-and-test on CI), #110 (`pam wait` race) and #31 (one
+  `curl_origin` flake on windows-11-arm, main run 34959772710) remain open.
+
+Residual issues carried forward: #4 (a scratch daemon stopped answering after
+25 minutes of fixture-proxy polling; task #102 fixed publisher saturation and
+proved 5,196 cross-process exchanges, but the 25-minute connect timeout is not
+proven identical, so the issue stays open), #28 (a download lock test is flaky
+under the full workspace run), #29 (the agent-visible result does not name the
+model that wrote a summary), #30 (`flow.inspect` does not consult tier
+readiness). `pam_daemon::diagnosis_service` still has no production caller — a
+product decision, not dead code.
+
+No release, tag or push is implied by this checkpoint.

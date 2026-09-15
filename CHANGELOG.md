@@ -6,6 +6,32 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A tier default now needs more than a verified digest: the model's exact
+  SHA-256 must match a compiled-in qualification record for this engine build
+  and platform (`pam_model::qualification`; today only gpt-oss-20b-MXFP4 on
+  llama.cpp b10938, macOS arm64, under answer contract v2). `admin.models.
+  defaults.set` refuses anything else with cause `unverified` or
+  `unqualified`, and a default seeded past the admin op is refused at resolve
+  time with the same cause, so a job never runs on unmeasured weights. Try
+  still works on any installed model. The Models screen badges
+  qualified / engine / test only with the reason, and the tier selects
+  disable what cannot serve.
+
+### Added
+
+- `admin.models.status` reports one readiness record per tier: the first
+  rung of configured → installed → verified → qualified → engine → ready
+  that fails, the cause a job would be refused with, a recovery line, the
+  qualification record, and whether the weights are in memory right now.
+  The Models runtime tab opens with that verdict and one repair button per
+  blocked tier; Settings → Models prints it under each tier; Home and the
+  log-compression form say before submission why no model will answer.
+- `docs/model-qualification-decisions.md`: the standing record of which
+  artifacts qualified, which were screened and rejected, what was not
+  measured, and the compression decision.
+
 ### Added
 
 - A straight answer to "can PAM reach the keychain?", in three places:

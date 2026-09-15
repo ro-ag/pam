@@ -46,7 +46,7 @@ for access, evidence, polling, validation, or landing decisions.
 | Enterprise access | Existing Jira, Confluence, SharePoint, Jenkins, GitHub, Sonar adapters | Deployment-specific acceptance and exact cross-product correlations |
 | Jenkins | Explicit build investigation, bounded stages/nodes/logs, CLI observation summary, coverage gaps | Decisive-evidence follow-up and CLI retrieval; root cause remains unresolved |
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
-| Orchestration | Flows, checks, approvals, retries, tickets, durable remote polling, guarded landing through sync (bounds-proven pack transfer, exact-lease fast-forward) | Enterprise checkpoint of the complete recipe (#94) |
+| Orchestration | Flows, checks, approvals, retries, tickets, durable remote polling, guarded landing through sync (bounds-proven pack transfer, exact-lease fast-forward); plan 30 checkpoint #94 recorded 2026-09-15 in enterprise-evidence-checkpoint.md | Live enterprise connectors with the owner's tokens; native-app capture; a real 32 GB host |
 | Models | llama.cpp engine as a pinned, digest-verified external process (b10938; Unix socket, Windows loopback) routing every generation path; candle removed 2026-09-13 (plan 37); frozen bench on the engine under answer contract v2 (gpt-oss-20b 0.980/0 FP @593 ms warm p95, 2026-09-15); evidence-backed admission (#96, 2026-09-15): a tier default must be verified and match a compiled-in qualification record on this engine and target — gpt-oss-20b on macos-arm64 is the only one | The three missing-answer cases; qualification on Linux/Windows targets |
 | Microsoft compression | Removed 2026-09-13 with the candle runtime (plan 37); qualification records stay under docs/benchmarks | Nothing: evidence reduction is deterministic framing only |
 
@@ -71,7 +71,9 @@ verified digest plus a qualification record for this engine and target.
 
 The five workstreams below are real ptrack plans. Existing unfinished tasks
 were moved with their history and issue links preserved. Plan #30 remains the
-umbrella and historical delivery record; #94 is its final integration gate.
+umbrella and historical delivery record; #94 was its final integration gate,
+recorded on 2026-09-15 in [the enterprise checkpoint](enterprise-evidence-checkpoint.md#plan-30-final-checkpoint-task-94-2026-09-15)
+with its named blockers (native capture, 32 GB hardware, live connectors, Windows).
 Task dependencies, rather than broad plan barriers, allow independent work.
 Every task carries its own caller/integration and acceptance note in ptrack.
 
@@ -206,7 +208,7 @@ not an unauthorized force-close or a lower arbitrary weight floor.
 | #104 | Actionable escalation and cost accounting | Target, status, citations, missing evidence and next permitted action reach the agent; actual total spend is measured |
 | #105 | Honest model/operator readiness | DONE 2026-09-15: the daemon computes one readiness record per tier (`pam_daemon::model_readiness`: configured → installed → verified → qualified → engine → ready, first failing rung with the job's own refusal cause and a recovery line; residency reported beside it, never as a rung) in `admin.models.status`; the Models runtime tab, the Settings tier selects, Home's rephrase line and the log-compression form all read that record and name the one repair; compression is stated off |
 | #106 | Task-first entry points | DONE 2026-09-12: Home leads with starter task cards and a start_task Ask intent that deep-link to a flow's run overview; the run tab checks readiness through admin.flows.inspect and shows blockers with a destination; no model needed. Resume by ticket stays the Run history tab and `pam wait <ticket>` |
-| #124 | Usability checkpoint | Representative agent completes workflow without guessing operations or fetching raw logs unnecessarily |
+| #124 | Usability checkpoint | DONE 2026-09-15: CLI-only agent path verified live on a scratch daemon with the real models and engine — flow inspect named blockers with recovery, flow run/wait/result returned the bounded handoff, evidence read followed next_action verbatim, the qualified model summarized a real build failure honestly, and clearing the default produced an explicit model_skipped observation on the deterministic path; live admission refusals and GUI readiness on real replies; residuals filed as issues #29 (model identity absent from the agent result) and #30 (flow.inspect ignores readiness) |
 
 #100 is a diagnostic correctness repair, not a conversational feature. #104
 provides measurement for #108. Model readiness can show an explicit unqualified

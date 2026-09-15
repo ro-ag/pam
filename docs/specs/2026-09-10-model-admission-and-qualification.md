@@ -154,6 +154,8 @@ one, so bumping the engine forces requalification. The only record is
 gpt-oss-20b-MXFP4 on b10938/macos-arm64 under answer contract v2
 (`docs/benchmarks/2026-09-15-answer-contract-v2`); Linux and Windows builds stay
 unqualified until measured there. Memory is not a gate and is not in the record.
+The per-artifact dispositions are published in
+[model qualification decisions](../model-qualification-decisions.md) (task #123).
 
 ## One paired acceptance experiment
 

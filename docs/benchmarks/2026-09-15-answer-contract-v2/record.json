@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-15-answer-contract-v2",
+  "purpose": "task_108_answer_contract_v2_gpt_oss_20b_rerun_against_the_gates",
+  "host": "Apple M4 Max, 64 GiB, ambient load (not a 32 GB measurement)",
+  "engine": {
+    "tag": "b10938",
+    "build_info": "b10938-f1e44dcc1",
+    "backend": "Metal (default offload)",
+    "supervisor_settings": {
+      "reasoning_budget": 0,
+      "enable_thinking": false,
+      "cache_prompt": false,
+      "seed": 7,
+      "context_tokens": 8192
+    }
+  },
+  "contract": {
+    "version": "v2",
+    "case_set_sha256": "779638853b93eee0ff338ea00f4334cb86c625862577c73f27be8c853c1272f2",
+    "previous_case_set_sha256": "a324c2e3c28a933a845b3f6e0655fdb65472696bf4f516782992e2b9cf5dc8c6",
+    "changes_from_v1": [
+      "every build question (build_triage, abstention_trap) carries a host-parsed STATUSES/COMPLETENESS block: exit codes come from `exit=N` lines and nowhere else; a cut-off code, a stage with no code, a planned stage with no line and one stage reporting two codes are each a completeness note (capability_bench::exit_facts); the parser reproduces every frozen expectation by construction (test the_host_verdict_agrees_with_every_frozen_expectation)",
+      "abstention traps ask 'Did every planned stage of this build record complete and pass?' instead of the FINAL-stage question, so variant 1 (a planned stage's result is absent) is undecidable rather than arguably PASS",
+      "the system prompt names the block as authoritative and status words (SUCCESS, PASS) as non-evidence",
+      "the answer is the first word after the last ANSWER: marker with quotes and markup stripped (v1 kept the whole line, which scored 'PARALLEL\". Also we need\u2026' as a false alarm)",
+      "output cap 160 tokens (v1: 96) and recorded in the summary; a run that hits the cap is a contract violation, never a guess",
+      "coverage_on_decidable excludes contract violations on decidable cases (v1 counted a missing answer as covered)",
+      "per-case output text (400 chars) is recorded so a violation is readable",
+      "product envelope: pam_model::engine_server::output_budget raises any positive max_tokens below 16 to 16 (gpt-oss returns raw harmony control tokens under that floor); 0 keeps its engine meaning"
+    ],
+    "comparability": "v2 numbers are not comparable with the v1 screens (2026-09-12/13/14); the v1 records stay as history"
+  },
+  "gates": {
+    "accuracy": ">=0.95",
+    "false_passes": 0,
+    "warm_p95_ms": "<10000 short tasks"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "file": "gpt-oss-20b-mxfp4-v2-run1-cap96-lineparser.jsonl",
+      "revision": "58f7655",
+      "output_cap": 96,
+      "answer_parser": "whole line",
+      "accuracy": "0.960",
+      "false_passes": 0,
+      "false_alarms": 0,
+      "over_abstentions": 0,
+      "contract_violations": 6,
+      "warm_p95_ms": 918,
+      "note": "six missing answers: bt-038 (prose verdict, no marker) and all five PARALLEL pipeline cases, which spent the whole 96-token cap on inline analysis"
+    },
+    {
+      "run": 2,
+      "file": "gpt-oss-20b-mxfp4-v2-run2-cap160-lineparser.jsonl",
+      "revision": "ade4a35",
+      "output_cap": 160,
+      "answer_parser": "whole line",
+      "accuracy": "0.967",
+      "false_passes": 0,
+      "false_alarms": 2,
+      "over_abstentions": 0,
+      "contract_violations": 3,
+      "warm_p95_ms": 722,
+      "note": "two PARALLEL cases answered 'ANSWER: PARALLEL\". Also we need to provide\u2026' and the whole-line parser scored them as false alarms; jl-003/jl-027 still hit the cap; bt-038 unchanged"
+    },
+    {
+      "run": 3,
+      "file": "gpt-oss-20b-mxfp4-v2.jsonl",
+      "revision": "620aa8c",
+      "output_cap": 160,
+      "answer_parser": "first word",
+      "accuracy": "0.980",
+      "false_passes": 0,
+      "false_alarms": 0,
+      "over_abstentions": 0,
+      "contract_violations": 3,
+      "coverage_on_decidable": "0.974",
+      "cold_p50_ms": 448,
+      "cold_p95_ms": 633,
+      "warm_p50_ms": 399,
+      "warm_p95_ms": 593,
+      "families": {
+        "abstention_trap": "22/22",
+        "build_triage": "47/48 (bt-038 no answer)",
+        "fact_extraction": "40/40",
+        "jenkins_label": "38/40 (jl-003, jl-027 hit the 160-token cap)"
+      }
+    }
+  ],
+  "reference_run": 3,
+  "artifact": {
+    "name": "gpt-oss-20b-MXFP4",
+    "sha256": "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+    "bytes": 12109566624
+  },
+  "findings": [
+    "Under the product contract gpt-oss-20b meets all three gates on this host: accuracy 0.980 (>=0.95), zero false passes, zero false alarms, zero over-abstentions, warm p95 593 ms.",
+    "Every v1 false pass and over-abstention was a contract artefact: with host-parsed exit facts and an unambiguous trap question the abstention family is 22/22 and build triage has no false pass, false alarm or over-abstention.",
+    "The remaining gap is three missing answers (2.0%): gpt-oss keeps reasoning inline on the two PARALLEL records with a failing first branch and exhausts 160 tokens before its answer line (reasoning_budget 0 does not stop that), and on bt-038 it states the verdict in prose without the marker. These count against accuracy and coverage, never as a pass.",
+    "Deterministic exit parsing owns exit truth in the product (#139 structured path); the model's role on build questions is to read the host's facts, which it now does without contradicting them."
+  ],
+  "not_measured": [
+    "a second artifact on v2 (user decision 2026-09-15: gpt-oss-20b only)",
+    "32 GB host footprint (memory is not a gate; this host cannot measure it)",
+    "the 500+100 held-out qualification corpus of the admission spec"
+  ],
+  "raw": "one JSON line per case plus the summary line, emitted by capability_bench with PAM_BENCH_BACKEND=llama; run 3 is the record, runs 1 and 2 are kept for the audit trail"
+}

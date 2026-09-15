@@ -20,7 +20,7 @@ import {
   type BridgeFailure,
   type ModelEntry,
 } from "../lib/ipc";
-import { FLOOR_SENTENCE } from "./Models";
+import { admissionBlocker } from "./Models";
 
 /**
  * Settings → Models: the persistent choices, as opposed to the live
@@ -28,10 +28,11 @@ import { FLOOR_SENTENCE } from "./Models";
  * tier, which vendor agent CLI PAM borrows as its curator, and where the
  * weights live plus how long they stay resident.
  *
- * The engine floor is enforced twice on purpose: the daemon refuses a
- * `test_only` model as a tier default with cause `unverified`, and the
- * select here renders those options disabled with the reason in the
- * label — so the human never has to earn the refusal to learn the rule.
+ * Admission is enforced twice on purpose: the daemon refuses a `test_only`
+ * model as a tier default with cause `unverified` and a verified-but-unmeasured
+ * one with cause `unqualified`, and the select here renders those options
+ * disabled with the reason in the label — so the human never has to earn the
+ * refusal to learn the rule.
  */
 
 /** The tiers a job can ask for; `heavy` falls back to `light`, then none. */
@@ -74,16 +75,19 @@ function TierSelect({
         className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
       >
         <option value="">none (deterministic)</option>
-        {models.map((model) => (
-          <option
-            key={model.id}
-            value={model.id}
-            disabled={model.class === "test_only"}
-            title={model.class === "test_only" ? FLOOR_SENTENCE : undefined}
-          >
-            {model.class === "test_only" ? `${model.id} — ${FLOOR_SENTENCE}` : model.id}
-          </option>
-        ))}
+        {models.map((model) => {
+          const blocker = admissionBlocker(model);
+          return (
+            <option
+              key={model.id}
+              value={model.id}
+              disabled={blocker !== undefined}
+              title={blocker}
+            >
+              {blocker === undefined ? model.id : `${model.id} — ${blocker}`}
+            </option>
+          );
+        })}
       </select>
       <span className="block font-sans text-sm text-ink-muted">{TIER_SENTENCES[tier]}</span>
     </label>

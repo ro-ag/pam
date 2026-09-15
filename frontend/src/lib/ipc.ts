@@ -358,6 +358,27 @@ export function auditRequest(
 /** Engine class: `engine` once the digest is verified, `test_only` until then. */
 export type ModelClass = "engine" | "test_only";
 
+/**
+ * The compiled-in admission evidence a verified digest matched on this
+ * platform (`pam_model::qualification::Qualification`). Only a qualified
+ * entry serves a job; verified alone still means Try only.
+ */
+export interface Qualification {
+  artifact: string;
+  sha256: string;
+  engine_tag: string;
+  targets: string[];
+  contract: string;
+  case_set_sha256: string;
+  /** Repository path of the evidence record. */
+  record: string;
+  host: string;
+  accuracy: number;
+  false_passes: number;
+  warm_p95_ms: number;
+  decided: string;
+}
+
 /** What the bounded GGUF header parser could read out of a file. */
 export interface GgufInfo {
   architecture: string;
@@ -391,6 +412,8 @@ export interface ModelEntry {
   info_error: string | null;
   class: ModelClass;
   verified: VerifiedRecord | null;
+  /** Null for an unverified file, or a verified one nobody has measured here. */
+  qualification: Qualification | null;
   catalog_id: string | null;
 }
 

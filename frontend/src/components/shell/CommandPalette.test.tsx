@@ -157,6 +157,7 @@ describe("CommandPalette", () => {
           info_error: null,
           class: "engine",
           verified: null,
+          qualification: null,
           catalog_id: null,
         },
       ],

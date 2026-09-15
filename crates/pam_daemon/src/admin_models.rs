@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use pam_model::catalog::{CATALOG, find_preset};
 use pam_model::curator::{AgentCli, AgentId};
 use pam_model::download::{DownloadError, DownloadRequest, curl_recovery_line};
-use pam_model::registry::{ModelClass, ModelEntry, RegistryError};
+use pam_model::registry::{ModelEntry, RegistryError};
 use pam_model::runtime::{GenerateRequest, RuntimeState};
 use pam_proto::Outcome;
 use serde_json::{Value, json};
@@ -28,7 +28,9 @@ use crate::admin::{
     RECOVERY_INTERNAL, required_str,
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
-use crate::model_service::{ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier};
+use crate::model_service::{
+    ModelService, ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier,
+};
 
 /// `admin.models.list` → `{ models, models_dir }`.
 pub const OP_MODELS_LIST: &str = "admin.models.list";
@@ -106,6 +108,10 @@ pub const MODEL_ADMIN_OPS: &[&str] = &[
 /// default.
 pub const CAUSE_UNVERIFIED: &str = "unverified";
 
+/// Refusal cause: a verified model with no qualification record on this
+/// target was offered as a tier default.
+pub const CAUSE_UNQUALIFIED: &str = "unqualified";
+
 /// Refusal cause: no model in the registry carries that id.
 pub const CAUSE_UNKNOWN_MODEL: &str = "unknown_model";
 
@@ -161,6 +167,9 @@ const RECOVERY_LIBRARY: &str =
 /// Recovery line for an unverified model offered as a default.
 const RECOVERY_UNVERIFIED: &str = "Tier defaults need a verified model: run Verify on the PAM GUI Models screen, \
      or download it from the catalog, which checks the digest.";
+
+/// Recovery line for a verified but unqualified model offered as a default.
+const RECOVERY_UNQUALIFIED: &str = "Tier defaults need a qualified model: one whose exact digest met the capability gates      on this engine and platform (see docs/benchmarks). Unqualified models still answer Try on      the PAM GUI Models screen.";
 
 /// Recovery line for a transfer that is already running.
 const RECOVERY_DOWNLOAD_RUNNING: &str =
@@ -567,15 +576,28 @@ impl AdminService {
         };
 
         let entry = self.entry(model_id).await?;
-        if entry.class == ModelClass::TestOnly {
-            return Err(AdminRefusal {
-                cause: CAUSE_UNVERIFIED,
-                detail: format!(
-                    "{model_id} has no verified digest; unverified models prove the wiring \
-                     and never serve a job"
-                ),
-                recovery: RECOVERY_UNVERIFIED,
-            });
+        match ModelService::admit(&entry) {
+            Ok(()) => {}
+            Err(ModelUnavailable::Unverified(_)) => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_UNVERIFIED,
+                    detail: format!(
+                        "{model_id} has no verified digest; unverified models prove the wiring \
+                         and never serve a job"
+                    ),
+                    recovery: RECOVERY_UNVERIFIED,
+                });
+            }
+            Err(_) => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_UNQUALIFIED,
+                    detail: format!(
+                        "{model_id} is verified but no qualification record covers its digest \
+                         on this platform; it proves the wiring and never serves a job"
+                    ),
+                    recovery: RECOVERY_UNQUALIFIED,
+                });
+            }
         }
         self.models.set_default(tier, Some(&entry.id)).await?;
         Ok(AdminOk {
@@ -837,7 +859,9 @@ fn diagnostic_refusal(error: ModelUnavailable) -> AdminRefusal {
         ModelUnavailable::Service(error) => download_refusal(error),
         ModelUnavailable::Store(error) => AdminRefusal::from(error),
         ModelUnavailable::Missing(id) => download_refusal(ModelServiceError::UnknownModel(id)),
-        ModelUnavailable::NoDefault(_) => AdminRefusal {
+        ModelUnavailable::NoDefault(_)
+        | ModelUnavailable::Unverified(_)
+        | ModelUnavailable::Unqualified(_) => AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,
             detail: "Explicit diagnostic unexpectedly attempted tier resolution.".to_owned(),
             recovery: RECOVERY_INTERNAL,

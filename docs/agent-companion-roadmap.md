@@ -47,7 +47,7 @@ for access, evidence, polling, validation, or landing decisions.
 | Jenkins | Explicit build investigation, bounded stages/nodes/logs, CLI observation summary, coverage gaps | Decisive-evidence follow-up and CLI retrieval; root cause remains unresolved |
 | Evidence | Deterministic reduction with source maps; original/compact/semantic storage | Common identity/completeness/redaction contract and authorized range reads |
 | Orchestration | Flows, checks, approvals, retries, tickets, durable remote polling, guarded landing through sync (bounds-proven pack transfer, exact-lease fast-forward) | Enterprise checkpoint of the complete recipe (#94) |
-| Models | llama.cpp engine as a pinned, digest-verified external process (b10938; Unix socket, Windows loopback) routing every generation path; candle removed 2026-09-13 (plan 37); frozen bench on the engine under answer contract v2 (gpt-oss-20b 0.980/0 FP @593 ms warm p95, 2026-09-15) | Engine-based admission replacing the 18 GB floor (#96); the three missing-answer cases |
+| Models | llama.cpp engine as a pinned, digest-verified external process (b10938; Unix socket, Windows loopback) routing every generation path; candle removed 2026-09-13 (plan 37); frozen bench on the engine under answer contract v2 (gpt-oss-20b 0.980/0 FP @593 ms warm p95, 2026-09-15); evidence-backed admission (#96, 2026-09-15): a tier default must be verified and match a compiled-in qualification record on this engine and target — gpt-oss-20b on macos-arm64 is the only one | The three missing-answer cases; qualification on Linux/Windows targets |
 | Microsoft compression | Removed 2026-09-13 with the candle runtime (plan 37); qualification records stay under docs/benchmarks | Nothing: evidence reduction is deterministic framing only |
 
 The Microsoft smoke preserved evidence and reduced 1,017 tokens to 459, but took
@@ -63,8 +63,9 @@ resolution (issue #25), so enablement now waits on the #108 gates, not
 compressor work.
 See [implementation notes](microsoft-compression.md) and
 [Jenkins behavior](jenkins-investigation.md) for shipped limits.
-No 9–14 GB investigator has been qualified. Current weight-size eligibility
-remains disputed in #96.
+gpt-oss-20b-MXFP4 (12.1 GB) is the one qualified investigator, on b10938/macos-arm64
+under answer contract v2. Weight-size eligibility is gone (#155, #96): admission is a
+verified digest plus a qualification record for this engine and target.
 
 ## Dependency-ordered plans
 
@@ -165,7 +166,7 @@ must preserve user changes; releases and artifact publishing remain separate.
 | #139 | Structured advisory diagnosis and scoped reads | Invalid/hostile/unsupported claims fail safely; quotes, target membership and run-wide budgets enforced |
 | #140 | Microsoft compression qualification | DONE 2026-09-12: held-out retention proven and restricted per class; sequence measured against deterministic-only; decision recorded (default off, enablement blocked on the citation-offset contract) |
 | #108 | Paired end-to-end qualification | Published acceptance report, per-product coverage/errors/abstention/resources and realized frontier savings. Status 2026-09-12: targets confirmed as gates; accuracy-first candidate screen (candle: 14B 82%/9 FP, 32B 84%/8 FP, 30B-A3B 74%/8 FP, Qwen3-Coder-30B-A3B 84.7%/7 FP; llama.cpp engine, Metal: coder 85.3%/7 FP at warm p95 671 ms, gpt-oss-20b 86.7%/3 FP at 574 ms — docs/benchmarks/2026-09-13-llama-engine-screen; 2026 candidates Qwen3.8-27B 89.3%/9 FP, Qwen3.6-35B-A3B 88%/12 FP, gemma-4-26B-A4B 79.3%/2 FP at coverage 0.754, GLM-4.7-Flash 82%/13 FP, Devstral-Small-2-24B 89.3%/8 FP with 4 on decidable triage — docs/benchmarks/2026-09-14-engine-candidate-screen; gpt-oss-20b stays the reference) shows the false-pass set is stable across artifacts, so the gates must be measured on the product contract and the ambiguous trap cases reworded before any artifact can pass (docs/benchmarks/2026-09-12-candidate-accuracy). Status 2026-09-15: answer contract v2 (host-parsed exit facts, every-stage trap question, first-word answer parsing, 160-token cap, 16-token engine floor) — gpt-oss-20b 98.0%/0 FP/0 FA/0 over-abstentions at warm p95 593 ms, three missing answers remain (docs/benchmarks/2026-09-15-answer-contract-v2); the gates are met on this host under the product contract |
-| #96 | Artifact/task/backend eligibility | Evidence-backed promotion replaces the size floor; configured unqualified models stay visible |
+| #96 | Artifact/task/backend eligibility | DONE 2026-09-15: `pam_model::qualification` binds digest + engine tag + target + contract + gates + record; `defaults.set` and `resolve` refuse unverified/unqualified; unqualified defaults stay configured and visible, Try still works; only gpt-oss-20b on macos-arm64 qualifies |
 | #123 | Qualification checkpoint | Explicit qualified envelope or no-go decision; no invented readiness |
 
 Follow the [admission specification](specs/2026-09-10-model-admission-and-qualification.md)

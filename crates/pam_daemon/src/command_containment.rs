@@ -2,9 +2,10 @@
 //!
 //! Supported only on macOS with its system sandbox launcher. No network, Mach
 //! service lookup, GUI automation, or process control outside the workload is
-//! granted. Only explicitly supplied repository and toolchain reads are allowed;
-//! repository writes require a stateful operation. No implicit HOME/cache/temp
-//! exception exists. Unsupported configurations never fall back to raw exec.
+//! granted. Only the immutable system trees (including the system TLS
+//! configuration under `/private/etc/ssl`) and explicitly supplied repository
+//! and toolchain reads are allowed; repository writes require a stateful
+//! operation. No implicit HOME/cache/temp exception exists. Unsupported configurations never fall back to raw exec.
 //!
 //! Host provisioning must keep protected assets outside writable repositories,
 //! including pre-existing hardlink aliases. New hardlinks are denied. This does
@@ -17,8 +18,20 @@ use std::path::PathBuf;
 /// Stable refusal cause for unavailable command containment.
 pub const CAUSE_UNAVAILABLE: &str = "command_containment_unavailable";
 
+/// Immutable, root-owned system trees every workload may read. `/private/etc/ssl`
+/// is the system TLS configuration: Apple's `LibreSSL`, which the system libcurl
+/// that cargo links loads at start-up, exits the whole process with "Auto
+/// configuration failed" when it cannot open `openssl.cnf`, and it ignores
+/// `OPENSSL_CONF`. Nothing else under `/etc` is granted.
 #[cfg(any(target_os = "macos", test))]
-const SYSTEM_READ_ROOTS: &[&str] = &["/System", "/usr", "/bin", "/sbin", "/private/var/db/dyld"];
+const SYSTEM_READ_ROOTS: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private/var/db/dyld",
+    "/private/etc/ssl",
+];
 
 /// Trusted daemon-supplied boundaries; never inferred from the child's environment.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -15,7 +15,8 @@ use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::flow_service::{
     CAUSE_FLOW_NOT_FOUND, CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings,
-    SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH, SettingsPatch, step_capability,
+    SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH, SettingsPatch, boundary_read_roots,
+    step_capability,
 };
 use crate::log_service::LogService;
 use crate::policy::PolicyGate;
@@ -355,4 +356,61 @@ fn connector_assertions_fail_closed_without_changing_observation_or_api_failure(
     );
     apply_connector_assertion(&step, None, &mut report);
     assert_eq!(report.error.unwrap().cause, "connector_bad_response");
+}
+
+/// Issue #26: a daemon binary that lives under its own protected base (or
+/// inside the repository) must not become a read root, because the profile
+/// refuses any root overlapping those boundaries and every build flow then
+/// fails before its first step.
+#[test]
+fn boundary_read_roots_drop_grants_inside_the_protected_base_or_the_repository() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("base");
+    let repo = tmp.path().join("repo");
+    let tools = tmp.path().join("tools");
+    for dir in [&base.join("bin"), &repo.join("target"), &tools] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let program = tools.join("cargo");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    for file in [
+        &program,
+        &base.join("bin/pam"),
+        &repo.join("target/pam"),
+        &elsewhere.join("pam"),
+    ] {
+        std::fs::write(file, b"").expect("file");
+    }
+    let tools = tools.canonicalize().expect("canonical tools");
+
+    let inside_base =
+        boundary_read_roots(&base, &repo, &program, Some(&base.join("bin/pam")), None);
+    let canonical_base = base.canonicalize().expect("canonical base");
+    assert!(
+        inside_base.contains(&tools),
+        "program directory stays granted"
+    );
+    assert!(
+        inside_base
+            .iter()
+            .all(|root| !root.starts_with(&canonical_base)),
+        "no root under the protected base: {inside_base:?}"
+    );
+
+    let inside_repo =
+        boundary_read_roots(&base, &repo, &program, Some(&repo.join("target/pam")), None);
+    let canonical_repo = repo.canonicalize().expect("canonical repo");
+    assert!(
+        inside_repo
+            .iter()
+            .all(|root| !root.starts_with(&canonical_repo)),
+        "no root under the repository: {inside_repo:?}"
+    );
+
+    let separate = boundary_read_roots(&base, &repo, &program, Some(&elsewhere.join("pam")), None);
+    assert!(
+        separate.contains(&elsewhere.canonicalize().expect("canonical elsewhere")),
+        "a daemon directory outside both boundaries stays granted: {separate:?}"
+    );
 }

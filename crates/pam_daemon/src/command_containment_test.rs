@@ -52,6 +52,10 @@ fn profile_has_no_unscoped_reads_network_or_host_services() {
     assert!(text.contains("(deny file-link)"));
     assert!(text.contains("(allow signal (target self))"));
     assert!(!text.contains("(allow file-write*"));
+    // The system TLS configuration is readable; the rest of /etc is not.
+    assert!(text.contains("(allow file-read* file-map-executable (subpath \"/private/etc/ssl\"))"));
+    assert!(!text.contains("(subpath \"/private/etc\")"));
+    assert!(!text.contains("(subpath \"/etc\")"));
 }
 
 #[test]

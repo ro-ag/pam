@@ -338,7 +338,9 @@ calls `pam_connectors::call`. Secrets live only inside the call.
    order, env = daemon env minus names matching
    `(?i)token|secret|password|passwd|credential|api_key|apikey|private_key`
    plus `PATH`, the step `env`, `GIT_TERMINAL_PROMPT=0`,
-   `GIT_ASKPASS`/`SSH_ASKPASS` = false, `PAM_FLOW=<id>`, `PAM_STEP=<id>`,
+   `GIT_ASKPASS`/`SSH_ASKPASS` = false, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+   = `/dev/null` (personal configuration is outside command authority),
+   `PAM_FLOW=<id>`, `PAM_STEP=<id>`,
    own process group on unix (`process_group(0)`), `kill_on_drop`.
    Timeout → kill the group, step `failed` (`timeout`); output over
    `MAX_SOURCE_BYTES` (64 MiB) → kill, `failed` (`output_limit`); cancel

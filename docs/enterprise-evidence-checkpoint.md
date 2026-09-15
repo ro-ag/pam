@@ -84,9 +84,11 @@ Named blockers — acceptance is not claimed for these:
   #145; the two runner-load flakes (#31 `curl_origin`, #33 lease reaping) were
   reproduced as passing on the idle VM and hardened (PR 147); `cargo test
   --workspace` passed in full inside the VM (52 suites). #22 (no Windows admin
-  adapter) stays open on hold: a kernel-authenticated peer check needs a scoped
-  `unsafe` windows-sys module the workspace lints forbid, which is the owner's
-  call.
+  adapter) closed the same night without `unsafe` (PR 149): the Windows adapter is
+  loopback TCP behind an owner-only nonce with a server-first proof, documented in
+  [the administration boundary](admin-boundary.md); the GUI bridge, testkit admin
+  and CLI admin suites now run on Windows, and the full workspace passed in the VM
+  on that commit.
 
 Residual issues carried forward at the checkpoint, and their disposition the
 same day (plan 38): #4 retired after a 30-minute churn on the current build

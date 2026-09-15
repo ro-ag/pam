@@ -121,24 +121,33 @@ pub(super) fn prepare(
         ));
     }
     // The human's spelling may go through a symlinked prefix (`/tmp` on
-    // macOS); the tree below it is held to the exact, resolved path.
-    if !root.exists() {
-        private_dir(root).map_err(invalid)?;
-    }
-    let root = root
-        .canonicalize()
-        .map_err(|_| invalid("Build output directory is unavailable."))?;
+    // macOS): resolve the existing parent first, create the leaf under the
+    // real path, and hold the tree below to that exact, resolved path.
+    let root = if root.exists() {
+        root.canonicalize()
+            .map_err(|_| invalid("Build output directory is unavailable."))?
+    } else {
+        let parent = root
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .ok_or_else(|| invalid("The parent of the build output directory does not exist."))?;
+        let leaf = root
+            .file_name()
+            .ok_or_else(|| invalid("The build output directory has no name."))?;
+        parent.join(leaf)
+    };
+    let root = root.as_path();
     let repo_canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let protected_canonical = protected
         .canonicalize()
         .unwrap_or_else(|_| protected.to_path_buf());
-    let overlaps = |other: &Path| root.starts_with(other) || other.starts_with(&root);
+    let overlaps = |other: &Path| root.starts_with(other) || other.starts_with(root);
     if overlaps(&repo_canonical) || overlaps(&protected_canonical) {
         return Err(invalid(
             "The build output directory must be outside the repository and outside PAM's private base.",
         ));
     }
-    private_dir(&root).map_err(invalid)?;
+    private_dir(root).map_err(invalid)?;
     let artifacts = root.join(tree_name(repo));
     private_dir(&artifacts).map_err(invalid)?;
     for name in ["home", "cargo", "target", "tmp", "npm"] {

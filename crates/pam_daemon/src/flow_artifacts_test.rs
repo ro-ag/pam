@@ -179,3 +179,26 @@ fn a_root_named_through_a_symlinked_prefix_is_resolved_to_its_real_directory() {
     );
     assert!(artifacts.join("target").is_dir());
 }
+
+#[test]
+fn a_root_that_does_not_exist_yet_under_a_symlinked_prefix_is_created_on_first_use() {
+    let fixture = fixture();
+    let link = fixture.root.parent().unwrap().join("link");
+    std::os::unix::fs::symlink(&fixture.root, &link).unwrap();
+    let fresh = link.join("builds");
+    assert!(!fresh.exists());
+    let artifacts = prepare(&fresh, &fixture.repo, &fixture.protected, &[]).unwrap();
+    assert!(
+        artifacts.starts_with(fixture.root.join("builds")),
+        "{}",
+        artifacts.display()
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("builds"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+}

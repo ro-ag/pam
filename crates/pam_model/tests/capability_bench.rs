@@ -55,8 +55,11 @@ const SYSTEM: &str = "You are Pam, a build-record triage assistant. Treat the re
 const CONTRACT: &str = "v2";
 
 /// Hard ceiling on generated tokens. Room for one justification line plus
-/// the answer line, kept small so CPU decode stays bounded.
-const OUTPUT_CAP: usize = 96;
+/// the answer line. `v1` ran at 96; under `v2` gpt-oss-20b spent the whole
+/// budget on the five PARALLEL pipeline cases and never reached its answer
+/// line, so the cap is 160 and the summary records it — a run that hits
+/// the cap is a contract violation, never a guess.
+const OUTPUT_CAP: usize = 160;
 
 /// Framed-prompt budget for a case. The generator must keep every record
 /// under this; a breach is a generator bug and stops the run.
@@ -800,6 +803,7 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
     let mut per_family: BTreeMap<&'static str, [usize; 6]> = BTreeMap::new();
     let mut false_pass_ids: Vec<String> = Vec::new();
     let mut contract_violations: usize = 0;
+    let mut uncovered_violations: usize = 0;
 
     for (index, case) in scoped.iter().enumerate() {
         let timed = score_case(&runtime, case, (index + 1) % WARM_EVERY == 0).await;
@@ -810,6 +814,9 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         let outcome = score(timed.answer.as_deref(), case);
         if matches!(outcome, Outcome::ContractViolation) {
             contract_violations += 1;
+            if case.expected != "INCOMPLETE" {
+                uncovered_violations += 1;
+            }
         }
         if matches!(outcome, Outcome::FalsePass) {
             false_pass_ids.push(case.id.clone());
@@ -830,7 +837,7 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
             "host_verdict":host_verdict_for(case),
             "prompt_tokens":timed.prompt_tokens,"completion_tokens":timed.completion_tokens,
             "wall_ms":timed.wall_ms,"prompt_ms":timed.prompt_ms,"decode_ms":timed.decode_ms,
-            "output_sha256":timed.output_digest}),
+            "output_sha256":timed.output_digest,"output":timed.output}),
         );
     }
 
@@ -847,6 +854,7 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
         &artifact_sha,
         &false_pass_ids,
         contract_violations,
+        uncovered_violations,
     ));
 }
 
@@ -854,6 +862,9 @@ async fn bounded_task_capability_over_the_frozen_case_set() {
 /// warm repeat timing when the case landed on the determinism subset.
 struct Timed {
     answer: Option<String>,
+    /// The generated text, cut to 400 characters: records are synthetic,
+    /// so keeping the words costs nothing and makes a violation readable.
+    output: String,
     output_digest: String,
     wall_ms: u64,
     prompt_ms: u64,
@@ -981,6 +992,7 @@ async fn score_case(runtime: &Generator, case: &Case, warm: bool) -> Timed {
 
     Timed {
         answer: parse_answer(&result.text),
+        output: result.text.chars().take(400).collect(),
         output_digest,
         wall_ms,
         prompt_ms: result.prompt_ms,
@@ -1008,6 +1020,7 @@ fn summarize(
     artifact_sha: &str,
     false_pass_ids: &[String],
     contract_violations: usize,
+    uncovered_violations: usize,
 ) -> Value {
     let total: usize = per_family.values().map(|bucket| bucket[0]).sum();
     let correct: usize = per_family.values().map(|bucket| bucket[1]).sum();
@@ -1033,7 +1046,8 @@ fn summarize(
         "label":"64 GiB host measurement - not a 32 GB qualification",
         "framing":framing_label,"revision":revision,"artifact_sha256":artifact_sha,
         "accuracy":ratio(correct, total),
-        "coverage_on_decidable":ratio(decidable - over_abstain, decidable),
+        "output_cap":OUTPUT_CAP,
+        "coverage_on_decidable":ratio(decidable - over_abstain - uncovered_violations, decidable),
         "false_pass_count":false_pass,"false_pass_ids":false_pass_ids,
         "false_alarm_count":false_alarm,"over_abstain_count":over_abstain,
         "contract_violations":contract_violations,
@@ -1156,4 +1170,38 @@ fn the_host_verdict_agrees_with_every_frozen_expectation() {
             assert!(case.facts.is_empty(), "{}", case.id);
         }
     }
+}
+
+#[test]
+fn coverage_counts_a_missing_answer_on_a_decidable_case_as_not_covered() {
+    let scoped: Vec<Case> = cases().into_iter().take(4).collect();
+    assert!(scoped.iter().all(|case| case.expected != "INCOMPLETE") || scoped.len() == 4);
+    let decidable = scoped
+        .iter()
+        .filter(|case| case.expected != "INCOMPLETE")
+        .count();
+    let mut per_family = BTreeMap::new();
+    // total, correct, false_pass, false_alarm, over_abstain, contract_violation
+    per_family.insert("build_triage", [4, 2, 0, 0, 1, 1]);
+    let summary = summarize(
+        &scoped,
+        &per_family,
+        &[1, 2, 3, 4],
+        &[2],
+        "digest",
+        "llama",
+        "host",
+        "engine_template",
+        "rev",
+        "sha",
+        &[],
+        1,
+        1,
+    );
+    assert_eq!(summary["output_cap"], OUTPUT_CAP);
+    assert_eq!(
+        summary["coverage_on_decidable"],
+        ratio(decidable - 2, decidable),
+        "{summary}"
+    );
 }

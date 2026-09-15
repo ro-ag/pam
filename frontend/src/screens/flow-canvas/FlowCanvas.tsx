@@ -50,24 +50,15 @@ import { StepNode } from "./StepNode";
 import { TetherEdge } from "./TetherEdge";
 
 /**
- * The canvas host: a toolbar, the xyflow viewport, the minimap. The flow
- * spec is the truth and lives in the Flows screen; this component derives
- * nodes and edges from it, keeps a local copy so xyflow can report
- * measurements and selection back, and turns every gesture into a pure
- * `graph.ts` edit handed up through `onChange`.
- *
- * Positions are the one thing the spec does not know. Stored ones win,
- * nodes the canvas has already placed keep their place, and only the rest
- * are laid out by ELK — so an added step lands next to the flow instead
- * of scattering everything the human arranged. ELK places notes too, as
- * comment boxes beside their step; only a note typed onto a step that is
- * already placed takes the fallback spot beside it until the next Tidy.
- *
- * Selection is owned by the screen (the inspector shares it) and mirrored
- * onto the nodes; the canvas reports back only what a gesture changed —
- * the `select` changes xyflow emits on a click or a drag-select — never
- * the store's own echo of the selection it was just handed, which lags a
- * render behind and would otherwise argue with the mirror forever.
+ * The canvas host: a toolbar, the xyflow viewport, the minimap. The flow spec is the truth, owned by
+ * the Flows screen; nodes and edges derive from it, and gestures become a pure `graph.ts` edit via
+ * `onChange`. Positions are the one thing the spec doesn't know: stored ones win, already-placed
+ * nodes keep their place, and the rest go through ELK, which also places notes as comment boxes
+ * beside their step — a note typed onto an already-placed step falls back beside it until Tidy.
+ * Selection is owned by the screen and mirrored onto the nodes; the canvas reports back only the
+ * `select` changes xyflow emits on a click or drag-select — never the store's own echo, which lags
+ * a render and would otherwise fight the mirror.
+ * The local node/edge copy exists so xyflow can report measurements and selection back; ELK places an added step next to the existing flow instead of scattering the human's arrangement.
  */
 
 export type Selection =
@@ -115,10 +106,7 @@ function sameSelection(a: Selection, b: Selection): boolean {
  * What the selected nodes and edges mean to the inspector. A note stands
  * for its step; the Verdict frame is never selectable.
  */
-export function selectionOf(
-  nodes: readonly CanvasNode[],
-  edges: readonly CanvasEdge[],
-): Selection {
+function selectionOf(nodes: readonly CanvasNode[], edges: readonly CanvasEdge[]): Selection {
   const node = nodes.find((candidate) => candidate.selected);
   if (node) {
     if (node.type === "note") return { kind: "step", id: node.data.stepId };

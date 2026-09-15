@@ -59,12 +59,6 @@ pub struct RuntimeDir {
 }
 
 impl RuntimeDir {
-    /// Resolves `~/.pam` as the base directory and prepares `~/.pam/run`.
-    pub fn from_home() -> Result<Self, RuntimeDirError> {
-        let home = std::env::home_dir().ok_or(RuntimeDirError::HomeNotFound)?;
-        Self::at_base(&home.join(".pam"))
-    }
-
     /// Prepares `<base>/run` (created with mode `0700` on unix) and computes
     /// the socket paths, validating both against the 104-byte limit before
     /// creating anything.

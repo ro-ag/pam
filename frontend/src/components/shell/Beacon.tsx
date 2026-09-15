@@ -9,7 +9,7 @@ const beaconLabels: Record<BeaconState, string> = {
   down: "daemon unreachable",
 };
 
-export const beaconVariants = cva("rounded-pill", {
+const beaconVariants = cva("rounded-pill", {
   variants: {
     state: {
       connected: "bg-beacon-green",
@@ -22,7 +22,7 @@ export const beaconVariants = cva("rounded-pill", {
   },
 });
 
-export type BeaconProps = VariantProps<typeof beaconVariants> & { className?: string };
+type BeaconProps = VariantProps<typeof beaconVariants> & { className?: string };
 
 export function Beacon({ state, className }: BeaconProps) {
   const resolved: BeaconState = state ?? "down";

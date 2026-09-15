@@ -22,10 +22,10 @@ import {
  */
 
 /** The compaction report kind: it is the one row with a stats line. */
-export const KIND_COMPACT = "log.compact";
+const KIND_COMPACT = "log.compact";
 
 /** The model's prose: the one row that speaks in Pam's serif. */
-export const KIND_SUMMARY = "log.summary";
+const KIND_SUMMARY = "log.summary";
 
 /** A number out of an evidence row's parsed `meta_json`, or null. */
 function metaNumber(meta: Record<string, unknown> | null, key: string): number | null {

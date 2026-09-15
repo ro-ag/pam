@@ -1,7 +1,15 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::catalog::{CATALOG, QWEN_BASE_URL, find_preset};
+use crate::catalog::{CATALOG, find_preset};
+
+/// Where every entry below is fetched from.
+///
+/// Each [`Preset::url`] is this prefix plus the file name, spelled out in
+/// full because a `const` cannot `format!`. A unit test holds the two
+/// halves together.
+const QWEN_BASE_URL: &str =
+    "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/";
 
 const GB: u64 = 1_000_000_000;
 

@@ -18,24 +18,13 @@ import {
 import { exactTime, relativeTime } from "../lib/time";
 
 /**
- * Approvals — the raised hand. Each pending approval is Pam holding a
- * request still until the human answers, so every one gets a raised card
- * (never a table row): capability in the data voice, requester identity,
- * a serif sentence saying what a yes means, and the two answers. Approve
- * is the view's one primary; Deny stays quiet furniture until hovered —
- * refusing is legitimate, so it never has to shout.
- *
- * Live-ness mirrors Activity: the daemon event stream nudges the query
- * through one ~300ms trailing debounce, so a raised hand surfaces well
- * under a second after its `approval_pending` event.
- *
- * Resolution is optimistic: the card leaves the list the moment the
- * human answers (spinner riding the exit), and on a bridge failure it
- * returns carrying the uniform failure shape inline.
- *
- * The daemon auto-refuses an unanswered hand after 15 minutes
- * (`DEFAULT_APPROVAL_TIMEOUT`); from minute 10 the card's clock shifts
- * to the warning token and starts counting the time left.
+ * Approvals — the raised hand: each pending approval renders as a full card (never a table row).
+ * Approve is primary; Deny stays quiet until hovered — refusing is legitimate, not shouted.
+ * Live-ness mirrors Activity: a ~300ms trailing debounce on the daemon event stream surfaces a
+ * card under a second after `approval_pending`. Resolution is optimistic — it exits on answer and
+ * returns with the uniform failure shape on a bridge failure.
+ * The daemon auto-refuses an unanswered hand after 15 minutes (`DEFAULT_APPROVAL_TIMEOUT`); from
+ * minute 10 the clock switches to the warning token and counts down.
  */
 
 /** Trailing debounce for event-driven refetches: bursts coalesce. */
@@ -63,7 +52,7 @@ function useNow(intervalMs: number): number {
 // --- what approving means --------------------------------------------------
 
 /** How a gated flow step names itself: `flow.step:<flow>/<step>`. */
-export const FLOW_STEP_PREFIX = "flow.step:";
+const FLOW_STEP_PREFIX = "flow.step:";
 
 /**
  * What the sentence renders in the data voice. Almost always the

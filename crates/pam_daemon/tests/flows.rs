@@ -1,26 +1,15 @@
-//! The flow engine end to end: a real daemon on a temp base dir, real
-//! zmq, a real `SQLite` store, real child processes.
+//! The flow engine end to end: a real daemon on a temp base dir, real zmq, a real `SQLite` store,
+//! real child processes. Nothing about a run is faked here except the two things a test must never
+//! reach — the OS keychain and the network — which the harness replaces with [`FakeSecretBackend`]
+//! and [`FakeTransport`]. The flows themselves are written into the library the daemon reads, the
+//! commands are real processes, and the verdicts come back over the socket.
 //!
-//! Nothing about a run is faked here except the two things a test must
-//! never reach — the OS keychain and the network — which the harness
-//! replaces with [`FakeSecretBackend`] and [`FakeTransport`]. The flows
-//! themselves are written into the library the daemon reads, the
-//! commands are real processes, and the verdicts come back over the
-//! socket.
-//!
-//! # The helper
-//!
-//! Three endings need a child process that behaves on command — one that
-//! outlives its timeout, one that floods the output cap, one that is
-//! killed mid-run. `pam-flow-helper` is that process; Cargo builds it
-//! with this package and hands its path to integration tests through
-//! `CARGO_BIN_EXE_pam-flow-helper`.
-//!
-//! # Timing
-//!
-//! Every await is bounded by the harness's wall deadline. Nothing here
-//! asserts on a duration: a loaded runner stretches wall time, and the
-//! budget only has to catch a hang.
+//! Three endings need a child process that behaves on command — one that outlives its timeout, one
+//! that floods the output cap, one that is killed mid-run. `pam-flow-helper` is that process; Cargo
+//! builds it with this package and hands its path to integration tests through
+//! `CARGO_BIN_EXE_pam-flow-helper`. Every await is bounded by the harness's wall deadline: nothing
+//! here asserts on a duration, since a loaded runner stretches wall time and the budget only has to
+//! catch a hang.
 
 use std::path::PathBuf;
 use std::sync::Arc;

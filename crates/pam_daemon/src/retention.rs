@@ -1,52 +1,27 @@
 //! Retention: how long pam keeps what it saw.
 //!
-//! Two windows, both age-based, both edited from Settings › Retention:
-//! how long evidence blobs live, and how long the audit record of a
-//! request lives. Both default to *forever* — a store that has never
-//! been told a window loses nothing when this code lands — and both are
-//! stored as JSON in the `setting` table (`null` for forever), so an
-//! unset key and a deliberate "keep everything" read the same.
-//!
-//! # Evidence first, audit last
-//!
-//! The spine spec's phrase is the whole design. A pass prunes evidence
-//! before it prunes records, and it never removes a request's
-//! [`KEEP_KIND`] row while the request is still there: the verdict is
-//! what makes activity history readable, and it costs a few dozen bytes
-//! next to the logs it summarizes. The verdict does leave — with its
-//! request, its audit rows and its approval — when the *audit* window
-//! catches up with it, because a record leaves whole or not at all.
-//! Evidence belonging to a request that has not finished is never
-//! touched, however old it looks: the executor may still be writing it.
-//!
-//! # Evidence may not outlive the audit trail
-//!
-//! [`validate`] refuses a pair whose evidence window is longer than its
-//! audit window. Keeping blobs past the record that explains them is
-//! storage without meaning, and the daemon says so rather than quietly
-//! clamping the number — the human learns the rule from pam, the same
-//! posture Settings › Flows takes with its allowlist. `forever` evidence
-//! is not that violation: nothing outlives its record, so a finite audit
-//! window bounds the evidence under it whatever the evidence window
-//! says. Only two finite windows in the wrong order can go wrong, and a
-//! human editing one select at a time must be able to set either first.
-//!
-//! # When a pass runs
-//!
-//! [`RetentionService::run_scheduler`] prunes on its first tick — which
-//! is immediate, so the daemon prunes at boot after crash recovery — and
-//! every [`PRUNE_INTERVAL`] after that. A settings save prunes at once
-//! (see [`crate::admin_retention`]), and so does the GUI's Prune now
-//! button. Every pass writes [`SETTING_LAST_RUN`], even one that removed
-//! nothing: "I looked and there was nothing to take" is a fact the panel
-//! shows.
-//!
-//! # Concurrency
-//!
-//! The service is a handle over the shared [`Store`]; each prune is two
-//! store calls, and each of those holds the store's connection lock
-//! across its own `BEGIN`..`COMMIT` (turso refuses concurrent use of one
-//! connection). Nothing here holds a lock of its own.
+//! Two windows, both age-based, edited from Settings › Retention: how long evidence blobs live, and
+//! how long a request's audit record lives. Both default to forever (a store never told a window
+//! loses nothing) and are stored as JSON in the `setting` table (`null` = forever), so unset and
+//! deliberate "keep everything" read the same.
+//! - **Evidence first, audit last**: a pass prunes evidence before records, and never removes a
+//!   request's [`KEEP_KIND`] row while the request is still there (the verdict makes activity
+//!   history readable). The verdict leaves — with its request, audit rows, and approval — only when
+//!   the audit window catches up with it, because a record leaves whole or not at all. Evidence for
+//!   an unfinished request is never touched, however old, since the executor may still be writing
+//!   it.
+//! - **Evidence may not outlive audit**: [`validate`] refuses a pair whose evidence window is
+//!   longer than its audit window — the daemon says so rather than quietly clamping. `forever`
+//!   evidence is not that violation: a finite audit window still bounds the evidence under it
+//!   regardless of the evidence window's own value; only two finite windows in the wrong order can
+//!   go wrong, and either select must be settable first.
+//! - **When a pass runs**: [`RetentionService::run_scheduler`] prunes on its first tick (immediate,
+//!   so a boot prunes right after crash recovery) and every [`PRUNE_INTERVAL`] after; a settings
+//!   save and the GUI's Prune now button also prune at once ([`crate::admin_retention`]). Every
+//!   pass writes [`SETTING_LAST_RUN`], even a no-op one.
+//! - **Concurrency**: the service is a handle over the shared [`Store`]; each prune is two store
+//!   calls, each holding the store's connection lock across its own `BEGIN`..`COMMIT` (the store
+//!   refuses concurrent use of one connection). Nothing here holds a lock of its own.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

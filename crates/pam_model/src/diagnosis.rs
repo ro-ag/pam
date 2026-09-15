@@ -1,33 +1,16 @@
 //! The structured advisory diagnosis contract
-//! ([spec](docs/specs/2026-09-09-local-model-prompts.md), roadmap task 139).
+//! ([spec](docs/specs/2026-09-09-local-model-prompts.md)).
 //!
-//! One stateless call: the daemon renders a versioned task — question,
-//! hypothesis definitions, strict response schema, and the evidence/reads
-//! data — the model answers in exactly one JSON object, and
-//! [`validate`] admits only responses that are syntactically exact, in
-//! scope, and byte-honest. Everything hostile or merely unsure becomes a
-//! [`Rejection`] the caller resolves as an unresolved handoff; nothing
-//! here is ever executed.
-//!
-//! # What is enforced here, and what is not
-//!
-//! This module enforces the *contract*: shape, enums, lengths, evidence
-//! membership, exact byte quotes, and read offers. It deliberately does
-//! not judge *authority* — whether a hypothesis is supported by the tags
-//! the host assigned, whether the evidence is complete enough to assert
-//! anything, whether confidence is high enough to matter. Those are the
-//! recipe owner's policy (the daemon's diagnosis service) and are computed
-//! in code there, never from model flags.
-//!
-//! # No repair, no retry
-//!
-//! Leading or trailing prose, unknown fields, an overlong summary, a
-//! fabricated quote, an invented operation — each is a rejection. The
-//! response is never truncated into validity, a near-miss field is never
-//! guessed, and the caller is expected to spend zero retries: a model
-//! that misread the contract once will misread it again within the same
-//! bounded task. Missing evidence is a valid result; a malformed answer
-//! is not parsed into one.
+//! One stateless call: the daemon renders a versioned task, the model
+//! answers in exactly one JSON object, and [`validate`] admits only
+//! responses that are syntactically exact, in scope, and byte-honest.
+//! Anything hostile or unsure becomes a [`Rejection`], an unresolved
+//! handoff; nothing here is ever executed. It enforces the *contract*
+//! (shape, lengths, evidence membership, exact quotes) but never
+//! *authority* — hypothesis support and confidence are the daemon's
+//! diagnosis service's policy, never taken from model flags. There is
+//! no repair or retry: a rejection is never truncated or guessed into
+//! validity; missing evidence is valid, a malformed answer is not.
 
 use crate::runtime::GenerateRequest;
 use serde_json::json;

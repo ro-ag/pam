@@ -1,46 +1,19 @@
-//! The daemon's model layer: settings, registry, runtime, and the jobs
-//! that outlive a request.
-//!
-//! [`ModelService`] is the only thing in the daemon that touches
-//! [`pam_model`]. It owns four pieces of state and nothing else:
-//!
-//! - the **settings** the model layer reads ([`SETTING_MODELS_DIR`] and
-//!   friends), all persisted in the store so a restart keeps them;
-//! - the **models directory**, rebuilt into a [`Registry`] whenever the
-//!   setting changes, so a `Registry` handed out is always current;
-//! - the **engine**, one [`EngineServer`] supervising the pinned
-//!   `llama.cpp` release for the process — loading a second model means
-//!   unloading the first, strictly old-before-new, because two sets of
-//!   weights do not fit the machines this targets;
-//! - the **live download handles**, keyed by job id, so a transfer can be
-//!   cancelled and a second download of the same file refused.
-//!
-//! # Jobs are not requests
-//!
-//! A download runs for an hour; the admin op that started it answers in
-//! milliseconds. So the op returns a job id and the transfer's history
-//! lives on `model_job` rows ([`pam_store::ModelJobRow`]): a follower task
-//! polls the handle every [`DOWNLOAD_POLL`] and writes progress, then the
-//! verdict. A `running` row found at boot belonged to a daemon that is
-//! gone, and [`ModelService::new`] fails it with
-//! [`CAUSE_DAEMON_RESTART`] — the part file on disk still resumes.
-//!
-//! # Nothing here is agent-facing
-//!
-//! Administration is GUI-only (see [`crate::admin`]); the ops live in
-//! [`crate::admin_models`]. The one daemon-internal entry point is
-//! [`ModelService::generate`], which later plans call to spend a tier's
-//! model on a job. With no default configured it returns
-//! [`ModelUnavailable::NoDefault`] so the caller takes its deterministic
-//! path — the model layer never becomes a hard dependency.
-//!
-//! # Memory comes back on its own
-//!
-//! A ticker every [`IDLE_TICK`] compares the service's own `last_used_at`
-//! — updated after every load and every generation — against
-//! [`SETTING_IDLE_UNLOAD_MIN`] and unloads the engine when the model has
-//! been idle that long (`0` means never). The decision itself is
-//! [`should_unload`], a pure function, so it is testable without weights.
+//! The daemon's model layer. [`ModelService`] is the only daemon code touching [`pam_model`],
+//! owning four state pieces: the **settings** ([`SETTING_MODELS_DIR`] and friends, persisted across
+//! restarts); the **models directory**, rebuilt into a [`Registry`] on every setting change; the
+//! **engine**, one [`EngineServer`] over the pinned `llama.cpp` release — a second load unloads the
+//! first, strictly old-before-new, since two weight sets don't fit; and the **download handles**,
+//! keyed by job id (cancel, dedupe). A download runs an hour vs the admin op's ms response, so it
+//! returns a `job_id` and the history lives on `model_job` rows, polled every [`DOWNLOAD_POLL`]; a
+//! `running` row found at boot belonged to a dead daemon and [`ModelService::new`] fails it with
+//! [`CAUSE_DAEMON_RESTART`] (the part file still resumes). Administration is GUI-only
+//! ([`crate::admin_models`]); the only daemon-internal entry point, [`ModelService::generate`],
+//! returns [`ModelUnavailable::NoDefault`] with nothing configured so the caller falls back
+//! deterministically. An [`IDLE_TICK`] ticker unloads the engine once idle past
+//! [`SETTING_IDLE_UNLOAD_MIN`] (`0` = never), via the pure [`should_unload`].
+//! The model layer never becomes a hard dependency: with nothing configured every caller falls back
+//! deterministically. `last_used_at` (which drives idle unload) is updated after every load and
+//! every generation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -1,37 +1,16 @@
-//! The log half of the admin surface: `admin.log.compress` and
-//! `admin.evidence.*`.
+//! The log half of the admin surface: `admin.log.compress` and `admin.evidence.*`. Ordinary admin
+//! ops — see [`crate::admin`] for the security model: GUI tripwire, request row, single terminal
+//! audit row, deadline, structural guard (no [`crate::policy::classify`] entry, never a capability,
+//! never grantable). Log compression is daemon-internal — flows and connector diagnoses call
+//! [`crate::log_service::LogService`] directly, no agent ever names it — so these ops exist only
+//! for the human observatory: drive a log through the pipeline and watch the tokens-avoided
+//! odometer move.
 //!
-//! These are ordinary admin ops in every way that matters — read
-//! [`crate::admin`]'s module docs for the security model, because every
-//! word of it applies here. The tripwire, the request row, the single
-//! terminal audit row, the deadline, and the structural guard (no
-//! [`crate::policy::classify`] entry, never a capability, never grantable)
-//! are the same ones.
-//!
-//! # Why these exist at all
-//!
-//! Log compression is daemon-internal: flows and connector diagnoses will
-//! call [`crate::log_service::LogService`] directly, and no agent ever
-//! names it. What these four ops give a human is the observatory — drive a
-//! log through the pipeline by hand, read every evidence row it left, and
-//! watch the tokens-avoided odometer move. That is a GUI act, so it is an
-//! `admin.*` op and nothing else.
-//!
-//! # The daemon reads the file, the human names it
-//!
-//! [`OP_LOG_COMPRESS`] takes an absolute path and reads it as the daemon's
-//! own user. There is no sandbox here and none is claimed: the GUI runs as
-//! that same user (see [`crate::admin`]'s wall-is-filesystem-permissions
-//! note), so this reads exactly what the person at the keyboard could read
-//! anyway. Relative paths are refused rather than resolved, because the
-//! daemon's working directory is not a thing a human can reason about.
-//!
-//! # The evidence rows belong to the op's own request
-//!
-//! Evidence has a foreign key onto `request(id)`, and the request row a
-//! compress writes under is the admin envelope's own. So the rows are
-//! findable exactly where the GUI already looks: expand the request in
-//! Activity and the strip is there.
+//! [`OP_LOG_COMPRESS`] takes an absolute path and reads it as the daemon's own user — no sandbox,
+//! the same access the person at the keyboard already has. Relative paths are refused, not
+//! resolved: the daemon's working directory is not something a human can reason about. Evidence has
+//! a foreign key onto `request(id)`; a compress's row is the admin envelope's own, findable exactly
+//! where the GUI already looks — expand the request in Activity.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -1,37 +1,15 @@
 //! A bounded GGUF header parser: what a file claims to be, read safely.
 //!
-//! # Why a hand-rolled parser
-//!
-//! candle can open a GGUF file, but only by mapping the whole thing. The
-//! registry scans a directory that may hold a hundred gigabytes of weights
-//! and wants one line of description per file, so it needs the header and
-//! nothing else. This module reads exactly that — magic, version, metadata
-//! key/values, tensor descriptors — and stops at the first byte of tensor
-//! data.
-//!
-//! # Hostile input is the normal case
-//!
-//! A `.gguf` in the models directory is whatever the filesystem happens to
-//! contain: a half-finished download, a renamed zip, a file the human
-//! copied from somewhere. So every length in the header is treated as a
-//! claim, not a fact. Counts, string lengths, and the running header size
-//! are checked against hard caps before a single allocation
-//! ([`GGUF_MAX_TENSORS`], [`GGUF_MAX_METADATA_KV`],
-//! [`GGUF_MAX_STRING_BYTES`], [`GGUF_MAX_HEADER_BYTES`]); tensor offsets
-//! must be aligned and must not overlap. The hardening is ported from
-//! pam-old, which learned it the direct way.
-//!
-//! Every failure is a [`GgufError`] naming the field. Nothing here panics
-//! and nothing here allocates on an unvalidated length.
-//!
-//! # Format
-//!
-//! Little-endian throughout: magic `GGUF`, `version: u32`,
-//! `tensor_count: u64`, `metadata_kv_count: u64`, then the KV pairs
-//! (`key: string`, `type: u32`, value), then one descriptor per tensor
-//! (`name: string`, `n_dims: u32`, `dims: [u64]`, `dtype: u32`,
-//! `offset: u64`). Version 1 used 32-bit counts and is refused; 2 and 3 are
-//! accepted and differ only in details this parser does not read.
+//! candle only opens a GGUF file by mapping it whole; this reads just the header (magic,
+//! version, metadata, tensor descriptors) and stops at the first tensor byte, so scanning
+//! gigabytes of weights costs one description per file. A `.gguf` may be a half-finished
+//! download or a renamed zip, so every length is a claim, not a fact: counts, string
+//! lengths, and header size are checked against hard caps ([`GGUF_MAX_TENSORS`],
+//! [`GGUF_MAX_METADATA_KV`], [`GGUF_MAX_STRING_BYTES`], [`GGUF_MAX_HEADER_BYTES`]) before
+//! any allocation, and tensor offsets must be aligned and non-overlapping. Every failure is
+//! a [`GgufError`] naming the field; nothing here panics or allocates on an unvalidated
+//! length. Format is little-endian throughout; version 1 (32-bit counts) is refused, 2 and
+//! 3 are accepted.
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;

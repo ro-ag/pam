@@ -1,46 +1,17 @@
 //! What is actually on disk: scan, classify, verify, delete.
 //!
-//! # Layout
-//!
-//! `<models dir>/<vendor>/<file>.gguf`, two levels and no deeper. That is
-//! the layout the owner's machine already uses, and it gives every model a
-//! natural id — `<vendor>/<file stem>` — that is stable across scans,
-//! readable in a log line, and safe in a JSON body. Nothing here invents a
-//! database: the filesystem *is* the registry, so a model the human dropped
-//! in by hand and a model PAM downloaded are the same kind of thing.
-//!
-//! Files loose in the models dir, files nested a level deeper, and anything
-//! not ending in `.gguf` are ignored; so are dotfiles, which is what keeps
-//! a download's own sidecars out of the listing.
-//!
-//! # Admission
-//!
-//! [`classify`] is the whole engine/test-only rule: a file whose SHA-256
-//! has been verified (a completed Verify job, or a catalog download that
-//! checked its digest) is an [`ModelClass::Engine`]; anything unverified is
-//! [`ModelClass::TestOnly`]. A test-only model loads and answers prompts —
-//! that is how the wiring gets proved — but the daemon refuses it as a tier
-//! default, because a job must never run on bytes nobody has checked. Size
-//! is no longer a criterion: the llama.cpp engine runs whatever fits, and
-//! quality is measured by the capability bench, not guessed from bytes.
-//!
-//! # Verification
-//!
-//! [`Registry::verify`] streams SHA-256 over the file and writes the result
-//! to a `.<file>.pam-model.verified` sidecar, so the answer survives a
-//! restart and the GUI does not have to re-hash gigabytes to draw a badge.
-//! When the file name matches a catalog preset, the digest is compared to
-//! that preset's and the verdict recorded: `Some(true)` means these are the
-//! bytes PAM meant to fetch, `Some(false)` means a file is wearing a name
-//! that does not belong to it, and `None` means there is nothing to compare
-//! against. An unreadable or stale sidecar is treated as absent rather than
-//! as an error — the worst it can cost is one re-verification.
-//!
-//! # Blocking
-//!
-//! Every call here hits the filesystem synchronously and
-//! [`Registry::verify`] reads whole gigabytes. Async callers wrap these in
-//! `spawn_blocking`.
+//! Layout: `<models dir>/<vendor>/<file>.gguf`, two levels and no deeper — the filesystem
+//! *is* the registry, with `<vendor>/<file stem>` as the stable id. Loose files, files
+//! nested deeper, non-`.gguf` files, and dotfiles (a download's own sidecars) are ignored.
+//! [`classify`] admits a model only once its SHA-256 is verified ([`ModelClass::Engine`]);
+//! unverified is [`ModelClass::TestOnly`] — loadable/promptable to prove wiring, but never
+//! a tier default, since a job must never run on unchecked bytes; size is no longer a
+//! criterion. [`Registry::verify`] streams SHA-256 to a `.<file>.pam-model.verified`
+//! sidecar; against a matching catalog preset it records `Some(true)` (expected bytes),
+//! `Some(false)` (wrong bytes under that name), or `None` (nothing to compare); an
+//! unreadable or stale sidecar counts as absent, not an error. All calls hit the
+//! filesystem synchronously; async callers wrap them in `spawn_blocking`.
+//! A model dropped into the directory by hand and one PAM downloaded are the same kind of entry.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

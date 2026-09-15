@@ -1,24 +1,16 @@
-//! The model-layer checkpoint, driven exactly the way the GUI drives it:
-//! every step is a `pam_client::client::send_admin` call — the call the
-//! bridge's `admin_call` command is one line over — against a real
-//! daemon, with real weights.
+//! The model-layer checkpoint, driven exactly the way the GUI drives it: every step is a
+//! `pam_client::client::send_admin` call — the call the bridge's `admin_call` command is one line
+//! over — against a real daemon, with real weights. Opt-in, because it needs a GGUF on disk: set
+//! `PAM_BENCH_MODEL` to a small test-only model (the wiring model is Qwen3-0.6B `Q8_0`, 639 MB);
+//! the test fetches it via the daemon's own `file://` download path (same code as Hugging Face
+//! fetches), lists it, refuses it as a tier-default `unverified`, loads, prompts, and unloads it.
+//! Unset, the test prints how to run it and passes.
 //!
-//! Opt-in, because it needs a GGUF on disk: set `PAM_BENCH_MODEL` to a
-//! small test-only model (the wiring model is Qwen3-0.6B `Q8_0`, 639 MB)
-//! and the test fetches it through the daemon's own download path (a
-//! `file://` URL through system curl — the same code that fetches from
-//! Hugging Face), lists it, refuses it as a tier default (`unverified`),
-//! loads it, prompts it, and unloads it. Unset, the test prints how to
-//! run it and passes.
-//!
-//! Two knobs make it a production-binary check rather than a harness
-//! one: `PAM_CHECKPOINT_BASE` points it at an already-running daemon's
-//! base dir (for example the one `pam gui` started) instead of spawning
-//! a `pam_testkit` daemon, and `PAM_CHECKPOINT_MODELS_DIR` names the
-//! models directory it installs into (a fresh temp dir by default).
-//!
-//! Native administration is supported on macOS/Linux only. The bridge integration
-//! suite separately verifies explicit unsupported-platform failure.
+//! Two knobs make it a production-binary check rather than a harness one: `PAM_CHECKPOINT_BASE`
+//! points it at an already-running daemon's base dir (e.g. one `pam gui` started) instead of
+//! spawning a `pam_testkit` daemon, and `PAM_CHECKPOINT_MODELS_DIR` names the models directory it
+//! installs into (a fresh temp dir by default). Native administration is supported on macOS/Linux
+//! only; the bridge integration suite separately verifies explicit unsupported-platform failure.
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 

@@ -1,38 +1,18 @@
-//! The mechanical half of a flow run: what one step reports, how the
-//! verdict is computed from those reports, and how a command step's child
-//! process is spawned, read, bounded and killed.
-//!
-//! Everything here is deliberately free of daemon state — no store, no
-//! gate, no approvals — so the fiddly parts (the outcome matrix, the
-//! summary sentence, the environment scrub, program resolution, and the
-//! child-process lifecycle) are unit-tested without a daemon.
-//! [`crate::flow_service`] owns the policy: it decides *whether* a step
-//! runs, and calls in here to run it.
-//!
-//! # The child process contract
-//!
-//! [`run_command`] gives a step's program a cwd (the caller's repo), a
-//! scrubbed environment ([`scrub_env`]), a null stdin, and one interleaved
-//! output buffer: stdout and stderr are read concurrently into a single
-//! `Vec<u8>` in arrival order, because a build log that separates the two
-//! is unreadable and `pam_compact` reduces the interleaving a human would
-//! have seen. Four things can end the run — the process exits, the step's
-//! timeout elapses, the output passes [`MAX_SOURCE_BYTES`], or the request
-//! is cancelled — and the last three kill the child.
-//!
-//! # What is killed, and what is not
-//!
-//! On unix the child is placed in its own process group
-//! (`process_group(0)`), which detaches it from the daemon's: a terminal
-//! signal aimed at pam never reaches a flow's `cargo test`. The kill path
-//! signals **the child only** (`Child::start_kill`, plus `kill_on_drop`
-//! for the paths that return early). A program that forks and detaches its
-//! own grandchildren therefore leaks them, exactly as a shell's `Ctrl-C`
-//! would; chasing a process tree needs per-OS process-group and job-object
-//! code that this plan does not carry. The buffer is still closed and the
-//! step still ends on time — a surviving grandchild delays nothing. All
-//! descendants still inherit the OS containment profile; detaching cannot gain
-//! network, private PAM access, or host write authority.
+//! The mechanical half of a flow run: what one step reports, how the verdict is computed, and how a
+//! command step's child process is spawned, read, bounded and killed — free of daemon state (no
+//! store, gate, approvals), unit-tested without one; [`crate::flow_service`] decides *whether* a
+//! step runs and calls in here to run it. [`run_command`] gives the program a cwd (caller's repo),
+//! a scrubbed environment ([`scrub_env`]), null stdin, and one interleaved stdout+stderr buffer in
+//! arrival order. Four things end a run — exit, timeout, output past [`MAX_SOURCE_BYTES`], or
+//! cancellation — and the last three kill the child. On unix the child sits in its own process
+//! group (`process_group(0)`), detached from the daemon's, so a signal aimed at pam never reaches a
+//! flow's `cargo test`; the kill path signals **the child only** (`Child::start_kill`,
+//! `kill_on_drop` on early return) — a program that forks and detaches its own grandchildren leaks
+//! them, like a shell's `Ctrl-C` would, but the step still ends on time regardless. All descendants
+//! still inherit the OS containment profile: detaching cannot gain network, private PAM access, or
+//! host write authority.
+//! Detached grandchildren are not chased down: that needs per-OS process-group or job-object code
+//! this crate does not carry.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;

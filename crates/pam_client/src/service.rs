@@ -1,21 +1,14 @@
-//! Login-start integration for the daemon: one user-scope unit per
-//! platform (macOS `LaunchAgent`, systemd user unit, Windows per-user
-//! scheduled task), rendered and managed here, shared by
-//! `pam service …` and the GUI bridge.
+//! Login-start integration for the daemon: one user-scope unit per platform (macOS `LaunchAgent`,
+//! systemd user unit, Windows per-user scheduled task), rendered and managed here, shared by `pam
+//! service …` and the GUI bridge. Every OS call goes through [`Runner`], so tests drive all three
+//! platforms on any host with a fake; platform managers are compiled everywhere and selected by
+//! [`ServiceEnv::platform`]. Never sudo, admin, or root — user scope only.
 //!
-//! Every OS call goes through [`Runner`], so tests drive all three
-//! platforms on any host with a fake; the platform managers are compiled
-//! everywhere and selected by [`ServiceEnv::platform`]. Never sudo,
-//! admin, or root (spine spec: user scope only).
-//!
-//! Install semantics: stop a loose daemon first (bounded, through
-//! [`crate::client::stop_daemon`]) so the managed instance takes over,
-//! write the unit, register and start it. Uninstall unregisters and
-//! removes the unit; on macOS and Linux the manager stops the managed
-//! daemon along with it (`launchctl bootout`, `systemctl disable --now`),
-//! and the next pam command starts one lazily. `pam daemon` exits 0 on
-//! `already running`, so a manager never restart-loops against a loose
-//! instance.
+//! Install semantics: stop a loose daemon first (bounded, through [`crate::client::stop_daemon`])
+//! so the managed instance takes over, write the unit, register and start it. Uninstall unregisters
+//! and removes the unit; on macOS and Linux the manager also stops the managed daemon (`launchctl
+//! bootout`, `systemctl disable --now`), and the next pam command starts one lazily. `pam daemon`
+//! exits 0 on `already running`, so a manager never restart-loops against a loose instance.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

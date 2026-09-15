@@ -1,19 +1,13 @@
-//! GUI-local log reading: the tail of the daemon's own log file.
+//! GUI-local log reading: the tail of the daemon's own log file. This cannot be a daemon operation:
+//! the daemon log (`<base>/log/daemon.log`, written by
+//! `pam_daemon::lifecycle::init_daemon_logging`) is the daemon's own diagnostics, whose most
+//! important audience is a human debugging a daemon that will not start or answer — reading it must
+//! work precisely when the daemon is down. The GUI process runs as the same user, so it reads the
+//! file straight from disk instead.
 //!
-//! # Why this is not a daemon operation
-//!
-//! The daemon log (`<base>/log/daemon.log`, written by
-//! `pam_daemon::lifecycle::init_daemon_logging`) is the daemon's own
-//! diagnostics — and its most important audience is a human debugging a
-//! daemon that will not start or will not answer. Reading it must
-//! therefore work precisely when the daemon is down, so it can never be
-//! an IPC capability. The GUI process runs as the same user; it reads
-//! the file straight from disk instead.
-//!
-//! Rotation: `tracing_appender::rolling::daily` appends the date to the
-//! prefix (`daemon.log.2026-09-01`), so "the newest file" is the
-//! lexicographically greatest `daemon.log*` name — ISO dates sort
-//! correctly as strings, no mtime reads needed.
+//! Rotation: `tracing_appender::rolling::daily` appends the date to the prefix
+//! (`daemon.log.2026-09-01`), so "the newest file" is the lexicographically greatest `daemon.log*`
+//! name — ISO dates sort correctly as strings, no mtime reads needed.
 
 use std::fs;
 use std::path::{Path, PathBuf};

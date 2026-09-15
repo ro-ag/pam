@@ -14,7 +14,7 @@ import type { NoteNode as NoteNodeType } from "./graph";
  * so nobody mistakes a note for something a flow can wait on.
  */
 
-export const noteVariants = cva(
+const noteVariants = cva(
   "w-48 rounded-control border bg-surface p-2.5 font-sans text-sm text-ink-muted shadow-none transition-colors duration-150",
   {
     variants: {

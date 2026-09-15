@@ -60,7 +60,7 @@ const START_TASKS: ReadonlyArray<{ id: string; title: string; needs: string }> =
   },
 ];
 /** How many exchanges Pam keeps — the number the placeholder promises. */
-export const MEMORY_DEPTH = 3;
+const MEMORY_DEPTH = 3;
 
 /** Small counts read as words in Pam's voice; big ones stay numerals. */
 const COUNT_WORDS = [
@@ -77,12 +77,12 @@ const COUNT_WORDS = [
 ] as const;
 
 /** `One`, `Two`, … `12` — the greeting counts hands, it does not tally. */
-export function countWord(n: number): string {
+function countWord(n: number): string {
   return COUNT_WORDS[n] ?? String(n);
 }
 
 /** The display word over the greeting; local clock, no timezone games. */
-export function partOfDay(nowMs: number): string {
+function partOfDay(nowMs: number): string {
   const hour = new Date(nowMs).getHours();
   if (hour < 12) return "Good morning";
   if (hour < 18) return "Good afternoon";

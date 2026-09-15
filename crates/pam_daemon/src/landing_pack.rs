@@ -4,12 +4,6 @@
 //! is small enough to index safely, using pure-Rust inflate (no C zlib, no
 //! sha1 crate — Git verifies the trailer later) and no whole-object
 //! buffering. Every violation refuses on first sight; nothing here retries.
-#![allow(
-    dead_code,
-    reason = "preflight-only scaffolding: the guarded landing sync flow wires \
-              this module into a live fetch in a follow-up change, but the \
-              bounds proof must exist and pass its own tests now"
-)]
 use flate2::{Decompress, FlushDecompress, Status};
 use serde::{Deserialize, Serialize};
 

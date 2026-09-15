@@ -1,39 +1,16 @@
-//! The model half of the admin surface: `admin.models.*` and
-//! `admin.curator.*`.
-//!
-//! These are ordinary admin ops in every way that matters — read
-//! [`crate::admin`]'s module docs for the security model, because every
-//! word of it applies here. The tripwire, the request row, the single
-//! terminal audit row, the deadline, and the structural guard (no
-//! [`crate::policy::classify`] entry, never a capability, never grantable)
-//! are the same ones; this module only adds op names and bodies. They live
-//! in their own file because there are fifteen of them, not because they
-//! are a different kind of thing.
-//!
-//! # What an agent can and cannot do
-//!
-//! Nothing here is reachable by an agent using PAM as intended: there is
-//! no `pam` subcommand that constructs any of these envelopes, and
-//! [`pam_client`](https://docs.rs/pam_client) refuses `admin.*` outright.
-//! Downloading weights, deleting them, loading them, choosing a tier
-//! default, and picking a curator CLI are human acts through the GUI.
-//! What agents get is the read-only `model` block on the `status`
+//! The model half of the admin surface: `admin.models.*` and `admin.curator.*`. Ordinary admin ops
+//! — see [`crate::admin`] for the security model: GUI tripwire, request row, single terminal audit
+//! row, deadline, structural guard (no [`crate::policy::classify`] entry, never a capability, never
+//! grantable). No `pam` subcommand constructs these envelopes, and `pam_client` refuses `admin.*`
+//! outright: downloading, deleting, or loading weights, choosing a tier default, and picking a
+//! curator CLI are human-only. Agents get only the read-only `model` block on the `status`
 //! capability.
 //!
-//! # Refusals name a cause the GUI can act on
-//!
-//! Every refusal carries `{ cause, detail, recovery }`. The causes are
-//! contract — the GUI matches on them — and the ones that come out of the
-//! runtime are [`pam_model::RuntimeError::cause`] verbatim, so a new
-//! runtime failure surfaces under its own name instead of being flattened
-//! into "internal error".
-//!
-//! # Long work answers with a job id
-//!
-//! `admin.models.download` and `admin.models.verify` return a `job_id` and
-//! nothing else: the work outlives the op. Its progress and verdict live
-//! on `model_job` rows, which [`OP_MODELS_STATUS`] reports (see
-//! [`crate::model_service`]).
+//! Every refusal carries `{ cause, detail, recovery }`; causes are contract the GUI matches on, and
+//! ones from the runtime are [`pam_model::RuntimeError::cause`] verbatim rather than flattened to
+//! "internal error". `admin.models.download` and `.verify` return only a `job_id` — the work
+//! outlives the op — and its progress and verdict live on `model_job` rows, which
+//! [`OP_MODELS_STATUS`] reports (see [`crate::model_service`]).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

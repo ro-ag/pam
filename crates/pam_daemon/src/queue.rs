@@ -1,106 +1,49 @@
 //! Queue manager: per-repo ordered lanes, executor leases, cancellation,
 //! and in-flight deduplication.
 //!
-//! # Design
-//!
-//! Lanes serialize work **per repo** — one leased request per lane at a
-//! time — while different repos run in parallel. The lanes are an
-//! in-memory index over the `request` table: the table is the durable
-//! truth (state `queued`), so [`QueueManager::rebuild_from_store`]
-//! reconstructs every lane on boot. Read-only capabilities never enter a
-//! lane at all ([`AdmitOutcome::Bypass`]).
-//!
-//! # Bypass row semantics
-//!
-//! A read-only bypass still inserts a `request` row — the audit trail and
-//! the GUI activity feed need every request on record — but the row is
-//! born `running` atomically, with an admission expiry, and its id is never
-//! pushed into a lane. The caller executes it straight away and records
-//! the terminal state itself.
-//!
-//! # Admission vs placement
-//!
-//! Admission is split in two so the policy gate can run in between with
-//! every contract intact ([`PolicyGate::evaluate`] needs the `request`
-//! row to exist; the spec wants the gate before enqueue):
-//!
-//! 1. [`QueueManager::admit`] — dedupe check + `request` row insert
-//!    (state `running` with an absolute expiry), under the internal mutex.
-//! 2. [`QueueManager::place_in_lane`] — persists authorization and `queued`, then pushes onto
-//!    its repo's lane, once the gate has allowed it.
-//!
-//! A gate refusal between the two moves the row straight to `refused`;
-//! the id never reaches a lane. A concurrent duplicate arriving in that
-//! window attaches to the admitted request and is forwarded whatever
-//! terminal response it gets — refusals included — which is exactly what
-//! running the duplicate itself would have produced.
-//!
-//! [`PolicyGate::evaluate`]: crate::policy::PolicyGate::evaluate
-//!
-//! # Deduplication
-//!
-//! Before inserting a laned request, the manager looks for an *in-flight*
-//! duplicate (state `queued`, `running`, or `waiting_approval`): by
-//! complete shape plus `idempotency_key` when the envelope carries one, otherwise by shape —
-//! byte equality of capability + repo + serialized args (deterministic:
-//! `serde_json` serializes maps with sorted keys). A hit returns
-//! [`AdmitOutcome::Attached`] naming the existing request; the caller
-//! subscribes to that request's events and result instead of starting a
-//! second execution. Terminal requests never match, so retries after
-//! completion run fresh. The internal mutex is held across the
-//! check-then-insert, so concurrent admissions cannot both miss the
-//! check.
-//!
-//! # Leases
-//!
-//! [`QueueManager::take_next`] hands work out under a lease: the request
-//! is marked `running` and gets a deadline derived from the envelope's
-//! `deadline_ms`, clamped to [`MAX_LEASE`]. A lease that outlives its
-//! deadline is reaped ([`QueueManager::reap_expired`], driven
-//! periodically by [`QueueManager::run_reaper`]): the request becomes
-//! terminal `failed` with cause [`CAUSE_LEASE_EXPIRED`], an audit row
-//! (action [`ACTION_LEASE_REAPED`], decision `timeout`, actor `system`)
-//! is written, the holder's cancel signal fires, and the lane is freed.
-//!
-//! # Cancellation
-//!
-//! [`QueueManager::cancel`] serves both `pam cancel <ticket>` and the
-//! GUI; the caller passes the [`Actor`] the cancellation acts as (the
-//! GUI passes [`Actor::Human`]; the CLI passes whatever identity the
-//! pipeline assigns the ticket holder). A queued request is cancelled
-//! outright: removed from its lane, terminal `failed` with cause
-//! [`CAUSE_CANCELLED`], audited (action [`ACTION_CANCEL`], decision
-//! `deny`). A running request is signalled cooperatively — the lease's
-//! cancel signal flips and the executor finishes through
-//! [`QueueManager::complete`]; its terminal write and audit happen on
-//! that path.
-//!
-//! # Audit invariant
-//!
-//! Every terminal transition the queue performs — queued-cancellation,
-//! lease reaping, and executor completion via [`QueueManager::complete`]
-//! (which takes the executor's audit fields) — goes through
-//! [`Store::finish_request`], the store-level choke point that writes
-//! the terminal state and its audit row in one transaction. The queue
-//! never calls `update_request_state` with a terminal state, and
-//! `finish_request`'s already-terminal guard makes double-finish races
-//! (reaper vs executor) a first-wins no-op with no duplicate audit row.
-//!
-//! # Concurrency
-//!
-//! One `QueueManager` behind `&self` with a single `tokio::sync::Mutex`
-//! over the in-memory maps — the daemon is a monolith with low
-//! contention, and no lock is ever held across an `.await` that waits on
-//! anything but the store. There are no lane worker tasks here; the
-//! executor loop (task #9) drives [`QueueManager::take_next`] /
-//! [`QueueManager::complete`].
-//!
-//! # Boot
-//!
-//! [`QueueManager::rebuild_from_store`] reloads `queued` rows into lanes,
-//! oldest first. Crash recovery of `running` / `waiting_approval` rows
-//! left by a dead daemon (fail with cause `daemon_restart`) is task #12
-//! and deliberately not handled here.
+//! - **Design**: lanes serialize work per repo (one leased request per lane at a time) while
+//!   different repos run in parallel; they are an in-memory index over the `request` table (state
+//!   `queued` is the durable truth), so [`QueueManager::rebuild_from_store`] reconstructs every
+//!   lane on boot. Read-only capabilities never enter a lane ([`AdmitOutcome::Bypass`]).
+//! - **Bypass rows**: a read-only bypass still inserts a `request` row (audit trail + GUI feed need
+//!   it) but is born `running` atomically with an admission expiry and never enters a lane; the
+//!   caller executes it and records the terminal state itself.
+//! - **Admission vs placement**: split in two so [`PolicyGate::evaluate`](crate::policy::PolicyGate::evaluate)
+//!   can run between, needing the `request` row to exist
+//!   first — (1) [`QueueManager::admit`]: dedupe check + row insert (`running`, absolute expiry)
+//!   under the internal mutex; (2) [`QueueManager::place_in_lane`]: persists authorization +
+//!   `queued`, pushes onto the repo's lane, once the gate allows. A gate refusal between the two
+//!   sends the row straight to `refused` (never reaches a lane); a concurrent duplicate arriving in
+//!   that window attaches and is forwarded the same terminal response, refusals included.
+//! - **Deduplication**: before inserting a laned request, look for an in-flight duplicate
+//!   (`queued`/`running`/`waiting_approval`) by `idempotency_key` when present, else by shape —
+//!   byte equality of capability + repo + serialized args (`serde_json` sorts map keys, so this is
+//!   deterministic). A hit returns [`AdmitOutcome::Attached`]; the caller subscribes instead of
+//!   re-executing. Terminal requests never match, so retries after completion run fresh. The mutex
+//!   is held across check-then-insert so concurrent admissions cannot both miss the check.
+//! - **Leases**: [`QueueManager::take_next`] marks the request `running` with a deadline from
+//!   `deadline_ms`, clamped to [`MAX_LEASE`]. An expired lease is reaped
+//!   ([`QueueManager::reap_expired`], driven by [`QueueManager::run_reaper`]): terminal
+//!   `failed`/[`CAUSE_LEASE_EXPIRED`], audited ([`ACTION_LEASE_REAPED`], decision `timeout`, actor
+//!   `system`), the holder's cancel signal fires, and the lane is freed.
+//! - **Cancellation**: [`QueueManager::cancel`] serves `pam cancel <ticket>` and the GUI, acting as
+//!   the caller-supplied [`Actor`] (the CLI passes the identity the pipeline assigned the ticket holder, the GUI [`Actor::Human`]). A queued request is removed from
+//!   its lane and terminal `failed`/[`CAUSE_CANCELLED`], audited ([`ACTION_CANCEL`], `deny`). A
+//!   running request is signalled cooperatively via the lease's cancel signal; its terminal
+//!   write/audit happen through [`QueueManager::complete`].
+//! - **Audit invariant**: every terminal transition the queue performs — queued-cancellation, lease
+//!   reaping, executor completion via [`QueueManager::complete`] — goes through
+//!   [`Store::finish_request`], the choke point writing terminal state + audit row in one
+//!   transaction. The queue never calls `update_request_state` with a terminal state; the
+//!   already-terminal guard makes reaper-vs-executor double-finish races a first-wins no-op with no
+//!   duplicate audit row.
+//! - **Concurrency**: one `QueueManager` behind `&self`, a single `tokio::sync::Mutex` over the
+//!   in-memory maps (low-contention monolith); no lock is ever held across an `.await` on anything
+//!   but the store. There are no lane worker tasks — the executor loop drives
+//!   [`QueueManager::take_next`]/[`QueueManager::complete`].
+//! - **Boot**: [`QueueManager::rebuild_from_store`] reloads `queued` rows into lanes, oldest first.
+//!   Crash recovery of `running`/`waiting_approval` rows left by a dead daemon (failed with cause
+//!   `daemon_restart`) happens elsewhere, not here.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

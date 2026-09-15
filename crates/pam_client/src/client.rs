@@ -1,45 +1,18 @@
-//! Client-side daemon lifecycle: lazy auto-start.
+//! Client-side daemon lifecycle: lazy auto-start. [`ensure_daemon`] probes for a daemon behind
+//! `pam.sock`, spawns `pam daemon` detached if none, and waits (bounded, ~3 s, one respawn retry)
+//! for readiness. Probe: `daemon.lock` has an **exclusive holder** (a shared-lock probe conflicts
+//! with it) and `pam.sock` exists; a stale socket with no lock holder reads as *no daemon*, and the
+//! spawned daemon removes and rebinds it under the lock. Client path resolution never creates or
+//! chmods the runtime directory; only daemon startup prepares it.
 //!
-//! Any `pam` command may find no daemon behind `pam.sock` — a fresh
-//! machine, a crashed daemon, or one that just drained itself away for
-//! a self-restart. [`ensure_daemon`] makes the daemon exist before the
-//! command talks to it: probe, spawn `pam daemon` detached if nobody is
-//! there, and wait (bounded, ~3 s, one respawn retry) for readiness.
-//!
-//! # Probe
-//!
-//! "A daemon is running" is read from the same facts the daemon
-//! maintains: the `daemon.lock` file has an **exclusive holder** (a
-//! read-only shared-lock probe conflicts with the daemon's exclusive lock)
-//! and the `pam.sock` file exists. A successful probe unlocks explicitly.
-//! A stale socket with no lock holder therefore reads as *no daemon*,
-//! and the spawned daemon removes and rebinds it under the lock. The
-//! probe uses a nonblocking OS lock operation and cannot be fooled by a
-//! leftover socket file. Client path resolution never creates or chmods
-//! the runtime directory; only daemon startup prepares that directory.
-//!
-//! # Request flow
-//!
-//! [`send_request`] is the full path every client subcommand takes:
-//! ensure the daemon exists, build the envelope ([`crate::request`]),
-//! exchange it over a zmq `DEALER` against `pam.sock` with a client-side
-//! timeout of `deadline_ms` plus a margin, and retry exactly once after
-//! a [`CAUSE_DAEMON_OUTDATED`] refusal (the daemon drains and re-spawns
-//! the newer binary; the spec says the client retries).
-//!
-//! [`send_request`] refuses the reserved GUI-only `admin.*` namespace
-//! before touching the socket; the GUI administers the daemon through
-//! [`send_admin`] instead (see both functions' docs for the security
-//! reasoning).
-//!
-//! [`follow_ticket`] is the event side: subscribe to `events.sock` on
-//! the ticket's topic and stream events until a terminal `done` /
-//! `refused` (bounded by a caller-chosen timeout), reconciling against
-//! the daemon's store (read-only `query` capability) so a terminal
-//! event that predates the subscription still terminates the follow —
-//! zmq `PUB` has no replay (see the function docs). `pam wait` follows
-//! quietly; `pam subscribe` prints each event — one code path, the
-//! callback decides.
+//! [`send_request`] ensures the daemon, builds the envelope, and exchanges it over a zmq `DEALER`
+//! (timeout `deadline_ms` + margin, retrying exactly once after a [`CAUSE_DAEMON_OUTDATED`] refusal
+//! — the daemon drains and re-spawns), refusing the reserved GUI-only `admin.*` namespace before
+//! touching the socket ([`send_admin`] is the GUI's path instead). [`follow_ticket`] subscribes to
+//! `events.sock` and streams to a terminal `done`/`refused`, reconciling against the daemon's store
+//! since zmq `PUB` has no replay; `pam wait` follows quietly, `pam subscribe` prints each event.
+//! Intermediate events stream at normal `PUB` latency; only a missed terminal event falls back to
+//! the reconcile cadence.
 
 use std::fs::{File, TryLockError};
 use std::io;
@@ -320,21 +293,15 @@ pub fn should_retry(response: &Response) -> bool {
     matches!(response, Response::Refusal { cause, .. } if cause == CAUSE_DAEMON_OUTDATED)
 }
 
-/// Sends one request through the full client flow (see the module docs):
-/// ensure the daemon, build the envelope, exchange over `pam.sock`, and
-/// retry exactly once after a `daemon_outdated` refusal.
+/// Sends one request through the full client flow (module docs): ensure the daemon, build the
+/// envelope, exchange over `pam.sock`, retry exactly once after a `daemon_outdated` refusal. The
+/// daemon's answer (result, refusal, or ticket) is returned as-is; rendering and exit codes are the
+/// caller's job (the `pam` binary's `render` module).
 ///
-/// The daemon's answer — result, refusal, or ticket — is returned as-is;
-/// rendering and exit codes are the caller's job ([`crate::render`]).
-///
-/// # Admin guard
-///
-/// A capability under the reserved `admin.` prefix errors with
-/// [`RequestError::AdminOnly`] **before anything touches the socket**:
-/// every CLI subcommand funnels through here, so no subcommand — present
-/// or future — can reach the daemon's GUI-only admin surface (the v1
-/// `pam access grant` self-grant lesson, closed structurally). The GUI
-/// uses [`send_admin`] instead.
+/// A capability under the reserved `admin.` prefix errors with [`RequestError::AdminOnly`] **before
+/// anything touches the socket** — every CLI subcommand funnels through here, so no subcommand,
+/// present or future, can reach the daemon's GUI-only admin surface. The GUI uses [`send_admin`]
+/// instead.
 pub async fn send_request(
     base_dir: &Path,
     capability: &str,
@@ -352,23 +319,16 @@ pub async fn send_request(
     send_envelope(base_dir, &envelope).await
 }
 
-/// Sends one **GUI-only** admin operation (`admin.*`) to the daemon.
+/// Sends one **GUI-only** admin operation (`admin.*`) to the daemon — the path `pam gui`
+/// administers the daemon through (grants, approvals, profile, activity), deliberately separate
+/// from [`send_request`], which refuses `admin.*` outright. The native administration channel
+/// authenticates peers independently of the envelope's caller fields, never falls back to the
+/// public socket, and is unavailable where that channel is unsupported.
 ///
-/// This is the path `pam gui` (the Tauri bridge) administers the daemon
-/// through — grants, approvals, profile, activity. It is deliberately
-/// separate from [`send_request`], which refuses `admin.*` outright so
-/// the CLI subcommand surface can never reach administration. The
-/// native administration channel authenticates peers independently of the
-/// envelope's caller fields. It never falls back to the public socket.
-/// Administration is unavailable where that native channel is unsupported.
-///
-/// The exchange runs once. A transport error or version refusal is returned
-/// without replaying the operation, because a missing reply can follow an
-/// applied change. Inspect the resulting state before manually trying again.
-///
-/// A capability outside `admin.*` errors with
-/// [`RequestError::NotAdmin`]. Admin ops always wait (they are
-/// synchronous request/reply).
+/// The exchange runs once: a transport error or version refusal is returned without replaying the
+/// operation, because a missing reply can follow an applied change — inspect the resulting state
+/// before manually retrying. A capability outside `admin.*` errors with [`RequestError::NotAdmin`].
+/// Admin ops always wait (synchronous request/reply).
 pub async fn send_admin(
     base_dir: &Path,
     op: &str,
@@ -461,43 +421,18 @@ const RECONCILE_MIN: Duration = Duration::from_secs(1);
 /// Cap on the reconcile back-off interval.
 const RECONCILE_MAX: Duration = Duration::from_secs(30);
 
-/// Follows a ticket's event stream on `events.sock` until its terminal
-/// `done` / `refused` event, calling `on_event` for every event seen
-/// (the terminal one included). Returns the terminal event; gives up
-/// with [`RequestError::FollowTimeout`] past `timeout`.
+/// Follows a ticket's event stream on `events.sock` to a terminal `done`/`refused` event, calling
+/// `on_event` for each one seen. Returns the terminal event; gives up with
+/// [`RequestError::FollowTimeout`] past `timeout`. Two races can silently drop the terminal event:
+/// zmq `PUB` has no replay, so an event published before this subscription registered is gone for
+/// good; and `SubSocket::subscribe` only queues the subscription frame, so an event published in
+/// the instant before `PUB` processes it is filtered out.
 ///
-/// # Why events alone are not enough (issue #1)
-///
-/// zmq `PUB` has no replay: an event published before the daemon's
-/// `PUB` socket registered this subscription is gone for good. Live
-/// verification hit exactly that: `pam echo --no-wait` then a separate
-/// `pam subscribe` seconds later — by the time the subscriber joined,
-/// the request's `done` event (and everything before it) had already
-/// been published to nobody, so the follow sat blind until its
-/// timeout. Cross-process delivery itself is sound (the same pure-Rust
-/// zmq `SUB` over ipc receives reliably once the subscription is
-/// registered before the publish); the in-process testkit never sees
-/// the failure because its tests subscribe before sending requests. A
-/// second, narrower hole has the same shape: `SubSocket::subscribe`
-/// only queues the subscription frame to the publisher, so an event
-/// published in the instant before the `PUB` side processes it is
-/// silently filtered out — fatal when that event is the terminal one.
-///
-/// # The reconcile loop
-///
-/// The store is the authority on request state, so the follow never
-/// trusts the event stream with the *termination* decision alone:
-/// authorize through the scoped `query` capability before subscribing, then
-/// reconcile whether the ticket is already terminal —
-/// immediately after subscribing (catches a follower that joined after
-/// the finish), and again on a backing-off interval while events are
-/// quiet (catches a terminal event lost to the subscription race). A
-/// reconciled terminal state is surfaced as the synthesized terminal
-/// event. Intermediate events still stream with `PUB` latency; only
-/// missed ones fall back to the reconcile cadence. Earlier events
-/// published before the subscription (`queued`, `started`) remain
-/// unreplayable — the documented `--no-wait` join race — but the
-/// terminal event is now guaranteed to arrive.
+/// The store is therefore the authority on termination, never the event stream alone: authorize
+/// through the scoped `query` capability, then reconcile whether the ticket is already terminal —
+/// immediately after subscribing, and again on a backing-off interval while events are quiet —
+/// surfaced as the synthesized terminal event. Events before the subscription (`queued`, `started`)
+/// stay unreplayable, but the terminal event is now guaranteed to arrive.
 pub async fn follow_ticket(
     base_dir: &Path,
     ticket: &str,

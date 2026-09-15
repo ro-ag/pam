@@ -1,27 +1,15 @@
 //! Deterministic, provenance-preserving log reduction.
 //!
-//! `pam_compact` takes the exact bytes of a build or test log and returns a
-//! smaller rendering of it plus a complete map of where every source byte
-//! went. Nothing here interprets the log, calls a model, or knows about the
-//! daemon: parsing and rendering are byte-based, locale-independent, and the
-//! same input always produces the same output.
-//!
-//! The reduction is structural, in the order the algorithm applies it:
-//!
-//! 1. **Records** — split on `\r\n`, `\n` (lines) and bare `\r` (progress
-//!    frames); an unterminated tail is a line.
-//! 2. **Display form** — terminal escape sequences stripped, lossy UTF-8,
-//!    control characters rendered as `\t`, `\xNN` or `\u{...}`.
-//! 3. **Omissions** — every progress frame that a following record
-//!    overwrites, then adjacent records with an identical display form.
-//! 4. **Retention** — the first and last `boundary_records` of what
-//!    survived, plus every record containing a failure keyword and its
-//!    neighbours.
-//! 5. **Fragments** — retained records render themselves; consecutive
-//!    omissions with the same reason merge into one `[... N ... ]` marker.
-//!    Fragments are contiguous and ordered, so reading their byte ranges
-//!    from the source in order rebuilds the original exactly.
-//!
+//! Takes the exact bytes of a log and returns a smaller rendering plus a byte-range map of
+//! where every source byte went; byte-based, locale-independent, deterministic — nothing
+//! here interprets the log, calls a model, or knows the daemon. In order: (1) **Records**
+//! split on `\r\n`, `\n`, bare `\r`; an unterminated tail counts as a line. (2) **Display
+//! form** strips escapes, lossy UTF-8, control chars as `\t`/`\xNN`/`\u{...}`. (3)
+//! **Omissions** drop progress frames a later record overwrites, then identical adjacent
+//! forms. (4) **Retention** keeps first/last `boundary_records` plus any failure-keyword
+//! record and neighbours. (5) **Fragments** render retained records, merge same-reason
+//! omissions into `[... N ...]`; fragments stay contiguous and ordered, so replaying byte
+//! ranges rebuilds the source exactly.
 //! ```
 //! use pam_compact::{Policy, compact};
 //!

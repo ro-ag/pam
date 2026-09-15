@@ -19,13 +19,13 @@ import { evidenceStats, logCompress, toBridgeFailure, type CompressReport } from
  */
 
 /** How long the digits take to roll to a new figure. */
-export const ROLL_SECONDS = 0.8;
+const ROLL_SECONDS = 0.8;
 
 /** The capability the compress box files its request under. */
 export const COMPRESS_CAPABILITY = "admin.log.compress";
 
 /** What the odometer shows before the first answer lands. */
-export const NO_FIGURE_YET = "—";
+const NO_FIGURE_YET = "—";
 
 /**
  * True when `path` is one the daemon will accept: absolute, POSIX or
@@ -44,7 +44,7 @@ export function isAbsolutePath(path: string): boolean {
  * `prefers-reduced-motion` the value simply lands, because a number that
  * refuses to hold still is not an animation anyone asked for.
  */
-export function Odometer({ value }: { value: number }) {
+function Odometer({ value }: { value: number }) {
   const reduced = useReducedMotion();
   const rolling = useMotionValue(0);
   const digits = useTransform(rolling, (raw) => Math.round(raw).toLocaleString());

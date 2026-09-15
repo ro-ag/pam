@@ -75,7 +75,7 @@ export const railVariants = cva("w-1 shrink-0 self-stretch transition-colors dur
 });
 
 /** The kind glyph: commands in the accent, connectors in copper. */
-export const glyphVariants = cva("flex shrink-0", {
+const glyphVariants = cva("flex shrink-0", {
   variants: {
     kind: {
       command: "text-accent",
@@ -90,13 +90,13 @@ export const glyphVariants = cva("flex shrink-0", {
 export const HANDLE_CLASSES = "flow-connection-handle rounded-pill";
 
 /** A validation marker outranks selection: the flow will not run until it is fixed. */
-export function ringFor(data: StepNodeData, selected: boolean): Ring {
+function ringFor(data: StepNodeData, selected: boolean): Ring {
   if (data.marker) return "invalid";
   if (selected) return "selected";
   return "none";
 }
 
-export function railFor(data: StepNodeData): Rail {
+function railFor(data: StepNodeData): Rail {
   return data.status ?? "none";
 }
 
@@ -104,7 +104,7 @@ const DEFAULT_TIMEOUT = "5m";
 const DEFAULT_RETRY = { attempts: 1, backoff: "500ms" };
 
 /** What the second row says: the argv line, or `connector · call`. */
-export function stepBody(step: FlowStep): string {
+function stepBody(step: FlowStep): string {
   if (step.action.kind === "landing") return `landing · ${step.action.operation}`;
   return step.action.kind === "command"
     ? joinArgv(step.action.argv)
@@ -115,7 +115,7 @@ function retryIsDefault(retry: FlowStep["retry"]): boolean {
   return retry.attempts === DEFAULT_RETRY.attempts && retry.backoff === DEFAULT_RETRY.backoff;
 }
 
-export interface Modifier {
+interface Modifier {
   /** The aria-label screen readers and the tests read. */
   label: string;
   /** The tooltip, carrying the value the glyph stands for. */
@@ -125,7 +125,7 @@ export interface Modifier {
 }
 
 /** The modifier glyphs, in the order the spec's modifier table lists them. */
-export function modifiersOf(step: FlowStep): Modifier[] {
+function modifiersOf(step: FlowStep): Modifier[] {
   const glyphs: Modifier[] = [];
   if (step.approval === "required") {
     glyphs.push({

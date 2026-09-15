@@ -1,31 +1,15 @@
-//! Advisory caller identity stamped into every request [`Envelope`].
+//! Advisory caller identity stamped into every request [`pam_proto::Envelope`]. **Not authentication**: the
+//! client inspects its own parent-process chain and cwd to guess the invoking agent and repo; the
+//! daemon uses these only for attribution, filtering, and audit. A malicious local process can
+//! trivially forge them — the security wall is the filesystem: only processes that can reach the
+//! runtime directory (and its `pam.sock`) can talk to the daemon at all.
 //!
-//! # This is not authentication
-//!
-//! Everything in this module is **advisory, self-reported context**: the
-//! client inspects its own parent-process chain to guess which agent invoked
-//! it and normalizes its working directory to name the repository it acts on.
-//! The daemon uses these values for attribution, filtering, and audit — and
-//! for nothing else. A malicious local process can trivially forge them.
-//! The security wall is the filesystem: only processes that can reach the
-//! runtime directory (and its `pam.sock` socket) can talk to the daemon at
-//! all.
-//!
-//! # Detection rules
-//!
-//! - `agent`: the parent-process chain is walked upward (bounded depth,
-//!   cycle-safe) and each process name is matched, lowercased, by **prefix**
-//!   against a table of known agents — so `Claude`, `claude`, and
-//!   `claude-code` all classify as `claude`. The nearest matching ancestor
-//!   wins. With no match, the immediate parent's name (typically a shell such
-//!   as `zsh`) is reported so the audit trail still says something; an empty
-//!   chain reports `unknown`.
-//! - `repo`: the canonicalized current working directory, replaced by the
-//!   repository top level when a `.git` entry (directory, or file for git
-//!   worktrees) is found walking upward. Detected by a pure filesystem walk —
-//!   no `git` subprocess, no `libgit2`. The value stays normalized path text;
-//!   a stable project-identity marker is deliberately deferred.
-//! - `pid`: the client's own process id.
+//! `agent`: parent-process chain walked upward (bounded, cycle-safe), each name matched lowercased
+//! by **prefix** against known agents (`claude`, `claude-code` → `claude`); nearest match wins,
+//! else the immediate parent's name, else `unknown`. `repo`: canonicalized cwd replaced by the repo
+//! top level on a `.git` entry (directory, or file for worktrees) found walking upward — pure
+//! filesystem walk, no `git`/`libgit2`; a stable project-identity marker is deliberately deferred.
+//! `pid`: the client's own process id.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -24,7 +24,7 @@ import type {
 export type RunStatus = "running" | FlowStepStatus;
 
 /** The first validation error, pointed at the node it belongs to. */
-export interface Marker {
+interface Marker {
   path: string;
   message: string;
   /** The path below the node prefix (`run[0]`, `repo.default`). */
@@ -40,17 +40,17 @@ export interface StepNodeData extends Record<string, unknown> {
   selected?: boolean;
 }
 
-export interface InputsNodeData extends Record<string, unknown> {
+interface InputsNodeData extends Record<string, unknown> {
   inputs: FlowSpec["inputs"];
   marker: Marker | null;
 }
 
-export interface VerdictNodeData extends Record<string, unknown> {
+interface VerdictNodeData extends Record<string, unknown> {
   outcome: OutcomeName | null;
 }
 
 /** A step's note, drawn as its own node and tethered to the step. */
-export interface NoteNodeData extends Record<string, unknown> {
+interface NoteNodeData extends Record<string, unknown> {
   stepId: string;
   text: string;
 }
@@ -62,16 +62,16 @@ export type NoteNode = Node<NoteNodeData, "note">;
 export type CanvasNode = StepNode | InputsNode | VerdictNode | NoteNode;
 
 /** `terminal` is the implicit, unselectable edge into the Verdict frame. */
-export type EdgeKind = "needs" | "succeeded" | "failed" | "terminal";
+type EdgeKind = "needs" | "succeeded" | "failed" | "terminal";
 export type EditableEdgeKind = Exclude<EdgeKind, "terminal">;
 
-export interface FlowEdgeData extends Record<string, unknown> {
+interface FlowEdgeData extends Record<string, unknown> {
   kind: EdgeKind;
   running: boolean;
 }
 
 /** The curved, dotted line from a note to its step: annotation, never execution. */
-export interface TetherEdgeData extends Record<string, unknown> {
+interface TetherEdgeData extends Record<string, unknown> {
   kind: "note";
 }
 

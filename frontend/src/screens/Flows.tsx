@@ -27,21 +27,13 @@ import { FlowRunCard, useFlowVerdict, type FlowRunState } from "./FlowRunCard";
 import { FlowRuns } from "./FlowRuns";
 
 /**
- * Flows — the workbench. Everything pam knows how to do on its own,
- * shelved on the left; on the right, the one you picked: its shape, its
- * text, and everything it has ever done.
- *
- * The screen is human-facing by construction. Agents reach flows through
- * `pam flow run`, never through this; what lives here is the part only a
- * human should hold — writing the list of commands pam is allowed to
- * run, and reading back what running it actually produced.
- *
- * Three tabs, one file. Canvas and YAML are two readings of the same
- * draft — one lifted `{ yaml, spec, error, dirty }` per selected flow,
- * owned here — and every edit on either side goes through the daemon's
- * normalizer so the other side shows exactly what will be saved. Runs is
- * the flow's history. The daemon stays the only validator: the live
- * check between keystrokes can disable Save, never bless a flow.
+ * Flows — the workbench: everything pam can do on the left, the selected flow's shape, text, and
+ * history on the right. Human-facing by construction: agents reach flows only through
+ * `pam flow run`, never through this screen.
+ * Canvas and YAML are two readings of one lifted `{ yaml, spec, error, dirty }` draft per flow;
+ * every edit on either side goes through the daemon's normalizer so the other side shows exactly
+ * what will be saved. The daemon stays the only validator — the live check between keystrokes can
+ * disable Save, never bless a flow.
  */
 
 /** The tabs of the detail pane; the canvas comes first. */
@@ -100,13 +92,13 @@ function LibraryEntry({
 // --- the draft ---------------------------------------------------------------
 
 /** The first rule a draft breaks, as the daemon names it. */
-export interface FlowIssue {
+interface FlowIssue {
   path: string;
   message: string;
 }
 
 /** One selected flow, as both tabs see it. */
-export interface Draft {
+interface Draft {
   yaml: string;
   /** The last shape the daemon accepted, or the canvas's own edit while it checks. */
   spec: FlowSpec | null;
@@ -118,19 +110,13 @@ const EMPTY_DRAFT: Draft = { yaml: "", spec: null, error: null, dirty: false };
 
 /**
  * The lifted draft and its round trip through `admin.flows.normalize`.
- *
- * A canvas edit lands in the spec at once (the node moves now) and, after
- * a short quiet, goes to the daemon as the raw file shape; the reply's
- * canonical YAML becomes the textarea's text and its resolved flow the
- * spec, so defaults the human never typed are filled in. A YAML edit goes
- * the other way after a longer quiet and only ever updates the spec and
- * the error — the human's text stays as typed until Save writes it.
- *
- * Only the newest request may answer. Every edit and every flow change
- * bumps a sequence number; a reply that comes back under an older number
- * is dropped, so a slow answer to a stale draft can never overwrite a
- * newer one. `flush` fires a pending yaml check at once, for the moment
- * the human switches to the canvas and wants to see what they typed.
+ * A canvas edit lands in the spec at once (the node moves now), then after a short quiet goes to
+ * the daemon; the reply's canonical YAML becomes the textarea text and its resolved flow the
+ * spec, filling in defaults the human never typed. A YAML edit goes the other way after a longer
+ * quiet and only updates spec and error — text stays as typed until Save.
+ * Only the newest request may answer: every edit and flow change bumps a sequence number, and a
+ * reply under an older number is dropped. `flush` fires a pending yaml check at once, for
+ * switching to canvas.
  */
 function useFlowDraft(entry: FlowListEntry) {
   const detail = useQuery({ queryKey: ["flow", entry.id], queryFn: () => flowsGet(entry.id) });

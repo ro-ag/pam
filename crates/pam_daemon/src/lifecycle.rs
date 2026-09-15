@@ -2,48 +2,27 @@
 //! request rows, the lifecycle phase the pipeline consults, and the
 //! daemon's own log file.
 //!
-//! # Single instance
-//!
-//! Exactly one daemon per base directory, arbitrated by an advisory file
-//! lock on `<base>/run/daemon.lock` ([`acquire_instance_lock`], the
-//! stable `std::fs::File` locking API — `flock` on unix, `LockFileEx` on
-//! Windows). The holder writes its pid into the file so a losing
-//! contender can name who beat it. The lock is held for the daemon's
-//! whole lifetime — [`InstanceLock`] keeps the file handle open and the
-//! guard explicitly unlocks on drop, including when a subprocess temporarily
-//! inherited the open file description. Process exit also releases the lock
-//! once the OS closes the last inherited handle.
-//!
-//! # Lock-first ordering
-//!
-//! The lock is acquired **before** anything else touches the runtime
-//! directory. Only the lock holder may remove and rebind the socket
-//! files (`pam.sock`, `events.sock`), so a stale socket with no lock
-//! holder is removed safely and a live daemon's sockets are never
-//! yanked from under it. [`crate::transport::Transport::bind`] performs
-//! the removal; [`crate::daemon::run_daemon_with`] guarantees the
-//! ordering.
-//!
-//! # Crash recovery
-//!
-//! On boot — after the lock, before the lanes are rebuilt —
-//! [`recover_stuck_rows`] requeues safe journaled flows under their original
-//! admission and expiry, and fails legacy `running` / `waiting_approval`
-//! row a dead daemon left mid-flight: terminal `failed`, outcome
-//! [`CAUSE_DAEMON_RESTART`], audited through the
-//! [`pam_store::Store::finish_request`] choke point (action
-//! [`ACTION_DAEMON_RESTART`], decision `timeout`, actor `system`, with
-//! a retry note in the detail). A ticket holder polling such a request
-//! finds a legible failure instead of a row stuck in-flight forever.
-//! `queued` rows are untouched — they are restart-safe by design and
-//! [`crate::queue::QueueManager::rebuild_from_store`] restores them.
-//!
-//! # Self-logging
-//!
-//! [`init_daemon_logging`] writes the daemon's own tracing output to
-//! `<base>/log/daemon.log`, rotated daily. This log is for debugging
-//! PAM itself and is never mixed with product evidence (which lives in
-//! the store's `evidence` table).
+//! - **Single instance**: exactly one daemon per base directory, arbitrated by an advisory file
+//!   lock on `<base>/run/daemon.lock` ([`acquire_instance_lock`], `flock` on unix / `LockFileEx` on
+//!   Windows); the holder writes its pid so a losing contender can name who beat it. The lock is
+//!   held for the daemon's whole lifetime ([`InstanceLock`] keeps the handle open and unlocks
+//!   explicitly on drop, even across a subprocess that briefly inherited the open file
+//!   description); process exit also releases it once the OS closes the last inherited handle.
+//! - **Lock-first ordering**: the lock is acquired before anything else touches the runtime
+//!   directory. Only the lock holder may remove/rebind `pam.sock`/`events.sock`, so a stale socket
+//!   with no lock holder is removed safely and a live daemon's sockets are never yanked from under
+//!   it ([`crate::transport::Transport::bind`] does the removal; [`crate::daemon::run_daemon_with`]
+//!   guarantees the ordering).
+//! - **Crash recovery**: on boot, after the lock and before lanes rebuild, [`recover_stuck_rows`]
+//!   requeues safe journaled flows under their original admission and expiry, and fails legacy
+//!   `running`/`waiting_approval` rows a dead daemon left mid-flight — terminal `failed`,
+//!   [`CAUSE_DAEMON_RESTART`], audited through [`pam_store::Store::finish_request`]
+//!   ([`ACTION_DAEMON_RESTART`], `timeout`, `system`, with a retry note). `queued` rows are
+//!   untouched — restart-safe by design, restored by
+//!   [`crate::queue::QueueManager::rebuild_from_store`].
+//! - **Self-logging**: [`init_daemon_logging`] writes daemon tracing output to
+//!   `<base>/log/daemon.log`, rotated daily — for debugging PAM itself, never mixed with product
+//!   evidence (which lives in the store's `evidence` table).
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};

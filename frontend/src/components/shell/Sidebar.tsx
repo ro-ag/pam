@@ -10,12 +10,12 @@ import {
   Workflow,
   type LucideIcon,
 } from "lucide-react";
-import { cn, cva, type VariantProps } from "../../lib/cn";
+import { cn, cva } from "../../lib/cn";
 
 /** Desktop navigation stays available immediately; selection has a fixed inset marker.
  * The full-height column keeps its brand below native macOS traffic lights.
  */
-export const navItemVariants = cva(
+const navItemVariants = cva(
   "flex h-9 w-full items-center gap-2.5 rounded-control px-3 font-sans text-sm font-medium transition-colors duration-100",
   {
     variants: {
@@ -29,8 +29,6 @@ export const navItemVariants = cva(
     },
   },
 );
-
-export type NavItemState = NonNullable<VariantProps<typeof navItemVariants>["state"]>;
 
 function NavLink({
   to,

@@ -1,36 +1,16 @@
-//! The connector host: what the Connectors screen configures, and what a
-//! flow step calls through.
+//! The connector host: the Connectors screen's backend, and what a flow step calls through.
+//! [`ConnectorService::list`] merges the seven static descriptors, saved rows, and keychain state;
+//! `configure` writes a row and credential; `test` proves it still works; `invoke` — the only one
+//! an agent can cause — never runs until the connector is configured, enabled, and credentialed.
 //!
-//! Three surfaces sit on one service. [`ConnectorService::list`] merges the
-//! seven static descriptors (`pam_connectors`) with the rows a human has
-//! saved (`pam_store`) and with what the OS keychain holds
-//! ([`crate::secrets`]), so the GUI can draw the whole panel from one
-//! answer. [`ConnectorService::configure`] writes a row and its credential.
-//! [`ConnectorService::test`] proves the credential still works.
-//! [`ConnectorService::invoke`] is what a flow step reaches — it is the only
-//! one an agent can cause, and it never runs until the connector is
-//! configured, enabled, and credentialed.
-//!
-//! # A secret is only ever borrowed
-//!
-//! The credential lives in the OS keychain and nowhere else. It is read for
-//! the length of one call, converted straight into a
-//! [`pam_connectors::Secret`] (which redacts its `Debug` and overwrites its
-//! bytes on drop), handed to the transport as a header on stdin, and
-//! dropped. It is never written to the store, an audit row, evidence, argv,
-//! or the daemon log — the `configure` audit row records only *that* a
-//! credential was set or cleared.
-//!
-//! # A missing piece degrades, it does not stop the daemon
-//!
-//! Neither the native credential store nor `curl` is a boot requirement.
-//! When the keychain will not open, the service still lists and still says
-//! `store_available: false` on every entry, and any operation that needs a
-//! credential refuses with the keychain's own cause. When `curl` is not
-//! installed, the service still lists and configures, and every operation
-//! that would speak HTTP refuses with `connector_cli_missing` and the
-//! platform's install line. AWS CLI execution is separately refused until
-//! its credential helpers have qualified containment.
+//! The credential lives only in the OS keychain: read for one call into a
+//! [`pam_connectors::Secret`] (redacts `Debug`, overwrites bytes on drop), handed to the transport
+//! on stdin, then dropped — never written to the store, an audit row, evidence, argv, or the daemon
+//! log; `configure`'s audit row records only *that* a credential was set or cleared. Neither the
+//! keychain nor `curl` is a boot requirement: a closed keychain still lists with `store_available:
+//! false` and refuses credentialed ops with its own cause; missing `curl` still lists and
+//! configures but refuses HTTP ops with `connector_cli_missing`. AWS CLI execution is refused
+//! separately until its credential helpers have qualified containment.
 
 use std::collections::BTreeMap;
 

@@ -6,19 +6,13 @@ import type { BeaconState } from "./Beacon";
 export const STATUS_POLL_MS = 5_000;
 
 /**
- * Daemon liveness for the beacon, wired to the real IPC bridge:
- *
- * - green when `daemon_status` answers connected (the call also lazily
- *   starts the daemon),
- * - amber when connected **and** approvals are waiting (the status poll
- *   piggybacks an `admin.approvals.pending` count),
- * - red when the daemon is unreachable — including plain-browser dev and
- *   jsdom, where every bridge call rejects with `BridgeUnavailable`.
- *
- * A 5 s poll carries the steady state; the daemon event stream adds
- * liveness — an `approval_pending` or terminal event re-polls
- * immediately so the beacon turns amber (and back) without waiting out
- * the interval.
+ * Daemon liveness for the beacon, wired to the real IPC bridge: green when `daemon_status`
+ * answers connected (the call also lazily starts the daemon); amber when connected **and**
+ * approvals are waiting (the poll piggybacks an `admin.approvals.pending` count); red when the
+ * daemon is unreachable — including plain-browser dev and jsdom, where every bridge call rejects
+ * with `BridgeUnavailable`. A 5s poll carries the steady state; the daemon event stream adds
+ * liveness — an `approval_pending` or terminal event re-polls immediately so the beacon turns
+ * amber (and back) without waiting out the interval.
  */
 export function useDaemonStatus(): BeaconState {
   const [state, setState] = useState<BeaconState>("down");

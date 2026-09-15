@@ -1,20 +1,13 @@
-//! Cross-process PUB/SUB regression test (issue #1): a REAL `pam
-//! daemon` **process** — the compiled binary, spawned via
-//! `CARGO_BIN_EXE_pam` on an isolated `PAM_BASE_DIR` — followed from
-//! this test process over the real ipc sockets.
+//! Cross-process PUB/SUB regression test: spawns a REAL `pam daemon` process
+//! (`CARGO_BIN_EXE_pam`, isolated `PAM_BASE_DIR`) and follows it over real ipc sockets.
 //!
-//! The in-process suites (testkit, `cli.rs`) run daemon and subscriber
-//! in one process; the live failure this guards against was only ever
-//! observed between two OS processes: `pam echo --no-wait` returned a
-//! ticket, and a later `pam subscribe` received nothing because the
-//! terminal event had already been published before the subscription
-//! joined (zmq `PUB` has no replay). Both follow scenarios are covered:
-//! subscribing while the request still runs, and subscribing after it
-//! finished.
+//! In-process suites run daemon and subscriber in one process, but the failure this guards
+//! against only reproduces across two OS processes: zmq `PUB` has no replay, so a terminal event
+//! published before a later `pam subscribe` joins is lost. Covers both subscribing while the
+//! request runs and after it finished.
 //!
-//! Every await is bounded; the spawned daemon receives `SIGTERM` (the
-//! same signal `pam daemon stop` sends) and is reaped on the way out,
-//! panic included, so no stray daemon outlives the test.
+//! Every await is bounded; the spawned daemon receives `SIGTERM` (same as `pam daemon stop`) and
+//! is reaped on the way out, panic included, so no stray daemon outlives the test.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

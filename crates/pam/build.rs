@@ -1,30 +1,15 @@
-//! Build script for the pam app crate: this crate owns the Tauri app
-//! (config, overlays, icons, capabilities) and produces the `pam` binary,
-//! which is what the Tauri CLI expects. The window and the commands
-//! themselves live in `pam_gui`.
+//! Build script for the pam app crate: produces the `pam` binary the Tauri CLI expects.
+//! `tauri_build` reads `tauri.conf.json`, validates `capabilities/`, and generates the ACL
+//! manifest that `allow-*` permissions in `capabilities/main-window.json` refer to —
+//! `AppManifest::commands` below lists the `#[tauri::command]` functions granted an
+//! auto-generated `allow-<command>` permission.
 //!
-//! `tauri_build` reads `tauri.conf.json` (next to this file), validates the
-//! capability files under `capabilities/`, and generates the ACL manifest
-//! that the `allow-*` permissions in `capabilities/main-window.json`
-//! refer to — `AppManifest::commands` below is the list of `#[tauri::command]`
-//! functions that get an auto-generated `allow-<command>` permission.
-//!
-//! # Which frontend the binary carries (the "white window" law)
-//!
-//! `tauri::generate_context!` in `main.rs` picks its webview source at
-//! compile time, driven by the `custom-protocol` feature of the `tauri`
-//! crate (turned on by `tauri build`, and by this crate's `gui-embed`
-//! feature for the manual path):
-//!
-//! - feature off (any plain `cargo build`, debug *or* release): the dev
-//!   context is compiled in — the window loads `devUrl`
-//!   (`http://127.0.0.1:1420`, the Vite dev server) and `frontend/dist` is
-//!   never read, so a clean checkout builds without ever running npm.
-//!   Offline, such a binary shows an empty white window; that is expected.
-//! - feature on (`cargo build --release -p pam --features gui-embed`):
-//!   `frontend/dist` is embedded into the binary at compile time. The dist
-//!   directory must exist — run `npm --prefix frontend run build` first, or
-//!   codegen aborts with a clear panic naming the missing path.
+//! Which frontend ships is fixed at compile time by the `tauri` crate's `custom-protocol` feature
+//! (via `tauri::generate_context!`): off (any plain `cargo build`) loads `devUrl`
+//! (`http://127.0.0.1:1420`) and never reads `frontend/dist`, so a clean checkout builds without
+//! npm; offline this shows an expected empty white window. On (this crate's `gui-embed` feature)
+//! embeds `frontend/dist` at compile time — run `npm --prefix frontend run build` first, or
+//! codegen panics naming the missing path.
 
 fn main() {
     let manifest = tauri_build::AppManifest::new().commands(&[

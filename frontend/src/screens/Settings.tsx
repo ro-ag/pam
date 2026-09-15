@@ -516,7 +516,7 @@ export const EVIDENCE_CHOICES: ReadonlyArray<number | null> = [30, 90, 365, null
 export const AUDIT_CHOICES: ReadonlyArray<number | null> = [90, 365, null];
 
 /** The one place a window is spoken: "30 days", "1 year", "forever". */
-export function windowLabel(days: number | null): string {
+function windowLabel(days: number | null): string {
   if (days === null) return "forever";
   if (days === 365) return "1 year";
   return `${days} days`;
@@ -528,7 +528,7 @@ function windowValue(days: number | null): string {
 }
 
 /** One prune pass in the data voice: when it ran, and exactly what left. */
-export function pruneLine(report: PruneReport, nowMs?: number): string {
+function pruneLine(report: PruneReport, nowMs?: number): string {
   return (
     `last pruned ${relativeTime(report.ts, nowMs)} · ` +
     `${report.evidence_rows} evidence rows (${formatBytes(report.evidence_bytes)}) · ` +
@@ -666,7 +666,7 @@ function RetentionPanel() {
 export const LOG_LINE_CHOICES = [100, 500, 1000] as const;
 
 /** How often the auto-refresh re-reads the tail. */
-export const LOG_REFRESH_MS = 5_000;
+const LOG_REFRESH_MS = 5_000;
 
 /**
  * Colorizes one log line by its level token — plain string matching on

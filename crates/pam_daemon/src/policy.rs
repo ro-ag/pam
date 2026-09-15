@@ -1,43 +1,22 @@
 //! Policy gate: decides, before enqueue, whether a request may proceed.
 //!
-//! # Design
-//!
-//! The gate only **decides** — it never waits. Approval-gated operations
-//! pause in the executor via the approval service (a later task); the
-//! gate's [`GateDecision::RequireApproval`] is the signal to do so. An
-//! ungranted capability under a manual profile is an immediate
-//! [`GateDecision::Refuse`] — nothing is enqueued, and the recovery line
-//! points the human at the GUI, never at a security command.
-//!
-//! # Grants
-//!
-//! Capability grants are global (machine-wide) only; an active grant is a
-//! `grant` row whose `revoked_ts` is NULL. Revocation and manual granting
-//! are GUI-only administration and arrive with that surface — the gate
-//! itself only ever *adds* grants, on the relaxed profile's
-//! non-destructive auto-grant path.
-//!
-//! # Audit split
-//!
-//! [`PolicyGate::evaluate`] does **not** audit refusals or approvals: the
-//! request pipeline (which owns the request context) audits every terminal
-//! decision when it acts on the returned [`GateDecision`]. Auto-grants are
-//! the one exception — they mutate the `grant` table inside `evaluate`, so
-//! the matching audit row (action `auto_grant`, actor `policy`, decision
-//! `allow`, active profile in the detail) is written right there.
-//!
-//! Because audit rows reference `request.id` by foreign key,
-//! [`PolicyGate::evaluate`] takes the request id under the contract that
-//! **the request row already exists** — the pipeline inserts the request
-//! before gating it.
-//!
-//! # Profiles
-//!
-//! One policy engine, one [`Profile`] enum, no per-OS code paths — only
-//! the *default* differs by platform ([`Profile::platform_default`]).
-//! The active profile persists in the `setting` table under
-//! [`PROFILE_SETTING_KEY`] as a JSON string; changing it is GUI-only (the
-//! GUI writes the setting, and the daemon constructs its gate from it).
+//! The gate only decides — it never waits; approval-gated operations pause in the executor via the
+//! approval service, with [`GateDecision::RequireApproval`] as the signal. An ungranted capability
+//! under a manual profile is an immediate [`GateDecision::Refuse`] — nothing enqueued, and the
+//! recovery line points the human at the GUI, never a security command.
+//! - **Grants**: capability grants are global (machine-wide) only; an active grant is a `grant` row
+//!   with `revoked_ts` NULL. Revocation and manual granting are GUI-only administration; the gate
+//!   itself only ever adds grants, via the relaxed profile's non-destructive auto-grant path.
+//! - **Audit split**: [`PolicyGate::evaluate`] does not audit refusals or approvals — the request
+//!   pipeline audits every terminal decision when it acts on the returned [`GateDecision`].
+//!   Auto-grants are the exception: they mutate the `grant` table inside `evaluate`, so their audit
+//!   row (`auto_grant`, actor `policy`, `allow`, active profile in the detail) is written right
+//!   there. Because audit rows reference `request.id` by foreign key, `evaluate` takes the request
+//!   id under the contract that the request row already exists (the pipeline inserts it before
+//!   gating).
+//! - **Profiles**: one policy engine, one [`Profile`] enum, no per-OS code paths — only the default
+//!   differs by platform ([`Profile::platform_default`]). The active profile persists in the
+//!   `setting` table under [`PROFILE_SETTING_KEY`] as a JSON string; changing it is GUI-only.
 
 use std::sync::Arc;
 
@@ -116,28 +95,21 @@ pub enum CapabilityClass {
 
 /// Static capability registry: what each known capability may do.
 ///
-/// Known capabilities: `status` (read-only), `query` (read-only
-/// ticket-state lookup backing `pam wait` / `pam subscribe`), `echo`
-/// (the first executor capability, non-destructive), `cancel` (the
-/// built-in behind `pam cancel <ticket>`), and the three flow
-/// capabilities. The table is static by design — the registry is not
-/// something a request can extend. An unknown capability classifies as
-/// `None` and the gate refuses it with cause
-/// [`CAUSE_UNKNOWN_CAPABILITY`].
+/// Known capabilities: `status` (read-only), `query` (read-only ticket-state lookup backing `pam
+/// wait`/`pam subscribe`), `echo` (first executor capability, non-destructive), `cancel` (built-in
+/// behind `pam cancel <ticket>`), and the three flow capabilities. The table is static by design —
+/// not something a request can extend. An unknown capability classifies as `None` and the gate
+/// refuses with [`CAUSE_UNKNOWN_CAPABILITY`].
 ///
-/// `cancel` does mutate state (it fails the target request), but it is
-/// deliberately classed `ReadOnly`: a cancellation must never queue
-/// behind the very work it cancels, and the read-only class is what
-/// gives it the grant bypass and the lane bypass. Its effect is bounded
-/// to pam's own bookkeeping — nothing outside the daemon changes.
+/// `cancel` mutates state (it fails the target request) but is deliberately classed `ReadOnly`: a
+/// cancellation must never queue behind the very work it cancels, and the read-only class gives it
+/// the grant bypass and lane bypass. Its effect is bounded to pam's own bookkeeping — nothing
+/// outside the daemon changes.
 ///
-/// `flow.run` is `NonDestructive` for the same kind of reason turned
-/// around: a flow is a recipe, and running one changes nothing by
-/// itself. Every step that *could* change something is gated
-/// individually inside the run, under its own
-/// `flow.step:<flow>/<step>` capability name — so the class here
-/// governs admission and lanes, and the steps govern damage (see
-/// [`crate::flow_service`]).
+/// `flow.run` is `NonDestructive` for the opposite reason: a flow is a recipe, and running one
+/// changes nothing by itself. Every step that could change something is gated individually inside
+/// the run, under its own `flow.step:<flow>/<step>` capability name — so this class governs
+/// admission/lanes, and the steps govern damage (see [`crate::flow_service`]).
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {

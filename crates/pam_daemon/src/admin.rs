@@ -1,84 +1,43 @@
 //! Privileged administration through a separate native daemon ingress.
 //!
-//! Public `ZeroMQ` refuses every `admin.*` envelope, including forged GUI labels.
-//! Private ingress checks kernel peer ownership; the enterprise sandbox must
-//! exclude that endpoint, PAM state and trusted process/assets from agents.
-//! OS ownership does not prove GUI mode: unrestricted same-user processes remain
-//! privileged and are outside this boundary. See `docs/admin-boundary.md`.
-//! The supported CLI has no administrative subcommands. The native GUI uses the
-//! dedicated client path; its `pam-gui` label remains an advisory consistency
-//! check, never the source of authority. No bearer credential crosses the wire.
-//!
-//! # Structural guard: never in the capability pipeline
-//!
-//! Admin operations are **not capabilities**. They have no
-//! [`crate::policy::classify`] entry, never pass the policy gate, never
-//! enter a queue lane, and can never be granted, approved, or
-//! auto-granted. The dispatcher intercepts the reserved
-//! [`ADMIN_PREFIX`] *before* admit/gate and hands the envelope to
-//! [`AdminService::handle`]; the normal pipeline never sees it. That
-//! keeps the two permission systems from ever feeding each other: a
-//! grant can not unlock administration, and administration can not be
-//! smuggled through an approval.
-//!
-//! # Audit: every admin op is a request row
-//!
-//! Audit rows reference `request.id` by foreign key, so every admin
-//! operation inserts a real `request` row (capability = the `admin.*`
-//! op name, repo = [`ADMIN_REPO`], `caller_agent` from the envelope)
-//! with arguments omitted: credentials and other sensitive admin inputs must
-//! never enter the request ledger, including refused requests. Operation-specific
-//! audit fields retain the non-secret change description. The service
-//! finishes the row immediately through the store's terminal choke point
-//! ([`pam_store::Store::finish_request`]) — terminal state and audit
-//! row in one transaction, same invariant as every other request:
-//!
-//! - success → state `done`, audit action [`ACTION_ADMIN`], decision
-//!   `allow`, actor `human` (admin ops are a human acting through the
-//!   GUI);
-//! - refusal (validation error, unknown op, missing grant/approval) →
-//!   state `refused`, action [`ACTION_ADMIN`], decision `refuse`,
-//!   actor `system` (the daemon refused the malformed/impossible op);
-//! - tripwire → state `refused`, action [`ACTION_ADMIN_DENIED`],
-//!   decision `refuse`, actor `system`;
-//! - deadline elapsed mid-op → state `failed`, the daemon's
-//!   deadline-refusal audit row, decision `timeout`, actor `system`.
-//!
-//! Rows enter `running` atomically. Crash recovery fails interrupted admin
-//! operations without replaying them; effects may need reconciliation.
-//!
-//! Admin envelopes do **not** touch the caller registry
-//! ([`pam_store::Store::upsert_caller`] runs on the admitted pipeline
-//! path only): the registry feeds agent/repo filters, and `pam-gui` on
-//! repo `gui` is not an observed workload.
-//!
-//! # Profile changes apply at the next daemon start
-//!
-//! [`OP_PROFILE_SET`] validates and persists `policy.profile`, but the
-//! running [`crate::policy::PolicyGate`] reads the setting once at
-//! construction — the new profile governs from the next daemon start.
-//! The response body says so (`"applies": "next_daemon_start"`), and
-//! the GUI owns telling the human / restarting the daemon.
-//!
-//! # Versioning
-//!
-//! Op names are constants (`OP_*`), all under [`ADMIN_PREFIX`]. An
-//! unrecognized `admin.*` capability is refused with
-//! [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here, or in
-//! [`crate::admin_models`] / [`crate::admin_logs`] /
-//! [`crate::admin_retention`], and nowhere else.
-//!
-//! # The model ops live next door, under the same rules
-//!
-//! [`crate::admin_models`] holds the `admin.models.*` and
-//! `admin.curator.*` ops, [`crate::admin_logs`] the `admin.log.*` and
-//! `admin.evidence.*` ones, [`crate::admin_connectors`] the
-//! `admin.connectors.*` ones, and [`crate::admin_retention`] the
-//! `admin.retention.*` ones. They are dispatched from [`AdminService`]
-//! before this module's own `match` and are administration in every sense
-//! that matters here: same tripwire, same deadline, same request row, same
-//! single terminal audit row, no [`crate::policy::classify`] entry, no
-//! grant, no approval. The split is file size, not privilege.
+//! Public `ZeroMQ` refuses every `admin.*` envelope, including forged GUI labels; private ingress
+//! checks kernel peer ownership, and the enterprise sandbox must exclude that endpoint, PAM state,
+//! and trusted process/assets from agents. OS ownership does not prove GUI mode — unrestricted
+//! same-user processes remain privileged and sit outside this boundary (see
+//! `docs/admin-boundary.md`). The supported CLI has no administrative subcommands; the GUI's
+//! `pam-gui` label is advisory only, never the source of authority, and no bearer credential
+//! crosses the wire.
+//! - **Structural guard**: admin ops are not capabilities — no [`crate::policy::classify`] entry,
+//!   never pass the policy gate, never enter a queue lane, never granted/approved/auto-granted. The
+//!   dispatcher intercepts [`ADMIN_PREFIX`] before admit/gate and hands the envelope to
+//!   [`AdminService::handle`]; the normal pipeline never sees it, so a grant can't unlock
+//!   administration and administration can't be smuggled through an approval.
+//! - **Audit**: every admin op inserts a real `request` row (capability = op name, repo =
+//!   [`ADMIN_REPO`], `caller_agent` from envelope) with arguments omitted — credentials/sensitive
+//!   admin inputs must never enter the request ledger, including on refusal; operation-specific
+//!   audit fields keep the non-secret change description. Finished immediately through
+//!   [`pam_store::Store::finish_request`] (terminal state + audit row in one transaction, same
+//!   invariant as every other request). Rows enter `running` atomically; crash recovery fails
+//!   interrupted admin ops without replaying them, so effects may need reconciliation.
+//! - **Outcomes**: success → `done`, [`ACTION_ADMIN`], `allow`, actor `human`; refusal (validation,
+//!   unknown op, missing grant/approval) → `refused`, [`ACTION_ADMIN`], `refuse`, actor `system`;
+//!   tripwire → `refused`, [`ACTION_ADMIN_DENIED`], `refuse`, `system`; deadline elapsed mid-op →
+//!   `failed`, deadline-refusal row, `timeout`, `system`.
+//! - Admin envelopes never touch the caller registry ([`pam_store::Store::upsert_caller`] runs on
+//!   the admitted pipeline path only) — `pam-gui` on repo `gui` is not an observed workload.
+//! - [`OP_PROFILE_SET`] persists `policy.profile`, but the running [`crate::policy::PolicyGate`]
+//!   reads it once at construction, so the new profile governs only from the next daemon start
+//!   (response carries `"applies": "next_daemon_start"`); the GUI owns telling the human /
+//!   restarting.
+//! - Op names are `OP_*` constants under [`ADMIN_PREFIX`]; an unrecognized `admin.*` capability is
+//!   refused with [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here or in
+//!   [`crate::admin_models`]/[`crate::admin_logs`]/[`crate::admin_retention`], nowhere else.
+//! - [`crate::admin_models`] holds `admin.models.*`/`admin.curator.*`, [`crate::admin_logs`] holds
+//!   `admin.log.*`/`admin.evidence.*`, [`crate::admin_connectors`] holds `admin.connectors.*`,
+//!   [`crate::admin_retention`] holds `admin.retention.*` — dispatched from [`AdminService`] before
+//!   this module's own `match`, under identical rules (same tripwire, deadline, request row, single
+//!   terminal audit row, no classify entry, no grant, no approval); the split is file size, not
+//!   privilege.
 
 use std::sync::Arc;
 use std::time::Duration;

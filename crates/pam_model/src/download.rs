@@ -1,84 +1,15 @@
 //! Fetching weights: system `curl` as a child process, integrity in Rust.
 //!
-//! # Why curl
-//!
-//! Hugging Face is HTTPS, and every pure-Rust TLS stack either compiles C
-//! (`ring`, `aws-lc`) or is still alpha. macOS, Windows 10+, and mainstream
-//! Linux all ship `curl`, so PAM borrows the one TLS implementation that is
-//! already on the machine and keeps its own dependency tree free of a C
-//! compiler. curl moves bytes; it does not get to decide whether they are
-//! the right bytes. Size and SHA-256 are checked here, after the transfer,
-//! against what the catalog said the file should be.
-//!
-//! A machine without curl gets a refusal that names the binary and the
-//! install command for its platform ([`curl_recovery_line`]) rather than a
-//! transfer that fails halfway with a confusing message.
-//!
-//! # Sidecars, and why their names are frozen
-//!
-//! Beside the destination file, three hidden files carry the state of a
-//! transfer ([`sidecar_paths`]):
-//!
-//! - `.<file>.pam-model.part` — the bytes so far. curl resumes into it.
-//! - `.<file>.pam-model.json` — the [`Checkpoint`]: which URL these bytes
-//!   came from and what they are supposed to hash to.
-//! - `.<file>.pam-model.lock` — held for the life of the transfer, so two
-//!   downloads of the same file cannot interleave into one part file.
-//!
-//! The names and the JSON field set are pam-old's, unchanged. The owner has
-//! multi-gigabyte partial downloads on disk from the previous PAM; a rename
-//! here would mean re-fetching them. `license_digest` is written for that
-//! compatibility alone — nothing reads it back.
-//!
-//! A checkpoint is never silently reused. If the URL or the expected digest
-//! on disk disagrees with the request, that is
-//! [`DownloadError::CheckpointConflict`]: the part file's provenance is
-//! unknown, and appending to it would produce a file that hashes to
-//! nothing anyone asked for.
-//!
-//! # Entity tags
-//!
-//! curl writes the response `ETag` to a temp file (`--etag-save`) and it is
-//! kept in the checkpoint, again for field compatibility. It is
-//! deliberately *not* fed back as `--etag-compare` on resume: that sends
-//! `If-None-Match` alongside the resume `Range`, and a server answering
-//! `304 Not Modified` leaves curl with an empty successful transfer over a
-//! half-finished part file. Integrity here comes from the digest, which is
-//! stronger than an `ETag` and does not need the server's cooperation.
-//!
-//! # Stalls
-//!
-//! curl waits forever by default: a server that accepts the connection
-//! and then sends nothing leaves the transfer running with a part file
-//! that never grows, and PAM's progress poll faithfully reports the same
-//! byte count until someone gives up. [`TransferLimits`] closes that —
-//! a connect deadline and a minimum sustained rate, both handed to curl,
-//! so a dead transfer becomes a [`DownloadState::Failed`] with a cause
-//! instead of a spinner. The part file survives it, so the next attempt
-//! resumes.
-//!
-//! curl's exit code is the only structured thing it reports, and
-//! [`failure_cause`] turns it into the cause the GUI shows: a refused
-//! connection, a name that does not resolve and a stall are three
-//! different problems with three different fixes, and calling them all
-//! `download_failed` hides that. [`failure_recovery`] carries the fix.
-//!
-//! # Shape of a transfer
-//!
-//! [`start`] does everything that can fail fast — locate curl, refuse an
-//! existing destination, take the lock, reconcile the checkpoint — and then
-//! spawns a task. The task's progress and terminal verdict come back
-//! through a [`watch`] channel on [`DownloadHandle`], so a caller can poll
-//! ([`DownloadHandle::state`]) or wait ([`DownloadHandle::wait`]) without
-//! owning the task. Progress is the part file's size, polled every 500 ms:
-//! curl's own progress meter would have to be parsed out of a terminal
-//! format, and the file size is the fact that actually matters.
-//!
-//! Cancelling kills curl and keeps the part file. So does a failed
-//! transfer. The only outcomes that delete anything are success (the
-//! sidecars are gone once the file is in place) and a digest mismatch,
-//! where the part is removed because resuming known-wrong bytes would loop
-//! forever.
+//! No pure-Rust TLS stack is free of a C compiler, so PAM shells out to the system `curl`,
+//! which only moves bytes: size and SHA-256 are checked here after the transfer, against
+//! the catalog (missing curl is a named refusal via [`curl_recovery_line`]). Sidecar file
+//! names ([`sidecar_paths`]) are frozen to match pam-old, so multi-gigabyte partial
+//! downloads already on disk keep resuming instead of re-fetching. A checkpoint is never
+//! silently reused across a different URL or digest ([`DownloadError::CheckpointConflict`]).
+//! The `ETag` is saved but never sent as `--etag-compare`: a `304` would leave an empty
+//! transfer over a half-finished part file, so the digest stays the only integrity signal.
+//! Stalls are caught by [`TransferLimits`]; only a successful transfer or a digest mismatch
+//! deletes the part file — cancelling or failing keeps it so the next attempt resumes.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;

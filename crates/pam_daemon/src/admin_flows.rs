@@ -1,31 +1,14 @@
-//! The flow half of the admin surface: `admin.flows.list`, `.get`,
-//! `.save`, `.delete`, `.run`, `.normalize`, and the two settings ops.
+//! The flow half of the admin surface: `admin.flows.list`, `.get`, `.save`, `.delete`, `.run`,
+//! `.normalize`, and the two settings ops. Ordinary admin ops — see [`crate::admin`] for the
+//! security model: GUI tripwire, request row, single terminal audit row, deadline, structural guard
+//! (no [`crate::policy::classify`] entry, never a capability, never grantable). A flow file *is*
+//! the command list pam will run: writing one is human-only; running one is not — `flow.run` is a
+//! normal capability gated per step (see [`crate::flow_service`]).
 //!
-//! These are ordinary admin ops — read [`crate::admin`]'s module docs for
-//! the security model, because every word of it applies here: the GUI
-//! tripwire, the request row, the single terminal audit row, the
-//! deadline, and the structural guard (no [`crate::policy::classify`]
-//! entry, never a capability, never grantable).
-//!
-//! # Why editing flows is GUI-only, and running them is not
-//!
-//! A flow file *is* the list of commands pam will run. An agent that
-//! could write one could run anything the allowlist permits without ever
-//! naming it in a request — so writing flows is a human act, behind this
-//! surface. *Running* one is not: `flow.run` is a normal capability an
-//! agent names like any other, and every step it takes is gated on its
-//! own (see [`crate::flow_service`]).
-//!
-//! # `admin.flows.run` takes the front door
-//!
-//! The GUI's Run button does not execute anything here. [`OP_FLOWS_RUN`]
-//! builds a genuine `flow.run` envelope — caller agent `pam-gui`, the
-//! repo the human picked — and pushes it through the pipeline's own
-//! ingress channel, then forwards whatever comes back (a ticket, or the
-//! gate's refusal). The run is therefore classified, admitted, deduped,
-//! gated, laned and audited exactly as an agent's would be, and the GUI
-//! follows its ticket's events like any other subscriber. Nothing about
-//! starting a flow from the GUI is privileged; only editing one is.
+//! [`OP_FLOWS_RUN`] (the GUI's Run button) builds a genuine `flow.run` envelope — caller agent
+//! `pam-gui`, the repo the human picked — through the pipeline's ingress channel: classified,
+//! admitted, deduped, gated, laned and audited as an agent's would be. Starting a flow from the GUI
+//! is not privileged; only editing one is.
 
 use pam_flow::{Entry, FlowError, Source};
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};

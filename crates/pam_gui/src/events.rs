@@ -1,25 +1,15 @@
-//! The event stream: one long-lived task subscribing to the daemon's
-//! `events.sock` `PUB` socket on **all** topics (empty prefix) and
-//! forwarding every event to the frontend as a Tauri event.
+//! The event stream: one long-lived task subscribing to the daemon's `events.sock` `PUB` socket on
+//! **all** topics and forwarding every event to the frontend as a Tauri event.
 //!
-//! # Design
-//!
-//! - **Lazy, singleton.** Nothing runs until the frontend calls the
-//!   [`events_subscribe`] command once; an atomic guard makes later
-//!   calls no-ops, so exactly one subscriber task exists per GUI
-//!   process. The frontend listens with `@tauri-apps/api/event`'s
-//!   `listen` on [`EVENT_CHANNEL`].
-//! - **Resilient.** `PUB` has no replay and the daemon restarts on its
-//!   own (drain/respawn on version handshake, `daemon_stop` from the
-//!   GUI). The task reconnects forever: every stream failure — connect
-//!   refused, socket closed, an idle stretch during which the daemon's
-//!   instance lock turned out to be free — tears the subscription down
-//!   and retries with exponential backoff ([`next_backoff`], capped),
-//!   reset after any successfully forwarded event.
-//! - **Payload.** `PUB` frames are `[topic, payload]` with the ticket as
-//!   topic; the forwarded shape is `{ ticket, event }`
-//!   ([`decode_event_frames`]). Undecodable frames are dropped — noise
-//!   on the wire must not kill the stream.
+//! Lazy, singleton: nothing runs until the frontend calls [`events_subscribe`] once; an atomic
+//! guard makes later calls no-ops, so exactly one subscriber task exists per GUI process (frontend
+//! listens via `@tauri-apps/api/event`'s `listen` on [`EVENT_CHANNEL`]). Resilient: `PUB` has no
+//! replay and the daemon restarts on its own, so the task reconnects forever — every stream failure
+//! (connect refused, socket closed, an idle stretch where the daemon's instance lock turned out
+//! free) tears the subscription down and retries with exponential backoff ([`next_backoff`],
+//! capped), reset after any successfully forwarded event. Payload: `PUB` frames are `[topic,
+//! payload]` with the ticket as topic, forwarded as `{ ticket, event }` ([`decode_event_frames`]);
+//! undecodable frames are dropped so wire noise cannot kill the stream.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1094,6 +1094,10 @@ export interface FlowScopePolicy {
 export interface FlowSettings {
   allowed_programs: string[];
   extra_path: string[];
+  /** Private directory build outputs go under; `null` until a human names one. */
+  artifacts_root?: string | null;
+  /** Toolchain caches a step may read but never write. */
+  read_cache_roots?: string[];
   scope_policy?: FlowScopePolicy;
 }
 

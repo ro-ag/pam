@@ -38,8 +38,8 @@ use crate::admin::{
 };
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
-    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal, RECOVERY_FLOW_EDIT,
-    SettingsPatch,
+    ArtifactsRootPatch, CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal,
+    RECOVERY_FLOW_EDIT, SettingsPatch,
 };
 use crate::scope_policy::{CAUSE_SCOPE_INVALID, RECOVERY_SCOPE, ScopePolicy};
 use crate::transport::IncomingRequest;
@@ -74,11 +74,13 @@ pub const OP_FLOWS_RUN: &str = "admin.flows.run";
 /// the run overview shows what would block before anyone presses Run.
 pub const OP_FLOWS_INSPECT: &str = "admin.flows.inspect";
 
-/// `admin.flows.settings.get` → `{ allowed_programs, extra_path }`.
+/// `admin.flows.settings.get` → `{ allowed_programs, extra_path,
+/// artifacts_root, read_cache_roots, scope_policy }`.
 pub const OP_FLOWS_SETTINGS_GET: &str = "admin.flows.settings.get";
 
-/// `admin.flows.settings.set { allowed_programs?, extra_path? }` → the
-/// settings as they now stand.
+/// `admin.flows.settings.set { allowed_programs?, extra_path?,
+/// artifacts_root?, read_cache_roots?, scope_policy? }` → the settings as
+/// they now stand. `artifacts_root: null` clears the build output directory.
 pub const OP_FLOWS_SETTINGS_SET: &str = "admin.flows.settings.set";
 
 /// GUI-only landing recipe and mutation-scope inspection.
@@ -451,6 +453,8 @@ impl AdminService {
             body: json!({
                 "allowed_programs": settings.allowed_programs,
                 "extra_path": settings.extra_path,
+                "artifacts_root": settings.artifacts_root,
+                "read_cache_roots": settings.read_cache_roots,
                 "scope_policy": scope_policy,
             }),
             audit: json!({ "op": OP_FLOWS_SETTINGS_GET }),
@@ -479,6 +483,8 @@ impl AdminService {
         let patch = SettingsPatch {
             allowed_programs: string_list(args, "allowed_programs", OP_FLOWS_SETTINGS_SET)?,
             extra_path: string_list(args, "extra_path", OP_FLOWS_SETTINGS_SET)?,
+            artifacts_root: optional_string(args, "artifacts_root", OP_FLOWS_SETTINGS_SET)?,
+            read_cache_roots: string_list(args, "read_cache_roots", OP_FLOWS_SETTINGS_SET)?,
         };
         let settings = self
             .flows
@@ -495,12 +501,16 @@ impl AdminService {
             body: json!({
                 "allowed_programs": settings.allowed_programs,
                 "extra_path": settings.extra_path,
+                "artifacts_root": settings.artifacts_root,
+                "read_cache_roots": settings.read_cache_roots,
                 "scope_policy": scope_policy,
             }),
             audit: json!({
                 "op": OP_FLOWS_SETTINGS_SET,
                 "allowed_programs": settings.allowed_programs.len(),
                 "extra_path": settings.extra_path.len(),
+                "artifacts_root": settings.artifacts_root.is_some(),
+                "read_cache_roots": settings.read_cache_roots.len(),
                 "approved_repositories": scope_policy.repositories.len(),
             }),
         })
@@ -609,6 +619,21 @@ fn string_list(args: &Value, key: &str, op: &str) -> Result<Option<Vec<String>>,
             .collect::<Result<Vec<String>, AdminRefusal>>()
             .map(Some),
         Some(_) => Err(malformed()),
+    }
+}
+
+/// The build output directory argument: absent leaves it alone, `null`
+/// clears it, a string sets it, anything else is malformed.
+fn optional_string(args: &Value, key: &str, op: &str) -> Result<ArtifactsRootPatch, AdminRefusal> {
+    match args.get(key) {
+        None => Ok(ArtifactsRootPatch::Keep),
+        Some(Value::Null) => Ok(ArtifactsRootPatch::Clear),
+        Some(Value::String(value)) => Ok(ArtifactsRootPatch::Set(value.clone())),
+        Some(_) => Err(AdminRefusal {
+            cause: CAUSE_INVALID_ADMIN_ARGS,
+            detail: format!("{op} needs {key:?} to be a string or null"),
+            recovery: RECOVERY_FIX_ARGS,
+        }),
     }
 }
 

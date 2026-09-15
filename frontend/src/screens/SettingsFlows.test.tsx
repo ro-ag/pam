@@ -259,6 +259,66 @@ describe("extra PATH", () => {
   });
 });
 
+describe("build output directory", () => {
+  it("shows the unset state and saves the directory a human types", async () => {
+    await renderSection();
+    expect(screen.getByText(/no build output directory/i)).toBeInTheDocument();
+    const input = screen.getByLabelText("build output directory");
+    fireEvent.change(input, { target: { value: " ~/pam-builds " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save directory" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({ artifacts_root: "~/pam-builds" }),
+    );
+  });
+
+  it("shows the configured directory and clears it with an explicit null", async () => {
+    mocks.flowsSettingsGet.mockResolvedValue({
+      ...SETTINGS,
+      artifacts_root: "/private/builds",
+    });
+    await renderSection();
+    expect(screen.getByLabelText("build output directory")).toHaveValue("/private/builds");
+    fireEvent.click(screen.getByRole("button", { name: "Clear directory" }));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({ artifacts_root: null }),
+    );
+  });
+});
+
+describe("read-only caches", () => {
+  it("adds and removes a cache directory through the same op", async () => {
+    let current: FlowSettings = { ...SETTINGS, read_cache_roots: ["~/.cargo/registry"] };
+    mocks.flowsSettingsGet.mockImplementation(async () => current);
+    mocks.flowsSettingsSet.mockImplementation(async (patch: Partial<FlowSettings>) => {
+      current = { ...current, ...patch };
+      return current;
+    });
+    await renderSection();
+    fireEvent.change(screen.getByLabelText("cache directory to add"), {
+      target: { value: "~/.cargo/git" },
+    });
+    fireEvent.click(
+      within(
+        screen.getByLabelText("cache directory to add").closest("form") as HTMLFormElement,
+      ).getByRole("button", { name: "Add" }),
+    );
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({
+        read_cache_roots: ["~/.cargo/registry", "~/.cargo/git"],
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("remove cache directory ~/.cargo/registry")).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByLabelText("remove cache directory ~/.cargo/registry"));
+    await waitFor(() =>
+      expect(mocks.flowsSettingsSet).toHaveBeenCalledWith({
+        read_cache_roots: ["~/.cargo/git"],
+      }),
+    );
+  });
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;

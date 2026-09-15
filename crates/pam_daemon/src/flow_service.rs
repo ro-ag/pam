@@ -59,6 +59,8 @@ mod watch_runtime;
 #[path = "flow_watch_runtime_test.rs"]
 mod watch_runtime_test;
 
+#[path = "flow_artifacts.rs"]
+mod artifacts;
 #[path = "landing_checks.rs"]
 mod landing_checks;
 #[cfg(all(test, target_os = "macos"))]
@@ -103,6 +105,14 @@ pub const SETTING_ALLOWED_PROGRAMS: &str = "flows.allowed_programs";
 /// `setting` key holding the directories prepended to a step's `PATH`.
 pub const SETTING_EXTRA_PATH: &str = "flows.extra_path";
 
+/// `setting` key holding the private directory build outputs go under
+/// (a JSON string, or `null` while no human has named one).
+pub const SETTING_ARTIFACTS_ROOT: &str = "flows.artifacts_root";
+
+/// `setting` key holding the toolchain caches a step may read but not
+/// write (`~/.cargo/registry`, `~/.cargo/git`).
+pub const SETTING_READ_CACHE_ROOTS: &str = "flows.read_cache_roots";
+
 /// Capability name: run a flow.
 pub const CAP_FLOW_RUN: &str = "flow.run";
 
@@ -142,6 +152,14 @@ pub const CAUSE_LIBRARY_UNREADABLE: &str = "library_unreadable";
 /// Step cause: the program is not in `flows.allowed_programs`.
 pub const CAUSE_PROGRAM_NOT_ALLOWED: &str = "program_not_allowed";
 
+/// Step cause: the program keeps state in a home or cache directory and no
+/// private build output directory is configured to hold it.
+pub const CAUSE_ARTIFACTS_ROOT_UNSET: &str = "artifacts_root_unset";
+
+/// Settings or step cause: the configured build output directory cannot be
+/// used (relative, inside the repository or the private base, not private).
+pub const CAUSE_ARTIFACTS_ROOT_INVALID: &str = "artifacts_root_invalid";
+
 /// Step cause: the program is allowed but not installed.
 pub const CAUSE_PROGRAM_MISSING: &str = "program_missing";
 
@@ -178,6 +196,9 @@ pub const RECOVERY_FLOW_EDIT: &str =
 
 /// Recovery line for a program the allowlist does not carry.
 pub const RECOVERY_ALLOWED_PROGRAMS: &str = "open Pam → Settings → Flows → allowed programs";
+
+/// Recovery for [`CAUSE_ARTIFACTS_ROOT_UNSET`] and [`CAUSE_ARTIFACTS_ROOT_INVALID`].
+pub const RECOVERY_ARTIFACTS_ROOT: &str = "open Pam → Settings → Flows → build output directory and name a private directory outside every repository";
 
 /// Recovery line for a program that is allowed but not installed.
 pub const RECOVERY_EXTRA_PATH: &str =
@@ -246,6 +267,11 @@ pub struct FlowSettings {
     /// Directories prepended to the inherited `PATH`. Stored as the human
     /// typed them, `~` and `%USERPROFILE%` included.
     pub extra_path: Vec<String>,
+    /// The private directory build outputs go under, as the human typed
+    /// it; `None` until one is named, and a build tool refuses until then.
+    pub artifacts_root: Option<String>,
+    /// Toolchain caches a step may read but never write, as typed.
+    pub read_cache_roots: Vec<String>,
 }
 
 impl FlowSettings {
@@ -272,7 +298,26 @@ impl FlowSettings {
                 .into_iter()
                 .map(std::borrow::ToOwned::to_owned)
                 .collect(),
+            artifacts_root: None,
+            read_cache_roots: vec!["~/.cargo/registry".to_owned(), "~/.cargo/git".to_owned()],
         }
+    }
+
+    /// [`Self::artifacts_root`] as a real directory, `~` expanded.
+    #[must_use]
+    pub fn artifacts_root_dir(&self) -> Option<PathBuf> {
+        self.artifacts_root.as_deref().and_then(expand_home)
+    }
+
+    /// [`Self::read_cache_roots`] as the directories that exist right now;
+    /// a cache that is not there is simply not linked.
+    #[must_use]
+    pub fn read_cache_dirs(&self) -> Vec<PathBuf> {
+        self.read_cache_roots
+            .iter()
+            .filter_map(|raw| expand_home(raw))
+            .filter(|dir| dir.is_dir())
+            .collect()
     }
 
     /// The environment-name pattern a step's inherited environment is
@@ -333,6 +378,22 @@ pub struct SettingsPatch {
     pub allowed_programs: Option<Vec<String>>,
     /// Replaces the extra `PATH`.
     pub extra_path: Option<Vec<String>>,
+    /// Names, clears, or leaves alone the build output directory.
+    pub artifacts_root: ArtifactsRootPatch,
+    /// Replaces the read-only cache list.
+    pub read_cache_roots: Option<Vec<String>>,
+}
+
+/// What a settings patch does to the build output directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ArtifactsRootPatch {
+    /// Leave it as it is.
+    #[default]
+    Keep,
+    /// Forget it; build tools refuse again until a new one is named.
+    Clear,
+    /// Name it, as the human typed it.
+    Set(String),
 }
 
 /// What one `flow.run` was asked to do.
@@ -444,7 +505,30 @@ impl FlowService {
             extra_path: self
                 .setting_list(SETTING_EXTRA_PATH, &defaults.extra_path)
                 .await?,
+            artifacts_root: self.setting_optional_string(SETTING_ARTIFACTS_ROOT).await?,
+            read_cache_roots: self
+                .setting_list(SETTING_READ_CACHE_ROOTS, &defaults.read_cache_roots)
+                .await?,
         })
+    }
+
+    /// One optional string setting; unset, `null` and anything that is not
+    /// a string all read as `None`.
+    async fn setting_optional_string(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let Some(raw) = self.store.get_setting(key).await? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<Option<String>>(&raw) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                tracing::warn!(
+                    setting = key,
+                    %error,
+                    "the stored flow setting is not a string; reading it as unset"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Current GUI-approved scopes, independently of capability grants.
@@ -503,11 +587,27 @@ impl FlowService {
                 check_allowed_program(program)?;
             }
         }
+        let root = match &patch.artifacts_root {
+            ArtifactsRootPatch::Keep => None,
+            ArtifactsRootPatch::Clear => Some(None),
+            ArtifactsRootPatch::Set(raw) => Some(Some(check_artifacts_root(raw.trim())?)),
+        };
+        if let Some(root) = root {
+            let raw = serde_json::to_string(&root).expect("an optional string always serializes");
+            self.store
+                .set_setting(SETTING_ARTIFACTS_ROOT, &raw)
+                .await
+                .map_err(|error| store_note(&error))?;
+        }
         for (key, list) in [
             (SETTING_ALLOWED_PROGRAMS, allowed.as_ref()),
             (
                 SETTING_EXTRA_PATH,
                 patch.extra_path.as_deref().map(clean_list).as_ref(),
+            ),
+            (
+                SETTING_READ_CACHE_ROOTS,
+                patch.read_cache_roots.as_deref().map(clean_list).as_ref(),
             ),
         ] {
             let Some(list) = list else { continue };
@@ -650,7 +750,14 @@ impl FlowService {
             })?,
             None => FlowSettings::platform_default().allowed_programs,
         };
-        let (steps, step_blockers) = self.inspect_steps(flow, &vars, &repo, &allowed).await?;
+        let artifacts_root = self
+            .setting_optional_string(SETTING_ARTIFACTS_ROOT)
+            .await
+            .map_err(|error| store_note(&error))?
+            .is_some();
+        let (steps, step_blockers) = self
+            .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root)
+            .await?;
         blockers.extend(step_blockers);
         let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
             "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
@@ -681,6 +788,7 @@ impl FlowService {
         vars: &Vars,
         repo: &Path,
         allowed: &[String],
+        artifacts_root: bool,
     ) -> Result<(Vec<Value>, Vec<Value>), FlowRefusal> {
         let mut blockers = Vec::new();
         let mut steps = Vec::new();
@@ -711,21 +819,15 @@ impl FlowService {
                         .await;
                 }
                 Action::Command { argv } => {
-                    item["containment"] = json!(if cfg!(target_os = "macos") {
-                        "checked_before_execution"
-                    } else {
-                        "unavailable"
-                    });
-                    if !cfg!(target_os = "macos") {
-                        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
-                    }
-                    let program = argv.first().and_then(|value| substitute(value, vars).ok());
-                    item["program"] = json!(program);
-                    if !program.as_ref().is_some_and(|program| {
-                        check_allowed_program(program).is_ok() && allowed.contains(program)
-                    }) {
-                        blockers.push(json!({"step": step.id, "cause": "program_not_allowed_or_unresolved", "recovery": RECOVERY_ALLOWED_PROGRAMS}));
-                    }
+                    inspect_command_step(
+                        step,
+                        argv,
+                        vars,
+                        allowed,
+                        artifacts_root,
+                        &mut item,
+                        &mut blockers,
+                    );
                 }
                 Action::Connector {
                     connector,
@@ -1121,6 +1223,65 @@ fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
         ));
     }
     Ok(())
+}
+
+/// What `flow.inspect` says about one command step: containment, the
+/// program's allowlist status, and whether its build outputs have a home.
+fn inspect_command_step(
+    step: &Step,
+    argv: &[String],
+    vars: &Vars,
+    allowed: &[String],
+    artifacts_root: bool,
+    item: &mut Value,
+    blockers: &mut Vec<Value>,
+) {
+    item["containment"] = json!(if cfg!(target_os = "macos") {
+        "checked_before_execution"
+    } else {
+        "unavailable"
+    });
+    if !cfg!(target_os = "macos") {
+        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
+    }
+    let program = argv.first().and_then(|value| substitute(value, vars).ok());
+    item["program"] = json!(program);
+    if !program
+        .as_ref()
+        .is_some_and(|program| check_allowed_program(program).is_ok() && allowed.contains(program))
+    {
+        blockers.push(json!({"step": step.id, "cause": "program_not_allowed_or_unresolved", "recovery": RECOVERY_ALLOWED_PROGRAMS}));
+    }
+    let needs_artifacts = program.as_deref().is_some_and(artifacts::needs_artifacts);
+    item["artifacts"] = json!(match (needs_artifacts, artifacts_root) {
+        (false, _) => "not_needed",
+        (true, true) => "configured",
+        (true, false) => "unset",
+    });
+    if needs_artifacts && !artifacts_root {
+        blockers.push(json!({"step": step.id, "cause": CAUSE_ARTIFACTS_ROOT_UNSET, "recovery": RECOVERY_ARTIFACTS_ROOT}));
+    }
+}
+
+/// Refuses a build output directory that is empty or not absolute once
+/// `~` is expanded; whether it is private and outside every boundary is
+/// checked against the repository each time a step runs.
+fn check_artifacts_root(raw: &str) -> Result<String, FlowRefusal> {
+    if raw.is_empty() {
+        return Err(FlowRefusal::new(
+            CAUSE_ARTIFACTS_ROOT_INVALID,
+            "the build output directory is empty".to_owned(),
+            RECOVERY_ARTIFACTS_ROOT,
+        ));
+    }
+    match expand_home(raw) {
+        Some(dir) if dir.is_absolute() => Ok(raw.to_owned()),
+        _ => Err(FlowRefusal::new(
+            CAUSE_ARTIFACTS_ROOT_INVALID,
+            format!("{raw:?} is not an absolute path"),
+            RECOVERY_ARTIFACTS_ROOT,
+        )),
+    }
 }
 
 /// Trims, drops empties, and removes duplicates while keeping order.
@@ -1889,19 +2050,25 @@ impl RunState<'_> {
             return Ok(());
         };
 
-        let mut env = base_env(self.settings);
+        let (containment, mut env) = match self.contain_step(step, &program, &resolved).await {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                report.fail(
+                    StepStatus::Blocked,
+                    refusal.cause,
+                    refusal.detail,
+                    refusal.recovery,
+                );
+                return Ok(());
+            }
+        };
         for (name, value) in &step.env {
             env.push((name.clone(), value.clone()));
         }
         env.push(("PAM_FLOW".to_owned(), self.flow.id.clone()));
         env.push(("PAM_STEP".to_owned(), step.id.clone()));
         let spec = CommandSpec {
-            containment: command_boundary(
-                &self.service.protected_base,
-                &self.repo,
-                &resolved,
-                step.effect == pam_flow::Effect::Stateful,
-            ),
+            containment,
             program: resolved,
             argv: argv[1..].to_vec(),
             cwd: self.repo.clone(),
@@ -1935,6 +2102,74 @@ impl RunState<'_> {
         }
         self.settle(step, attempt, report).await;
         Ok(())
+    }
+
+    /// The boundary and environment one command step runs under: the
+    /// repository boundary, plus the private artifacts tree and the
+    /// read-only caches when a build output directory is configured.
+    async fn contain_step(
+        &self,
+        step: &Step,
+        program: &str,
+        resolved: &Path,
+    ) -> Result<
+        (
+            crate::command_containment::CommandContainment,
+            Vec<(String, String)>,
+        ),
+        FlowRefusal,
+    > {
+        let mut containment = command_boundary(
+            &self.service.protected_base,
+            &self.repo,
+            resolved,
+            step.effect == pam_flow::Effect::Stateful,
+        );
+        let Some(artifacts) = self.prepare_artifacts(program).await? else {
+            return Ok((containment, base_env(self.settings)));
+        };
+        containment
+            .read_only_roots
+            .extend(self.settings.read_cache_dirs());
+        containment.read_only_roots.sort();
+        containment.read_only_roots.dedup();
+        containment.artifact_roots.push(artifacts.clone());
+        let env = artifacts::build_env(self.settings, &artifacts);
+        Ok((containment, env))
+    }
+
+    /// The private artifacts tree this step writes to: `None` when no root
+    /// is configured and the program does not need one, a refusal when the
+    /// program does (`artifacts_root_unset`) or the root is unusable.
+    async fn prepare_artifacts(&self, program: &str) -> Result<Option<PathBuf>, FlowRefusal> {
+        let Some(root) = self.settings.artifacts_root_dir() else {
+            if artifacts::needs_artifacts(program) {
+                return Err(FlowRefusal::new(
+                    CAUSE_ARTIFACTS_ROOT_UNSET,
+                    format!(
+                        "{program:?} keeps its caches and build outputs in a home directory, \
+                         and no private build output directory is configured"
+                    ),
+                    RECOVERY_ARTIFACTS_ROOT,
+                ));
+            }
+            return Ok(None);
+        };
+        let repo = self.repo.clone();
+        let protected = self.service.protected_base.clone();
+        let caches = self.settings.read_cache_dirs();
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+            artifacts::prepare(&root, &repo, &protected, &caches)
+        })
+        .await
+        .map_err(|error| {
+            FlowRefusal::new(
+                CAUSE_ARTIFACTS_ROOT_INVALID,
+                error.to_string(),
+                RECOVERY_ARTIFACTS_ROOT,
+            )
+        })?
+        .map(Some)
     }
 
     /// One child-process attempt, as an [`Attempt`]. `None` means the

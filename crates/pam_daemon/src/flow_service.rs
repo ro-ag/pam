@@ -2670,6 +2670,49 @@ fn command_boundary(
     program: &Path,
     allow_repository_writes: bool,
 ) -> crate::command_containment::CommandContainment {
+    let daemon_exe = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    crate::command_containment::CommandContainment {
+        protected_base: protected_base.to_path_buf(),
+        repository: repo.to_path_buf(),
+        read_only_roots: boundary_read_roots(
+            protected_base,
+            repo,
+            program,
+            daemon_exe.as_deref(),
+            home.as_deref(),
+        ),
+        allow_repository_writes,
+        artifact_roots: Vec::new(),
+    }
+}
+
+/// The read roots for a command boundary: the immutable system trees, the
+/// program's own directory, the daemon's own directory and the rustup
+/// toolchain. The last three are conveniences, so one that falls inside the
+/// protected base or the repository is dropped rather than declared: the
+/// repository is readable already, and the private base is never granted.
+/// Declaring it would make the whole boundary invalid (issue #26: a daemon
+/// binary living under its own base refused every build flow).
+pub(crate) fn boundary_read_roots(
+    protected_base: &Path,
+    repo: &Path,
+    program: &Path,
+    daemon_exe: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let protected = protected_base
+        .canonicalize()
+        .unwrap_or_else(|_| protected_base.to_path_buf());
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let separate = |root: &Path| {
+        !root.starts_with(&protected)
+            && !protected.starts_with(root)
+            && !root.starts_with(&repo)
+            && !repo.starts_with(root)
+    };
     let mut roots: Vec<PathBuf> = ["/System", "/usr", "/bin", "/sbin", "/Library/Developer"]
         .into_iter()
         .map(PathBuf::from)
@@ -2677,28 +2720,24 @@ fn command_boundary(
         .collect();
     if let Ok(executable) = program.canonicalize()
         && let Some(parent) = executable.parent()
-        && !parent.starts_with(repo)
+        && separate(parent)
     {
         roots.push(parent.to_path_buf());
     }
-    if let Ok(executable) = std::env::current_exe().and_then(|path| path.canonicalize())
+    if let Some(executable) = daemon_exe
+        && let Ok(executable) = executable.canonicalize()
         && let Some(parent) = executable.parent()
+        && separate(parent)
     {
         roots.push(parent.to_path_buf());
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let toolchain = PathBuf::from(home).join(".rustup");
-        if toolchain.is_dir() {
+    if let Some(home) = home {
+        let toolchain = home.join(".rustup");
+        if toolchain.is_dir() && separate(&toolchain) {
             roots.push(toolchain);
         }
     }
     roots.sort();
     roots.dedup();
-    crate::command_containment::CommandContainment {
-        protected_base: protected_base.to_path_buf(),
-        repository: repo.to_path_buf(),
-        read_only_roots: roots,
-        allow_repository_writes,
-        artifact_roots: Vec::new(),
-    }
+    roots
 }

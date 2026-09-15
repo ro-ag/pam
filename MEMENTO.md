@@ -101,6 +101,15 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
 
+## pam-old-evidence-before-redesign
+- kind: habit
+- scope: project
+- rule: Before reassessing PAM local-model value, inspect pam-old model quality investigations and product-specific diagnosis code; do not reduce its intended role to generic log summaries.
+- fix: Read pam-old docs/model-memory.md, docs/benchmarks/llama-cpp-macos.md, ptrack tasks 24/25, and Jenkins/Sonar research modules; distinguish measured quality smoke tests, production wiring, and unproven end-to-end workflow accuracy.
+- hits: 2026-09-09
+- cost: 0
+- status: watching
+
 ## pam-blocking-work-outlives-timeout
 - kind: habit
 - scope: project
@@ -125,6 +134,15 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - rule: Drop a child stdin handle after writing the complete input, before awaiting output EOF; AsyncWrite shutdown alone may leave the pipe open.
 - fix: Move stdin into the writer future so it is dropped when the write completes, and keep a real child-process regression that finishes under the original deadline.
 - hits: 2026-09-10
+- cost: 0
+- status: watching
+
+## typescript7-eslint-compat
+- kind: habit
+- scope: project
+- rule: When upgrading all JS dependencies to latest, use TypeScript 7 for builds and Microsofts documented side-by-side TypeScript 6 compatibility API for typescript-eslint; do not hold the compiler back solely because of the linter peer range.
+- fix: Use @typescript/native alias npm:typescript@^7.0.2 and typescript alias npm:@typescript/typescript6@^6.0.2; verify tsc --version, clean npm ci, npm ls, lint, build and tests.
+- hits: 2026-09-12
 - cost: 0
 - status: watching
 

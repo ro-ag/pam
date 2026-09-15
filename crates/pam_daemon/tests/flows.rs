@@ -1481,6 +1481,72 @@ async fn the_helper_reads_the_environment_a_step_gives_it() {
 
 // --- opt-in ------------------------------------------------------------
 
+/// `flow.inspect` says before a run whether a summarize step will get its
+/// summary, from the heavy tier's readiness record, and stays `not_assessed`
+/// for a flow that never asks the model.
+#[tokio::test]
+async fn inspect_reports_whether_the_summary_will_come_from_the_heavy_tier() {
+    with_deadline(async {
+        let summarized = "schema: 1\nid: summarized\nname: Summarized\n\
+                          steps:\n\
+                          \x20 - id: version\n    run: [git, --version]\n    output: summarize\n";
+        let plain = "schema: 1\nid: plain\nname: Plain\n\
+                     steps:\n\
+                     \x20 - id: version\n    run: [git, --version]\n";
+        let flows = FlowDaemon::spawn(&[("summarized", summarized), ("plain", plain)]).await;
+        let mut client = flows.daemon.client().await;
+
+        let body = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect_summarized",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "summarized" }),
+                    true,
+                ))
+                .await,
+        );
+        let model = &body["model"];
+        assert_eq!(model["required"], false, "{model}");
+        assert_eq!(model["used_by"], serde_json::json!(["version"]));
+        assert_eq!(model["tier"], "heavy");
+        assert_eq!(model["stage"], "unconfigured");
+        assert_eq!(model["qualification"], "none");
+        assert_eq!(
+            model["summary"], "skipped",
+            "no heavy default: the summary is skipped"
+        );
+        assert_eq!(model["blocker"]["cause"], "no_default");
+        assert!(
+            model["blocker"]["recovery"]
+                .as_str()
+                .expect("recovery")
+                .contains("Settings > Models"),
+            "{model}"
+        );
+
+        let body = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect_plain",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "plain" }),
+                    true,
+                ))
+                .await,
+        );
+        assert_eq!(body["model"]["qualification"], "not_assessed");
+        assert_eq!(body["model"]["used_by"], serde_json::json!([]));
+        assert!(body["model"].get("stage").is_none(), "{}", body["model"]);
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
 /// `output: summarize` against a real model, when one is configured.
 ///
 /// Skipped unless `PAM_BENCH_MODEL` names a registry id: the workspace

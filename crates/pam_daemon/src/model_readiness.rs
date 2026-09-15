@@ -97,6 +97,19 @@ pub struct TierReadiness {
 }
 
 impl ModelService {
+    /// [`Self::readiness`] with the engine facts read now: for callers that
+    /// need one tier's verdict outside a status read.
+    pub async fn readiness_now(&self, tier: Tier) -> Result<TierReadiness, ModelUnavailable> {
+        let engine = pam_model::engine::status(&self.engine_base());
+        let resident = self.engine_server().and_then(|server| server.model());
+        self.readiness(
+            tier,
+            &engine,
+            resident.as_ref().map(|model| model.id.as_str()),
+        )
+        .await
+    }
+
     /// The readiness of `tier`, given the engine's state and what it holds.
     ///
     /// Reads the settings and the registry; the engine facts are passed in so a

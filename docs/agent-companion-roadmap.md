@@ -80,6 +80,10 @@ the download lock released on a refused start (PR 142), and the daemon wedge
 retired after a 30-minute churn reproduction attempt. Plan 39 closed the one item
 that surfaced meanwhile: `pam wait` raced a running flow's evidence-view publish
 and read `result_unavailable`; the daemon now reads that window as pending (PR 145).
+Plan 40 (same night, Windows via the Parallels VM) hardened the two Windows CI flakes
+(PR 147) and recorded a full `cargo test --workspace` pass inside the VM; the Windows
+admin transport (#22, task #170) is held on the owner's decision about a scoped
+`unsafe` FFI exception.
 Task dependencies, rather than broad plan barriers, allow independent work.
 Every task carries its own caller/integration and acceptance note in ptrack.
 

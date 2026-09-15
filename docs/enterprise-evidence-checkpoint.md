@@ -79,9 +79,14 @@ Named blockers — acceptance is not claimed for these:
 - **Live enterprise connectors.** GitHub, Jenkins, Sonar, Jira, Confluence,
   SharePoint and JFrog are proven against fake transports and a real-curl local
   origin; a live run needs the owner's tokens entered in Settings → Connectors.
-- **Windows.** Excluded by the owner on 2026-09-15: issues #22 (no admin adapter),
-  #24 (connector save-and-test on CI), #110 (`pam wait` race) and #31 (one
-  `curl_origin` flake on windows-11-arm, main run 34959772710) remain open.
+- **Windows.** Excluded by the owner at the checkpoint, then taken up the same
+  evening in the Parallels Windows 11 ARM64 VM (plan 40): #24 was already fixed by
+  #145; the two runner-load flakes (#31 `curl_origin`, #33 lease reaping) were
+  reproduced as passing on the idle VM and hardened (PR 147); `cargo test
+  --workspace` passed in full inside the VM (52 suites). #22 (no Windows admin
+  adapter) stays open on hold: a kernel-authenticated peer check needs a scoped
+  `unsafe` windows-sys module the workspace lints forbid, which is the owner's
+  call.
 
 Residual issues carried forward at the checkpoint, and their disposition the
 same day (plan 38): #4 retired after a 30-minute churn on the current build

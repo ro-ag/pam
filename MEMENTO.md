@@ -146,3 +146,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## clippy-before-full-gate
+- kind: project-way
+- scope: project
+- rule: Run cargo clippy --all-targets -- -D warnings on the touched crate before launching tools/check.sh; the full gate costs ten minutes per clippy nit
+- fix: cargo clippy -p <crate> --all-targets -- -D warnings (about 1 min) then ./tools/check.sh; this session lost four gate runs to must_use, absurd_extreme_comparisons, match_same_arms and needless_pass_by_value
+- hits: 2026-09-15
+- cost: 40
+- status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
+

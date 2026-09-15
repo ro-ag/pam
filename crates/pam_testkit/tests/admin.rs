@@ -366,7 +366,7 @@ async fn unsafe_parent_and_symlink_base_are_rejected_before_state_creation() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is_not_replayed() {
     with_deadline(async {
@@ -414,7 +414,7 @@ async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is
     .await;
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn native_version_mismatch_refuses_mutation_and_requests_restart() {
     with_deadline(async {

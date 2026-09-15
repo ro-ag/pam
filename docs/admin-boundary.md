@@ -13,6 +13,22 @@ authenticate the peer's operating-system owner and process identity; they do
 operation. Executable-path checks, where applied, likewise do not prove code
 integrity or GUI mode.
 
+On Windows (2026-09-15), safe Rust gets no kernel peer credentials on a named pipe
+and the workspace forbids the raw FFI that would, so the adapter proves ownership
+by possession instead: the daemon listens on an ephemeral `127.0.0.1` port and
+writes `<base>\admin\control.json` — the port and a fresh 32-byte nonce — into
+the owner's private base, whose NTFS ACL is inherited from the profile directory
+(owner, SYSTEM, Administrators). The handshake is server-first: the daemon sends
+`sha256("pam-admin-server" ‖ nonce)` before reading a byte, so a client never
+hands the nonce to a process that merely reused the port after a stale control
+file; the client then presents the raw nonce, compared in constant time, and only
+then is a request frame read. Reading that file is the same standing a Unix peer
+proves through its uid: another local user cannot; an administrator or an
+unrestricted same-user process can, exactly as root or a same-uid process can on
+Unix. The connection is loopback-only and the same frame budgets, header timeout
+and connection cap apply. This proves no more than the Unix path does: not GUI
+mode, not code integrity, not that a human asked.
+
 ## Deployment assumption
 
 The security boundary depends on the agent's OS sandbox excluding:
@@ -63,9 +79,11 @@ Use scoped result/evidence reads for details.
 ## Failure behavior
 
 Administration uses no bearer secret carried through the public protocol and
-never falls back to the public socket. Windows native administration is currently
-unsupported; PAM must report that limitation rather than use a weaker identity
-check or silently restore public administration.
+never falls back to the public socket. The Windows nonce travels only over the
+private loopback connection, after the server has proved it holds the same nonce,
+and never through the public ZeroMQ endpoint. On a platform with no adapter at all
+PAM reports that limitation rather than use a weaker identity check or silently
+restore public administration.
 
 The client sends an administrative operation once. A lost connection, timeout,
 or lost reply can occur after a change has taken effect, so the client does not

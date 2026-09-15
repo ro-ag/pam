@@ -28,6 +28,10 @@ thiserror.workspace = true
 tokio.workspace = true
 # model job ids (`job_<ulid>`), the same shape as request ids.
 ulid.workspace = true
+# The Windows admin adapter hashes its owner nonce (server proof) and hex-encodes it
+# into the control file; both are pure Rust and already workspace dependencies.
+sha2.workspace = true
+hex.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
@@ -57,6 +61,9 @@ windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust D-Bus Secret Service client; NOT the `dbus`/`libdbus-sys` crate.
 zbus-secret-service-keyring-store = { version = "=1.0.1", features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(windows)'.dependencies]
+getrandom.workspace = true
 
 [dev-dependencies]
 # dev-only cycle (pam_testkit depends on pam_daemon); path-only

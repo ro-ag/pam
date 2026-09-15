@@ -81,6 +81,9 @@ tauri-build = { version = "2", default-features = false, features = ["config-jso
 sha2 = "0.10"
 # hex digests for the sha256 above; pure Rust, no dependencies.
 hex = "0.4"
+# OS randomness for the Windows admin nonce: a syscall binding (ProcessPrng through
+# windows-targets), pure Rust, no C compile step. Already in the tree through ulid.
+getrandom = "0.3"
 # YAML flow files (pam_flow). Maintained serde_yaml fork; pure Rust.
 serde_yaml_ng = "0.10"
 # URL parsing for connector base URLs (pam_connectors); pure Rust.

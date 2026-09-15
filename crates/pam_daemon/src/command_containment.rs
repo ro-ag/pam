@@ -259,5 +259,9 @@ fn validate_artifact_owner(
             return Err("artifact directory must be private and owned by PAM's user".to_owned());
         }
     }
+    // Under `test` on Windows the function exists for the unit tests but has no
+    // ownership check to make; the parameters are still part of its contract.
+    #[cfg(not(unix))]
+    let _ = (root, protected);
     Ok(())
 }

@@ -32,6 +32,14 @@ All notable changes to pam are documented in this file. The format follows
   artifacts qualified, which were screened and rejected, what was not
   measured, and the compression decision.
 
+### Fixed
+
+- A download refused at the checkpoint check (foreign part file, wrong
+  digest) now unlocks its transfer lock explicitly instead of merely
+  closing the handle, so a curl process another task forked in that
+  window can no longer hold the inherited lock past the next start. The
+  same explicit release covers discarding a partial download.
+
 ### Added
 
 - A straight answer to "can PAM reach the keychain?", in three places:

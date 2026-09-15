@@ -300,18 +300,72 @@
           "over_abstain": 0
         }
       }
+    },
+    {
+      "artifact": "Devstral-Small-2-24B-Instruct-2512 Q4_K_M",
+      "source": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF",
+      "bytes": 14334446752,
+      "note": "added 2026-09-15 at the user's request; plain instruct (no thinking mode), dense 24B; ties the top accuracy but 4 of its 8 false passes are on decidable build-triage records (bt-019/029/037/039), the critical class, where every other artifact has 0",
+      "accuracy": "0.893",
+      "false_passes": 8,
+      "false_pass_ids": [
+        "bt-019",
+        "bt-029",
+        "bt-037",
+        "bt-039",
+        "at-003",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 4,
+      "coverage_on_decidable": "0.965",
+      "contract_violations": 0,
+      "warm_p50_ms": 1312,
+      "warm_p95_ms": 1587,
+      "families": {
+        "abstention_trap": {
+          "correct": 13,
+          "total": 22,
+          "false_pass": 4,
+          "contract_violation": 0,
+          "over_abstain": 1
+        },
+        "build_triage": {
+          "correct": 41,
+          "total": 48,
+          "false_pass": 4,
+          "contract_violation": 0,
+          "over_abstain": 3
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
     }
   ],
   "ranking_on_false_passes": [
     "gemma-4-26B-A4B 2 (coverage 0.754)",
     "gpt-oss-20b 3",
     "Qwen3-Coder-30B-A3B 7",
+    "Devstral-Small-2-24B 8 (4 on decidable triage)",
     "Qwen3.8-27B 9",
     "Nemotron-3.5 11 (unfair)",
     "Qwen3.6-35B-A3B 12",
     "GLM-4.7-Flash 13"
   ],
-  "decision": "gpt-oss-20b stays the reference artifact: the best balance of false passes (3), accuracy (0.867) and latency (574 ms). gemma-4-26B-A4B is the only safer artifact on the critical class (2) but refuses 23 decidable triage records, so it would trade false passes for unusable coverage. No artifact meets the 0.95 / zero-false-pass gates; every remaining false pass on the two best artifacts is an abstention-trap variant, which points at the contract (deterministic exit parsing, trap rewording) rather than at another model.",
+  "decision": "gpt-oss-20b stays the reference artifact: the best balance of false passes (3), accuracy (0.867) and latency (574 ms). gemma-4-26B-A4B is the only safer artifact on the critical class (2) but refuses 23 decidable triage records, so it would trade false passes for unusable coverage. No artifact meets the 0.95 / zero-false-pass gates; every remaining false pass on the two best artifacts is an abstention-trap variant, which points at the contract (deterministic exit parsing, trap rewording) rather than at another model. Devstral-Small-2-24B (screened 2026-09-15) does not change this: 0.893 accuracy, but 8 false passes including 4 on decidable build triage, the one class every other artifact keeps clean.",
   "not_measured": [
     "gpt-oss-120b (63 GB, does not fit this host)",
     "Qwen3-Coder-Next (48 GB, four shards, not fetched)",

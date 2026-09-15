@@ -83,13 +83,17 @@ Named blockers — acceptance is not claimed for these:
   #24 (connector save-and-test on CI), #110 (`pam wait` race) and #31 (one
   `curl_origin` flake on windows-11-arm, main run 34959772710) remain open.
 
-Residual issues carried forward: #4 (a scratch daemon stopped answering after
-25 minutes of fixture-proxy polling; task #102 fixed publisher saturation and
-proved 5,196 cross-process exchanges, but the 25-minute connect timeout is not
-proven identical, so the issue stays open), #28 (a download lock test is flaky
-under the full workspace run), #29 (the agent-visible result does not name the
-model that wrote a summary), #30 (`flow.inspect` does not consult tier
-readiness). `pam_daemon::diagnosis_service` still has no production caller — a
-product decision, not dead code.
+Residual issues carried forward at the checkpoint, and their disposition the
+same day (plan 38): #4 retired after a 30-minute churn on the current build
+(1,581 fresh connections, 316 abandoned subscribers, descriptors flat, every
+probe instant; the 2026-09-03 wedge predates #102's publisher fix — reopen with
+a fresh sample if a post-#102 daemon stops answering); #28 closed (a refused
+download start now unlocks its transfer lock explicitly, PR 142); #29 closed
+(observations and the summary evidence identity name the model and the record
+that admitted it, PR 141); #30 closed (`flow.inspect` and `pam status` carry the
+tier readiness verdict, PR 140). Open after plan 38: #32 (`pam wait` raced
+result readability once on a loaded Linux CI gate; reproduce under load before
+changing the fail-closed answer) and the Windows set. `pam_daemon::diagnosis_service`
+still has no production caller — a product decision, not dead code.
 
 No release, tag or push is implied by this checkpoint.

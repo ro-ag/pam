@@ -74,6 +74,11 @@ were moved with their history and issue links preserved. Plan #30 remains the
 umbrella and historical delivery record; #94 was its final integration gate,
 recorded on 2026-09-15 in [the enterprise checkpoint](enterprise-evidence-checkpoint.md#plan-30-final-checkpoint-task-94-2026-09-15)
 with its named blockers (native capture, 32 GB hardware, live connectors, Windows).
+Plan 38 (2026-09-15) closed the checkpoint's residuals: readiness-aware `flow.inspect`
+and `status` (PR 140), the summarizing model named in the agent result (PR 141),
+the download lock released on a refused start (PR 142), and the daemon wedge
+retired after a 30-minute churn reproduction attempt; issue #32 (a `pam wait`
+readability race under CI load) is the one new open item.
 Task dependencies, rather than broad plan barriers, allow independent work.
 Every task carries its own caller/integration and acceptance note in ptrack.
 

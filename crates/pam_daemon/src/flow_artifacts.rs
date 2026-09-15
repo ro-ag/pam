@@ -37,6 +37,8 @@ fn invalid(detail: impl Into<String>) -> FlowRefusal {
 /// that is reachable through a symlink or open to other users.
 pub(super) fn private_dir(path: &Path) -> Result<(), &'static str> {
     if !path.exists() {
+        // Only the unix mode call mutates the builder; Windows has no mode.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

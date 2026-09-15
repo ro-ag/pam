@@ -311,11 +311,36 @@ async fn model_block(ctx: &ExecContext) -> serde_json::Value {
     let engine = pam_model::engine::status(&ctx.models.engine_base());
     let engine_model = ctx.models.engine_server().and_then(|server| server.model());
     let (light, heavy) = ctx.models.defaults().await.unwrap_or((None, None));
+    // The same verdict the GUI shows, reduced to what an agent acts on: the
+    // stage and, when blocked, the cause. Absent when the store cannot answer.
+    let resident = engine_model.as_ref().map(|model| model.id.clone());
+    let mut readiness = serde_json::Map::new();
+    for tier in [
+        crate::model_service::Tier::Light,
+        crate::model_service::Tier::Heavy,
+    ] {
+        let verdict = ctx
+            .models
+            .readiness(tier, &engine, resident.as_deref())
+            .await
+            .ok()
+            .map(|readiness| {
+                serde_json::json!({
+                    "stage": readiness.stage,
+                    "cause": readiness.blocker.map(|blocker| blocker.cause),
+                })
+            });
+        readiness.insert(
+            tier.as_str().to_owned(),
+            verdict.unwrap_or(serde_json::Value::Null),
+        );
+    }
     serde_json::json!({
         "state": state,
         "id": id,
         "tokens_per_sec": tokens_per_sec,
         "defaults": { "light": light, "heavy": heavy },
+        "readiness": serde_json::Value::Object(readiness),
         "engine": {
             "installed": engine.installed,
             "tag": engine.expected_tag,

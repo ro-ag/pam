@@ -328,6 +328,10 @@ async fn status_bypasses_the_lanes_and_verifies() {
         );
         assert_eq!(body["model"]["defaults"]["light"], serde_json::Value::Null);
         assert_eq!(body["model"]["defaults"]["heavy"], serde_json::Value::Null);
+        // And the per-tier verdict an agent acts on: stage plus the cause.
+        assert_eq!(body["model"]["readiness"]["light"]["stage"], "unconfigured");
+        assert_eq!(body["model"]["readiness"]["light"]["cause"], "no_default");
+        assert_eq!(body["model"]["readiness"]["heavy"]["stage"], "unconfigured");
 
         let store = daemon.handle.store();
         let row = store.get_request("req_status").await.unwrap().unwrap();

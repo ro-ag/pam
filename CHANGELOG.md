@@ -36,6 +36,19 @@ All notable changes to pam are documented in this file. The format follows
   qualification record that admitted it, the summary evidence identity
   carries the same block, and the log-compression report's `model` names
   the record. Identity only, never figures.
+- `pam flow inspect` says before a run whether a summarize step will get
+  its summary: the `model` block names the steps that ask the model, the
+  heavy tier's stage, and the blocker with cause and recovery when the
+  summary will be skipped. `pam status --json` carries the per-tier stage
+  and cause under `model.readiness`.
+
+### Fixed
+
+- A download refused at the checkpoint check (foreign part file, wrong
+  digest) now unlocks its transfer lock explicitly instead of merely
+  closing the handle, so a curl process another task forked in that
+  window can no longer hold the inherited lock past the next start. The
+  same explicit release covers discarding a partial download.
 
 ### Added
 

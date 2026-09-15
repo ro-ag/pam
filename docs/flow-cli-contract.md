@@ -27,6 +27,17 @@ service availability remain unknown where they cannot be established without
 accessing external state. Execution rechecks admission; a successful inspection
 is neither approval nor proof that the job will succeed.
 
+The `model` block says what a summarize step will get, from the heavy tier's
+readiness record (2026-09-15): `used_by` names the steps with `output: summarize`;
+`summary` is `model` when the tier is ready or `skipped` with a `blocker`
+(`cause`, `detail`, `recovery`) otherwise; `stage` is the first failing rung of
+configured → installed → verified → qualified → engine → ready; `qualification`
+is `qualified`, `unqualified`, `unverified`, `missing` or `none`. `required`
+stays false — a skipped summary leaves the compact evidence in place — and a flow
+with no summarize step reports `qualification: not_assessed`. The same verdict,
+reduced to `stage` and `cause` per tier, sits under `model.readiness` in
+`pam status --json`.
+
 Revision-bound recipes additionally expose a declared correlation target during
 inspection and a frozen target digest in results. Use `revision-jenkins-check`
 or `revision-ci-triage` with explicit repository, full commit and product IDs;

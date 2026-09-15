@@ -371,13 +371,36 @@ pub fn discard_partial(dest: &Path) -> Result<u64, DownloadError> {
     remove_if_present(&paths.part)?;
     remove_if_present(&paths.checkpoint)?;
     remove_if_present(&etag_path(&paths.checkpoint))?;
-    drop(lock);
+    release_lock(lock);
     remove_if_present(&paths.lock)?;
     Ok(bytes)
 }
 
+/// Reconciles the on-disk checkpoint with `wanted`: a foreign checkpoint is a
+/// conflict, a matching one lends its etag, and the result is written back.
+fn admit_checkpoint(paths: &SidecarPaths, wanted: &mut Checkpoint) -> Result<(), DownloadError> {
+    if let Some(existing) = read_checkpoint(&paths.checkpoint) {
+        existing.check_against(wanted)?;
+        wanted.etag = existing.etag;
+    }
+    write_checkpoint(&paths.checkpoint, wanted)?;
+    Ok(())
+}
+
+/// Gives the transfer lock back explicitly before the handle closes.
+///
+/// Closing alone releases the lock only when this is the last reference to
+/// the open file description; a child forked by another task between our
+/// open and its exec holds a duplicate until then, and `flock` follows the
+/// description, not the handle. An explicit unlock applies to the whole
+/// description, so the next `acquire_lock` never sees a ghost holder.
+pub(crate) fn release_lock(lock: File) {
+    let _ = lock.unlock();
+    drop(lock);
+}
+
 /// Whether another process or task holds the transfer lock.
-fn is_locked(path: &Path) -> bool {
+pub(crate) fn is_locked(path: &Path) -> bool {
     let Ok(file) = OpenOptions::new()
         .create(false)
         .write(true)
@@ -564,11 +587,13 @@ pub fn start_with_limits(
     let lock = acquire_lock(&paths.lock)?;
 
     let mut wanted = Checkpoint::for_request(&request);
-    if let Some(existing) = read_checkpoint(&paths.checkpoint) {
-        existing.check_against(&wanted)?;
-        wanted.etag = existing.etag;
+    if let Err(error) = admit_checkpoint(&paths, &mut wanted) {
+        // Refusing is not the same as finishing: unlock explicitly, as
+        // `publish_terminal` does, so a descriptor a concurrent fork inherited
+        // cannot keep the lock alive past this return.
+        release_lock(lock);
+        return Err(error);
     }
-    write_checkpoint(&paths.checkpoint, &wanted)?;
 
     let (state, states) = watch::channel(DownloadState::Running(DownloadProgress {
         bytes: file_size(&paths.part),
@@ -885,7 +910,7 @@ impl Job {
 /// unresumable forever. The lock itself is what refuses a concurrent
 /// transfer, and the operating system releases it when the process dies,
 /// whether or not the file survives.
-fn acquire_lock(path: &Path) -> Result<File, DownloadError> {
+pub(crate) fn acquire_lock(path: &Path) -> Result<File, DownloadError> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)

@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "record": "2026-09-14-engine-candidate-screen",
+  "purpose": "task_156_2026_candidates_on_the_llama_cpp_engine_vs_gpt_oss_20b",
+  "host": "Apple M4 Max, 64 GiB, ambient load (not a 32 GB measurement)",
+  "engine": {
+    "tag": "b10938",
+    "build_info": "b10938-f1e44dcc1",
+    "backend": "Metal (default offload)",
+    "supervisor_settings": {
+      "reasoning_budget": 0,
+      "enable_thinking": false,
+      "cache_prompt": false,
+      "seed": 7,
+      "context_tokens": 8192
+    }
+  },
+  "case_set_sha256": "a324c2e3c28a933a845b3f6e0655fdb65472696bf4f516782992e2b9cf5dc8c6",
+  "reference": {
+    "artifact": "gpt-oss-20b-MXFP4",
+    "record": "2026-09-13-llama-engine-screen",
+    "accuracy": "0.867",
+    "false_passes": 3,
+    "warm_p95_ms": 574
+  },
+  "gates": {
+    "accuracy": ">=0.95",
+    "false_passes": 0,
+    "warm_p95_ms": "<10000 short tasks"
+  },
+  "artifacts": [
+    {
+      "artifact": "Qwen3.8-27B Q4_K_M",
+      "source": "ggml-org/Qwen3.8-27B-GGUF",
+      "bytes": 18973870432,
+      "note": "thinking switched off through the template; highest accuracy, 9 false passes incl. 3 decidable build-triage traps",
+      "accuracy": "0.893",
+      "false_passes": 9,
+      "false_pass_ids": [
+        "bt-009",
+        "bt-029",
+        "bt-039",
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 5,
+      "coverage_on_decidable": "0.982",
+      "contract_violations": 0,
+      "warm_p50_ms": 1982,
+      "warm_p95_ms": 2351,
+      "families": {
+        "abstention_trap": {
+          "correct": 12,
+          "total": 22,
+          "false_pass": 6,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "build_triage": {
+          "correct": 42,
+          "total": 48,
+          "false_pass": 3,
+          "contract_violation": 0,
+          "over_abstain": 2
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "Qwen3.6-35B-A3B Q4_K_M",
+      "source": "ggml-org/Qwen3.6-35B-A3B-GGUF",
+      "bytes": 20419565568,
+      "note": "fast MoE; 12 false passes",
+      "accuracy": "0.880",
+      "false_passes": 12,
+      "false_pass_ids": [
+        "bt-009",
+        "bt-019",
+        "bt-029",
+        "bt-039",
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-009",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 5,
+      "coverage_on_decidable": "0.991",
+      "contract_violations": 0,
+      "warm_p50_ms": 587,
+      "warm_p95_ms": 796,
+      "families": {
+        "abstention_trap": {
+          "correct": 10,
+          "total": 22,
+          "false_pass": 8,
+          "contract_violation": 0,
+          "over_abstain": 1
+        },
+        "build_triage": {
+          "correct": 42,
+          "total": 48,
+          "false_pass": 4,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "gemma-4-26B-A4B-it Q4_0",
+      "source": "ggml-org/gemma-4-26B-A4B-it-GGUF",
+      "bytes": 14618145824,
+      "note": "fewest false passes (2) but over-abstains on 23 decidable build-triage records (coverage 0.754)",
+      "accuracy": "0.793",
+      "false_passes": 2,
+      "false_pass_ids": [
+        "bt-007",
+        "at-021"
+      ],
+      "false_alarms": 1,
+      "coverage_on_decidable": "0.754",
+      "contract_violations": 0,
+      "warm_p50_ms": 412,
+      "warm_p95_ms": 516,
+      "families": {
+        "abstention_trap": {
+          "correct": 14,
+          "total": 22,
+          "false_pass": 1,
+          "contract_violation": 0,
+          "over_abstain": 6
+        },
+        "build_triage": {
+          "correct": 25,
+          "total": 48,
+          "false_pass": 1,
+          "contract_violation": 0,
+          "over_abstain": 22
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "GLM-4.7-Flash Q4_K",
+      "source": "ggml-org/GLM-4.7-Flash-GGUF",
+      "bytes": 18244193920,
+      "note": "13 false passes, the worst on the critical class",
+      "accuracy": "0.820",
+      "false_passes": 13,
+      "false_pass_ids": [
+        "bt-007",
+        "bt-031",
+        "bt-037",
+        "bt-039",
+        "at-001",
+        "at-002",
+        "at-003",
+        "at-007",
+        "at-009",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 3,
+      "coverage_on_decidable": "0.904",
+      "contract_violations": 0,
+      "warm_p50_ms": 391,
+      "warm_p95_ms": 512,
+      "families": {
+        "abstention_trap": {
+          "correct": 6,
+          "total": 22,
+          "false_pass": 9,
+          "contract_violation": 0,
+          "over_abstain": 4
+        },
+        "build_triage": {
+          "correct": 37,
+          "total": 48,
+          "false_pass": 4,
+          "contract_violation": 0,
+          "over_abstain": 7
+        },
+        "fact_extraction": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 40,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 0,
+          "over_abstain": 0
+        }
+      }
+    },
+    {
+      "artifact": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B Q4_0",
+      "source": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+      "bytes": 18898091584,
+      "note": "NOT a fair measurement: 38 contract violations (32 on fact extraction) - the answer format did not survive its template under the bounded-task settings; needs its own framing before a comparison",
+      "accuracy": "0.653",
+      "false_passes": 11,
+      "false_pass_ids": [
+        "bt-019",
+        "bt-029",
+        "bt-037",
+        "bt-039",
+        "at-001",
+        "at-003",
+        "at-007",
+        "at-013",
+        "at-015",
+        "at-019",
+        "at-021"
+      ],
+      "false_alarms": 1,
+      "coverage_on_decidable": "0.982",
+      "contract_violations": 38,
+      "warm_p50_ms": 634,
+      "warm_p95_ms": 940,
+      "families": {
+        "abstention_trap": {
+          "correct": 13,
+          "total": 22,
+          "false_pass": 7,
+          "contract_violation": 1,
+          "over_abstain": 0
+        },
+        "build_triage": {
+          "correct": 42,
+          "total": 48,
+          "false_pass": 4,
+          "contract_violation": 0,
+          "over_abstain": 2
+        },
+        "fact_extraction": {
+          "correct": 8,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 32,
+          "over_abstain": 0
+        },
+        "jenkins_label": {
+          "correct": 35,
+          "total": 40,
+          "false_pass": 0,
+          "contract_violation": 5,
+          "over_abstain": 0
+        }
+      }
+    }
+  ],
+  "ranking_on_false_passes": [
+    "gemma-4-26B-A4B 2 (coverage 0.754)",
+    "gpt-oss-20b 3",
+    "Qwen3-Coder-30B-A3B 7",
+    "Qwen3.8-27B 9",
+    "Nemotron-3.5 11 (unfair)",
+    "Qwen3.6-35B-A3B 12",
+    "GLM-4.7-Flash 13"
+  ],
+  "decision": "gpt-oss-20b stays the reference artifact: the best balance of false passes (3), accuracy (0.867) and latency (574 ms). gemma-4-26B-A4B is the only safer artifact on the critical class (2) but refuses 23 decidable triage records, so it would trade false passes for unusable coverage. No artifact meets the 0.95 / zero-false-pass gates; every remaining false pass on the two best artifacts is an abstention-trap variant, which points at the contract (deterministic exit parsing, trap rewording) rather than at another model.",
+  "not_measured": [
+    "gpt-oss-120b (63 GB, does not fit this host)",
+    "Qwen3-Coder-Next (48 GB, four shards, not fetched)",
+    "reasoning arms (need their own output envelope)"
+  ],
+  "raw": "one JSON line per case plus the summary line per artifact, emitted by capability_bench with PAM_BENCH_BACKEND=llama"
+}

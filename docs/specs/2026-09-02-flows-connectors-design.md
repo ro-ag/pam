@@ -268,6 +268,13 @@ prepended to PATH; default macOS `~/.cargo/bin /opt/homebrew/bin
 /usr/local/bin`, Linux `~/.cargo/bin ~/.local/bin /usr/local/bin`,
 Windows `%USERPROFILE%\.cargo\bin`). A launchd/systemd daemon inherits
 a minimal PATH, so without this cargo never resolves.
+`flows.artifacts_root` (string or `null`, default `null`) names the
+private build output directory every command step writes its home,
+cargo home, target, temp and npm cache into (one tree per repository);
+a cargo/npm step is `blocked` with `artifacts_root_unset` until it is
+set. `flows.read_cache_roots` (array, default `~/.cargo/registry
+~/.cargo/git`) lists the caches linked read-only under that tree. See
+[command containment](../command-containment.md).
 
 ## Daemon (`pam_daemon`)
 
@@ -332,7 +339,9 @@ calls `pam_connectors::call`. Secrets live only inside the call.
 5. **Command step.** Program must be in `flows.allowed_programs`
    (else `blocked`, cause `program_not_allowed`, recovery "open Pam →
    Settings → Flows → allowed programs"), resolved on
-   `extra_path ++ PATH` (missing → `failed`, `program_missing`).
+   `extra_path ++ PATH` (missing → `failed`, `program_missing`); a
+   program that keeps state in a home directory needs
+   `flows.artifacts_root` (unset → `blocked`, `artifacts_root_unset`).
    `tokio::process::Command`: cwd = `caller.repo`, stdin null,
    stdout+stderr piped and interleaved into one buffer in arrival
    order, env = daemon env minus names matching
@@ -408,7 +417,7 @@ grandchildren are not chased in this plan.
 | `admin.flows.save` | `{ id, yaml }` | the list entry; refusals `flow_invalid` (message + path), `id_mismatch`, `library_unwritable` |
 | `admin.flows.delete` | `{ id }` | `{ id, revealed_builtin: bool }`; `not_found` for a builtin without a shadow |
 | `admin.flows.run` | `{ id, repo, inputs }` | `{ ticket, position }` — builds a `flow.run` envelope with caller `{ agent: "pam-gui", repo }`, `wait: false`, and submits it through the pipeline ingress (gate, lanes, audit all apply); the GUI follows the ticket's events |
-| `admin.flows.settings.get` / `.set` | — / `{ allowed_programs?, extra_path? }` | `{ allowed_programs, extra_path }`; shells refused with `program_not_allowed` |
+| `admin.flows.settings.get` / `.set` | — / `{ allowed_programs?, extra_path?, artifacts_root?, read_cache_roots? }` | `{ allowed_programs, extra_path, artifacts_root, read_cache_roots }`; shells refused with `program_not_allowed`, a relative `artifacts_root` with `artifacts_root_invalid`, `artifacts_root: null` clears it |
 | `admin.connectors.list` | — | `{ connectors: [ { id, name, auth, enabled, base_url, username, credential_present, store_available, last_test } ] }` |
 | `admin.connectors.configure` | `{ id, enabled?, base_url?, username?, credential?: { set: string } \| { clear: true } }` | the list entry; `bad_url`, `store_unavailable`, `store_denied` |
 | `admin.connectors.test` | `{ id }` | `{ status: passed\|failed, detail, ts }` |

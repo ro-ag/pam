@@ -24,7 +24,8 @@ use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
-    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, CAUSE_PROGRAM_NOT_ALLOWED,
+    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_INVALID,
+    CAUSE_PROGRAM_NOT_ALLOWED,
 };
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
@@ -733,4 +734,63 @@ async fn create_options_refuse_collisions_and_restore_only_an_absent_override() 
         Outcome::Changed,
     );
     assert_eq!(deleted["revealed_builtin"], true);
+}
+
+#[tokio::test]
+async fn settings_carry_the_artifacts_root_and_a_null_clears_it() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let body = body_of(
+        admin
+            .handle(&admin_envelope("req_get", OP_FLOWS_SETTINGS_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["artifacts_root"], serde_json::Value::Null);
+    assert_eq!(
+        body["read_cache_roots"],
+        json!(["~/.cargo/registry", "~/.cargo/git"])
+    );
+
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_set",
+                OP_FLOWS_SETTINGS_SET,
+                json!({ "artifacts_root": "~/pam-builds", "read_cache_roots": ["~/.cargo/registry"] }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(body["artifacts_root"], "~/pam-builds");
+    assert_eq!(body["read_cache_roots"], json!(["~/.cargo/registry"]));
+
+    let response = admin
+        .handle(&admin_envelope(
+            "req_relative",
+            OP_FLOWS_SETTINGS_SET,
+            json!({ "artifacts_root": "builds" }),
+        ))
+        .await;
+    assert_eq!(cause_of(response), CAUSE_ARTIFACTS_ROOT_INVALID);
+
+    let response = admin
+        .handle(&admin_envelope(
+            "req_number",
+            OP_FLOWS_SETTINGS_SET,
+            json!({ "artifacts_root": 7 }),
+        ))
+        .await;
+    assert_eq!(cause_of(response), CAUSE_INVALID_ADMIN_ARGS);
+
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_clear",
+                OP_FLOWS_SETTINGS_SET,
+                json!({ "artifacts_root": null }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(body["artifacts_root"], serde_json::Value::Null);
 }

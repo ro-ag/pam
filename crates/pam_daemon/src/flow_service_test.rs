@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::flow_service::{
-    CAUSE_FLOW_NOT_FOUND, CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings,
-    SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH, SettingsPatch, boundary_read_roots,
+    ArtifactsRootPatch, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_NOT_FOUND,
+    CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings, SETTING_ALLOWED_PROGRAMS,
+    SETTING_ARTIFACTS_ROOT, SETTING_EXTRA_PATH, SettingsPatch, boundary_read_roots,
     step_capability,
 };
 use crate::log_service::LogService;
@@ -157,7 +158,7 @@ async fn setting_the_allowlist_trims_and_deduplicates() {
                 String::new(),
                 "cargo".to_owned(),
             ]),
-            extra_path: None,
+            ..SettingsPatch::default()
         })
         .await
         .expect("the settings save");
@@ -175,7 +176,7 @@ async fn a_shell_is_refused_from_the_allowlist() {
     let refusal = flows
         .set_settings(SettingsPatch {
             allowed_programs: Some(vec!["git".to_owned(), "bash".to_owned()]),
-            extra_path: None,
+            ..SettingsPatch::default()
         })
         .await
         .expect_err("a shell is refused");
@@ -195,7 +196,7 @@ async fn a_program_with_a_path_separator_is_refused() {
     let refusal = flows
         .set_settings(SettingsPatch {
             allowed_programs: Some(vec!["/usr/bin/git".to_owned()]),
-            extra_path: None,
+            ..SettingsPatch::default()
         })
         .await
         .expect_err("a path is refused");
@@ -413,4 +414,116 @@ fn boundary_read_roots_drop_grants_inside_the_protected_base_or_the_repository()
         separate.contains(&elsewhere.canonicalize().expect("canonical elsewhere")),
         "a daemon directory outside both boundaries stays granted: {separate:?}"
     );
+}
+
+#[test]
+fn the_platform_default_names_the_cargo_caches_and_no_artifacts_root() {
+    let settings = FlowSettings::platform_default();
+    assert_eq!(settings.artifacts_root, None);
+    assert_eq!(settings.artifacts_root_dir(), None);
+    assert_eq!(
+        settings.read_cache_roots,
+        ["~/.cargo/registry", "~/.cargo/git"]
+    );
+    // Expansion drops nothing that exists and keeps the order.
+    let home = std::env::home_dir().expect("a home");
+    let dirs = settings.read_cache_dirs();
+    assert!(dirs.iter().all(|dir| dir.starts_with(&home)), "{dirs:?}");
+}
+
+#[tokio::test]
+async fn the_artifacts_root_is_unset_until_a_human_names_one_and_clears_again() {
+    let (_tmp, store, flows) = service().await;
+    assert_eq!(
+        flows
+            .settings()
+            .await
+            .expect("settings read")
+            .artifacts_root,
+        None
+    );
+
+    let settings = flows
+        .set_settings(SettingsPatch {
+            artifacts_root: ArtifactsRootPatch::Set("  ~/pam-builds ".to_owned()),
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("the root saves");
+    assert_eq!(settings.artifacts_root.as_deref(), Some("~/pam-builds"));
+    assert_eq!(
+        settings.artifacts_root_dir(),
+        Some(std::env::home_dir().expect("a home").join("pam-builds"))
+    );
+    assert_eq!(
+        store
+            .get_setting(SETTING_ARTIFACTS_ROOT)
+            .await
+            .expect("get_setting ok")
+            .as_deref(),
+        Some("\"~/pam-builds\"")
+    );
+    // The untouched lists keep their defaults.
+    assert_eq!(
+        settings.allowed_programs,
+        FlowSettings::platform_default().allowed_programs
+    );
+
+    let cleared = flows
+        .set_settings(SettingsPatch {
+            artifacts_root: ArtifactsRootPatch::Clear,
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("the root clears");
+    assert_eq!(cleared.artifacts_root, None);
+    assert_eq!(
+        flows
+            .settings()
+            .await
+            .expect("settings read")
+            .artifacts_root,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_relative_or_empty_artifacts_root_is_refused_and_nothing_is_written() {
+    let (_tmp, _store, flows) = service().await;
+    for raw in ["builds", "./builds", "   "] {
+        let refusal = flows
+            .set_settings(SettingsPatch {
+                artifacts_root: ArtifactsRootPatch::Set(raw.to_owned()),
+                ..SettingsPatch::default()
+            })
+            .await
+            .expect_err("a relative root is refused");
+        assert_eq!(refusal.cause, CAUSE_ARTIFACTS_ROOT_INVALID, "{raw:?}");
+        assert!(
+            refusal.recovery.contains("Settings"),
+            "{}",
+            refusal.recovery
+        );
+    }
+    assert_eq!(
+        flows
+            .settings()
+            .await
+            .expect("settings read")
+            .artifacts_root,
+        None
+    );
+}
+
+#[tokio::test]
+async fn the_read_cache_roots_are_a_list_setting_like_the_extra_path() {
+    let (_tmp, _store, flows) = service().await;
+    let settings = flows
+        .set_settings(SettingsPatch {
+            read_cache_roots: Some(vec![" ~/.cargo/registry ".to_owned(), String::new()]),
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("the caches save");
+    assert_eq!(settings.read_cache_roots, ["~/.cargo/registry"]);
 }

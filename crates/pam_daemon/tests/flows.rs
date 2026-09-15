@@ -30,6 +30,7 @@ use pam_compact::MAX_SOURCE_BYTES;
 use pam_daemon::admin::{ADMIN_CALLER_AGENT, ADMIN_REPO};
 use pam_daemon::admin_flows::{
     OP_FLOWS_DELETE, OP_FLOWS_GET, OP_FLOWS_LIST, OP_FLOWS_RUN, OP_FLOWS_SAVE,
+    OP_FLOWS_SETTINGS_SET,
 };
 use pam_daemon::approval::Resolution;
 use pam_daemon::command_containment::CommandContainment;
@@ -38,9 +39,9 @@ use pam_daemon::daemon::{
 };
 use pam_daemon::flow_exec::{CommandOutcome, CommandSpec, run_command};
 use pam_daemon::flow_service::{
-    CAP_FLOW_LIST, CAP_FLOW_RUN, CAP_FLOW_SHOW, CAUSE_FLOW_NOT_FOUND, CAUSE_OUTPUT_LIMIT,
-    CAUSE_PROGRAM_NOT_ALLOWED, CAUSE_REPO_MISSING, CAUSE_TIMEOUT, EVIDENCE_KIND_CONNECTOR_RESULT,
-    EVIDENCE_KIND_FLOW_RESULT, step_capability,
+    CAP_FLOW_INSPECT, CAP_FLOW_LIST, CAP_FLOW_RUN, CAP_FLOW_SHOW, CAUSE_ARTIFACTS_ROOT_UNSET,
+    CAUSE_FLOW_NOT_FOUND, CAUSE_OUTPUT_LIMIT, CAUSE_PROGRAM_NOT_ALLOWED, CAUSE_REPO_MISSING,
+    CAUSE_TIMEOUT, EVIDENCE_KIND_CONNECTOR_RESULT, EVIDENCE_KIND_FLOW_RESULT, step_capability,
 };
 use pam_daemon::log_service::{EVIDENCE_KIND_LOG_SOURCE, EVIDENCE_KIND_LOG_SUMMARY};
 use pam_daemon::model_service::SETTING_DEFAULT_HEAVY;
@@ -714,6 +715,129 @@ async fn a_program_that_is_not_allowed_blocks_the_run() {
         );
         // A block stops the run: the `when: always` step never ran.
         assert_eq!(body["steps"].as_array().expect("steps").len(), 1);
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_build_tool_step_is_blocked_until_a_private_artifacts_root_is_configured() {
+    with_deadline(async {
+        let yaml = "schema: 1\nid: build\nname: Build\n\
+                    steps:\n\
+                    \x20 - id: build\n    run: [cargo, --version]\n";
+        let flows = FlowDaemon::spawn(&[("build", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        drop(result_body(
+            client
+                .request(&admin_envelope(
+                    "req_allow",
+                    OP_FLOWS_SETTINGS_SET,
+                    serde_json::json!({ "allowed_programs": ["git", "pam-flow-helper", "cargo"] }),
+                ))
+                .await,
+        ));
+
+        // Inspection names the blocker before anything runs.
+        let inspection = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "build" }),
+                    true,
+                ))
+                .await,
+        );
+        assert_eq!(inspection["readiness"], "blocked", "{inspection}");
+        let blocker = inspection["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .find(|blocker| blocker["cause"] == CAUSE_ARTIFACTS_ROOT_UNSET)
+            .unwrap_or_else(|| panic!("no artifacts blocker in {inspection}"));
+        assert_eq!(blocker["step"], "build");
+        assert!(
+            blocker["recovery"]
+                .as_str()
+                .expect("recovery")
+                .contains("Settings → Flows"),
+            "{blocker}"
+        );
+
+        let body = flows.run(&mut client, "req_run", "build").await;
+        assert_eq!(body["outcome"], "blocked", "{body}");
+        let build = step(&body, "build");
+        assert_eq!(build["status"], "blocked");
+        assert_eq!(build["error"]["cause"], CAUSE_ARTIFACTS_ROOT_UNSET);
+        assert!(
+            build["error"]["recovery"]
+                .as_str()
+                .expect("recovery")
+                .contains("Settings → Flows"),
+            "{build}"
+        );
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_configured_artifacts_root_gives_every_command_step_a_private_cargo_target() {
+    with_deadline(async {
+        let yaml = "schema: 1\nid: target\nname: Target\n\
+                    steps:\n\
+                    \x20 - id: show\n    run: [pam-flow-helper, echo-env, CARGO_TARGET_DIR]\n";
+        let flows = FlowDaemon::spawn(&[("target", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        let root = short_tempdir();
+        let root_path = root.path().canonicalize().expect("root exists");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &root_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("the root is made private");
+        let settings = result_body(
+            client
+                .request(&admin_envelope(
+                    "req_root",
+                    OP_FLOWS_SETTINGS_SET,
+                    serde_json::json!({ "artifacts_root": root_path.display().to_string() }),
+                ))
+                .await,
+        );
+        assert_eq!(settings["artifacts_root"], root_path.display().to_string());
+
+        let body = flows.run(&mut client, "req_run", "target").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.assert_invariant_clean().await;
+            flows.daemon.stop().await;
+            return;
+        }
+        assert_eq!(body["outcome"], "solved", "{body}");
+        let show = step(&body, "show");
+        assert_eq!(show["status"], "succeeded");
+        let source = show["evidence"][0].as_str().expect("the step's source row");
+        let row = flows
+            .daemon
+            .store()
+            .get_evidence(source)
+            .await
+            .expect("evidence read")
+            .expect("the row exists");
+        let printed = PathBuf::from(String::from_utf8_lossy(&row.content).trim());
+        assert!(
+            printed.starts_with(&root_path) && printed.ends_with("target"),
+            "{}",
+            printed.display()
+        );
+        assert!(printed.is_dir(), "{} was not created", printed.display());
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;

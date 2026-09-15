@@ -129,6 +129,78 @@ function ListEditor({
   );
 }
 
+/**
+ * The one directory a build tool may write: an absolute path (or `~/…`)
+ * outside every repository, created private by the daemon. Saving sends
+ * the trimmed path; clearing sends an explicit `null`, which is how the
+ * daemon spells "no directory" — an omitted key leaves it untouched.
+ */
+function DirectoryEditor({
+  value,
+  busy,
+  onSave,
+}: {
+  value: string | null;
+  busy: boolean;
+  onSave: (next: string | null) => boolean;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = draft ?? value ?? "";
+  return (
+    <div className="space-y-3">
+      <p className="font-data text-xs text-ink-faint">build output directory</p>
+      {value ? (
+        <p className="font-sans text-sm text-ink-muted">
+          Read-only build steps write their cargo home, target and caches under this private
+          directory, one tree per repository.
+        </p>
+      ) : (
+        <p className="font-sans text-sm text-ink-muted">
+          No build output directory — cargo and npm steps refuse until one is named. Choose a
+          private directory outside every repository.
+        </p>
+      )}
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const next = shown.trim();
+          if (busy || !next || next === value) return;
+          if (onSave(next)) setDraft(null);
+        }}
+      >
+        <input
+          aria-label="build output directory"
+          value={shown}
+          disabled={busy}
+          onChange={(event) => {
+            if (!busy) setDraft(event.target.value);
+          }}
+          placeholder="directory, e.g. ~/pam-builds"
+          className={fieldClasses}
+        />
+        <Button
+          size="sm"
+          type="submit"
+          disabled={busy || !shown.trim() || shown.trim() === value}
+        >
+          Save directory
+        </Button>
+        <Button
+          size="sm"
+          type="button"
+          disabled={busy || !value}
+          onClick={() => {
+            if (!busy && value && onSave(null)) setDraft(null);
+          }}
+        >
+          Clear directory
+        </Button>
+      </form>
+    </div>
+  );
+}
+
 export function SettingsFlowsSection() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: ["flow-settings"], queryFn: flowsSettingsGet });
@@ -173,6 +245,8 @@ export function SettingsFlowsSection() {
   const listFailure = settings.isError ? toBridgeFailure(settings.error) : null;
   const programs = settings.data?.allowed_programs ?? [];
   const extraPath = settings.data?.extra_path ?? [];
+  const artifactsRoot = settings.data?.artifacts_root ?? null;
+  const readCaches = settings.data?.read_cache_roots ?? [];
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
@@ -210,6 +284,27 @@ export function SettingsFlowsSection() {
           empty="Nothing added — steps see only the daemon's own PATH."
           busy={busy}
           onChange={(next) => change({ extra_path: next })}
+        />
+      </div>
+
+      <div className="border-t border-line pt-4">
+        <DirectoryEditor
+          value={artifactsRoot}
+          busy={busy}
+          onSave={(next) => change({ artifacts_root: next })}
+        />
+      </div>
+
+      <div className="border-t border-line pt-4">
+        <ListEditor
+          title="read-only caches"
+          values={readCaches}
+          addLabel="cache directory to add"
+          removeLabel="remove cache directory"
+          placeholder="directory, e.g. ~/.cargo/registry"
+          empty="No cache is shared — every build fetches nothing, since steps have no network."
+          busy={busy}
+          onChange={(next) => change({ read_cache_roots: next })}
         />
       </div>
 

@@ -543,6 +543,29 @@ export interface ModelsEngineSummary {
   loaded: EngineLoadedModel | null;
 }
 
+/**
+ * The first rung of configured → installed → verified → qualified → engine →
+ * ready that fails, or `ready` (`pam_daemon::model_readiness::Stage`).
+ */
+export type ReadinessStage =
+  "unconfigured" | "missing" | "unverified" | "unqualified" | "engine_missing" | "ready";
+
+/** One tier's verdict, computed by the daemon with the job's own refusal cause. */
+export interface TierReadiness {
+  tier: "light" | "heavy";
+  /** The id set on this tier itself, before any fallback. */
+  configured: string | null;
+  /** The id the tier resolves to after `heavy` → `light` fallback. */
+  model_id: string | null;
+  fallback: boolean;
+  stage: ReadinessStage;
+  /** Whether the engine holds `model_id` right now — transient, independent of `stage`. */
+  resident: boolean;
+  qualification: Qualification | null;
+  /** Present exactly when `stage` is not `ready`. */
+  blocker: { cause: string; detail: string; recovery: string } | null;
+}
+
 /** Everything the Models screen polls, in one read. */
 export interface ModelsStatus {
   runtime: { state: RuntimeState; busy: boolean };
@@ -553,6 +576,8 @@ export interface ModelsStatus {
   host_ram_bytes: number;
   /** Absent on an older daemon that predates the engine — never invented. */
   engine?: ModelsEngineSummary;
+  /** Absent on an older daemon that predates readiness — never invented. */
+  readiness?: { light: TierReadiness; heavy: TierReadiness };
 }
 
 /** What one generation produced, and what it cost. */

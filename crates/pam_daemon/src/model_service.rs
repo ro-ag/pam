@@ -734,8 +734,8 @@ impl ModelService {
     }
 
     /// The `admin.models.status` body: the runtime, the jobs worth
-    /// showing, the tier defaults, and the settings behind them.
-    pub async fn status(&self) -> Result<serde_json::Value, StoreError> {
+    /// showing, the tier defaults, their readiness, and the settings behind them.
+    pub async fn status(&self) -> Result<serde_json::Value, ModelUnavailable> {
         let (light, heavy) = self.defaults().await?;
         let rows = self.store.list_model_jobs(JOB_QUERY_LIMIT).await?;
         let (running, settled): (Vec<ModelJobRow>, Vec<ModelJobRow>) =
@@ -747,6 +747,15 @@ impl ModelService {
             .collect();
         let engine_status = engine::status(&self.engine_base());
         let engine_loaded = self.engine_server().and_then(|engine| engine.model());
+        let resident = engine_loaded.as_ref().map(|loaded| loaded.id.clone());
+        let readiness = json!({
+            "light": self
+                .readiness(Tier::Light, &engine_status, resident.as_deref())
+                .await?,
+            "heavy": self
+                .readiness(Tier::Heavy, &engine_status, resident.as_deref())
+                .await?,
+        });
         Ok(json!({
             "runtime": self.snapshot(),
             "engine": {
@@ -757,6 +766,7 @@ impl ModelService {
             },
             "jobs": jobs,
             "defaults": { "light": light, "heavy": heavy },
+            "readiness": readiness,
             "idle_unload_min": self.idle_unload_min().await?,
             "models_dir": self.models_dir().display().to_string(),
             "host_ram_bytes": self.host_ram_bytes,

@@ -251,6 +251,57 @@ describe("polling cadence", () => {
   });
 });
 
+describe("readiness card", () => {
+  it("draws the daemon's verdict per tier and the repair opens the right tab", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({
+        defaults: { light: null, heavy: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M" },
+        readiness: {
+          light: {
+            tier: "light",
+            configured: null,
+            model_id: null,
+            fallback: false,
+            stage: "unconfigured",
+            resident: false,
+            qualification: null,
+            blocker: {
+              cause: "no_default",
+              detail: "no default model for tier light",
+              recovery: "",
+            },
+          },
+          heavy: {
+            tier: "heavy",
+            configured: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+            model_id: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+            fallback: false,
+            stage: "engine_missing",
+            resident: false,
+            qualification: null,
+            blocker: {
+              cause: "engine_not_installed",
+              detail: "the llama.cpp engine b10938 is not installed (not_installed)",
+              recovery:
+                "Install the llama.cpp engine from Models > Runtime; the model itself is ready.",
+            },
+          },
+        },
+      }),
+    );
+    renderModels();
+    const heavy = await screen.findByRole("list", { name: "heavy readiness" });
+    expect(within(heavy).getAllByRole("listitem")[4]).toHaveAttribute("aria-current", "step");
+    expect(
+      screen.getByText("the llama.cpp engine b10938 is not installed (not_installed)"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Install engine" }));
+    expect(
+      await screen.findByRole("tab", { name: "Downloads", selected: true }),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("runtime card", () => {
   it("says Pam's idle sentence and closes the try box with a reason", async () => {
     renderModels();

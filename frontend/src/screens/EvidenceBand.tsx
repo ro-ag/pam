@@ -5,7 +5,13 @@ import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
 import { formatBytes } from "../lib/bytes";
-import { evidenceStats, logCompress, toBridgeFailure, type CompressReport } from "../lib/ipc";
+import {
+  evidenceStats,
+  logCompress,
+  modelsStatus,
+  toBridgeFailure,
+  type CompressReport,
+} from "../lib/ipc";
 
 /**
  * EvidenceBand — the compression observatory, sitting under the Activity
@@ -99,6 +105,15 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
   const [path, setPath] = useState("");
   const [exitStatus, setExitStatus] = useState("");
   const [useModel, setUseModel] = useState(true);
+  // Read only while the box is ticked: the line under it is the one thing
+  // here that needs the model layer, and an unticked box should cost nothing.
+  const models = useQuery({
+    queryKey: ["models", "status"],
+    queryFn: modelsStatus,
+    enabled: useModel,
+  });
+  const heavy = models.data?.readiness?.heavy;
+  const heavyBlocked = heavy && heavy.stage !== "ready" ? heavy.blocker?.detail : null;
 
   const stats = useQuery({ queryKey: ["evidence-stats"], queryFn: () => evidenceStats() });
 
@@ -188,6 +203,11 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           />
           summarize with the heavy model
         </label>
+        {useModel && heavyBlocked && (
+          <p className="font-sans text-xs text-warning">
+            No summary will come of this — {heavyBlocked}.
+          </p>
+        )}
         <div className="flex flex-wrap items-center gap-3">
           <Button
             size="sm"

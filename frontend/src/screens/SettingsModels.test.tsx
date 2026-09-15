@@ -176,6 +176,45 @@ describe("tier defaults", () => {
     expect(within(heavy).getByRole("option", { name: "none (deterministic)" })).toBeEnabled();
   });
 
+  it("prints the daemon's readiness verdict under each tier", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      status({
+        defaults: { light: null, heavy: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M" },
+        readiness: {
+          light: {
+            tier: "light",
+            configured: null,
+            model_id: null,
+            fallback: false,
+            stage: "unconfigured",
+            resident: false,
+            qualification: null,
+            blocker: {
+              cause: "no_default",
+              detail: "no default model for tier light",
+              recovery: "",
+            },
+          },
+          heavy: {
+            tier: "heavy",
+            configured: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+            model_id: "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+            fallback: false,
+            stage: "ready",
+            resident: true,
+            qualification: null,
+            blocker: null,
+          },
+        },
+      }),
+    );
+    const section = await renderModelsSection();
+    expect(await section.findByText("no default model for tier light")).toHaveClass(
+      "text-warning",
+    );
+    expect(section.getByText("Ready and in memory.")).toBeInTheDocument();
+  });
+
   it("offers a verified but unqualified model disabled, with the qualification sentence", async () => {
     const section = await renderModelsSection();
     const heavy = await section.findByLabelText("heavy tier default");

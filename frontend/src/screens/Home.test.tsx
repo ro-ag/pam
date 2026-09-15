@@ -215,7 +215,9 @@ describe("Home shell", () => {
     });
     renderHome();
     const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
-    await waitFor(() => expect(within(overview).getByText(/Active requests/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(within(overview).getByText(/Active requests/)).toBeInTheDocument(),
+    );
     expect(within(overview).queryByText(/Keychain/)).not.toBeInTheDocument();
   });
 
@@ -323,6 +325,52 @@ describe("Home shell", () => {
       await screen.findByText("answers stay in my own words: no light model is set"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Models" })).toBeInTheDocument();
+  });
+
+  it("speaks the daemon's readiness verdict for the light tier when it reports one", async () => {
+    window.localStorage.setItem(rephraseStorageKey, "on");
+    mocks.modelsStatus.mockResolvedValue({
+      runtime: { state: { state: "idle" }, busy: false },
+      jobs: [],
+      defaults: { light: "qwen/x", heavy: null },
+      idle_unload_min: 10,
+      models_dir: "/Users/me/.pam/models",
+      host_ram_bytes: 64e9,
+      readiness: {
+        light: {
+          tier: "light",
+          configured: "qwen/x",
+          model_id: "qwen/x",
+          fallback: false,
+          stage: "unverified",
+          resident: false,
+          qualification: null,
+          blocker: {
+            cause: "model_unverified",
+            detail: "qwen/x has no verified digest",
+            recovery: "",
+          },
+        },
+        heavy: {
+          tier: "heavy",
+          configured: null,
+          model_id: "qwen/x",
+          fallback: true,
+          stage: "unverified",
+          resident: false,
+          qualification: null,
+          blocker: {
+            cause: "model_unverified",
+            detail: "qwen/x has no verified digest",
+            recovery: "",
+          },
+        },
+      },
+    });
+    renderHome();
+    expect(
+      await screen.findByText("answers stay in my own words: qwen/x has no verified digest"),
+    ).toBeInTheDocument();
   });
 
   it("renders a source failure as Pam's sentence, not a crash", async () => {

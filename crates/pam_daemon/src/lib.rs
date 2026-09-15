@@ -41,6 +41,7 @@ mod flow_result_service_test;
 pub mod flow_service;
 pub mod lifecycle;
 pub mod log_service;
+pub mod model_readiness;
 pub mod model_service;
 pub mod policy;
 pub mod queue;
@@ -81,6 +82,8 @@ mod lifecycle_recovery_test;
 mod lifecycle_test;
 #[cfg(test)]
 mod log_service_test;
+#[cfg(test)]
+mod model_readiness_test;
 #[cfg(test)]
 mod model_service_test;
 #[cfg(test)]

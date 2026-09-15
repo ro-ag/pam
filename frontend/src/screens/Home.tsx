@@ -117,6 +117,18 @@ export function HomeScreen() {
     enabled: rephrase,
   });
 
+  // The daemon's verdict when it reports one; the bare setting on an older daemon.
+  const lightReadiness = models.data?.readiness?.light;
+  const lightBlocked = lightReadiness
+    ? lightReadiness.stage === "unconfigured"
+      ? "no light model is set"
+      : lightReadiness.stage === "ready"
+        ? null
+        : (lightReadiness.blocker?.detail ?? "the light model is not ready")
+    : models.data?.defaults.light === null
+      ? "no light model is set"
+      : null;
+
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const navigate = useNavigate();
   const sources = useMemo(liveSources, []);
@@ -295,10 +307,10 @@ export function HomeScreen() {
                 ))}
               </div>
             </details>
-            {rephrase && models.data?.defaults.light === null && (
+            {rephrase && lightBlocked && (
               <div className="flex flex-wrap items-center gap-3 border-t border-line px-5 py-3">
                 <p className="min-w-0 flex-1 text-xs text-ink-muted">
-                  answers stay in my own words: no light model is set
+                  answers stay in my own words: {lightBlocked}
                 </p>
                 <Button
                   size="sm"

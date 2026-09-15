@@ -688,12 +688,28 @@ async fn unload_on_an_idle_runtime_is_a_success() {
 async fn status_carries_the_runtime_jobs_defaults_and_settings() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
+        fx.install_gguf("qwen", "tiny.gguf");
+        fx.models
+            .set_default(Tier::Light, Some("qwen/tiny"))
+            .await
+            .unwrap();
         let body = expect_result(fx.run(OP_MODELS_STATUS, json!({})).await, Outcome::Verified);
         assert_eq!(body["runtime"]["state"]["state"], "idle");
         assert_eq!(body["runtime"]["busy"], false);
         assert_eq!(body["jobs"].as_array().unwrap().len(), 0);
-        assert_eq!(body["defaults"]["light"], Value::Null);
+        assert_eq!(body["defaults"]["light"], "qwen/tiny");
         assert_eq!(body["defaults"]["heavy"], Value::Null);
+        // Readiness is the daemon's verdict, one per tier, with the job's own cause.
+        assert_eq!(body["readiness"]["light"]["stage"], "unverified");
+        assert_eq!(body["readiness"]["light"]["model_id"], "qwen/tiny");
+        assert_eq!(body["readiness"]["light"]["resident"], false);
+        assert_eq!(
+            body["readiness"]["light"]["blocker"]["cause"],
+            crate::log_service::CAUSE_MODEL_UNVERIFIED
+        );
+        assert_eq!(body["readiness"]["heavy"]["fallback"], true);
+        assert_eq!(body["readiness"]["heavy"]["configured"], Value::Null);
+        assert_eq!(body["readiness"]["heavy"]["stage"], "unverified");
         assert_eq!(body["idle_unload_min"], 10);
         assert_eq!(
             body["models_dir"],

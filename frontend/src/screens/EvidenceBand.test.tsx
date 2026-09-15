@@ -14,6 +14,7 @@ import { EvidenceBand, isAbsolutePath } from "./EvidenceBand";
 const mocks = vi.hoisted(() => ({
   evidenceStats: vi.fn(),
   logCompress: vi.fn(),
+  modelsStatus: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -107,14 +108,18 @@ describe("the compress box", () => {
     expect(button).toBeDisabled();
     fireEvent.change(screen.getByLabelText("log path"), { target: { value: "build.log" } });
     expect(button).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("log path"), { target: { value: "/tmp/build.log" } });
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/build.log" },
+    });
     expect(button).toBeEnabled();
   });
 
   it("sends the path, the exit status, and the model toggle, then reports the saving", async () => {
     renderBand();
     await screen.findByText("21,450");
-    fireEvent.change(screen.getByLabelText("log path"), { target: { value: "/tmp/build.log" } });
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/build.log" },
+    });
     fireEvent.change(screen.getByLabelText("exit status"), { target: { value: "1" } });
     fireEvent.click(screen.getByRole("button", { name: "Compress" }));
     await waitFor(() =>
@@ -124,14 +129,18 @@ describe("the compress box", () => {
         model: true,
       }),
     );
-    expect(await screen.findByText(/88 KB → 4 KB · ~21,000 tokens avoided/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/88 KB → 4 KB · ~21,000 tokens avoided/),
+    ).toBeInTheDocument();
     expect(onCompressed).toHaveBeenCalledTimes(1);
   });
 
   it("drops the model toggle and the exit status when neither is offered", async () => {
     renderBand();
     await screen.findByText("21,450");
-    fireEvent.change(screen.getByLabelText("log path"), { target: { value: "/tmp/build.log" } });
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/build.log" },
+    });
     fireEvent.click(screen.getByLabelText("use model"));
     fireEvent.click(screen.getByRole("button", { name: "Compress" }));
     await waitFor(() =>
@@ -142,6 +151,53 @@ describe("the compress box", () => {
     );
   });
 
+  it("warns before submission when the heavy tier cannot answer", async () => {
+    mocks.modelsStatus.mockResolvedValue({
+      runtime: { state: { state: "idle" }, busy: false },
+      jobs: [],
+      defaults: { light: null, heavy: "qwen/x" },
+      idle_unload_min: 10,
+      models_dir: "/Users/dev/llm",
+      host_ram_bytes: 64e9,
+      readiness: {
+        light: {
+          tier: "light",
+          configured: null,
+          model_id: null,
+          fallback: false,
+          stage: "unconfigured",
+          resident: false,
+          qualification: null,
+          blocker: {
+            cause: "no_default",
+            detail: "no default model for tier light",
+            recovery: "",
+          },
+        },
+        heavy: {
+          tier: "heavy",
+          configured: "qwen/x",
+          model_id: "qwen/x",
+          fallback: false,
+          stage: "unqualified",
+          resident: false,
+          qualification: null,
+          blocker: {
+            cause: "model_unqualified",
+            detail: "qwen/x is verified but no qualification record covers its digest",
+            recovery: "",
+          },
+        },
+      },
+    });
+    renderBand();
+    expect(
+      await screen.findByText(/No summary will come of this — qwen\/x is verified but no/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("use model"));
+    expect(screen.queryByText(/No summary will come of this/)).toBeNull();
+  });
+
   it("says why there is no summary when the model layer stood aside", async () => {
     mocks.logCompress.mockResolvedValue(
       report({
@@ -150,7 +206,9 @@ describe("the compress box", () => {
     );
     renderBand();
     await screen.findByText("21,450");
-    fireEvent.change(screen.getByLabelText("log path"), { target: { value: "/tmp/build.log" } });
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/build.log" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Compress" }));
     expect(
       await screen.findByText(/No summary this time — no heavy model is configured/),
@@ -175,7 +233,12 @@ describe("the compress box", () => {
 
 describe("isAbsolutePath", () => {
   it("accepts what the daemon accepts and nothing else", () => {
-    for (const path of ["/tmp/build.log", "  /tmp/build.log  ", "C:\\logs\\build.log", "D:/b.log"])
+    for (const path of [
+      "/tmp/build.log",
+      "  /tmp/build.log  ",
+      "C:\\logs\\build.log",
+      "D:/b.log",
+    ])
       expect(isAbsolutePath(path), path).toBe(true);
     for (const path of ["", "build.log", "./build.log", "~/build.log", "C:build.log"])
       expect(isAbsolutePath(path), path).toBe(false);

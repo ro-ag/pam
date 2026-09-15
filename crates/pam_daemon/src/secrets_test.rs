@@ -139,7 +139,6 @@ async fn a_probe_reports_reach_denial_and_unavailability() {
 
     let health = store.probe_keyring().await;
     assert_eq!(health.state, KeyringState::Reachable);
-    assert!(health.state.is_reachable());
     assert_eq!(health.cause, None);
     assert_eq!(
         health.recovery, None,
@@ -206,7 +205,7 @@ async fn worker_capacity_failure_keeps_its_cause_and_is_not_cached_as_os_health(
         Some("blocking_capacity_exhausted")
     );
     *backend.fail_with.lock().unwrap() = None;
-    assert!(store.keyring_health().await.state.is_reachable());
+    assert_eq!(store.keyring_health().await.state, KeyringState::Reachable);
     assert_eq!(
         SecretError::from(crate::blocking_jobs::Error::Join).cause(),
         "blocking_job_failed"

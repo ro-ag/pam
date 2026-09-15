@@ -1,35 +1,18 @@
-//! The IPC bridge: the Tauri commands the frontend invokes, wrapping the
-//! `pam_client` library — status, admin operations, ordinary capability
-//! requests, and daemon stop.
+//! The IPC bridge: the Tauri commands the frontend invokes, wrapping the `pam_client` library —
+//! status, admin operations, ordinary capability requests, and daemon stop. Every command fails
+//! with a [`BridgeError`] serialized as `{ cause, detail, recovery }`, mirroring the daemon's
+//! `Refusal` wire shape, so the frontend renders every failure the same way whether the daemon
+//! refused, the transport broke, or the bridge itself said no.
 //!
-//! # Error shape
-//!
-//! Every command fails with a [`BridgeError`] serialized as
-//! `{ cause, detail, recovery }`, mirroring the daemon's `Refusal` wire
-//! shape — the frontend renders every failure the same way, whether the
-//! daemon refused, the transport broke, or the bridge itself said no.
-//! Daemon refusals pass through verbatim; client-side errors are mapped
-//! onto the same shape here.
-//!
-//! # Command surface decisions
-//!
-//! - **One generic [`admin_call`]** instead of one command per op: the
-//!   op names and body shapes live in `pam_daemon::admin`, and the
-//!   frontend gets typed wrappers per op (`frontend/src/lib/ipc.ts`).
-//!   The bridge whitelists the known `admin.*` op names before touching
-//!   the socket, so a typo (or an unexpected op smuggled through the
-//!   webview) is refused client-side with the same legible shape the
-//!   daemon would answer with.
-//! - **[`daemon_status`] never errors on an unreachable daemon** — it
-//!   answers `{ connected: false }` so the beacon can render "down"
-//!   without treating it as a failure. It calls
-//!   `pam_client::client::send_request`, which ensures the daemon first:
-//!   opening the GUI (or the status poll) lazily starts the daemon, and
-//!   the envelope carries the GUI process's own advisory caller identity
-//!   — status is an ordinary read-only capability, not an admin op.
-//! - **[`request_capability`] is the thin escape hatch** for future views
-//!   (echo/status today). `send_request` refuses `admin.*` structurally;
-//!   administration goes through [`admin_call`] and `send_admin` only.
+//! **One generic [`admin_call`]** replaces one command per op: the bridge whitelists the known
+//! `admin.*` op names before touching the socket, so a typo or smuggled op is refused client-side
+//! with the same shape the daemon would give. **[`daemon_status`] never errors on an unreachable
+//! daemon** — it answers `{ connected: false }` and lazily starts the daemon via `send_request`
+//! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so
+//! [`request_capability`] can stay a thin escape hatch — administration goes only through
+//! [`admin_call`] and `send_admin`.
+//! Daemon refusals pass through verbatim; client-side errors are mapped onto the same shape here.
+//! The envelope carries the GUI process's own advisory (not authenticated) caller identity.
 
 use std::path::PathBuf;
 use std::time::Duration;

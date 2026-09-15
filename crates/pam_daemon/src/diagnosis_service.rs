@@ -1,40 +1,16 @@
-//! The bounded structured diagnosis run: the host asks, the model
-//! proposes, the host disposes ([spec](docs/specs/2026-09-09-local-model-prompts.md),
-//! roadmap task 139).
-//!
-//! One run is a recipe owner's bounded investigation: authoritative
-//! statuses, evidence with host-assigned tags, completeness metadata, and
-//! a catalog of pre-bound observe-only reads. Each round is one stateless
-//! advisory call — the model never sees chat history, and its validated
-//! response may do exactly one of two things: finish, or request one
-//! offered read. Everything else lands as an [`DiagnosisOutcome::Unresolved`]
-//! handoff with the refusal cause attached.
-//!
-//! # Where the authority lines are
-//!
-//! - **Reads**: the response may only repeat a host-minted
-//!   `operation_id`/`target_ref` pair; dispatch then uses the pre-bound
-//!   [`ObserveDispatch`] — connector, call, arguments — and nothing from
-//!   the response. There is no variant of [`ObserveDispatch`] that can
-//!   merge, publish, rerun, or run a command: the type system, not the
-//!   prompt, is the boundary.
-//! - **Authority**: a terminal `finish` verdict is admitted only when the
-//!   recipe's [`AuthorityRule`] for its hypothesis is satisfied by the
-//!   tags of the evidence it *cited*, the evidence set is complete, and
-//!   confidence is not low. Unknown and low confidence always escalate.
-//!   None of these checks read a model flag; they read host data.
-//! - **Status**: the outcome is advisory. Workflow status and product
-//!   observations keep their authority; a `Diagnosed` result is a quoted
-//!   hypothesis, never a check result.
-//!
-//! # Failure is the normal path
-//!
-//! No configured model, a malformed answer, a fabricated quote, a forged
-//! read pair, an exhausted read budget, a failed follow-up read — each is
-//! an [`DiagnosisOutcome::Unresolved`] with a stable cause, zero retries:
-//! a model that violated the contract once within a bounded task gets no
-//! second attempt to violate it differently. The caller renders the cause
-//! into its handoff (`escalation_required` semantics) unchanged.
+//! The bounded structured diagnosis run: the host asks, the model proposes, the host disposes. Each
+//! round is one stateless advisory call over authoritative statuses, tagged evidence, and pre-bound
+//! observe-only reads; a validated response may only finish or request one offered read, else it
+//! becomes [`DiagnosisOutcome::Unresolved`]. The response may only repeat a host-minted
+//! `operation_id`/`target_ref`; dispatch uses the pre-bound [`ObserveDispatch`] (connector, call,
+//! args), never the response's own data — no variant can merge, publish, rerun, or run a command,
+//! so the type system is the boundary, not the prompt. A terminal `finish` is admitted only when
+//! the recipe's [`AuthorityRule`] is satisfied by *cited* evidence's tags, the evidence set is
+//! complete, and confidence is not low (unknown/low always escalate), checked from host data only.
+//! The outcome stays advisory — `Diagnosed` is a quoted hypothesis, never a check result. Failure
+//! is the normal path: no model, a malformed or fabricated answer, a forged read pair, an exhausted
+//! budget — each is [`DiagnosisOutcome::Unresolved`] with a stable cause and zero retries.
+//! The caller renders an `Unresolved` cause into its handoff unchanged, as `escalation_required`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;

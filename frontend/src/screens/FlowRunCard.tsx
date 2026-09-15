@@ -28,24 +28,19 @@ import {
 import { formatDuration } from "../lib/time";
 
 /**
- * The run card — the one place a human starts a flow, and the verdict
- * that lands when it finishes.
+ * The run card — where a human starts a flow and sees its verdict.
  *
- * Starting a flow from here is deliberately unprivileged: the daemon
- * turns `admin.flows.run` into a genuine `flow.run` envelope and pushes
- * it through its own pipeline, so it is classified, gated, laned and
- * audited exactly like an agent's. The GUI gets a ticket back and does
- * what any subscriber does — follows that ticket's events, then reads
- * the verdict out of evidence.
- *
- * The verdict is never invented here. It is the `flow.result` evidence
- * row, parsed: the same JSON the CLI prints and the audit trail keeps.
- * That is why the run card and the run history render through the same
- * two components below — one truth, two places to read it.
+ * Starting a flow here is deliberately unprivileged: the daemon turns
+ * `admin.flows.run` into a genuine `flow.run` envelope, so it is
+ * classified, gated, laned, and audited exactly like an agent's. The
+ * verdict is never invented here — it is the `flow.result` evidence
+ * row (same JSON as the CLI and audit trail), rendered through the
+ * same components as run history below.
+ * `admin.flows.run` answers with a ticket; the card follows that ticket's events rather than receiving the verdict directly.
  */
 
 /** The evidence kind carrying a run's whole verdict. */
-export const FLOW_RESULT_KIND = "flow.result";
+const FLOW_RESULT_KIND = "flow.result";
 
 /** Truth vocabulary → badge tone; the same mapping the tide uses. */
 export const OUTCOME_TONES: Record<OutcomeName, BadgeProps["tone"]> = {
@@ -66,7 +61,7 @@ const STEP_TONES: Record<FlowStepStatus, BadgeProps["tone"]> = {
 };
 
 /** Milliseconds as the shortest honest reading a human wants. */
-export function stepDuration(ms: number): string {
+function stepDuration(ms: number): string {
   if (ms < 1_000) return `${ms}ms`;
   return formatDuration(Math.round(ms / 1_000));
 }
@@ -78,7 +73,7 @@ export function stepDuration(ms: number): string {
  * table speaks in the data voice; the only prose is a step's own summary
  * or the reason it did not succeed.
  */
-export function StepTable({ steps }: { steps: FlowStepReport[] }) {
+function StepTable({ steps }: { steps: FlowStepReport[] }) {
   if (steps.length === 0) {
     return <p className="font-sans text-sm text-ink-muted">This run took no steps at all.</p>;
   }
@@ -133,7 +128,7 @@ export function StepTable({ steps }: { steps: FlowStepReport[] }) {
 }
 
 /** The verdict card: outcome chip, Pam's sentence, then the step table. */
-export function FlowVerdict({ result }: { result: FlowResult }) {
+function FlowVerdict({ result }: { result: FlowResult }) {
   return (
     <div aria-label="run verdict" className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">

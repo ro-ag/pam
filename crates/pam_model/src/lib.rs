@@ -1,45 +1,15 @@
-//! The model layer: what weights exist, what they are, and (from wave 2 on)
-//! how to fetch and run them.
+//! The model layer: what weights exist, what they are, and how to fetch and run them.
 //!
-//! This crate knows nothing about the daemon. It reads files, inspects GGUF
-//! headers, describes a curated catalog, and owns the inference runtime; the
-//! daemon's `ModelService` is what turns any of that into an admin op. Keeping
-//! the split sharp means the whole layer is testable without a socket, a
-//! store, or a request.
-//!
-//! # Shape
-//!
-//! - [`gguf`] — a bounded header parser. It reads the header and nothing
-//!   else, under hard caps, so a hostile or truncated file is a legible
-//!   error instead of a multi-gigabyte allocation.
-//! - [`catalog`] — the static list of models PAM offers to download,
-//!   with exact sizes and SHA-256 digests.
-//! - [`registry`] — what is actually on disk under the models directory:
-//!   scan, classify, verify, delete.
-//! - [`download`] — resumable transfers through the system `curl`, with
-//!   the integrity check done here rather than trusted to the network.
-//! - [`runtime`] — shared inference types (requests, results, snapshots,
-//!   errors). Inference itself runs out of process, in the pinned
-//!   `llama.cpp` release [`engine`] installs and [`engine_server`]
-//!   supervises.
-//! - [`curator`] — the vendor agent CLIs installed on the machine: detect
-//!   them, ask one a single tool-free question.
-//! - [`error`] — one place to reach for the crate's error types.
-//!
-//! # Admission
-//!
-//! [`registry::classify`] admits a model only once its digest is verified:
-//! a verified file is [`ModelClass::Engine`] and may be a tier default;
-//! anything unverified is [`ModelClass::TestOnly`], loadable and promptable
-//! from the GUI to prove the wiring, refused as a tier default. Size decides
-//! nothing since the llama.cpp engine replaced the in-process runtime.
-//!
-//! # Blocking
-//!
-//! Registry and GGUF calls are synchronous and hit the filesystem —
-//! [`registry::sha256_file`] streams whole gigabytes. Callers on an async
-//! runtime run them through `spawn_blocking`; this crate does not decide
-//! that for them.
+//! Knows nothing about the daemon — reads files, inspects GGUF headers, describes a
+//! curated catalog, owns the inference runtime; `ModelService` (daemon) turns that into
+//! admin ops, keeping this layer testable without a socket, store, or request. Modules:
+//! [`gguf`], [`catalog`], [`registry`], [`download`], [`runtime`], [`engine`] /
+//! [`engine_server`] (out-of-process `llama.cpp`), [`curator`], [`error`].
+//! [`registry::classify`] admits a model only once its digest is verified
+//! ([`ModelClass::Engine`], eligible as a tier default); unverified is
+//! [`ModelClass::TestOnly`] — loadable/promptable to prove wiring, never a tier default.
+//! Registry/GGUF calls are synchronous filesystem hits ([`registry::sha256_file`] streams
+//! gigabytes); async callers must wrap them in `spawn_blocking` themselves.
 
 pub mod catalog;
 pub mod curator;

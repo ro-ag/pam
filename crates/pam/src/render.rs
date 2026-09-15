@@ -1,18 +1,9 @@
-//! Human and machine rendering of daemon responses and events.
+//! Human and machine rendering of daemon responses and events. Exit codes: `0`
+//! solved/changed/verified (or a ticket), `1` transport/client failure, `2` usage error, `3`
+//! refused, `4` unresolved, `5` blocked.
 //!
-//! # Exit codes
-//!
-//! The CLI maps every terminal state to a stable exit code (documented
-//! in the crate docs): `0` for a solved / changed / verified result (and
-//! a ticket), `3` for a refusal, `4` for an unresolved result, `5` for a
-//! blocked result. Usage errors and stubs exit `2`; transport and other
-//! client-side failures exit `1`.
-//!
-//! # Refusals
-//!
-//! A refusal always renders all three fields the daemon sends — machine
-//! cause, human detail, and the recovery sentence (which points at the
-//! GUI, never at a security command):
+//! A refusal always renders all three fields the daemon sends — machine cause, human detail, and
+//! the recovery sentence (points at the GUI, never a security command):
 //!
 //! ```text
 //! pam: refused (not_granted)
@@ -20,17 +11,10 @@
 //!   → Open the PAM GUI to grant it, then retry.
 //! ```
 //!
-//! With `--json` the raw [`Response`] JSON goes to stdout instead; the
-//! exit code is mapped the same way either way.
-//!
-//! # Flows
-//!
-//! `pam flow` gets three bespoke renderers — [`render_flow_list`],
-//! [`render_flow_show`], [`render_flow_result`] — plus
-//! [`parse_flow_inputs`], which turns the subcommand's positional
-//! `key=value` arguments into the `flow.run` args object. Parsing lives
-//! here beside the rendering so the clap shell in `main.rs` stays thin
-//! and the CLI's whole text surface is unit-testable in one place.
+//! With `--json` the raw [`Response`] JSON goes to stdout instead; the exit code is mapped the
+//! same way either way. `pam flow` gets three renderers — [`render_flow_list`],
+//! [`render_flow_show`], [`render_flow_result`] — plus [`parse_flow_inputs`], which turns
+//! positional `key=value` args into the `flow.run` args object.
 
 use std::fmt::Write as _;
 

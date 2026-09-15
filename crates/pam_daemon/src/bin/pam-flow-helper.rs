@@ -1,10 +1,8 @@
 //! A deliberately boring child process the flow-engine tests drive.
 //!
-//! `pam_daemon::flow_exec::run_command` has four endings a real program
-//! has to produce for the tests to mean anything —
-//! a clean exit, a non-zero exit, a process that outlives its timeout, and
-//! one that writes more than the output cap — and no portable system
-//! command produces all four. This binary does, in four lines of logic:
+//! `pam_daemon::flow_exec::run_command` has four endings a real program must produce — a clean
+//! exit, a non-zero exit, a process that outlives its timeout, and one that writes past the output
+//! cap — and no portable system command produces all four. This binary does:
 //!
 //! ```text
 //! pam-flow-helper sleep <ms>        # runs for <ms> and exits 0
@@ -13,16 +11,11 @@
 //! pam-flow-helper echo-env <NAME>   # prints the value of $NAME, or nothing
 //! ```
 //!
-//! # Why it is always built
-//!
-//! The obvious shape is a `[[bin]]` gated behind `required-features =
-//! ["testing"]`, but Cargo only sets `CARGO_BIN_EXE_pam-flow-helper` for an
-//! integration test when the binary is actually built, and a plain
-//! `cargo test --workspace` does not turn that feature on — the tests would
-//! not compile. Being always built costs the shipped product nothing:
-//! `pam_daemon` is a library dependency of `pam`, and Cargo never builds a
-//! dependency's binary targets, so `pam-flow-helper` exists only in a
-//! workspace build of this crate.
+//! It is always built, never feature-gated: Cargo only sets `CARGO_BIN_EXE_pam-flow-helper` for an
+//! integration test when the binary is actually built, and a plain `cargo test --workspace` would
+//! not turn on a `required-features = ["testing"]` gate, so the tests would not compile. This costs
+//! the shipped product nothing — `pam_daemon` is a library dependency of `pam`, and Cargo never
+//! builds a dependency's binary targets.
 
 use std::io::Write;
 use std::process::ExitCode;

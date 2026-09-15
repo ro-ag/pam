@@ -1,38 +1,16 @@
-//! The connector half of the admin surface: `admin.connectors.list`,
-//! `.configure`, and `.test`.
+//! The connector half of the admin surface: `admin.connectors.list`, `.configure`, and `.test`.
 //!
-//! These are ordinary admin ops — read [`crate::admin`]'s module docs for
-//! the security model, because every word of it applies here: the GUI
-//! tripwire, the request row, the single terminal audit row, the deadline,
-//! and the structural guard (no [`crate::policy::classify`] entry, never a
-//! capability, never grantable).
+//! Ordinary admin ops — see [`crate::admin`] for the security model: GUI tripwire, request row,
+//! single terminal audit row, deadline, structural guard (no [`crate::policy::classify`] entry,
+//! never a capability, never grantable). No `pam` subcommand builds these envelopes; a non-GUI
+//! caller trips the wire and is audited as [`crate::admin::ACTION_ADMIN_DENIED`]. An agent only
+//! reaches a connector via a flow step through
+//! [`crate::connector_service::ConnectorService::invoke`], gated by policy.
 //!
-//! # Why connectors are GUI-only
-//!
-//! Configuring a connector means handing pam a credential and pointing it
-//! at a service. An agent that could do that could grant itself reach it
-//! does not have — so it cannot, by construction: no `pam` subcommand
-//! builds one of these envelopes, and an envelope that arrives from any
-//! caller but the GUI trips the wire and is audited as
-//! [`crate::admin::ACTION_ADMIN_DENIED`]. What an agent *can* do is run a
-//! flow step whose connector a human already enabled, which goes through
-//! [`crate::connector_service::ConnectorService::invoke`] and the policy
-//! gate, never through this file.
-//!
-//! # Bridge deadlines
-//!
-//! [`OP_CONNECTORS_TEST`] talks to a remote service under a ten second
-//! deadline ([`CONNECTOR_TEST_DEADLINE`]), so the GUI bridge allows it 15 s
-//! and the other two ops the usual 30 s.
-//!
-//! # The secret is never in the bookkeeping
-//!
-//! [`OP_CONNECTORS_CONFIGURE`] writes exactly one
-//! [`ACTION_CONNECTOR_CONFIGURE`] audit row, whose detail says *that* a
-//! credential was set, cleared, or left alone — never the credential. The
-//! envelope's own args are the GUI's business: it sends the secret once,
-//! over the same unix socket, and the daemon puts it straight into the OS
-//! keychain.
+//! [`OP_CONNECTORS_TEST`] has a 10 s deadline ([`CONNECTOR_TEST_DEADLINE`]; GUI bridge 15 s), the
+//! other ops the usual 30 s. [`OP_CONNECTORS_CONFIGURE`] writes exactly one
+//! [`ACTION_CONNECTOR_CONFIGURE`] audit row recording only *that* a credential was set, cleared, or
+//! left alone — never the credential, which crosses the socket once into the OS keychain.
 
 use pam_connectors::{ConnectorId, descriptor};
 use pam_proto::Outcome;

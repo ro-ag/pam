@@ -1,178 +1,74 @@
 //! Pipeline assembly: the request path from `pam.sock` to a response.
-//!
-//! # Request path
-//!
 //! ```text
 //! transport → classify → admit (dedupe + row insert) → policy gate
 //!           → lane placement → executor → audit → response
 //! ```
 //!
-//! [`run_daemon`] wires the existing services (transport, policy gate,
-//! queue manager, store) into long-lived tokio tasks:
-//!
-//! - a **dispatcher** that spawns one pipeline task per incoming
-//!   request ([`Pipeline::handle`]);
-//! - an **executor loop** that leases queued work from the lanes and
-//!   runs it through [`BuiltinCapability`] dispatch;
-//! - the queue's **lease reaper**;
-//! - the **retention pruner** ([`crate::retention`]), which prunes on
-//!   its first tick — so a boot prunes, right after crash recovery —
-//!   and every [`PRUNE_INTERVAL`] after that.
-//!
-//! # Ordering constraints
-//!
-//! The gate needs the `request` row to exist (audit foreign key) but
-//! must run before anything is placed in a lane, and dedupe must run
-//! before the row insert. [`QueueManager::admit`] therefore does
-//! dedupe + insert atomically, the gate runs next, and only an allowed
-//! request reaches [`QueueManager::place_in_lane`]. A crash between
-//! admit and placement can resurrect a not-yet-gated `queued` row on
-//! restart; such a row re-enters a lane on rebuild and executes without
-//! a fresh gate pass — an accepted, narrow window (the capability was
-//! at worst one auto-grant away from allowed).
-//!
-//! # Admin surface (GUI-only)
-//!
-//! Envelopes whose capability starts with the reserved
-//! [`crate::admin::ADMIN_PREFIX`] are refused on public IPC regardless
-//! of caller labels. Native private administration uses
-//! [`crate::admin_transport`] and owns its work through terminal audit. Admin operations
-//! are not capabilities: they have no `classify()` entry and can never
-//! be granted, approved, or queued. The service records its own request
-//! row, enforces the envelope deadline, audits every outcome
-//! ([`ACTION_ADMIN`] / [`ACTION_ADMIN_DENIED`] are terminal actions),
-//! and answers synchronously — no events, except what an approval
-//! resolution already publishes through the approval service. The full
-//! security model (why GUI-only is structural for CLI users but
-//! advisory at the socket) lives in the [`crate::admin`] module docs.
-//!
-//! # Caller registry
-//!
-//! Every **admitted** request (bypass, laned, or attached duplicate)
-//! upserts its observed agent+repo pair into the `caller` table — an
-//! advisory registry feeding the GUI sidebar and activity filters,
-//! never authorization. Admin envelopes are deliberately excluded: the
-//! GUI is not an observed workload.
-//!
-//! # Boot order and lifecycle
-//!
-//! [`run_daemon_with`] boots in a fixed order: **instance lock** →
-//! store open → **crash recovery** ([`crate::lifecycle::recover_stuck_rows`])
-//! → lane rebuild → transport bind (which removes stale socket files —
-//! safe, because the lock is already held; see the lifecycle module's
-//! lock-first ordering) → serve.
-//!
-//! Shutdown is a **graceful drain**, driven by an internal lifecycle
-//! task once the caller's shutdown watch flips (or the daemon requests
-//! its own restart): the phase leaves
-//! [`LifecyclePhase::Serving`] so the pipeline refuses new requests
-//! ([`CAUSE_DAEMON_SHUTTING_DOWN`]), the executor loop and reaper stop
-//! (no new leases; `queued` rows are the restart-safe checkpoint and
-//! stay put for the next boot), in-flight leases get a bounded drain
-//! ([`DaemonConfig::drain_timeout`]) and are cancelled cooperatively
-//! past it, then the dispatcher stops. The store needs no explicit
-//! flush — every write (audit included) is per-statement durable — so
-//! closing it is dropping it. A request parked in `waiting_approval`
-//! is not drained; the next boot's crash recovery fails it legibly.
-//!
-//! # Version handshake
-//!
-//! Every envelope carries the client binary's build version. The single
-//! `pam` binary ships client and daemon at the same workspace version,
-//! so a mismatch means the binary on disk was replaced while this
-//! daemon process kept running — the client is the **newer** build.
-//! The pipeline checks before anything else: a mismatched request is
-//! refused ([`CAUSE_DAEMON_OUTDATED`], with a retry hint — no request
-//! row is recorded; the retry lands on the new daemon) and the daemon
-//! moves to [`LifecyclePhase::Restarting`], which triggers the same
-//! graceful drain. The process shell (`pam daemon`) observes the phase
-//! through [`DaemonHandle::lifecycle`] and re-spawns the new binary
-//! after the drain; the client-side retry is the client module's job.
-//!
-//! # Replies and attachment
-//!
-//! For `wait: true` the pipeline task parks on the [`CompletionRouter`]
-//! until the executor finishes the request — duplicate callers attached
-//! to the same request register with the same router entry and every
-//! waiter receives the terminal [`Response`] (fan-out). The router keeps
-//! each terminal response for a short grace period so an attacher that
-//! registers just after completion still gets its answer instead of
-//! hanging to its deadline. For `wait: false` the pipeline answers with
-//! a [`Response::Ticket`] immediately; results reach the store and the
-//! event stream only.
-//!
-//! # Deadlines
-//!
-//! Admission persists one expiry for the original request. Approval waits,
-//! lane waits and execution share it, including ticketed requests. An expired
-//! laned request is recorded as `failed` / `lease_expired`, signalled to stop,
-//! and exposed as [`CAUSE_DEADLINE_EXCEEDED`]. Explicit cancellation retains
-//! its separate cause. Attached observers have independent wait timeouts and
-//! never cancel the original request when their own wait expires.
-//!
-//! # Audit invariant: every terminal state writes its own audit row
-//!
-//! Every transition into a terminal request state (`done`, `refused`,
-//! `failed`) goes through **one choke point**:
-//! [`pam_store::Store::finish_request`], which writes the state, the
-//! outcome, and the terminal audit row in a single `SQLite` transaction
-//! — crash-safe (no window where the state is terminal but the audit
-//! row missing) and race-safe (an already-terminal row is a first-wins
-//! no-op, so a reaper/executor double-finish never writes a duplicate
-//! audit row). No code path may call
-//! [`pam_store::Store::update_request_state`] with a terminal state; the
-//! store enforces that with a `debug_assert`, and the laned paths reach
-//! the choke point through [`QueueManager::complete`] (which takes the
-//! executor's audit fields). The v1 issue #49 lesson — silent terminal
-//! paths — is thereby structural, not conventional.
-//!
-//! The terminal audit row per path ([`TERMINAL_ACTIONS`] lists the
-//! action names):
-//!
-//! - gate refusal (unknown capability, ungranted capability) and every
-//!   approval-path refusal (denied, timed out, cancelled while waiting)
-//!   → [`ACTION_GATE_REFUSAL`], decision `refuse`, actor `policy`;
-//! - execution success → [`ACTION_EXECUTE`], decision `allow`, actor
-//!   `system`;
-//! - execution failure → [`ACTION_EXECUTE`], decision `refuse`, actor
-//!   `system`;
-//! - cancelled execution → the queue's `cancel` action, decision `deny`,
-//!   actor `system` (queued-side cancellation is audited by the queue
-//!   itself, lease reaping by the reaper);
-//! - bypass deadline expiry → [`ACTION_DEADLINE_REFUSAL`], decision
-//!   `timeout`, actor `system`;
-//! - daemon-side bookkeeping failure → [`ACTION_INTERNAL_FAILURE`],
-//!   decision `refuse`, actor `system`.
-//!
-//! On the laned deadline path the [`ACTION_DEADLINE_REFUSAL`] row is
-//! written *in addition to* the lease-expiry terminal row. The persisted
-//! outcome is `lease_expired`; both the original waiter and reaper expose
-//! `deadline_exceeded` to callers. Explicit cancellation remains `cancelled`.
-//!
-//! A store failure on a terminal write cannot be answered to anyone
-//! (the caller already has its response or its ticket), so it is logged
-//! at error level in the daemon log and the row is left for the next
-//! boot's crash recovery. Concurrent statements on the store's single
-//! connection used to be the one way such a write failed (turso refuses
-//! concurrent use of a connection); the store now serializes them.
-//!
-//! # Approval pause
-//!
-//! [`GateDecision::RequireApproval`] parks the admitted request in the
-//! approval service ([`crate::approval`]) before lane placement: the
-//! request row moves to `waiting_approval`, `approval_pending` goes out
-//! on PUB, and the GUI resolves it through
-//! [`DaemonHandle::approvals`]. On approval the pipeline moves the row
-//! back to `queued` and continues into lane placement exactly as an
-//! allow; a denial, timeout, or cancellation refuses with its own cause
-//! ([`CAUSE_APPROVAL_DENIED`], [`CAUSE_APPROVAL_TIMEOUT`], the queue's
-//! `cancelled`) and a GUI recovery line. A waiting caller whose
-//! `deadline_ms` elapses mid-approval cancels the wait (the service
-//! resolves the row `denied` with note `cancelled`); a `wait: false`
-//! caller gets its ticket immediately and the approval wait runs in a
-//! background task, bounded by approval timeout and original admission expiry.
-//! The request-state transitions around the wait belong to the pipeline —
-//! see the approval module docs for the writer split.
+//! [`run_daemon`] wires transport, policy gate, queue manager, and store into tokio tasks: a
+//! dispatcher spawning one pipeline task per request ([`Pipeline::handle`]), an executor loop
+//! leasing queued work through [`BuiltinCapability`] dispatch, the queue's lease reaper, and the
+//! retention pruner ([`crate::retention`]), which prunes on its first tick (so a boot prunes right
+//! after crash recovery) and every [`PRUNE_INTERVAL`] after. **Ordering**: dedupe + row insert
+//! happen atomically in [`QueueManager::admit`] (audit needs the row to exist), the gate runs next,
+//! and only an allowed request reaches [`QueueManager::place_in_lane`]. A crash between admit and
+//! placement can resurrect an ungated `queued` row, which re-enters a lane and executes without a
+//! fresh gate pass on restart — accepted, since the capability was at worst one auto-grant away
+//! from allowed.
+//! - **Admin surface (GUI-only)**: capabilities under [`crate::admin::ADMIN_PREFIX`] are refused on
+//!   public IPC regardless of caller labels; only [`crate::admin_transport`] may call them. Admin
+//!   ops have no `classify()` entry and are never granted/approved/queued; they record their own
+//!   request row, enforce the envelope deadline, and audit every outcome
+//!   ([`ACTION_ADMIN`]/[`ACTION_ADMIN_DENIED`], terminal) synchronously, with no events beyond what
+//!   an approval resolution already publishes.
+//! - **Caller registry**: every admitted request (bypass, laned, attached duplicate) upserts its
+//!   agent+repo pair into the `caller` table — advisory only, never authorization; admin envelopes
+//!   are excluded.
+//! - **Boot order** ([`run_daemon_with`]): instance lock → store open → crash recovery
+//!   ([`crate::lifecycle::recover_stuck_rows`]) → lane rebuild → transport bind (safe to drop stale
+//!   sockets, lock already held) → serve.
+//! - **Shutdown** is a graceful drain: phase leaves [`LifecyclePhase::Serving`] (new requests
+//!   refused, [`CAUSE_DAEMON_SHUTTING_DOWN`]), executor/reaper stop taking leases (`queued` rows
+//!   are the restart-safe checkpoint), in-flight leases get [`DaemonConfig::drain_timeout`] then
+//!   cooperative cancellation, then the dispatcher stops. No explicit store flush is needed — every
+//!   write, audit included, is per-statement durable. A `waiting_approval` request is not drained;
+//!   crash recovery fails it on next boot.
+//! - **Version handshake**: every envelope carries the client build version; client and daemon ship
+//!   as one binary, so a mismatch means the on-disk binary was replaced under a running (older)
+//!   daemon. Checked first: a mismatch is refused with [`CAUSE_DAEMON_OUTDATED`] (no request row
+//!   recorded) and moves the daemon to [`LifecyclePhase::Restarting`], triggering the same drain;
+//!   `pam daemon` re-spawns the new binary after.
+//! - **Replies**: `wait: true` parks the pipeline task on the [`CompletionRouter`] until execution
+//!   finishes; duplicate callers attached to the same request share the router entry and all get
+//!   the terminal [`Response`] (fan-out), with a short post-completion grace period for late
+//!   attachers. `wait: false` returns a [`Response::Ticket`] immediately.
+//! - **Deadlines**: one expiry (set at admission) covers approval waits, lane waits, and execution,
+//!   including ticketed requests; an expired laned request is `failed`/`lease_expired`, exposed as
+//!   [`CAUSE_DEADLINE_EXCEEDED`]. Explicit cancellation keeps its own cause. Attached observers'
+//!   wait timeouts are independent and never cancel the original request.
+//! - **Audit invariant**: every terminal transition (`done`/`refused`/`failed`) goes through the
+//!   single choke point [`pam_store::Store::finish_request`], writing state + outcome + terminal
+//!   audit row in one transaction (crash-safe; race-safe since an already-terminal row is a
+//!   first-wins no-op). [`pam_store::Store::update_request_state`] may never be called with a
+//!   terminal state (`debug_assert`-enforced); laned paths reach the choke point via
+//!   [`QueueManager::complete`]. Terminal actions ([`TERMINAL_ACTIONS`]): gate or approval refusal
+//!   → [`ACTION_GATE_REFUSAL`]; execute success/failure → [`ACTION_EXECUTE`]; cancelled → queue's
+//!   cancel action; bypass deadline → [`ACTION_DEADLINE_REFUSAL`]; internal bookkeeping failure →
+//!   [`ACTION_INTERNAL_FAILURE`]. A laned deadline writes [`ACTION_DEADLINE_REFUSAL`] in addition
+//!   to the lease-expiry row (outcome `lease_expired`, exposed as `deadline_exceeded`). A store
+//!   failure on a terminal write is logged at error level and left for next boot's crash recovery —
+//!   the store serializes all statements on its single connection (concurrent use is refused).
+//! - **Audit decisions/actors**: gate refusal → `refuse`/`policy` (unknown or ungranted
+//!   capability; denied, timed-out or cancelled approval); execute success → `allow`/`system`,
+//!   failure → `refuse`/`system`; cancel → `deny`/`system`; bypass deadline → `timeout`/`system`;
+//!   internal failure → `refuse`/`system`. A [`CAUSE_DAEMON_OUTDATED`] refusal carries a retry
+//!   hint, and the retry lands on the new daemon.
+//! - **Approval pause**: [`GateDecision::RequireApproval`] parks the request in [`crate::approval`]
+//!   before lane placement (`waiting_approval`, `approval_pending` on PUB, resolved via
+//!   [`DaemonHandle::approvals`]); approval returns it to `queued`. Denial/timeout/cancellation
+//!   refuse with [`CAUSE_APPROVAL_DENIED`]/[`CAUSE_APPROVAL_TIMEOUT`]/cancelled. A caller's
+//!   `deadline_ms` elapsing mid-approval cancels the wait (resolved `denied`, note `cancelled`);
+//!   `wait: false` returns a ticket immediately while the wait runs in the background, bounded by
+//!   approval timeout and admission expiry.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

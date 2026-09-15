@@ -1,18 +1,13 @@
-//! Bridge integration tests: the seams `pam_gui`'s Tauri commands are
-//! thin over, driven against a **real daemon** (`pam_testkit`).
+//! Bridge integration tests: the seams `pam_gui`'s Tauri commands are thin over, driven against a
+//! **real daemon** (`pam_testkit`). The Tauri runtime itself never starts here; instead each test
+//! replicates exactly what the command bodies do — the same `pam_client` calls with the same
+//! parameters, unwrapped through the same [`pam_gui::bridge`] helpers — plus the event subscriber's
+//! decode path: a `SubSocket` connected the way `events.rs` connects, decoding `PUB` frames through
+//! the very [`decode_event_frames`] the forwarding task uses.
 //!
-//! The Tauri runtime itself never starts here (headless webview testing
-//! is out of scope); instead each test replicates exactly what the
-//! command bodies do — the same `pam_client` calls with the same
-//! parameters, unwrapped through the same [`pam_gui::bridge`] helpers —
-//! plus the event subscriber's decode path: a `SubSocket` connected the
-//! way `events.rs` connects, decoding `PUB` frames through the very
-//! [`decode_event_frames`] the forwarding task uses.
-//!
-//! The commands resolve their base dir from the process environment
-//! (`$PAM_BASE_DIR`), which the workspace's `unsafe` denial forbids
-//! mutating in-process — so the tests pass the harness base dir to the
-//! underlying client calls explicitly, as the commands do one line in.
+//! The commands resolve their base dir from the process environment (`$PAM_BASE_DIR`), which the
+//! workspace's `unsafe` denial forbids mutating in-process — so the tests pass the harness base dir
+//! to the underlying client calls explicitly, as the commands do one line in.
 
 use std::time::Duration;
 

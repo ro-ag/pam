@@ -1,25 +1,15 @@
 //! Keyring-backed credential store for connector secrets.
 //!
-//! Every connector row in `pam_store` (base URL, username, enabled flag,
-//! test result) is safe to keep in `SQLite` because none of it is a secret;
-//! the bearer token, personal access token, or password that actually
-//! authenticates a call lives here instead, in the platform's native
-//! credential store — macOS Keychain, the Windows Credential Manager, or
-//! the Secret Service over D-Bus on Linux — never on disk in plaintext and
-//! never in the `SQLite` database.
-//!
-//! [`SecretStore`] is the daemon-facing handle: it runs every backend call
-//! under [`tokio::task::spawn_blocking`] (native keyrings may block on a
-//! desktop service, or on macOS prompt the user) and only ever returns a
-//! sanitized [`SecretError`] — the platform's own error text is logged
-//! with [`tracing::warn!`] and goes no further, because it can carry
-//! account identifiers or other detail a refusal must not leak.
-//!
-//! [`SecretBackend`] is the injectable boundary. [`NativeSecretBackend`]
-//! is the real one, selected per target OS at compile time.
-//! [`FakeSecretBackend`] is an in-memory stand-in the daemon's own tests
-//! (and its `DaemonConfig::secret_backend` injection point) use instead —
-//! no test in this codebase touches a real keychain.
+//! Connector rows in `pam_store` hold only non-secrets (base URL, username,
+//! enabled flag, test result); the token or password lives in the OS
+//! credential store (macOS Keychain, Windows Credential Manager, Secret
+//! Service on Linux), never on disk in plaintext. [`SecretStore`] runs every
+//! backend call under [`tokio::task::spawn_blocking`] and returns only a
+//! sanitized [`SecretError`]: the platform's own error text is logged with
+//! [`tracing::warn!`] and goes no further, since it can carry account
+//! identifiers. [`SecretBackend`] is the injectable boundary:
+//! [`NativeSecretBackend`] per target OS, [`FakeSecretBackend`] in tests
+//! (no test touches a real keychain).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,12 +64,6 @@ pub enum KeyringState {
 }
 
 impl KeyringState {
-    /// Whether connector credentials can be used at all.
-    #[must_use]
-    pub fn is_reachable(self) -> bool {
-        matches!(self, Self::Reachable)
-    }
-
     /// The wire name, as the status body and the CLI print it.
     #[must_use]
     pub fn as_str(self) -> &'static str {

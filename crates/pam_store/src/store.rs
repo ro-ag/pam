@@ -1085,30 +1085,6 @@ impl Store {
         Ok(Some(ids))
     }
 
-    /// Reads every `running` or `waiting_approval` row, oldest first.
-    /// Intended for bounded test fixtures; startup recovery must use
-    /// [`Self::stuck_recovery_page`] instead.
-    pub async fn list_stuck_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {} FROM request
-                     WHERE state IN ('running','waiting_approval')
-                     ORDER BY created_ts, id",
-                    Self::REQUEST_COLUMNS
-                ),
-                (),
-            )
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(Self::parse_request_row(&row)?);
-        }
-        Ok(out)
-    }
-
     /// Moves a request to a **non-terminal** `state`, recording `outcome`
     /// and bumping `updated_ts`. Errors if the request does not exist.
     ///

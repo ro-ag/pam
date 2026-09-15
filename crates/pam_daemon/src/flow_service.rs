@@ -1,57 +1,23 @@
 //! The flow engine: the library a human edits, the settings that bound
 //! what a step may run, and one run of a flow end to end.
 //!
-//! # What a run is
+//! `flow.run` classifies `NonDestructive`; each step that could change
+//! something is gated on its own under [`step_capability`]
+//! (`flow.step:<flow>/<step>`), which is what approvals show and remember.
+//! A step is gated ([`pam_flow::Step::gated`]) when it is stateful or asks
+//! for approval (`Destructive`) or calls a connector (`External`); a
+//! read-only local command never touches the gate.
 //!
-//! A flow is a recipe, not a privilege. `flow.run` itself classifies
-//! [`NonDestructive`](crate::policy::CapabilityClass::NonDestructive) —
-//! running a recipe changes nothing — and every step that *could* change
-//! something goes through the policy gate on its own, under the capability
-//! name [`step_capability`] spells (`flow.step:<flow>/<step>`). That name
-//! is what a human sees in the approvals view and what the remember
-//! checkbox remembers, which is exactly the granularity a person wants:
-//! "yes, this step of this flow may run", not "yes, flows may run".
-//!
-//! # The three gated shapes
-//!
-//! A step reaches the gate when it is stateful, when it asks for approval
-//! outright, or when it calls a connector (it leaves the machine) — that
-//! is [`pam_flow::Step::gated`]. Stateful and approval-required steps
-//! evaluate as
-//! [`Destructive`](crate::policy::CapabilityClass::Destructive), connector
-//! steps as [`External`](crate::policy::CapabilityClass::External). A
-//! read-only local command with no approval flag never touches the gate:
-//! `git status` in the caller's own repo is not an act pam asks permission
-//! for.
-//!
-//! # Blocked is an answer, not a refusal
-//!
-//! A denied approval, an expired approval, a gate refusal, a disabled
-//! connector, a program that is not on the allowlist — these end the run
-//! with outcome `blocked` and a step report saying which step and why.
-//! They are *results*: the request finishes `done`, the verdict is filed
-//! as evidence, and the caller reads the recovery line off the step. Only
-//! the four things that stop a run before it can start —
-//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`],
-//! [`CAUSE_INPUT_MISSING`], [`CAUSE_REPO_MISSING`] — are refusals, carried
-//! out of the executor as [`CapabilityFailure::Refused`].
-//!
-//! # Output
-//!
-//! Every step's output goes through
-//! [`LogService::compress`](crate::log_service::LogService::compress),
-//! which is where the token odometer's numbers come from. `compact` (the
-//! default) files the source and the reduction; `summarize` additionally
-//! asks the heavy model for a paragraph and puts it on the step report;
-//! `discard` keeps nothing. Empty output is not compressed — an evidence
-//! row holding zero bytes tells nobody anything.
-//!
-//! # The verdict is evidence
-//!
-//! The body a run answers with is written verbatim as one
-//! [`EVIDENCE_KIND_FLOW_RESULT`] row, so the GUI's run history renders a
-//! finished run without re-running it and `pam flow run --no-wait`
-//! callers can fetch the verdict off the ticket later.
+//! A denied/expired approval, gate refusal, disabled connector or
+//! non-allowlisted program ends the run `blocked` with the step naming why:
+//! the request finishes `done` and the verdict is filed as evidence. Only
+//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`], [`CAUSE_INPUT_MISSING`]
+//! and [`CAUSE_REPO_MISSING`] are refusals ([`CapabilityFailure::Refused`]).
+//! Step output goes through [`LogService::compress`](crate::log_service::LogService::compress)
+//! (`compact` default, `summarize` adds a model paragraph, `discard` keeps
+//! nothing; empty output is not filed). The verdict body is written verbatim
+//! as one [`EVIDENCE_KIND_FLOW_RESULT`] row so run history and
+//! `pam flow run --no-wait` callers can read it later.
 
 #[path = "flow_watch_runtime.rs"]
 mod watch_runtime;
@@ -318,13 +284,6 @@ impl FlowSettings {
             .filter_map(|raw| expand_home(raw))
             .filter(|dir| dir.is_dir())
             .collect()
-    }
-
-    /// The environment-name pattern a step's inherited environment is
-    /// scrubbed against, as the spec writes it.
-    #[must_use]
-    pub fn secret_env_pattern() -> &'static str {
-        "(?i)token|secret|password|passwd|credential|api_key|apikey|private_key"
     }
 
     /// [`Self::extra_path`] as real directories, `~` and `%USERPROFILE%`

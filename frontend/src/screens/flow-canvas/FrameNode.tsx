@@ -16,7 +16,7 @@ import { HANDLE_CLASSES } from "./StepNode";
  * five outcome chips, grey until a run paints one).
  */
 
-export const frameVariants = cva("w-50 p-0 ring-offset-2 ring-offset-chrome", {
+const frameVariants = cva("w-50 p-0 ring-offset-2 ring-offset-chrome", {
   variants: {
     rim: {
       none: "ring-0",

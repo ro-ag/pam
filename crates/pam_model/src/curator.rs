@@ -1,74 +1,16 @@
 //! The curator tier: the vendor agent CLIs already installed on the machine.
 //!
-//! PAM holds no API keys. When a job wants a frontier model rather than the
-//! local weights, it borrows one the human is already paying for by running
-//! their own `claude`, `codex`, `copilot` or `gemini` binary the way a shell
-//! script would — one turn, no tools, no session left behind. That is the
-//! whole tier: [`detect`] finds what is installed, [`invoke`] asks it one
-//! question.
-//!
-//! # What "non-interactive" has to mean
-//!
-//! These CLIs are agents. Run carelessly they will read files, run commands
-//! and write session state, none of which PAM asked for. So every
-//! invocation is pinned three ways: the working directory is a fresh empty
-//! temp dir that dies with the call, `PATH` is narrowed to the agent's own
-//! directory plus the daemon's, and the flags that disable tools and
-//! session persistence are mandatory rather than nice to have
-//! ([`invoke_args`] is the single place they live). Output is read into
-//! bounded buffers ([`INVOKE_MAX_OUTPUT`]) because a runaway agent printing
-//! forever must cost memory that is capped, not memory that is available.
-//!
-//! # The invocation forms
-//!
-//! Flags were read off `--help` and exercised against the binaries
-//! installed on the owner's machine on 2026-09-01. A CLI that later drops
-//! or renames one of them fails visibly — its own stderr comes back inside
-//! [`CuratorError::Failed`] — rather than silently starting an interactive
-//! session that never returns.
-//!
-//! | agent | form | status |
-//! | --- | --- | --- |
-//! | `claude` | `--print --output-format text --no-session-persistence --permission-mode plan --tools ""`, prompt on stdin | verified against 2.1.220 |
-//! | `codex` | `exec --skip-git-repo-check --ephemeral --sandbox read-only --color never`, prompt on stdin | verified against codex-cli 0.151.0 |
-//! | `copilot` | `-p <prompt> --silent --no-color --output-format text --available-tools=` | verified against 1.0.82 |
-//! | `gemini` | `--prompt <prompt>` | **unverified** — not installed on the reference machine; taken from the CLI's README |
-//!
-//! Notes on the ones that surprised us:
-//!
-//! - `claude` 2.1.220 has no `--max-turns`. The spec's draft named it; the
-//!   installed CLI does not list it under `--help`, so passing it would be
-//!   an immediate parse error. `--print` is already single-turn, and
-//!   `--permission-mode plan` plus `--tools ""` is what actually keeps the
-//!   session from touching the machine.
-//! - `codex exec` reads the prompt from stdin when no `PROMPT` argument is
-//!   given, and a bare `-` is only an alias for that. It writes its banner,
-//!   the transcript and the token count to **stderr**; stdout carries the
-//!   final assistant message and nothing else, so `-o <file>` buys nothing
-//!   and is left out.
-//! - `copilot` refuses `--deny-tool '*'` (`Invalid rule format: *`) — that
-//!   flag takes `kind(argument)` patterns, not globs. The filter that
-//!   actually empties the model's toolbox is `--available-tools=`, passed
-//!   as one argument with an empty value.
-//! - `claude` reports an expired login on **stdout** with exit 1 and an
-//!   empty stderr, which is why [`invoke`] falls back to the stdout tail
-//!   for the failure detail when stderr is empty: the human needs to read
-//!   "OAuth session expired", not "exited with 1: ".
-//!
-//! # Windows
-//!
-//! These CLIs install as `claude.cmd` and friends, which Windows runs
-//! through `cmd.exe`. The shim is the process that starts, so a script
-//! that has been deleted or renamed comes back as
-//! [`CuratorError::Failed`] carrying `cmd.exe`'s own exit 1 — not the
-//! spawn error a Unix host would report. Both are legible; they are just
-//! not the same variant.
-//!
-//! # Blocking
-//!
-//! [`detect`] is synchronous — it stats directories and waits on
-//! `--version` — so async callers wrap it in `spawn_blocking`. [`invoke`]
-//! is async and drives the child with `tokio::process`.
+//! PAM holds no API keys; it borrows the human's own `claude`, `codex`,
+//! `copilot`, or `gemini` CLI for one turn, no tools, no session left
+//! behind. [`detect`] finds what's installed; [`invoke`] asks one question,
+//! run in a fresh empty temp dir with `PATH` narrowed to the agent's own
+//! directory plus the daemon's. Flags disabling tools/session persistence
+//! are mandatory, kept in [`invoke_args`]. Output is capped at
+//! [`INVOKE_MAX_OUTPUT`] for bounded memory; `gemini`'s form is unverified.
+//! On Windows a deleted CLI fails through `cmd.exe` as
+//! [`CuratorError::Failed`] with its exit 1, not a spawn error.
+//! [`detect`] is synchronous (`spawn_blocking`); [`invoke`] is async via
+//! `tokio::process`.
 
 use std::ffi::OsStr;
 use std::io::Read as _;
@@ -211,17 +153,14 @@ pub enum CuratorError {
 
 /// Find the vendor agent CLIs on the given `PATH`.
 ///
-/// `path_env` is passed in rather than read from the environment so the
-/// caller — the daemon, which knows what environment it wants agents to
-/// see — decides, and so tests can point detection at a directory they
-/// control.
-///
-/// A candidate has to be a regular file (a directory named `codex` is not
-/// a CLI) and executable (on Unix, some `x` bit; on Windows, one of the
-/// executable extensions). The first match wins per agent, the way a shell
-/// would resolve it. Each survivor is asked `--version` under
-/// `version_deadline`; a CLI that misses the deadline is killed and
-/// reported with `version: None` rather than dropped.
+/// `path_env` is passed in (not read from the environment) so the
+/// daemon decides what agents see, and tests can point detection at a
+/// directory they control. A candidate must be a regular file (a
+/// directory named `codex` is not a CLI) and executable (Unix: any `x`
+/// bit; Windows: a recognized executable extension); the first match
+/// per agent wins, the way a shell would resolve it. Each survivor is
+/// asked `--version` under `version_deadline` — one that misses it is
+/// killed and reported with `version: None`, not dropped.
 ///
 /// Blocking: stats the filesystem and waits on child processes.
 #[must_use]
@@ -249,8 +188,13 @@ pub fn detect(path_env: &OsStr, version_deadline: Duration) -> Vec<AgentCli> {
 /// table that a test can read back, instead of scattering it through the
 /// spawn code.
 ///
-/// See the module docs for where each form comes from and which one is
-/// still unverified.
+/// Verified forms (`claude` 2.1.220, `codex` 0.151.0, `copilot` 1.0.82; `gemini` unverified):
+/// `claude` has no `--max-turns` (a parse error) — `--print --permission-mode plan --tools ""`
+/// is what keeps it off the machine, and an expired login is reported on stdout with exit 1 and
+/// empty stderr, so [`invoke`] falls back to the stdout tail for detail; `codex exec` writes its
+/// banner, transcript and token count to stderr and only the final message to stdout, so
+/// `-o <file>` buys nothing; `copilot` refuses `--deny-tool '*'` ("Invalid rule format") and
+/// `--available-tools=` is the flag that actually empties its toolbox.
 #[must_use]
 pub fn invoke_args(id: AgentId, prompt: &str) -> (Vec<String>, bool) {
     let owned = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();

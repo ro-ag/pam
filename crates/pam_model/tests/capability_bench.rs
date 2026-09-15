@@ -1,26 +1,15 @@
 //! Opt-in bounded-task capability bench over the production runtime.
 //!
-//! This is the #108 measurement instrument. The case set is *frozen as code*:
-//! [`cases`] builds every case procedurally from its index — no randomness,
-//! no time, no environment — so the set can only change through a visible
-//! commit, and every run prints the SHA-256 [`case_digest`] of what it
-//! actually asked. The first recorded run's digest is the reference any later
-//! tuning must be diffed against.
-//!
-//! What it measures on one loaded artifact, under the framing the artifact
-//! itself declares: per-family correctness on synthetic build/pipeline
-//! records whose truth is fixed by construction, abstention on records that
-//! genuinely do not decide an answer, false passes (claiming success on
-//! failing or undecidable evidence — the critical failure class), cold and
-//! warm latency, and output determinism on a repeat subset.
-//!
-//! What it does NOT claim: nothing here is a 32 GiB measurement — label the
-//! host honestly via `PAM_BENCH_HOST_LABEL` and read every figure as that
-//! host, that backend, that artifact. The proposed acceptance targets
-//! (>=95% bounded-task accuracy, zero false passes, warm p95 <10 s on short
-//! tasks) are recorded in the summary; they are *not asserted* here until
-//! confirmed, because a target must never look like a gate that quietly
-//! moved.
+//! The case set is *frozen as code*: [`cases`] builds every case procedurally from its index
+//! — no randomness, time, or environment — changing only via a visible commit; every run
+//! prints the SHA-256 [`case_digest`] of what it asked, and the first recorded digest is the
+//! reference later tuning is diffed against. It measures, on one loaded artifact under the
+//! framing it declares: per-family correctness, abstention on records that genuinely don't
+//! decide, false passes (claiming success on failing/undecidable evidence — the critical
+//! failure class), cold/warm latency, and determinism on a repeat subset. It does NOT claim a
+//! specific host size — label the host via `PAM_BENCH_HOST_LABEL` and read every figure as
+//! that host/backend/artifact. Acceptance targets (>=95% accuracy, zero false passes, warm
+//! p95 <10 s) are recorded but never asserted, so a target can't look like a gate that moved.
 //!
 //! ```text
 //! PAM_BENCH_MODEL=/tmp/pam-candidate-screen/models/qwen/Qwen3-14B-Q5_K_M.gguf \

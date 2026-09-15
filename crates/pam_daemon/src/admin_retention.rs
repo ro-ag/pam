@@ -1,31 +1,15 @@
-//! The retention half of the admin surface: `admin.retention.get`,
-//! `.set`, and `.prune`.
+//! The retention half of the admin surface: `admin.retention.get`, `.set`, and `.prune`. Ordinary
+//! admin ops — see [`crate::admin`] for the security model: GUI tripwire, request row, single
+//! terminal audit row, 30 s deadline, structural guard (no [`crate::policy::classify`] entry, never
+//! a capability, never grantable; `admin.*` is refused structurally on the request path, so an
+//! agent can never reach pruning). Pruning is the one admin act that cannot be undone — the
+//! evidence and audit rows are gone for good — which is why it sits behind the same door as editing
+//! a flow.
 //!
-//! These are ordinary admin ops — read [`crate::admin`]'s module docs for
-//! the security model, because every word of it applies here: the GUI
-//! tripwire, the request row, the single terminal audit row, the 30 s
-//! deadline, and the structural guard (no [`crate::policy::classify`]
-//! entry, never a capability, never grantable).
-//!
-//! # Why deleting history is GUI-only
-//!
-//! Everything else the admin surface does can be undone by doing it
-//! again. Pruning cannot: the evidence and the audit rows are gone, and
-//! nothing in pam can bring them back. That makes choosing the windows —
-//! and pressing Prune now — the most human act the daemon has, and it
-//! belongs behind the same door as editing a flow. An agent can never
-//! reach it: `admin.*` is refused structurally on the request path.
-//!
-//! # A save prunes at once
-//!
-//! [`OP_RETENTION_SET`] runs a pass as soon as the windows are stored, so
-//! the panel's answer already carries the figures for what the new
-//! setting removed. The alternative — telling the human the window
-//! changed and letting the hourly tick do the work — leaves the screen
-//! saying one thing and the database another for up to an hour.
-//!
-//! The service itself, the windows, the validation rule and the schedule
-//! live in [`crate::retention`]; this module is only the door.
+//! [`OP_RETENTION_SET`] prunes at once rather than waiting for the hourly tick, so the panel's
+//! answer already carries the figures for what the new window removed instead of leaving the screen
+//! and the database disagreeing for up to an hour. The windows, validation rule, and schedule live
+//! in [`crate::retention`]; this module is only the door.
 
 use pam_proto::Outcome;
 use serde_json::{Value, json};

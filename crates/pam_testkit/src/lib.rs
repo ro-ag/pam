@@ -1,24 +1,15 @@
 //! Integration-test harness for the pam workspace.
 //!
-//! Spins up a **real daemon** ([`pam_daemon::daemon::run_daemon_with`])
-//! on a temp runtime dir with a short path (unix socket paths are capped
-//! at 104 bytes on macOS), talks to it over **real zmq** (`DEALER` for
-//! requests, `SUB` for lifecycle events), and inspects the **real
-//! `SQLite` store** through the daemon's own [`Store`] handle.
-//!
-//! # Deadline discipline
-//!
-//! Every await in the harness is bounded by [`with_deadline`] — a
-//! generous **wall** deadline ([`TEST_DEADLINE`]) that tolerates loaded
-//! runners but fails genuine hangs (the v1 testkit lesson: classify
-//! CPU-bound work by wall budget, never assert on wall *durations*).
-//! Ordering assertions should use logical event order, not clocks.
-//!
-//! # Audit invariant
-//!
-//! [`TestDaemon::assert_invariant_clean`] combines the store's
-//! missing-audit sweep with a per-request exactly-one-terminal-row
-//! check over every request id a [`TestClient`] of this daemon sent.
+//! Spins up a **real daemon** ([`pam_daemon::daemon::run_daemon_with`]) on a temp runtime
+//! dir with a short path (unix socket paths cap at 104 bytes on macOS), talks to it over
+//! **real zmq** (`DEALER` for requests, `SUB` for lifecycle events), and inspects the
+//! **real `SQLite` store** through the daemon's own [`Store`] handle. Every await is
+//! bounded by [`with_deadline`] — a generous **wall** deadline ([`TEST_DEADLINE`]) that
+//! tolerates loaded runners but fails genuine hangs; classify CPU-bound work by wall
+//! budget, never assert on wall *durations*, and use logical event order for ordering
+//! assertions, not clocks. [`TestDaemon::assert_invariant_clean`] combines the store's
+//! missing-audit sweep with a per-request exactly-one-terminal-row check over every
+//! request id a [`TestClient`] of this daemon sent.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -186,7 +177,7 @@ async fn seed_string_list(tmp: &tempfile::TempDir, key: &str, values: &[&str]) {
 /// at `<base>/flows/<id>.yaml`.
 ///
 /// Deliberately a plain file write rather than
-/// [`pam_flow::Library::save`]: a test that wants an *invalid* flow in
+/// `pam_flow::Library::save`: a test that wants an *invalid* flow in
 /// the library (to prove the list renders its message) could not save
 /// one through the validator.
 #[must_use]

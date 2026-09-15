@@ -26,27 +26,15 @@ import {
 } from "./activitySearch";
 
 /**
- * Activity — the default screen: the tide. The owner watches the water
- * from here; every request the daemon has seen rolls in as a compact row
- * (~44px): state dot, capability in the data voice, repo tail,
- * truth-vocabulary badge, live relative age. A row opens into its detail
- * (args JSON, id, exact stamps) in place.
- *
- * Rows run in lanes, one per agent, alphabetical so lanes never trade
- * places, newest on top within a lane: two agents working at once read as
- * two currents rather than one interleaved list. Chips under the state
- * lens narrow to an agent or a repo (the same `?agent=` / `?repo=` params
- * a shared URL carries).
- *
- * Live-ness: the daemon event stream invalidates the queries through one
- * ~300ms trailing debounce, so a burst of events becomes one refetch and
- * a new request is visible well under a second after its event.
- *
- * Plain list, no virtualization: the daemon clamps the reply to 100 rows
- * (v0 volumes) and the panel already scrolls.
- *
- * Follow-up (blocked on IPC surface): per-request audit trail in the
- * detail view — there is no `admin.audit.*` op on the bridge yet.
+ * Activity — the default screen: the tide, every request the daemon has seen as a compact row.
+ * Rows run in lanes, one per agent, alphabetical so lanes never swap, newest on top within a lane.
+ * Chips narrow to an agent or repo via the same `?agent=` / `?repo=` params a shared URL carries.
+ * Live-ness: a ~300ms trailing debounce on the daemon event stream coalesces bursts into one
+ * refetch; a new request is visible well under a second after its event.
+ * Plain list, no virtualization: the daemon clamps replies to 100 rows (v0 volumes) and the panel
+ * already scrolls.
+ * Follow-up (blocked on IPC surface): per-request audit trail in the detail view — no
+ * `admin.audit.*` op on the bridge yet.
  */
 
 /** Rows requested per fetch; the store clamps to the same bound. */

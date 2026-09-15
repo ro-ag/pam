@@ -23,10 +23,10 @@ import { FlowVerdictPanel, OUTCOME_TONES } from "./FlowRunCard";
  */
 
 /** How many `flow.run` rows the history asks for. */
-export const RUNS_LIMIT = 50;
+const RUNS_LIMIT = 50;
 
 /** The capability every run is filed under. */
-export const RUN_CAPABILITY = "flow.run";
+const RUN_CAPABILITY = "flow.run";
 
 /** The flow id out of a request's parsed args, or null. */
 export function flowIdOf(args: unknown): string | null {

@@ -9,7 +9,7 @@ import type { TetherEdge as TetherEdgeType } from "./graph";
  * It has no hit area — a note is selected by its card, never its string.
  */
 
-export const TETHER_CLASSES = "flow-edge-tether fill-none stroke-ink-faint stroke-1";
+const TETHER_CLASSES = "flow-edge-tether fill-none stroke-ink-faint stroke-1";
 
 function TetherEdgeComponent({
   id,

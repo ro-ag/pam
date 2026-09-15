@@ -1,39 +1,16 @@
 //! The models PAM offers to download, with the numbers that make the offer
 //! honest.
 //!
-//! # Why a static list
-//!
-//! A catalog fetched from the network would be one more thing that can be
-//! down, one more thing that can lie, and one more thing to authenticate.
-//! This one is compiled in: four entries, each with the exact byte count and
-//! SHA-256 digest of the file it names, taken from the Hugging Face LFS
-//! metadata. The download layer verifies against these numbers rather than
-//! against anything the server says about itself, so a mirror, a proxy, or a
-//! bad day at the CDN cannot hand PAM a different file than the one the
-//! human chose.
-//!
-//! Growing the catalog is a code change with a review. That is the point.
-//!
-//! # One engine class
-//!
-//! Every entry is Qwen3-Coder-30B-A3B-Instruct — a mixture of experts with
-//! roughly 3B parameters active per token, which is what makes a 30B model
-//! answer at a usable speed on a laptop. The entries differ only in
-//! quantization, and each one carries the digest the download verifies; a
-//! unit test enforces that, because a catalog entry without a digest could
-//! never be admitted as a tier default.
-//!
-//! Only K-quants and `Q8_0` are listed. The repository also publishes IQ and
-//! UD variants, and they are smaller — but candle's quantized kernels do not
-//! cover those formats, so offering one would mean a model that downloads
-//! and then fails to load.
-//!
-//! # RAM
-//!
-//! [`Preset::min_host_ram_bytes`] is what the host needs, not what the file
-//! weighs: weights, KV cache, and the rest of the machine's working set.
-//! The GUI hides entries that do not fit rather than disabling them —
-//! a greyed-out row the human can never use is noise.
+//! The catalog is compiled in, not fetched: each entry carries the exact
+//! byte count and SHA-256 of the file it names (from the Hugging Face LFS
+//! metadata), and the download layer verifies against these numbers, never
+//! against what the server says, so a mirror or proxy cannot substitute a
+//! file. Growing the catalog is a reviewed code change. Every entry is a
+//! Qwen3-Coder-30B-A3B-Instruct quantization with a digest (a unit test
+//! enforces it: an entry without one could never be a tier default).
+//! [`Preset::min_host_ram_bytes`] is what the host needs (weights, KV cache
+//! and the rest of the working set), not the file size; the GUI hides
+//! entries that do not fit rather than greying them out.
 
 /// A model PAM knows how to fetch, down to the byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -86,14 +63,6 @@ impl Preset {
         format!("{}/{stem}", self.vendor)
     }
 }
-
-/// Where every entry below is fetched from.
-///
-/// Each [`Preset::url`] is this prefix plus the file name, spelled out in
-/// full because a `const` cannot `format!`. A unit test holds the two
-/// halves together.
-pub const QWEN_BASE_URL: &str =
-    "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/";
 
 /// Licence text for every entry below.
 const QWEN_LICENSE_URL: &str =

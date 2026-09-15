@@ -34,20 +34,14 @@ import {
 } from "../lib/ipc";
 
 /**
- * Models — the human's whole view of the local inference layer: what is
- * running right now, what is on disk, what is on offer, and a box to
- * prove a loaded model actually answers.
+ * Models — the human's view of the inference layer: running, on
+ * disk, on offer, and a box to prove a loaded model answers.
  *
- * Administration is GUI-only by design (spine decision): every control
- * here is an `admin.models.*` op that no agent, CLI, or MCP call can
- * reach. The screen is deliberately honest about admission — a
- * model under 18 GB loads and answers, and is refused as a tier default,
- * and both facts are on screen before anyone earns the refusal.
- *
- * Polling: `admin.models.status` is the single live read. It ticks every
- * two seconds while a job runs or a load is in flight, and every ten
- * otherwise — the screen should feel alive during a download without
- * spending a request per second staring at an idle runtime.
+ * Administration is GUI-only by design (spine decision): every
+ * control is an `admin.models.*` op no agent, CLI, or MCP call can
+ * reach. A model under 18 GB loads and answers but is refused as a
+ * tier default — both facts shown before the refusal. Polling uses
+ * `admin.models.status` alone, ticking every 2s while busy, else 10s.
  */
 
 /** Poll interval while a job is running or the runtime is loading. */
@@ -57,13 +51,13 @@ export const POLL_BUSY_MS = 2_000;
 export const POLL_IDLE_MS = 10_000;
 
 /** Default token budget for the try box — a wiring check, not an essay. */
-export const TRY_DEFAULT_MAX_TOKENS = 64;
+const TRY_DEFAULT_MAX_TOKENS = 64;
 
 /** The sentence a `test_only` model carries wherever it is offered. */
 export const FLOOR_SENTENCE = "unverified — wiring checks only, never a tier default";
 
 /** The admission rule, said plainly, next to the paste-URL form. */
-export const FLOOR_NOTE =
+const FLOOR_NOTE =
   "Unverified models load only as test-only: run Verify and they can serve jobs.";
 
 /** Empty library, in Pam's voice. */
@@ -75,7 +69,7 @@ export const IDLE_RUNTIME_SENTENCE =
   "Nothing loaded. Memory is yours until a job or a click needs the model.";
 
 /** Why the try box is closed when nothing is in memory. */
-export const TRY_DISABLED_REASON = "Load a model first — there is nothing to ask.";
+const TRY_DISABLED_REASON = "Load a model first — there is nothing to ask.";
 
 /** The model id a preset installs as: `<vendor>/<file stem>`. */
 export function presetModelId(preset: CatalogPreset): string {
@@ -210,9 +204,7 @@ function RuntimeCard({
         {runtime?.state === "loading" && (
           <Badge tone="warning">loading · {runtime.phase}</Badge>
         )}
-        {runtime?.state === "idle" && engine?.loaded && (
-          <Badge tone="success">engine</Badge>
-        )}
+        {runtime?.state === "idle" && engine?.loaded && <Badge tone="success">engine</Badge>}
         {runtime?.state === "idle" && !engine?.loaded && <Badge tone="neutral">idle</Badge>}
       </div>
 

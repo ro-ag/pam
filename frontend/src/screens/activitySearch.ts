@@ -17,7 +17,7 @@ export const STATE_FILTERS = ["all", "active", "waiting", "done", "refused", "fa
 export type StateFilter = (typeof STATE_FILTERS)[number];
 
 /** URL search params for `/activity`; absent means "all". */
-export interface ActivitySearch {
+interface ActivitySearch {
   repo?: string;
   agent?: string;
   state?: Exclude<StateFilter, "all">;

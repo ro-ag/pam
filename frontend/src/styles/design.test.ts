@@ -6,20 +6,14 @@ import themesCss from "./themes.css?raw";
 import tokensCss from "./tokens.css?raw";
 
 /**
- * Design-system contract tests.
- *
- * The token layer (`tokens.css` + `themes.css`) is the ONE place style
- * decisions live; components consume semantic utilities only. These tests
- * make that contract executable:
- *
- *  1. every semantic role components rely on exists in `tokens.css`;
- *  2. the stock Tailwind namespaces stay wiped (no `bg-neutral-950` ever);
- *  3. all four theme blocks define the same primitive set, every primitive
- *     `tokens.css` references resolves in every theme, and the bare-`:root`
- *     dark fallback stays verbatim in sync with Ventisquero dark;
- *  4. the cva exemplars (Panel/Badge/Button) keep their variant maps total,
- *     distinct, and token-backed — no variant may smuggle in a class the
- *     token set does not answer for.
+ * Design-system contract tests: the token layer (`tokens.css` + `themes.css`) is the ONE place
+ * style decisions live; components consume semantic utilities only. Enforced here:
+ * 1. every semantic role components rely on exists in `tokens.css`;
+ * 2. stock Tailwind namespaces stay wiped (no `bg-neutral-950` ever);
+ * 3. all four theme blocks define the same primitive set, every primitive `tokens.css` reference
+ *    resolves in every theme, and the bare-`:root` dark fallback matches Ventisquero dark verbatim;
+ * 4. the cva exemplars (Panel/Badge/Button) keep variant maps total, distinct, and token-backed —
+ *    no variant may smuggle in a class the token set doesn't answer for.
  */
 
 /* ------------------------------------------------------------------ *

@@ -1,33 +1,15 @@
-//! Transport service: zmq `ROUTER` serving requests on `pam.sock`, zmq
-//! `PUB` broadcasting events on `events.sock`.
-//!
-//! # Design
-//!
-//! The transport owns both sockets and forwards in two directions only —
-//! it never interprets a request beyond envelope validation:
-//!
-//! - **Requests in**: the `ROUTER` receive half runs in a task. Each frame
-//!   pair `[identity, payload]` is parsed as a JSON [`Envelope`]; a valid
-//!   one is forwarded to the daemon core over the `mpsc` channel handed to
-//!   [`Transport::bind`], a malformed one is answered immediately with a
-//!   `bad_request` [`Response::Refusal`].
-//! - **Replies out**: every [`IncomingRequest`] carries a `oneshot` sender
-//!   for its single [`Response`]. A small per-request forwarding task
-//!   awaits the `oneshot` and pushes `(identity, response)` onto an
-//!   internal reply `mpsc`; the `ROUTER` send half drains that channel.
-//!   The forwarder exits quietly when the daemon core drops the `oneshot`
-//!   without answering.
-//! - **Events out**: [`EventPublisher`] is a clone-able handle over an
-//!   `mpsc`; a task owning the `PUB` socket drains it, sending
-//!   `[request-id topic, JSON event]` frame pairs. This is a public broadcast:
-//!   a wildcard subscriber can observe opaque request IDs, lifecycle states,
-//!   timing and progress percentages across tasks. Topic filters are not access
-//!   control. Progress prose is replaced with a constant before enqueueing;
-//!   task, product, repository and evidence details require scoped result reads.
-//!
-//! Shutdown is a `tokio::sync::watch` flag: [`Transport::shutdown`] flips
-//! it and joins the three socket tasks; dropping the sockets closes the
-//! binds and removes the `ipc` files.
+//! Transport service: zmq `ROUTER` serving requests on `pam.sock`, zmq `PUB` broadcasting events on
+//! `events.sock`. It owns both sockets and only forwards, never interpreting past envelope
+//! validation. **In**: each `[identity, payload]` frame pair is parsed as a JSON [`Envelope`] and
+//! forwarded to the daemon core over the `mpsc` handed to [`Transport::bind`]; a malformed one gets
+//! an immediate `bad_request` [`Response::Refusal`]. **Out**: each [`IncomingRequest`] carries a
+//! `oneshot` for its one [`Response`], forwarded onto a reply `mpsc` the `ROUTER` drains.
+//! [`EventPublisher`] drains into the `PUB` socket as `[request-id topic, JSON event]` pairs — a
+//! public broadcast: a wildcard subscriber sees opaque request IDs, lifecycle states, timing, and
+//! progress percentages, and topic filters are not access control. Progress prose is replaced with
+//! a constant before enqueueing; task, product, repository and evidence details require scoped
+//! result reads. Shutdown is a `tokio::sync::watch` flag: [`Transport::shutdown`] flips it, joins
+//! the three socket tasks, and dropping the sockets removes the `ipc` files.
 
 use std::io;
 use std::path::PathBuf;

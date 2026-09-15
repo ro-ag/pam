@@ -1,49 +1,17 @@
-//! The Tauri shell behind `pam gui`: window setup, webview context, and the
-//! IPC commands the frontend may invoke.
+//! The Tauri shell behind `pam gui`: window setup, webview context, and the IPC commands the
+//! frontend may invoke. pam ships **one binary** — the GUI is not a separate app: this crate is a
+//! plain library that `crates/pam` depends on, and `pam gui` calls [`run`], handing the process to
+//! the Tauri event loop. Tauri's own config (`tauri.conf.json`, `capabilities/`, bundle icons, the
+//! ACL-generating build script) lives in the app crate `crates/pam`, whose generated
+//! `tauri::Context` [`run`] takes as its argument.
 //!
-//! # Architecture
-//!
-//! pam ships **one binary**; the GUI is not a separate app. This crate is a
-//! plain library — `crates/pam` depends on it and `pam gui` calls [`run`],
-//! which hands the process to the Tauri event loop. Everything Tauri owns
-//! lives in the **app crate** (`crates/pam`): `tauri.conf.json` and its
-//! per-platform overlays, the capability files under `capabilities/`, the
-//! bundle icons, and the build script that generates the ACL manifest for
-//! the commands below. [`run`] takes the generated `tauri::Context` as its
-//! argument, so the config lives next to the crate that produces the `pam`
-//! binary — which is what the Tauri CLI expects.
-//!
-//! # Dev context vs embedded frontend
-//!
-//! Which frontend the window loads is decided at **compile time**, by the
-//! `custom-protocol` feature of `tauri` (see `crates/pam/build.rs` for the
-//! full story). `tauri build` turns it on itself; the app crate's
-//! `gui-embed` feature (which enables this crate's `embed`) is the manual
-//! equivalent:
-//!
-//! - default (`embed` off): the window loads the Vite dev server at
-//!   `http://127.0.0.1:1420`. Dev flow: start the server
-//!   (`npm --prefix frontend run dev`, or the `gui-dev` entry in
-//!   `.claude/launch.json`), then `cargo run -p pam -- gui`. A plain
-//!   `cargo build` never reads `frontend/dist`, so the workspace compiles
-//!   from a clean checkout without npm — but such a binary (release
-//!   included) shows a white window when no dev server is running.
-//! - `embed` on (production): `frontend/dist` is compiled into the binary.
-//!   Build with `npm --prefix frontend run build` followed by
-//!   `cargo build --release -p pam --features gui-embed` (or
-//!   `npm --prefix frontend run gui:build`, which does both).
-//!
-//! The Tauri CLI is part of the flow now that the app crate owns the
-//! config: `npm --prefix frontend run tauri -- build` builds the frontend
-//! and bundles the `pam` binary for the host platform, and
-//! `npm --prefix frontend run dev:desktop` is `tauri dev -- -- gui`.
-//! `npm run gui:build` remains the manual embed path.
-//!
-//! # Build weight
-//!
-//! There is no feature gate around the GUI: the owner ships one binary, so
-//! CLI-only builds pay the Tauri/wry compile cost too. Accepted trade-off —
-//! revisit only if workspace build times become a real problem.
+//! Which frontend loads is fixed at compile time by `tauri`'s `custom-protocol` feature; this
+//! crate's `embed` feature is the manual switch. Off (default, dev): `npm --prefix frontend run
+//! dev` then `cargo run -p pam -- gui` — loads the Vite dev server, shows a white window if it
+//! isn't running. On (production): `npm --prefix frontend run build` then `cargo build --release -p
+//! pam --features gui-embed` (or `npm --prefix frontend run gui:build` for both). No feature gate
+//! exists otherwise: the owner ships one binary, so CLI-only builds pay the Tauri/wry compile cost
+//! too — accepted trade-off, revisit only if build times become a real problem.
 
 pub mod bridge;
 pub mod events;

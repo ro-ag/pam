@@ -21,7 +21,7 @@ export const panelVariants = cva("border", {
   },
 });
 
-export type PanelProps = HTMLAttributes<HTMLElement> & VariantProps<typeof panelVariants>;
+type PanelProps = HTMLAttributes<HTMLElement> & VariantProps<typeof panelVariants>;
 
 export function Panel({ ground, className, ...props }: PanelProps) {
   return <section className={cn(panelVariants({ ground }), className)} {...props} />;

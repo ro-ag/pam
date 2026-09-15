@@ -1,5 +1,4 @@
-//! The llama.cpp inference engine as a pinned, digest-verified external
-//! binary.
+//! The llama.cpp inference engine as a pinned, digest-verified external binary.
 //!
 //! PAM itself stays pure Rust; the engine is `llama-server` from one exact
 //! upstream GitHub release (`ENGINE_TAG`), one asset per supported target,

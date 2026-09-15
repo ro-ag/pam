@@ -1,55 +1,30 @@
 //! Approval service: pauses approval-gated requests until a human
 //! resolves them in the GUI, or the approval times out.
 //!
-//! # Design
-//!
-//! The policy gate signals [`GateDecision::RequireApproval`]; the
-//! pipeline then calls [`ApprovalService::request_approval`], which
-//! inserts the unresolved `approval` row, parks the request in the
-//! `waiting_approval` state, publishes [`Event::ApprovalPending`], and
-//! waits for exactly one of: a resolution
-//! ([`ApprovalService::resolve`]), the approval timeout (default
-//! [`DEFAULT_APPROVAL_TIMEOUT`]), or the caller-side cancel signal.
-//!
-//! # Security surface: GUI-only, never agent-callable
-//!
-//! [`ApprovalService::resolve`] is a **daemon-internal** API. It is
-//! deliberately *not* a capability an envelope can name, and the CLI has
-//! no security subcommand that reaches it: v1's self-grant hole was an
-//! agent approving its own operations, and the fix is structural — the
-//! only path to a resolution is the GUI process calling into the daemon
-//! as the human's surface. Until the GUI lands, integration tests reach
-//! the service through [`DaemonHandle::approvals`]. The GUI's pending
-//! list is [`ApprovalService::pending`], backed by the store, so it
-//! survives a daemon restart.
-//!
-//! # Remember semantics (ask-once)
-//!
-//! An approval resolved with [`Resolution::Approve`] `remember: true`
-//! inserts a `grant` row (audited as [`ACTION_GRANT_FROM_APPROVAL`]),
-//! regardless of profile or class. The policy matrix decides what that
-//! grant *means*: under relaxed it turns the next gate evaluation into
-//! an outright allow (ask-once); under standard/strict a granted
-//! destructive/external capability still requires per-operation approval
-//! — the grant is harmless there and consistent everywhere, so the
-//! service always inserts it and lets the matrix rule.
-//!
-//! # State and audit split
-//!
-//! The service owns the `approval` row and the resolution audit rows;
-//! the **pipeline** owns every `request` state transition around the
-//! wait, keeping a single request-state writer per path: the service
-//! moves the row *into* `waiting_approval` when the wait begins (that
-//! transition is part of the wait itself), and the pipeline moves it out
-//! on the outcome — back to `queued` before lane placement on approval,
-//! or to terminal `refused` (with its own refusal audit row) on denial,
-//! timeout, or cancellation.
-//!
-//! Every resolution writes an [`ACTION_APPROVAL`] audit row:
-//! approve → decision `approve`, actor `human`; deny → decision `deny`,
-//! actor `human`; timeout → decision `timeout`, actor `system`;
-//! cancelled-while-waiting → decision `deny`, actor `system`, with the
-//! approval row resolved `denied` and note `cancelled`.
+//! [`GateDecision::RequireApproval`] triggers [`ApprovalService::request_approval`]: inserts the
+//! unresolved `approval` row, parks the request `waiting_approval`, publishes
+//! [`Event::ApprovalPending`], and waits for exactly one of a resolution
+//! ([`ApprovalService::resolve`]), the timeout ([`DEFAULT_APPROVAL_TIMEOUT`] default), or the
+//! caller-side cancel signal.
+//! - **Security surface (GUI-only)**: [`ApprovalService::resolve`] is daemon-internal — not a
+//!   capability an envelope can name, and the CLI has no subcommand reaching it (the fix for the
+//!   self-grant hole of an agent approving its own ops is structural: only the GUI process, as the
+//!   human's surface, can resolve). Until the GUI lands, tests reach it via
+//!   [`DaemonHandle::approvals`]. [`ApprovalService::pending`] is store-backed, so it survives a
+//!   daemon restart.
+//! - **Remember (ask-once)**: `remember: true` on [`Resolution::Approve`] always inserts a `grant`
+//!   row ([`ACTION_GRANT_FROM_APPROVAL`]), regardless of profile/class; the policy matrix decides
+//!   its meaning — under relaxed it makes the next gate evaluation an outright allow, under
+//!   standard/strict a granted destructive/external capability still needs per-operation approval,
+//!   so the grant is harmless there.
+//! - **State/audit split**: the service owns the `approval` row and resolution audit rows; the
+//!   pipeline owns every `request` state transition around the wait (single writer per path) — the
+//!   service moves the row into `waiting_approval` when the wait begins, the pipeline moves it out
+//!   on outcome (back to `queued` before lane placement on approval, or terminal `refused` with its
+//!   own refusal audit row on denial/timeout/cancellation).
+//! - Every resolution writes an [`ACTION_APPROVAL`] row: approve → `approve`/`human`; deny →
+//!   `deny`/`human`; timeout → `timeout`/`system`; cancelled-while-waiting → `deny`/`system`
+//!   (approval row resolved `denied`, note `cancelled`).
 //!
 //! [`GateDecision::RequireApproval`]: crate::policy::GateDecision::RequireApproval
 //! [`DaemonHandle::approvals`]: crate::daemon::DaemonHandle::approvals
@@ -146,21 +121,18 @@ impl ApprovalService {
         }
     }
 
-    /// Parks `request_id` until its approval is resolved.
+    /// Parks `request_id` until its approval is resolved: inserts the unresolved `approval` row,
+    /// moves the request to `waiting_approval`, publishes [`Event::ApprovalPending`], and waits for
+    /// a resolution, the timeout, or `cancel` flipping to `true` (a closed `cancel` channel counts
+    /// as cancellation — the caller lost its right to wait).
     ///
-    /// Inserts the unresolved `approval` row, moves the request to
-    /// `waiting_approval`, publishes [`Event::ApprovalPending`], and
-    /// waits for a resolution, the timeout, or `cancel` flipping to
-    /// `true` (a closed `cancel` channel counts as cancellation — the
-    /// caller lost its right to wait). Whatever ends the wait is
-    /// recorded on the approval row and audited before this returns; the
-    /// caller owns the request-state transition that follows (see the
-    /// module docs for the split).
+    /// Whatever ends the wait is recorded on the approval row and audited before this returns; the
+    /// caller owns the request-state transition that follows (see the module docs for the split).
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`StoreError`] when the bookkeeping writes
-    /// fail; the caller answers with an internal refusal.
+    /// Returns the underlying [`StoreError`] when the bookkeeping writes fail; the caller answers
+    /// with an internal refusal.
     pub async fn request_approval(
         &self,
         request_id: &str,

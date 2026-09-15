@@ -1,16 +1,13 @@
-//! Flow definitions: the YAML schema, validation, normalized rendering,
-//! digest, the embedded starter flows, and the global library directory.
+//! Flow definitions: the YAML schema, validation, normalized rendering, digest, the
+//! embedded starter flows, and the global library directory. Pure library — no daemon
+//! knowledge. See `docs/specs/2026-09-02-flows-connectors-design.md`.
 //!
-//! Pure library — no daemon knowledge. See
-//! `docs/specs/2026-09-02-flows-connectors-design.md`.
-//!
-//! A flow is one YAML file: an id, a name, a description, optional inputs,
-//! and an ordered list of steps. A step either runs an allowlisted local
-//! program (`run: [git, status, --short]`) or calls one read-only connector
-//! operation (`connector: github`, `call: runs`). [`parse`] turns the text
-//! into a [`Flow`] or into a [`FlowError::Invalid`] naming the offending
-//! YAML path; [`to_normalized_yaml`] renders a `Flow` back in canonical key
-//! order with defaults omitted, and [`digest`] fingerprints that rendering.
+//! A flow is one YAML file: an id, a name, a description, optional inputs, and an ordered
+//! list of steps. A step either runs an allowlisted local program (`run: [git, status,
+//! --short]`) or calls one read-only connector operation (`connector: github`, `call:
+//! runs`). [`parse`] turns the text into a [`Flow`] or a [`FlowError::Invalid`] naming the
+//! offending YAML path; [`to_normalized_yaml`] renders a `Flow` back in canonical key order
+//! with defaults omitted, and [`digest`] fingerprints that rendering.
 //!
 //! ```
 //! let flow = pam_flow::parse(

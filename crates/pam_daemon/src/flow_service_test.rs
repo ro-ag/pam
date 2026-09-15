@@ -110,14 +110,6 @@ fn the_platform_default_allowlist_carries_the_toolchain_and_no_shell() {
     assert!(!settings.extra_path.is_empty());
 }
 
-#[test]
-fn the_secret_env_pattern_is_the_one_the_spec_names() {
-    assert_eq!(
-        FlowSettings::secret_env_pattern(),
-        "(?i)token|secret|password|passwd|credential|api_key|apikey|private_key"
-    );
-}
-
 #[tokio::test]
 async fn the_first_settings_read_persists_the_platform_default() {
     let (_tmp, store, flows) = service().await;

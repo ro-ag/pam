@@ -1,46 +1,27 @@
 //! Built-in capabilities and the context they execute in.
 //!
-//! # Design
-//!
-//! The capability registry is static by design (see the spine spec), so
-//! dispatch is a plain enum — [`BuiltinCapability`] — rather than a
-//! `dyn` trait object: native `async fn` in traits is not
-//! dyn-compatible, and an enum over a closed set needs neither the
-//! `async-trait` boxing detour nor manual future desugaring. Connectors
-//! and flows extend this enum when they land.
-//!
-//! Capabilities receive an [`ExecContext`] and return either a
-//! [`CapabilityOutput`] (outcome + body + evidence ids) or a
-//! [`CapabilityFailure`]. They never touch the `request` row or the
-//! audit trail themselves — terminal bookkeeping belongs to the daemon
-//! pipeline ([`crate::daemon`]), which owns exactly one audit write per
-//! terminal path.
-//!
-//! # Built-ins
-//!
-//! - `status` (read-only): daemon version, protocol version, uptime and
-//!   the in-flight request count. Outcome `verified`.
-//! - `query` (read-only): the lifecycle state of the request named by
-//!   `args.ticket`, straight from the store. This is the authoritative
-//!   answer `pam wait` / `pam subscribe` reconcile against: zmq `PUB`
-//!   has no replay, so a subscriber that joins after a ticket's
-//!   terminal event was published would otherwise wait forever on a
-//!   request that already finished. Outcome `verified`.
-//! - `echo` (non-destructive): mirrors its args back; an optional
-//!   `delay_ms` argument sleeps first, honoring the cancel signal — the
-//!   integration tests use it as a controllable long-running capability.
-//!   An optional `fail: true` argument makes it fail (after any delay)
-//!   with [`CapabilityFailure::Failed`] — a documented test/diagnostic
-//!   surface for driving the execution-failure path end to end.
-//!   Outcome `solved`.
-//! - `cancel` (read-only class, see [`crate::policy::classify`] for why):
-//!   the built-in behind `pam cancel <ticket>`. Cancels the queued or
-//!   running request named by `args.ticket` via
-//!   [`crate::queue::QueueManager::cancel`]. For a request cancelled
-//!   while still queued (the queue writes the terminal row and audit),
-//!   it also releases any attached waiters with a refusal and publishes
-//!   the `refused` event — a running request reaches those through its
-//!   own executor instead.
+//! The capability registry is static (per spine spec), so dispatch is a plain enum
+//! ([`BuiltinCapability`]) rather than a `dyn` trait object — native `async fn` in traits isn't
+//! dyn-compatible, and a closed enum needs no `async-trait` boxing or manual future desugaring.
+//! Connectors and flows extend this enum when they land. Capabilities receive an [`ExecContext`]
+//! and return a [`CapabilityOutput`] (outcome + body + evidence ids) or [`CapabilityFailure`]; they
+//! never touch the `request` row or audit trail themselves — terminal bookkeeping is the daemon
+//! pipeline's ([`crate::daemon`]), which owns exactly one audit write per terminal path.
+//! - `status` (read-only): daemon version, protocol version, uptime, in-flight request count.
+//!   Outcome `verified`.
+//! - `query` (read-only): the lifecycle state of `args.ticket`'s request, straight from the store —
+//!   the authoritative answer `pam wait`/`pam subscribe` reconcile against, since zmq `PUB` has no
+//!   replay and a late subscriber would otherwise wait forever on an already-finished ticket.
+//!   Outcome `verified`.
+//! - `echo` (non-destructive): mirrors its args back; optional `delay_ms` sleeps first, honoring
+//!   the cancel signal (used by integration tests as a controllable long-running capability);
+//!   optional `fail: true` fails (after any delay) with [`CapabilityFailure::Failed`], a documented
+//!   test/diagnostic surface for the execution-failure path. Outcome `solved`.
+//! - `cancel` (read-only class — see [`crate::policy::classify`]): backs `pam cancel <ticket>`,
+//!   cancelling the queued or running request via [`crate::queue::QueueManager::cancel`]. For a
+//!   still-queued cancellation (the queue writes the terminal row/audit) it also releases attached
+//!   waiters with a refusal and publishes `refused`; a running request's own executor does that
+//!   instead.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -18,7 +18,7 @@ import {
 import { exactTime, relativeTime } from "../lib/time";
 import { SonarRepositoryMappingsEditor } from "./SonarRepositoryMappings";
 
-export const CAUSE_STORE_DENIED = "store_denied";
+const CAUSE_STORE_DENIED = "store_denied";
 export const STORE_UNAVAILABLE_COPY =
   "the OS credential store is unavailable; see the daemon log";
 const fieldClasses =

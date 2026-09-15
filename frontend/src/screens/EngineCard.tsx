@@ -23,12 +23,12 @@ const POLL_MS = 10_000;
 const REINSTALL_CAUSES = new Set(["stale_release", "server_missing", "manifest_invalid"]);
 
 /** First characters of a digest, enough to eyeball without the whole hash. */
-export function shaPrefix(sha256: string): string {
+function shaPrefix(sha256: string): string {
   return sha256.slice(0, 12);
 }
 
 /** The one honest sentence for whatever `cause` the daemon reports. */
-export function engineStatusLine(status: EngineStatus): string {
+function engineStatusLine(status: EngineStatus): string {
   switch (status.cause) {
     case "not_installed":
       return "Not installed";

@@ -1,40 +1,17 @@
-//! Log compression: a deterministic reduction that always succeeds, and a
-//! local-model summary that is allowed to fail.
-//!
-//! # The shape of the pipeline
-//!
-//! One call to [`LogService::compress`] leaves up to three evidence rows
-//! under the caller's request id:
-//!
-//! 1. [`EVIDENCE_KIND_LOG_SOURCE`] — the exact bytes that came in. Nothing
-//!    is normalized, trimmed or re-encoded: this row is what makes every
-//!    later claim checkable, and what the fragment offsets in the compact
-//!    report index into.
-//! 2. [`pam_store::EVIDENCE_KIND_LOG_COMPACT`] — the [`pam_compact`]
-//!    report serialized as JSON, fragments included. The fragments are the
-//!    provenance map (every source byte belongs to exactly one), so the
-//!    original is rebuilt by reading the ranges back from the source row
-//!    in order. Its `meta_json` carries [`CompressStats`], which is what
-//!    the tokens-avoided odometer aggregates without touching a blob.
-//! 3. [`EVIDENCE_KIND_LOG_SUMMARY`] — the model's plain-text answer, when
-//!    a model was asked and answered.
-//!
-//! # A model failure is never a compress failure
-//!
-//! The deterministic half is the product; the summary is a bonus. Every
-//! way the model layer can decline — no tier default, the configured
-//! weights missing, the runtime busy, a prompt over the context, a crash —
-//! comes back as [`ModelSkipped`] with a cause the GUI can render, and the
-//! compact result stands unchanged. A store failure on the *summary*
-//! insert is downgraded the same way (cause [`CAUSE_STORE_ERROR`]): losing
-//! a summary row must not throw away a compaction that already happened.
-//! Only the bound check, the compaction itself, and the two evidence
-//! writes that carry the deterministic result can fail the call.
-//!
-//! # Bounded summaries
-//!
-//! Oversized evidence is refused before generation, never head/tail
-//! truncated. Flow steps and the GUI log observatory both call this service.
+//! Log compression: a deterministic reduction that always succeeds, and a local-model summary that
+//! is allowed to fail. One call to [`LogService::compress`] leaves up to three evidence rows:
+//! [`EVIDENCE_KIND_LOG_SOURCE`] (the exact unmodified source bytes, checkable provenance the
+//! fragment offsets index into); [`pam_store::EVIDENCE_KIND_LOG_COMPACT`] (the [`pam_compact`]
+//! report as JSON, `meta_json` carrying [`CompressStats`] for the tokens-avoided odometer); and
+//! [`EVIDENCE_KIND_LOG_SUMMARY`] (the model's answer, when one was produced). A model failure is
+//! never a compress failure: every way the model layer can decline — no tier default, missing
+//! weights, a busy runtime, an over-context prompt, a crash — comes back as [`ModelSkipped`] with a
+//! renderable cause; the compact result stands unchanged. A store failure on the *summary* insert
+//! downgrades the same way ([`CAUSE_STORE_ERROR`]): losing a summary must not discard a compaction
+//! that already happened. Only the bound check, the compaction, and the two deterministic evidence
+//! writes can fail the call; oversized evidence is refused up front, never truncated.
+//! Compact fragments form a provenance map — every source byte belongs to exactly one fragment —
+//! so the original can be rebuilt by reading ranges back from the source row in order.
 
 use std::sync::{Arc, LazyLock, Mutex};
 

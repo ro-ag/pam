@@ -91,9 +91,11 @@ a fresh sample if a post-#102 daemon stops answering); #28 closed (a refused
 download start now unlocks its transfer lock explicitly, PR 142); #29 closed
 (observations and the summary evidence identity name the model and the record
 that admitted it, PR 141); #30 closed (`flow.inspect` and `pam status` carry the
-tier readiness verdict, PR 140). Open after plan 38: #32 (`pam wait` raced
-result readability once on a loaded Linux CI gate; reproduce under load before
-changing the fail-closed answer) and the Windows set. `pam_daemon::diagnosis_service`
+tier readiness verdict, PR 140). Plan 39 then closed #32: a follower's `query`
+landing between a running flow's evidence insert and its view publish had been
+refused as `result_unavailable`; the store now tells an unpublished view
+(pending while the request runs) from a view under another repository (never
+readable), PR 145. Open after plan 39: the Windows set only. `pam_daemon::diagnosis_service`
 still has no production caller — a product decision, not dead code.
 
 No release, tag or push is implied by this checkpoint.

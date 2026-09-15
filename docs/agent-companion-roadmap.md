@@ -77,8 +77,9 @@ with its named blockers (native capture, 32 GB hardware, live connectors, Window
 Plan 38 (2026-09-15) closed the checkpoint's residuals: readiness-aware `flow.inspect`
 and `status` (PR 140), the summarizing model named in the agent result (PR 141),
 the download lock released on a refused start (PR 142), and the daemon wedge
-retired after a 30-minute churn reproduction attempt; issue #32 (a `pam wait`
-readability race under CI load) is the one new open item.
+retired after a 30-minute churn reproduction attempt. Plan 39 closed the one item
+that surfaced meanwhile: `pam wait` raced a running flow's evidence-view publish
+and read `result_unavailable`; the daemon now reads that window as pending (PR 145).
 Task dependencies, rather than broad plan barriers, allow independent work.
 Every task carries its own caller/integration and acceptance note in ptrack.
 

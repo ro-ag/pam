@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use crate::engine::Target;
 use crate::gguf_test::{GGML_F32, GgufValue, synth_gguf, tiny_moe_gguf};
+use crate::qualification::Qualification;
 use crate::registry::{
     ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, classify, default_models_dir,
-    sha256_file, verified_sidecar_path,
+    qualify, sha256_file, verified_sidecar_path,
 };
 
 /// A models dir with `qwen/<name>` written from `bytes`.
@@ -319,8 +321,70 @@ fn entry_at(path: &Path) -> ModelEntry {
         info_error: None,
         class: ModelClass::TestOnly,
         verified: None,
+        qualification: None,
         catalog_id: None,
     }
+}
+
+/// Leaks a one-record table naming `sha256` on the current target, the way a
+/// harness qualifies a fixture it just hashed.
+fn table_for(sha256: &str) -> &'static [Qualification] {
+    Box::leak(
+        vec![Qualification {
+            artifact: "fixture",
+            sha256: Box::leak(sha256.to_owned().into_boxed_str()),
+            engine_tag: crate::engine::ENGINE_TAG,
+            targets: Box::leak(vec![Target::current().unwrap()].into_boxed_slice()),
+            contract: "test",
+            case_set_sha256: "",
+            record: "docs/benchmarks/none",
+            host: "test",
+            accuracy: 1.0,
+            false_passes: 0,
+            warm_p95_ms: 1,
+            decided: "2026-01-01",
+        }]
+        .into_boxed_slice(),
+    )
+}
+
+#[test]
+fn a_verified_digest_is_qualified_only_when_a_record_names_it_on_this_target() {
+    let (dir, _) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let (sha256, size) = sha256_file(&path).unwrap();
+
+    let unqualified = Registry::with_qualifications(dir.path(), table_for("not-this-digest"));
+    unqualified
+        .record_verified(
+            &path,
+            &VerifiedRecord {
+                sha256: sha256.clone(),
+                size_bytes: size,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    let entry = unqualified.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(entry.class, ModelClass::Engine, "verified");
+    assert_eq!(
+        entry.qualification, None,
+        "but nothing measured this digest"
+    );
+
+    let qualified = Registry::with_qualifications(dir.path(), table_for(&sha256));
+    let entry = qualified.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(
+        entry.qualification.map(|record| record.artifact),
+        Some("fixture")
+    );
+
+    assert_eq!(
+        qualify(None, table_for(&sha256)),
+        None,
+        "an unverified file is never qualified, whatever the table says"
+    );
 }
 
 #[test]

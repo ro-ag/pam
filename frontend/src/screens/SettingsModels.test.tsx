@@ -6,7 +6,7 @@ import App, { createAppQueryClient } from "../App";
 import type { AgentCli, ModelEntry, ModelsStatus } from "../lib/ipc";
 import { applyTheme } from "../lib/theme";
 import { createAppRouter } from "../router";
-import { FLOOR_SENTENCE } from "./Models";
+import { FLOOR_SENTENCE, UNQUALIFIED_SENTENCE } from "./Models";
 import { CURATOR_AGENTS, SettingsModelsSection } from "./SettingsModels";
 
 /**
@@ -59,6 +59,20 @@ function engineEntry(): ModelEntry {
     info_error: null,
     class: "engine",
     verified: null,
+    qualification: {
+      artifact: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+      sha256: "fadc3e5f",
+      engine_tag: "b10938",
+      targets: ["macos-arm64"],
+      contract: "answer-contract-v2",
+      case_set_sha256: "7796",
+      record: "docs/benchmarks/2026-09-15-answer-contract-v2",
+      host: "test host",
+      accuracy: 0.98,
+      false_passes: 0,
+      warm_p95_ms: 593,
+      decided: "2026-09-15",
+    },
     catalog_id: "qwen3-coder-30b-a3b-q4_k_m",
   };
 }
@@ -69,6 +83,16 @@ function testOnlyEntry(): ModelEntry {
     id: "qwen/Qwen3-0.6B-Q8_0",
     size_bytes: 639_000_000,
     class: "test_only",
+    qualification: null,
+  };
+}
+
+function unqualifiedEntry(): ModelEntry {
+  return {
+    ...engineEntry(),
+    id: "candidates/gpt-oss-20b-MXFP4",
+    size_bytes: 12_109_566_624,
+    qualification: null,
   };
 }
 
@@ -87,7 +111,7 @@ beforeEach(() => {
   mocks.readDaemonLog.mockResolvedValue({ file: "/tmp/daemon.log", lines: [] });
   mocks.modelsStatus.mockResolvedValue(status());
   mocks.modelsList.mockResolvedValue({
-    models: [engineEntry(), testOnlyEntry()],
+    models: [engineEntry(), testOnlyEntry(), unqualifiedEntry()],
     models_dir: "/Users/dev/llm",
   });
   mocks.modelsDefaultsSet.mockResolvedValue({ tier: "heavy", model_id: null });
@@ -150,6 +174,15 @@ describe("tier defaults", () => {
       }),
     ).toBeEnabled();
     expect(within(heavy).getByRole("option", { name: "none (deterministic)" })).toBeEnabled();
+  });
+
+  it("offers a verified but unqualified model disabled, with the qualification sentence", async () => {
+    const section = await renderModelsSection();
+    const heavy = await section.findByLabelText("heavy tier default");
+    const option = await within(heavy).findByRole("option", {
+      name: `candidates/gpt-oss-20b-MXFP4 — ${UNQUALIFIED_SENTENCE}`,
+    });
+    expect(option).toBeDisabled();
   });
 });
 

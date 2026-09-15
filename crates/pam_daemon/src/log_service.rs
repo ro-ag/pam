@@ -50,6 +50,13 @@ pub const CAUSE_NO_DEFAULT: &str = "no_default";
 /// [`ModelSkipped::cause`] when the configured model is not installed.
 pub const CAUSE_MODEL_MISSING: &str = "model_missing";
 
+/// [`ModelSkipped::cause`] when the configured model has no verified digest.
+pub const CAUSE_MODEL_UNVERIFIED: &str = "model_unverified";
+
+/// [`ModelSkipped::cause`] when the configured model is verified but has no
+/// qualification record on this target.
+pub const CAUSE_MODEL_UNQUALIFIED: &str = "model_unqualified";
+
 /// [`ModelSkipped::cause`] when a store write cost us the summary row.
 pub const CAUSE_STORE_ERROR: &str = "store_error";
 
@@ -126,9 +133,9 @@ pub struct ModelUse {
 /// Why there is no summary, in terms the GUI can render.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelSkipped {
-    /// Machine-readable reason: [`CAUSE_NO_DEFAULT`],
-    /// [`CAUSE_MODEL_MISSING`], [`CAUSE_STORE_ERROR`], or a
-    /// [`pam_model::RuntimeError::cause`] verbatim.
+    /// Machine-readable reason: [`CAUSE_NO_DEFAULT`], [`CAUSE_MODEL_MISSING`],
+    /// [`CAUSE_MODEL_UNVERIFIED`], [`CAUSE_MODEL_UNQUALIFIED`],
+    /// [`CAUSE_STORE_ERROR`], or a [`pam_model::RuntimeError::cause`] verbatim.
     pub cause: String,
     /// The failure in words.
     pub detail: String,
@@ -653,6 +660,8 @@ fn skipped(err: &ModelUnavailable) -> ModelSkipped {
         ModelUnavailable::Service(_) => "model_registry_failed",
         ModelUnavailable::NoDefault(_) => CAUSE_NO_DEFAULT,
         ModelUnavailable::Missing(_) => CAUSE_MODEL_MISSING,
+        ModelUnavailable::Unverified(_) => CAUSE_MODEL_UNVERIFIED,
+        ModelUnavailable::Unqualified(_) => CAUSE_MODEL_UNQUALIFIED,
         ModelUnavailable::Runtime(runtime) => runtime.cause(),
         ModelUnavailable::Store(_) => CAUSE_STORE_ERROR,
     };

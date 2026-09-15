@@ -6,7 +6,10 @@
 //! [`classify`] admits a model only once its SHA-256 is verified ([`ModelClass::Engine`]);
 //! unverified is [`ModelClass::TestOnly`] — loadable/promptable to prove wiring, but never
 //! a tier default, since a job must never run on unchecked bytes; size is no longer a
-//! criterion. [`Registry::verify`] streams SHA-256 to a `.<file>.pam-model.verified`
+//! criterion. Verified is not yet qualified: [`ModelEntry::qualification`] is set only when
+//! the verified digest matches a [`crate::qualification`] record measured on the pinned
+//! engine and the current target, and only a qualified entry may serve a job.
+//! [`Registry::verify`] streams SHA-256 to a `.<file>.pam-model.verified`
 //! sidecar; against a matching catalog preset it records `Some(true)` (expected bytes),
 //! `Some(false)` (wrong bytes under that name), or `None` (nothing to compare); an
 //! unreadable or stale sidecar counts as absent, not an error. All calls hit the
@@ -20,11 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{CATALOG, find_preset};
+use crate::engine::Target;
 use crate::gguf::{self, GgufError, GgufInfo};
+use crate::qualification::{self, Qualification};
 
-/// The line between a model that may serve a job and one that may only
-/// prove the wiring works: 18 GB.
-///
 /// Chunk size for [`sha256_file`]. Big enough that the syscall overhead
 /// disappears, small enough to stay off the stack and out of the way.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
@@ -67,6 +69,10 @@ pub struct ModelEntry {
     pub class: ModelClass,
     /// The last verification, read back from the sidecar.
     pub verified: Option<VerifiedRecord>,
+    /// The admission evidence for this exact digest on this target, when there is
+    /// any. `None` for an unverified file, a verified file nobody has measured, or a
+    /// measured file on a target it was not measured on.
+    pub qualification: Option<Qualification>,
     /// Catalog preset whose file name this is, when there is one.
     pub catalog_id: Option<&'static str>,
 }
@@ -129,6 +135,9 @@ pub enum RegistryError {
 #[derive(Debug, Clone)]
 pub struct Registry {
     dir: PathBuf,
+    /// The qualification table entries are matched against; the compiled-in
+    /// one outside tests.
+    qualifications: &'static [Qualification],
 }
 
 impl Registry {
@@ -136,7 +145,19 @@ impl Registry {
     /// scan of a missing directory is simply empty, which is the honest
     /// answer on a machine with no models.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self::with_qualifications(dir, qualification::QUALIFIED)
+    }
+
+    /// [`Registry::new`] with an explicit qualification table, so a harness can
+    /// qualify a fixture it just wrote. Production callers use the compiled-in table.
+    pub fn with_qualifications(
+        dir: impl Into<PathBuf>,
+        qualifications: &'static [Qualification],
+    ) -> Self {
+        Self {
+            dir: dir.into(),
+            qualifications,
+        }
     }
 
     /// The models directory this registry covers.
@@ -194,6 +215,7 @@ impl Registry {
                     &vendor,
                     &file_name,
                     model_entry.metadata()?.len(),
+                    self.qualifications,
                 ));
             }
         }
@@ -302,12 +324,20 @@ impl Registry {
 }
 
 /// Builds the entry for one file, reading its header and its sidecar.
-fn describe(path: &Path, vendor: &str, file_name: &str, size_bytes: u64) -> ModelEntry {
+fn describe(
+    path: &Path,
+    vendor: &str,
+    file_name: &str,
+    size_bytes: u64,
+    qualifications: &'static [Qualification],
+) -> ModelEntry {
     let stem = file_name.strip_suffix(".gguf").unwrap_or(file_name);
     let (info, info_error) = match gguf::read_info(path) {
         Ok(info) => (Some(info), None),
         Err(error) => (None, Some(error.to_string())),
     };
+    let verified = read_verified(path);
+    let qualification = qualify(verified.as_ref(), qualifications);
 
     ModelEntry {
         id: format!("{vendor}/{stem}"),
@@ -317,8 +347,9 @@ fn describe(path: &Path, vendor: &str, file_name: &str, size_bytes: u64) -> Mode
         size_bytes,
         info,
         info_error,
-        class: classify(read_verified(path).as_ref()),
-        verified: read_verified(path),
+        class: classify(verified.as_ref()),
+        verified,
+        qualification,
         catalog_id: CATALOG
             .iter()
             .find(|preset| preset.file_name == file_name)
@@ -356,7 +387,7 @@ fn now_unix_seconds() -> i64 {
         })
 }
 
-/// Whether a file may serve jobs: only a verified digest admits it.
+/// Whether a file may be a tier default at all: only a verified digest admits it.
 #[must_use]
 pub fn classify(verified: Option<&VerifiedRecord>) -> ModelClass {
     if verified.is_some() {
@@ -364,6 +395,18 @@ pub fn classify(verified: Option<&VerifiedRecord>) -> ModelClass {
     } else {
         ModelClass::TestOnly
     }
+}
+
+/// The qualification a verified digest carries on the current target, from
+/// `records`. Nothing is qualified without a verification, on an unsupported
+/// target, or on a target the record does not cover.
+#[must_use]
+pub fn qualify(
+    verified: Option<&VerifiedRecord>,
+    records: &'static [Qualification],
+) -> Option<Qualification> {
+    let target = Target::current()?;
+    qualification::find_in(records, &verified?.sha256, target).copied()
 }
 
 /// `$HOME/llm` — the owner's existing layout, and the default the daemon

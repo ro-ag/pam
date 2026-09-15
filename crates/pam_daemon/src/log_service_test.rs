@@ -263,11 +263,10 @@ fn registry_coordinates(path: &Path) -> (PathBuf, String) {
 /// ```
 ///
 /// The path must sit in the registry layout — `<models dir>/<vendor>/<file>.gguf`.
-/// The tier default is seeded straight into the settings table rather than
-/// through `admin.models.defaults.set`, because that op enforces an
-/// engine-class floor a wiring model will never clear; `resolve` does not,
-/// and `resolve` is what this exercises. With the variable unset the test
-/// prints how to enable it and passes.
+/// The tier default is seeded straight into the settings table, and the file is
+/// hashed and qualified through the in-crate test hook, because a wiring model
+/// has no qualification record and `resolve` refuses anything without one. With
+/// the variable unset the test prints how to enable it and passes.
 #[tokio::test]
 async fn bench_model_writes_a_summary_row() {
     let Some(raw) = std::env::var_os(BENCH_MODEL_ENV) else {
@@ -305,6 +304,20 @@ async fn bench_model_writes_a_summary_row() {
         .await
         .unwrap();
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let (sha256, size_bytes) = pam_model::registry::sha256_file(Path::new(&raw)).unwrap();
+    models
+        .registry()
+        .record_verified(
+            Path::new(&raw),
+            &pam_model::VerifiedRecord {
+                sha256: sha256.clone(),
+                size_bytes,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    models.qualify_for_tests(&sha256);
     let logs = LogService::new(Arc::clone(&store), models);
 
     let mut log = String::new();

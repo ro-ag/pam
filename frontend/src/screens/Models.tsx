@@ -56,9 +56,24 @@ const TRY_DEFAULT_MAX_TOKENS = 64;
 /** The sentence a `test_only` model carries wherever it is offered. */
 export const FLOOR_SENTENCE = "unverified — wiring checks only, never a tier default";
 
+/** The sentence a verified but unqualified model carries wherever it is offered. */
+export const UNQUALIFIED_SENTENCE =
+  "verified, not qualified — Try only, never a tier default";
+
 /** The admission rule, said plainly, next to the paste-URL form. */
 const FLOOR_NOTE =
-  "Unverified models load only as test-only: run Verify and they can serve jobs.";
+  "Unverified models load only as test-only; a job needs a verified digest that met the capability gates on this platform.";
+
+/**
+ * Why an entry cannot be a tier default, or undefined when it can. The same
+ * two refusals the daemon makes (`unverified`, `unqualified`), so the human
+ * never has to earn the refusal to learn the rule.
+ */
+export function admissionBlocker(entry: ModelEntry): string | undefined {
+  if (entry.class === "test_only") return FLOOR_SENTENCE;
+  if (entry.qualification === null) return UNQUALIFIED_SENTENCE;
+  return undefined;
+}
 
 /** Empty library, in Pam's voice. */
 export const EMPTY_LIBRARY_SENTENCE =
@@ -135,9 +150,28 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** The class badge plus, for test-only weights, the reason it is capped. */
+/** The admission badge plus, for anything short of qualified, the reason it is capped. */
 function ClassBadge({ entry }: { entry: ModelEntry }) {
-  if (entry.class === "engine") return <Badge tone="success">engine</Badge>;
+  const qualification = entry.qualification;
+  if (qualification !== null) {
+    return (
+      <span className="space-y-1">
+        <Badge tone="success">qualified</Badge>
+        <span className="block font-sans text-xs text-ink-faint">
+          {qualification.contract} · {(qualification.accuracy * 100).toFixed(1)}% ·{" "}
+          {qualification.false_passes} false passes · {qualification.decided}
+        </span>
+      </span>
+    );
+  }
+  if (entry.class === "engine") {
+    return (
+      <span className="space-y-1">
+        <Badge tone="neutral">engine</Badge>
+        <span className="block font-sans text-xs text-ink-faint">{UNQUALIFIED_SENTENCE}</span>
+      </span>
+    );
+  }
   return (
     <span className="space-y-1">
       <Badge tone="neutral">test only</Badge>
@@ -317,7 +351,7 @@ function LibraryRow({
   onVerify: () => void;
   onDelete: () => void;
 }) {
-  const testOnly = entry.class === "test_only";
+  const blocker = admissionBlocker(entry);
   return (
     <tr className="border-t border-line align-top">
       <td className="py-2.5 pr-3">
@@ -354,8 +388,8 @@ function LibraryRow({
           <Button
             size="sm"
             variant="ghost"
-            disabled={busy || testOnly}
-            title={testOnly ? FLOOR_SENTENCE : undefined}
+            disabled={busy || blocker !== undefined}
+            title={blocker}
             onClick={() => onDefault("light")}
           >
             Set light
@@ -363,8 +397,8 @@ function LibraryRow({
           <Button
             size="sm"
             variant="ghost"
-            disabled={busy || testOnly}
-            title={testOnly ? FLOOR_SENTENCE : undefined}
+            disabled={busy || blocker !== undefined}
+            title={blocker}
             onClick={() => onDefault("heavy")}
           >
             Set heavy

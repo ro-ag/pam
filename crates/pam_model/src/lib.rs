@@ -6,8 +6,9 @@
 //! [`gguf`], [`catalog`], [`registry`], [`download`], [`runtime`], [`engine`] /
 //! [`engine_server`] (out-of-process `llama.cpp`), [`curator`], [`error`].
 //! [`registry::classify`] admits a model only once its digest is verified
-//! ([`ModelClass::Engine`], eligible as a tier default); unverified is
-//! [`ModelClass::TestOnly`] — loadable/promptable to prove wiring, never a tier default.
+//! ([`ModelClass::Engine`]); unverified is [`ModelClass::TestOnly`] — loadable/promptable to
+//! prove wiring, never a tier default. Serving a job takes more: the verified digest must
+//! match a [`qualification`] record measured on the pinned engine and this target.
 //! Registry/GGUF calls are synchronous filesystem hits ([`registry::sha256_file`] streams
 //! gigabytes); async callers must wrap them in `spawn_blocking` themselves.
 
@@ -22,6 +23,9 @@ pub mod engine_http;
 pub mod engine_server;
 pub mod error;
 pub mod gguf;
+pub mod qualification;
+#[cfg(test)]
+mod qualification_test;
 pub mod registry;
 pub mod runtime;
 
@@ -42,6 +46,7 @@ pub use download::{
     start,
 };
 pub use gguf::{GgufError, GgufInfo, read_info};
+pub use qualification::{QUALIFIED, Qualification};
 pub use registry::{
     ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, VerifyOutcome, classify,
     default_models_dir,

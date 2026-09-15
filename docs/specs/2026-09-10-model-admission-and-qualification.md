@@ -141,6 +141,20 @@ whatever fits, and quality is the capability bench's verdict (see
 `docs/benchmarks/2026-09-13-llama-engine-screen`), which is what let gpt-oss-20b
 (12.1 GB, the best-scoring artifact) become a default.
 
+**2026-09-15 (plan 34, task #96):** verification admits nothing to a job on its own.
+A compiled-in qualification table (`pam_model::qualification::QUALIFIED`) binds an
+exact artifact SHA-256 to the pinned engine tag, the targets it was measured on, the
+frozen contract and case-set digest, the gate figures and the evidence record path.
+A registry entry is *qualified* when its verified digest matches a record covering
+the current target; `admin.models.defaults.set` and `ModelService::resolve` both
+refuse anything else (`unverified`, `unqualified`), so a default seeded past the
+admin op is refused at the same line. Diagnostics (`admin.models.try`) still run on
+any installed model. A unit test refuses a record whose engine tag is not the pinned
+one, so bumping the engine forces requalification. The only record is
+gpt-oss-20b-MXFP4 on b10938/macos-arm64 under answer contract v2
+(`docs/benchmarks/2026-09-15-answer-contract-v2`); Linux and Windows builds stay
+unqualified until measured there. Memory is not a gate and is not in the record.
+
 ## One paired acceptance experiment
 
 Replay frozen incident bundles from git, lint, tests, builds, Sonar and publishing.

@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pam_model::download::{DownloadError, DownloadHandle, DownloadRequest, DownloadState};
 use pam_model::engine;
 use pam_model::engine_server::{EngineServer, EngineServerError, ServerOptions};
-use pam_model::registry::{ModelEntry, Registry, RegistryError, default_models_dir};
+use pam_model::qualification::{QUALIFIED, Qualification};
+use pam_model::registry::{ModelClass, ModelEntry, Registry, RegistryError, default_models_dir};
 use pam_model::runtime::{
     GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot, RuntimeState,
 };
@@ -148,6 +149,13 @@ pub enum ModelUnavailable {
     /// The configured model id is not in the models directory.
     #[error("default model {0} is not installed")]
     Missing(String),
+    /// The configured model has no verified digest, so nothing vouches for its bytes.
+    #[error("default model {0} is not verified")]
+    Unverified(String),
+    /// The configured model is verified but no qualification record covers its
+    /// digest on this target: it proves the wiring, it does not serve a job.
+    #[error("default model {0} is not qualified on this target")]
+    Unqualified(String),
     /// The runtime refused or failed.
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
@@ -216,6 +224,9 @@ pub struct ModelService {
     /// [`Registry`] is rebuilt from it on every read, so no caller can
     /// hold a stale one.
     models_dir: RwLock<PathBuf>,
+    /// The qualification table every registry read matches against: the
+    /// compiled-in one, or a fixture table an in-crate test installed.
+    qualifications: RwLock<&'static [Qualification]>,
     /// Where the llama.cpp engine is installed (`<base>/engine`); set by
     /// the daemon from its base directory. Unset (tests) falls back to a
     /// private directory beside the models.
@@ -268,6 +279,7 @@ impl ModelService {
         let service = Arc::new(Self {
             store,
             models_dir: RwLock::new(models_dir),
+            qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
             engine: std::sync::Mutex::new(None),
             busy: AtomicBool::new(false),
@@ -379,7 +391,42 @@ impl ModelService {
     /// A registry over the configured models directory.
     #[must_use]
     pub fn registry(&self) -> Registry {
-        Registry::new(self.models_dir())
+        Registry::with_qualifications(self.models_dir(), *self.qualifications())
+    }
+
+    fn qualifications(&self) -> std::sync::RwLockReadGuard<'_, &'static [Qualification]> {
+        self.qualifications
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Qualifies `sha256` on the current target with a leaked one-record table,
+    /// so a test can drive the production gate with a fixture it just hashed.
+    #[cfg(test)]
+    pub(crate) fn qualify_for_tests(&self, sha256: &str) {
+        let table: &'static [Qualification] = Box::leak(
+            vec![Qualification {
+                artifact: "fixture",
+                sha256: Box::leak(sha256.to_owned().into_boxed_str()),
+                engine_tag: engine::ENGINE_TAG,
+                targets: Box::leak(
+                    vec![engine::Target::current().expect("a supported target")].into_boxed_slice(),
+                ),
+                contract: "test",
+                case_set_sha256: "",
+                record: "docs/benchmarks/none",
+                host: "test",
+                accuracy: 1.0,
+                false_passes: 0,
+                warm_p95_ms: 1,
+                decided: "2026-01-01",
+            }]
+            .into_boxed_slice(),
+        );
+        *self
+            .qualifications
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = table;
     }
 
     /// Total physical RAM, measured once at construction — what the
@@ -430,7 +477,9 @@ impl ModelService {
     ///
     /// The fallback is deterministic and one step deep: `heavy` → `light`
     /// → nothing. A `light` tier never borrows the heavy model, because
-    /// the point of `light` is that it is cheap.
+    /// the point of `light` is that it is cheap. The entry must be admitted
+    /// ([`Self::admit`]): a configured id that has lost its verification or
+    /// was never qualified stays configured and visible, but does not serve.
     pub async fn resolve(&self, tier: Tier) -> Result<ModelEntry, ModelUnavailable> {
         let (light, heavy) = self.defaults().await?;
         let configured = match tier {
@@ -438,7 +487,22 @@ impl ModelService {
             Tier::Heavy => heavy.or(light),
         };
         let id = configured.ok_or(ModelUnavailable::NoDefault(tier))?;
-        self.find(&id).await?.ok_or(ModelUnavailable::Missing(id))
+        let entry = self.find(&id).await?.ok_or(ModelUnavailable::Missing(id))?;
+        Self::admit(&entry)?;
+        Ok(entry)
+    }
+
+    /// The job gate: verified digest and a qualification on this target. Applied
+    /// where a tier is pointed at a model and where a tier resolves, so a default
+    /// seeded past the admin op is refused at the same line.
+    pub fn admit(entry: &ModelEntry) -> Result<(), ModelUnavailable> {
+        if entry.class == ModelClass::TestOnly {
+            return Err(ModelUnavailable::Unverified(entry.id.clone()));
+        }
+        if entry.qualification.is_none() {
+            return Err(ModelUnavailable::Unqualified(entry.id.clone()));
+        }
+        Ok(())
     }
 
     /// One generation on the tier's model, loading it if needed.

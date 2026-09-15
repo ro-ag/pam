@@ -8,6 +8,7 @@ import { createAppRouter } from "../router";
 import {
   EMPTY_LIBRARY_SENTENCE,
   FLOOR_SENTENCE,
+  UNQUALIFIED_SENTENCE,
   IDLE_RUNTIME_SENTENCE,
   POLL_BUSY_MS,
   POLL_IDLE_MS,
@@ -104,6 +105,20 @@ function entry(overrides: Partial<ModelEntry> = {}): ModelEntry {
       verified_ts: nowSec - 600,
       matches_catalog: true,
     },
+    qualification: {
+      artifact: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
+      sha256: "fadc3e5f",
+      engine_tag: "b10938",
+      targets: ["macos-arm64"],
+      contract: "answer-contract-v2",
+      case_set_sha256: "7796",
+      record: "docs/benchmarks/2026-09-15-answer-contract-v2",
+      host: "test host",
+      accuracy: 0.98,
+      false_passes: 0,
+      warm_p95_ms: 593,
+      decided: "2026-09-15",
+    },
     catalog_id: "qwen3-coder-30b-a3b-q4_k_m",
     ...overrides,
   };
@@ -117,6 +132,7 @@ function testOnlyEntry(): ModelEntry {
     size_bytes: 639_000_000,
     class: "test_only",
     verified: null,
+    qualification: null,
     catalog_id: null,
     info: {
       architecture: "qwen3",
@@ -336,12 +352,29 @@ describe("library", () => {
     expect(table.getByRole("button", { name: "Load" })).toBeEnabled();
   });
 
-  it("offers a verified engine row its defaults, its size and its digest verdict", async () => {
-    mocks.modelsList.mockResolvedValue({ models: [entry()], models_dir: "/Users/dev/llm" });
+  it("badges a verified but unqualified row and refuses it as a tier default, with the reason", async () => {
+    mocks.modelsList.mockResolvedValue({
+      models: [entry({ qualification: null })],
+      models_dir: "/Users/dev/llm",
+    });
     renderModels();
     fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
     const table = within(await screen.findByRole("region", { name: "Installed models" }));
     expect(await table.findByText("engine")).toBeInTheDocument();
+    expect(table.getByText(UNQUALIFIED_SENTENCE)).toBeInTheDocument();
+    expect(table.getByText("verified")).toBeInTheDocument();
+    expect(table.getByRole("button", { name: "Set light" })).toBeDisabled();
+    expect(table.getByRole("button", { name: "Set heavy" })).toBeDisabled();
+    expect(table.getByRole("button", { name: "Load" })).toBeEnabled();
+  });
+
+  it("offers a qualified row its defaults, its evidence, its size and its digest verdict", async () => {
+    mocks.modelsList.mockResolvedValue({ models: [entry()], models_dir: "/Users/dev/llm" });
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Installed" }));
+    const table = within(await screen.findByRole("region", { name: "Installed models" }));
+    expect(await table.findByText("qualified")).toBeInTheDocument();
+    expect(table.getByText(/answer-contract-v2 · 98\.0% · 0 false passes/)).toBeInTheDocument();
     expect(table.getByText("verified")).toBeInTheDocument();
     expect(table.getByText("18.6 GB")).toBeInTheDocument();
     fireEvent.click(table.getByRole("button", { name: "Set heavy" }));

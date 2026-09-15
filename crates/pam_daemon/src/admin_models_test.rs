@@ -13,10 +13,11 @@ use crate::admin::{
 };
 use crate::admin_models::{
     CAUSE_ALREADY_INSTALLED, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED, CAUSE_UNKNOWN_MODEL,
-    CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET, OP_CURATOR_TEST,
-    OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE, OP_MODELS_DOWNLOAD,
-    OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST, OP_MODELS_LOAD,
-    OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD, OP_MODELS_VERIFY,
+    CAUSE_UNQUALIFIED, CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET,
+    OP_CURATOR_TEST, OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE,
+    OP_MODELS_DOWNLOAD, OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST,
+    OP_MODELS_LOAD, OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD,
+    OP_MODELS_VERIFY,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
@@ -235,9 +236,9 @@ impl GgufWriter {
     }
 }
 
-/// A minimal valid `qwen3` GGUF header — far under the engine floor, so
-/// the registry classes it `test_only`, which is exactly what the floor
-/// refusal needs to be provable without 18 GB of weights.
+/// A minimal valid `qwen3` GGUF header — unverified until a test hashes it,
+/// so the registry classes it `test_only`, which is exactly what the
+/// admission refusals need to be provable without real weights.
 fn tiny_gguf() -> Vec<u8> {
     let mut w = GgufWriter::default();
     w.buf.extend_from_slice(b"GGUF");
@@ -366,6 +367,64 @@ async fn a_test_only_model_is_refused_as_a_tier_default() {
             Outcome::Changed,
         );
         assert_eq!(body["model_id"], Value::Null);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_verified_model_needs_a_qualification_record_to_be_a_tier_default() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let path = fx.install_gguf("qwen", "tiny.gguf");
+        let (sha256, size_bytes) = pam_model::registry::sha256_file(&path).unwrap();
+        fx.models
+            .registry()
+            .record_verified(
+                &path,
+                &pam_model::VerifiedRecord {
+                    sha256: sha256.clone(),
+                    size_bytes,
+                    verified_ts: 0,
+                    matches_catalog: None,
+                },
+            )
+            .unwrap();
+
+        let listed = expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        assert_eq!(listed["models"][0]["class"], "engine");
+        assert_eq!(listed["models"][0]["qualification"], Value::Null);
+
+        let detail = expect_refusal(
+            fx.run(
+                OP_MODELS_DEFAULTS_SET,
+                json!({ "tier": "heavy", "model_id": "qwen/tiny" }),
+            )
+            .await,
+            CAUSE_UNQUALIFIED,
+        );
+        assert!(detail.contains("qwen/tiny"), "detail: {detail}");
+        assert_eq!(fx.models.defaults().await.unwrap(), (None, None));
+
+        fx.models.qualify_for_tests(&sha256);
+        let listed = expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        assert_eq!(
+            listed["models"][0]["qualification"]["sha256"],
+            sha256.as_str()
+        );
+        let body = expect_result(
+            fx.run(
+                OP_MODELS_DEFAULTS_SET,
+                json!({ "tier": "heavy", "model_id": "qwen/tiny" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(body["model_id"], "qwen/tiny");
+        assert_eq!(
+            fx.models.resolve(Tier::Heavy).await.unwrap().id,
+            "qwen/tiny"
+        );
     })
     .await
     .expect("test within deadline");

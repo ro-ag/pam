@@ -28,6 +28,73 @@ fn touch_model(dir: &std::path::Path, vendor: &str, file_name: &str) -> std::pat
     path
 }
 
+/// Verifies the placeholder at `path` (digest of whatever bytes are there) and
+/// qualifies that digest on this target, so the tier gate admits it.
+fn verify_and_qualify(service: &ModelService, path: &std::path::Path) {
+    let (sha256, size_bytes) = pam_model::registry::sha256_file(path).unwrap();
+    service
+        .registry()
+        .record_verified(
+            path,
+            &pam_model::VerifiedRecord {
+                sha256: sha256.clone(),
+                size_bytes,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    service.qualify_for_tests(&sha256);
+}
+
+#[tokio::test]
+async fn resolve_refuses_a_default_that_is_unverified_or_unqualified() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    service
+        .set_default(Tier::Light, Some("qwen/small"))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            service.resolve(Tier::Light).await.unwrap_err(),
+            ModelUnavailable::Unverified(ref id) if id == "qwen/small"
+        ),
+        "nothing vouches for the bytes"
+    );
+
+    let (sha256, size_bytes) = pam_model::registry::sha256_file(&path).unwrap();
+    service
+        .registry()
+        .record_verified(
+            &path,
+            &pam_model::VerifiedRecord {
+                sha256,
+                size_bytes,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            service.resolve(Tier::Light).await.unwrap_err(),
+            ModelUnavailable::Unqualified(ref id) if id == "qwen/small"
+        ),
+        "verified is not qualified"
+    );
+    assert_eq!(
+        service.defaults().await.unwrap().0.as_deref(),
+        Some("qwen/small"),
+        "the refused default stays configured and visible"
+    );
+
+    verify_and_qualify(&service, &path);
+    assert_eq!(service.resolve(Tier::Light).await.unwrap().id, "qwen/small");
+}
+
 #[tokio::test]
 async fn a_tier_with_no_default_is_unavailable_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -43,7 +110,8 @@ async fn a_tier_with_no_default_is_unavailable_not_an_error() {
 async fn heavy_falls_back_to_light_but_light_never_borrows_heavy() {
     let dir = tempfile::tempdir().unwrap();
     let service = service(dir.path()).await;
-    touch_model(dir.path(), "qwen", "small.gguf");
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    verify_and_qualify(&service, &path);
     service
         .set_default(Tier::Light, Some("qwen/small"))
         .await
@@ -380,7 +448,8 @@ async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
         .unwrap();
     let service = service(dir.path()).await;
     service.set_engine_base(dir.path().join("base"));
-    touch_model(dir.path(), "qwen", "tiny.gguf");
+    let path = touch_model(dir.path(), "qwen", "tiny.gguf");
+    verify_and_qualify(&service, &path);
     service
         .set_default(Tier::Light, Some("qwen/tiny"))
         .await

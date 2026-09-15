@@ -84,6 +84,16 @@ impl StepStatus {
     }
 }
 
+/// The model behind a step's summary: identity and admission evidence, never
+/// figures the reader would be tempted to trust in place of the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SummaryModel {
+    /// Registry id of the model that answered.
+    pub id: String,
+    /// The qualification record that admitted it.
+    pub qualification: Option<crate::log_service::ModelQualification>,
+}
+
 /// Why a step did not succeed, in the shape every pam refusal uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepError {
@@ -120,6 +130,10 @@ pub struct StepReport {
     /// The model's summary, for an `output: summarize` step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Which model wrote `summary`, and the record that admitted it. Absent when
+    /// the summary was skipped (then `summary` says why).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<SummaryModel>,
     /// Why it did not succeed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<StepError>,
@@ -139,6 +153,7 @@ impl StepReport {
             evidence: Vec::new(),
             evidence_unavailable: Vec::new(),
             summary: None,
+            summary_model: None,
             error: None,
         }
     }

@@ -10,6 +10,14 @@ one was declared. Without that declaration, target state is `not_declared`; pros
 step names and URLs in logs are never used to invent an association. Existing
 correlation status still determines whether product observations match that target.
 
+An observation whose text is a model summary names the model under `model`
+(2026-09-15): the registry id and the qualification record that admitted it
+(`artifact`, `contract`, `record`, `engine_tag`) — the record's identity, never
+its figures, so the reader goes to `docs/benchmarks` rather than trusting a number
+in a summary. Deterministic observations and skipped summaries carry no `model`;
+older stored projections read back without it. The summary evidence row's view
+identity (`kind: untrusted_model_output`) carries the same `model` block.
+
 Each observation carries up to four evidence handles with an explicit omitted count.
 These are supporting evidence, not authenticated decisive quotes. Current flows do
 not record formal quote attribution, so `decisive_citations` is empty and the missing

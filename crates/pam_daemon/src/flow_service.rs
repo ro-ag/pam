@@ -58,8 +58,8 @@ use crate::connector_service::{ConnectorService, InvokeError};
 use crate::daemon::{CAUSE_APPROVAL_DENIED, CAUSE_APPROVAL_TIMEOUT};
 use crate::executor::{CapabilityFailure, CapabilityOutput, ExecContext, outcome_str};
 use crate::flow_exec::{
-    CommandOutcome, CommandSpec, RunReport, StepReport, StepStatus, cancelled, outcome_for,
-    resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
+    CommandOutcome, CommandSpec, RunReport, StepReport, StepStatus, SummaryModel, cancelled,
+    outcome_for, resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
 };
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
 use crate::model_readiness::Stage;
@@ -2733,6 +2733,10 @@ impl RunState<'_> {
             self.evidence.push(id);
         }
         if summarize {
+            report.summary_model = compressed.model.as_ref().map(|used| SummaryModel {
+                id: used.id.clone(),
+                qualification: used.qualification.clone(),
+            });
             report.summary = compressed.summary_text.clone().or_else(|| {
                 compressed
                     .model_skipped

@@ -667,11 +667,23 @@ fn case_digest(cases: &[Case]) -> String {
 // ---------------------------------------------------------------------------
 
 /// The text the model committed to on its final `ANSWER:` line, if any. The
-/// marker may sit anywhere in the line; records never contain it.
+/// marker may sit anywhere in the line; records never contain it. The
+/// answer is the first word after the marker with any quoting or markup
+/// stripped: every family's truth is one token, so what follows that word
+/// is commentary, never the answer (contract v2; v1 kept the whole line).
 fn parse_answer(text: &str) -> Option<String> {
     let line = text.lines().rev().find(|line| line.contains("ANSWER:"))?;
-    let after = line.rsplit("ANSWER:").next()?.trim();
-    let answer = after.trim_end_matches('.').trim();
+    let after = line
+        .rsplit("ANSWER:")
+        .next()?
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`'));
+    let word = after.split_whitespace().next()?;
+    let answer = word.trim_matches(|c: char| {
+        matches!(
+            c,
+            '\'' | '"' | '`' | '*' | '_' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '.'
+        )
+    });
     if answer.is_empty() {
         None
     } else {
@@ -1204,4 +1216,25 @@ fn coverage_counts_a_missing_answer_on_a_decidable_case_as_not_covered() {
         ratio(decidable - 2, decidable),
         "{summary}"
     );
+}
+
+#[test]
+fn the_answer_is_the_first_word_after_the_last_marker_with_quotes_stripped() {
+    assert_eq!(
+        parse_answer("reasoning\nANSWER: PARALLEL\". Also we need to provide").as_deref(),
+        Some("PARALLEL")
+    );
+    assert_eq!(parse_answer("ANSWER: 'PASS'").as_deref(), Some("PASS"));
+    assert_eq!(
+        parse_answer("x\nANSWER: app-1.2.9.tar.gz.").as_deref(),
+        Some("app-1.2.9.tar.gz")
+    );
+    assert_eq!(parse_answer("ANSWER: v0.7.2\n").as_deref(), Some("v0.7.2"));
+    assert_eq!(
+        parse_answer("ANSWER: INCOMPLETE (no exit)").as_deref(),
+        Some("INCOMPLETE")
+    );
+    assert_eq!(parse_answer("**ANSWER:** FAIL").as_deref(), Some("FAIL"));
+    assert_eq!(parse_answer("ANSWER:"), None);
+    assert_eq!(parse_answer("no marker here"), None);
 }

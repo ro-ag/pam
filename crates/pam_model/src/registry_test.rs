@@ -5,7 +5,7 @@ use crate::gguf_test::{GGML_F32, GgufValue, synth_gguf, tiny_moe_gguf};
 use crate::qualification::Qualification;
 use crate::registry::{
     ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, classify, default_models_dir,
-    qualify, sha256_file, verified_sidecar_path,
+    is_plain_name, qualify, sha256_file, verified_sidecar_path,
 };
 
 /// A models dir with `qwen/<name>` written from `bytes`.
@@ -228,7 +228,7 @@ fn record_verified_is_what_a_finished_download_calls() {
 
     let record = VerifiedRecord {
         sha256: "a".repeat(64),
-        size_bytes: 7,
+        size_bytes: entry.size_bytes,
         verified_ts: 1_700_000_000,
         matches_catalog: Some(true),
     };
@@ -444,4 +444,130 @@ fn a_dense_model_scans_too() {
 fn default_models_dir_is_llm_under_home() {
     let dir = default_models_dir().expect("a home directory exists in the test environment");
     assert!(dir.ends_with("llm"), "{dir:?} should end in llm");
+}
+
+#[test]
+fn checked_dest_for_refuses_anything_but_one_plain_segment() {
+    let registry = Registry::new("/models");
+    assert_eq!(
+        registry.checked_dest_for("qwen", "Qwen3.gguf").unwrap(),
+        PathBuf::from("/models").join("qwen").join("Qwen3.gguf")
+    );
+    for bad in [
+        "",
+        ".",
+        "..",
+        "../x",
+        "..\\x",
+        "a/b",
+        "a\\b",
+        "/tmp",
+        "C:\\x",
+        ".hidden",
+        "a b",
+        "a\0b",
+        "ünïcode",
+    ] {
+        assert!(!is_plain_name(bad), "{bad:?} must not be a plain name");
+        assert!(
+            matches!(
+                registry.checked_dest_for(bad, "Qwen3.gguf"),
+                Err(RegistryError::InvalidName(name)) if name == bad
+            ),
+            "vendor {bad:?} must be refused"
+        );
+        assert!(
+            matches!(
+                registry.checked_dest_for("qwen", bad),
+                Err(RegistryError::InvalidName(name)) if name == bad
+            ),
+            "file name {bad:?} must be refused"
+        );
+    }
+    for good in ["qwen", "gpt-oss_20b.v2", "A1"] {
+        assert!(is_plain_name(good), "{good}");
+    }
+}
+
+#[test]
+fn a_rewritten_model_file_loses_its_verification_and_qualification() {
+    let (dir, _) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let (sha256, size) = sha256_file(&path).unwrap();
+    let registry = Registry::with_qualifications(dir.path(), table_for(&sha256));
+    registry
+        .record_verified(
+            &path,
+            &VerifiedRecord {
+                sha256,
+                size_bytes: size,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    let entry = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(entry.class, ModelClass::Engine);
+    assert!(
+        entry.qualification.is_some(),
+        "the fixture is qualified before the rewrite"
+    );
+
+    // Another file lands under the verified name: one more tensor, so the
+    // size differs and the old sidecar no longer describes these bytes.
+    let rewritten = synth_gguf(
+        3,
+        "qwen3",
+        15,
+        &[("output.weight", &[8, 8], GGML_F32)],
+        &[("qwen3.context_length", GgufValue::U32(8_192))],
+    );
+    assert_ne!(rewritten.len(), tiny_moe_gguf().len());
+    std::fs::write(&path, &rewritten).unwrap();
+
+    let entry = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(entry.verified, None, "a sidecar for other bytes is absent");
+    assert_eq!(entry.class, ModelClass::TestOnly);
+    assert_eq!(entry.qualification, None);
+    assert!(
+        verified_sidecar_path(&path).exists(),
+        "nothing is deleted, only distrusted"
+    );
+}
+
+#[test]
+fn a_sidecar_older_than_the_file_it_describes_is_stale() {
+    let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let entry = registry.find("qwen/tiny").unwrap().unwrap();
+    registry.verify(&entry).unwrap();
+    assert!(
+        registry
+            .find("qwen/tiny")
+            .unwrap()
+            .unwrap()
+            .verified
+            .is_some()
+    );
+
+    // Same size, newer bytes: the digest changed but the length did not, and
+    // the file's modification time is what gives it away.
+    let sidecar = verified_sidecar_path(&path);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&sidecar)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let mut bytes = tiny_moe_gguf();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert_eq!(
+        registry.find("qwen/tiny").unwrap().unwrap().verified,
+        None,
+        "a sidecar written before the file's last change describes other bytes"
+    );
 }

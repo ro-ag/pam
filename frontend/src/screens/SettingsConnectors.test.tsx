@@ -305,7 +305,7 @@ it("does not report cached Ready when the current read failed", async () => {
 it("says the keychain is reachable, and re-checks on demand", async () => {
   await setup();
   const banner = within(await screen.findByLabelText("keychain access"));
-  expect(banner.getByText("keychain · reachable")).toBeInTheDocument();
+  expect(banner.getByText("Keychain · reachable")).toBeInTheDocument();
 
   fireEvent.click(banner.getByRole("button", { name: "Re-check" }));
   // A Re-check asks the platform again rather than reading the daemon's
@@ -321,6 +321,6 @@ it("names a blocked keychain and carries its recovery", async () => {
   });
   await setup();
   const banner = within(await screen.findByLabelText("keychain access"));
-  expect(banner.getByText("keychain · denied")).toBeInTheDocument();
+  expect(banner.getByText("Keychain · denied")).toBeInTheDocument();
   expect(banner.getByText("Allow the access prompt when Pam asks.")).toBeInTheDocument();
 });

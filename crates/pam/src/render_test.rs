@@ -1,9 +1,10 @@
 use pam_proto::{Event, Outcome, Response};
 
+use crate::client::RequestError;
 use crate::render::{
-    EXIT_BLOCKED, EXIT_REFUSED, EXIT_UNRESOLVED, exit_code, parse_flow_inputs, render_event,
-    render_flow_list, render_flow_result, render_flow_show, render_json, render_refusal,
-    render_status, render_ticket,
+    CAUSE_FOLLOW_TIMEOUT, EXIT_BLOCKED, EXIT_REFUSED, EXIT_UNRESOLVED, exit_code,
+    parse_flow_inputs, render_event, render_flow_list, render_flow_result, render_flow_show,
+    render_follow_failure, render_json, render_refusal, render_status, render_ticket,
 };
 
 fn result(outcome: Outcome) -> Response {
@@ -562,4 +563,44 @@ fn durable_handoff_render_keeps_read_availability_and_escapes_content() {
     assert!(rendered.contains("expired"));
     assert!(rendered.contains("evidence_read"));
     assert!(!rendered.contains('\u{1b}'));
+}
+
+#[test]
+fn a_follow_failure_renders_as_a_refusal_object_only_under_json() {
+    let refused = RequestError::FollowRefused {
+        ticket: "req_t".to_owned(),
+        cause: "request_unavailable".to_owned(),
+        detail: "not yours".to_owned(),
+        recovery: "Check the GUI.".to_owned(),
+    };
+    assert_eq!(render_follow_failure(&refused, false), None);
+    let object: serde_json::Value =
+        serde_json::from_str(&render_follow_failure(&refused, true).expect("json")).unwrap();
+    assert_eq!(object["kind"], "refusal");
+    assert_eq!(object["id"], "req_t");
+    assert_eq!(object["cause"], "request_unavailable");
+    assert_eq!(object["detail"], "not yours");
+    assert_eq!(object["recovery"], "Check the GUI.");
+
+    let timed_out = RequestError::FollowTimeout {
+        ticket: "req_t".to_owned(),
+        waited: std::time::Duration::from_millis(250),
+    };
+    let object: serde_json::Value =
+        serde_json::from_str(&render_follow_failure(&timed_out, true).expect("json")).unwrap();
+    assert_eq!(object["kind"], "refusal");
+    assert_eq!(object["id"], "req_t");
+    assert_eq!(object["cause"], CAUSE_FOLLOW_TIMEOUT);
+    assert!(
+        object["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("pam wait req_t")
+    );
+
+    // Client-side failures keep the stderr line, JSON or not.
+    let ensure = RequestError::ReplyTimeout {
+        waited: std::time::Duration::from_secs(1),
+    };
+    assert_eq!(render_follow_failure(&ensure, true), None);
 }

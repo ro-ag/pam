@@ -317,10 +317,45 @@ pub fn render_systemd_unit(exe: &Path, base_override: Option<&Path>) -> String {
     let _ = writeln!(unit, "ExecStart=\"{}\" daemon", exe.display());
     unit.push_str("Restart=on-failure\nRestartSec=2\n");
     if let Some(base) = base_override {
-        let _ = writeln!(unit, "Environment=PAM_BASE_DIR={}", base.display());
+        let _ = writeln!(
+            unit,
+            "Environment=\"PAM_BASE_DIR={}\"",
+            systemd_quote(&base.display().to_string())
+        );
     }
     unit.push_str("\n[Install]\nWantedBy=default.target\n");
     unit
+}
+
+/// Escapes `value` for the inside of a double-quoted systemd assignment
+/// (`Environment="KEY=value"`): a bare value splits on whitespace, and
+/// inside the quotes only backslash and the quote itself need escaping.
+fn systemd_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '"') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted
+}
+
+/// Reads the `Status:` line of `schtasks /Query /FO LIST` output. A task
+/// the scheduler will run at logon reports `Ready` (or `Running` while the
+/// daemon is up); `Disabled` — and any status this parser does not know —
+/// counts as not loaded, so a task nobody re-enabled is never reported as
+/// armed.
+#[must_use]
+pub fn windows_task_loaded(query_output: &str) -> bool {
+    query_output
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case("status"))
+        .is_some_and(|(_, value)| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("ready") || value.eq_ignore_ascii_case("running")
+        })
 }
 
 /// The scheduled task's action: `conhost.exe --headless` runs the console
@@ -483,10 +518,19 @@ pub fn status(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport, Se
             }
         }
         Platform::Windows => {
-            if probe(runner, "schtasks", &args(&["/Query", "/TN", WINDOWS_TASK]))? {
+            let output = runner
+                .run(
+                    "schtasks",
+                    &args(&["/Query", "/TN", WINDOWS_TASK, "/FO", "LIST"]),
+                )
+                .map_err(|source| ServiceError::Spawn {
+                    program: "schtasks".to_owned(),
+                    source,
+                })?;
+            if output.status.success() {
                 ServiceState::Installed {
                     unit: WINDOWS_TASK.to_owned(),
-                    loaded: true,
+                    loaded: windows_task_loaded(&String::from_utf8_lossy(&output.stdout)),
                 }
             } else {
                 ServiceState::NotInstalled {

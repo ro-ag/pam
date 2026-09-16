@@ -10,7 +10,9 @@ import {
   workspaceSnapshot,
   type WorkspaceLayout,
 } from "../../lib/workspace";
+import { cn } from "../../lib/cn";
 import { Button, buttonVariants } from "../ui/Button";
+import { fieldClasses } from "../ui/field";
 
 /** Local viewing preferences only: selecting Build opens Flows but never runs one. */
 export function WorkspaceMenu() {
@@ -64,8 +66,15 @@ export function WorkspaceMenu() {
           <dialog
             ref={dialog}
             aria-labelledby={`${id}-title`}
-            onCancel={close}
-            className="workspace-dialog m-auto overflow-y-auto rounded-panel border border-line bg-surface p-5 text-ink shadow-xl backdrop:bg-black/40"
+            aria-modal="true"
+            onCancel={(event) => {
+              event.preventDefault();
+              close();
+            }}
+            onClick={(event) => {
+              if (event.target === event.currentTarget) close();
+            }}
+            className="workspace-dialog m-auto overflow-y-auto rounded-panel border border-line bg-surface p-5 text-ink shadow-float"
           >
             <div className="mb-4 flex items-center justify-between">
               <h2 id={`${id}-title`} className="font-display text-lg font-semibold">
@@ -188,7 +197,7 @@ export function WorkspaceMenu() {
                     value={name}
                     maxLength={40}
                     onChange={(event) => setName(event.target.value)}
-                    className="field-control h-8 min-w-0 flex-1 rounded-control border border-control-line bg-surface-raised px-2 text-sm"
+                    className={cn(fieldClasses, "w-auto min-w-0 flex-1 font-sans text-sm")}
                     placeholder="My workspace"
                   />
                   <Button type="submit" disabled={!name.trim() || workspace.saved.length >= 8}>

@@ -97,6 +97,7 @@ beforeEach(() => {
   mocks.daemonStatus.mockResolvedValue({
     connected: true,
     status: { daemon_version: "0.10.1", protocol: 1, uptime_s: 3_723, active_requests: 2 },
+    base_dir: "/Users/me/.pam",
   });
   mocks.daemonStop.mockResolvedValue({ outcome: "stopped", pid: 42 });
   mocks.serviceStatus.mockResolvedValue({
@@ -498,7 +499,7 @@ describe("appearance", () => {
 
   it("applies a theme family from its swatch card", async () => {
     renderSettings();
-    const vina = await screen.findByRole("button", { name: "Viña del Mar Night" });
+    const vina = await screen.findByRole("button", { name: "Viña del Mar dark" });
     expect(vina).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(vina);
     expect(document.documentElement.dataset.theme).toBe("vina");
@@ -521,10 +522,10 @@ describe("appearance", () => {
   it("previews all four Costa appearances with their own palette scope", async () => {
     renderSettings();
     for (const [label, family, mode] of [
-      ["Ventisquero Bedrock", "ventisquero", "dark"],
-      ["Ventisquero Mist", "ventisquero", "light"],
-      ["Viña del Mar Night", "vina", "dark"],
-      ["Viña del Mar Dawn", "vina", "light"],
+      ["Ventisquero dark", "ventisquero", "dark"],
+      ["Ventisquero light", "ventisquero", "light"],
+      ["Viña del Mar dark", "vina", "dark"],
+      ["Viña del Mar light", "vina", "light"],
     ]) {
       const card = await screen.findByRole("button", { name: label });
       expect(card.querySelector(`[data-theme='${family}']`)).toHaveAttribute("data-mode", mode);
@@ -542,7 +543,7 @@ describe("appearance", () => {
     expect(material).toBeChecked();
     expect(document.documentElement.dataset.material).toBe("opaque");
     expect(window.localStorage.getItem(materialStorageKey)).toBe("opaque");
-    fireEvent.click(screen.getByRole("button", { name: "Viña del Mar Dawn" }));
+    fireEvent.click(screen.getByRole("button", { name: "Viña del Mar light" }));
     expect(document.documentElement.dataset.material).toBe("opaque");
     fireEvent.click(material);
     expect(document.documentElement.dataset.material).toBe("glass");
@@ -559,7 +560,7 @@ describe("retention", () => {
     await waitFor(() => expect(evidence.value).toBe("90"));
     expect((screen.getByLabelText("audit age") as HTMLSelectElement).value).toBe("365");
     expect(
-      screen.getByText(/last pruned 12m ago · 41 evidence rows \(2 MB\) · 3 requests/),
+      screen.getByText(/pruned 41 evidence rows \(2 MB\) and 3 requests · 12m ago/),
     ).toBeInTheDocument();
     expect(screen.queryByText("arrives with retention")).not.toBeInTheDocument();
     expect(EVIDENCE_CHOICES).toEqual([30, 90, 365, null]);
@@ -599,7 +600,7 @@ describe("retention", () => {
     fireEvent.click(prune);
     await waitFor(() => expect(mocks.retentionPrune).toHaveBeenCalledTimes(1));
     expect(
-      await screen.findByText(/2 evidence rows \(512 B\) · 0 requests/),
+      await screen.findByText(/pruned 2 evidence rows \(512 B\) and 0 requests/),
     ).toBeInTheDocument();
   });
 
@@ -625,7 +626,8 @@ describe("daemon", () => {
     expect(card.getByText("1h 02m")).toBeInTheDocument();
     expect(card.getByText("2")).toBeInTheDocument();
     expect(card.getByText("running")).toBeInTheDocument();
-    expect(card.getByText(/base dir: ~\/\.pam/)).toBeInTheDocument();
+    // The live base dir the bridge resolved, not the documented rule.
+    expect(card.getByText(/base dir: \/Users\/me\/\.pam/)).toBeInTheDocument();
   });
 
   it("stops the daemon only after the two-tap confirm", async () => {
@@ -639,14 +641,85 @@ describe("daemon", () => {
     expect(await screen.findByText(/stopped · pid 42/)).toBeInTheDocument();
   });
 
-  it("labels restart honestly as stop + lazy start", async () => {
+  it("restarts only after the two-tap confirm, and says what stop answered", async () => {
     renderSettings("daemon");
-    const restart = await screen.findByRole("button", {
-      name: "Restart (stop + lazy start)",
-    });
+    const restart = await screen.findByRole("button", { name: "Restart" });
+    await waitFor(() => expect(restart).toBeEnabled());
     fireEvent.click(restart);
+    expect(mocks.daemonStop).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText(/starting it again/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/stopped · pid 42 · the next status poll starts it again/),
+    ).toBeInTheDocument();
+    // The sentence under the buttons says what a restart is.
+    expect(
+      screen.getByText(/Restart stops the daemon; the next status poll/),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps Stop and Restart closed while the daemon is unreachable", async () => {
+    mocks.daemonStatus.mockResolvedValue({ connected: false, status: null, base_dir: "/x" });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("unreachable")).toBeInTheDocument();
+    expect(card.getByRole("button", { name: "Stop daemon" })).toBeDisabled();
+    const restart = card.getByRole("button", { name: "Restart" });
+    expect(restart).toBeDisabled();
+    expect(restart).toHaveAttribute("title", "The daemon is not running");
+  });
+
+  it.each([
+    ["not_running", null, /was not running/],
+    ["still_draining", 42, /still draining · pid 42 · finishing in-flight work/],
+  ] as const)("reports a %s stop outcome in words", async (outcome, pid, expected) => {
+    mocks.daemonStop.mockResolvedValue({ outcome, pid });
+    renderSettings("daemon");
+    const stop = await screen.findByRole("button", { name: "Stop daemon" });
+    await waitFor(() => expect(stop).toBeEnabled());
+    fireEvent.click(stop);
+    fireEvent.click(screen.getByRole("button", { name: "stop it?" }));
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+  });
+
+  it("reports a restart of a daemon that was not running", async () => {
+    mocks.daemonStop.mockResolvedValue({ outcome: "not_running", pid: null });
+    renderSettings("daemon");
+    const restart = await screen.findByRole("button", { name: "Restart" });
+    await waitFor(() => expect(restart).toBeEnabled());
+    fireEvent.click(restart);
+    fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
+    expect(
+      await screen.findByText(/was not running · the next status poll starts it/),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the daemon's refusal when removing the login unit fails", async () => {
+    mocks.serviceStatus.mockResolvedValue({
+      platform: "linux",
+      exe: "/usr/bin/pam",
+      state: {
+        kind: "installed",
+        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        loaded: true,
+      },
+      note: null,
+    });
+    mocks.serviceUninstall.mockRejectedValue({
+      cause: "service_manager_failed",
+      detail: "systemctl --user disable --now refused",
+      recovery: "Run `pam service uninstall` from a shell to see the manager's own output.",
+    });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    fireEvent.click(await card.findByRole("button", { name: "Remove" }));
+    fireEvent.click(card.getByRole("button", { name: "remove it?" }));
+    expect(
+      await card.findByText(/start at login · service_manager_failed/),
+    ).toBeInTheDocument();
+    expect(card.getByText(/systemctl --user disable --now refused/)).toBeInTheDocument();
+    // The unit is still installed: Remove is offered again.
+    expect(card.getByRole("button", { name: "Remove" })).toBeInTheDocument();
   });
 
   it("offers to install the login unit when none exists", async () => {
@@ -736,7 +809,7 @@ describe("logs", () => {
     await screen.findByLabelText("daemon log lines");
     expect(screen.getByRole("button", { name: "refresh log" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "copy log lines" })).toBeEnabled();
-    expect(screen.getByRole("checkbox", { name: "auto 5s" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Refresh every 5 s" })).not.toBeChecked();
   });
 
   it("renders the uniform failure shape when the bridge is unavailable", async () => {

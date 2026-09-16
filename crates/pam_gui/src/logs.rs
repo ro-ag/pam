@@ -10,6 +10,7 @@
 //! name — ISO dates sort correctly as strings, no mtime reads needed.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
@@ -23,6 +24,12 @@ pub const MIN_LINES: u32 = 50;
 /// Largest tail a caller can ask for; anything higher clamps down so a
 /// huge log never floods the webview.
 pub const MAX_LINES: u32 = 1_000;
+
+/// How many bytes from the end of the file the tail reads: a day of
+/// daemon logging can run to hundreds of megabytes, and [`MAX_LINES`]
+/// lines never need more than this window. A line longer than the whole
+/// window is simply cut at its start.
+pub const TAIL_WINDOW_BYTES: u64 = 1024 * 1024;
 
 /// What [`read_daemon_log`] answers: which file was read, and its tail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,22 +92,41 @@ pub fn tail_daemon_log(base: &Path, lines: u32) -> Result<LogTail, BridgeError> 
             ));
         }
     };
-    // Lossy: a stray non-UTF-8 byte must never make the whole log
-    // unviewable — this is a diagnostics viewer, not an archive.
-    let bytes = fs::read(&newest).map_err(|err| {
+    let (bytes, truncated) = read_tail_window(&newest).map_err(|err| {
         BridgeError::new(
             "log_unreadable",
             format!("cannot read {}: {err}", newest.display()),
             "Check permissions on the pam log directory.",
         )
     })?;
+    // Lossy: a stray non-UTF-8 byte must never make the whole log
+    // unviewable — this is a diagnostics viewer, not an archive.
     let content = String::from_utf8_lossy(&bytes);
-    let all: Vec<&str> = content.lines().collect();
+    let mut all: Vec<&str> = content.lines().collect();
+    if truncated {
+        // The window started mid-line: the first "line" is a fragment.
+        all.remove(0);
+    }
     let tail = &all[all.len().saturating_sub(wanted)..];
     Ok(LogTail {
         file: newest.display().to_string(),
         lines: tail.iter().map(ToString::to_string).collect(),
     })
+}
+
+/// The last [`TAIL_WINDOW_BYTES`] of `path` (the whole file when it is
+/// smaller), and whether the window started past the file's first byte
+/// — in which case its first line is only a fragment.
+fn read_tail_window(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, start > 0))
 }
 
 /// The tail of the newest daemon log file, read straight from disk (no

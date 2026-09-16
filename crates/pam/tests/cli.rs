@@ -376,6 +376,73 @@ async fn cancel_stops_a_delayed_echo() {
     .expect("test within deadline");
 }
 
+/// `pam wait --timeout-ms` on a ticket still running: exit 1 (an
+/// observation timeout, not a verdict), the ticket named on stderr so the
+/// caller can come back for it, and with `--json` a refusal object on
+/// stdout instead — while the request itself keeps running.
+#[tokio::test]
+async fn wait_past_its_timeout_exits_one_and_keeps_the_ticket() {
+    warm_binary();
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let repo = temp_git_repo();
+        // The follow authorizes its ticket through the repository scope.
+        seed_repository_scope(&daemon, repo.path()).await;
+        let started = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["echo", r#"{"delay_ms": 6000}"#, "--no-wait", "--json"],
+        )
+        .await;
+        assert_eq!(started.code, 0, "{} {}", started.stdout, started.stderr);
+        let started: serde_json::Value = serde_json::from_str(&started.stdout).unwrap();
+        let ticket = started["ticket"].as_str().unwrap();
+
+        let waited = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["wait", ticket, "--timeout-ms", "300"],
+        )
+        .await;
+        assert_eq!(waited.code, 1, "{} {}", waited.stdout, waited.stderr);
+        assert!(waited.stdout.is_empty(), "{}", waited.stdout);
+        assert!(waited.stderr.starts_with("pam wait: "), "{}", waited.stderr);
+        assert!(waited.stderr.contains(ticket), "{}", waited.stderr);
+
+        let waited = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["wait", ticket, "--timeout-ms", "300", "--json"],
+        )
+        .await;
+        assert_eq!(waited.code, 1, "{} {}", waited.stdout, waited.stderr);
+        let object: serde_json::Value = serde_json::from_str(&waited.stdout).unwrap();
+        assert_eq!(object["kind"], "refusal");
+        assert_eq!(object["id"], ticket);
+        assert_eq!(object["cause"], render::CAUSE_FOLLOW_TIMEOUT);
+
+        // The timeout observed; it did not cancel: the request is still live.
+        let store = daemon.handle.store();
+        let row = store.get_request(ticket).await.unwrap().unwrap();
+        assert!(
+            matches!(row.state, RequestState::Queued | RequestState::Running),
+            "{:?}",
+            row.state
+        );
+        let cancelled = run_pam(&daemon.base(), repo.path(), &["cancel", ticket]).await;
+        assert_eq!(
+            cancelled.code, 0,
+            "{} {}",
+            cancelled.stdout, cancelled.stderr
+        );
+        wait_for_row(&store, ticket, |row| row.state == RequestState::Failed).await;
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
 #[tokio::test]
 async fn a_refusal_renders_cause_detail_and_recovery_and_exits_three() {
     timeout(DEADLINE, async {

@@ -5,7 +5,7 @@
 //! never a capability, never grantable). No `pam` subcommand builds these envelopes; a non-GUI
 //! caller trips the wire and is audited as [`crate::admin::ACTION_ADMIN_DENIED`]. An agent only
 //! reaches a connector via a flow step through
-//! [`crate::connector_service::ConnectorService::invoke`], gated by policy.
+//! [`crate::connector_service::ConnectorService::invoke_with_budget`], gated by policy.
 //!
 //! [`OP_CONNECTORS_TEST`] has a 10 s deadline ([`CONNECTOR_TEST_DEADLINE`]; GUI bridge 15 s), the
 //! other ops the usual 30 s. [`OP_CONNECTORS_CONFIGURE`] writes exactly one
@@ -309,7 +309,9 @@ fn credential_arg(args: &Value, op: &str) -> Result<Option<CredentialAction>, Ad
         if secret.is_empty() {
             return Err(malformed());
         }
-        return Ok(Some(CredentialAction::Set(secret.to_owned())));
+        return Ok(Some(CredentialAction::Set(crate::secrets::Secret::new(
+            secret.to_owned(),
+        ))));
     }
     if object.get("clear").and_then(Value::as_bool) == Some(true) {
         return Ok(Some(CredentialAction::Clear));

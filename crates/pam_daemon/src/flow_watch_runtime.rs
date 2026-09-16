@@ -3,7 +3,7 @@ use super::{
     Action, Arc, ArgValue, Attempt, BTreeMap, CallResult, CapabilityFailure, ConnectorId, Duration,
     Instant, RunState, Step, StepReport, StepStatus, Value, cancelled, json, rate_limit_wait,
 };
-use crate::flow_recovery::{WatchState, failure};
+use crate::flow_recovery::{Prepare, WatchState, failure};
 use crate::flow_watch::{self, State, WatchError};
 
 pub(super) fn watch_retryable(error: &crate::connector_service::InvokeError) -> bool {
@@ -32,14 +32,21 @@ fn blocked(step: &Step, cause: &str, detail: impl Into<String>) -> StepReport {
     report
 }
 
-fn status_call(connector: ConnectorId) -> &'static str {
+/// The bounded status call a watch polls, or `None` for a connector that
+/// has no watchable status; the caller refuses that before any scope check.
+pub(super) fn status_call(connector: ConnectorId) -> Option<&'static str> {
     match connector {
-        ConnectorId::Github => "run_status",
-        ConnectorId::Jenkins => "build_status",
-        ConnectorId::Sonarqube => "ce_status",
-        _ => "unsupported",
+        ConnectorId::Github => Some("run_status"),
+        ConnectorId::Jenkins => Some("build_status"),
+        ConnectorId::Sonarqube => Some("ce_status"),
+        _ => None,
     }
 }
+
+/// Step cause: the connector has no status call a watch can poll.
+const CAUSE_WATCH_UNSUPPORTED: &str = "watch_unsupported_connector";
+/// Step cause: the status call answered something other than JSON.
+const CAUSE_WATCH_MALFORMED: &str = "watch_status_malformed";
 
 const TARGET_CHANGED: &str = "watch_target_changed";
 
@@ -144,33 +151,29 @@ impl RunState<'_> {
         if step.watch.is_none() || !watch.collecting {
             return attempt;
         }
-        let Attempt::Succeeded {
-            result: Some(value),
-            ..
-        } = &attempt
-        else {
-            return attempt;
-        };
-        let Err(error) = flow_watch::validate_pins(connector, &watch.observation, value) else {
-            return attempt;
-        };
-        let Attempt::Succeeded {
-            result,
-            output,
-            exit_status,
-        } = attempt
-        else {
-            unreachable!()
-        };
-        Attempt::Failed {
-            result,
-            output,
-            exit_status,
-            status: StepStatus::Blocked,
-            cause: error.cause,
-            detail: error.detail.to_owned(),
-            recovery: crate::correlation::RECOVERY.to_owned(),
-            retry_after: None,
+        match attempt {
+            Attempt::Succeeded {
+                result: Some(value),
+                output,
+                exit_status,
+            } => match flow_watch::validate_pins(connector, &watch.observation, &value) {
+                Ok(()) => Attempt::Succeeded {
+                    result: Some(value),
+                    output,
+                    exit_status,
+                },
+                Err(error) => Attempt::Failed {
+                    result: Some(value),
+                    output,
+                    exit_status,
+                    status: StepStatus::Blocked,
+                    cause: error.cause,
+                    detail: error.detail.to_owned(),
+                    recovery: crate::correlation::RECOVERY.to_owned(),
+                    retry_after: None,
+                },
+            },
+            other => other,
         }
     }
 
@@ -233,14 +236,24 @@ impl RunState<'_> {
         // Ready is durable before parking or beginning the terminal collector.
         if collecting {
             self.recovery
-                .prepare(&self.service.store, &self.ctx.request_id, step, true)
+                .prepare(
+                    &self.service.store,
+                    &self.ctx.request_id,
+                    step,
+                    Prepare::Run,
+                )
                 .await?;
             return Ok(None);
         }
         if let Err(error) = self.watch_admit(*connector, policy, polls, errors, delay) {
             // Settle a blocked report through the normal prepared->checkpoint path.
             self.recovery
-                .prepare(&self.service.store, &self.ctx.request_id, step, true)
+                .prepare(
+                    &self.service.store,
+                    &self.ctx.request_id,
+                    step,
+                    Prepare::Run,
+                )
                 .await?;
             return Ok(Some(self.watch_blocked(step, &error)));
         }
@@ -255,7 +268,13 @@ impl RunState<'_> {
         connector: ConnectorId,
         args: BTreeMap<String, ArgValue>,
     ) -> Result<Result<Polled, Box<StepReport>>, CapabilityFailure> {
-        let call = status_call(connector);
+        let Some(call) = status_call(connector) else {
+            return Ok(Err(Box::new(blocked(
+                step,
+                CAUSE_WATCH_UNSUPPORTED,
+                format!("{} has no status call a watch can poll", connector.as_str()),
+            ))));
+        };
         let mut status_args = args;
         status_args.retain(|key, _| match connector {
             ConnectorId::Github => matches!(key.as_str(), "repo" | "run_id" | "run_attempt"),
@@ -289,7 +308,13 @@ impl RunState<'_> {
                 Ok(observation) => (observation, None),
                 Err(error) => return Ok(Err(Box::new(self.watch_blocked(step, &error)))),
             },
-            Ok(_) => return Err(failure()),
+            Ok(_) => {
+                return Ok(Err(Box::new(blocked(
+                    step,
+                    CAUSE_WATCH_MALFORMED,
+                    format!("{call} answered something other than a JSON status"),
+                ))));
+            }
             Err(error) => {
                 if !watch_retryable(&error) {
                     return Ok(Err(Box::new(blocked(step, error.cause(), error.detail()))));
@@ -363,7 +388,12 @@ impl RunState<'_> {
         // Normal step settlement expects a prepared attempt. A crash before it resumes the
         // persisted conflict marker and produces the same refusal without another HTTP call.
         self.recovery
-            .prepare(&self.service.store, &self.ctx.request_id, step, true)
+            .prepare(
+                &self.service.store,
+                &self.ctx.request_id,
+                step,
+                Prepare::Run,
+            )
             .await?;
         self.retained_watch_conflict(step).ok_or_else(failure)
     }
@@ -493,7 +523,11 @@ impl RunState<'_> {
             polls,
             u32::from(policy.max_polls),
             errors,
-            128_u64.saturating_sub(self.ctx.budget.usage().http_calls),
+            self.ctx
+                .budget
+                .limits()
+                .http_calls
+                .saturating_sub(self.ctx.budget.usage().http_calls),
             self.ctx
                 .budget
                 .deadline()
@@ -526,7 +560,7 @@ impl RunState<'_> {
     ) -> Result<String, CapabilityFailure> {
         let id = format!("ev_{}", ulid::Ulid::new());
         let bytes = crate::flow_recovery::encode(&observation.payload)?;
-        if bytes.len() > 16 * 1024 {
+        if bytes.len() > crate::flow_recovery::MAX_INLINE_BYTES {
             return Err(failure());
         }
         let state = match observation.state {

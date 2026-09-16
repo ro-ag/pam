@@ -3,13 +3,18 @@ use std::path::Path;
 
 use crate::catalog::{CATALOG, find_preset};
 
-/// Where every entry below is fetched from.
+/// Where each vendor's entries are fetched from.
 ///
-/// Each [`Preset::url`] is this prefix plus the file name, spelled out in
-/// full because a `const` cannot `format!`. A unit test holds the two
+/// Each [`Preset::url`] is its vendor's prefix plus the file name, spelled
+/// out in full because a `const` cannot `format!`. A unit test holds the two
 /// halves together.
-const QWEN_BASE_URL: &str =
-    "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/";
+fn base_url(vendor: &str) -> &'static str {
+    match vendor {
+        "qwen" => "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/",
+        "openai" => "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/",
+        other => panic!("no base URL for vendor {other}"),
+    }
+}
 
 const GB: u64 = 1_000_000_000;
 
@@ -86,7 +91,7 @@ fn urls_point_at_the_named_file() {
         );
         assert_eq!(
             preset.url,
-            format!("{QWEN_BASE_URL}{}", preset.file_name),
+            format!("{}{}", base_url(preset.vendor), preset.file_name),
             "{} url is not its base plus its file name",
             preset.id
         );
@@ -136,4 +141,17 @@ fn ram_requirements_never_drop_below_the_weights() {
             preset.id
         );
     }
+}
+
+#[test]
+fn the_qualified_artifact_is_offered_with_the_digest_its_evidence_names() {
+    let preset = find_preset("gpt-oss-20b-mxfp4").expect("the qualified artifact has a preset");
+    let record = crate::qualification::QUALIFIED
+        .iter()
+        .find(|record| record.sha256 == preset.sha256)
+        .expect("the preset's digest is the qualified one");
+    assert_eq!(record.artifact, "gpt-oss-20b-MXFP4");
+    assert_eq!(preset.size_bytes, 12_109_566_624);
+    assert_eq!(preset.model_id(), "openai/gpt-oss-20b-MXFP4");
+    assert_eq!(preset.quant, crate::gguf::quant_label_for(38));
 }

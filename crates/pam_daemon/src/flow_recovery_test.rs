@@ -1,5 +1,5 @@
 use crate::flow_exec::{StepReport, StepStatus};
-use crate::flow_recovery::{Recovery, Snapshot, encode};
+use crate::flow_recovery::{Prepare, Recovery, Snapshot, encode};
 use pam_flow::Vars;
 use pam_store::Store;
 use serde_json::json;
@@ -32,7 +32,7 @@ async fn settled_prefix_restores_variables_and_refuses_changed_recipe_inputs_or_
         .await
         .unwrap();
     recovery
-        .prepare(&store, "r", &flow.steps[0], true)
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
         .await
         .unwrap();
     snapshot
@@ -87,7 +87,10 @@ async fn prepared_effect_never_restores_as_ready() {
         .unwrap();
     let mut effect = flow.steps[0].clone();
     effect.effect = pam_flow::Effect::Stateful;
-    recovery.prepare(&store, "r", &effect, true).await.unwrap();
+    recovery
+        .prepare(&store, "r", &effect, Prepare::Run)
+        .await
+        .unwrap();
     assert!(
         Recovery::open(&store, "r", &flow, repo.path(), &vars)
             .await
@@ -129,7 +132,7 @@ async fn missing_checkpoint_and_changed_connector_configuration_refuse_restore()
     };
     snapshot.all_origins.push(origin);
     recovery
-        .prepare(&store, "r", &flow.steps[0], true)
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
         .await
         .unwrap();
     recovery
@@ -196,7 +199,7 @@ async fn pruned_source_and_expired_view_cannot_restore_verified_variables() {
         .await
         .unwrap();
     recovery
-        .prepare(&store, "r", &flow.steps[0], true)
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
         .await
         .unwrap();
     snapshot
@@ -289,4 +292,55 @@ async fn foreign_or_unpublished_evidence_and_unlisted_report_refs_refuse_restore
     snapshot.reports.clear();
     snapshot.evidence = vec!["id".to_owned(); 129];
     assert!(Snapshot::decode(&encode(&snapshot).unwrap(), &snapshot.fingerprint, &flow).is_err());
+}
+
+#[tokio::test]
+async fn a_conflicting_journal_identity_files_no_orphan_checkpoint() {
+    let (store, repo, flow, vars) = fixture().await;
+    let identity = pam_store::FlowJournalIdentity {
+        request_id: "r".to_owned(),
+        flow_digest: "0".repeat(64),
+        repository: repo.path().to_string_lossy().into_owned(),
+        input_fingerprint: crate::flow_recovery::fingerprint(&flow, repo.path(), &vars).unwrap(),
+    };
+    let cursor = json!({"evidence_id":"ev_other","next_step":0}).to_string();
+    assert_eq!(
+        store.begin_flow_journal(&identity, &cursor).await.unwrap(),
+        pam_store::FlowJournalBegin::Inserted
+    );
+    assert!(
+        Recovery::open(&store, "r", &flow, repo.path(), &vars)
+            .await
+            .is_err()
+    );
+    let checkpoints = store
+        .list_evidence("r")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == crate::flow_recovery::KIND)
+        .count();
+    assert_eq!(
+        checkpoints, 0,
+        "a refused open must leave no checkpoint row"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_open_binds_the_journal_and_files_exactly_one_checkpoint() {
+    let (store, repo, flow, vars) = fixture().await;
+    Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    let journal = store.read_flow_journal("r").await.unwrap().unwrap();
+    let cursor: serde_json::Value = serde_json::from_str(&journal.checkpoint_json).unwrap();
+    let checkpoints: Vec<_> = store
+        .list_evidence("r")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == crate::flow_recovery::KIND)
+        .collect();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(cursor["evidence_id"], checkpoints[0].id);
 }

@@ -94,6 +94,13 @@ work 5. Client/internal errors and observation timeout use 1. Cancellation and
 request expiry remain explicit terminal causes in JSON; observation timeout does
 not cancel the original request. Keep the ticket to inspect it later.
 
+Without `--json`, a refused or timed-out follow is one `pam wait:` (or
+`pam subscribe:`) line on stderr naming the ticket. With `--json` (`pam wait`
+and `pam subscribe` both take it), it is instead a `kind: refusal` object on
+stdout — the same shape as every other refusal — whose `id` is the ticket;
+an observation timeout uses cause `follow_timeout`. Exit codes are the same
+either way. Client-side failures (no daemon, transport) stay on stderr.
+
 See [agent workflow](agent-workflow-contract.md), [evidence retrieval](evidence-retrieval.md)
 and [admission budgets](scoped-admission-and-budgets.md). Embedded
 [exact job watches](job-watches.md) use the same run/wait/result commands; guarded

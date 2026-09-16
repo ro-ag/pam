@@ -366,7 +366,9 @@ async fn save_and_test_uses_current_credentials_against_a_local_http_service() {
             config.secret_backend = Some(backend);
             config.http_transport = Some(Arc::new(LocalConnectorTransport {
                 origin,
-                curl: pam_connectors::CurlTransport::new("curl".into()).allow_http_for_tests(),
+                curl: pam_connectors::CurlTransport::trusted()
+                    .expect("the trusted OS curl")
+                    .allow_http_for_tests(),
             }));
         })
         .await;

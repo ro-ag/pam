@@ -90,7 +90,8 @@
     background: var(--pam-action-gradient);
     mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
     -webkit-mask: url("./assets/materials/chaos-soft.webp") center / 100% 100% no-repeat;
-    opacity: 0.65;
+    /* Light palettes lower the wave so it never shows through the 84% glass. */
+    opacity: var(--pam-wave-opacity);
   }
   [data-background-motion="slow"] .desktop-shell::before,
   [data-background-motion="slower"] .desktop-shell::before {
@@ -188,6 +189,7 @@
   }
   .appearance-palette {
     min-width: 0;
+    max-width: 280px;
     overflow: hidden;
     border: 1px solid var(--pam-line);
     border-radius: 12px;
@@ -344,12 +346,13 @@
     font-size: 13px;
     cursor: pointer;
   }
+  /* 40x24: the switch itself is a 24px target, not only its label row. */
   .preference-switch {
     position: relative;
     display: inline-flex;
     flex-shrink: 0;
-    width: 36px;
-    height: 22px;
+    width: 40px;
+    height: 24px;
   }
   .preference-switch input {
     position: absolute;
@@ -366,7 +369,7 @@
     border-radius: 20px;
     background: var(--pam-chrome);
     transition: background 140ms ease;
-    padding: 3px;
+    padding: 4px;
   }
   .preference-switch-track > span {
     display: block;
@@ -380,7 +383,7 @@
     background: var(--pam-accent);
   }
   .preference-switch input:checked + .preference-switch-track > span {
-    transform: translateX(14px);
+    transform: translateX(16px);
     background: var(--pam-chrome);
   }
   .preference-switch input:focus-visible + .preference-switch-track {
@@ -444,7 +447,7 @@
     border: 2px solid var(--pam-accent);
     border-radius: 50%;
     background: var(--pam-surface-raised);
-    box-shadow: 0 1px 4px #0004;
+    box-shadow: var(--pam-shadow-thumb);
   }
   .preference-range input::-moz-range-thumb {
     width: 10px;
@@ -452,7 +455,7 @@
     border: 2px solid var(--pam-accent);
     border-radius: 50%;
     background: var(--pam-surface-raised);
-    box-shadow: 0 1px 4px #0004;
+    box-shadow: var(--pam-shadow-thumb);
   }
   .preference-range-extents {
     display: flex;
@@ -563,6 +566,10 @@
   .page-content:focus-visible {
     outline-offset: -3px;
   }
+  .page-tabs .settings-tab {
+    flex: 0 0 auto;
+    padding-inline: 14px;
+  }
   .page-tabs .settings-tab[aria-selected="true"] {
     box-shadow: inset 0 -2px 0 var(--pam-accent);
   }
@@ -582,7 +589,7 @@
     padding-bottom: 16px;
   }
   .home-conversation {
-    max-width: 960px;
+    max-width: var(--container-content);
     margin-inline: auto;
   }
   .flow-library-layout {
@@ -631,9 +638,6 @@
   .flow-library-layout > .flow-library {
     display: none;
   }
-  .home-columns {
-    grid-template-columns: minmax(0, 1fr);
-  }
   .home-prompts {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -655,7 +659,7 @@
     padding: 16px 20px 14px;
   }
   .settings-context {
-    letter-spacing: 0.08em;
+    flex-shrink: 1;
   }
   .settings-tabs {
     display: flex;
@@ -743,7 +747,7 @@
     min-width: 0;
   }
   .appearance-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   }
   .settings-connectors {
     display: grid;
@@ -788,16 +792,10 @@
     }
   }
   @container (min-width: 960px) {
-    .home-columns {
-      grid-template-columns: minmax(0, 1fr) 380px;
-    }
     .settings-models,
     .settings-security,
     .connector-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .appearance-grid {
-      grid-template-columns: repeat(4, minmax(0, 1fr));
     }
   }
   @container (min-width: 1400px) {
@@ -825,6 +823,10 @@
   .action-control:hover:not(:disabled),
   .action-control:active:not(:disabled) {
     background: var(--color-accent-hover);
+  }
+  .action-control:disabled {
+    background-image: none;
+    box-shadow: none;
   }
   .field-control {
     box-shadow: var(--pam-shadow-raise);
@@ -929,7 +931,8 @@
   }
   .flow-workbench {
     flex: 1;
-    min-height: 0;
+    /* The canvas keeps a working height at 1100x700; the pane scrolls instead. */
+    min-height: 420px;
     flex-direction: column;
   }
   .flow-inspector {

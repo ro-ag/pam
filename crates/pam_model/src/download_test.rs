@@ -220,6 +220,181 @@ async fn an_interrupted_transfer_resumes_from_its_part() {
         "the resume must ask for the bytes it is missing, saw {:?}",
         server.requests()
     );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|line| line.trim() == "If-Range: \"v1\""),
+        "the resume must say which file its bytes belong to, saw {:?}",
+        server.requests()
+    );
+}
+
+#[tokio::test]
+async fn a_changed_etag_restarts_the_transfer_from_zero() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(256 * 1024);
+    let server = origin::serve_interrupting(bytes.clone(), "v1", 64 * 1024).await;
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    let paths = sidecar_paths(&fixture.dest);
+
+    let broken = settled(&start(request.clone()).unwrap()).await;
+    assert!(matches!(broken, DownloadState::Failed { .. }), "{broken:?}");
+    assert_eq!(std::fs::metadata(&paths.part).unwrap().len(), 64 * 1024);
+
+    // The origin replaced the file. The same bytes under a new tag keep the
+    // test honest: appending the old 64 KiB to the whole body would be a
+    // size mismatch, and only a restart from zero can produce the digest.
+    server.set_etag("v2");
+    assert_eq!(
+        settled(&start(request).unwrap()).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes),
+        },
+        "the resume was refused and the transfer started over"
+    );
+    assert_eq!(std::fs::read(&fixture.dest).unwrap(), bytes);
+    let requests = server.requests();
+    let resumes = requests
+        .iter()
+        .filter(|line| line.trim() == "If-Range: \"v1\"")
+        .count();
+    assert_eq!(
+        resumes, 1,
+        "one resume was attempted with the old tag: {requests:?}"
+    );
+    let gets = requests
+        .iter()
+        .filter(|line| line.starts_with("GET "))
+        .count();
+    assert_eq!(
+        gets, 3,
+        "interrupted, refused resume, full restart: {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|line| line.trim() == "If-Range: \"v2\""),
+        "the restart carries no range at all: {requests:?}"
+    );
+    assert!(!paths.part.exists());
+    assert!(!paths.checkpoint.exists());
+}
+
+#[tokio::test]
+async fn a_transfer_of_the_wrong_size_is_named_as_one() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(8 * 1024);
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let mut request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    request.expected_size = Some(size_of(&bytes) + 1);
+
+    let state = settled(&start(request).unwrap()).await;
+    let DownloadState::Failed { cause, detail } = state else {
+        panic!("a wrong size must fail, got {state:?}");
+    };
+    assert_eq!(cause, "size_mismatch");
+    assert!(
+        detail.contains("8192"),
+        "the detail names the size: {detail}"
+    );
+    assert!(
+        !fixture.dest.exists(),
+        "nothing lands under the model's name"
+    );
+    assert!(
+        sidecar_paths(&fixture.dest).part.exists(),
+        "the bytes stay for a human to discard or inspect"
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_appears_mid_transfer_is_never_overwritten() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(512 * 1024);
+    let server =
+        origin::serve_slowly(bytes.clone(), "v1", 64 * 1024, Duration::from_millis(100)).await;
+    let handle = start(request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes)).unwrap();
+    let paths = sidecar_paths(&fixture.dest);
+    assert!(wait_for_path(&paths.part).await);
+
+    // Someone drops weights under the same name while curl runs.
+    std::fs::write(&fixture.dest, b"hand-copied weights").unwrap();
+
+    let state = settled(&handle).await;
+    let DownloadState::Failed { cause, detail } = state else {
+        panic!("the finished transfer must not replace the file, got {state:?}");
+    };
+    assert_eq!(cause, "already_exists", "{detail}");
+    assert_eq!(
+        std::fs::read(&fixture.dest).unwrap(),
+        b"hand-copied weights",
+        "the file that was there first survives untouched"
+    );
+    assert!(
+        paths.part.exists(),
+        "the transferred bytes are kept, not lost"
+    );
+}
+
+#[test]
+fn a_url_that_is_not_http_is_refused_before_curl_runs() {
+    let fixture = fixture();
+    for url in [
+        "-K/tmp/x/a.gguf",
+        "--config=/tmp/evil",
+        "file:///etc/passwd",
+        "ftp://example.invalid/x.gguf",
+        "http://",
+        "https:///nohost",
+        "example.com/x.gguf",
+        "http://example.com/x\n.gguf",
+        "",
+    ] {
+        let request = DownloadRequest {
+            url: url.to_owned(),
+            dest: fixture.dest.clone(),
+            expected_size: None,
+            expected_sha256: None,
+            license_id: None,
+        };
+        assert!(
+            matches!(&start(request), Err(DownloadError::InvalidUrl(bad)) if bad == url),
+            "{url:?} must be refused as a URL"
+        );
+    }
+    assert!(
+        !sidecar_paths(&fixture.dest).lock.exists(),
+        "nothing was set up"
+    );
+    for url in [
+        "https://example.com/x.gguf",
+        "HTTP://127.0.0.1:1/x",
+        "http://[::1]:1/x",
+    ] {
+        assert!(crate::download::check_url(url).is_ok(), "{url}");
+    }
+}
+
+#[test]
+fn the_curl_pam_runs_is_the_operating_systems_own() {
+    let Ok(curl) = curl_path() else {
+        eprintln!("skipping: no trusted curl ({})", curl_recovery_line());
+        return;
+    };
+    assert!(curl.is_absolute(), "{curl:?}");
+    assert!(curl.is_file(), "{curl:?}");
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert_eq!(curl, std::fs::canonicalize("/usr/bin/curl").unwrap());
+    #[cfg(target_os = "windows")]
+    assert!(
+        curl.ends_with("System32\\curl.exe"),
+        "{curl:?} is not the System32 binary"
+    );
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ GUI administration grants exact repository/product scopes. Every operation reche
 
 HTTP requests use the [trusted OS transport](command-containment.md). Redirects, oversized responses, HTTP authentication failures, rate limits, and timeouts remain errors or explicit incomplete outcomes. Paging does not reset budgets. Returned continuation URLs are not authority to fetch arbitrary locations. No connector can mint grants or bypass OS-keychain storage.
 
-The core does not invoke a vendor agent CLI or hosted model to troubleshoot. Local Git commands run under mandatory containment. [Guarded landing](guarded-landing.md) introduces typed Git push, GitHub PR/merge operations and private validation outputs under separate GUI policy; its full synchronization checkpoint is still pending. Ordinary connector access remains read-only. AWS CLI is currently refused before credential/process access; JFrog publishing is unsupported. Neither is silently substituted for one of the six required adapters.
+The core does not invoke a vendor agent CLI or hosted model to troubleshoot. Local Git commands run under mandatory containment. [Guarded landing](guarded-landing.md) introduces typed Git push, GitHub PR/merge operations and private validation outputs under separate GUI policy; its full synchronization checkpoint is still pending. Ordinary connector access remains read-only. AWS CLI is currently refused before credential/process access, and a flow that names `connector: aws` is refused at validation with that blocker (`pam_flow::validate::AWS_BLOCKER`) rather than accepted and failed at run time; JFrog publishing is unsupported. Neither is silently substituted for one of the six required adapters.
 
 ## Live qualification procedure
 

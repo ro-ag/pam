@@ -41,6 +41,10 @@ pub(super) const NONCE_BYTES: usize = 32;
 const SERVER_PROOF_LABEL: &[u8] = b"pam-admin-server";
 /// The control file's `schema_version`.
 const CONTROL_SCHEMA: u32 = 1;
+/// Connections allowed to sit in the nonce handshake at once. Held only until
+/// admission, so an unadmitted local process idling sockets open cannot eat the
+/// [`MAX_CONNECTIONS`] served budget out from under the owner's GUI.
+pub(super) const MAX_PENDING_ADMISSIONS: usize = 8;
 
 /// What the daemon publishes into the private base for its own owner.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -197,6 +201,7 @@ async fn accept(
     nonce: [u8; NONCE_BYTES],
 ) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let pending = Arc::new(Semaphore::new(MAX_PENDING_ADMISSIONS));
     let mut tasks = JoinSet::new();
     let mut lifecycle = phase.subscribe();
     loop {
@@ -208,14 +213,20 @@ async fn accept(
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break; };
                 if !is_loopback(peer) { continue; }
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
+                // Only the small pre-admission budget is spent before the
+                // peer proves itself; a served permit is taken once it has.
+                let Ok(pending_permit) = Arc::clone(&pending).try_acquire_owned() else { continue; };
+                let permits = Arc::clone(&permits);
                 let admin = Arc::clone(&admin);
                 let phase = phase.clone();
                 tasks.spawn(async move {
-                    let _permit = permit;
                     let mut stream = stream;
                     let served = async {
                         admit_client(&mut stream, &nonce).await?;
+                        drop(pending_permit);
+                        let _permit = permits
+                            .try_acquire_owned()
+                            .map_err(|_| busy())?;
                         serve(&mut stream, &admin, &phase).await
                     };
                     if let Err(error) = served.await {
@@ -234,9 +245,20 @@ async fn accept(
     while tasks.join_next().await.is_some() {}
 }
 
+/// The refusal when every served connection slot is taken by an admitted peer.
+fn busy() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "private administration is serving its maximum number of connections",
+    )
+}
+
 /// Server side of the handshake: prove first, then demand the nonce. A wrong
 /// nonce ends the connection before any request byte is parsed.
-async fn admit_client(stream: &mut TcpStream, nonce: &[u8; NONCE_BYTES]) -> io::Result<()> {
+pub(super) async fn admit_client(
+    stream: &mut TcpStream,
+    nonce: &[u8; NONCE_BYTES],
+) -> io::Result<()> {
     tokio::time::timeout(HEADER_TIMEOUT, async {
         stream.write_all(&server_proof(nonce)).await?;
         let mut presented = [0u8; NONCE_BYTES];

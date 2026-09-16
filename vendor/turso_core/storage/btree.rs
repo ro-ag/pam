@@ -1459,6 +1459,8 @@ impl BTreeCursor {
     /// outer state machine yet. Production state machines should prefer
     /// [`BTreeCursor::move_to_root_nonblock`] so they can yield through spill
     /// IO instead of blocking inside the pager.
+    // PAM: kept as the documented blocking shim; nothing in the selected build calls it.
+    #[allow(dead_code)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn move_to_root(&mut self) -> Result<Option<Completion>> {
         let io = self.pager.io.clone();
@@ -1745,6 +1747,8 @@ impl BTreeCursor {
 
     /// Move cursor to position using registers directly, avoiding record serialization.
     /// See `seek_unpacked` for rationale.
+    // PAM: unused by the selected build; retained unchanged from upstream.
+    #[allow(dead_code)]
     #[instrument(skip(self, registers), level = Level::DEBUG)]
     fn indexbtree_move_to_unpacked(
         &mut self,

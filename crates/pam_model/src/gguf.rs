@@ -1,6 +1,6 @@
 //! A bounded GGUF header parser: what a file claims to be, read safely.
 //!
-//! candle only opens a GGUF file by mapping it whole; this reads just the header (magic,
+//! The engine maps a GGUF file whole to run it; this reads just the header (magic,
 //! version, metadata, tensor descriptors) and stops at the first tensor byte, so scanning
 //! gigabytes of weights costs one description per file. A `.gguf` may be a half-finished
 //! download or a renamed zip, so every length is a claim, not a fact: counts, string
@@ -244,8 +244,19 @@ impl<R: Read + Seek> HeaderReader<R> {
             });
         }
         self.charge(len)?;
-        let mut buf = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-        self.inner.read_exact(&mut buf)?;
+        // Read through `take` rather than into a buffer sized by the header:
+        // a hostile length would otherwise allocate up to the cap (256 MiB)
+        // before the first byte proved the file that short. The buffer grows
+        // with what actually arrives, and a short file fails on the length
+        // check with a few kilobytes allocated.
+        let mut buf = Vec::new();
+        let read = self.inner.by_ref().take(len).read_to_end(&mut buf)?;
+        if u64::try_from(read).ok() != Some(len) {
+            return Err(GgufError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{what} declares {len} bytes but the file holds {read}"),
+            )));
+        }
         String::from_utf8(buf)
             .map_err(|_| GgufError::Malformed(format!("{what} is not valid UTF-8")))
     }
@@ -343,27 +354,42 @@ impl<R: Read + Seek> HeaderReader<R> {
     }
 }
 
-/// Elements per block and bytes per block for a ggml dtype.
+/// Elements per block and bytes per block for a ggml dtype: ggml's
+/// `type_traits` table (`ggml.c`), by `ggml_type` id.
 ///
-/// Only the dtypes candle's quantized kernels cover; anything else is a
-/// malformed header as far as pam is concerned, because pam could not run
-/// it anyway.
+/// Every type llama.cpp's current writers emit is here, so a file the
+/// pinned engine can load never scans as malformed for its dtype alone;
+/// `MXFP4` (39) is what gpt-oss ships as. The gaps are ggml's own: 4, 5
+/// (`Q4_2`, `Q4_3`) and 31–33 (the Arm repacking types) were removed
+/// upstream and never appear in a file. An id outside the table is a
+/// malformed header as far as pam is concerned.
 fn ggml_block_layout(dtype: u32) -> Option<(u64, u64)> {
     let layout = match dtype {
-        0 => (1, 4),      // F32
-        1 | 30 => (1, 2), // F16, BF16
-        2 => (32, 18),    // Q4_0
-        3 => (32, 20),    // Q4_1
-        6 => (32, 22),    // Q5_0
-        7 => (32, 24),    // Q5_1
-        8 => (32, 34),    // Q8_0
-        9 => (32, 36),    // Q8_1
-        10 => (256, 84),  // Q2_K
-        11 => (256, 110), // Q3_K
-        12 => (256, 144), // Q4_K
-        13 => (256, 176), // Q5_K
-        14 => (256, 210), // Q6_K
-        15 => (256, 292), // Q8_K
+        0 | 26 => (1, 4),      // F32, I32
+        1 | 25 | 30 => (1, 2), // F16, I16, BF16
+        24 => (1, 1),          // I8
+        27 | 28 => (1, 8),     // I64, F64
+        2 | 20 => (32, 18),    // Q4_0, IQ4_NL
+        3 => (32, 20),         // Q4_1
+        6 => (32, 22),         // Q5_0
+        7 => (32, 24),         // Q5_1
+        8 => (32, 34),         // Q8_0
+        9 => (32, 36),         // Q8_1
+        39 => (32, 17),        // MXFP4
+        10 => (256, 84),       // Q2_K
+        11 | 21 => (256, 110), // Q3_K, IQ3_S
+        12 => (256, 144),      // Q4_K
+        13 => (256, 176),      // Q5_K
+        14 => (256, 210),      // Q6_K
+        15 => (256, 292),      // Q8_K
+        16 | 35 => (256, 66),  // IQ2_XXS, TQ2_0
+        17 => (256, 74),       // IQ2_XS
+        18 => (256, 98),       // IQ3_XXS
+        19 => (256, 50),       // IQ1_S
+        22 => (256, 82),       // IQ2_S
+        23 => (256, 136),      // IQ4_XS
+        29 => (256, 56),       // IQ1_M
+        34 => (256, 54),       // TQ1_0
         _ => return None,
     };
     Some(layout)
@@ -411,6 +437,7 @@ pub fn quant_label_for(file_type: u32) -> String {
         32 => "BF16",
         36 => "TQ1_0",
         37 => "TQ2_0",
+        38 => "MXFP4_MOE",
         other => return format!("unknown({other})"),
     };
     label.to_owned()

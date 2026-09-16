@@ -471,6 +471,48 @@ async fn approvals_resolve_approves_the_waiting_request_with_remember() {
     .unwrap();
 }
 
+/// The note lands in the audit detail column, which is a receipt: a note
+/// over the cap is refused up front, before the approval is touched.
+#[tokio::test]
+async fn approvals_resolve_refuses_a_note_over_the_cap_without_resolving() {
+    timeout(DEADLINE, async {
+        let (store, admin, approvals, mut events) = service_with_approvals().await;
+        let (_cancel, wait) = spawn_approval_wait(&store, &approvals, &mut events, "req_w9").await;
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_r9",
+                OP_APPROVALS_RESOLVE,
+                serde_json::json!({
+                    "request_id": "req_w9",
+                    "resolution": "approved",
+                    "note": "n".repeat(crate::admin::MAX_APPROVAL_NOTE_BYTES + 1),
+                }),
+            ))
+            .await;
+        expect_refusal(response, CAUSE_INVALID_ADMIN_ARGS);
+        assert_admin_row(&store, "req_r9", RequestState::Refused, ACTION_ADMIN).await;
+        assert!(!wait.is_finished(), "the approval is still pending");
+
+        // Exactly the cap is fine.
+        let response = admin
+            .handle(&admin_envelope(
+                "req_r10",
+                OP_APPROVALS_RESOLVE,
+                serde_json::json!({
+                    "request_id": "req_w9",
+                    "resolution": "denied",
+                    "note": "n".repeat(crate::admin::MAX_APPROVAL_NOTE_BYTES),
+                }),
+            ))
+            .await;
+        expect_result(response, Outcome::Changed);
+        assert_eq!(wait.await.unwrap().unwrap(), ApprovalOutcome::Denied);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn approvals_resolve_refuses_an_unknown_request_id() {
     timeout(DEADLINE, async {

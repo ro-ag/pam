@@ -126,7 +126,7 @@ async function askQuestion(question: string) {
   const input = await screen.findByRole("textbox", { name: "ask pam" });
   await waitFor(() => expect(input).toBeEnabled());
   fireEvent.change(input, { target: { value: question } });
-  fireEvent.submit(screen.getByRole("form", { name: "Ask PAM" }));
+  fireEvent.submit(screen.getByRole("form", { name: "Ask Pam" }));
 }
 
 describe("Home shell", () => {
@@ -174,7 +174,7 @@ describe("Home shell", () => {
     const { unmount } = render(
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
-    expect(await screen.findByText("One request awaiting your approval.")).toBeInTheDocument();
+    expect(await screen.findByText("One request awaiting review.")).toBeInTheDocument();
     unmount();
 
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
@@ -297,11 +297,11 @@ describe("Home shell", () => {
     renderHome();
     const input = await screen.findByRole("textbox", { name: "ask pam" });
     expect(input).toHaveAccessibleDescription(
-      "Ask about PAM itself. I keep only this screen and the last three exchanges.",
+      "Ask about PAM itself. Only this screen and the last three exchanges are kept.",
     );
-    expect(screen.getByText("Ask PAM", { selector: "label" })).toHaveAttribute("for", input.id);
+    expect(screen.getByText("Ask Pam", { selector: "label" })).toHaveAttribute("for", input.id);
     fireEvent.change(input, { target: { value: "what's waiting for my approval?" } });
-    fireEvent.submit(screen.getByRole("form", { name: "Ask PAM" }));
+    fireEvent.submit(screen.getByRole("form", { name: "Ask Pam" }));
     await waitFor(() => expect(input).toBeDisabled());
     expect(screen.getByRole("button", { name: "Ask" })).toHaveAttribute("aria-busy", "true");
     release({ pending: [] });

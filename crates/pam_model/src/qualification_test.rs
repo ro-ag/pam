@@ -14,7 +14,7 @@ fn repo_root() -> &'static Path {
         .unwrap()
 }
 
-fn record_like(sha256: &'static str, targets: &'static [Target]) -> Qualification {
+const fn record_like(sha256: &'static str, targets: &'static [Target]) -> Qualification {
     Qualification {
         artifact: "fixture",
         sha256,
@@ -159,4 +159,28 @@ fn find_matches_digest_and_target_only() {
     );
     assert!(find_in(RECORDS, "abd", Target::MacosArm64).is_none());
     assert!(find("not-a-digest", Target::MacosArm64).is_none());
+}
+
+#[test]
+fn find_in_refuses_a_record_that_fails_a_gate_or_names_another_engine() {
+    static FAILING: &[Qualification] = &[
+        Qualification {
+            false_passes: 1,
+            ..record_like("gate", &[Target::MacosArm64])
+        },
+        Qualification {
+            engine_tag: "b0",
+            ..record_like("stale", &[Target::MacosArm64])
+        },
+        record_like("good", &[Target::MacosArm64]),
+    ];
+    assert!(
+        find_in(FAILING, "gate", Target::MacosArm64).is_none(),
+        "a false pass disqualifies on the admission path, not only in the table test"
+    );
+    assert!(
+        find_in(FAILING, "stale", Target::MacosArm64).is_none(),
+        "figures from another engine build qualify nothing"
+    );
+    assert!(find_in(FAILING, "good", Target::MacosArm64).is_some());
 }

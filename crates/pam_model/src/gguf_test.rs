@@ -1,7 +1,8 @@
 use std::io::Cursor;
 
 use crate::gguf::{
-    GGUF_MAX_METADATA_KV, GGUF_MAX_TENSORS, GgufError, parse_info, quant_label_for, read_info,
+    GGUF_MAX_METADATA_KV, GGUF_MAX_STRING_BYTES, GGUF_MAX_TENSORS, GgufError, parse_info,
+    quant_label_for, read_info,
 };
 
 // ggml dtype ids the fixtures use.
@@ -9,6 +10,8 @@ pub(crate) const GGML_F32: u32 = 0;
 pub(crate) const GGML_Q8_0: u32 = 8;
 pub(crate) const GGML_Q4_K: u32 = 12;
 pub(crate) const GGML_Q6_K: u32 = 14;
+pub(crate) const GGML_IQ4_XS: u32 = 23;
+pub(crate) const GGML_MXFP4: u32 = 39;
 
 /// A metadata value a fixture can carry. Deliberately a small subset — the
 /// parser's job here is to walk past what it does not need, and these are the
@@ -97,6 +100,8 @@ pub(crate) fn tensor_bytes(dims: &[u64], dtype: u32) -> u64 {
         GGML_Q8_0 => (32, 34),
         GGML_Q4_K => (256, 144),
         GGML_Q6_K => (256, 210),
+        GGML_IQ4_XS => (256, 136),
+        GGML_MXFP4 => (32, 17),
         other => panic!("fixture used an unmodelled dtype {other}"),
     };
     elements.div_ceil(block) * size
@@ -452,5 +457,97 @@ fn read_info_on_a_missing_file_is_io() {
     assert!(matches!(
         read_info(&dir.path().join("absent.gguf")),
         Err(GgufError::Io(_))
+    ));
+}
+
+#[test]
+fn parses_the_llama_cpp_dtypes_gpt_oss_and_i_quants_ship_as() {
+    // gpt-oss-20b-MXFP4.gguf is 289 F32, 98 Q8_0 and 72 MXFP4 tensors under
+    // file type 38; an IQ4_XS tensor stands in for the i-quant family. The
+    // 32-element / 17-byte MXFP4 block is what makes the offsets line up.
+    let bytes = synth_gguf(
+        3,
+        "gpt-oss",
+        38,
+        &[
+            ("blk.0.ffn_gate_exps.weight", &[2880, 2880, 32], GGML_MXFP4),
+            ("blk.0.attn_q.weight", &[2880, 4096], GGML_Q8_0),
+            ("blk.1.ffn_down_exps.weight", &[2880, 2880, 32], GGML_IQ4_XS),
+            ("output_norm.weight", &[2880], GGML_F32),
+        ],
+        &[
+            ("general.name", GgufValue::Str("gpt-oss-20b".into())),
+            ("gpt-oss.context_length", GgufValue::U32(131_072)),
+            ("gpt-oss.expert_count", GgufValue::U32(32)),
+        ],
+    );
+    let info = parse_info(Cursor::new(bytes)).unwrap();
+    assert_eq!(info.architecture, "gpt-oss");
+    assert_eq!(info.quant_label, "MXFP4_MOE");
+    assert_eq!(info.expert_count, Some(32));
+    assert_eq!(info.tensor_count, 4);
+    assert_eq!(
+        info.parameter_count,
+        2880 * 2880 * 32 + 2880 * 4096 + 2880 * 2880 * 32 + 2880
+    );
+}
+
+#[test]
+fn every_ggml_type_id_llama_cpp_writes_is_accepted_and_the_gaps_are_not() {
+    for dtype in [
+        0u32, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 34, 35, 39,
+    ] {
+        let bytes = synth_gguf_raw(3, *b"GGUF", "qwen3", 15, &[("a", &[256], dtype, 0)], &[]);
+        assert!(
+            parse_info(Cursor::new(bytes)).is_ok(),
+            "ggml type {dtype} is one llama.cpp writes"
+        );
+    }
+    for gap in [4u32, 5, 31, 32, 33, 36, 37, 38, 40] {
+        let bytes = synth_gguf_raw(3, *b"GGUF", "qwen3", 15, &[("a", &[256], gap, 0)], &[]);
+        assert!(
+            matches!(parse_info(Cursor::new(bytes)), Err(GgufError::Malformed(_))),
+            "ggml type {gap} is a removed or unassigned id"
+        );
+    }
+}
+
+#[test]
+fn a_huge_declared_string_on_a_tiny_file_fails_fast_without_the_allocation() {
+    // One metadata pair whose key claims just under the 256 MiB cap (the
+    // magic and counts already used a few bytes of the header budget); the
+    // file is a hundred bytes. The parser must fail on the shortfall, not
+    // reserve the declared length first.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&(GGUF_MAX_STRING_BYTES - 4096).to_le_bytes());
+    bytes.resize(100, b'k');
+    let started = std::time::Instant::now();
+    let error = parse_info(Cursor::new(bytes)).unwrap_err();
+    assert!(matches!(error, GgufError::Io(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("holds"),
+        "the shortfall is named: {error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "no 256 MiB buffer was touched"
+    );
+
+    // One byte over the cap is refused before any read at all.
+    let mut over = Vec::new();
+    over.extend_from_slice(b"GGUF");
+    over.extend_from_slice(&3u32.to_le_bytes());
+    over.extend_from_slice(&0u64.to_le_bytes());
+    over.extend_from_slice(&1u64.to_le_bytes());
+    over.extend_from_slice(&(GGUF_MAX_STRING_BYTES + 1).to_le_bytes());
+    over.resize(100, b'k');
+    assert!(matches!(
+        parse_info(Cursor::new(over)),
+        Err(GgufError::Malformed(_))
     ));
 }

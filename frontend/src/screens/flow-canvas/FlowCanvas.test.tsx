@@ -426,14 +426,22 @@ describe("FlowCanvas edges and frames", () => {
     }
   });
 
-  it("paints the verdict frame's outcome chip and fades the others", async () => {
+  it("shows only the run's own outcome on the verdict frame, and a quiet line before a run", async () => {
     renderCanvas({ outcome: "solved" });
     await settle();
     const verdict = screen.getByLabelText("verdict frame");
-    for (const name of ["solved", "changed", "verified", "unresolved", "blocked"]) {
-      const chip = within(verdict).getByText(name);
-      expect(chip.className.includes("opacity-40"), name).toBe(name !== "solved");
+    expect(within(verdict).getByText("solved")).toBeInTheDocument();
+    for (const name of ["changed", "verified", "unresolved", "blocked"]) {
+      expect(within(verdict).queryByText(name)).toBeNull();
     }
+  });
+
+  it("says no run yet on the verdict frame before any outcome", async () => {
+    renderCanvas();
+    await settle();
+    expect(
+      within(screen.getByLabelText("verdict frame")).getByText("no run yet"),
+    ).toBeInTheDocument();
   });
 
   it("wires handles as 10px pills in the line color, plus a hidden anchor for the note", async () => {

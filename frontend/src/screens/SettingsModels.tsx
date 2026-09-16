@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { useRephrasePref } from "../lib/ask/prefs";
 import { cn } from "../lib/cn";
@@ -72,13 +72,13 @@ function TierSelect({
 }) {
   return (
     <label className="space-y-1.5">
-      <span className="block font-data text-xs text-ink-faint">{tier}</span>
+      <span className={fieldLabelClasses}>{tier === "light" ? "Light" : "Heavy"}</span>
       <select
         aria-label={`${tier} tier default`}
         value={value ?? ""}
         disabled={disabled}
         onChange={(event) => onChange(event.target.value === "" ? null : event.target.value)}
-        className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+        className={cn(fieldClasses, "px-2 disabled:cursor-not-allowed disabled:opacity-70")}
       >
         <option value="">none (deterministic)</option>
         {models.map((model) => {
@@ -125,10 +125,7 @@ function TierDefaultsPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">tier defaults</p>
-        <Badge tone="accent">GUI-only</Badge>
-      </div>
+      <p className="font-data text-xs text-ink-faint">Tier defaults</p>
 
       {listFailure && <FailureNote failure={listFailure} label="models" />}
 
@@ -172,18 +169,15 @@ function AskPamPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">ask pam</p>
-        <Badge tone="accent">GUI-only</Badge>
-      </div>
+      <p className="font-data text-xs text-ink-faint">Ask Pam · local preference</p>
 
       <div className="flex items-center justify-between gap-3">
-        <span className="font-data text-xs text-ink">
-          rephrase answers with the light model
+        <span className="font-sans text-sm text-ink">
+          Rephrase answers with the light model
         </span>
         <Button
           size="sm"
-          variant={rephrase ? "primary" : "ghost"}
+          variant={rephrase ? "primary" : "secondary"}
           role="switch"
           aria-checked={rephrase}
           aria-label="rephrase answers with the light model"
@@ -195,8 +189,8 @@ function AskPamPanel() {
 
       <p className="font-sans text-sm text-ink-muted">
         {rephrase
-          ? "I keep every number and name; if the model drops one, my own sentence stands."
-          : "My answers are my own sentences from live state; turn this on to let the light model soften them."}
+          ? "Every number and name is kept; if the model drops one, the original sentence stands."
+          : "Answers are plain sentences built from live state; turn this on to let the light model soften them."}
       </p>
     </Panel>
   );
@@ -236,7 +230,7 @@ function CuratorPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <p className="font-data text-xs text-ink-faint">curator agent</p>
+      <p className="font-data text-xs text-ink-faint">Curator agent</p>
       <p className="font-sans text-sm text-ink-muted">
         A vendor CLI you already pay for, asked one question at a time. PAM holds no API keys —
         it rides your own subscription, or nothing.
@@ -269,7 +263,7 @@ function CuratorPanel() {
                   checked={active}
                   disabled={pick.isPending}
                   onChange={() => pick.mutate(cli.id)}
-                  className="mt-1 size-3.5 accent-accent-strong"
+                  className="mt-0.5 size-4.5 shrink-0 accent-accent-strong"
                 />
                 <span className="min-w-0 space-y-0.5">
                   <span className="block font-data text-sm font-medium text-ink">{cli.id}</span>
@@ -293,7 +287,7 @@ function CuratorPanel() {
               checked={selected === null}
               disabled={pick.isPending}
               onChange={() => pick.mutate(null)}
-              className="size-3.5 accent-accent-strong"
+              className="size-4.5 shrink-0 accent-accent-strong"
             />
             <span className="font-data text-sm text-ink-muted">none</span>
           </label>
@@ -303,8 +297,9 @@ function CuratorPanel() {
       <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
         <Button
           size="sm"
-          variant="ghost"
+          variant="secondary"
           disabled={selected === null || test.isPending}
+          title={selected === null ? "Pick a curator agent first" : undefined}
           onClick={() => test.mutate()}
         >
           {test.isPending && (
@@ -399,12 +394,11 @@ function StoragePanel() {
     apply.mutate(patch);
   }
 
-  const inputClasses =
-    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  const inputClasses = fieldClasses;
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <p className="font-data text-xs text-ink-faint">storage &amp; residency</p>
+      <p className="font-data text-xs text-ink-faint">Storage and residency</p>
       {status.isError && (
         <FailureNote failure={toBridgeFailure(status.error)} label="model settings" />
       )}
@@ -418,7 +412,7 @@ function StoragePanel() {
         }}
       >
         <label className="min-w-0 flex-1 space-y-1">
-          <span className="block font-data text-xs text-ink-faint">models directory</span>
+          <span className={fieldLabelClasses}>Models directory</span>
           <input
             aria-label="models directory"
             value={dir}
@@ -432,7 +426,13 @@ function StoragePanel() {
             className={inputClasses}
           />
         </label>
-        <Button size="sm" type="submit" disabled={busy || !dir.trim()}>
+        <Button
+          size="sm"
+          type="submit"
+          variant="secondary"
+          disabled={busy || !dir.trim()}
+          title={!dir.trim() ? "Name a directory first" : undefined}
+        >
           Apply
         </Button>
       </form>
@@ -445,7 +445,7 @@ function StoragePanel() {
         }}
       >
         <label className="w-40 space-y-1">
-          <span className="block font-data text-xs text-ink-faint">idle unload (minutes)</span>
+          <span className={fieldLabelClasses}>Idle unload (minutes)</span>
           <input
             type="number"
             min={0}
@@ -460,7 +460,13 @@ function StoragePanel() {
             className={inputClasses}
           />
         </label>
-        <Button size="sm" type="submit" variant="ghost" disabled={busy || !validMinutes}>
+        <Button
+          size="sm"
+          type="submit"
+          variant="secondary"
+          disabled={busy || !validMinutes}
+          title={!validMinutes ? "Whole minutes, 0 or more" : undefined}
+        >
           Apply
         </Button>
         <span className="font-sans text-sm text-ink-muted">

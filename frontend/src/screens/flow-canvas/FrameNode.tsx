@@ -4,7 +4,7 @@ import { memo, type ReactNode } from "react";
 import { Badge } from "../../components/ui/Badge";
 import { Panel } from "../../components/ui/Panel";
 import { cn, cva } from "../../lib/cn";
-import type { OutcomeName } from "../../lib/ipc";
+import { outcomeLabel } from "../../lib/outcome";
 import { OUTCOME_TONES } from "../FlowRunCard";
 import type { InputsNode, VerdictNode } from "./graph";
 import { HANDLE_CLASSES } from "./StepNode";
@@ -12,8 +12,8 @@ import { HANDLE_CLASSES } from "./StepNode";
 /**
  * The two fixed frames. They are surface Panels, not raised cards, so
  * they read as the deck the steps stand on: Inputs is where a run starts
- * (the declared inputs, `name = default`), Verdict is where it ends (the
- * five outcome chips, grey until a run paints one).
+ * (the declared inputs, `name = default`), Verdict is where it ends (one
+ * outcome chip once a run has painted it, a quiet line until then).
  */
 
 const frameVariants = cva("w-50 p-0 ring-offset-2 ring-offset-chrome", {
@@ -26,14 +26,6 @@ const frameVariants = cva("w-50 p-0 ring-offset-2 ring-offset-chrome", {
   },
   defaultVariants: { rim: "none" },
 });
-
-const OUTCOMES: readonly OutcomeName[] = [
-  "solved",
-  "changed",
-  "verified",
-  "unresolved",
-  "blocked",
-];
 
 function FrameHeader({
   glyph,
@@ -98,19 +90,14 @@ function VerdictFrame({ data }: NodeProps<VerdictNode>) {
         className={HANDLE_CLASSES}
       />
       <FrameHeader glyph={<Flag size={14} aria-hidden="true" />} title="Verdict" />
-      <div className="flex flex-wrap gap-1.5 px-3 py-2.5">
-        {OUTCOMES.map((name) => (
-          <Badge
-            key={name}
-            tone={OUTCOME_TONES[name]}
-            className={cn(
-              "transition-opacity duration-300",
-              data.outcome !== name && "opacity-40",
-            )}
-          >
-            {name}
+      <div className="px-3 py-2.5">
+        {data.outcome ? (
+          <Badge tone={OUTCOME_TONES[data.outcome]} className="transition-opacity duration-300">
+            {outcomeLabel(data.outcome)}
           </Badge>
-        ))}
+        ) : (
+          <p className="font-sans text-sm text-ink-muted">no run yet</p>
+        )}
       </div>
     </Panel>
   );

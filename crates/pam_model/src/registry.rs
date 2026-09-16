@@ -124,6 +124,12 @@ pub enum RegistryError {
     #[error("{0:?} is not a directory")]
     NotADirectory(PathBuf),
 
+    /// A vendor or file name is not one plain path segment: empty, `.`,
+    /// `..`, a hidden name, a separator, a drive or root, or a character
+    /// outside `[A-Za-z0-9._-]`. Refused before a path is built from it.
+    #[error("{0:?} is not a plain name; pam only writes under <models dir>/<vendor>/<file>")]
+    InvalidName(String),
+
     /// A header could not be read at all. Per-file parse failures land on
     /// [`ModelEntry::info_error`] instead; this is for the callers that
     /// asked about one specific file.
@@ -166,10 +172,34 @@ impl Registry {
         &self.dir
     }
 
-    /// Where a download of `file_name` from `vendor` should land.
+    /// Where a download of `file_name` from `vendor` should land, for names
+    /// this binary wrote itself (a catalog preset's `vendor` and `file_name`
+    /// are compiled-in constants).
+    ///
+    /// This is a plain join and does not validate: a caller holding a
+    /// vendor or file name that came from outside — an admin argument, a
+    /// URL — must use [`Registry::checked_dest_for`], which refuses anything
+    /// that is not one plain path segment.
     #[must_use]
     pub fn dest_for(&self, vendor: &str, file_name: &str) -> PathBuf {
         self.dir.join(vendor).join(file_name)
+    }
+
+    /// [`Registry::dest_for`] for names that came from a caller: both must
+    /// pass [`is_plain_name`], so the result is always exactly two levels
+    /// under the models directory. `../../etc`, `/tmp`, `C:\x`, `.hidden`
+    /// and an empty string are [`RegistryError::InvalidName`].
+    pub fn checked_dest_for(
+        &self,
+        vendor: &str,
+        file_name: &str,
+    ) -> Result<PathBuf, RegistryError> {
+        for name in [vendor, file_name] {
+            if !is_plain_name(name) {
+                return Err(RegistryError::InvalidName(name.to_owned()));
+            }
+        }
+        Ok(self.dest_for(vendor, file_name))
     }
 
     /// Every `.gguf` under `<dir>/<vendor>/`, sorted by id.
@@ -210,11 +240,12 @@ impl Registry {
                 if file_name.starts_with('.') || !is_gguf(&path) {
                     continue;
                 }
+                let metadata = model_entry.metadata()?;
                 entries.push(describe(
                     &path,
                     &vendor,
                     &file_name,
-                    model_entry.metadata()?.len(),
+                    &metadata,
                     self.qualifications,
                 ));
             }
@@ -328,15 +359,16 @@ fn describe(
     path: &Path,
     vendor: &str,
     file_name: &str,
-    size_bytes: u64,
+    metadata: &std::fs::Metadata,
     qualifications: &'static [Qualification],
 ) -> ModelEntry {
+    let size_bytes = metadata.len();
     let stem = file_name.strip_suffix(".gguf").unwrap_or(file_name);
     let (info, info_error) = match gguf::read_info(path) {
         Ok(info) => (Some(info), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let verified = read_verified(path);
+    let verified = read_verified(path, metadata);
     let qualification = qualify(verified.as_ref(), qualifications);
 
     ModelEntry {
@@ -357,13 +389,42 @@ fn describe(
     }
 }
 
-/// Reads a verification sidecar, treating anything unreadable as absent.
+/// Reads a verification sidecar, treating anything unreadable or stale as
+/// absent.
 ///
 /// A sidecar written by a newer pam, half-written by a crash, or edited by
 /// a curious human should cost one re-verification, not a broken listing.
-fn read_verified(path: &Path) -> Option<VerifiedRecord> {
-    let bytes = std::fs::read(verified_sidecar_path(path)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// So should a sidecar that no longer describes the file beside it: one
+/// whose recorded size differs from the file's, or that was written before
+/// the file was last modified. A GGUF rewritten under a verified name would
+/// otherwise keep the old digest's `Engine` class and qualification.
+fn read_verified(path: &Path, file: &std::fs::Metadata) -> Option<VerifiedRecord> {
+    let sidecar = verified_sidecar_path(path);
+    let bytes = std::fs::read(&sidecar).ok()?;
+    let record: VerifiedRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.size_bytes != file.len() {
+        return None;
+    }
+    if let (Ok(sidecar_mtime), Ok(file_mtime)) = (
+        std::fs::metadata(&sidecar).and_then(|meta| meta.modified()),
+        file.modified(),
+    ) && sidecar_mtime < file_mtime
+    {
+        return None;
+    }
+    Some(record)
+}
+
+/// Whether `name` is one plain path segment: non-empty, not hidden, not
+/// `.` or `..`, and only `[A-Za-z0-9._-]` — so no separator, drive letter
+/// or root on any platform.
+#[must_use]
+pub fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Whether a path names a GGUF file. Extension-based rather than

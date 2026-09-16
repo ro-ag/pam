@@ -4,6 +4,18 @@
  * precise stamp for detail views.
  */
 
+import { useEffect, useState } from "react";
+
+/** A ticking now, for live relative ages without a per-row timer. */
+export function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs]);
+  return now;
+}
+
 /** Steps, largest first: [threshold in seconds, divisor, unit suffix]. */
 const STEPS: ReadonlyArray<readonly [number, number, string]> = [
   [604_800, 604_800, "w"],

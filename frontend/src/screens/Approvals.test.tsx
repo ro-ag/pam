@@ -9,6 +9,7 @@ import {
   WARNING_AFTER_S,
   approvalMeaning,
   capabilityLabel,
+  commandLine,
   waitingClock,
 } from "./Approvals";
 
@@ -145,13 +146,65 @@ describe("resolving", () => {
     renderApprovals();
     await screen.findByText("2 requests awaiting review");
     const pushCard = card("repo.push");
-    fireEvent.click(pushCard.getByRole("checkbox", { name: "remember this capability" }));
+    fireEvent.click(pushCard.getByRole("checkbox", { name: "Remember this capability" }));
     fireEvent.click(pushCard.getByRole("button", { name: "Approve" }));
     await waitFor(() =>
       expect(mocks.approvalsResolve).toHaveBeenCalledWith("req_a", "approved", {
         remember: true,
       }),
     );
+  });
+
+  it("approves carrying the note, which the daemon records for either answer", async () => {
+    renderApprovals();
+    await screen.findByText("2 requests awaiting review");
+    const pushCard = card("repo.push");
+    fireEvent.click(pushCard.getByRole("button", { name: "Add note" }));
+    fireEvent.change(pushCard.getByRole("textbox", { name: "resolution note" }), {
+      target: { value: "  release branch, reviewed  " },
+    });
+    fireEvent.click(pushCard.getByRole("button", { name: "Approve" }));
+    await waitFor(() =>
+      expect(mocks.approvalsResolve).toHaveBeenCalledWith("req_a", "approved", {
+        remember: false,
+        note: "release branch, reviewed",
+      }),
+    );
+  });
+
+  it("shows what the request will run and where, joined from its tide row", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        {
+          id: "req_a",
+          capability: "repo.push",
+          repo: "/Users/dev/pam",
+          agent: "claude",
+          args: { argv: ["git", "push", "origin", "main"] },
+          state: "waiting_approval",
+          outcome: null,
+          created_ts: nowSec() - 185,
+          updated_ts: nowSec() - 185,
+        },
+      ],
+    });
+    renderApprovals();
+    await screen.findByText("2 requests awaiting review");
+    await waitFor(() =>
+      expect(mocks.activityList).toHaveBeenCalledWith({
+        state: "waiting_approval",
+        limit: 100,
+      }),
+    );
+    const pushCard = card("repo.push");
+    expect(await pushCard.findByText("git push origin main")).toBeInTheDocument();
+    expect(pushCard.getByText("/Users/dev/pam")).toBeInTheDocument();
+    // A hand the tide has not shown yet says so instead of inventing a command.
+    expect(card("echo").getByText("not in the tide yet")).toBeInTheDocument();
+    expect(commandLine({ argv: ["a", "b"] })).toBe("a b");
+    expect(commandLine({ path: "/tmp/x" })).toBe('{"path":"/tmp/x"}');
+    expect(commandLine({})).toBeNull();
+    expect(commandLine(null)).toBeNull();
   });
 
   it("approves without remembering by default", async () => {
@@ -169,13 +222,14 @@ describe("resolving", () => {
     renderApprovals();
     await screen.findByText("2 requests awaiting review");
     const pushCard = card("repo.push");
-    fireEvent.click(pushCard.getByRole("button", { name: "add note" }));
+    fireEvent.click(pushCard.getByRole("button", { name: "Add note" }));
     fireEvent.change(pushCard.getByRole("textbox", { name: "resolution note" }), {
       target: { value: "  not on main  " },
     });
     fireEvent.click(pushCard.getByRole("button", { name: "Deny" }));
     await waitFor(() =>
       expect(mocks.approvalsResolve).toHaveBeenCalledWith("req_a", "denied", {
+        remember: false,
         note: "not on main",
       }),
     );
@@ -273,8 +327,8 @@ describe("lowered hands and broken water", () => {
   it("lowers the hand in Pam's voice when nothing is pending", async () => {
     mocks.approvalsPending.mockResolvedValue({ pending: [] });
     renderApprovals();
-    expect(await screen.findByText(/No hands raised/)).toBeInTheDocument();
-    expect(screen.getByText(/no agent or CLI can answer for you/)).toBeInTheDocument();
+    expect(await screen.findByText(/No requests are waiting for review/)).toBeInTheDocument();
+    expect(screen.getByText(/only this app can answer it/)).toBeInTheDocument();
     expect(screen.getByText("0 requests awaiting review")).toBeInTheDocument();
   });
 
@@ -286,6 +340,6 @@ describe("lowered hands and broken water", () => {
     expect(await screen.findByText(/disconnected · bridge_unavailable/)).toBeInTheDocument();
     expect(screen.getByText(/pam -- gui/)).toBeInTheDocument();
     // A broken bridge never claims calm water.
-    expect(screen.queryByText(/No hands raised/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/No requests are waiting/)).not.toBeInTheDocument();
   });
 });

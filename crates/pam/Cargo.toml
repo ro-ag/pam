@@ -32,7 +32,6 @@ tauri-build.workspace = true
 # The integration harness inspects the daemon's store directly.
 pam_store.workspace = true
 pam_testkit.workspace = true
-pam_connectors = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

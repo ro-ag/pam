@@ -79,8 +79,19 @@ The current OS command profile is qualified on macOS; other platforms refuse.
 The initial checkout implementation supports ordinary SHA-1 repositories only.
 It refuses linked worktrees, shallow source repositories, source alternates,
 submodules and tracked symlinks. Capture is capped at 4,096 files, 4 MiB per file,
-64 MiB total source and a 512 KiB serialized manifest. These are explicit product
-limits, not evidence that all enterprise repositories have been qualified.
+64 MiB total source and a 512 KiB serialized manifest. Before any Git process
+runs, PAM also walks the source repository's `.git` directory itself and refuses
+a metadata tree with more than 32,768 entries, or one containing a symlink or
+any other non-regular file. These are explicit product limits, not evidence
+that all enterprise repositories have been qualified.
+
+The sealed checktree lives in `<workspace directory>/landing-<ulid>/tree`, with
+its private build outputs beside it. PAM removes that whole `landing-<ulid>`
+directory when the ticket ends, whatever the outcome, so that mandatory checks
+have somewhere to run while the ticket can still resume and nothing is left
+behind once it cannot. A ticket parked between required-check polls keeps its
+workspace. The directory is only ever removed when it still has exactly that
+shape under the currently configured workspace directory.
 
 ## Durable effects and bounded waiting
 
@@ -89,6 +100,14 @@ timeout or lost response does not authorize repeating it. Recovery reads the
 remote state and compares it with the frozen intent. Conflicting or inconclusive
 state remains uncertain and requires reconciliation. Ordinary stateful command
 steps do not acquire this typed recovery behavior.
+
+For push and sync the intent also records what the Git process itself reported
+once it has run. A push that Git rejected, leaving the exact remote ref at the
+old value PAM observed, refuses as `landing_push_rejected`. A prepared push or
+sync found unchanged on resume, one Git reported complete while the ref stayed
+put, and a ref that moved to anything else all refuse as
+`landing_effect_uncertain`, with the detail saying which of the three it was.
+None of them is resent automatically.
 
 Policy revision, original admission, grant revision, scope, expiry and shared
 budget are checked again before work. Git credentials are supplied only to the

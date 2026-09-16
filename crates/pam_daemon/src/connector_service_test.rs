@@ -32,6 +32,27 @@ async fn approve_connector_repo(store: &Store, repo: &std::path::Path) {
     }).to_string()).await.expect("explicit test scope");
 }
 
+/// A patch can end up in a log line or a panic message; neither may carry
+/// the secret.
+#[test]
+fn a_patch_debug_never_prints_the_credential() {
+    let patch = ConfigurePatch {
+        credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+            TOKEN.to_owned(),
+        ))),
+        base_url: Some(Some(BASE_URL.to_owned())),
+        ..ConfigurePatch::default()
+    };
+    let rendered = format!("{patch:?}");
+    assert!(!rendered.contains(TOKEN), "{rendered}");
+    assert!(rendered.contains("Set([REDACTED])"), "{rendered}");
+    assert!(
+        rendered.contains(BASE_URL),
+        "non-secrets still print: {rendered}"
+    );
+    assert_eq!(format!("{:?}", CredentialAction::Clear), "Clear");
+}
+
 /// A service over an in-memory store, a fake keychain, and a scripted
 /// transport — the three seams the real service runs on.
 struct Fixture {
@@ -76,7 +97,9 @@ impl Fixture {
                 ConfigurePatch {
                     enabled: Some(true),
                     base_url: Some(Some(BASE_URL.to_owned())),
-                    credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                    credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                        TOKEN.to_owned(),
+                    ))),
                     ..ConfigurePatch::default()
                 },
             )
@@ -149,7 +172,9 @@ async fn configure_writes_the_credential_and_normalizes_the_base_url() {
                 // No trailing slash: the stored value gets one.
                 base_url: Some(Some("https://ci.example.test/jenkins".to_owned())),
                 username: Some(Some("builder".to_owned())),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
             },
         )
         .await
@@ -189,7 +214,9 @@ async fn configure_refuses_a_bad_base_url_before_writing_anything() {
             ConfigurePatch {
                 enabled: Some(true),
                 base_url: Some(Some("http://api.github.test/".to_owned())),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -266,7 +293,9 @@ async fn an_unreachable_credential_store_refuses_configure_and_still_lists() {
         .configure(
             ConnectorId::Github,
             ConfigurePatch {
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -435,7 +464,9 @@ async fn invoke_refuses_a_missing_base_url_before_the_transport_sees_anything() 
             ConnectorId::Github,
             ConfigurePatch {
                 enabled: Some(true),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -467,7 +498,9 @@ async fn invoke_refuses_a_connector_missing_the_user_name_its_auth_needs() {
             ConfigurePatch {
                 enabled: Some(true),
                 base_url: Some(Some("https://ci.example.test/".to_owned())),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -611,7 +644,9 @@ async fn a_daemon_without_curl_refuses_http_and_uncontained_aws() {
             ConfigurePatch {
                 enabled: Some(true),
                 base_url: Some(Some(BASE_URL.to_owned())),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -707,7 +742,9 @@ async fn configuration_changes_retire_the_old_verdict_and_test_current_credentia
             ConnectorId::Github,
             ConfigurePatch {
                 base_url: Some(Some("https://replacement.github.test/".to_owned())),
-                credential: Some(CredentialAction::Set(replacement.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    replacement.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -755,7 +792,9 @@ async fn failed_secret_replacement_retires_proof_without_applying_new_settings()
             ConfigurePatch {
                 enabled: Some(false),
                 base_url: Some(Some("https://replacement.github.test/".to_owned())),
-                credential: Some(CredentialAction::Set("replacement".to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    "replacement".to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -816,7 +855,9 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
             ConnectorId::Github,
             ConfigurePatch {
                 base_url: Some(Some(BASE_URL.to_owned())),
-                credential: Some(CredentialAction::Set(TOKEN.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )
@@ -844,7 +885,9 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
     let configure = service.configure(
         ConnectorId::Github,
         ConfigurePatch {
-            credential: Some(CredentialAction::Set("new-identity".to_owned())),
+            credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                "new-identity".to_owned(),
+            ))),
             ..ConfigurePatch::default()
         },
     );

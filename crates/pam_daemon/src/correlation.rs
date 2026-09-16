@@ -64,7 +64,7 @@ impl Frozen {
         Ok(())
     }
 
-    pub fn refuse_unbound_verification(&mut self, step: &Step) -> bool {
+    pub(crate) fn refuse_unbound_verification(&mut self, step: &Step) -> bool {
         if self.target.is_none() || step.role != Role::Verify {
             return false;
         }
@@ -72,7 +72,7 @@ impl Frozen {
         true
     }
 
-    pub async fn prepare(
+    pub(crate) async fn prepare(
         store: &Store,
         ticket: &str,
         repository: &str,
@@ -119,9 +119,9 @@ impl Frozen {
         for row in store
             .read_correlation_steps(ticket)
             .await
-            .map_err(storage)?
+            .map_err(retained)?
         {
-            let binding: Value = serde_json::from_str(&row.canonical_json).map_err(storage)?;
+            let binding: Value = serde_json::from_str(&row.canonical_json).map_err(retained)?;
             let decision = &binding["decision"];
             if binding["schema_version"] != 1
                 || binding["target_id"] != frozen.target_id
@@ -147,7 +147,7 @@ impl Frozen {
         Ok(frozen)
     }
 
-    pub async fn check_mapping(&self, store: &Store) -> Result<(), Failure> {
+    pub(crate) async fn check_mapping(&self, store: &Store) -> Result<(), Failure> {
         if let Some(mapping) = &self.sonar_mapping
             && crate::sonar_mapping::Snapshot::load(store)
                 .await
@@ -164,7 +164,7 @@ impl Frozen {
         Ok(())
     }
 
-    pub fn invalidate(&mut self, error: &Failure) {
+    pub(crate) fn invalidate(&mut self, error: &Failure) {
         self.decisions.insert(
             "mapping_check".to_owned(),
             json!({"status":"conflicting","detail":error.detail}),
@@ -172,7 +172,7 @@ impl Frozen {
     }
 
     /// Repository identity comes only from the GUI-owned mapping snapshot.
-    pub async fn enrich(
+    pub(crate) async fn enrich(
         &self,
         store: &Store,
         origin: &ConnectorTarget,
@@ -205,7 +205,7 @@ impl Frozen {
     }
 
     /// Product outcomes are deliberately excluded from the identity binding.
-    pub async fn associate(
+    pub(crate) async fn associate(
         &mut self,
         store: &Store,
         ticket: &str,
@@ -309,7 +309,7 @@ impl Frozen {
         let jobs = store
             .read_correlation_membership(ticket, step_id, &binding.to_string())
             .await
-            .map_err(storage)?
+            .map_err(retained)?
             .ok_or_else(|| Failure {
                 cause: STORAGE,
                 detail: "retained run-attempt binding changed".to_owned(),
@@ -336,11 +336,11 @@ impl Frozen {
         }
     }
 
-    pub fn report(&self) -> Value {
+    pub(crate) fn report(&self) -> Value {
         json!({"target_id":self.target_id,"binding":self.record,"steps":self.decisions,"status":self.status()})
     }
 
-    pub fn summary(&self) -> crate::flow_contract::CorrelationSummary {
+    pub(crate) fn summary(&self) -> crate::flow_contract::CorrelationSummary {
         crate::flow_contract::CorrelationSummary {
             status: self.status().to_owned(),
             target_id: self.target_id.clone(),
@@ -377,7 +377,7 @@ impl Frozen {
         }
     }
 
-    pub fn outcome(&self, outcome: pam_proto::Outcome) -> pam_proto::Outcome {
+    pub(crate) fn outcome(&self, outcome: pam_proto::Outcome) -> pam_proto::Outcome {
         if self.target.is_some()
             && self.status() != "matched"
             && matches!(
@@ -398,10 +398,19 @@ fn job_key(base: &str, repository: Option<&Value>, job: Option<&Value>) -> Optio
     Some(json!([base, repository, job]).to_string())
 }
 
+/// A write of an immutable association failed.
 fn storage(error: impl std::fmt::Display) -> Failure {
     Failure {
         cause: STORAGE,
         detail: format!("immutable correlation could not be recorded: {error}"),
+    }
+}
+
+/// A retained association could not be read back or parsed.
+fn retained(error: impl std::fmt::Display) -> Failure {
+    Failure {
+        cause: STORAGE,
+        detail: format!("retained correlation could not be read: {error}"),
     }
 }
 

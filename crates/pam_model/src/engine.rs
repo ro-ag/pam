@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::download::{self, DownloadRequest, DownloadState};
+use crate::registry::verified_sidecar_path;
 
 /// The upstream release tag every target is pinned to.
 pub const ENGINE_TAG: &str = "b10938";
@@ -274,7 +275,10 @@ pub struct EngineStatus {
     pub expected_build: u64,
     /// This platform's target, when the release covers it.
     pub target: Option<Target>,
-    /// Whether a verified server for the pinned tag is present.
+    /// Whether the manifest records the pinned tag, build and target and
+    /// the server file it names is present. Read from files only: the
+    /// digest was verified when the manifest was written, and the binary is
+    /// not re-hashed or re-run here.
     pub installed: bool,
     /// The server binary, when installed.
     pub server_path: Option<PathBuf>,
@@ -420,6 +424,10 @@ pub async fn install_release(
     ));
     let verified = unpack_and_verify(&archive, &scratch, release).await;
     let _ = std::fs::remove_file(&archive);
+    // The downloader records a verification sidecar beside anything it
+    // fetched with a digest; for a model that is the registry's evidence,
+    // for an archive that is about to be deleted it is litter.
+    let _ = std::fs::remove_file(verified_sidecar_path(&archive));
     let (server_dir, version_line) = match verified {
         Ok(found) => found,
         Err(error) => {
@@ -451,6 +459,7 @@ async fn fetch_archive(
     let archive = layout.archive_path(&release.asset_name);
     if archive.exists() {
         std::fs::remove_file(&archive).map_err(|e| io("remove stale archive", &e))?;
+        let _ = std::fs::remove_file(verified_sidecar_path(&archive));
     }
     let handle = download::start(DownloadRequest {
         url: release.url(),
@@ -524,7 +533,16 @@ fn write_manifest(
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| EngineError::Io {
         detail: format!("encode manifest: {e}"),
     })?;
-    std::fs::write(layout.manifest_path(), bytes).map_err(|e| io("write manifest", &e))
+    // Through a temporary file and a rename, so a crash mid-write leaves
+    // the previous manifest (or none) rather than a truncated one that
+    // `status` would report as `manifest_invalid`.
+    let path = layout.manifest_path();
+    let temp = layout.root().join(".pam-engine.json.tmp");
+    std::fs::write(&temp, bytes).map_err(|e| io("write manifest", &e))?;
+    std::fs::rename(&temp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        io("publish manifest", &e)
+    })
 }
 
 async fn cancelled(cancel: &mut watch::Receiver<bool>) {

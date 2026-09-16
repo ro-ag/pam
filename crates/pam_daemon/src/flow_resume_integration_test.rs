@@ -117,7 +117,7 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         let secrets=Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let reads=Arc::new(Reads::default());
         let connectors=Arc::new(ConnectorService::new(store.clone(),secrets.clone(),reads.clone()));
-        connectors.configure(pam_flow::ConnectorId::Github,ConfigurePatch{enabled:Some(true),base_url:Some(Some("https://github.test/".to_owned())),credential:Some(CredentialAction::Set("fixture-only".to_owned())),..ConfigurePatch::default()}).await.unwrap();
+        connectors.configure(pam_flow::ConnectorId::Github,ConfigurePatch{enabled:Some(true),base_url:Some(Some("https://github.test/".to_owned())),credential:Some(CredentialAction::Set(crate::secrets::Secret::new("fixture-only".to_owned()))),..ConfigurePatch::default()}).await.unwrap();
         let gate=Arc::new(PolicyGate::new(store.clone()).await.unwrap());
         let flows=Arc::new(FlowService::new(base.path(),store.clone(),approvals.clone(),connectors,logs,gate));
         let queue=Arc::new(QueueManager::new(store.clone()));

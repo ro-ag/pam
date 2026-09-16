@@ -2,7 +2,7 @@ use std::ptr;
 
 use pam_flow::{ConnectorId, connector_calls};
 
-use crate::{AuthKind, descriptor, descriptors};
+use crate::{AuthKind, descriptor};
 
 #[test]
 fn the_call_table_is_pam_flows_own_slice() {
@@ -22,13 +22,19 @@ fn every_descriptor_describes_itself() {
         assert_eq!(descriptor(id).id, id);
         assert!(!descriptor(id).name.is_empty());
     }
-    let listed: Vec<ConnectorId> = descriptors().iter().map(|entry| entry.id).collect();
+    let listed: Vec<ConnectorId> = ConnectorId::ALL
+        .iter()
+        .map(|id| descriptor(*id).id)
+        .collect();
     assert_eq!(listed, ConnectorId::ALL.to_vec());
 }
 
 #[test]
 fn names_are_spelled_the_way_the_vendors_spell_them() {
-    let names: Vec<&str> = descriptors().iter().map(|entry| entry.name).collect();
+    let names: Vec<&str> = ConnectorId::ALL
+        .iter()
+        .map(|id| descriptor(*id).name)
+        .collect();
     assert_eq!(
         names,
         vec![

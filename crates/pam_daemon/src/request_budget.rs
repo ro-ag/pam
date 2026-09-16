@@ -262,6 +262,14 @@ impl RequestBudget {
         })
     }
 
+    /// The admitted ceilings this request runs under, already clamped to
+    /// the compiled maximums; headroom checks read these, never a fresh
+    /// [`Limits::default`].
+    #[must_use]
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     /// Snapshot for the final evidence/handoff record.
     #[must_use]
     pub fn usage(&self) -> Usage {

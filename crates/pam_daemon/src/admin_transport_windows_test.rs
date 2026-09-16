@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::platform::{NONCE_BYTES, same, server_proof};
+use super::platform::{NONCE_BYTES, admit_client, same, server_proof};
 
 /// The handshake's two pure pieces: the server proof is a domain-separated hash
 /// of the nonce (never the nonce itself), and equality is constant-time by
@@ -49,6 +49,42 @@ async fn a_client_never_sends_the_nonce_to_a_port_that_cannot_prove_it() {
         received.is_empty(),
         "nothing was sent to the impostor, got {received:?}"
     );
+}
+
+/// Server side: a peer that read the proof but presents the wrong nonce is
+/// refused with `PermissionDenied` before any request byte is read, and the
+/// connection ends without a reply frame.
+#[tokio::test]
+async fn the_server_refuses_a_wrong_nonce_before_reading_a_request() {
+    let nonce = [5u8; NONCE_BYTES];
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let verdict = admit_client(&mut stream, &nonce).await;
+        // Whatever the peer sent after the nonce is never consumed.
+        let mut unread = Vec::new();
+        let _ = stream.read_to_end(&mut unread).await;
+        (verdict, unread)
+    });
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let mut proof = [0u8; NONCE_BYTES];
+    stream.read_exact(&mut proof).await.unwrap();
+    assert!(
+        same(&proof, &server_proof(&nonce)),
+        "the real server proves"
+    );
+    stream.write_all(&[6u8; NONCE_BYTES]).await.unwrap();
+    stream.write_all(b"request bytes").await.unwrap();
+    drop(stream);
+    let (verdict, unread) = server.await.unwrap();
+    assert_eq!(
+        verdict.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(unread, b"request bytes", "no request byte was parsed");
 }
 
 /// The end-to-end path — control file, server proof, nonce, framed exchange —

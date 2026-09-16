@@ -4,6 +4,7 @@
 //! is small enough to index safely, using pure-Rust inflate (no C zlib, no
 //! sha1 crate — Git verifies the trailer later) and no whole-object
 //! buffering. Every violation refuses on first sight; nothing here retries.
+use crate::landing_checkout::valid_oid;
 use flate2::{Decompress, FlushDecompress, Status};
 use serde::{Deserialize, Serialize};
 
@@ -80,18 +81,8 @@ fn response_invalid() -> PackError {
         detail: "upload-pack response preamble is malformed or missing the pack".to_owned(),
     }
 }
-fn is_valid_sha40(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        && value.bytes().any(|b| b != b'0')
-}
-fn is_lower_hex40(bytes: &[u8]) -> bool {
-    bytes.len() == 40
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+fn valid_oid_bytes(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(valid_oid)
 }
 fn push_pkt_line(body: &mut Vec<u8>, payload: &str) {
     let len = payload.len() + 4;
@@ -103,7 +94,7 @@ fn push_pkt_line(body: &mut Vec<u8>, payload: &str) {
 /// zero to two `have` pkt-lines, then `done`. Refuses unless every sha is 40
 /// lowercase hex, non-zero, and `haves.len() <= 2`.
 pub(crate) fn upload_pack_request(want: &str, haves: &[&str]) -> Result<Vec<u8>, PackError> {
-    if !is_valid_sha40(want) || haves.len() > 2 || haves.iter().any(|have| !is_valid_sha40(have)) {
+    if !valid_oid(want) || haves.len() > 2 || haves.iter().any(|have| !valid_oid(have)) {
         return Err(request_invalid(
             "want or have identity is not a valid non-zero 40-hex sha, or too many haves were given",
         ));
@@ -130,7 +121,7 @@ fn classify_pkt(payload: &[u8]) -> Result<(), PackError> {
         && rest.len() >= 40
     {
         let (sha, tail) = rest.split_at(40);
-        if is_lower_hex40(sha)
+        if valid_oid_bytes(sha)
             && matches!(tail, b"\n" | b" continue\n" | b" common\n" | b" ready\n")
         {
             return Ok(());
@@ -219,9 +210,11 @@ fn parse_ofs_delta_offset(pack: &[u8], pos: &mut usize) -> Result<u64, PackError
             .get(*pos)
             .ok_or_else(|| structural("ofs-delta offset is truncated"))?;
         *pos += 1;
+        // `(n + 1) << 7`, refused once the shift would drop bits: a
+        // checked shift only guards the shift amount, never the value.
         n = n
             .checked_add(1)
-            .and_then(|v| v.checked_shl(7))
+            .and_then(|v| v.checked_mul(128))
             .ok_or_else(|| structural("ofs-delta offset overflows"))?;
         n |= u64::from(byte & 0x7f);
         more = byte & 0x80 != 0;

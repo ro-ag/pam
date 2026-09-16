@@ -110,7 +110,9 @@ describe("shell chrome", () => {
   it("shows the beacon red while no daemon answers (jsdom has no bridge)", async () => {
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
-    expect(screen.getByRole("status", { name: "daemon unreachable" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: "daemon unreachable" }),
+    ).toBeInTheDocument();
   });
 
   it("cycles theme families by token redefinition on the root element", async () => {

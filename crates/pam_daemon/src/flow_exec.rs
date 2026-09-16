@@ -320,6 +320,14 @@ pub enum CommandOutcome {
         /// The operating system's reason.
         String,
     ),
+    /// It started and closed its pipes, but the OS would not report how it
+    /// ended; its output is kept, its exit status is unknown.
+    WaitFailed {
+        /// The operating system's reason.
+        detail: String,
+        /// Everything it wrote before the reap failed.
+        output: Vec<u8>,
+    },
 }
 
 /// Why the collector loop stopped.
@@ -336,8 +344,7 @@ enum Ending {
 }
 
 /// Runs one command step's child process to one of [`CommandOutcome`]'s
-/// four endings (see the module docs for the contract and the kill
-/// caveat).
+/// endings (see the module docs for the contract and the kill caveat).
 pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) -> CommandOutcome {
     let deadline = tokio::time::Instant::now() + spec.timeout;
     let mut command = match contained_command(&spec, cancel, deadline).await {
@@ -410,7 +417,10 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
                 status: status.code().unwrap_or(SIGNALLED_EXIT_STATUS),
                 output,
             },
-            Err(error) => CommandOutcome::SpawnFailed(error.to_string()),
+            Err(error) => CommandOutcome::WaitFailed {
+                detail: error.to_string(),
+                output,
+            },
         }
     }
 }
@@ -584,7 +594,8 @@ pub async fn run_command_budgeted(
     match &outcome {
         CommandOutcome::Exited { output, .. }
         | CommandOutcome::TimedOut { output }
-        | CommandOutcome::OutputLimit { output } => {
+        | CommandOutcome::OutputLimit { output }
+        | CommandOutcome::WaitFailed { output, .. } => {
             reservation
                 .finish_persisted(u64::try_from(output.len()).unwrap_or(u64::MAX))
                 .await?;

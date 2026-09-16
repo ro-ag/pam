@@ -9,8 +9,8 @@
 //! small C SIMD kernel for vector distance — the one residue in an otherwise pure-Rust
 //! stack. WAL is native (nothing switches it on); `PRAGMA user_version`, CHECK constraints,
 //! and `PRAGMA foreign_keys = ON` all work. The API is async; Turso drives its own I/O, and
-//! this crate's only `tokio` dependency is the `sync` mutex serializing
-//! [`Store::finish_request`] transactions.
+//! this crate's only `tokio` dependency is the `sync` mutex serializing every statement on
+//! the one connection (held across each `BEGIN`..`COMMIT` window).
 //! Integrity is enforced twice — CHECK and foreign-key constraints in the database, typed enums in
 //! Rust — and the daemon still owns threading and task placement.
 
@@ -26,11 +26,13 @@ pub use store::{
     EvidenceOrigins, EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest,
     EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin,
     FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantRow, LandingSession,
-    MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_REQUEST_LIST_LIMIT, ModelJobRow,
+    MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_LIST_LIMIT, ModelJobRow,
     PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow,
     RequestState, RequestStatusMeta, Store,
 };
 
+#[cfg(test)]
+mod evidence_views_test;
 #[cfg(test)]
 mod migrations_test;
 #[cfg(test)]

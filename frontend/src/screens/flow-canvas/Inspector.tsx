@@ -129,12 +129,24 @@ function Select<T extends string>({
   );
 }
 
-/** Replaces one key of a record, keeping the others in place. */
-function renameKey<V>(record: Record<string, V>, from: string, to: string): Record<string, V> {
+/**
+ * Replaces one key of a record, keeping the others in place. A rename
+ * onto a name the record already holds answers `null` — `fromEntries`
+ * would otherwise keep one entry and silently drop the other.
+ */
+function renameKey<V>(
+  record: Record<string, V>,
+  from: string,
+  to: string,
+): Record<string, V> | null {
+  if (to !== from && Object.prototype.hasOwnProperty.call(record, to)) return null;
   return Object.fromEntries(
     Object.entries(record).map(([key, value]) => [key === from ? to : key, value]),
   );
 }
+
+/** The refusal a colliding rename shows beside its field. */
+const NAME_TAKEN: Refused = { cause: "name taken", fix: "pick a name no other entry uses" };
 
 function withoutKey<V>(record: Record<string, V>, key: string): Record<string, V> {
   return Object.fromEntries(Object.entries(record).filter(([candidate]) => candidate !== key));
@@ -193,12 +205,23 @@ function InputsFields({
   onChange: (spec: FlowSpec) => void;
 }) {
   const inputs = spec.inputs;
+  const [refused, setRefused] = useState<Refused | null>(null);
   const write = (next: Record<string, FlowSpecInput>) => onChange(updateInputs(spec, next));
+  const rename = (from: string, to: string) => {
+    const next = renameKey(inputs, from, to);
+    if (next === null) {
+      setRefused(NAME_TAKEN);
+      return;
+    }
+    setRefused(null);
+    write(next);
+  };
   const patch = (name: string, change: Partial<FlowSpecInput>) =>
     write({ ...inputs, [name]: { ...inputs[name], ...change } });
   const names = Object.keys(inputs);
   return (
     <>
+      {refused && <Refusal refused={refused} label="rename refused" />}
       {names.length === 0 && (
         <p className="font-sans text-sm text-ink-muted">
           This flow takes no inputs; every step runs as written.
@@ -210,7 +233,7 @@ function InputsFields({
             <input
               aria-label="input name"
               value={name}
-              onChange={(event) => write(renameKey(inputs, name, event.target.value))}
+              onChange={(event) => rename(name, event.target.value)}
               className={cn(fieldClasses, "flex-1")}
             />
             <Button
@@ -218,7 +241,7 @@ function InputsFields({
               size="sm"
               aria-label={`remove ${name}`}
               onClick={() => write(withoutKey(inputs, name))}
-              className="px-2"
+              className="min-w-8 px-2"
             >
               <X size={14} aria-hidden="true" />
             </Button>
@@ -423,16 +446,27 @@ function EnvRows({
   patch: (change: Partial<FlowStep>) => void;
 }) {
   const names = Object.keys(step.env);
+  const [refused, setRefused] = useState<Refused | null>(null);
   const write = (env: Record<string, string>) => patch({ env });
+  const rename = (from: string, to: string) => {
+    const next = renameKey(step.env, from, to);
+    if (next === null) {
+      setRefused(NAME_TAKEN);
+      return;
+    }
+    setRefused(null);
+    write(next);
+  };
   return (
     <div className="space-y-2">
       <span className={fieldLabelClasses}>env</span>
+      {refused && <Refusal refused={refused} label="rename refused" />}
       {names.map((name, index) => (
         <div key={index} className="flex items-center gap-2">
           <input
             aria-label="env name"
             value={name}
-            onChange={(event) => write(renameKey(step.env, name, event.target.value))}
+            onChange={(event) => rename(name, event.target.value)}
             className={cn(fieldClasses, "w-28 shrink-0")}
           />
           <input
@@ -446,7 +480,7 @@ function EnvRows({
             size="sm"
             aria-label={`remove ${name}`}
             onClick={() => write(withoutKey(step.env, name))}
-            className="px-2"
+            className="min-w-8 px-2"
           >
             <X size={14} aria-hidden="true" />
           </Button>
@@ -491,8 +525,12 @@ function StepFields({
 
   const stateful = step.effect === "stateful";
   const kind = step.action.kind;
+  // A landing step is built from the landing policy, not from this panel:
+  // its operation is read-only and it never turns into a command or a
+  // connector call with one click.
+  const landing = kind === "landing";
   const flipKind = (next: "command" | "connector") => {
-    if (next === kind) return;
+    if (next === kind || landing) return;
     patch({
       action:
         next === "command"
@@ -524,15 +562,33 @@ function StepFields({
             key={candidate}
             type="button"
             aria-pressed={kind === candidate}
+            disabled={landing}
+            title={
+              landing ? "A landing step keeps its operation; add a new step instead" : undefined
+            }
             onClick={() => flipKind(candidate)}
-            className={toggleVariants({ state: kind === candidate ? "active" : "idle" })}
+            className={cn(
+              toggleVariants({ state: kind === candidate ? "active" : "idle" }),
+              "disabled:cursor-not-allowed disabled:opacity-70",
+            )}
           >
             {candidate}
           </button>
         ))}
+        {landing && <Badge tone="accent">landing</Badge>}
       </div>
 
-      {kind === "command" ? (
+      {step.action.kind === "landing" ? (
+        <Field label="operation">
+          <input
+            aria-label="operation"
+            readOnly
+            value={step.action.operation}
+            title="Set by the landing policy in Settings › Flows"
+            className={cn(fieldClasses, "text-ink-muted")}
+          />
+        </Field>
+      ) : step.action.kind === "command" ? (
         <ArgvLine step={step} commit={(argv) => patch({ action: { kind: "command", argv } })} />
       ) : (
         <ConnectorFields step={step} patch={patch} />
@@ -655,7 +711,7 @@ function StepList({
   const last = spec.steps.length - 1;
   return (
     <Group>
-      <Eyebrow>steps · in order</Eyebrow>
+      <Eyebrow>Steps, in order</Eyebrow>
       <ol className="space-y-1">
         {spec.steps.map((step, index) => {
           const selected = selection.kind === "step" && selection.id === step.id;
@@ -681,7 +737,7 @@ function StepList({
                 aria-label={`move ${step.id} up`}
                 disabled={index === 0}
                 onClick={() => move(step.id, -1)}
-                className="rounded-control p-1 text-ink-faint hover:text-ink disabled:opacity-30"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronUp size={14} aria-hidden="true" />
               </button>
@@ -690,7 +746,7 @@ function StepList({
                 aria-label={`move ${step.id} down`}
                 disabled={index === last}
                 onClick={() => move(step.id, 1)}
-                className="rounded-control p-1 text-ink-faint hover:text-ink disabled:opacity-30"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronDown size={14} aria-hidden="true" />
               </button>
@@ -747,7 +803,10 @@ function EdgeFields({
       </p>
       <fieldset className="space-y-2" aria-label="edge kind">
         {EDGE_KINDS.map((kind) => (
-          <label key={kind} className="flex items-center gap-2 font-data text-xs text-ink">
+          <label
+            key={kind}
+            className="flex min-h-8 cursor-pointer items-center gap-2 font-data text-xs text-ink"
+          >
             <input
               type="radio"
               name="edge-kind"
@@ -755,7 +814,7 @@ function EdgeFields({
               value={kind}
               checked={edge.kind === kind}
               onChange={() => flip(kind)}
-              className="accent-accent"
+              className="size-4.5 accent-accent"
             />
             {kind}
             <span className="text-ink-faint">
@@ -799,7 +858,7 @@ export function Inspector({ spec, selection, onChange, onSelect, error }: Inspec
   return (
     <Panel ground="command" aria-label="inspector" className="space-y-4 p-4">
       <div className="flex items-center gap-2">
-        <Eyebrow>inspector</Eyebrow>
+        <Eyebrow>Inspector</Eyebrow>
         <Badge tone={selection.kind === "none" ? "neutral" : "accent"}>
           {title(selection)}
         </Badge>

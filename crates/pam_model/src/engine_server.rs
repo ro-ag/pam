@@ -303,7 +303,7 @@ impl EngineServer {
         }
         let _ = std::fs::remove_file(&self.socket);
         let endpoint = self.choose_endpoint()?;
-        let api_key = fresh_api_key(model_path);
+        let api_key = fresh_api_key(model_path)?;
         let mut child = self.spawn(model_path, &endpoint, options, &api_key)?;
         let pid = child.id().unwrap_or_default();
         let deadline = Instant::now() + options.load_timeout;
@@ -351,6 +351,24 @@ impl EngineServer {
         .await
         .ok()
         .and_then(|reply| serde_json::from_slice::<serde_json::Value>(&reply.body).ok());
+        // Health alone does not prove the peer is our child: on a loopback
+        // port the number was probed and released before the spawn, and
+        // another local process could have taken it in between — in which
+        // case it now holds the bearer key. The server's own `/props`
+        // names the model it loaded; anything but our path is a stranger,
+        // and the child is stopped rather than trusted.
+        let served_path = props.as_ref().and_then(|p| p["model_path"].as_str());
+        if served_path != Some(model_path.to_string_lossy().as_ref()) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&self.socket);
+            return Err(EngineServerError::Spawn(format!(
+                "the server at {} reports model {:?}, not {}; refusing to trust it",
+                endpoint.host_arg(),
+                served_path.unwrap_or("<none>"),
+                model_path.display()
+            )));
+        }
         let model = EngineModel {
             id: model_id.to_owned(),
             path: model_path.to_path_buf(),
@@ -593,7 +611,19 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
 /// A per-load bearer token. The socket is already private to PAM's user;
 /// the key stops any other local process that can reach the path from
 /// driving the server, and it never leaves this process.
-fn fresh_api_key(model_path: &Path) -> String {
+///
+/// Entropy, on every platform without a new dependency: the standard
+/// library's `RandomState` keys are seeded per thread from the operating
+/// system's CSPRNG (`getrandom` / `BCryptGenRandom` / `getentropy`), and
+/// hashing distinct inputs under several fresh states yields independent
+/// 64-bit `SipHash` outputs of those secret keys. Four such words (256
+/// bits) go into the digest, plus 32 bytes read straight from
+/// `/dev/urandom` where the device exists (an exact `read_exact`, never a
+/// read to end — the device is endless), plus the pid, the time and the
+/// model path so two loads never share a key even under a broken RNG. The
+/// result is 64 lowercase hex characters; an empty key is refused.
+fn fresh_api_key(model_path: &Path) -> Result<String, EngineServerError> {
+    use std::hash::{BuildHasher, RandomState};
     let mut hasher = Sha256::new();
     hasher.update(model_path.to_string_lossy().as_bytes());
     hasher.update(std::process::id().to_le_bytes());
@@ -604,15 +634,23 @@ fn fresh_api_key(model_path: &Path) -> String {
             .unwrap_or_default()
             .to_le_bytes(),
     );
-    // Exactly 32 bytes of OS entropy where the device exists; never
-    // `fs::read`, which would read the endless device to exhaustion.
+    for round in 0_u64..4 {
+        let word = RandomState::new().hash_one((round, model_path));
+        hasher.update(word.to_le_bytes());
+    }
     let mut entropy = [0_u8; 32];
     if let Ok(mut device) = std::fs::File::open("/dev/urandom") {
         use std::io::Read as _;
         let _ = device.read_exact(&mut entropy);
     }
     hasher.update(entropy);
-    format!("{:x}", hasher.finalize())
+    let key = format!("{:x}", hasher.finalize());
+    if key.len() != 64 || key.bytes().all(|b| b == b'0') {
+        return Err(EngineServerError::Spawn(
+            "no entropy for the engine API key; refusing to start the server".to_owned(),
+        ));
+    }
+    Ok(key)
 }
 
 fn now_ms() -> i64 {
@@ -625,14 +663,27 @@ fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// The last [`LOG_TAIL_BYTES`] of the server log, read by seeking to the
+/// end rather than loading a log that may have grown for days.
 fn log_tail(log: &Path) -> String {
-    std::fs::read(log)
-        .map(|bytes| {
-            let start = bytes.len().saturating_sub(600);
-            String::from_utf8_lossy(&bytes[start..]).into_owned()
-        })
-        .unwrap_or_default()
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(log) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
+
+/// How much of the server log a crash report carries.
+const LOG_TAIL_BYTES: u64 = 600;
 
 /// The smallest explicit output budget a generation is given. gpt-oss's
 /// harmony template opens an analysis channel before the answer; under

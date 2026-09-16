@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import {
   sonarMappingsGet,
@@ -12,8 +13,6 @@ import {
 } from "../lib/ipc";
 
 const key = ["sonar-repository-mappings"];
-const fieldClasses =
-  "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink";
 
 export function SonarRepositoryMappingsEditor() {
   const client = useQueryClient();

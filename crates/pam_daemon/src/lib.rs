@@ -5,6 +5,8 @@
 pub mod admin;
 pub mod admin_connectors;
 pub mod admin_engine;
+#[cfg(test)]
+mod admin_engine_test;
 pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;

@@ -365,7 +365,7 @@ async fn cancel_of_a_queued_request_releases_waiters_and_tells_subscribers() {
             AdmitOutcome::Admitted
         );
         fx.queue
-            .place_in_lane(&target.id, &target.caller.repo, target.deadline_ms)
+            .place_in_lane(&target.id, &target.caller.repo)
             .await
             .unwrap();
 
@@ -399,6 +399,43 @@ async fn cancel_of_a_queued_request_releases_waiters_and_tells_subscribers() {
         let (topic, event) = fx.events_rx.recv().await.unwrap();
         assert_eq!(topic, "req_target");
         assert_eq!(event, Event::Refused);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The audit actor names who asked, as far as the vocabulary allows: a
+/// cancel the GUI sent (caller agent `pam-gui`) is a human's decision, an
+/// agent's `pam cancel` is the daemon acting for it.
+#[tokio::test]
+async fn cancel_from_the_gui_audits_a_human_actor() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let target = envelope("req_gui_target", serde_json::json!({ "n": 1 }));
+        assert_eq!(
+            fx.queue
+                .admit(&target, CapabilityClass::NonDestructive)
+                .await
+                .unwrap(),
+            AdmitOutcome::Admitted
+        );
+        fx.queue
+            .place_in_lane(&target.id, &target.caller.repo)
+            .await
+            .unwrap();
+
+        let mut ctx = fx.ctx_uncancelled(
+            "req_gui_cancel",
+            serde_json::json!({ "ticket": "req_gui_target" }),
+        );
+        ctx.caller.agent = crate::admin::ADMIN_CALLER_AGENT.to_owned();
+        let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
+        assert_eq!(output.body["result"], "cancelled_queued");
+
+        let audit = fx.store.audit_for_request("req_gui_target").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_CANCEL);
+        assert_eq!(audit[0].actor, Actor::Human);
     })
     .await
     .expect("test within deadline");

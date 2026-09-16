@@ -135,12 +135,24 @@ pub struct LastTest {
 }
 
 /// What a configure asks of the stored credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` never prints the secret: a patch can end up in a log line or a
+/// panic message, and `[REDACTED]` is all either may carry. The secret is a
+/// [`crate::secrets::Secret`], so its bytes are zeroed when the patch drops.
 pub enum CredentialAction {
     /// Write this secret, replacing any existing one.
-    Set(String),
+    Set(crate::secrets::Secret),
     /// Delete the stored secret.
     Clear,
+}
+
+impl std::fmt::Debug for CredentialAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set(_) => formatter.write_str("Set([REDACTED])"),
+            Self::Clear => formatter.write_str("Clear"),
+        }
+    }
 }
 
 impl CredentialAction {
@@ -156,8 +168,9 @@ impl CredentialAction {
 }
 
 /// A partial change to one connector: a field left as `None` is untouched,
-/// and `Some(None)` clears the field.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// and `Some(None)` clears the field. `Debug` goes through
+/// [`CredentialAction`]'s, so the secret stays redacted.
+#[derive(Debug, Default)]
 pub struct ConfigurePatch {
     /// New `enabled` value, when given.
     pub enabled: Option<bool>,
@@ -458,8 +471,13 @@ impl ConnectorService {
                 .await?;
         }
 
-        match patch.credential.as_ref() {
-            Some(CredentialAction::Set(secret)) => self.secrets.set(id.as_str(), secret).await?,
+        // The secret moves out of the patch into the store's blocking call
+        // and is zeroed there; no copy of it is made along the way.
+        let credential_changed = patch.credential.is_some();
+        match patch.credential {
+            Some(CredentialAction::Set(secret)) => {
+                self.secrets.set(id.as_str(), secret).await?;
+            }
             Some(CredentialAction::Clear) => {
                 self.secrets.clear(id.as_str()).await?;
             }
@@ -474,7 +492,7 @@ impl ConnectorService {
             .upsert_connector(
                 id.as_str(),
                 ConnectorPatch {
-                    invalidate_test: patch.credential.is_some(),
+                    invalidate_test: credential_changed,
                     enabled: patch.enabled,
                     base_url: base_url.as_ref().map(|value| value.as_deref()),
                     username,
@@ -510,12 +528,11 @@ impl ConnectorService {
         Ok((passed, detail))
     }
 
-    /// Runs one connector call on behalf of a flow step.
-    ///
-    /// Everything a human must fix — disabled, no credential, no base URL,
-    /// an unreachable keychain, a missing `curl` — refuses here, before the
-    /// transport is touched. Only a fully configured, enabled connector
-    /// ever reaches the network.
+    /// Test-only shortcut over [`Self::invoke_with_budget`] with a fresh
+    /// per-call budget. Production always carries the request's persisted
+    /// cumulative allowance, so no daemon path may call this: a budget
+    /// minted per call would let one request spend without bound.
+    #[cfg(test)]
     pub async fn invoke(
         &self,
         repo: &Path,
@@ -639,13 +656,13 @@ impl ConnectorService {
         args: &BTreeMap<String, ArgValue>,
     ) -> Result<Option<ConnectorRow>, InvokeError> {
         let policy = ScopePolicy::load(&self.store).await?;
-        policy.authorize_repo(repo)?;
+        let canonical = policy.authorize_repo_blocking(repo).await?;
         let row = self.store.get_connector(id.as_str()).await?;
         if !row.as_ref().is_some_and(|row| row.enabled) {
             return Err(InvokeError::Disabled);
         }
         let base_url = configured_url(id, row.as_ref())?;
-        policy.authorize_connector(repo, id, &base_url, call, args)?;
+        policy.authorize_connector_at(&canonical, id, &base_url, call, args)?;
         Ok(row)
     }
 

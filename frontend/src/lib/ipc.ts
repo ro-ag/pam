@@ -97,6 +97,8 @@ export function keyringHealth(status: StatusBody | null | undefined): KeyringHea
 export interface DaemonStatusReply {
   connected: boolean;
   status: StatusBody | null;
+  /** The base directory the bridge resolved (`$PAM_BASE_DIR` or `~/.pam`); absent on an older bridge. */
+  base_dir?: string;
 }
 
 /** Daemon health; ensures (lazily starts) the daemon as a side effect. */

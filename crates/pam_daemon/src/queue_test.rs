@@ -63,7 +63,7 @@ async fn admit(queue: &QueueManager, envelope: &Envelope) -> AdmitOutcome {
 async fn enqueue(queue: &QueueManager, envelope: &Envelope) -> usize {
     assert_eq!(admit(queue, envelope).await, AdmitOutcome::Admitted);
     queue
-        .place_in_lane(&envelope.id, &envelope.caller.repo, envelope.deadline_ms)
+        .place_in_lane(&envelope.id, &envelope.caller.repo)
         .await
         .unwrap()
 }
@@ -660,6 +660,12 @@ async fn pre_gate_admission_is_not_recovered_and_legacy_queued_rows_fail_closed(
     let legacy = store.get_request("legacy").await.unwrap().unwrap();
     assert_eq!(legacy.state, RequestState::Failed);
     assert_eq!(legacy.outcome.as_deref(), Some("admission_invalid"));
+    // Nothing timed out: a row recovery refused to restore is audited as
+    // a recovery refusal, not as a reaped lease.
+    let audit = store.audit_for_request("legacy").await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, crate::queue::ACTION_RECOVERY_REFUSAL);
+    assert_eq!(audit[0].detail.as_deref(), Some("admission_invalid"));
 }
 
 #[tokio::test]
@@ -693,18 +699,15 @@ async fn placement_cannot_extend_expiry_or_change_admitted_repository() {
         .unwrap()
         .expires_at_ms;
     assert!(matches!(
-        queue.place_in_lane(&env.id, REPO_B, u64::MAX).await,
+        queue.place_in_lane(&env.id, REPO_B).await,
         Err(QueueError::NotAdmitted)
     ));
-    queue
-        .place_in_lane(&env.id, REPO_A, u64::MAX)
-        .await
-        .unwrap();
+    queue.place_in_lane(&env.id, REPO_A).await.unwrap();
     let row = store.get_request(&env.id).await.unwrap().unwrap();
     assert_eq!(row.expires_at_ms, expires);
     assert!(row.queue_authorized);
     assert!(matches!(
-        queue.place_in_lane(&env.id, REPO_A, 60_000).await,
+        queue.place_in_lane(&env.id, REPO_A).await,
         Err(QueueError::NotAdmitted)
     ));
 }
@@ -830,6 +833,13 @@ async fn grant_revocation_invalidates_queued_work_even_after_regrant_and_restart
             .outcome
             .as_deref(),
         Some("authorization_changed")
+    );
+    let audit = store.audit_for_request("restart").await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|row| row.action == crate::queue::ACTION_RECOVERY_REFUSAL),
+        "{audit:?}"
     );
 }
 

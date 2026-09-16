@@ -104,7 +104,10 @@ describe("Settings layout contract", () => {
   it("uses content-width breakpoints and additional columns on wide windows", () => {
     expect(styles).toContain("@container (min-width: 960px)");
     expect(styles).toContain("@container (min-width: 1400px)");
-    expect(styles).toMatch(/\.appearance-grid\s*\{\s*grid-template-columns: repeat\(4,/);
+    expect(styles).toMatch(
+      /\.appearance-grid\s*\{\s*grid-template-columns: repeat\(auto-fill, minmax\(200px, 1fr\)\)/,
+    );
+    expect(styles).toMatch(/\.appearance-palette\s*\{[^}]*max-width: 280px/);
     expect(styles).toMatch(/\.connector-grid\s*\{\s*grid-template-columns: repeat\(3,/);
     expect(styles).toContain("max-width: 1440px");
   });

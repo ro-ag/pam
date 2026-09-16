@@ -62,13 +62,15 @@ afterEach(() => {
 });
 
 describe("Beacon", () => {
-  it("defaults to the down state", () => {
+  it("defaults to the connecting state: nothing claimed before the first answer", () => {
     render(<Beacon />);
-    const beacon = screen.getByRole("status", { name: "daemon unreachable" });
-    expect(beacon.innerHTML).toContain("bg-beacon-red");
+    const beacon = screen.getByRole("status", { name: "daemon connecting" });
+    expect(beacon).toHaveTextContent("Connecting");
+    expect(beacon.innerHTML).not.toContain("bg-beacon-red");
   });
 
   it.each([
+    ["connecting", "daemon connecting", "bg-line-strong"],
     ["connected", "daemon connected", "bg-beacon-green"],
     ["pending", "daemon approval pending", "bg-beacon-amber"],
     ["down", "daemon unreachable", "bg-beacon-red"],
@@ -164,7 +166,7 @@ describe("shell layout", () => {
     const toolbar = screen.getByRole("toolbar", { name: "panel controls" });
     expect(panel?.firstElementChild).toBe(toolbar);
     expect(
-      within(toolbar).getByRole("status", { name: "daemon unreachable" }),
+      await within(toolbar).findByRole("status", { name: "daemon unreachable" }),
     ).toBeInTheDocument();
     const controls = within(toolbar).getAllByRole("button");
     expect(controls).toHaveLength(4);

@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   evidenceList: vi.fn(),
   evidenceGet: vi.fn(),
   logCompress: vi.fn(),
+  auditRequest: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -95,6 +96,7 @@ beforeEach(() => {
   mocks.evidenceList.mockResolvedValue({ evidence: [] });
   mocks.evidenceGet.mockResolvedValue(null);
   mocks.logCompress.mockResolvedValue(null);
+  mocks.auditRequest.mockResolvedValue({ request_id: "req_run", rows: [] });
 });
 
 afterEach(() => {
@@ -146,6 +148,55 @@ describe("the tide", () => {
     expect(router.state.location.search.state).toBe("refused");
   });
 
+  it("opens the compression's own row after a compress, even though the tide hides admin rows", async () => {
+    // The daemon drops every `admin.*` row under hide_probes, so the
+    // compress row only ever arrives through the capability-filtered read.
+    const compressRow = row({
+      id: "req_zip",
+      capability: "admin.log.compress",
+      agent: "pam-gui",
+      args: { path: "/tmp/build.log" },
+      created_ts: Math.floor(Date.now() / 1000) - 5,
+    });
+    mocks.activityList.mockImplementation((args: { capability?: string }) =>
+      Promise.resolve({
+        requests: args.capability === "admin.log.compress" ? [compressRow] : TIDE,
+      }),
+    );
+    mocks.logCompress.mockResolvedValue({
+      source: { id: "source", bytes: 1000 },
+      compact: { id: "compact", bytes: 100 },
+      summary: null,
+      compact_text: "Build completed",
+      summary_text: null,
+      stats: {
+        source_bytes: 1000,
+        compact_bytes: 100,
+        source_records: 10,
+        retained_records: 1,
+        tokens_source_est: 250,
+        tokens_compact_est: 25,
+        tokens_avoided_est: 225,
+      },
+      model: null,
+      model_skipped: null,
+    });
+    renderActivity();
+    await screen.findByText("compress.log");
+    // The compress row sits in the tide beside the agents' rows.
+    expect(await screen.findByText("admin.log.compress")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Log compression" }));
+    fireEvent.change(screen.getByLabelText("log path"), {
+      target: { value: "/tmp/build.log" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Compress" }));
+    await screen.findByText(/225 tokens avoided/);
+    fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
+    const rowButton = screen.getByText("admin.log.compress").closest("button") as HTMLElement;
+    await waitFor(() => expect(rowButton).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText(/"path": "\/tmp\/build.log"/)).toBeInTheDocument();
+  });
+
   it("renders one row per request with capability, agent, repo tail, and verdict", async () => {
     renderActivity();
     expect(await screen.findByText("compress.log")).toBeInTheDocument();
@@ -181,6 +232,52 @@ describe("the tide", () => {
     expect(screen.getByText(/"hello": "water"/)).toBeInTheDocument();
     fireEvent.click(rowButton as HTMLElement);
     expect(screen.queryByText("req_run")).not.toBeInTheDocument();
+  });
+
+  it("shows the request's audit trail under its evidence, in the daemon's words", async () => {
+    mocks.auditRequest.mockResolvedValue({
+      request_id: "req_ref",
+      rows: [
+        {
+          id: 1,
+          action: "gate",
+          decision: "refuse",
+          actor: "system",
+          detail: {
+            cause: "capability_denied",
+            detail: "repo.push is not granted",
+            recovery: "Grant it in Settings › Security.",
+          },
+          ts: 1_756_684_800,
+        },
+        {
+          id: 2,
+          action: "execute",
+          decision: "allow",
+          actor: "human",
+          detail: "note",
+          ts: 1_756_684_860,
+        },
+      ],
+    });
+    renderActivity();
+    fireEvent.click((await screen.findByText("repo.push")).closest("button") as HTMLElement);
+    await waitFor(() => expect(mocks.auditRequest).toHaveBeenCalledWith("req_ref"));
+    const trail = within(await screen.findByRole("list", { name: "audit trail" }));
+    const rows = trail.getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("gate · refuse · system");
+    expect(rows[0]).toHaveTextContent(
+      "capability_denied — repo.push is not granted — Grant it in Settings › Security.",
+    );
+    expect(rows[1]).toHaveTextContent("execute · allow · human");
+    expect(rows[1]).toHaveTextContent("note");
+  });
+
+  it("says so when a request left no audit rows", async () => {
+    renderActivity();
+    fireEvent.click((await screen.findByText("compress.log")).closest("button") as HTMLElement);
+    expect(await screen.findByText("no audit rows for this request")).toBeInTheDocument();
   });
 
   it("asks for the expanded request's evidence", async () => {
@@ -278,6 +375,23 @@ describe("lanes", () => {
     expect(screen.getByText(/3 requests · 2 lanes · newest first/)).toBeInTheDocument();
   });
 
+  it("labels the filter groups and keeps every chip a 32px target", async () => {
+    renderActivity();
+    await screen.findByText("compress.log");
+    const state = screen.getByRole("group", { name: "state filter" });
+    expect(within(state).getByText("State")).toBeInTheDocument();
+    const agents = screen.getByRole("group", { name: "Agent filters" });
+    const repos = screen.getByRole("group", { name: "Repository filters" });
+    expect(within(agents).getByText("Agent")).toBeInTheDocument();
+    expect(within(repos).getByText("Repository")).toBeInTheDocument();
+    for (const chip of [
+      ...within(agents).getAllByRole("button"),
+      ...within(state).getAllByRole("button"),
+    ]) {
+      expect(chip.className).toContain("h-8");
+    }
+  });
+
   it("shows agent and repo chips; an agent chip narrows to one lane and writes the URL", async () => {
     serverFilters();
     const router = renderActivity();
@@ -362,7 +476,11 @@ describe("live updates", () => {
     renderActivity();
     await screen.findByText("compress.log");
     await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
-    const initialCalls = mocks.activityList.mock.calls.length;
+    // Count the tide's own reads: the compress-row query shares the
+    // `["activity"]` prefix and refetches alongside it.
+    const tideCalls = () =>
+      mocks.activityList.mock.calls.filter(([args]) => args.hide_probes === true).length;
+    const initialCalls = tideCalls();
 
     vi.useFakeTimers();
     const burst: PamEventPayload = { ticket: "t1", event: { kind: "done" } };
@@ -372,11 +490,11 @@ describe("live updates", () => {
       for (const handler of eventHandlers) handler(burst);
     });
     // Inside the debounce window nothing has refetched yet.
-    expect(mocks.activityList.mock.calls.length).toBe(initialCalls);
+    expect(tideCalls()).toBe(initialCalls);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(EVENT_REFRESH_MS);
     });
-    expect(mocks.activityList.mock.calls.length).toBe(initialCalls + 1);
+    expect(tideCalls()).toBe(initialCalls + 1);
   });
 });
 
@@ -405,5 +523,9 @@ describe("quiet and broken water", () => {
     expect(screen.getByText(/pam -- gui/)).toBeInTheDocument();
     // A broken bridge never claims calm water.
     expect(screen.queryByText(/No activity yet/)).not.toBeInTheDocument();
+    // Retry asks again instead of leaving the human to reload.
+    const before = mocks.activityList.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(mocks.activityList.mock.calls.length).toBeGreaterThan(before));
   });
 });

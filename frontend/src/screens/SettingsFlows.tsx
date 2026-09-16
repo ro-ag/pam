@@ -4,7 +4,9 @@ import { LandingSettings } from "./LandingSettings";
 import { useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
+import { cn } from "../lib/cn";
 import {
   flowsSettingsGet,
   flowsSettingsSet,
@@ -30,10 +32,10 @@ import {
  * daemon cannot see because it never inherited a login shell's PATH.
  */
 
-const fieldClasses =
-  "h-8 min-w-40 flex-1 rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+/** The list fields grow with the row instead of spanning it. */
+const rowFieldClasses = cn(fieldClasses, "w-auto min-w-40 flex-1");
 
-/** One removable chip: the value in the data voice, and a way out. */
+/** One removable chip: the value in the data voice, and a 24px way out. */
 function ListChip({
   value,
   label,
@@ -46,7 +48,7 @@ function ListChip({
   disabled: boolean;
 }) {
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-badge border border-line bg-surface px-2.5 py-0.5 font-data text-xs text-ink-muted">
+    <span className="inline-flex items-center gap-1 rounded-badge border border-line-strong bg-surface py-0.5 pr-0.5 pl-2.5 font-data text-xs text-ink-muted">
       {value}
       <button
         type="button"
@@ -55,9 +57,9 @@ function ListChip({
         onClick={() => {
           if (!disabled) onRemove();
         }}
-        className="text-ink-faint transition-colors duration-150 hover:text-danger"
+        className="flex size-6 items-center justify-center rounded-badge text-ink-muted transition-colors duration-150 hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-70"
       >
-        <X aria-hidden="true" className="size-3" />
+        <X aria-hidden="true" className="size-3.5" />
       </button>
     </span>
   );
@@ -103,7 +105,7 @@ function ListEditor({
         </div>
       )}
       <form
-        className="flex flex-wrap items-center gap-2"
+        className="flex flex-wrap items-end gap-2"
         onSubmit={(event) => {
           event.preventDefault();
           const value = draft.trim();
@@ -111,17 +113,25 @@ function ListEditor({
           if (onChange(values.includes(value) ? values : [...values, value])) setDraft("");
         }}
       >
-        <input
-          aria-label={addLabel}
-          value={draft}
-          disabled={busy}
-          onChange={(event) => {
-            if (!busy) setDraft(event.target.value);
-          }}
-          placeholder={placeholder}
-          className={fieldClasses}
-        />
-        <Button size="sm" type="submit" disabled={busy || !draft.trim()}>
+        <label className="min-w-40 flex-1 space-y-1">
+          <span className={fieldLabelClasses}>{addLabel}</span>
+          <input
+            aria-label={addLabel}
+            value={draft}
+            disabled={busy}
+            onChange={(event) => {
+              if (!busy) setDraft(event.target.value);
+            }}
+            placeholder={placeholder}
+            className={fieldClasses}
+          />
+        </label>
+        <Button
+          size="sm"
+          type="submit"
+          disabled={busy || !draft.trim()}
+          title={!draft.trim() ? "Type a value first" : undefined}
+        >
           Add
         </Button>
       </form>
@@ -148,7 +158,7 @@ function DirectoryEditor({
   const shown = draft ?? value ?? "";
   return (
     <div className="space-y-3">
-      <p className="font-data text-xs text-ink-faint">build output directory</p>
+      <p className="font-data text-xs text-ink-faint">Build output directory</p>
       {value ? (
         <p className="font-sans text-sm text-ink-muted">
           Read-only build steps write their cargo home, target and caches under this private
@@ -161,7 +171,7 @@ function DirectoryEditor({
         </p>
       )}
       <form
-        className="flex flex-wrap items-center gap-2"
+        className="flex flex-wrap items-end gap-2"
         onSubmit={(event) => {
           event.preventDefault();
           const next = shown.trim();
@@ -169,27 +179,39 @@ function DirectoryEditor({
           if (onSave(next)) setDraft(null);
         }}
       >
-        <input
-          aria-label="build output directory"
-          value={shown}
-          disabled={busy}
-          onChange={(event) => {
-            if (!busy) setDraft(event.target.value);
-          }}
-          placeholder="directory, e.g. ~/pam-builds"
-          className={fieldClasses}
-        />
+        <label className="min-w-40 flex-1 space-y-1">
+          <span className={fieldLabelClasses}>Directory</span>
+          <input
+            aria-label="build output directory"
+            value={shown}
+            disabled={busy}
+            onChange={(event) => {
+              if (!busy) setDraft(event.target.value);
+            }}
+            placeholder="e.g. ~/pam-builds"
+            className={fieldClasses}
+          />
+        </label>
         <Button
           size="sm"
           type="submit"
           disabled={busy || !shown.trim() || shown.trim() === value}
+          title={
+            !shown.trim()
+              ? "Name a directory first"
+              : shown.trim() === value
+                ? "Already saved"
+                : undefined
+          }
         >
           Save directory
         </Button>
         <Button
           size="sm"
           type="button"
+          variant="secondary"
           disabled={busy || !value}
+          title={!value ? "No directory is set" : undefined}
           onClick={() => {
             if (!busy && value && onSave(null)) setDraft(null);
           }}
@@ -255,6 +277,7 @@ export function SettingsFlowsSection() {
           <FailureNote failure={listFailure} label="flow settings" />
           <Button
             size="sm"
+            variant="secondary"
             disabled={settings.isFetching}
             onClick={() => void settings.refetch()}
           >
@@ -264,11 +287,11 @@ export function SettingsFlowsSection() {
       )}
 
       <ListEditor
-        title="allowed programs"
+        title="Allowed programs"
         values={programs}
-        addLabel="program to allow"
+        addLabel="Program to allow"
         removeLabel="remove program"
-        placeholder="program, e.g. cargo"
+        placeholder="e.g. cargo"
         empty="No program is allowed yet, so every command step would refuse."
         busy={busy}
         onChange={(next) => change({ allowed_programs: next })}
@@ -276,11 +299,11 @@ export function SettingsFlowsSection() {
 
       <div className="border-t border-line pt-4">
         <ListEditor
-          title="extra PATH"
+          title="Extra PATH"
           values={extraPath}
-          addLabel="directory to add to PATH"
+          addLabel="Directory to add to PATH"
           removeLabel="remove directory"
-          placeholder="directory, e.g. /opt/homebrew/bin"
+          placeholder="e.g. /opt/homebrew/bin"
           empty="Nothing added — steps see only the daemon's own PATH."
           busy={busy}
           onChange={(next) => change({ extra_path: next })}
@@ -297,11 +320,11 @@ export function SettingsFlowsSection() {
 
       <div className="border-t border-line pt-4">
         <ListEditor
-          title="read-only caches"
+          title="Read-only caches"
           values={readCaches}
-          addLabel="cache directory to add"
+          addLabel="Cache directory to add"
           removeLabel="remove cache directory"
-          placeholder="directory, e.g. ~/.cargo/registry"
+          placeholder="e.g. ~/.cargo/registry"
           empty="No cache is shared — every build fetches nothing, since steps have no network."
           busy={busy}
           onChange={(next) => change({ read_cache_roots: next })}
@@ -358,7 +381,7 @@ function ScopeEditor({
       className="space-y-3 border-t border-line pt-4"
     >
       <h3 className="font-data text-xs text-ink-faint">
-        approved repositories and connector scopes
+        Approved repositories and connector scopes
       </h3>
       <p className="text-sm text-ink-muted">
         Empty means deny. Approve each local repository and the service targets it may read.
@@ -431,7 +454,7 @@ function ScopeEditor({
       >
         <input
           aria-label="repository root"
-          className={fieldClasses}
+          className={rowFieldClasses}
           value={root}
           disabled={busy}
           placeholder="/absolute/path/to/repository"
@@ -464,7 +487,12 @@ function ScopeEditor({
         >
           Save scopes
         </Button>
-        <Button size="sm" disabled={busy || !draft} onClick={() => setDraft(null)}>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={busy || !draft}
+          onClick={() => setDraft(null)}
+        >
           Discard scope changes
         </Button>
       </div>
@@ -519,7 +547,7 @@ function ConnectorScopeForm({
       <div className="flex flex-wrap gap-2">
         <select
           aria-label={`connector for ${root}`}
-          className={fieldClasses}
+          className={rowFieldClasses}
           value={connector}
           disabled={busy}
           onChange={(event) => {
@@ -536,16 +564,17 @@ function ConnectorScopeForm({
         </select>
         <input
           aria-label={`service URL for ${root}`}
-          className={fieldClasses}
+          className={rowFieldClasses}
           value={url}
           disabled={busy}
           placeholder="https://jenkins.example/"
           onChange={(event) => setUrl(event.target.value)}
         />
       </div>
-      <label className="flex items-center gap-2 text-sm text-ink-muted">
+      <label className="flex min-h-8 cursor-pointer items-center gap-2 text-sm text-ink-muted">
         <input
           type="checkbox"
+          className="size-4.5 accent-accent-strong"
           checked={wide}
           disabled={busy}
           onChange={(event) => setWide(event.target.checked)}
@@ -560,7 +589,7 @@ function ConnectorScopeForm({
           </p>
           <textarea
             aria-label={`exact targets for ${root}`}
-            className={`${fieldClasses} min-h-16 w-full py-2`}
+            className={cn(fieldClasses, "h-auto min-h-16 py-2")}
             value={targets}
             disabled={busy}
             onChange={(event) => setTargets(event.target.value)}
@@ -575,8 +604,18 @@ function ConnectorScopeForm({
       <Button
         size="sm"
         type="submit"
+        variant="secondary"
         disabled={
           busy || existing.includes(connector) || !url.trim() || (!wide && !targets.trim())
+        }
+        title={
+          existing.includes(connector)
+            ? "This connector already has a scope"
+            : !url.trim()
+              ? "Enter the service URL first"
+              : !wide && !targets.trim()
+                ? "List at least one target, or allow all"
+                : undefined
         }
       >
         Add connector scope

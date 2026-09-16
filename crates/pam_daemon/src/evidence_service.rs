@@ -162,7 +162,8 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
         .await
         .map_err(|_| unavailable())?;
     let repo = policy
-        .authorize_repo(Path::new(&ctx.caller.repo))
+        .authorize_repo_blocking(Path::new(&ctx.caller.repo))
+        .await
         .map_err(|_| unavailable())?;
     let repository = repo.to_string_lossy().into_owned();
     let meta = ctx
@@ -253,7 +254,7 @@ fn read_output(
     let provenance = if range.bytes.is_empty() {
         Vec::new()
     } else {
-        crate::evidence_view::resolve_segments(
+        crate::evidence_view::resolve(
             &segments,
             crate::evidence_view::ByteRange {
                 start: range.offset,

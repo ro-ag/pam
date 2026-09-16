@@ -92,7 +92,7 @@ async fn symlink_retarget_cannot_change_admitted_lane_or_ticket_owner() {
     let stored = store.get_request("request").await.unwrap().unwrap();
     assert_eq!(stored.repo, a.to_string_lossy());
     queue
-        .place_in_lane("request", &normalized.caller.repo, normalized.deadline_ms)
+        .place_in_lane("request", &normalized.caller.repo)
         .await
         .unwrap();
     assert!(

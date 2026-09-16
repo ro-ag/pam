@@ -185,7 +185,20 @@ async fn accept(
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break; };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
-                if verify_peer(&stream, uid).is_err() { continue; }
+                if let Err(error) = verify_peer(&stream, uid) {
+                    // Who knocked is worth a line: a wrong uid on the
+                    // owner-only socket is either a misconfiguration or
+                    // someone probing it.
+                    let credentials = stream.peer_cred().ok();
+                    tracing::warn!(
+                        expected_uid = uid,
+                        peer_uid = credentials.as_ref().map(tokio::net::unix::UCred::uid),
+                        peer_pid = credentials.as_ref().and_then(tokio::net::unix::UCred::pid),
+                        kind = ?error.kind(),
+                        "private admin connection refused at peer verification"
+                    );
+                    continue;
+                }
                 let admin = Arc::clone(&admin);
                 let phase = phase.clone();
                 tasks.spawn(async move {

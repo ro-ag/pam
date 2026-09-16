@@ -73,6 +73,15 @@ pub enum ClientError {
         /// Total time spent waiting across all attempts.
         waited: Duration,
     },
+    /// The blocking readiness probe ([`ensure_daemon`] on a worker
+    /// thread) could not be joined: it panicked or the runtime is
+    /// shutting down.
+    #[error("the daemon readiness probe did not complete: {source}")]
+    ProbeTask {
+        /// The underlying join error.
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 /// What [`ensure_daemon`] found or did.
@@ -95,6 +104,33 @@ pub fn ensure_daemon(base_dir: &Path) -> Result<EnsureOutcome, ClientError> {
         READINESS_WAIT,
         READINESS_POLL,
     )
+}
+
+/// [`ensure_daemon`] for async callers: the probe sleeps and polls
+/// synchronously (up to [`READINESS_WAIT`] per spawn attempt), so it runs
+/// on a blocking thread instead of parking a tokio or Tauri worker.
+async fn ensure_daemon_async(base_dir: &Path) -> Result<EnsureOutcome, ClientError> {
+    ensure_daemon_off_thread(
+        base_dir,
+        spawn_detached_daemon,
+        READINESS_WAIT,
+        READINESS_POLL,
+    )
+    .await
+}
+
+/// [`ensure_daemon_async`] with the spawner and timing injected: runs
+/// [`ensure_daemon_with`] on a blocking thread and joins it.
+pub(crate) async fn ensure_daemon_off_thread(
+    base_dir: &Path,
+    mut spawn: impl FnMut() -> io::Result<()> + Send + 'static,
+    wait: Duration,
+    poll: Duration,
+) -> Result<EnsureOutcome, ClientError> {
+    let base = base_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_daemon_with(&base, &mut spawn, wait, poll))
+        .await
+        .map_err(|source| ClientError::ProbeTask { source })?
 }
 
 /// [`ensure_daemon`] with the spawner and timing injected — the
@@ -184,8 +220,12 @@ fn spawn_detached_daemon() -> io::Result<()> {
         .map(|_child| ())
 }
 
-/// Default bound on `pam wait` / `pam subscribe` (10 minutes).
-pub const DEFAULT_FOLLOW_TIMEOUT: Duration = Duration::from_mins(10);
+/// Default bound on `pam wait` / `pam subscribe`, in milliseconds
+/// (10 minutes) — the CLI's `--timeout-ms` default.
+pub const DEFAULT_FOLLOW_TIMEOUT_MS: u64 = 600_000;
+
+/// [`DEFAULT_FOLLOW_TIMEOUT_MS`] as a [`Duration`].
+pub const DEFAULT_FOLLOW_TIMEOUT: Duration = Duration::from_millis(DEFAULT_FOLLOW_TIMEOUT_MS);
 
 /// Extra client-side budget on top of the envelope's `deadline_ms`
 /// before [`send_request`] gives up on a reply: the daemon enforces the
@@ -355,7 +395,7 @@ pub async fn send_admin(
         deadline_ms,
         wait: true,
     };
-    ensure_daemon(base_dir)?;
+    ensure_daemon_async(base_dir).await?;
     pam_daemon::admin_transport::exchange(base_dir, &envelope)
         .await
         .map_err(|source| RequestError::AdminTransport { source })
@@ -367,7 +407,7 @@ pub async fn send_admin(
 async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response, RequestError> {
     let mut retried = false;
     loop {
-        ensure_daemon(base_dir)?;
+        ensure_daemon_async(base_dir).await?;
         let dirs = RuntimeDir::paths_at_base(base_dir)?;
         let response = exchange(&dirs, envelope).await?;
         if should_retry(&response) && !retried {
@@ -439,7 +479,7 @@ pub async fn follow_ticket(
     timeout: Duration,
     mut on_event: impl FnMut(&Event),
 ) -> Result<Event, RequestError> {
-    ensure_daemon(base_dir)?;
+    ensure_daemon_async(base_dir).await?;
     let deadline = Instant::now() + timeout;
     let timed_out = || RequestError::FollowTimeout {
         ticket: ticket.to_owned(),

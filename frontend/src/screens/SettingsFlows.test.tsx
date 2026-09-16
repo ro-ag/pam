@@ -178,7 +178,7 @@ async function renderSection() {
     </QueryClientProvider>,
   );
   await screen.findByText("git");
-  await waitFor(() => expect(screen.getByLabelText("program to allow")).toBeEnabled());
+  await waitFor(() => expect(screen.getByLabelText("Program to allow")).toBeEnabled());
   return client;
 }
 
@@ -193,10 +193,10 @@ describe("allowed programs", () => {
 
   it("adds a program through the daemon, not just on screen", async () => {
     await renderSection();
-    fireEvent.change(screen.getByLabelText("program to allow"), { target: { value: "gh" } });
+    fireEvent.change(screen.getByLabelText("Program to allow"), { target: { value: "gh" } });
     fireEvent.click(
       within(
-        screen.getByLabelText("program to allow").closest("form") as HTMLFormElement,
+        screen.getByLabelText("Program to allow").closest("form") as HTMLFormElement,
       ).getByRole("button", { name: "Add" }),
     );
     await waitFor(() =>
@@ -221,10 +221,10 @@ describe("allowed programs", () => {
       recovery: "Name the program the step actually runs, not a shell.",
     });
     await renderSection();
-    fireEvent.change(screen.getByLabelText("program to allow"), { target: { value: "bash" } });
+    fireEvent.change(screen.getByLabelText("Program to allow"), { target: { value: "bash" } });
     fireEvent.click(
       within(
-        screen.getByLabelText("program to allow").closest("form") as HTMLFormElement,
+        screen.getByLabelText("Program to allow").closest("form") as HTMLFormElement,
       ).getByRole("button", { name: "Add" }),
     );
     expect(await screen.findByText(/flow settings · program_not_allowed/)).toBeInTheDocument();
@@ -235,12 +235,12 @@ describe("allowed programs", () => {
 describe("extra PATH", () => {
   it("adds and removes a directory through the same op", async () => {
     await renderSection();
-    fireEvent.change(screen.getByLabelText("directory to add to PATH"), {
+    fireEvent.change(screen.getByLabelText("Directory to add to PATH"), {
       target: { value: "/usr/local/bin" },
     });
     fireEvent.click(
       within(
-        screen.getByLabelText("directory to add to PATH").closest("form") as HTMLFormElement,
+        screen.getByLabelText("Directory to add to PATH").closest("form") as HTMLFormElement,
       ).getByRole("button", { name: "Add" }),
     );
     await waitFor(() =>
@@ -294,12 +294,12 @@ describe("read-only caches", () => {
       return current;
     });
     await renderSection();
-    fireEvent.change(screen.getByLabelText("cache directory to add"), {
+    fireEvent.change(screen.getByLabelText("Cache directory to add"), {
       target: { value: "~/.cargo/git" },
     });
     fireEvent.click(
       within(
-        screen.getByLabelText("cache directory to add").closest("form") as HTMLFormElement,
+        screen.getByLabelText("Cache directory to add").closest("form") as HTMLFormElement,
       ).getByRole("button", { name: "Add" }),
     );
     await waitFor(() =>
@@ -337,7 +337,7 @@ it("blocks initial and failed reads until a successful retry", async () => {
       <SettingsFlowsSection />
     </QueryClientProvider>,
   );
-  const input = screen.getByLabelText("program to allow");
+  const input = screen.getByLabelText("Program to allow");
   expect(input).toBeDisabled();
   fireEvent.change(input, { target: { value: "gh" } });
   fireEvent.submit(input.closest("form")!);
@@ -364,7 +364,7 @@ it("serializes double submits, chip removal and the post-save refresh", async ()
   const save = deferred<FlowSettings>();
   mocks.flowsSettingsSet.mockReturnValue(save.promise);
   const client = await renderSection();
-  const input = screen.getByLabelText("program to allow");
+  const input = screen.getByLabelText("Program to allow");
   fireEvent.change(input, { target: { value: "gh" } });
   act(() => {
     fireEvent.submit(input.closest("form")!);
@@ -373,7 +373,7 @@ it("serializes double submits, chip removal and the post-save refresh", async ()
   });
   await waitFor(() => expect(mocks.flowsSettingsSet).toHaveBeenCalledTimes(1));
   expect(screen.getByLabelText("remove program git")).toBeDisabled();
-  expect(screen.getByLabelText("directory to add to PATH")).toBeDisabled();
+  expect(screen.getByLabelText("Directory to add to PATH")).toBeDisabled();
   const refresh = deferred<FlowSettings>();
   mocks.flowsSettingsGet.mockReturnValue(refresh.promise);
   await act(async () =>
@@ -408,6 +408,6 @@ it("blocks a failed background refresh even when cached chips remain", async () 
   expect(await screen.findByText(/flow settings · offline/)).toBeInTheDocument();
   expect(screen.getByLabelText("remove program git")).toBeDisabled();
   fireEvent.click(screen.getByLabelText("remove program git"));
-  fireEvent.submit(screen.getByLabelText("program to allow").closest("form")!);
+  fireEvent.submit(screen.getByLabelText("Program to allow").closest("form")!);
   expect(mocks.flowsSettingsSet).not.toHaveBeenCalled();
 });

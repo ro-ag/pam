@@ -8,8 +8,8 @@ use pam_daemon::runtime_dir::RuntimeDir;
 use pam_proto::{Outcome, Response};
 
 use crate::client::{
-    ClientError, DaemonStatus, EnsureOutcome, ensure_daemon_with, probe_daemon, should_retry,
-    wait_for_daemon_exit,
+    ClientError, DaemonStatus, EnsureOutcome, ensure_daemon_off_thread, ensure_daemon_with,
+    probe_daemon, should_retry, wait_for_daemon_exit,
 };
 
 /// Short bounds so the not-ready path stays fast.
@@ -109,6 +109,31 @@ fn a_failing_spawn_is_reported_as_a_spawn_error() {
     .expect_err("spawn failure surfaces");
 
     assert!(matches!(err, ClientError::Spawn { .. }), "got {err:?}");
+}
+
+/// The readiness wait sleeps and polls synchronously; the async entry
+/// point must keep that off the runtime's worker. On a single-threaded
+/// runtime a blocked worker would stall this timer until the whole
+/// not-ready wait (two attempts) had elapsed.
+#[tokio::test(flavor = "current_thread")]
+async fn the_async_readiness_wait_does_not_block_the_runtime_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    let started = std::time::Instant::now();
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(POLL).await;
+        started.elapsed()
+    });
+    let never_ready = ensure_daemon_off_thread(&base, || Ok(()), WAIT, POLL).await;
+    assert!(
+        matches!(never_ready, Err(ClientError::NotReady { .. })),
+        "{never_ready:?}"
+    );
+    let timer_done_after = timer.await.unwrap();
+    assert!(
+        timer_done_after < WAIT,
+        "the timer task waited on the readiness probe: {timer_done_after:?}"
+    );
 }
 
 #[test]

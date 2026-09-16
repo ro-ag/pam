@@ -100,7 +100,9 @@ async fn pump_events(app: AppHandle, base: PathBuf) {
 /// any event was forwarded (feeds the backoff reset).
 async fn stream_events(app: &AppHandle, base: &Path) -> bool {
     let mut delivered = false;
-    let Ok(dirs) = RuntimeDir::at_base(base) else {
+    // Paths only: the daemon alone creates and protects `<base>/run`; a
+    // subscriber never creates or chmods it.
+    let Ok(dirs) = RuntimeDir::paths_at_base(base) else {
         return delivered;
     };
     let mut sub = SubSocket::new();

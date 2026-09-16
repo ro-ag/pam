@@ -491,7 +491,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExternalAggState {
     pub context: usize,
     pub state: *mut AggCtx,
@@ -500,6 +500,33 @@ pub struct ExternalAggState {
     pub finalize_fn: FinalizeFunction,
     pub aggregate_destructor: Option<ContextDestructor>,
     pub value_destructor: Option<ValueDestructor>,
+}
+
+// PAM: hand-written so the function-pointer fields compare by address
+// explicitly (`fn_addr_eq`) instead of through the derive, which the
+// `unpredictable_function_pointer_comparisons` lint refuses. Same semantics
+// as the previous derive.
+impl PartialEq for ExternalAggState {
+    fn eq(&self, other: &Self) -> bool {
+        let aggregate_destructor_eq = match (self.aggregate_destructor, other.aggregate_destructor)
+        {
+            (Some(a), Some(b)) => std::ptr::fn_addr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let value_destructor_eq = match (self.value_destructor, other.value_destructor) {
+            (Some(a), Some(b)) => std::ptr::fn_addr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.context == other.context
+            && self.state == other.state
+            && self.argc == other.argc
+            && std::ptr::fn_addr_eq(self.step_fn, other.step_fn)
+            && std::ptr::fn_addr_eq(self.finalize_fn, other.finalize_fn)
+            && aggregate_destructor_eq
+            && value_destructor_eq
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth

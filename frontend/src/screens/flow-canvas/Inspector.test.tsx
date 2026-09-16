@@ -153,6 +153,62 @@ describe("Inspector", () => {
     });
   });
 
+  it("keeps a landing step's operation read-only and refuses to flip its kind", () => {
+    const landing: FlowStep = {
+      ...defaultStep("land", "command"),
+      action: { kind: "landing", operation: "merge" },
+    };
+    const props = renderInspector(
+      { kind: "step", id: "land" },
+      { spec: { ...fixture(), steps: [...fixture().steps, landing] } },
+    );
+    const operation = screen.getByLabelText("operation");
+    expect(operation).toHaveValue("merge");
+    expect(operation).toHaveAttribute("readonly");
+    expect(screen.queryByLabelText("argv")).toBeNull();
+    expect(screen.queryByLabelText("connector")).toBeNull();
+    for (const name of ["command", "connector"]) {
+      const toggle = screen.getByRole("button", { name });
+      expect(toggle).toBeDisabled();
+      fireEvent.click(toggle);
+    }
+    expect(props.onChange).not.toHaveBeenCalled();
+  });
+
+  it("refuses an input or env rename onto a name already taken", () => {
+    const spec: FlowSpec = {
+      ...fixture(),
+      inputs: {
+        repo: { description: "", default: null },
+        base: { description: "", default: "main" },
+      },
+    };
+    const props = renderInspector({ kind: "inputs" }, { spec });
+    const [first] = screen.getAllByLabelText("input name");
+    fireEvent.change(first, { target: { value: "base" } });
+    expect(props.onChange).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("rename refused")).toHaveTextContent("name taken");
+    fireEvent.change(first, { target: { value: "root" } });
+    expect(Object.keys(lastSpec(props).inputs)).toEqual(["root", "base"]);
+    expect(screen.queryByLabelText("rename refused")).toBeNull();
+
+    const envProps = renderInspector(
+      { kind: "step", id: "b" },
+      {
+        spec: {
+          ...fixture(),
+          steps: fixture().steps.map((candidate) =>
+            candidate.id === "b" ? { ...candidate, env: { A: "1", B: "2" } } : candidate,
+          ),
+        },
+      },
+    );
+    const [envName] = screen.getAllByLabelText("env name");
+    fireEvent.change(envName, { target: { value: "B" } });
+    expect(envProps.onChange).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("rename refused")).toHaveTextContent("name taken");
+  });
+
   it("feeds the call select from the connector's table and pre-lists its arguments", () => {
     const props = renderInspector({ kind: "step", id: "c" });
     expect(screen.getByLabelText("connector")).toHaveValue("github");

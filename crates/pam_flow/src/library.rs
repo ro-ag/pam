@@ -6,8 +6,10 @@
 //! library file with a builtin's id shadows it, and deleting that file
 //! reveals the builtin again.
 //!
-//! Listing never fails because one file is broken: an unreadable flow comes
-//! back as an [`Entry`] whose `parsed` is the validation error, so the GUI
+//! Listing never fails because one file is broken: an invalid flow comes
+//! back as an [`Entry`] whose `parsed` is the validation error, and a file
+//! that cannot be read at all (bad permissions, not UTF-8) as one whose
+//! `parsed` is the [`FlowError::Io`] and whose `yaml` is empty, so the GUI
 //! can show the file and say what is wrong with it.
 
 use std::fs;
@@ -108,8 +110,19 @@ impl Library {
         }
         files.sort();
         for (id, path) in files {
-            let yaml = read(&path)?;
-            let found = entry(&id, Source::Library, Some(path), yaml);
+            // A file that cannot be read is still listed, with the read
+            // error where its validation error would go: one unreadable
+            // flow must not hide the rest of the library.
+            let found = match read(&path) {
+                Ok(yaml) => entry(&id, Source::Library, Some(path), yaml),
+                Err(error) => Entry {
+                    id: id.clone(),
+                    source: Source::Library,
+                    path: Some(path),
+                    yaml: String::new(),
+                    parsed: Err(error),
+                },
+            };
             match entries.iter_mut().find(|existing| existing.id == id) {
                 Some(existing) => *existing = found,
                 None => entries.push(found),

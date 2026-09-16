@@ -5,7 +5,9 @@
 //! handful of routes the supervisor uses with deterministic JSON:
 //! `/health`, `/props`, `/apply-template`, `/tokenize`,
 //! `/v1/chat/completions`. `PAM_FAKE_HEALTH_DELAY_MS` delays readiness;
-//! `PAM_FAKE_EXIT_EARLY=1` exits at once, like a crashed server.
+//! `PAM_FAKE_EXIT_EARLY=1` exits at once, like a crashed server;
+//! `PAM_FAKE_MODEL_PATH` makes `/props` report that path instead of `-m`,
+//! like a stranger squatting the endpoint.
 #![allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
@@ -27,7 +29,10 @@ async fn main() {
     };
     let socket = value("--host").expect("--host <socket>");
     let api_key = value("--api-key").unwrap_or_default();
-    let model = value("-m").unwrap_or_default();
+    let model = std::env::var("PAM_FAKE_MODEL_PATH")
+        .ok()
+        .or_else(|| value("-m"))
+        .unwrap_or_default();
     let ctx = value("-c").unwrap_or_else(|| "0".into());
     if std::env::var_os("PAM_FAKE_EXIT_EARLY").is_some() {
         eprintln!("fake llama-server: exiting early as instructed");

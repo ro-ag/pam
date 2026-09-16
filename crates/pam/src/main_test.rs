@@ -146,3 +146,47 @@ fn workflow_commands_have_bounded_discovery_and_typed_arguments() {
         Cmd::Wait { json: true, .. }
     ));
 }
+
+#[test]
+fn follow_commands_share_the_json_flag_and_the_default_timeout() {
+    use crate::DEFAULT_FOLLOW_TIMEOUT_MS;
+    let Cmd::Subscribe {
+        ticket,
+        timeout_ms,
+        json,
+    } = Cli::try_parse_from(["pam", "subscribe", "ticket", "--json"])
+        .unwrap()
+        .command
+    else {
+        panic!("subscribe");
+    };
+    assert_eq!(ticket, "ticket");
+    assert_eq!(timeout_ms, DEFAULT_FOLLOW_TIMEOUT_MS);
+    assert!(json);
+    let Cmd::Wait { timeout_ms, .. } =
+        Cli::try_parse_from(["pam", "wait", "ticket", "--timeout-ms", "250"])
+            .unwrap()
+            .command
+    else {
+        panic!("wait");
+    };
+    assert_eq!(timeout_ms, 250);
+}
+
+#[test]
+fn the_last_of_echo_wait_and_no_wait_wins() {
+    let flags = |argv: &[&str]| {
+        let mut args = vec!["pam", "echo"];
+        args.extend_from_slice(argv);
+        let Cmd::Echo { wait, no_wait, .. } = Cli::try_parse_from(args).unwrap().command else {
+            panic!("echo");
+        };
+        // The dispatch rule: wait unless `--no-wait` stands unrevoked.
+        wait || !no_wait
+    };
+    assert!(flags(&[]));
+    assert!(flags(&["--wait"]));
+    assert!(!flags(&["--no-wait"]));
+    assert!(flags(&["--no-wait", "--wait"]));
+    assert!(!flags(&["--wait", "--no-wait"]));
+}

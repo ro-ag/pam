@@ -7,10 +7,13 @@ accuracy, safe resource limits, or task qualification.
 `admin.models.try` requires an explicit installed `model_id`, a prompt and an
 optional output-token limit. An optional `timeout_ms` is bounded to 1–120,000 ms;
 Ask sends its shorter waiting deadline to the server. Load the intended artifact explicitly first. A
-missing, unloaded, different or busy model produces a refusal. A diagnostic
-request does not load a model, swap the current model or choose a tier fallback.
-The inference worker checks the requested identity at execution, rather than
-trusting a previously observed status snapshot.
+missing model refuses `unknown_model`; an unloaded or different resident model
+refuses `model_not_loaded` (naming what is loaded, if anything); a busy runtime
+refuses `runtime_busy`. A diagnostic request never loads a model, swaps the
+current model or chooses a tier fallback: the daemon compares the requested
+entry (id and path) against what the engine holds at execution, rather than
+trusting a previously observed status snapshot. A deadline that drops the
+request also clears the runtime's `busy` flag, so idle unload proceeds as usual.
 
 A successful response includes `requested_model_id` and the actual worker-owned
 `model` identity (`id`, `architecture`, `quant`, `device`, `weight_bytes`), alongside

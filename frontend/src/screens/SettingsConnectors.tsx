@@ -5,7 +5,9 @@ import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses as sharedFieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
+import { cn } from "../lib/cn";
 import {
   connectorsConfigure,
   connectorsKeyring,
@@ -21,8 +23,7 @@ import { SonarRepositoryMappingsEditor } from "./SonarRepositoryMappings";
 const CAUSE_STORE_DENIED = "store_denied";
 export const STORE_UNAVAILABLE_COPY =
   "the OS credential store is unavailable; see the daemon log";
-const fieldClasses =
-  "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:opacity-50";
+const fieldClasses = cn(sharedFieldClasses, "disabled:opacity-70");
 
 // These examples follow PAM's actual adapter contracts, especially Jira's
 // bearer token and SharePoint's Microsoft Graph endpoint.
@@ -196,15 +197,18 @@ function ConnectorRow({
       className="connector-card space-y-3 rounded-card border border-line bg-surface-raised p-4"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <input
-          type="checkbox"
-          aria-label={`enable ${connector.name}`}
-          checked={connector.enabled}
-          disabled={busy}
-          onChange={(event) => act({ kind: "enable", enabled: event.target.checked })}
-          className="size-3.5 cursor-pointer accent-accent-strong"
-        />
-        <span className="font-sans text-sm font-medium text-ink">{connector.name}</span>
+        {/* The label is the target: the box plus the name, never the 18px box alone. */}
+        <label className="flex min-h-8 cursor-pointer items-center gap-2">
+          <input
+            type="checkbox"
+            aria-label={`enable ${connector.name}`}
+            checked={connector.enabled}
+            disabled={busy}
+            onChange={(event) => act({ kind: "enable", enabled: event.target.checked })}
+            className="size-4.5 cursor-pointer accent-accent-strong"
+          />
+          <span className="font-sans text-sm font-medium text-ink">{connector.name}</span>
+        </label>
         {!connector.enabled && <Badge>Disabled</Badge>}
         <Badge
           tone={state === "Ready" ? "success" : state === "Test failed" ? "danger" : "neutral"}
@@ -219,10 +223,10 @@ function ConnectorRow({
       {unavailable && (
         <p className="font-data text-xs text-warning">{STORE_UNAVAILABLE_COPY}</p>
       )}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3">
         {connector.needs_base_url && (
           <label className="space-y-1">
-            <span className="block font-data text-xs text-ink-faint">base URL</span>
+            <span className={fieldLabelClasses}>Base URL</span>
             <input
               aria-label={`${connector.name} base URL`}
               value={baseUrl}
@@ -235,9 +239,7 @@ function ConnectorRow({
         )}
         {connector.username_label && (
           <label className="space-y-1">
-            <span className="block font-data text-xs text-ink-faint">
-              {connector.username_label}
-            </span>
+            <span className={fieldLabelClasses}>{connector.username_label}</span>
             <input
               aria-label={`${connector.name} ${connector.username_label}`}
               value={username}
@@ -250,7 +252,7 @@ function ConnectorRow({
       </div>
       {!profile && (
         <label className="block space-y-1">
-          <span className="block font-data text-xs text-ink-faint">credential</span>
+          <span className={fieldLabelClasses}>Credential</span>
           <input
             type="password"
             autoComplete="new-password"
@@ -259,7 +261,7 @@ function ConnectorRow({
             disabled={busy}
             onChange={(event) => edit(() => setSecret(event.target.value))}
             placeholder={
-              connector.credential_present ? "stored · type to replace" : "paste it here"
+              connector.credential_present ? "Stored; type to replace it" : "Paste the token"
             }
             className={fieldClasses}
           />
@@ -269,6 +271,13 @@ function ConnectorRow({
         <Button
           size="sm"
           disabled={busy || needsUrl || needsCredentials}
+          title={
+            needsUrl
+              ? "Enter the base URL first"
+              : needsCredentials
+                ? "Enter the credential first"
+                : undefined
+          }
           onClick={() => act({ kind: "save-test" })}
         >
           {save.isPending && (
@@ -282,6 +291,7 @@ function ConnectorRow({
             confirmLabel="clear it?"
             busy={busy}
             disabled={!connector.credential_present}
+            title={!connector.credential_present ? "No credential is stored" : undefined}
             onConfirm={() => act({ kind: "clear" })}
           />
         )}
@@ -338,7 +348,7 @@ function KeyringBanner() {
       }`}
     >
       <p className={`font-data text-xs ${reachable ? "text-ink-muted" : "text-danger"}`}>
-        keychain · {health.data.state}
+        Keychain · {health.data.state}
       </p>
       {!reachable && health.data.recovery && (
         <p className="font-sans text-sm text-ink">{health.data.recovery}</p>

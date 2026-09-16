@@ -736,6 +736,50 @@ async fn create_options_refuse_collisions_and_restore_only_an_absent_override() 
     assert_eq!(deleted["revealed_builtin"], true);
 }
 
+/// One request carries both settings; a scope policy that cannot be
+/// normalized (a root that does not exist) is refused before the other
+/// settings are written, so a refusal changes nothing.
+#[tokio::test]
+async fn a_scope_refusal_leaves_the_other_settings_untouched() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let before = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_before",
+                OP_FLOWS_SETTINGS_GET,
+                json!({}),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    let response = admin
+        .handle(&admin_envelope(
+            "req_partial",
+            OP_FLOWS_SETTINGS_SET,
+            json!({
+                "allowed_programs": ["git", "cargo", "make"],
+                "scope_policy": {
+                    "version": 1,
+                    "repositories": [{ "root": "/nowhere/pam/does/not/exist", "connectors": [] }],
+                },
+            }),
+        ))
+        .await;
+    assert_eq!(cause_of(response), crate::scope_policy::CAUSE_SCOPE_DENIED);
+    let after = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_after",
+                OP_FLOWS_SETTINGS_GET,
+                json!({}),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(after["allowed_programs"], before["allowed_programs"]);
+    assert_eq!(after["scope_policy"], before["scope_policy"]);
+}
+
 #[tokio::test]
 async fn settings_carry_the_artifacts_root_and_a_null_clears_it() {
     let (_tmp, _store, admin, _ingress) = service().await;

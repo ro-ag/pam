@@ -389,19 +389,28 @@ async fn echo(mut ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailur
 }
 
 /// `cancel`: cancel the request named by `args.ticket`.
+///
+/// The audit actor is the caller as the audit vocabulary can name it: a
+/// human when the GUI asked (caller agent `pam-gui`), otherwise the daemon
+/// acting for an agent's `pam cancel` — there is no per-agent actor.
 async fn cancel(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let Some(ticket) = ctx.args.get("ticket").and_then(serde_json::Value::as_str) else {
         return Err(CapabilityFailure::Failed {
             detail: "cancel needs args.ticket naming the request to cancel".to_owned(),
         });
     };
-    let outcome = ctx
-        .queue
-        .cancel(ticket, pam_store::Actor::System)
-        .await
-        .map_err(|err| CapabilityFailure::Failed {
-            detail: format!("cannot cancel {ticket}: {err}"),
-        })?;
+    let actor = if ctx.caller.agent == crate::admin::ADMIN_CALLER_AGENT {
+        pam_store::Actor::Human
+    } else {
+        pam_store::Actor::System
+    };
+    let outcome =
+        ctx.queue
+            .cancel(ticket, actor)
+            .await
+            .map_err(|err| CapabilityFailure::Failed {
+                detail: format!("cannot cancel {ticket}: {err}"),
+            })?;
     let (result, request_outcome) = match outcome {
         CancelOutcome::CancelledQueued => {
             // The queue already wrote the terminal row and the audit row;

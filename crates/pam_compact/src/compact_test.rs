@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use super::{
+use crate::compact::{
     ALGORITHM_VERSION, CompactError, Compacted, FailureKeyword, Fragment, FragmentKind,
     MAX_SOURCE_BYTES, MAX_SOURCE_RECORDS, OmissionReason, Policy, RetentionReason, compact,
     estimate_tokens, sha256_hex,

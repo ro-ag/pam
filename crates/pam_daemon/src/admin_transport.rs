@@ -19,6 +19,10 @@ use crate::lifecycle::LifecyclePhase;
 #[path = "admin_transport_frame.rs"]
 mod frame;
 
+#[cfg(test)]
+#[path = "admin_transport_frame_test.rs"]
+mod frame_test;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "admin_transport_unix.rs"]
 mod platform;

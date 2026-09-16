@@ -8,13 +8,17 @@ repository.workspace = true
 
 [dependencies]
 # the report is stored as an evidence blob and read back through the admin
-# ops, so every public type round-trips through JSON.
+# ops, so every public type round-trips through JSON (serde derives only;
+# the encoding itself happens in the daemon).
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 # source digest recorded in the report; RustCrypto, pure Rust.
 sha2.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+# the round-trip test encodes and decodes a report.
+serde_json.workspace = true
 
 [lints]
 workspace = true

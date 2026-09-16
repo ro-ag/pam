@@ -7,10 +7,10 @@
 //! returns a `job_id` and the history lives on `model_job` rows, polled every [`DOWNLOAD_POLL`]; a
 //! `running` row found at boot belonged to a dead daemon and [`ModelService::new`] fails it with
 //! [`CAUSE_DAEMON_RESTART`] (the part file still resumes). Administration is GUI-only
-//! ([`crate::admin_models`]); the only daemon-internal entry point, [`ModelService::generate`],
-//! returns [`ModelUnavailable::NoDefault`] with nothing configured so the caller falls back
-//! deterministically. An [`IDLE_TICK`] ticker unloads the engine once idle past
-//! [`SETTING_IDLE_UNLOAD_MIN`] (`0` = never), via the pure [`should_unload`].
+//! ([`crate::admin_models`]); the only daemon-internal entry point,
+//! [`ModelService::generate_bounded`], returns [`ModelUnavailable::NoDefault`] with nothing
+//! configured so the caller falls back deterministically. An [`IDLE_TICK`] ticker unloads the engine once idle past
+//! [`SETTING_IDLE_UNLOAD_MIN`] (`0` = never), via the pure `should_unload`.
 //! The model layer never becomes a hard dependency: with nothing configured every caller falls back
 //! deterministically. `last_used_at` (which drives idle unload) is updated after every load and
 //! every generation.
@@ -159,6 +159,15 @@ pub enum ModelUnavailable {
     /// The runtime refused or failed.
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    /// A diagnostic named a model other than the one the engine holds; a
+    /// diagnostic never loads or swaps, so the human loads it first.
+    #[error("{requested} is not the loaded model ({})", resident.as_deref().unwrap_or("nothing is loaded"))]
+    NotResident {
+        /// The model the diagnostic asked for.
+        requested: String,
+        /// The model the engine holds, if any.
+        resident: Option<String>,
+    },
     /// Reading the settings failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -195,22 +204,48 @@ pub enum ModelServiceError {
     Registry(#[from] RegistryError),
 }
 
-/// Owns the cancellation sender while an admin diagnostic future is alive.
-/// Dropping a watch sender alone would leave its final `false` value unchanged.
-pub(crate) struct DiagnosticCancellation(watch::Sender<bool>);
+/// Owns a cancellation sender while an admin future (diagnostic, engine
+/// install) is alive, and sends `true` when dropped: an admin deadline
+/// drops the future, and dropping a watch sender alone would leave its
+/// final `false` in place, so a worker waiting on `changed()` would pend
+/// forever on the closed channel instead of stopping.
+pub(crate) struct CancelOnDrop(watch::Sender<bool>);
 
-impl DiagnosticCancellation {
+impl CancelOnDrop {
     pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
         let (sender, receiver) = watch::channel(false);
         (Self(sender), receiver)
     }
 }
 
-impl Drop for DiagnosticCancellation {
+impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         let _ = self.0.send(true);
     }
 }
+
+/// Holds `busy` at `true` for exactly as long as a generation future is
+/// alive. A caller's deadline (`admin.models.try`, a bounded summary) drops
+/// the future mid-await; a plain store-after-await would then leave `busy`
+/// stuck and the idle-unload ticker would never drop the weights.
+pub(crate) struct BusyGuard<'a>(&'a AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    pub(crate) fn engage(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The registry's view of the model the engine holds, cached at load time so
+/// [`ModelService::snapshot`] answers without touching the filesystem.
+type Resident = Option<(PathBuf, LoadedModel)>;
 
 /// The live download handles, keyed by job id, with the destination each
 /// is writing to.
@@ -236,8 +271,12 @@ pub struct ModelService {
     engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
     /// True while a generation is in flight on the engine. Status only —
     /// serialization comes from `operation`, held for the duration of
-    /// every generate and load.
+    /// every generate and load. Set and cleared by [`BusyGuard`].
     busy: AtomicBool,
+    /// What the engine holds, as the registry described it when it was
+    /// loaded (weight bytes, quant, architecture); `snapshot` reads this
+    /// instead of stat-ing the weights on an async thread.
+    resident: RwLock<Resident>,
     /// Unix seconds of the last load or generation; what the idle-unload
     /// ticker compares [`SETTING_IDLE_UNLOAD_MIN`] against.
     last_used_at: AtomicI64,
@@ -283,6 +322,7 @@ impl ModelService {
             engine_base: RwLock::new(None),
             engine: std::sync::Mutex::new(None),
             busy: AtomicBool::new(false),
+            resident: RwLock::new(None),
             last_used_at: AtomicI64::new(0),
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
@@ -317,18 +357,25 @@ impl ModelService {
         if let Some(engine) = self.engine_server() {
             engine.unload().await;
         }
+        self.set_resident(None);
         Ok(())
     }
 
-    /// The current state, read without touching the engine process: `Idle`
-    /// when nothing is loaded, `Loaded` with the model the engine holds.
+    /// The current state, read without touching the engine process or the
+    /// filesystem: `Idle` when nothing is loaded, `Loaded` with the model
+    /// the engine holds. Polled every couple of seconds, so it reads the
+    /// supervisor already built (never `engine::status`, which reads the
+    /// manifest) and the registry view cached at load time (never the
+    /// weights' metadata).
     #[must_use]
     pub fn snapshot(&self) -> RuntimeSnapshot {
-        let state = match self.engine_server().and_then(|engine| engine.model()) {
-            Some(model) => RuntimeState::Loaded(engine_snapshot_model(
-                &model,
-                self.last_used_at.load(Ordering::Acquire),
-            )),
+        let engine = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let state = match engine.and_then(|engine| engine.model()) {
+            Some(model) => RuntimeState::Loaded(self.resident_view(&model)),
             None => RuntimeState::Idle,
         };
         RuntimeSnapshot {
@@ -344,6 +391,36 @@ impl ModelService {
         self.last_used_at.store(now_ts(), Ordering::Release);
     }
 
+    /// The runtime-shaped view of `model`: the registry entry cached when
+    /// it was loaded, or — if the engine holds something this service did
+    /// not load — a view with `unknown` quant/architecture and no size.
+    fn resident_view(&self, model: &pam_model::engine_server::EngineModel) -> LoadedModel {
+        let last_used_at = self.last_used_at.load(Ordering::Acquire);
+        let cached = self
+            .resident
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut view = match cached.as_ref() {
+            Some((path, loaded)) if loaded.id == model.id && *path == model.path => loaded.clone(),
+            _ => engine_snapshot_model(model),
+        };
+        view.loaded_at = model.loaded_at_ms;
+        view.last_used_at = if last_used_at > 0 {
+            last_used_at
+        } else {
+            model.loaded_at_ms
+        };
+        view
+    }
+
+    /// Remembers (or forgets) the registry view of what the engine holds.
+    fn set_resident(&self, resident: Resident) {
+        *self
+            .resident
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = resident;
+    }
+
     /// One bounded completion on the engine, shaped like the runtime-typed
     /// result every caller expects.
     async fn engine_generate(
@@ -354,11 +431,12 @@ impl ModelService {
         cancel: watch::Receiver<bool>,
         input_limit: usize,
     ) -> Result<GenerateResult, RuntimeError> {
-        self.busy.store(true, Ordering::Release);
-        let outcome = engine
-            .generate(request, cancel, input_limit, ENGINE_GENERATE_DEADLINE)
-            .await;
-        self.busy.store(false, Ordering::Release);
+        let outcome = {
+            let _busy = BusyGuard::engage(&self.busy);
+            engine
+                .generate(request, cancel, input_limit, ENGINE_GENERATE_DEADLINE)
+                .await
+        };
         self.touch_last_used();
         let result = outcome.map_err(engine_error)?;
         let decode_ms = result.predicted_ms.max(0.0);
@@ -444,6 +522,17 @@ impl ModelService {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base);
     }
 
+    /// The daemon's base directory as set by [`Self::set_engine_base`], or
+    /// `None` when the daemon never set one (tests); what the models
+    /// directory must never overlap.
+    #[must_use]
+    pub fn daemon_base(&self) -> Option<PathBuf> {
+        self.engine_base
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// The directory `pam_model::engine` installs under: the daemon's
     /// base directory, or a private directory beside the models when the
     /// daemon never set one.
@@ -505,21 +594,13 @@ impl ModelService {
         Ok(())
     }
 
-    /// One generation on the tier's model, loading it if needed.
+    /// One generation on the tier's model, loading it if needed, with a
+    /// task-specific prefill limit enforced by the generator's exact
+    /// tokenizer.
     ///
     /// The load is lazy and the swap is strict: a different model in
     /// memory is unloaded before this one is mapped, because two sets of
     /// weights do not fit.
-    pub async fn generate(
-        &self,
-        tier: Tier,
-        request: GenerateRequest,
-    ) -> Result<GenerateResult, ModelUnavailable> {
-        self.generate_bounded(tier, request, pam_model::runtime::CONTEXT_TOKENS)
-            .await
-    }
-
-    /// Applies a task-specific prefill limit using the generator's exact tokenizer.
     pub async fn generate_bounded(
         &self,
         tier: Tier,
@@ -538,9 +619,11 @@ impl ModelService {
             .await?)
     }
 
-    /// Diagnose on one explicitly requested installed model without loading or swapping.
-    /// Dropping the caller signals cancellation; an in-progress forward pass finishes
-    /// before the worker observes that signal, so cancellation is cooperative.
+    /// Diagnose on one explicitly requested installed model without loading or swapping:
+    /// the engine must already hold exactly that entry (same id and path), otherwise
+    /// [`ModelUnavailable::NotResident`]. Dropping the caller signals cancellation; an
+    /// in-progress forward pass finishes before the worker observes that signal, so
+    /// cancellation is cooperative.
     pub async fn generate_diagnostic(
         &self,
         model_id: &str,
@@ -551,9 +634,18 @@ impl ModelService {
             .find(model_id)
             .await?
             .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
-        let (guard, cancel) = DiagnosticCancellation::new();
-        let loaded = self.ensure_loaded_inner(&entry).await?;
         let engine = self.engine_server().ok_or_else(engine_not_installed)?;
+        let current = match engine.model() {
+            Some(current) if current.id == entry.id && current.path == entry.path => current,
+            other => {
+                return Err(ModelUnavailable::NotResident {
+                    requested: entry.id,
+                    resident: other.map(|current| current.id),
+                });
+            }
+        };
+        let loaded = engine_loaded_model(&entry, &current);
+        let (guard, cancel) = CancelOnDrop::new();
         let result = self
             .engine_generate(
                 &engine,
@@ -592,15 +684,29 @@ impl ModelService {
             && current.id == entry.id
             && current.path == entry.path
         {
+            let loaded = engine_loaded_model(entry, &current);
+            self.set_resident(Some((entry.path.clone(), loaded.clone())));
             self.touch_last_used();
-            return Ok(engine_loaded_model(entry, &current));
+            return Ok(loaded);
         }
+        // The swap is about to happen: forget the old view before the old
+        // weights go, so a snapshot taken mid-load never pairs the new
+        // engine model with the old registry entry.
+        self.set_resident(None);
+        let options = ServerOptions {
+            context_tokens: context_tokens_for(
+                entry.info.as_ref().and_then(|info| info.context_length),
+            ),
+            ..ServerOptions::default()
+        };
         let current = engine
-            .load(&entry.id, &entry.path, &ServerOptions::default())
+            .load(&entry.id, &entry.path, &options)
             .await
             .map_err(engine_error)?;
+        let loaded = engine_loaded_model(entry, &current);
+        self.set_resident(Some((entry.path.clone(), loaded.clone())));
         self.touch_last_used();
-        Ok(engine_loaded_model(entry, &current))
+        Ok(loaded)
     }
 
     /// Starts a transfer and returns its job id.
@@ -868,6 +974,7 @@ impl ModelService {
             return;
         }
         engine.unload().await;
+        self.set_resident(None);
         tracing::info!(model = %loaded.id, idle_min, "idle unload");
     }
 }
@@ -896,14 +1003,40 @@ async fn follow_download(
     handle: DownloadHandle,
 ) {
     let mut ticker = tokio::time::interval(DOWNLOAD_POLL);
+    // A store that refuses every progress write would otherwise warn twice
+    // a second for an hour: the first failure is a warning, the rest are
+    // debug lines with a count until the write succeeds again.
+    let mut progress_failures: u64 = 0;
     let verdict = loop {
         ticker.tick().await;
         match handle.state() {
             DownloadState::Running(progress) => {
                 let done = i64::try_from(progress.bytes).unwrap_or(i64::MAX);
                 let total = progress.total.and_then(|bytes| i64::try_from(bytes).ok());
-                if let Err(err) = store.update_model_job_progress(&job_id, done, total).await {
-                    tracing::warn!(job = %job_id, error = %err, "download progress not recorded");
+                match store.update_model_job_progress(&job_id, done, total).await {
+                    Ok(()) => {
+                        if progress_failures > 0 {
+                            tracing::info!(
+                                job = %job_id,
+                                failures = progress_failures,
+                                "download progress recording recovered"
+                            );
+                        }
+                        progress_failures = 0;
+                    }
+                    Err(err) => {
+                        progress_failures += 1;
+                        if progress_failures == 1 {
+                            tracing::warn!(job = %job_id, error = %err, "download progress not recorded");
+                        } else {
+                            tracing::debug!(
+                                job = %job_id,
+                                error = %err,
+                                failures = progress_failures,
+                                "download progress still not recorded"
+                            );
+                        }
+                    }
                 }
             }
             terminal => break terminal,
@@ -1045,6 +1178,21 @@ impl From<crate::blocking_jobs::Error> for ModelServiceError {
 /// How long one engine completion may take end to end.
 const ENGINE_GENERATE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(15);
 
+/// The context the server is started with: [`CONTEXT_TOKENS`] as the
+/// admission envelope, lowered to `<arch>.context_length` when the GGUF
+/// header reports a smaller figure — a server asked for more context than
+/// its model was trained on fails to load or answers garbage past the
+/// limit. An absent or zero header value keeps the envelope.
+///
+/// [`CONTEXT_TOKENS`]: pam_model::runtime::CONTEXT_TOKENS
+pub(crate) fn context_tokens_for(reported: Option<u64>) -> usize {
+    let envelope = pam_model::runtime::CONTEXT_TOKENS;
+    match reported.and_then(|tokens| usize::try_from(tokens).ok()) {
+        Some(tokens) if tokens > 0 => tokens.min(envelope),
+        _ => envelope,
+    }
+}
+
 /// The runtime-shaped view of a model the engine holds.
 fn engine_loaded_model(
     entry: &ModelEntry,
@@ -1087,30 +1235,23 @@ fn engine_not_installed() -> RuntimeError {
     )
 }
 
-/// [`snapshot`](ModelService::snapshot)'s view of the model the engine
-/// holds, without a registry lookup: `snapshot` is polled every couple of
-/// seconds and must never scan the models directory to answer. Quant and
-/// architecture are reported as `unknown` here; a caller that already has
-/// the [`ModelEntry`] (`ensure_loaded_inner`) uses [`engine_loaded_model`]
-/// instead, which fills them in from the registry.
-fn engine_snapshot_model(
-    model: &pam_model::engine_server::EngineModel,
-    last_used_at: i64,
-) -> LoadedModel {
-    let weight_bytes = std::fs::metadata(&model.path).map_or(0, |meta| meta.len());
+/// [`snapshot`](ModelService::snapshot)'s fallback view of a model the
+/// engine holds but this service has no cached registry entry for: no
+/// registry lookup and no filesystem access — `snapshot` is polled every
+/// couple of seconds and must never scan the models directory or stat the
+/// weights to answer. Quant and architecture are `unknown` and the size is
+/// `0`; a load through `ensure_loaded_inner` caches the registry's
+/// [`engine_loaded_model`] view instead, which fills them in.
+fn engine_snapshot_model(model: &pam_model::engine_server::EngineModel) -> LoadedModel {
     LoadedModel {
         id: model.id.clone(),
         quant: "unknown".to_owned(),
         architecture: "unknown".to_owned(),
         context_length: model.context_length,
-        weight_bytes,
+        weight_bytes: 0,
         device: "llama.cpp".to_owned(),
         loaded_at: model.loaded_at_ms,
-        last_used_at: if last_used_at > 0 {
-            last_used_at
-        } else {
-            model.loaded_at_ms
-        },
+        last_used_at: model.loaded_at_ms,
         last_tokens_per_sec: None,
     }
 }

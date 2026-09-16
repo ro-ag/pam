@@ -81,9 +81,18 @@ fn invalid(detail: &'static str) -> CheckoutError {
 fn io_error(_: std::io::Error) -> CheckoutError {
     error("landing_checkout_io", "local checkout I/O failed")
 }
-fn valid_oid(value: &str) -> bool {
+/// Refusal cause shared by every landing operation the cancel signal stops.
+pub(crate) const CANCELLED: &str = "cancelled";
+/// The one object-identity rule every landing module applies: exactly 40
+/// lowercase hexadecimal digits and not the all-zero (absent) identity.
+/// Landing supports ordinary SHA-1 repositories only, so a 64-digit SHA-256
+/// identity is refused here even though `pam_flow` accepts one as a
+/// correlation target.
+pub(crate) fn valid_oid(value: &str) -> bool {
     value.len() == 40
-        && value.bytes().all(|b| b.is_ascii_hexdigit())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && value.bytes().any(|b| b != b'0')
 }
 fn bounded_read(path: &Path, max: usize) -> Result<Vec<u8>, CheckoutError> {
@@ -123,10 +132,14 @@ fn resolve_ref(git: &Path, reference: &str) -> Result<String, CheckoutError> {
         return Err(invalid("unsupported Git reference"));
     }
     let path = git.join(reference);
+    let packed = git.join("packed-refs");
     let value = if path.exists() {
         text(&bounded_read(&path, 128)?)?.trim().to_owned()
     } else {
-        let packed = bounded_read(&git.join("packed-refs"), 1024 * 1024)?;
+        if !packed.exists() {
+            return Err(invalid("requested base or branch reference is unavailable"));
+        }
+        let packed = bounded_read(&packed, 1024 * 1024)?;
         let mut found = text(&packed)?
             .lines()
             .filter_map(|line| line.split_once(' '))
@@ -144,7 +157,7 @@ fn resolve_ref(git: &Path, reference: &str) -> Result<String, CheckoutError> {
     if !valid_oid(&value) {
         return Err(invalid("only direct full SHA-1 refs are supported"));
     }
-    Ok(value.to_ascii_lowercase())
+    Ok(value)
 }
 /// The branch `HEAD` points at (`refs/heads/…`); detached heads are refused.
 pub(crate) fn head_branch(request: &CheckoutRequest) -> Result<String, CheckoutError> {
@@ -176,9 +189,7 @@ pub(crate) fn ref_state(request: &CheckoutRequest) -> Result<(String, String), C
     Ok((branch.to_owned(), resolve_ref(&git, &request.base_ref)?))
 }
 pub(crate) fn validate_layout(request: &CheckoutRequest) -> Result<(), CheckoutError> {
-    if !valid_oid(&request.expected_commit)
-        || request.expected_commit != request.expected_commit.to_ascii_lowercase()
-    {
+    if !valid_oid(&request.expected_commit) {
         return Err(invalid("expected commit must be lowercase full SHA-1"));
     }
     for path in [
@@ -443,7 +454,7 @@ impl Git<'_> {
         };
         let result = tokio::select! {
             biased;
-            () = crate::flow_exec::cancelled(cancel) => Err(error("cancelled", "checkout capture cancelled")),
+            () = crate::flow_exec::cancelled(cancel) => Err(error(CANCELLED, "checkout capture cancelled")),
             () = tokio::time::sleep_until(self.deadline.into()) => Err(error("deadline_exceeded", "checkout capture deadline elapsed")),
             result = operation => result,
         };
@@ -778,7 +789,7 @@ where
     tokio::pin!(work);
     tokio::select! {
         biased;
-        () = crate::flow_exec::cancelled(cancel) => Err(error("cancelled", "checkout capture cancelled")),
+        () = crate::flow_exec::cancelled(cancel) => Err(error(CANCELLED, "checkout capture cancelled")),
         result = &mut work => result.map_err(|failure| error(failure.cause(), "checkout worker did not complete"))?,
     }
 }
@@ -841,7 +852,7 @@ pub(crate) async fn revalidate_accepting(
 
 fn still_active(cancel: &watch::Receiver<bool>, deadline: Instant) -> Result<(), CheckoutError> {
     if *cancel.borrow() || cancel.has_changed().is_err() {
-        return Err(error("cancelled", "checkout capture cancelled"));
+        return Err(error(CANCELLED, "checkout capture cancelled"));
     }
     if Instant::now() >= deadline {
         return Err(error(

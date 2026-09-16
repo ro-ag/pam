@@ -695,14 +695,6 @@ fn resolve_validated(segments: &[Segment], requested: ByteRange) -> Vec<Segment>
         .collect()
 }
 
-/// Named resolver used by retrieval plumbing; equivalent to [`resolve`].
-pub fn resolve_segments(
-    segments: &[Segment],
-    requested: ByteRange,
-) -> Result<Vec<Segment>, ViewError> {
-    resolve(segments, requested)
-}
-
 /// Compose view→intermediate and intermediate→source edges. Identity may split
 /// at parent boundaries. A coarse child keeps its whole view range and maps to
 /// the covering hull of source ranges; it never acquires byte-exact authority.

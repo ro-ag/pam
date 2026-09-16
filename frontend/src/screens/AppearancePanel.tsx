@@ -32,8 +32,8 @@ export function AppearancePanel() {
     <div className="appearance-panel">
       <div className="appearance-palette-section">
         <div className="appearance-palette-heading">
-          <span>COLOR PALETTE</span>
-          <span>Applies instantly · remembered</span>
+          <span>Color palette</span>
+          <span>Applies instantly and is remembered</span>
         </div>
         <div className="appearance-grid grid gap-3">
           {themes.flatMap((family) =>
@@ -43,7 +43,7 @@ export function AppearancePanel() {
                 <button
                   key={`${family.id}-${appearance}`}
                   type="button"
-                  aria-label={`${family.label} ${family.appearances[appearance]}`}
+                  aria-label={`${family.label} ${appearance}`}
                   aria-pressed={active}
                   onClick={() => applyTheme(family.id, appearance)}
                   className={cn("appearance-palette", active && "appearance-palette-selected")}
@@ -54,7 +54,7 @@ export function AppearancePanel() {
                     className="theme-preview appearance-palette-preview"
                   >
                     <span className="appearance-palette-name">
-                      <span>{family.appearances[appearance]}</span>
+                      <span>{family.label}</span>
                       {active && <Check aria-hidden="true" className="size-3.5" />}
                     </span>
                     <span className="appearance-mini-window" aria-hidden="true">
@@ -75,8 +75,8 @@ export function AppearancePanel() {
                     </span>
                   </span>
                   <span className="appearance-palette-caption">
-                    <span>{family.label}</span>
-                    <span>{appearance}</span>
+                    <span>{appearance === "light" ? "Light" : "Dark"}</span>
+                    {active && <span>current</span>}
                   </span>
                 </button>
               );

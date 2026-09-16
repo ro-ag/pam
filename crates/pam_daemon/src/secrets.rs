@@ -5,9 +5,10 @@
 //! credential store (macOS Keychain, Windows Credential Manager, Secret
 //! Service on Linux), never on disk in plaintext. [`SecretStore`] runs every
 //! backend call under [`tokio::task::spawn_blocking`] and returns only a
-//! sanitized [`SecretError`]: the platform's own error text is logged with
-//! [`tracing::warn!`] and goes no further, since it can carry account
-//! identifiers. [`SecretBackend`] is the injectable boundary:
+//! sanitized [`SecretError`]: only the platform error's *kind* (its variant
+//! name) is logged with [`tracing::warn!`]; its text goes nowhere, since it
+//! can carry account identifiers or secret material. [`SecretBackend`] is
+//! the injectable boundary:
 //! [`NativeSecretBackend`] per target OS, [`FakeSecretBackend`] in tests
 //! (no test touches a real keychain).
 
@@ -260,7 +261,7 @@ impl NativeSecretBackend {
     /// # Errors
     ///
     /// Returns a sanitized failure without retaining platform error
-    /// details; the underlying error text goes to [`tracing::warn!`].
+    /// details; only the error's kind goes to [`tracing::warn!`].
     pub fn open() -> Result<Self, SecretError> {
         #[cfg(target_os = "macos")]
         let store: Arc<CredentialStore> = apple_native_keyring_store::keychain::Store::new()
@@ -332,15 +333,41 @@ impl SecretBackend for NativeSecretBackend {
 }
 
 /// Maps a platform keyring error to a sanitized [`SecretError`], logging
-/// the platform's own text (which can carry account identifiers or other
-/// detail a refusal must not leak) at `warn` level only.
+/// only the error's kind at `warn` level: the platform's own text can
+/// carry account identifiers, process details or — on some backends'
+/// error paths — the secret material itself, so it never reaches a log
+/// line either.
 fn map_keyring_error(error: &KeyringError, action: &str) -> SecretError {
     let kind = match error {
         KeyringError::NoStorageAccess(_) => SecretError::Denied,
         _ => SecretError::Unavailable,
     };
-    tracing::warn!(action, cause = kind.cause(), %error, "native credential store call failed");
+    tracing::warn!(
+        action,
+        cause = kind.cause(),
+        platform_kind = keyring_error_kind(error),
+        "native credential store call failed"
+    );
     kind
+}
+
+/// The variant name of a keyring error and nothing else — no payload,
+/// however the variant spells it.
+pub(crate) fn keyring_error_kind(error: &KeyringError) -> &'static str {
+    match error {
+        KeyringError::PlatformFailure(_) => "platform_failure",
+        KeyringError::NoStorageAccess(_) => "no_storage_access",
+        KeyringError::NoEntry => "no_entry",
+        KeyringError::BadEncoding(_) => "bad_encoding",
+        KeyringError::BadDataFormat(..) => "bad_data_format",
+        KeyringError::BadStoreFormat(_) => "bad_store_format",
+        KeyringError::TooLong(..) => "too_long",
+        KeyringError::Invalid(..) => "invalid",
+        KeyringError::Ambiguous(_) => "ambiguous",
+        KeyringError::NoDefaultStore => "no_default_store",
+        KeyringError::NotSupportedByStore(_) => "not_supported_by_store",
+        _ => "other",
+    }
 }
 
 /// [`NativeSecretBackend`] opened on first use, from whichever blocking
@@ -540,12 +567,13 @@ impl SecretStore {
             .map(|value| value.map(Secret::new))
     }
 
-    /// Creates or replaces the secret stored for `connector_id`.
-    pub async fn set(&self, connector_id: &str, secret: &str) -> Result<(), SecretError> {
+    /// Creates or replaces the secret stored for `connector_id`. Takes the
+    /// [`Secret`] by value: it moves into the blocking call and is zeroed
+    /// when that call drops it, with no plain-`String` copy in between.
+    pub async fn set(&self, connector_id: &str, secret: Secret) -> Result<(), SecretError> {
         let backend = Arc::clone(&self.backend);
         let account = account_for(connector_id);
-        let secret = secret.to_owned();
-        run_blocking(move || backend.set(&account, &secret)).await
+        run_blocking(move || backend.set(&account, secret.expose())).await
     }
 
     /// Deletes the secret stored for `connector_id`, returning whether one

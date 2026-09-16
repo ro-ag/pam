@@ -185,6 +185,18 @@ async fn install_downloads_unpacks_and_smoke_checks_the_server() {
         "archive removed"
     );
     assert!(
+        !crate::registry::verified_sidecar_path(&layout.archive_path("release.tar.gz")).exists(),
+        "the downloader's verification sidecar goes with the archive"
+    );
+    assert!(
+        fs::read_dir(layout.root()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")),
+        "the manifest's temporary file is renamed away"
+    );
+    assert!(
         fs::read_dir(layout.root()).unwrap().all(|e| !e
             .unwrap()
             .file_name()

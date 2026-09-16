@@ -1,11 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { LoaderCircle, Play } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
-import { fieldClasses } from "../components/ui/field";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { cn } from "../lib/cn";
 import {
@@ -14,6 +15,7 @@ import {
   evidenceList,
   flowsInspect,
   flowsRun,
+  requestCapability,
   subscribeEvents,
   toBridgeFailure,
   type BridgeFailure,
@@ -24,7 +26,9 @@ import {
   type FlowStepReport,
   type FlowStepStatus,
   type OutcomeName,
+  type PamEventPayload,
 } from "../lib/ipc";
+import { outcomeLabel } from "../lib/outcome";
 import { formatDuration } from "../lib/time";
 
 /**
@@ -66,6 +70,41 @@ function stepDuration(ms: number): string {
   return formatDuration(Math.round(ms / 1_000));
 }
 
+/** A summary longer than this many characters is clamped to three lines until opened. */
+const SUMMARY_CLAMP_CHARS = 240;
+
+/**
+ * A step's own words. A model observation can run to a paragraph; the
+ * table shows three lines of it and a way to read the rest, so the step
+ * column never dwarfs the columns of fact beside it.
+ */
+function StepSummary({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > SUMMARY_CLAMP_CHARS;
+  return (
+    <span className="mt-1 block max-w-md">
+      <span
+        className={cn(
+          "block font-sans text-sm text-ink-muted",
+          long && !open && "line-clamp-3",
+        )}
+      >
+        {text}
+      </span>
+      {long && (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          className="mt-1 min-h-8 rounded-control font-sans text-xs text-accent-strong underline"
+        >
+          {open ? "Show less" : "Show more"}
+        </button>
+      )}
+    </span>
+  );
+}
+
 // --- the verdict -----------------------------------------------------------
 
 /**
@@ -95,11 +134,7 @@ function StepTable({ steps }: { steps: FlowStepReport[] }) {
             <tr key={step.id} className="border-t border-line align-top">
               <td className="py-2.5 pr-3 font-data text-sm text-ink">
                 {step.id}
-                {step.summary && (
-                  <span className="mt-1 block max-w-md font-sans text-sm text-ink-muted">
-                    {step.summary}
-                  </span>
-                )}
+                {step.summary && <StepSummary text={step.summary} />}
                 {step.error && (
                   <span className="mt-1 block max-w-md font-data text-xs text-danger">
                     {step.error.cause} · {step.error.detail}
@@ -132,7 +167,9 @@ function FlowVerdict({ result }: { result: FlowResult }) {
   return (
     <div aria-label="run verdict" className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Badge tone={OUTCOME_TONES[result.outcome] ?? "neutral"}>{result.outcome}</Badge>
+        <Badge tone={OUTCOME_TONES[result.outcome] ?? "neutral"}>
+          {outcomeLabel(result.outcome)}
+        </Badge>
         <span className="font-data text-xs text-ink-faint" title={result.repo}>
           {result.flow.id} · {result.repo}
         </span>
@@ -190,7 +227,7 @@ export function FlowVerdictPanel({ requestId }: { requestId: string }) {
 function destinationFor(cause: string): { to: "/settings" | "/models"; hash?: string } | null {
   if (cause.includes("connector")) return { to: "/settings", hash: "connectors" };
   if (cause === "landing_permission_missing" || cause.startsWith("landing_"))
-    return { to: "/settings", hash: "landing" };
+    return { to: "/settings", hash: "flows" };
   if (
     cause === "program_missing" ||
     cause === "program_not_allowed" ||
@@ -300,6 +337,12 @@ export interface FlowRunState {
   refused: boolean;
 }
 
+/** How many events the card keeps while its ticket is still unknown. */
+const EARLY_EVENT_CAP = 64;
+
+/** Why Run and Check readiness stay closed without a repository. */
+const REPO_HINT = "Enter a repository path first";
+
 export function FlowRunCard({
   flow,
   onRun,
@@ -308,6 +351,7 @@ export function FlowRunCard({
   /** Called whenever the run state changes; notes accumulate per ticket. */
   onRun?: (run: FlowRunState) => void;
 }) {
+  const queryClient = useQueryClient();
   const callers = useQuery({ queryKey: ["callers"], queryFn: callersList });
   const [repo, setRepo] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
@@ -317,6 +361,7 @@ export function FlowRunCard({
   const [refused, setRefused] = useState(false);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
   const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [inspection, setInspection] = useState<FlowInspection | null>(null);
   const [inspecting, setInspecting] = useState(false);
   const [inspectFailure, setInspectFailure] = useState<BridgeFailure | null>(null);
@@ -328,16 +373,33 @@ export function FlowRunCard({
   const repoRef = useRef(repo);
   repoRef.current = repo;
 
+  // The ticket the event stream filters on, and the events that arrived
+  // before it was known (see the subscription below).
+  const ticketRef = useRef<string | null>(null);
+  const early = useRef<PamEventPayload[]>([]);
+
+  // Only the newest check may answer: the auto-check on a flow switch and
+  // a manual one can otherwise land out of order.
+  const inspectionRun = useRef(0);
   const runInspection = useCallback(
     (repoValue: string, inputValues: Record<string, string>) => {
       const trimmed = repoValue.trim();
       if (!trimmed) return;
+      const run = ++inspectionRun.current;
       setInspecting(true);
       setInspectFailure(null);
       flowsInspect(flow.id, trimmed, inputValues)
-        .then((reply) => setInspection(reply))
-        .catch((error) => setInspectFailure(toBridgeFailure(error)))
-        .finally(() => setInspecting(false));
+        .then((reply) => {
+          if (run !== inspectionRun.current) return;
+          setInspection(reply);
+        })
+        .catch((error) => {
+          if (run !== inspectionRun.current) return;
+          setInspectFailure(toBridgeFailure(error));
+        })
+        .finally(() => {
+          if (run === inspectionRun.current) setInspecting(false);
+        });
     },
     [flow.id],
   );
@@ -346,12 +408,18 @@ export function FlowRunCard({
   // to that flow's defaults rather than carrying a neighbour's answers.
   // A repo the human already typed survives the switch, so this is also
   // where the readiness check re-runs for the newly selected flow — once,
-  // not on every keystroke that follows.
+  // not on every keystroke that follows. The inputs are keyed by value:
+  // every `["flows"]` refetch hands the card a fresh array for the same
+  // flow, and that must not reset a run in progress.
+  const inputsKey = JSON.stringify(flow.inputs);
   useEffect(() => {
+    const declared = JSON.parse(inputsKey) as FlowListEntry["inputs"];
     const defaults: Record<string, string> = {};
-    for (const input of flow.inputs) defaults[input.name] = input.default ?? "";
+    for (const input of declared) defaults[input.name] = input.default ?? "";
     setValues(defaults);
     setTicket(null);
+    ticketRef.current = null;
+    early.current = [];
     setNotes([]);
     setSettled(null);
     setRefused(false);
@@ -359,7 +427,7 @@ export function FlowRunCard({
     setInspection(null);
     setInspectFailure(null);
     runInspection(repoRef.current, defaults);
-  }, [flow.id, flow.inputs, runInspection]);
+  }, [flow.id, inputsKey, runInspection]);
 
   // Whoever listens gets every change, through a ref so a new callback
   // identity never re-announces an unchanged run.
@@ -369,16 +437,12 @@ export function FlowRunCard({
     onRunRef.current?.({ ticket, notes, settled, refused });
   }, [ticket, notes, settled, refused]);
 
-  // The ticket's own events drive the progress line. Kept in a ref so the
-  // subscription is opened once per run, not once per re-render.
-  const ticketRef = useRef<string | null>(null);
-  ticketRef.current = ticket;
-  useEffect(() => {
-    if (ticket === null) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    subscribeEvents((payload) => {
-      if (payload.ticket !== ticketRef.current) return;
+  // The ticket's own events drive the progress line. The stream is open
+  // from mount, because a short flow can finish before `admin.flows.run`
+  // even answers with its ticket: events that arrive while the ticket is
+  // still unknown wait in `early` and replay the moment it is.
+  const apply = useCallback(
+    (payload: PamEventPayload) => {
       if (payload.event.kind === "progress") {
         const note = payload.event.note;
         setNotes((prev) => [...prev, note]);
@@ -387,7 +451,23 @@ export function FlowRunCard({
       if (payload.event.kind === "done" || payload.event.kind === "refused") {
         setRefused(payload.event.kind === "refused");
         setSettled(payload.ticket);
+        // The history tab reads the tide; a settled run is a new row there.
+        void queryClient.invalidateQueries({ queryKey: ["flow-runs"] });
       }
+    },
+    [queryClient],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    subscribeEvents((payload) => {
+      const current = ticketRef.current;
+      if (current === null) {
+        early.current = [...early.current.slice(-(EARLY_EVENT_CAP - 1)), payload];
+        return;
+      }
+      if (payload.ticket !== current) return;
+      apply(payload);
     })
       .then((stop) => {
         if (cancelled) stop();
@@ -401,7 +481,7 @@ export function FlowRunCard({
       cancelled = true;
       unlisten?.();
     };
-  }, [ticket]);
+  }, [apply]);
 
   const repos = useMemo(() => {
     const seen = new Set((callers.data?.callers ?? []).map((caller) => caller.repo));
@@ -409,6 +489,7 @@ export function FlowRunCard({
   }, [callers.data]);
 
   const progress = notes.length > 0 ? notes[notes.length - 1] : null;
+  const running = ticket !== null && settled === null;
 
   const start = () => {
     setStarting(true);
@@ -416,47 +497,75 @@ export function FlowRunCard({
     setNotes([]);
     setSettled(null);
     setRefused(false);
+    setTicket(null);
+    ticketRef.current = null;
+    early.current = [];
     flowsRun(flow.id, repo.trim(), values)
-      .then((reply) => setTicket(reply.ticket))
+      .then((reply) => {
+        ticketRef.current = reply.ticket;
+        setTicket(reply.ticket);
+        const waiting = early.current.filter((payload) => payload.ticket === reply.ticket);
+        early.current = [];
+        for (const payload of waiting) apply(payload);
+      })
       .catch((error) => setFailure(toBridgeFailure(error)))
       .finally(() => setStarting(false));
   };
 
+  // `cancel` is an ordinary capability the daemon exposes to anyone who
+  // holds the ticket; the GUI asks as itself and the audit names a human.
+  const cancel = () => {
+    if (ticket === null) return;
+    setCancelling(true);
+    setFailure(null);
+    requestCapability("cancel", { ticket })
+      .catch((error) => setFailure(toBridgeFailure(error)))
+      .finally(() => setCancelling(false));
+  };
+
   return (
     <Panel ground="raised" aria-label="run this flow" className="space-y-4 p-4">
-      <p className="font-data text-xs text-ink-faint">run</p>
+      <p className="font-data text-xs text-ink-faint">Run</p>
 
-      <div className="space-y-1.5">
-        <span className="block font-data text-xs text-ink-faint">repo</span>
+      <div className="space-y-2">
         {repos.length > 0 && (
-          <select
-            aria-label="known repo"
-            value={repos.includes(repo) ? repo : ""}
-            onChange={(event) => setRepo(event.target.value)}
-            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
-          >
-            <option value="">pick a repo pam has seen</option>
-            {repos.map((known) => (
-              <option key={known} value={known}>
-                {known}
-              </option>
-            ))}
-          </select>
+          <label className="block space-y-1">
+            <span className={fieldLabelClasses}>Known repository</span>
+            <select
+              aria-label="known repo"
+              value={repos.includes(repo) ? repo : ""}
+              onChange={(event) => setRepo(event.target.value)}
+              className={cn(fieldClasses, "px-2")}
+            >
+              <option value="">Choose a repository pam has seen</option>
+              {repos.map((known) => (
+                <option key={known} value={known}>
+                  {known}
+                </option>
+              ))}
+            </select>
+          </label>
         )}
-        <input
-          aria-label="repo path"
-          value={repo}
-          onChange={(event) => setRepo(event.target.value)}
-          placeholder="or type an absolute path"
-          className={fieldClasses}
-        />
+        <label className="block space-y-1">
+          <span className={fieldLabelClasses}>Repository path</span>
+          <input
+            aria-label="repo path"
+            value={repo}
+            onChange={(event) => setRepo(event.target.value)}
+            placeholder="/absolute/path/to/repository"
+            className={fieldClasses}
+          />
+          <span className="block font-sans text-xs text-ink-muted">
+            An absolute path to the repository the flow runs in.
+          </span>
+        </label>
       </div>
 
       {flow.inputs.length > 0 && (
         <div className="space-y-3 border-t border-line pt-3">
           {flow.inputs.map((input) => (
             <label key={input.name} className="block space-y-1">
-              <span className="block font-data text-xs text-ink-faint">{input.name}</span>
+              <span className={fieldLabelClasses}>{input.name}</span>
               <input
                 aria-label={input.name}
                 ref={(el) => {
@@ -483,6 +592,7 @@ export function FlowRunCard({
           size="sm"
           variant="secondary"
           disabled={inspecting || !repo.trim()}
+          title={!repo.trim() ? REPO_HINT : undefined}
           onClick={() => runInspection(repo, values)}
         >
           {inspecting && <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />}
@@ -498,7 +608,14 @@ export function FlowRunCard({
       </div>
 
       <div className="flex flex-wrap items-center gap-3 border-t border-line pt-3">
-        <Button size="sm" disabled={starting || !repo.trim()} onClick={start}>
+        <Button
+          size="sm"
+          disabled={starting || running || !repo.trim()}
+          title={
+            !repo.trim() ? REPO_HINT : running ? "This flow is already running" : undefined
+          }
+          onClick={start}
+        >
           {starting ? (
             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
           ) : (
@@ -506,12 +623,21 @@ export function FlowRunCard({
           )}
           Run
         </Button>
+        {running && (
+          <ConfirmButton
+            label="Cancel run"
+            confirmLabel="cancel it?"
+            variant="secondary"
+            busy={cancelling}
+            onConfirm={cancel}
+          />
+        )}
         {ticket && <span className="font-data text-xs text-ink-faint">{ticket}</span>}
       </div>
 
       {failure && <FailureNote failure={failure} label="run" />}
 
-      {ticket && settled === null && (
+      {running && (
         <p
           aria-label="run progress"
           className={cn("font-data text-xs", progress ? "text-ink-muted" : "text-ink-faint")}

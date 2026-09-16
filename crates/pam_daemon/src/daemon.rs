@@ -5,7 +5,7 @@
 //! ```
 //!
 //! [`run_daemon`] wires transport, policy gate, queue manager, and store into tokio tasks: a
-//! dispatcher spawning one pipeline task per request ([`Pipeline::handle`]), an executor loop
+//! dispatcher spawning one pipeline task per request (`Pipeline::handle`), an executor loop
 //! leasing queued work through [`BuiltinCapability`] dispatch, the queue's lease reaper, and the
 //! retention pruner ([`crate::retention`]), which prunes on its first tick (so a boot prunes right
 //! after crash recovery) and every [`PRUNE_INTERVAL`] after. **Ordering**: dedupe + row insert
@@ -156,6 +156,7 @@ pub const TERMINAL_ACTIONS: &[&str] = &[
     ACTION_ADMIN_DENIED,
     crate::queue::ACTION_CANCEL,
     crate::queue::ACTION_LEASE_REAPED,
+    crate::queue::ACTION_RECOVERY_REFUSAL,
     crate::lifecycle::ACTION_DAEMON_RESTART,
 ];
 
@@ -310,7 +311,7 @@ impl CompletionRouter {
     }
 
     /// Delivers `response` to every waiter registered for `request_id`
-    /// and remembers it for late registrants (see [`FINISHED_TTL`]).
+    /// and remembers it for late registrants (see `FINISHED_TTL`).
     pub async fn finish(&self, request_id: &str, response: Response) {
         let mut inner = self.inner.lock().await;
         if let Some(waiters) = inner.waiting.remove(request_id) {
@@ -646,8 +647,8 @@ fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<d
     if injected.is_some() {
         return injected;
     }
-    match CurlTransport::trusted_path() {
-        Ok(curl) => Some(Arc::new(CurlTransport::new(curl))),
+    match CurlTransport::trusted() {
+        Ok(transport) => Some(Arc::new(transport)),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -819,11 +820,19 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
             pipeline.finish_parked_terminal(&id).await;
         }
         for repo in pipeline.queue.ready_repos().await {
-            if let Ok(Some(work)) = pipeline.queue.take_next(&repo).await {
-                let pipeline = Arc::clone(&pipeline);
-                tokio::spawn(async move {
-                    pipeline.execute_leased(work).await;
-                });
+            match pipeline.queue.take_next(&repo).await {
+                Ok(Some(work)) => {
+                    let pipeline = Arc::clone(&pipeline);
+                    tokio::spawn(async move {
+                        pipeline.execute_leased(work).await;
+                    });
+                }
+                Ok(None) => {}
+                // The lane stays as it was and the next tick retries; a
+                // store that fails every tick must not fail silently.
+                Err(error) => {
+                    tracing::error!(%repo, %error, "leasing the next request off its lane failed");
+                }
             }
         }
         tokio::select! {
@@ -1032,11 +1041,7 @@ impl Pipeline {
         // Register before placement so the completion cannot slip
         // between the two.
         let registration = self.router.register(id).await;
-        let position = match self
-            .queue
-            .place_in_lane(id, &envelope.caller.repo, envelope.deadline_ms)
-            .await
-        {
+        let position = match self.queue.place_in_lane(id, &envelope.caller.repo).await {
             Ok(position) => position,
             Err(QueueError::Expired) => return self.deadline_refusal(envelope).await,
             Err(error) => {
@@ -1347,6 +1352,13 @@ impl Pipeline {
         }
 
         let result = match BuiltinCapability::from_name(&row.capability) {
+            // Unreadable persisted args fail the lease rather than running
+            // the capability with empty args it never asked for.
+            Some(_) if serde_json::from_str::<serde_json::Value>(&row.args_json).is_err() => {
+                Err(CapabilityFailure::Failed {
+                    detail: "the request's persisted arguments are not readable JSON".to_owned(),
+                })
+            }
             Some(capability) => {
                 let args = serde_json::from_str(&row.args_json).unwrap_or(serde_json::Value::Null);
                 // The row keeps the caller's agent and repo but not its

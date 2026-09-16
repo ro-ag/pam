@@ -7,8 +7,10 @@ import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { Section } from "../components/ui/Section";
+import { DAEMON_STATUS_KEY } from "../components/shell/useDaemonStatus";
 import { formatBytes } from "../lib/bytes";
 import { cn } from "../lib/cn";
 import {
@@ -28,6 +30,7 @@ import {
   serviceUninstall,
   toBridgeFailure,
   type BridgeFailure,
+  type DaemonStopReply,
   type GrantRow,
   type Profile,
   type PruneReport,
@@ -101,7 +104,7 @@ function ProfilePanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <p className="font-data text-xs text-ink-faint">policy profile</p>
+      <p className="font-data text-xs text-ink-faint">Policy profile</p>
       <div role="radiogroup" aria-label="policy profile" className="space-y-2">
         {PROFILE_ORDER.map((candidate) => {
           const selected = current === candidate;
@@ -121,7 +124,7 @@ function ProfilePanel() {
                 checked={selected}
                 disabled={current === undefined || setProfile.isPending}
                 onChange={() => setProfile.mutate(candidate)}
-                className="mt-1 size-3.5 accent-accent-strong"
+                className="mt-0.5 size-4.5 shrink-0 accent-accent-strong"
               />
               <span className="space-y-0.5">
                 <span className="block font-data text-sm font-medium text-ink">
@@ -147,8 +150,20 @@ function ProfilePanel() {
 
 // --- security: grants ------------------------------------------------------
 
-/** The daemon's registered non-admin capabilities, for the add datalist. */
-export const KNOWN_CAPABILITIES = ["status", "echo", "query", "cancel"] as const;
+/**
+ * The daemon's grantable capabilities, for the add datalist — the `CAP_*`
+ * constants in `pam_daemon`. `status`, `query` and `cancel` are built-ins
+ * every caller already has and cannot be granted.
+ */
+export const KNOWN_CAPABILITIES = [
+  "echo",
+  "flow.run",
+  "flow.inspect",
+  "flow.list",
+  "flow.show",
+  "flow.result",
+  "evidence.read",
+] as const;
 
 function GrantRowView({
   grant,
@@ -222,7 +237,7 @@ function GrantsPanel() {
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
-      <p className="font-data text-xs text-ink-faint">capability grants</p>
+      <p className="font-data text-xs text-ink-faint">Capability grants</p>
 
       {listFailure && <FailureNote failure={listFailure} label="grants" />}
 
@@ -260,27 +275,35 @@ function GrantsPanel() {
       )}
 
       <form
-        className="flex flex-wrap items-center gap-2 border-t border-line pt-4"
+        className="flex flex-wrap items-end gap-2 border-t border-line pt-4"
         onSubmit={(event) => {
           event.preventDefault();
           const capability = draft.trim();
           if (capability) add.mutate(capability);
         }}
       >
-        <input
-          aria-label="capability to grant"
-          list="known-capabilities"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder="capability, e.g. echo"
-          className="h-8 min-w-48 flex-1 rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
-        />
+        <label className="min-w-48 flex-1 space-y-1">
+          <span className={fieldLabelClasses}>Capability to grant</span>
+          <input
+            aria-label="capability to grant"
+            list="known-capabilities"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="e.g. flow.run"
+            className={fieldClasses}
+          />
+        </label>
         <datalist id="known-capabilities">
           {KNOWN_CAPABILITIES.map((capability) => (
             <option key={capability} value={capability} />
           ))}
         </datalist>
-        <Button size="sm" type="submit" disabled={add.isPending || !draft.trim()}>
+        <Button
+          size="sm"
+          type="submit"
+          disabled={add.isPending || !draft.trim()}
+          title={!draft.trim() ? "Name a capability first" : undefined}
+        >
           {add.isPending && (
             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
           )}
@@ -311,7 +334,7 @@ function statusField(status: Record<string, unknown> | null | undefined, key: st
 function DaemonPanel({ active }: { active: boolean }) {
   const queryClient = useQueryClient();
   const status = useQuery({
-    queryKey: ["daemon", "status"],
+    queryKey: DAEMON_STATUS_KEY,
     queryFn: daemonStatus,
     enabled: active,
     refetchInterval: active ? 5_000 : false,
@@ -330,6 +353,20 @@ function DaemonPanel({ active }: { active: boolean }) {
     onError: (error) => setFailure(toBridgeFailure(error)),
     onSettled: refreshSoon,
   });
+  /** The stop op's answer in words; a restart adds what happens next. */
+  const stopNote = (reply: DaemonStopReply, restarting: boolean): string => {
+    const again = restarting ? " · the next status poll starts it again" : "";
+    switch (reply.outcome) {
+      case "stopped":
+        return `stopped · pid ${reply.pid ?? "?"}${restarting ? again : " · stays down until something asks for it"}`;
+      case "still_draining":
+        return `still draining · pid ${reply.pid ?? "?"} · finishing in-flight work${again}`;
+      case "not_running":
+        return restarting
+          ? "was not running · the next status poll starts it"
+          : "was not running";
+    }
+  };
 
   const service = useQuery({ queryKey: ["daemon", "service"], queryFn: serviceStatus });
   const [serviceNote, setServiceNote] = useState<string | null>(null);
@@ -357,11 +394,14 @@ function DaemonPanel({ active }: { active: boolean }) {
     onSuccess: (reply) =>
       applyService(reply, "removed · the next pam command starts the daemon lazily"),
     onError: (error) => setServiceFailure(toBridgeFailure(error)),
+    onSettled: refreshSoon,
   });
   const serviceState = service.data?.state;
   const serviceLabel =
     serviceState === undefined
-      ? "—"
+      ? service.isError
+        ? "unknown"
+        : "checking…"
       : serviceState.kind === "installed"
         ? `installed, ${serviceState.loaded ? "loaded" : "not loaded"}`
         : serviceState.kind === "not_installed"
@@ -375,7 +415,9 @@ function DaemonPanel({ active }: { active: boolean }) {
       : "neutral";
   const serviceDetail =
     serviceState === undefined
-      ? ""
+      ? service.isError
+        ? "the login service could not be read"
+        : ""
       : serviceState.kind === "unsupported"
         ? serviceState.reason
         : serviceState.unit;
@@ -395,7 +437,7 @@ function DaemonPanel({ active }: { active: boolean }) {
   return (
     <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">daemon</p>
+        <p className="font-data text-xs text-ink-faint">Daemon</p>
         {status.data &&
           (connected ? (
             <Badge tone="success">running</Badge>
@@ -412,7 +454,7 @@ function DaemonPanel({ active }: { active: boolean }) {
             <div key={label} className="space-y-0.5">
               <dt className="font-data text-xs text-ink-faint">{label}</dt>
               <dd className="font-data text-sm text-ink tabular-nums">
-                {connected ? value : "—"}
+                {connected ? value : "unknown"}
               </dd>
             </div>
           ))}
@@ -425,9 +467,9 @@ function DaemonPanel({ active }: { active: boolean }) {
       {!bridgeDown && (
         <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
           <div className="min-w-0 flex-1 space-y-0.5">
-            <p className="font-data text-xs text-ink-faint">start at login</p>
+            <p className="font-data text-xs text-ink-faint">Start at login</p>
             <p className="truncate font-data text-xs text-ink-muted" title={serviceDetail}>
-              {serviceDetail || "—"}
+              {serviceDetail || "no unit named yet"}
             </p>
           </div>
           <Badge tone={serviceTone}>{serviceLabel}</Badge>
@@ -461,47 +503,43 @@ function DaemonPanel({ active }: { active: boolean }) {
           confirmLabel="stop it?"
           busy={stop.isPending}
           disabled={!connected}
+          title={!connected ? "The daemon is not running" : undefined}
           onConfirm={() =>
             stop.mutate(undefined, {
-              onSuccess: (reply) =>
-                setNote(
-                  reply.outcome === "stopped"
-                    ? `stopped · pid ${reply.pid ?? "?"} · stays down until something asks for it`
-                    : reply.outcome === "still_draining"
-                      ? `still draining · pid ${reply.pid ?? "?"} · finishing in-flight work`
-                      : "was not running",
-                ),
+              onSuccess: (reply) => setNote(stopNote(reply, false)),
             })
           }
         />
-        {/* Honest label: there is no start op — stopping and then polling
-            status IS the restart, because status ensures (lazily starts)
-            the daemon. */}
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={stop.isPending}
-          onClick={() =>
+        {/* There is no start op — stopping and then polling status IS the
+            restart, because status ensures (lazily starts) the daemon. */}
+        <ConfirmButton
+          label="Restart"
+          confirmLabel="restart it?"
+          variant="secondary"
+          busy={stop.isPending}
+          disabled={!connected}
+          title={!connected ? "The daemon is not running" : undefined}
+          onConfirm={() =>
             stop.mutate(undefined, {
-              onSuccess: () => {
-                setNote("stopped · the next status poll is starting it again");
+              onSuccess: (reply) => {
+                setNote(stopNote(reply, true));
                 refreshSoon();
               },
             })
           }
-        >
-          Restart (stop + lazy start)
-        </Button>
+        />
       </div>
+      <p className="font-sans text-xs text-ink-muted">
+        Restart stops the daemon; the next status poll starts it again.
+      </p>
 
       {note && <p className="font-data text-xs text-ink-muted">{note}</p>}
       {failure && <FailureNote failure={failure} label="daemon" />}
 
       {/* The bridge resolves the base dir Rust-side ($PAM_BASE_DIR, else
-          ~/.pam); no IPC op reports it back yet, so this line documents
-          the rule rather than pretending to read the live value. */}
+          ~/.pam) and reports it with every status reply. */}
       <p className="border-t border-line pt-3 font-data text-xs text-ink-faint">
-        base dir: ~/.pam · override with $PAM_BASE_DIR
+        base dir: {status.data?.base_dir ?? "unknown"} · override with $PAM_BASE_DIR
       </p>
     </Panel>
   );
@@ -527,12 +565,11 @@ function windowValue(days: number | null): string {
   return days === null ? "forever" : String(days);
 }
 
-/** One prune pass in the data voice: when it ran, and exactly what left. */
+/** One prune pass in the data voice: exactly what left, and when. */
 function pruneLine(report: PruneReport, nowMs?: number): string {
   return (
-    `last pruned ${relativeTime(report.ts, nowMs)} · ` +
-    `${report.evidence_rows} evidence rows (${formatBytes(report.evidence_bytes)}) · ` +
-    `${report.requests} requests`
+    `pruned ${report.evidence_rows} evidence rows (${formatBytes(report.evidence_bytes)}) ` +
+    `and ${report.requests} requests · ${relativeTime(report.ts, nowMs)}`
   );
 }
 
@@ -582,8 +619,10 @@ function RetentionPanel() {
   const lastRun = report ?? state.data?.last_run ?? null;
   const busy = state.isPending || save.isPending;
 
-  const selectClasses =
-    "h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50";
+  const selectClasses = cn(
+    fieldClasses,
+    "w-auto px-2 disabled:cursor-not-allowed disabled:opacity-70",
+  );
 
   const windowField = (
     caption: string,
@@ -593,7 +632,7 @@ function RetentionPanel() {
     onPick: (next: number | null) => void,
   ) => (
     <label className="space-y-1">
-      <span className="block font-data text-xs text-ink-faint">{caption}</span>
+      <span className={fieldLabelClasses}>{caption}</span>
       <select
         aria-label={label}
         value={windowValue(days)}
@@ -615,10 +654,10 @@ function RetentionPanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">storage pruning</p>
+        <p className="font-data text-xs text-ink-faint">Storage pruning</p>
         <Button
           size="sm"
-          variant="ghost"
+          variant="secondary"
           disabled={prune.isPending}
           onClick={() => prune.mutate()}
         >
@@ -630,14 +669,14 @@ function RetentionPanel() {
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {windowField(
-          "keep evidence for",
+          "Keep evidence for",
           "evidence age",
           EVIDENCE_CHOICES,
           state.data?.evidence_days ?? null,
           (next) => save.mutate({ evidence_days: next }),
         )}
         {windowField(
-          "keep audit rows for",
+          "Keep audit rows for",
           "audit age",
           AUDIT_CHOICES,
           state.data?.audit_days ?? null,
@@ -712,7 +751,7 @@ function LogsPanel({ active }: { active: boolean }) {
           aria-label="lines to show"
           value={lineCount}
           onChange={(event) => setLineCount(Number(event.target.value))}
-          className="h-8 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink"
+          className={cn(fieldClasses, "w-auto px-2")}
         >
           {LOG_LINE_CHOICES.map((choice) => (
             <option key={choice} value={choice}>
@@ -720,14 +759,14 @@ function LogsPanel({ active }: { active: boolean }) {
             </option>
           ))}
         </select>
-        <label className="flex cursor-pointer items-center gap-1.5 font-data text-xs text-ink-muted">
+        <label className="flex min-h-8 cursor-pointer items-center gap-1.5 font-sans text-xs text-ink-muted">
           <input
             type="checkbox"
             checked={auto}
             onChange={(event) => setAuto(event.target.checked)}
-            className="size-3.5 accent-accent-strong"
+            className="size-4.5 accent-accent-strong"
           />
-          auto 5s
+          Refresh every 5 s
         </label>
         <Button
           size="sm"
@@ -800,45 +839,62 @@ function LogsPanel({ active }: { active: boolean }) {
 
 // --- the screen ------------------------------------------------------------
 
+/**
+ * The categories, each with the eyebrow that says what kind of thing it
+ * governs: a local preference lives in this app alone; a daemon setting
+ * or policy is administered here and nowhere else — no agent or CLI can
+ * change it. That one sentence sits in the header instead of a badge on
+ * every pane.
+ */
 const SETTINGS_CATEGORIES = [
   {
     id: "appearance",
     label: "Appearance",
+    eyebrow: "Local preference",
     blurb: "Four Costa appearances. Soft light, clear working surfaces.",
   },
   {
     id: "security",
     label: "Security",
-    blurb: "Policy profiles and capability grants. Only you can change these.",
-    admin: true,
+    eyebrow: "Daemon policy",
+    blurb: "Policy profiles and capability grants.",
   },
   {
     id: "models",
     label: "Models",
+    eyebrow: "Daemon setting",
     blurb: "Default models, agent assistance and local storage.",
   },
   {
     id: "flows",
     label: "Flows",
-    blurb: "Allowed programs and search paths for flow steps.",
-    admin: true,
+    eyebrow: "Daemon policy",
+    blurb:
+      "What a flow step may reach: allowed programs, search paths, build output and caches, approved repositories and connector scopes, and the landing policy.",
   },
   {
     id: "connectors",
     label: "Connectors",
-    blurb: "Service connections and credentials, managed locally.",
-    admin: true,
+    eyebrow: "Daemon setting",
+    blurb: "Service connections and credentials, stored in this machine's keychain.",
   },
-  { id: "daemon", label: "Daemon", blurb: "Connection, login service and daemon controls." },
+  {
+    id: "daemon",
+    label: "Daemon",
+    eyebrow: "Daemon control",
+    blurb: "Connection, login service and daemon controls.",
+  },
   {
     id: "retention",
     label: "Retention",
+    eyebrow: "Daemon setting",
     blurb: "How long requests and their evidence stay on disk.",
   },
   {
     id: "logs",
     label: "Logs",
-    blurb: "Local diagnostics, available even when the daemon is down.",
+    eyebrow: "Local diagnostics",
+    blurb: "The daemon's own log, readable even when the daemon is down.",
   },
 ] as const;
 
@@ -866,12 +922,7 @@ function SettingsPane({
       className="settings-pane"
     >
       {visited && (
-        <Section
-          eyebrow={category.id}
-          title={category.label}
-          blurb={category.blurb}
-          eyebrowExtra={"admin" in category && <Badge tone="accent">GUI-only</Badge>}
-        >
+        <Section eyebrow={category.eyebrow} title={category.label} blurb={category.blurb}>
           {children}
         </Section>
       )}
@@ -915,9 +966,10 @@ export function SettingsScreen() {
           <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
           <p className="text-sm text-ink-muted">Your machine. Your defaults.</p>
         </div>
-        <span className="settings-context font-data text-xs text-ink-muted">
-          LOCAL PREFERENCES
-        </span>
+        <p className="settings-context max-w-xs text-right font-sans text-xs text-ink-muted">
+          Appearance stays in this app. Every other category administers the daemon and can only
+          be changed here — never by an agent or the CLI.
+        </p>
       </header>
       <LayoutGroup id={motionGroup}>
         <motion.div

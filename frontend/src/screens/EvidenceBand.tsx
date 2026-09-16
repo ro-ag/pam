@@ -3,8 +3,10 @@ import { animate, useMotionValue, useReducedMotion, useTransform } from "motion/
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { formatBytes } from "../lib/bytes";
+import { cn } from "../lib/cn";
 import {
   evidenceStats,
   logCompress,
@@ -82,13 +84,13 @@ function CompressedNote({ report }: { report: CompressReport }) {
       </p>
       {report.semantic && (
         <p className="text-sm text-ink-muted">
-          Microsoft selected records are stored as evidence {report.semantic.id}. Original
-          evidence is unchanged.
+          Semantic selection stored the kept records as evidence {report.semantic.id}. The
+          original evidence is unchanged.
         </p>
       )}
       {report.compression_skipped && (
         <p className="text-sm text-ink-muted">
-          Microsoft compression skipped: {report.compression_skipped.detail}
+          Semantic compression skipped: {report.compression_skipped.detail}
         </p>
       )}
       {report.model_skipped && (
@@ -134,8 +136,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
   const statsFailure = stats.isError ? toBridgeFailure(stats.error) : null;
   const compressFailure = compress.isError ? toBridgeFailure(compress.error) : null;
   const figures = stats.data;
-  const inputClasses =
-    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50";
+  const inputClasses = cn(fieldClasses, "disabled:cursor-not-allowed disabled:opacity-70");
 
   return (
     <Panel
@@ -144,7 +145,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
       className="mt-2 mb-4 flex flex-col gap-6 p-5 md:flex-row md:items-start md:justify-between"
     >
       <div className="space-y-1">
-        <p className="font-data text-xs text-ink-faint">tokens avoided · 7 days</p>
+        <p className="font-data text-xs text-ink-faint">Tokens avoided, last 7 days</p>
         {figures ? (
           <Odometer value={figures.tokens_avoided_est} />
         ) : (
@@ -168,10 +169,10 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           if (isAbsolutePath(path) && !compress.isPending) compress.mutate();
         }}
       >
-        <p className="font-data text-xs text-ink-faint">compress a log</p>
+        <p className="font-data text-xs text-ink-faint">Compress a log</p>
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-56 flex-1 space-y-1">
-            <span className="block font-data text-xs text-ink-faint">log path</span>
+            <span className={fieldLabelClasses}>Log path</span>
             <input
               aria-label="log path"
               value={path}
@@ -182,7 +183,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
             />
           </label>
           <label className="w-24 space-y-1">
-            <span className="block font-data text-xs text-ink-faint">exit status</span>
+            <span className={fieldLabelClasses}>Exit status</span>
             <input
               type="number"
               aria-label="exit status"
@@ -193,15 +194,16 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
             />
           </label>
         </div>
-        <label className="flex items-center gap-2 font-data text-xs text-ink-muted">
+        <label className="flex min-h-8 cursor-pointer items-center gap-2 font-sans text-xs text-ink-muted">
           <input
             type="checkbox"
             aria-label="use model"
             checked={useModel}
             disabled={compress.isPending}
             onChange={(event) => setUseModel(event.target.checked)}
+            className="size-4.5 accent-accent-strong"
           />
-          summarize with the heavy model
+          Summarize with the heavy model
         </label>
         {useModel && heavyBlocked && (
           <p className="font-sans text-xs text-warning">
@@ -213,6 +215,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
             size="sm"
             type="submit"
             disabled={compress.isPending || !isAbsolutePath(path)}
+            title={!isAbsolutePath(path) ? "Enter an absolute path to a log file" : undefined}
           >
             Compress
           </Button>

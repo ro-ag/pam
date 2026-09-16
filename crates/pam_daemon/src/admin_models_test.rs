@@ -12,9 +12,9 @@ use crate::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService, CAUSE_INVALID_ADMIN_ARGS, CAUSE_UNKNOWN_ADMIN_OP,
 };
 use crate::admin_models::{
-    CAUSE_ALREADY_INSTALLED, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED, CAUSE_UNKNOWN_MODEL,
-    CAUSE_UNQUALIFIED, CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET,
-    OP_CURATOR_TEST, OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE,
+    CAUSE_ALREADY_INSTALLED, CAUSE_MODELS_DIR_OVERLAPS_BASE, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED,
+    CAUSE_UNKNOWN_MODEL, CAUSE_UNQUALIFIED, CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST,
+    OP_CURATOR_SET, OP_CURATOR_TEST, OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE,
     OP_MODELS_DOWNLOAD, OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST,
     OP_MODELS_LOAD, OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD,
     OP_MODELS_VERIFY,
@@ -738,12 +738,23 @@ async fn settings_set_moves_the_models_dir_and_the_idle_window() {
             .await,
             Outcome::Changed,
         );
+        // Stored canonical (symlinks resolved), so the registry's
+        // containment checks compare like with like.
         assert_eq!(
             body["models_dir"],
-            elsewhere.path().display().to_string().as_str()
+            elsewhere
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+                .as_str()
         );
         assert_eq!(body["idle_unload_min"], 0);
-        assert_eq!(fx.models.models_dir(), elsewhere.path());
+        assert_eq!(
+            fx.models.models_dir(),
+            elsewhere.path().canonicalize().unwrap()
+        );
 
         // A directory that is not there is refused, and nothing moves.
         expect_refusal(
@@ -754,7 +765,87 @@ async fn settings_set_moves_the_models_dir_and_the_idle_window() {
             .await,
             CAUSE_INVALID_ADMIN_ARGS,
         );
-        assert_eq!(fx.models.models_dir(), elsewhere.path());
+        assert_eq!(
+            fx.models.models_dir(),
+            elsewhere.path().canonicalize().unwrap()
+        );
+
+        // Weights are not PAM state: a directory inside the daemon's base
+        // (or one enclosing it) is refused, and the setting stays put.
+        let base = tempfile::tempdir().unwrap();
+        fx.models
+            .set_engine_base(base.path().canonicalize().unwrap());
+        let inside = base.path().join("weights");
+        std::fs::create_dir_all(&inside).unwrap();
+        for candidate in [inside.as_path(), base.path()] {
+            expect_refusal(
+                fx.run(
+                    OP_MODELS_SETTINGS_SET,
+                    json!({ "models_dir": candidate.display().to_string() }),
+                )
+                .await,
+                CAUSE_MODELS_DIR_OVERLAPS_BASE,
+            );
+        }
+        assert_eq!(
+            fx.models.models_dir(),
+            elsewhere.path().canonicalize().unwrap()
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The vendor and file name are joined under the models directory; a
+/// traversal or an absolute vendor would otherwise write a `.gguf` (and,
+/// on discard, unlink sidecars) anywhere the daemon can.
+#[tokio::test]
+async fn download_and_discard_refuse_a_vendor_that_is_not_one_plain_segment() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let outside = tempfile::tempdir().unwrap();
+        let escape = format!(
+            "../../{}",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        let absolute = outside.path().display().to_string();
+        for vendor in [
+            "..",
+            ".",
+            "",
+            "qwen/../..",
+            escape.as_str(),
+            absolute.as_str(),
+            "qwen\\..",
+        ] {
+            for op in [OP_MODELS_DOWNLOAD, OP_MODELS_DOWNLOAD_DISCARD] {
+                let detail = expect_refusal(
+                    fx.run(
+                        op,
+                        json!({ "url": "https://example.invalid/tiny.gguf", "vendor": vendor }),
+                    )
+                    .await,
+                    CAUSE_INVALID_ADMIN_ARGS,
+                );
+                assert!(
+                    vendor.is_empty() || detail.contains("not a plain name"),
+                    "{op} {vendor:?}: {detail}"
+                );
+            }
+        }
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "nothing was written outside the models directory"
+        );
+        // A URL whose file name is not plain is the same refusal.
+        expect_refusal(
+            fx.run(
+                OP_MODELS_DOWNLOAD,
+                json!({ "url": "https://example.invalid/.hidden.gguf", "vendor": "qwen" }),
+            )
+            .await,
+            CAUSE_INVALID_ADMIN_ARGS,
+        );
     })
     .await
     .expect("test within deadline");

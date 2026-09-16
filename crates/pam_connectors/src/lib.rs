@@ -1,15 +1,20 @@
-//! Read-only connectors over an injected HTTP transport (system `curl` in production). One
-//! module per connector; secrets never reach argv, logs, or evidence. See
-//! `docs/specs/2026-09-02-flows-connectors-design.md`. Seven services are reachable from a
-//! flow step — GitHub Actions, Jenkins, `SonarQube`, Jira Data Center, Confluence Cloud,
-//! `SharePoint` (via Microsoft Graph), and an allowlisted passthrough to the local `aws`
-//! CLI — all read-only; no call here creates, updates, or deletes anything. Two entry
-//! points cover it: [`call`] runs one flow step's connector action (JSON or a log);
-//! [`verify`] proves a stored credential works (the GUI's **Test** button). Both take a
-//! `&dyn HttpTransport`, so the daemon injects [`CurlTransport`] and tests inject
-//! [`testing::FakeTransport`](crate::testing::FakeTransport). The call table itself lives
-//! in `pam_flow` — [`descriptor`] borrows it, so the flow validator and the dispatcher can
-//! never disagree about which calls exist or what arguments they take.
+//! Connectors over an injected HTTP transport (system `curl` in production). One module
+//! per connector; secrets never reach argv, logs, or evidence. See
+//! `docs/specs/2026-09-02-flows-connectors-design.md`. Seven services are described —
+//! GitHub Actions, Jenkins, `SonarQube`, Jira Data Center, Confluence Cloud, `SharePoint`
+//! (via Microsoft Graph), and an allowlisted passthrough to the local `aws` CLI. Every
+//! flow-step call ([`call`]) is read-only: nothing reachable from a flow creates, updates,
+//! or deletes anything. The one writing surface is [`github_landing`] — typed pull-request
+//! creation and merge for guarded landing, under its own policy and never reachable from
+//! a flow step. The AWS descriptor exists, but the daemon refuses that connector before any
+//! credential or process is touched and `pam_flow` refuses a flow that names it, until
+//! containment lands. Two entry points cover the read path: [`call`] runs one flow step's
+//! connector action (JSON or a log); [`verify`] proves a stored credential works (the
+//! GUI's **Test** button). Both take a `&dyn HttpTransport`, so the daemon injects
+//! [`CurlTransport`] and tests inject `testing::FakeTransport` (behind the `testing`
+//! feature). The call table itself
+//! lives in `pam_flow` — [`descriptor`] borrows it, so the flow validator and the
+//! dispatcher can never disagree about which calls exist or what arguments they take.
 //! ```
 //! use pam_connectors::{ConnectorId, descriptor};
 //!
@@ -47,7 +52,7 @@ mod transport;
 pub mod testing;
 
 pub use curl::CurlTransport;
-pub use descriptor::{AuthKind, Descriptor, descriptor, descriptors};
+pub use descriptor::{AuthKind, Descriptor, descriptor};
 pub use error::ConnectorError;
 pub use pam_flow::{ArgValue, ConnectorId};
 pub use transport::{

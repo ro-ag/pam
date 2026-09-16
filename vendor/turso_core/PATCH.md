@@ -35,6 +35,21 @@ are omitted. PAM's workspace lockfile is authoritative. All other upstream
 files are unchanged except the three vector distance source files and the
 normalized manifest described above.
 
+## Warning-clean under `-D warnings`
+
+PAM's gate compiles the workspace with `RUSTFLAGS="-D warnings"`, and this
+path dependency's warnings are replayed into it. Three sites are touched,
+each marked with a `PAM:` comment and no behavioural change:
+
+- `storage/btree.rs`: `#[allow(dead_code)]` on `move_to_root` and
+  `indexbtree_move_to_unpacked`, which nothing in the selected build calls.
+- `types.rs`: `ExternalAggState` compares its function-pointer fields
+  through a hand-written `PartialEq` using `std::ptr::fn_addr_eq` (same
+  semantics as the previous derive; the derive trips
+  `unpredictable_function_pointer_comparisons`).
+- `vector/operations/text.rs`: `vector_from_text` spells its elided return
+  lifetime (`Vector<'_>`).
+
 ## Integration and validation
 
 PAM selects this same-version crate using `[patch.crates-io]`; this directory

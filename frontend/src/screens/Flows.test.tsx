@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => ({
   evidenceList: vi.fn(),
   evidenceGet: vi.fn(),
   subscribeEvents: vi.fn(),
+  requestCapability: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -331,9 +332,31 @@ describe("the library column", () => {
     await renderFlows();
     const library = within(await screen.findByLabelText("flow library"));
     for (const flow of FLOWS)
-      expect(library.getByRole("button", { name: new RegExp(flow.name) })).toBeInTheDocument();
+      expect(library.getByRole("option", { name: new RegExp(flow.name) })).toBeInTheDocument();
     expect(library.getAllByText("Custom")).toHaveLength(2);
     expect(library.queryByText("builtin")).not.toBeInTheDocument();
+  });
+
+  it("is a listbox: one selected option, arrows move focus, Enter picks", async () => {
+    await renderFlows();
+    await editorFor("pr-readiness");
+    const library = within(screen.getByLabelText("flow library"));
+    const list = library.getByRole("listbox", { name: "Flow library" });
+    const options = within(list).getAllByRole("option");
+    expect(options.filter((option) => option.getAttribute("aria-selected") === "true")).toEqual(
+      [options[0]],
+    );
+    // Only the selected option is in the tab order.
+    expect(options[0]).toHaveAttribute("tabindex", "0");
+    expect(options[1]).toHaveAttribute("tabindex", "-1");
+    options[0].focus();
+    fireEvent.keyDown(options[0], { key: "ArrowDown" });
+    await waitFor(() => expect(options[1]).toHaveFocus());
+    fireEvent.keyDown(options[1], { key: "Enter" });
+    await editorFor("after-merge-checks");
+    expect(options[1]).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(options[1], { key: "End" });
+    await waitFor(() => expect(options[options.length - 1]).toHaveFocus());
   });
 
   it("marks an unparseable flow invalid and says why, twice over", async () => {
@@ -510,6 +533,87 @@ describe("the run card", () => {
     expect(mocks.evidenceList).toHaveBeenCalledWith("req_run");
   });
 
+  it("lands a verdict whose done event beat the ticket reply", async () => {
+    // `admin.flows.run` answers after the run already finished: the card
+    // has been listening since mount and replays the early events.
+    let answer: (reply: { ticket: string; position: number }) => void = () => {};
+    mocks.flowsRun.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    await waitFor(() => expect(mocks.flowsRun).toHaveBeenCalled());
+    feed({ ticket: "req_run", event: { kind: "progress", note: "step 1/3" } });
+    feed({ ticket: "req_run", event: { kind: "done" } });
+    feed({ ticket: "req_other", event: { kind: "done" } });
+    expect(screen.queryByLabelText("run verdict")).toBeNull();
+    act(() => answer({ ticket: "req_run", position: 0 }));
+    const verdict = within(await screen.findByLabelText("run verdict"));
+    expect(verdict.getByText("verified")).toBeInTheDocument();
+    expect(screen.queryByText("step 1/3")).toBeNull();
+  });
+
+  it("keeps a run in flight across a flows refetch that hands the card a fresh entry", async () => {
+    const client = createAppQueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <FlowsScreen />
+      </QueryClientProvider>,
+    );
+    await screen.findByRole("heading", { name: "Flows", level: 1 });
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    expect(await screen.findByText("req_run")).toBeInTheDocument();
+    feed({ ticket: "req_run", event: { kind: "progress", note: "step 2/3" } });
+    expect(await screen.findByText("step 2/3")).toBeInTheDocument();
+    // The same flows, as a new array of new objects — what every refetch yields.
+    mocks.flowsList.mockResolvedValue({
+      flows: FLOWS.map((flow) => ({ ...flow, inputs: [...flow.inputs] })),
+    });
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["flows"] });
+    });
+    feed({ ticket: "req_run", event: { kind: "progress", note: "still going" } });
+    await waitFor(() => expect(mocks.flowsList).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("req_run")).toBeInTheDocument();
+    expect(screen.getByText("still going")).toBeInTheDocument();
+  });
+
+  it("offers Cancel while the run is live and asks the daemon through the cancel capability", async () => {
+    mocks.requestCapability.mockResolvedValue({
+      kind: "result",
+      id: "req_c",
+      outcome: "cancelled",
+      body: {},
+      evidence: [],
+    });
+    await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    expect(card.queryByRole("button", { name: "Cancel run" })).toBeNull();
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    const cancel = await card.findByRole("button", { name: "Cancel run" });
+    // Run stays closed while this run is live, and says why.
+    expect(card.getByRole("button", { name: "Run" })).toBeDisabled();
+    expect(card.getByRole("button", { name: "Run" })).toHaveAttribute(
+      "title",
+      "This flow is already running",
+    );
+    fireEvent.click(cancel);
+    expect(mocks.requestCapability).not.toHaveBeenCalled();
+    fireEvent.click(card.getByRole("button", { name: "cancel it?" }));
+    await waitFor(() =>
+      expect(mocks.requestCapability).toHaveBeenCalledWith("cancel", { ticket: "req_run" }),
+    );
+    feed({ ticket: "req_run", event: { kind: "refused" } });
+    expect(await screen.findByText(/run · refused/)).toBeInTheDocument();
+    expect(card.queryByRole("button", { name: "Cancel run" })).toBeNull();
+  });
+
   it("says so plainly when the daemon refuses the run outright", async () => {
     mocks.flowsRun.mockRejectedValue({
       cause: "capability_denied",
@@ -598,7 +702,11 @@ describe("the Runs tab", () => {
     const rows = runs.getAllByRole("listitem");
     expect(rows).toHaveLength(1);
     expect(runs.getByText("verified")).toBeInTheDocument();
-    expect(runs.getByText("pam")).toBeInTheDocument();
+    // Flow id, repo tail, agent and ticket, so a row means something closed.
+    expect(rows[0]).toHaveTextContent("pr-readiness");
+    expect(rows[0]).toHaveTextContent("pam");
+    expect(rows[0]).toHaveTextContent("pam-gui");
+    expect(rows[0]).toHaveTextContent("req_run");
 
     fireEvent.click(runs.getByRole("button", { expanded: false }));
     const verdict = within(await screen.findByLabelText("run verdict"));
@@ -833,8 +941,8 @@ describe("the canvas tab", () => {
     });
     expect(rail("clippy").className).toContain("bg-line");
     const verdictFrame = within(screen.getByLabelText("verdict frame"));
-    expect(verdictFrame.getByText("verified").className).not.toContain("opacity-40");
-    expect(verdictFrame.getByText("blocked").className).toContain("opacity-40");
+    expect(verdictFrame.getByText("verified")).toBeInTheDocument();
+    expect(verdictFrame.queryByText("blocked")).not.toBeInTheDocument();
   });
 
   it("editing after a run clears the rails", async () => {

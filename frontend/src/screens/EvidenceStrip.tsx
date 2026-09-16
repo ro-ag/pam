@@ -75,7 +75,7 @@ function EvidenceViewer({ content }: { content: EvidenceContent }) {
       )}
       {content.truncated && (
         <p className="font-data text-xs text-ink-faint tabular-nums">
-          showing the first {formatBytes(content.text.length)} of{" "}
+          showing the first {formatBytes(new TextEncoder().encode(content.text).length)} of{" "}
           {formatBytes(content.text_bytes)}
         </p>
       )}
@@ -100,7 +100,7 @@ function EvidenceChip({
       aria-pressed={selected}
       onClick={onSelect}
       className={cn(
-        "rounded-control border border-line px-2 py-1 font-data text-xs transition-colors duration-150",
+        "h-8 rounded-control border border-line-strong px-2.5 font-data text-xs transition-colors duration-150",
         selected ? "bg-accent-soft text-ink" : "text-ink-muted hover:text-ink",
       )}
     >
@@ -112,12 +112,14 @@ function EvidenceChip({
 export function EvidenceStrip({ requestId }: { requestId: string }) {
   const [selected, setSelected] = useState<string | null>(null);
 
+  // Two shapes under one prefix would collide: `["evidence", "req_x"]` is
+  // a list and `["evidence", "ev_y"]` a blob, so each gets its own segment.
   const list = useQuery({
-    queryKey: ["evidence", requestId],
+    queryKey: ["evidence", "list", requestId],
     queryFn: () => evidenceList(requestId),
   });
   const content = useQuery({
-    queryKey: ["evidence", selected],
+    queryKey: ["evidence", "content", selected],
     queryFn: () => evidenceGet(selected as string),
     enabled: selected !== null,
   });
@@ -134,7 +136,8 @@ export function EvidenceStrip({ requestId }: { requestId: string }) {
 
   return (
     <div className="space-y-2">
-      <div role="group" aria-label="evidence" className="flex flex-wrap gap-2">
+      <div role="group" aria-label="evidence" className="flex flex-wrap items-center gap-2">
+        <span className="font-sans text-xs text-ink-muted">Evidence</span>
         {rows.map((row) => (
           <EvidenceChip
             key={row.id}

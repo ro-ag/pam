@@ -198,6 +198,27 @@ async fn a_server_that_exits_or_never_becomes_healthy_is_reported_and_reaped() {
     ));
 }
 
+#[tokio::test]
+async fn a_healthy_server_that_serves_another_model_is_refused_and_stopped() {
+    let dir = short_dir();
+    let server = EngineServer::new(fake_binary(), dir.path(), dir.path()).unwrap();
+    let squatter = ServerOptions {
+        load_timeout: Duration::from_secs(10),
+        extra_env: vec![("PAM_FAKE_MODEL_PATH".into(), "/models/other.gguf".into())],
+        ..ServerOptions::default()
+    };
+    let refused = server
+        .load("fake/model", Path::new("/models/fake.gguf"), &squatter)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EngineServerError::Spawn(detail) if detail.contains("reports model")),
+        "{refused:?}"
+    );
+    assert!(server.model().is_none(), "nothing is trusted");
+    assert!(!server.socket().exists(), "the stranger's socket is gone");
+}
+
 /// Opt-in: the real installed engine with a real GGUF. Set
 /// `PAM_ENGINE_SERVER` (the llama-server binary) and `PAM_ENGINE_MODEL`.
 #[tokio::test]

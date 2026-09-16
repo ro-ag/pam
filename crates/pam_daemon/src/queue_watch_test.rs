@@ -45,7 +45,7 @@ async fn enqueue(queue: &QueueManager, id: &str) {
             .unwrap(),
         AdmitOutcome::Admitted
     );
-    queue.place_in_lane(id, "/repo", 60_000).await.unwrap();
+    queue.place_in_lane(id, "/repo").await.unwrap();
 }
 
 async fn ready_checkpoint(store: &Store, id: &str) {

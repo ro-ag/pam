@@ -5,17 +5,22 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { FailureNote } from "../components/ui/FailureNote";
 import { cn, cva } from "../lib/cn";
 import { PageTabs, PagePane } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
   activityList,
+  auditRequest,
   callersList,
   subscribeEvents,
   toBridgeFailure,
   type ActivityRow,
+  type AuditRow,
 } from "../lib/ipc";
-import { exactTime, relativeTime } from "../lib/time";
+import { outcomeLabel } from "../lib/outcome";
+import { repoTail } from "../lib/repo";
+import { exactTime, relativeTime, useNow } from "../lib/time";
 import { COMPRESS_CAPABILITY, EvidenceBand } from "./EvidenceBand";
 import { EvidenceStrip } from "./EvidenceStrip";
 import {
@@ -33,8 +38,7 @@ import {
  * refetch; a new request is visible well under a second after its event.
  * Plain list, no virtualization: the daemon clamps replies to 100 rows (v0 volumes) and the panel
  * already scrolls.
- * Follow-up (blocked on IPC surface): per-request audit trail in the detail view — no
- * `admin.audit.*` op on the bridge yet.
+ * An expanded row shows the request's audit trail (`admin.audit.request`) under its evidence.
  */
 
 /** Rows requested per fetch; the store clamps to the same bound. */
@@ -46,15 +50,13 @@ export const EVENT_REFRESH_MS = 300;
 /** How often the "3m ago" column re-renders. */
 const CLOCK_TICK_MS = 30_000;
 
-/** A ticking now, for live relative ages without a per-row timer. */
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(timer);
-  }, [intervalMs]);
-  return now;
-}
+/**
+ * How many hand-driven compressions the tide keeps alongside the agents'
+ * rows. `hide_probes` drops every `admin.*` request — the GUI's own
+ * polling, but also `admin.log.compress`, which a human asked for and
+ * wants to find. So the tide asks for those separately and merges them.
+ */
+const COMPRESS_LIMIT = 10;
 
 // --- state → visuals -------------------------------------------------------
 
@@ -94,22 +96,16 @@ function rowBadge(row: ActivityRow): { label: string; tone: BadgeProps["tone"] }
     case "running":
       return { label: "running", tone: "accent" };
     case "waiting_approval":
-      return { label: "approval held", tone: "warning" };
+      return { label: "awaiting review", tone: "warning" };
     case "refused":
-      return { label: row.outcome ?? "refused", tone: "danger" };
+      return { label: outcomeLabel(row.outcome ?? "refused"), tone: "danger" };
     case "failed":
-      return { label: row.outcome ?? "failed", tone: "danger" };
+      return { label: outcomeLabel(row.outcome ?? "failed"), tone: "danger" };
     case "done":
       return row.outcome
-        ? { label: row.outcome, tone: OUTCOME_TONES[row.outcome] ?? "neutral" }
+        ? { label: outcomeLabel(row.outcome), tone: OUTCOME_TONES[row.outcome] ?? "neutral" }
         : { label: "done", tone: "success" };
   }
-}
-
-/** Last path segment; the full path rides on the title attribute. */
-function repoTail(repo: string): string {
-  const segments = repo.split("/").filter(Boolean);
-  return segments[segments.length - 1] ?? repo;
 }
 
 // --- filter controls -------------------------------------------------------
@@ -147,8 +143,8 @@ function Chip({
       title={title}
       onClick={onToggle}
       className={cn(
-        "h-7 max-w-40 truncate rounded-control px-2.5 font-data text-xs transition-colors duration-100",
-        active ? "bg-accent-soft text-ink" : "text-ink-faint hover:text-ink",
+        "h-8 max-w-40 truncate rounded-control px-2.5 font-data text-xs transition-colors duration-100",
+        active ? "bg-accent-soft text-ink" : "text-ink-muted hover:text-ink",
       )}
     >
       {text}
@@ -180,28 +176,46 @@ function ChipBar({
   if (agents.length === 0 && repos.length === 0) return null;
   return (
     <div role="group" aria-label="chips" className="flex flex-wrap items-center gap-1">
-      {agents.map((option) => (
-        <Chip
-          key={`agent:${option}`}
-          label={`agent ${option}`}
-          text={option}
-          active={option === agent}
-          onToggle={() => onAgent(option === agent ? undefined : option)}
-        />
-      ))}
+      {agents.length > 0 && (
+        <div
+          role="group"
+          aria-label="Agent filters"
+          className="flex flex-wrap items-center gap-1"
+        >
+          <span className="pr-1 font-sans text-xs text-ink-muted">Agent</span>
+          {agents.map((option) => (
+            <Chip
+              key={`agent:${option}`}
+              label={`agent ${option}`}
+              text={option}
+              active={option === agent}
+              onToggle={() => onAgent(option === agent ? undefined : option)}
+            />
+          ))}
+        </div>
+      )}
       {agents.length > 0 && repos.length > 0 && (
         <span aria-hidden="true" className="mx-1 h-4 w-px bg-line" />
       )}
-      {repos.map((option) => (
-        <Chip
-          key={`repo:${option}`}
-          label={`repo ${repoTail(option)}`}
-          text={repoTail(option)}
-          title={option}
-          active={option === repo}
-          onToggle={() => onRepo(option === repo ? undefined : option)}
-        />
-      ))}
+      {repos.length > 0 && (
+        <div
+          role="group"
+          aria-label="Repository filters"
+          className="flex flex-wrap items-center gap-1"
+        >
+          <span className="pr-1 font-sans text-xs text-ink-muted">Repository</span>
+          {repos.map((option) => (
+            <Chip
+              key={`repo:${option}`}
+              label={`repo ${repoTail(option)}`}
+              text={repoTail(option)}
+              title={option}
+              active={option === repo}
+              onToggle={() => onRepo(option === repo ? undefined : option)}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -217,8 +231,9 @@ function StateSegments({
     <div
       role="group"
       aria-label="state filter"
-      className="flex h-8 items-center gap-0.5 rounded-control border border-line bg-surface-raised p-0.5"
+      className="flex items-center gap-0.5 rounded-control border border-line-strong bg-surface-raised p-0.5"
     >
+      <span className="px-2 font-sans text-xs text-ink-muted">State</span>
       {STATE_FILTERS.map((filter) => (
         <button
           key={filter}
@@ -226,8 +241,8 @@ function StateSegments({
           aria-pressed={filter === value}
           onClick={() => onChange(filter)}
           className={cn(
-            "h-full rounded-control px-2.5 font-data text-xs transition-colors duration-100",
-            filter === value ? "bg-accent-soft text-ink" : "text-ink-faint hover:text-ink",
+            "h-8 rounded-control px-2.5 font-data text-xs transition-colors duration-100",
+            filter === value ? "bg-accent-soft text-ink" : "text-ink-muted hover:text-ink",
           )}
         >
           {filter}
@@ -315,9 +330,61 @@ function TideRow({
             <p className="font-data text-xs text-ink-faint">no args recorded</p>
           )}
           <EvidenceStrip requestId={row.id} />
+          <AuditTrail requestId={row.id} />
         </div>
       )}
     </>
+  );
+}
+
+/** One audit row's detail: the daemon's own JSON when it wrote one, else the raw text. */
+function auditDetail(detail: unknown): string | null {
+  if (detail === null || detail === undefined) return null;
+  if (typeof detail === "string") return detail;
+  if (typeof detail === "object") {
+    const body = detail as Record<string, unknown>;
+    const parts = ["cause", "detail", "recovery"]
+      .map((key) => body[key])
+      .filter((value): value is string => typeof value === "string");
+    if (parts.length > 0) return parts.join(" — ");
+  }
+  return JSON.stringify(detail);
+}
+
+/**
+ * The request's audit trail, oldest first: what the daemon decided about
+ * it and why, in the words it recorded. The same rows Ask Pam reads for
+ * "why was that refused".
+ */
+function AuditTrail({ requestId }: { requestId: string }) {
+  const audit = useQuery({
+    queryKey: ["audit", requestId],
+    queryFn: () => auditRequest(requestId),
+  });
+  const failure = audit.isError ? toBridgeFailure(audit.error) : null;
+  if (failure) return <FailureNote failure={failure} label="audit" />;
+  const rows: AuditRow[] = audit.data?.rows ?? [];
+  if (audit.isPending) {
+    return <p className="font-data text-xs text-ink-faint">reading the audit trail…</p>;
+  }
+  if (rows.length === 0) {
+    return <p className="font-data text-xs text-ink-faint">no audit rows for this request</p>;
+  }
+  return (
+    <ol aria-label="audit trail" className="space-y-1.5">
+      {rows.map((entry) => {
+        const detail = auditDetail(entry.detail);
+        return (
+          <li key={entry.id} className="font-data text-xs text-ink-muted">
+            <span className="text-ink-faint" title={exactTime(entry.ts)}>
+              {exactTime(entry.ts).slice(11)}
+            </span>{" "}
+            <span className="text-ink">{entry.action}</span> · {entry.decision} · {entry.actor}
+            {detail && <span className="block pl-4 text-ink-muted">{detail}</span>}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -434,6 +501,20 @@ export function ActivityScreen() {
     placeholderData: (previous) => previous,
   });
 
+  // The hand-driven compressions, which `hide_probes` would otherwise drop
+  // with the GUI's own polling rows (see COMPRESS_LIMIT).
+  const compressions = useQuery({
+    queryKey: ["activity", "compress", search.repo ?? null, search.agent ?? null],
+    queryFn: () =>
+      activityList({
+        limit: COMPRESS_LIMIT,
+        capability: COMPRESS_CAPABILITY,
+        repo: search.repo,
+        agent: search.agent,
+      }),
+    placeholderData: (previous) => previous,
+  });
+
   const callers = useQuery({ queryKey: ["callers"], queryFn: callersList });
 
   // The event stream nudges the queries: one trailing ~300ms window per
@@ -464,10 +545,20 @@ export function ActivityScreen() {
     };
   }, [queryClient]);
 
-  const requests = activity.data?.requests;
+  const tideRequests = activity.data?.requests;
+  const compressRequests = compressions.data?.requests;
+  // One tide: the agents' rows plus the human's compressions, each id once.
+  const requests = useMemo(() => {
+    if (!tideRequests) return undefined;
+    const seen = new Set(tideRequests.map((row) => row.id));
+    const extra = (compressRequests ?? []).filter((row) => !seen.has(row.id));
+    return extra.length === 0 ? tideRequests : [...tideRequests, ...extra];
+  }, [tideRequests, compressRequests]);
   useEffect(() => {
     if (!pendingExpand || !requests) return;
-    const compressed = requests.find((row) => row.capability === COMPRESS_CAPABILITY);
+    const compressed = [...requests]
+      .filter((row) => row.capability === COMPRESS_CAPABILITY)
+      .sort((left, right) => right.created_ts - left.created_ts)[0];
     if (!compressed) return;
     setExpandedId(compressed.id);
     setPendingExpand(false);
@@ -536,7 +627,10 @@ export function ActivityScreen() {
         selected={tab}
         onSelect={setTab}
       />
-      <div className="page-toolbar space-y-3" hidden={tab !== "requests"}>
+      <div
+        className="page-toolbar flex flex-wrap items-center gap-x-4 gap-y-2"
+        hidden={tab !== "requests"}
+      >
         <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
         <ChipBar
           agents={agentOptions}
@@ -550,7 +644,7 @@ export function ActivityScreen() {
       <PagePane id="activity" tab="compression" active={tab === "compression"}>
         <h2 className="text-lg font-semibold">Log compression</h2>
         <p className="mb-4 text-sm text-ink-muted">
-          Compress a local log and inspect the saved evidence in Requests.
+          Compress a local log; the request and its evidence then open in Requests.
         </p>
         <EvidenceBand
           onCompressed={() => {
@@ -560,11 +654,18 @@ export function ActivityScreen() {
       </PagePane>
       <PagePane id="activity" tab="requests" active={tab === "requests"}>
         {failure && (
-          <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-            <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
-            <p className="font-sans text-sm text-ink">{failure.detail}.</p>
-            <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
-          </section>
+          <div className="mt-2">
+            <FailureNote failure={failure} label="disconnected">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={activity.isFetching}
+                onClick={() => void activity.refetch()}
+              >
+                Retry
+              </Button>
+            </FailureNote>
+          </div>
         )}
 
         {!failure && activity.isPending && <TideSkeleton />}
@@ -602,7 +703,7 @@ export function ActivityScreen() {
                     aria-label={lane.agent}
                     exit={fade}
                     transition={settle}
-                    className="activity-lane min-w-0 rounded-card border border-line bg-surface-raised p-2"
+                    className="activity-lane min-w-0 rounded-card border border-line-strong bg-surface-raised p-2"
                   >
                     <header className="flex items-center gap-2 px-2 pb-2">
                       <Badge tone="accent">{lane.agent}</Badge>

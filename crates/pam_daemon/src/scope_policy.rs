@@ -119,6 +119,17 @@ impl ScopePolicy {
         Ok(policy)
     }
 
+    /// [`Self::normalize`] off the async threads: every repository root is
+    /// canonicalized, one filesystem round trip per root, on the
+    /// repository-identity lane.
+    pub async fn normalize_blocking(self) -> Result<Self, ScopeError> {
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+            self.normalize()
+        })
+        .await
+        .map_err(identity_unavailable)?
+    }
+
     /// Normalize GUI input before the atomic settings write. Paths must exist.
     pub fn normalize(mut self) -> Result<Self, ScopeError> {
         self.validate()?;
@@ -183,6 +194,15 @@ impl ScopePolicy {
         Ok(canonical)
     }
 
+    /// [`Self::authorize_repo`] with the canonicalization (a filesystem
+    /// round trip) on the repository-identity lane rather than the async
+    /// thread that called; for the per-request paths.
+    pub async fn authorize_repo_blocking(&self, path: &Path) -> Result<PathBuf, ScopeError> {
+        let canonical = canonical_repo_blocking(path.to_path_buf()).await?;
+        self.repository(&canonical)?;
+        Ok(canonical)
+    }
+
     fn repository(&self, canonical: &Path) -> Result<&RepositoryScope, ScopeError> {
         self.repositories
             .iter()
@@ -200,8 +220,22 @@ impl ScopePolicy {
         args: &BTreeMap<String, ArgValue>,
     ) -> Result<(), ScopeError> {
         let canonical = self.authorize_repo(repo)?;
+        self.authorize_connector_at(&canonical, connector, base_url, call, args)
+    }
+
+    /// [`Self::authorize_connector`] for a root [`Self::authorize_repo`] (or
+    /// its blocking twin) already canonicalized and approved, so the caller
+    /// does not pay the filesystem round trip twice.
+    pub fn authorize_connector_at(
+        &self,
+        canonical: &Path,
+        connector: ConnectorId,
+        base_url: &str,
+        call: &str,
+        args: &BTreeMap<String, ArgValue>,
+    ) -> Result<(), ScopeError> {
         let scope = self
-            .repository(&canonical)?
+            .repository(canonical)?
             .connectors
             .iter()
             .find(|scope| scope.connector == connector)
@@ -253,6 +287,21 @@ impl ConnectorScope {
         }
         Ok(())
     }
+}
+
+/// [`canonical_repo`] on the repository-identity lane.
+async fn canonical_repo_blocking(path: PathBuf) -> Result<PathBuf, ScopeError> {
+    crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+        canonical_repo(&path)
+    })
+    .await
+    .map_err(identity_unavailable)?
+}
+
+/// The lane could not run the identity check at all: not a scope decision,
+/// so it fails closed as an invalid (unanswerable) policy question.
+fn identity_unavailable(error: crate::blocking_jobs::Error) -> ScopeError {
+    invalid(&format!("repository identity check did not run: {error}"))
 }
 
 fn canonical_repo(path: &Path) -> Result<PathBuf, ScopeError> {

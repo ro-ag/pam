@@ -252,7 +252,12 @@ function StepNodeComponent({ data, selected }: NodeProps<StepNodeType>) {
             </span>
           </header>
 
-          <p className="mt-0.5 truncate font-data text-xs text-ink-muted">{stepBody(step)}</p>
+          <p
+            className="mt-0.5 truncate font-data text-xs text-ink-muted"
+            title={stepBody(step)}
+          >
+            {stepBody(step)}
+          </p>
 
           {selected && marker && (
             <div className="pt-2.5">

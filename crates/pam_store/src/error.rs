@@ -41,6 +41,18 @@ pub enum StoreError {
         state: &'static str,
     },
 
+    /// A terminal state was handed to the non-terminal state helper;
+    /// terminal transitions go through `Store::finish_request`, which
+    /// writes the audit row in the same transaction.
+    #[error(
+        "request state {state:?} is terminal; record it through finish_request \
+         so its audit row lands in the same transaction"
+    )]
+    TerminalTransition {
+        /// The offending state's column value.
+        state: &'static str,
+    },
+
     /// A row referenced by id does not exist.
     #[error("no {table} row with id {id}")]
     NotFound {

@@ -263,6 +263,9 @@ const SHAREPOINT_CALLS: &[CallSpec] = &[
     },
 ];
 
+/// The AWS call table, kept so the descriptor and the GUI can show what the
+/// connector will offer; [`connector_blocker`] refuses every flow that names
+/// it until then.
 const AWS_CALLS: &[CallSpec] = &[
     CallSpec {
         name: "commands",
@@ -275,6 +278,30 @@ const AWS_CALLS: &[CallSpec] = &[
         yields_log: false,
     },
 ];
+
+/// Why the AWS connector cannot be named by a flow yet: the daemon refuses it
+/// before any credential or process is touched, and a flow file that depends
+/// on it would validate today and fail at run time. Lifted when containment
+/// for the CLI lands.
+pub const AWS_BLOCKER: &str = "the aws connector is unavailable until containment lands; the daemon refuses it before any credential or process is touched";
+
+/// The reason a connector may not be named by a flow, when there is one.
+///
+/// A blocked connector keeps its call table — [`connector_calls`] still
+/// answers, so descriptors and the GUI can describe it — but [`parse`]
+/// refuses any step that names it, with this text at `steps[n].connector`.
+#[must_use]
+pub fn connector_blocker(id: ConnectorId) -> Option<&'static str> {
+    match id {
+        ConnectorId::Aws => Some(AWS_BLOCKER),
+        ConnectorId::Github
+        | ConnectorId::Jenkins
+        | ConnectorId::Sonarqube
+        | ConnectorId::Jira
+        | ConnectorId::Confluence
+        | ConnectorId::Sharepoint => None,
+    }
+}
 
 /// The read-only calls a connector offers.
 #[must_use]
@@ -440,7 +467,9 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
         return Err(FlowError::invalid("name", "a flow needs a name"));
     }
     check_length("name", raw.name.len(), MAX_NAME_BYTES)?;
+    check_secrets(&raw.name, "name")?;
     check_length("description", raw.description.len(), MAX_DESCRIPTION_BYTES)?;
+    check_secrets(&raw.description, "description")?;
 
     if raw.inputs.len() > MAX_INPUTS {
         return Err(FlowError::invalid(
@@ -454,6 +483,10 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
     let mut inputs = BTreeMap::new();
     for (name, raw_input) in raw.inputs {
         check_input_name(&name)?;
+        check_secrets(
+            &raw_input.description,
+            &format!("inputs.{name}.description"),
+        )?;
         if let Some(default) = &raw_input.default {
             let path = format!("inputs.{name}.default");
             check_secrets(default, &path)?;
@@ -841,6 +874,9 @@ fn validate_connector(
             ),
         ));
     };
+    if let Some(blocker) = connector_blocker(id) {
+        return Err(FlowError::invalid(format!("{at}.connector"), blocker));
+    }
     let calls = connector_calls(id);
     let call_path = format!("{at}.call");
     let Some(call) = call else {
@@ -1000,6 +1036,16 @@ fn is_known_reference(key: &str, scope: &Scope) -> bool {
     let Some((id, tail)) = rest.split_once('.') else {
         return false;
     };
-    scope.earlier.contains(id)
-        && (tail == "exit_status" || tail == "result" || tail.starts_with("result."))
+    if !scope.earlier.contains(id) {
+        return false;
+    }
+    match tail {
+        "exit_status" | "result" => true,
+        // The pointer must be one the run could walk: `result.` and
+        // `result.jobs[a]` pass a prefix test but can never resolve, and
+        // refusing them here is cheaper than a failed run.
+        _ => tail
+            .strip_prefix("result.")
+            .is_some_and(|pointer| crate::vars::segments(pointer).is_some()),
+    }
 }

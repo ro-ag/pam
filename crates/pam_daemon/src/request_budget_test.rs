@@ -14,6 +14,24 @@ fn budget() -> std::sync::Arc<RequestBudget> {
 }
 
 #[test]
+fn admitted_limits_are_readable_and_never_exceed_the_compiled_ceiling() {
+    let limits = budget().limits().to_owned();
+    assert_eq!(limits.attempts, 2);
+    assert_eq!(limits.http_calls, 2);
+    let inflated = RequestBudget::with_limits(
+        Instant::now() + Duration::from_secs(10),
+        Limits {
+            attempts: u64::MAX,
+            http_calls: u64::MAX,
+            http_bytes: u64::MAX,
+            command_bytes: u64::MAX,
+        },
+    );
+    assert_eq!(inflated.limits().http_calls, Limits::default().http_calls);
+    assert_eq!(inflated.limits().attempts, Limits::default().attempts);
+}
+
+#[test]
 fn retries_share_attempts_and_cancelled_reservations_stay_spent() {
     let original = budget();
     let retry = std::sync::Arc::clone(&original);

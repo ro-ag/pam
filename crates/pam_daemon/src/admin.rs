@@ -93,6 +93,10 @@ pub const OP_APPROVALS_PENDING: &str = "admin.approvals.pending";
 /// → delivers a human resolution to the waiting request.
 pub const OP_APPROVALS_RESOLVE: &str = "admin.approvals.resolve";
 
+/// Longest `note` [`OP_APPROVALS_RESOLVE`] records into its audit detail:
+/// the detail column is a receipt, not a document.
+pub const MAX_APPROVAL_NOTE_BYTES: usize = 1024;
+
 /// `admin.activity.list { limit?, repo?, agent?, state?, capability? }`
 /// → recent request rows, newest first, bounded.
 pub const OP_ACTIVITY_LIST: &str = "admin.activity.list";
@@ -513,6 +517,18 @@ impl AdminService {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let note = args.get("note").and_then(serde_json::Value::as_str);
+        if let Some(note) = note
+            && note.len() > MAX_APPROVAL_NOTE_BYTES
+        {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!(
+                    "note is {} bytes; the audit detail keeps at most {MAX_APPROVAL_NOTE_BYTES}",
+                    note.len()
+                ),
+                recovery: RECOVERY_FIX_ARGS,
+            });
+        }
         let decision = match resolution {
             "approved" => Resolution::Approve { remember },
             "denied" => Resolution::Deny,

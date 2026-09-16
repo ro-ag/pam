@@ -1,4 +1,6 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PamEventPayload, PendingApproval } from "../../lib/ipc";
 
@@ -9,7 +11,13 @@ vi.mock("../../lib/ipc", () => ({
 }));
 
 import { approvalsPending, daemonStatus, subscribeEvents } from "../../lib/ipc";
-import { STATUS_POLL_MS, useDaemonStatus } from "./useDaemonStatus";
+import {
+  APPROVALS_PENDING_KEY,
+  DAEMON_STATUS_KEY,
+  OFFLINE_AFTER_MISSES,
+  STATUS_POLL_MS,
+  useDaemonStatus,
+} from "./useDaemonStatus";
 
 const mockStatus = vi.mocked(daemonStatus);
 const mockPending = vi.mocked(approvalsPending);
@@ -23,73 +31,113 @@ const approval: PendingApproval = {
   requested_ts: 1_756_684_800,
 };
 
+const up = { connected: true, status: {}, base_dir: "/tmp/pam" };
+const down = { connected: false, status: null, base_dir: "/tmp/pam" };
+
+/** The hook lives on the app's query client; each test gets a fresh one. */
+let client: QueryClient;
+
+/**
+ * Advances the fake clock, then one more millisecond: react-query hands
+ * the settled fetch to observers on a timer of its own that lands just
+ * after the interval's.
+ */
+async function tick(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await vi.advanceTimersByTimeAsync(1);
+  });
+}
+
+function mount() {
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  return renderHook(() => useDaemonStatus(), { wrapper });
+}
+
 beforeEach(() => {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // Browser-dev default: no event stream; the hook must cope quietly.
   mockSubscribe.mockRejectedValue(new Error("no bridge"));
+  mockPending.mockResolvedValue({ pending: [] });
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  client.clear();
 });
 
 describe("useDaemonStatus", () => {
-  it("turns green when the daemon answers with nothing pending", async () => {
-    mockStatus.mockResolvedValue({ connected: true, status: {} });
-    mockPending.mockResolvedValue({ pending: [] });
-    const { result } = renderHook(() => useDaemonStatus());
-    expect(result.current).toBe("down");
+  it("says connecting until the first poll answers, then green with nothing pending", async () => {
+    mockStatus.mockResolvedValue(up);
+    const { result } = mount();
+    expect(result.current).toBe("connecting");
     await waitFor(() => expect(result.current).toBe("connected"));
   });
 
   it("turns amber while approvals wait", async () => {
-    mockStatus.mockResolvedValue({ connected: true, status: {} });
+    mockStatus.mockResolvedValue(up);
     mockPending.mockResolvedValue({ pending: [approval] });
-    const { result } = renderHook(() => useDaemonStatus());
+    const { result } = mount();
     await waitFor(() => expect(result.current).toBe("pending"));
   });
 
-  it("stays red when the bridge rejects (plain-browser dev)", async () => {
+  it("goes red on the first miss when it was never green (plain-browser dev)", async () => {
     mockStatus.mockRejectedValue({
       cause: "bridge_unavailable",
       detail: "no shell",
       recovery: "open the app",
     });
-    const { result } = renderHook(() => useDaemonStatus());
-    await waitFor(() => expect(mockStatus).toHaveBeenCalled());
-    expect(result.current).toBe("down");
+    const { result } = mount();
+    await waitFor(() => expect(result.current).toBe("down"));
     expect(mockPending).not.toHaveBeenCalled();
   });
 
   it("reads a disconnected reply as red, not as an error", async () => {
-    mockStatus.mockResolvedValue({ connected: false, status: null });
-    const { result } = renderHook(() => useDaemonStatus());
-    await waitFor(() => expect(mockStatus).toHaveBeenCalled());
-    expect(result.current).toBe("down");
+    mockStatus.mockResolvedValue(down);
+    const { result } = mount();
+    await waitFor(() => expect(result.current).toBe("down"));
     expect(mockPending).not.toHaveBeenCalled();
   });
 
   it("keeps green when only the pending count fails", async () => {
-    mockStatus.mockResolvedValue({ connected: true, status: {} });
+    mockStatus.mockResolvedValue(up);
     mockPending.mockRejectedValue({ cause: "reply_timeout", detail: "", recovery: "" });
-    const { result } = renderHook(() => useDaemonStatus());
+    const { result } = mount();
     await waitFor(() => expect(result.current).toBe("connected"));
+  });
+
+  it("tolerates one missed poll while green and turns red on the second", async () => {
+    vi.useFakeTimers();
+    mockStatus.mockResolvedValue(up);
+    const { result } = mount();
+    await tick(0);
+    expect(result.current).toBe("connected");
+
+    // A busy daemon misses one poll: still green.
+    mockStatus.mockResolvedValue(down);
+    await tick(STATUS_POLL_MS);
+    expect(mockStatus).toHaveBeenCalledTimes(2);
+    expect(result.current).toBe("connected");
+
+    // The second consecutive miss is the honest red.
+    await tick(STATUS_POLL_MS);
+    expect(mockStatus).toHaveBeenCalledTimes(3);
+    expect(result.current).toBe("down");
+    expect(OFFLINE_AFTER_MISSES).toBe(2);
   });
 
   it("re-polls on the interval and follows the daemon back up", async () => {
     vi.useFakeTimers();
-    mockStatus.mockResolvedValue({ connected: false, status: null });
-    const { result } = renderHook(() => useDaemonStatus());
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
+    mockStatus.mockResolvedValue(down);
+    const { result } = mount();
+    await tick(0);
     expect(result.current).toBe("down");
     expect(mockStatus).toHaveBeenCalledTimes(1);
 
-    mockStatus.mockResolvedValue({ connected: true, status: {} });
-    mockPending.mockResolvedValue({ pending: [] });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(STATUS_POLL_MS);
-    });
+    mockStatus.mockResolvedValue(up);
+    await tick(STATUS_POLL_MS);
     expect(mockStatus).toHaveBeenCalledTimes(2);
     expect(result.current).toBe("connected");
   });
@@ -100,9 +148,8 @@ describe("useDaemonStatus", () => {
       handler = h;
       return Promise.resolve(() => {});
     });
-    mockStatus.mockResolvedValue({ connected: true, status: {} });
-    mockPending.mockResolvedValue({ pending: [] });
-    const { result } = renderHook(() => useDaemonStatus());
+    mockStatus.mockResolvedValue(up);
+    const { result } = mount();
     await waitFor(() => expect(result.current).toBe("connected"));
     await waitFor(() => expect(handler).toBeDefined());
 
@@ -111,5 +158,13 @@ describe("useDaemonStatus", () => {
       handler?.({ ticket: "req_01ABC", event: { kind: "approval_pending" } });
     });
     await waitFor(() => expect(result.current).toBe("pending"));
+  });
+
+  it("shares its queries with the screens under the documented keys", async () => {
+    mockStatus.mockResolvedValue(up);
+    const { result } = mount();
+    await waitFor(() => expect(result.current).toBe("connected"));
+    expect(client.getQueryData(DAEMON_STATUS_KEY)).toEqual(up);
+    expect(client.getQueryData(APPROVALS_PENDING_KEY)).toEqual({ pending: [] });
   });
 });

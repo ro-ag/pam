@@ -741,7 +741,10 @@ async fn create_options_refuse_collisions_and_restore_only_an_absent_override() 
 /// settings are written, so a refusal changes nothing.
 #[tokio::test]
 async fn a_scope_refusal_leaves_the_other_settings_untouched() {
-    let (_tmp, _store, admin, _ingress) = service().await;
+    let (tmp, _store, admin, _ingress) = service().await;
+    // An absolute path on every platform: a POSIX-looking path is refused as
+    // invalid on Windows before the root is ever resolved.
+    let missing_root = tmp.path().join("does-not-exist");
     let before = body_of(
         admin
             .handle(&admin_envelope(
@@ -760,7 +763,7 @@ async fn a_scope_refusal_leaves_the_other_settings_untouched() {
                 "allowed_programs": ["git", "cargo", "make"],
                 "scope_policy": {
                     "version": 1,
-                    "repositories": [{ "root": "/nowhere/pam/does/not/exist", "connectors": [] }],
+                    "repositories": [{ "root": missing_root, "connectors": [] }],
                 },
             }),
         ))

@@ -691,7 +691,7 @@ function RetentionPanel() {
       {failure && <FailureNote failure={failure} label="retention" />}
 
       <p className="font-sans text-sm text-ink-muted">
-        I prune when I start, every hour after that, and whenever you change these. Evidence
+        Pruning runs at daemon start, every hour after that, and whenever you change these. Evidence
         goes first; a request&apos;s verdict stays until its audit rows go, then the whole
         record leaves together.
       </p>
@@ -851,7 +851,7 @@ const SETTINGS_CATEGORIES = [
     id: "appearance",
     label: "Appearance",
     eyebrow: "Local preference",
-    blurb: "Four Costa appearances. Soft light, clear working surfaces.",
+    blurb: "Palette, color mode, glass and background motion.",
   },
   {
     id: "security",

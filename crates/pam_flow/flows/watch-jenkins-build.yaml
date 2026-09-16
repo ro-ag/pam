@@ -1,6 +1,6 @@
 schema: 1
 id: watch-jenkins-build
-name: Watch Jenkins Build
+name: Watch Jenkins build
 description: >-
   Watch one explicitly selected product execution, then collect its evidence
   and verify success against a declared source repository and commit. Polling

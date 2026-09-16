@@ -708,7 +708,7 @@ export function FlowsScreen({
 
       {!failure && !flows.isPending && selected === null && (
         <p className="max-w-md pt-6 font-sans text-lg text-ink-muted">
-          There are no flows installed at all — not even mine. Something is wrong with the flow
+          There are no flows installed at all — not even the built-in ones. Something is wrong with the flow
           library; the daemon log will say what.
         </p>
       )}

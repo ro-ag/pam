@@ -157,7 +157,7 @@ async function whyRefused(args: Args, sources: Sources, ctx: AskContext): Promis
   if (!row) {
     return {
       intent: "why_refused",
-      sentence: "I have refused nothing lately.",
+      sentence: "Nothing has been refused lately.",
       facts: [],
       links: [{ label: "Open Activity", to: "/activity", search: { state: "refused" } }],
     };
@@ -185,7 +185,7 @@ async function whyRefused(args: Args, sources: Sources, ctx: AskContext): Promis
   return {
     intent: "why_refused",
     sentence:
-      `I refused ${row.capability} from ${row.agent}: ${cause}` +
+      `PAM refused ${row.capability} from ${row.agent}: ${cause}` +
       `${detail ? ` — ${detail}` : ""}.${recovery ? ` ${recovery}` : ""}`,
     facts: [
       ["ticket", row.id],
@@ -326,7 +326,7 @@ async function whereChange(
     return {
       intent: "where_change",
       sentence:
-        "Tell me which setting: retention, start at login, the approval profile, grants, " +
+        "Name the setting: retention, start at login, the approval profile, grants, " +
         "the models directory, connectors, flow programs, or the theme.",
       facts: [],
       links: [{ label: "Open Settings", to: "/settings" }],
@@ -413,7 +413,7 @@ async function loginStart(_args: Args, sources: Sources): Promise<Answer> {
   if (state.kind === "not_installed") {
     return {
       intent: "login_start",
-      sentence: "No: nothing starts me at login.",
+      sentence: "No: PAM does not start at login.",
       facts,
       links,
     };
@@ -432,7 +432,7 @@ async function flows(args: Args, sources: Sources): Promise<Answer> {
   if (args.flow) {
     return {
       intent: "flows",
-      sentence: `I do not run flows from here; open ${args.flow} on the Flows screen.`,
+      sentence: `Flows do not run from here; open ${args.flow} on the Flows screen.`,
       facts: [["flow", args.flow]],
       links: [{ label: "Open Flows", to: "/flows", search: { flow: args.flow } }],
     };
@@ -545,7 +545,7 @@ async function tokensSaved(_args: Args, sources: Sources, ctx: AskContext): Prom
   return {
     intent: "tokens_saved",
     sentence:
-      `This week I avoided about ${stats.tokens_avoided_est.toLocaleString("en-US")} tokens ` +
+      `This week PAM avoided about ${stats.tokens_avoided_est.toLocaleString("en-US")} tokens ` +
       `across ${plural(stats.compressions, "compression")} ` +
       `(${kb(stats.source_bytes)} → ${kb(stats.compact_bytes)}).`,
     facts: [
@@ -562,7 +562,7 @@ export async function fallbackAnswer(): Promise<Answer> {
   return Promise.resolve({
     intent: "fallback",
     sentence:
-      "I can answer about pam itself: approvals, refusals, today's activity, the model, " +
+      "Ask about PAM itself: approvals, refusals, today's activity, the model, " +
       "settings, the daemon, login, flows, tokens saved. Tasks start from the cards on Home.",
     facts: [],
     links: [],

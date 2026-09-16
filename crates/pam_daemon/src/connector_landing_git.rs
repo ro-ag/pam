@@ -192,7 +192,7 @@ impl GitGuard {
             return Err(denied());
         }
         let scope = ScopePolicy::load(&self.store).await?;
-        scope.authorize_repo(&self.repo)?;
+        let canonical = scope.authorize_repo_blocking(&self.repo).await?;
         let row = self
             .store
             .get_connector(ConnectorId::Github.as_str())
@@ -208,7 +208,7 @@ impl GitGuard {
             "repo".into(),
             ArgValue::Text(policy.github_repository.clone()),
         )]);
-        scope.authorize_connector(&self.repo, ConnectorId::Github, &url, "runs", &args)?;
+        scope.authorize_connector_at(&canonical, ConnectorId::Github, &url, "runs", &args)?;
         Ok(row)
     }
 }

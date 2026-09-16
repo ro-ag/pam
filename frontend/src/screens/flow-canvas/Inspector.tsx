@@ -856,7 +856,7 @@ export function Inspector({ spec, selection, onChange, onSelect, error }: Inspec
       : undefined;
 
   return (
-    <Panel ground="command" aria-label="inspector" className="space-y-4 p-4">
+    <Panel ground="raised" aria-label="inspector" className="space-y-4 p-4">
       <div className="flex items-center gap-2">
         <Eyebrow>Inspector</Eyebrow>
         <Badge tone={selection.kind === "none" ? "neutral" : "accent"}>
@@ -870,7 +870,7 @@ export function Inspector({ spec, selection, onChange, onSelect, error }: Inspec
           failure={{
             cause: error.message,
             detail: `at \`${error.path}\``,
-            recovery: "fix it here and I will check the flow again",
+            recovery: "fix it here and the flow is checked again",
           }}
         />
       )}

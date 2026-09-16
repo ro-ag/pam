@@ -80,7 +80,7 @@ export function admissionBlocker(entry: ModelEntry): string | undefined {
 
 /** Empty library, in Pam's voice. */
 export const EMPTY_LIBRARY_SENTENCE =
-  "No weights on the shelf yet. Pick a model from Downloads and I'll fetch and verify it.";
+  "No weights on the shelf yet. Pick a model from Downloads to fetch and verify it.";
 
 /** Idle runtime, in Pam's voice. */
 export const IDLE_RUNTIME_SENTENCE =
@@ -895,7 +895,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
         </div>
         <p className="font-sans text-sm text-ink-muted">
           A pasted file arrives with no expected digest, so it stays unverified until you run
-          Verify and I know its hash. {FLOOR_NOTE}
+          Verify and its hash is known. {FLOOR_NOTE}
         </p>
       </form>
 
@@ -1092,7 +1092,7 @@ export function ModelsScreen() {
         <Section
           eyebrow="On disk"
           title="Installed models"
-          blurb="Every set of weights on disk, with what I know about each one."
+          blurb="Every set of weights on disk, and what is known about each one."
         >
           <LibraryTable
             models={models}
@@ -1107,7 +1107,7 @@ export function ModelsScreen() {
         <Section
           eyebrow="Catalog"
           title="Downloads"
-          blurb="The models I know how to fetch and verify — only the ones this machine can hold."
+          blurb="The models PAM can fetch and verify — only the ones this machine can hold."
         >
           <CatalogPanel jobs={jobs} />
           <EngineCard />

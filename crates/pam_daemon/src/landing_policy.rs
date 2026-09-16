@@ -295,6 +295,14 @@ impl Snapshot {
         json!({"revision": self.revision, "repositories": self.document.repositories})
     }
 
+    /// Every approved repository's private workspace root, in policy order.
+    pub fn workspace_roots(&self) -> impl Iterator<Item = &Path> {
+        self.document
+            .repositories
+            .iter()
+            .map(|repository| repository.workspace_root.as_path())
+    }
+
     pub async fn save(store: &Store, args: &Value, protected_base: &Path) -> Result<Self, Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

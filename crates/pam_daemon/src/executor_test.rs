@@ -470,3 +470,121 @@ async fn cancel_of_an_unknown_ticket_is_unresolved() {
     .await
     .expect("test within deadline");
 }
+
+/// A real repository the scope policy names — what a flow's journal
+/// checkpoint authorization insists on.
+async fn scoped_repo(fx: &Fixture) -> (tempfile::TempDir, String) {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    fx.store
+        .set_setting(
+            crate::scope_policy::SETTING_SCOPE_POLICY,
+            &serde_json::json!({
+                "version": 1, "repositories": [{"root": repo, "connectors": []}]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    (directory, repo)
+}
+
+/// A parked watch holds no lease, so `pam cancel` ends it the queued way:
+/// terminal row and audit from the queue, waiters released and subscribers
+/// told by the capability, and nothing left for the reaper to wake.
+#[tokio::test]
+async fn cancel_of_a_parked_ticket_is_cancelled_queued() {
+    timeout(DEADLINE, async {
+        let mut fx = fixture().await;
+        let (_directory, repo) = scoped_repo(&fx).await;
+        let mut target = envelope("req_parked", serde_json::json!({ "id": "parked" }));
+        target.capability = "flow.run".to_owned();
+        target.caller.repo.clone_from(&repo);
+        assert_eq!(
+            fx.queue
+                .admit(&target, CapabilityClass::NonDestructive)
+                .await
+                .unwrap(),
+            AdmitOutcome::Admitted
+        );
+        fx.queue
+            .place_in_lane(&target.id, &target.caller.repo)
+            .await
+            .unwrap();
+        let flow = pam_flow::parse(
+            "schema: 1\nid: parked\nname: Parked\nsteps:\n  - id: look\n    run: [git, status]\n",
+        )
+        .unwrap();
+        crate::flow_recovery::Recovery::open(
+            &fx.store,
+            "req_parked",
+            &flow,
+            std::path::Path::new(&target.caller.repo),
+            &pam_flow::Vars::new(),
+        )
+        .await
+        .unwrap();
+        let lease = fx
+            .queue
+            .take_next(&target.caller.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.request_id, "req_parked");
+        let resume = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            + 30_000;
+        assert!(fx.queue.park("req_parked", resume).await.unwrap());
+        assert!(fx.queue.leased_ids().await.is_empty());
+
+        let Registration::Pending(waiter) = fx.router.register("req_parked").await else {
+            panic!("target must still be pending");
+        };
+        let ctx = fx.ctx_uncancelled("req_cancel", serde_json::json!({ "ticket": "req_parked" }));
+        let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
+        assert_eq!(output.outcome, Outcome::Solved);
+        assert_eq!(output.body["result"], "cancelled_queued");
+
+        let row = fx.store.get_request("req_parked").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+        let audit = fx.store.audit_for_request("req_parked").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_CANCEL);
+        let Response::Refusal { id, cause, .. } = waiter.await.unwrap() else {
+            panic!("waiter must receive a refusal");
+        };
+        assert_eq!(id, "req_parked");
+        assert_eq!(cause, CAUSE_CANCELLED);
+        let (topic, event) = fx.events_rx.recv().await.unwrap();
+        assert_eq!(topic, "req_parked");
+        assert_eq!(event, Event::Refused);
+        // The due time wakes nothing: the checkpoint is gone from the queue.
+        assert_eq!(
+            fx.queue
+                .wake_due(tokio::time::Instant::now(), resume)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            fx.queue
+                .take_next(&target.caller.repo)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .await
+    .expect("test within deadline");
+}

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pam_daemon::daemon::CAUSE_DAEMON_OUTDATED;
@@ -264,40 +265,89 @@ async fn send_admin_requires_the_private_channel_even_when_public_daemon_is_read
     ));
 }
 
+/// A fake daemon behind `pam.sock`: holds the instance lock, binds a zmq
+/// `ROUTER` on the request endpoint (the two facts readiness checks) and
+/// answers every envelope through `reply`. `None` swallows the request,
+/// leaving the client to its own reply budget. No events endpoint exists.
+struct FakeRouter {
+    _lock: InstanceLock,
+    calls: Arc<Mutex<Vec<serde_json::Value>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl FakeRouter {
+    async fn start(
+        base: &std::path::Path,
+        reply: impl Fn(&serde_json::Value) -> Option<Response> + Send + 'static,
+    ) -> Self {
+        use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+        let dirs = RuntimeDir::at_base(base).unwrap();
+        let lock = acquire_instance_lock(dirs.run_dir()).unwrap();
+        let mut router = RouterSocket::new();
+        router.bind(&dirs.router_endpoint()).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok(message) = router.recv().await else {
+                    return;
+                };
+                let frames = message.into_vec();
+                let request: serde_json::Value =
+                    serde_json::from_slice(frames.last().unwrap()).unwrap();
+                seen.lock().unwrap().push(request.clone());
+                let Some(response) = reply(&request) else {
+                    continue;
+                };
+                let mut message = ZmqMessage::from(serde_json::to_vec(&response).unwrap());
+                message.push_front(frames[0].clone());
+                // The peer may already have given up; that is its business.
+                let _ = router.send(message).await;
+            }
+        });
+        Self {
+            _lock: lock,
+            calls,
+            server,
+        }
+    }
+
+    /// Every envelope received so far, in arrival order.
+    fn calls(&self) -> Vec<serde_json::Value> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FakeRouter {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// The version-handshake refusal, echoing the request's id.
+fn outdated(request: &serde_json::Value) -> Response {
+    Response::Refusal {
+        id: request["id"].as_str().unwrap().to_owned(),
+        cause: CAUSE_DAEMON_OUTDATED.to_owned(),
+        detail: "a newer pam is on disk".to_owned(),
+        recovery: "retry".to_owned(),
+    }
+}
+
 #[tokio::test]
 async fn refused_follow_queries_once_and_never_subscribes_to_events() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
     let tmp = tempfile::tempdir().unwrap();
-    let dirs = RuntimeDir::at_base(tmp.path()).unwrap();
-    let _lock = acquire_instance_lock(dirs.run_dir()).unwrap();
-    let mut router = RouterSocket::new();
-    router.bind(&dirs.router_endpoint()).await.unwrap();
     // Deliberately no events endpoint: an unauthorized follow must not connect.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&calls);
-    let server = tokio::spawn(async move {
-        loop {
-            let frames = router.recv().await.unwrap().into_vec();
-            observed.fetch_add(1, Ordering::SeqCst);
-            let request: serde_json::Value =
-                serde_json::from_slice(frames.last().unwrap()).unwrap();
-            assert_eq!(request["capability"], "query");
-            let reply = Response::Refusal {
-                id: request["id"].as_str().unwrap().to_owned(),
-                cause: "request_unavailable".to_owned(),
-                detail: "Ticket is unavailable in this repository.".to_owned(),
-                recovery: "Check repository access in the PAM GUI.".to_owned(),
-            };
-            let payload = serde_json::to_vec(&reply).unwrap();
-            let mut message = ZmqMessage::from(payload);
-            message.push_front(frames[0].clone());
-            router.send(message).await.unwrap();
-        }
-    });
+    let router = FakeRouter::start(tmp.path(), |request| {
+        assert_eq!(request["capability"], "query");
+        Some(Response::Refusal {
+            id: request["id"].as_str().unwrap().to_owned(),
+            cause: "request_unavailable".to_owned(),
+            detail: "Ticket is unavailable in this repository.".to_owned(),
+            recovery: "Check repository access in the PAM GUI.".to_owned(),
+        })
+    })
+    .await;
     let mut events = Vec::new();
     let result = crate::client::follow_ticket(
         tmp.path(),
@@ -311,9 +361,72 @@ async fn refused_follow_queries_once_and_never_subscribes_to_events() {
         "{result:?}"
     );
     assert!(events.is_empty());
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "denial is never retried");
-    server.abort();
-    let _ = server.await;
+    assert_eq!(router.calls().len(), 1, "denial is never retried");
+}
+
+/// The reply budget is the envelope deadline plus the transport margin; a
+/// daemon that takes the request and never answers is reported as a
+/// timeout, not retried, and the daemon saw the envelope exactly once.
+#[tokio::test]
+async fn a_daemon_that_never_replies_times_out_after_the_deadline_plus_margin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let router = FakeRouter::start(tmp.path(), |_| None).await;
+    let started = std::time::Instant::now();
+    let err = crate::client::send_request(
+        tmp.path(),
+        "echo",
+        serde_json::json!({ "n": 1 }),
+        true,
+        1,
+        None,
+    )
+    .await
+    .expect_err("no reply must not hang");
+    let elapsed = started.elapsed();
+    let crate::client::RequestError::ReplyTimeout { waited } = err else {
+        panic!("expected a reply timeout, got {err:?}");
+    };
+    // deadline_ms (1 ms) + the 5 s client margin, waited in full.
+    assert_eq!(waited, Duration::from_millis(5_001));
+    assert!(elapsed >= waited, "gave up early after {elapsed:?}");
+    let calls = router.calls();
+    assert_eq!(calls.len(), 1, "a timed-out exchange is not resent");
+    assert_eq!(calls[0]["capability"], "echo");
+    assert_eq!(calls[0]["deadline_ms"], 1);
+}
+
+/// `daemon_outdated` earns exactly one retry: two consecutive refusals end
+/// the exchange with the second refusal, after two sends of the same
+/// envelope with the retry pause between them.
+#[tokio::test]
+async fn two_outdated_refusals_stop_after_the_single_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let router = FakeRouter::start(tmp.path(), |request| Some(outdated(request))).await;
+    let started = std::time::Instant::now();
+    let response =
+        crate::client::send_request(tmp.path(), "echo", serde_json::json!({}), true, 1_000, None)
+            .await
+            .expect("a refusal is an answer, not an error");
+    let elapsed = started.elapsed();
+    assert!(
+        should_retry(&response),
+        "the final answer is the refusal itself"
+    );
+    let calls = router.calls();
+    assert_eq!(calls.len(), 2, "retried exactly once");
+    assert_eq!(
+        calls[0]["id"], calls[1]["id"],
+        "the retry resends the same envelope"
+    );
+    assert_eq!(calls[1]["capability"], "echo");
+    let Response::Refusal { id, .. } = &response else {
+        panic!("expected the refusal, got {response:?}");
+    };
+    assert_eq!(*id, calls[0]["id"]);
+    assert!(
+        elapsed >= Duration::from_millis(750),
+        "the retry waits for the old daemon to drain: {elapsed:?}"
+    );
 }
 
 #[test]

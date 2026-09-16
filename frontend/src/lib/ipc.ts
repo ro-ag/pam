@@ -227,6 +227,12 @@ export interface PendingApproval {
   repo: string;
   agent: string;
   requested_ts: number;
+  /** The request's recorded args as submitted; null when none were recorded. */
+  args: unknown;
+  /** The repository the request acts on, when the daemon can resolve it. */
+  repository: string | null;
+  /** The gated flow step's declared effect; null for a plain request. */
+  effect: FlowEffect | null;
 }
 
 /** `pam_store::RequestState`, exactly — the store knows no other states. */

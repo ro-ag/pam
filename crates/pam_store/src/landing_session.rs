@@ -110,6 +110,30 @@ impl Store {
         )
     }
 
+    /// The documents of every landing session whose ticket is still
+    /// live (queued, running or waiting for approval), for the startup
+    /// sweep: a workspace no live document names is an orphan. Oversized
+    /// documents are refused rather than silently dropped, since dropping
+    /// one would make its workspace look orphaned.
+    pub async fn live_landing_session_documents(&self) -> Result<Vec<String>, StoreError> {
+        let _guard = self.conn_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT CASE WHEN length(CAST(s.document AS BLOB))<=131072 THEN s.document ELSE NULL END
+                 FROM landing_session s JOIN request r ON r.id=s.request_id
+                 WHERE r.state IN ('queued','running','waiting_approval')
+                 ORDER BY s.request_id",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<Option<String>>(0)?.ok_or_else(invalid)?);
+        }
+        Ok(out)
+    }
+
     /// Read without allocating an oversized persisted document.
     pub async fn read_landing_session(
         &self,

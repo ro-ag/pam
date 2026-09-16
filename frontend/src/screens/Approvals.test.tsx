@@ -45,6 +45,9 @@ function hand(overrides: Partial<PendingApproval>): PendingApproval {
     repo: "/Users/dev/pam",
     agent: "claude",
     requested_ts: nowSec() - 185,
+    args: null,
+    repository: null,
+    effect: null,
     ...overrides,
   };
 }
@@ -172,35 +175,33 @@ describe("resolving", () => {
     );
   });
 
-  it("shows what the request will run and where, joined from its tide row", async () => {
-    mocks.activityList.mockResolvedValue({
-      requests: [
-        {
-          id: "req_a",
-          capability: "repo.push",
-          repo: "/Users/dev/pam",
-          agent: "claude",
+  it("shows what the request will run, where, and its effect from the pending entry itself", async () => {
+    mocks.approvalsPending.mockResolvedValue({
+      pending: [
+        hand({
+          request_id: "req_a",
+          capability: "flow.step:guarded-land/push",
           args: { argv: ["git", "push", "origin", "main"] },
-          state: "waiting_approval",
-          outcome: null,
-          created_ts: nowSec() - 185,
-          updated_ts: nowSec() - 185,
-        },
+          repository: "https://github.test/team/repo.git",
+          effect: "stateful",
+        }),
+        hand({ request_id: "req_b", capability: "echo", repo: "/Users/dev/other" }),
       ],
     });
     renderApprovals();
     await screen.findByText("2 requests awaiting review");
-    await waitFor(() =>
-      expect(mocks.activityList).toHaveBeenCalledWith({
-        state: "waiting_approval",
-        limit: 100,
-      }),
-    );
-    const pushCard = card("repo.push");
-    expect(await pushCard.findByText("git push origin main")).toBeInTheDocument();
-    expect(pushCard.getByText("/Users/dev/pam")).toBeInTheDocument();
-    // A hand the tide has not shown yet says so instead of inventing a command.
-    expect(card("echo").getByText("not in the tide yet")).toBeInTheDocument();
+    const pushCard = card("flow.step:guarded-land/push");
+    expect(pushCard.getByText("git push origin main")).toBeInTheDocument();
+    expect(pushCard.getByText("https://github.test/team/repo.git")).toBeInTheDocument();
+    expect(pushCard.getByText("stateful")).toBeInTheDocument();
+    // A plain request with nothing recorded says so instead of inventing a command,
+    // falls back to the caller's repo, and shows no effect row.
+    const echoCard = card("echo");
+    expect(echoCard.getByText("no arguments recorded")).toBeInTheDocument();
+    expect(echoCard.getByText("/Users/dev/other")).toBeInTheDocument();
+    expect(echoCard.queryByText("Effect")).toBeNull();
+    // No join against the tide any more.
+    expect(mocks.activityList).not.toHaveBeenCalled();
     expect(commandLine({ argv: ["a", "b"] })).toBe("a b");
     expect(commandLine({ path: "/tmp/x" })).toBe('{"path":"/tmp/x"}');
     expect(commandLine({})).toBeNull();

@@ -129,7 +129,7 @@ export function failureDetail(error: unknown): string {
 export function failedRead(intent: IntentId, what: string, error: unknown): Answer {
   return {
     intent,
-    sentence: `I could not read ${what}: ${failureDetail(error)}.`,
+    sentence: `PAM could not read ${what}: ${failureDetail(error)}.`,
     facts: [],
     links: [],
   };

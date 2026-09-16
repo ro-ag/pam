@@ -481,7 +481,14 @@ impl AdminService {
         }
     }
 
-    /// The unresolved approvals, oldest first.
+    /// The unresolved approvals, oldest first. Each row carries what the
+    /// agent submitted (`args`, the request's own JSON), the remote
+    /// repository the work names (`repository`: the flow's correlation
+    /// repository resolved against the inputs, or the `repository` argument
+    /// of a plain request, else null) and the gated step's declared
+    /// `effect` (`read_only` / `stateful`; null for a capability that is
+    /// not a flow step), so the GUI card needs no join against the
+    /// activity list.
     async fn approvals_pending(&self) -> Result<AdminOk, AdminRefusal> {
         let pending: Vec<serde_json::Value> = self
             .approvals
@@ -489,12 +496,18 @@ impl AdminService {
             .await?
             .into_iter()
             .map(|approval| {
+                let args = serde_json::from_str::<serde_json::Value>(&approval.args_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let (repository, effect) = self.approval_context(&approval, &args);
                 json!({
                     "request_id": approval.request_id,
                     "capability": approval.capability,
                     "repo": approval.repo,
                     "agent": approval.caller_agent,
                     "requested_ts": approval.requested_ts,
+                    "args": args,
+                    "repository": repository,
+                    "effect": effect,
                 })
             })
             .collect();
@@ -503,6 +516,50 @@ impl AdminService {
             body: json!({ "pending": pending }),
             audit: json!({ "op": OP_APPROVALS_PENDING }),
         })
+    }
+
+    /// What a pending approval acts on, read off the installed flow: the
+    /// correlation repository resolved against the submitted inputs (and
+    /// the flow's own input defaults), and the gated step's declared
+    /// effect. A request that is not a flow run may name a `repository`
+    /// argument directly. Anything unresolvable is null, never a guess.
+    fn approval_context(
+        &self,
+        approval: &pam_store::PendingApproval,
+        args: &serde_json::Value,
+    ) -> (Option<String>, Option<pam_flow::Effect>) {
+        let argument = |key: &str| args.get(key).and_then(serde_json::Value::as_str);
+        if approval.request_capability != "flow.run" {
+            return (argument("repository").map(str::to_owned), None);
+        }
+        let Some(flow) = argument("id")
+            .and_then(|id| self.flows.entry(id).ok())
+            .and_then(|entry| entry.parsed.ok())
+        else {
+            return (None, None);
+        };
+        let effect = approval
+            .capability
+            .strip_prefix(crate::flow_service::STEP_CAPABILITY_PREFIX)
+            .and_then(|rest| rest.strip_prefix(flow.id.as_str()))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|step_id| flow.steps.iter().find(|step| step.id == step_id))
+            .map(|step| step.effect);
+        let Some(correlation) = flow.correlation.as_ref() else {
+            return (None, effect);
+        };
+        let mut vars = pam_flow::Vars::new();
+        for (name, input) in &flow.inputs {
+            let submitted = args
+                .get("inputs")
+                .and_then(|inputs| inputs.get(name))
+                .and_then(serde_json::Value::as_str);
+            if let Some(value) = submitted.or(input.default.as_deref()) {
+                vars.set(&format!("inputs.{name}"), value);
+            }
+        }
+        let repository = pam_flow::substitute(&correlation.repository, &vars).ok();
+        (repository, effect)
     }
 
     /// Delivers a human resolution to the waiting request through

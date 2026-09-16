@@ -932,3 +932,381 @@ async fn deadline_expiry_removes_queued_work_without_calling_it_cancelled() {
     .await
     .expect("test within deadline");
 }
+
+// --- parked watches -------------------------------------------------------
+
+fn wall_now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// A `flow.run` envelope: the only capability the store lets a lease park.
+fn flow_envelope(id: &str, repo: &str) -> Envelope {
+    let mut env = envelope(id, repo, serde_json::json!({ "id": "parked" }), None);
+    env.capability = "flow.run".to_owned();
+    env
+}
+
+/// A repository a flow may run in: a real directory the scope policy
+/// names, which the journal's checkpoint authorization insists on.
+struct FlowRepo {
+    _dir: tempfile::TempDir,
+    path: String,
+}
+
+async fn flow_repo(store: &Store) -> FlowRepo {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    store
+        .set_setting(
+            crate::scope_policy::SETTING_SCOPE_POLICY,
+            &serde_json::json!({"version":1,"repositories":[{"root":path,"connectors":[]}]})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    FlowRepo { _dir: dir, path }
+}
+
+/// Opens the flow journal a parked checkpoint needs in state `ready`,
+/// exactly as the flow engine does on its first run of the ticket.
+async fn ready_journal(store: &Store, id: &str, repo: &str) {
+    let flow = pam_flow::parse(
+        "schema: 1\nid: parked\nname: Parked\nsteps:\n  - id: look\n    run: [git, status]\n",
+    )
+    .unwrap();
+    crate::flow_recovery::Recovery::open(
+        store,
+        id,
+        &flow,
+        std::path::Path::new(repo),
+        &pam_flow::Vars::new(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Admits, places and leases a parkable flow request in a fresh scoped
+/// repository, returning that repository.
+async fn leased_flow(store: &Store, queue: &QueueManager, id: &str) -> FlowRepo {
+    let repo = flow_repo(store).await;
+    enqueue(queue, &flow_envelope(id, &repo.path)).await;
+    ready_journal(store, id, &repo.path).await;
+    let work = queue.take_next(&repo.path).await.unwrap().unwrap();
+    assert_eq!(work.request_id, id);
+    repo
+}
+
+#[tokio::test]
+async fn park_frees_the_lane_and_wake_due_returns_the_ticket_only_when_due() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let repo = leased_flow(&store, &queue, "flow_1").await;
+        let lane = repo.path.as_str();
+        let resume = wall_now_ms() + 30_000;
+
+        assert!(queue.park("flow_1", resume).await.unwrap());
+        // Durable: the row is queued again with its poll time, and the
+        // in-memory lease and lane are both released.
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert_eq!(row.resume_at_ms, Some(resume));
+        assert!(queue.leased_ids().await.is_empty());
+        assert!(queue.ready_repos().await.is_empty());
+        assert!(queue.take_next(lane).await.unwrap().is_none());
+        timeout(Duration::from_secs(1), queue.work_available())
+            .await
+            .expect("parking wakes the executor loop");
+
+        // Other work on the same repository runs while the watch waits.
+        enqueue(
+            &queue,
+            &envelope("other", lane, serde_json::json!({ "n": 2 }), None),
+        )
+        .await;
+        let work = queue.take_next(lane).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "other");
+        assert!(
+            queue
+                .complete("other", RequestState::Done, None, execute_entry())
+                .await
+                .unwrap()
+        );
+
+        // Not due: nothing moves, and the lane stays empty.
+        assert_eq!(queue.wake_due(Instant::now(), resume - 1).await.unwrap(), 0);
+        assert!(queue.take_next(lane).await.unwrap().is_none());
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.resume_at_ms, Some(resume));
+
+        // Due: back into the lane, poll time cleared, leased again next.
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 1);
+        assert_eq!(queue.ready_repos().await, [lane]);
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert_eq!(row.resume_at_ms, None);
+        let work = queue.take_next(lane).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "flow_1");
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Running);
+        assert_eq!(queue.leased_ids().await, ["flow_1"]);
+
+        // Waking again is a no-op; a finished ticket can no longer park.
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 0);
+        assert!(
+            queue
+                .complete("flow_1", RequestState::Done, Some("ok"), execute_entry())
+                .await
+                .unwrap()
+        );
+        assert!(!queue.park("flow_1", resume).await.unwrap());
+        assert!(queue.take_parked_terminals().await.is_empty());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn park_refuses_stale_times_and_non_flow_leases_and_keeps_the_lease() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let _repo = leased_flow(&store, &queue, "flow_1").await;
+        // A poll time that is not in the future is refused durably.
+        assert!(!queue.park("flow_1", wall_now_ms()).await.unwrap());
+        assert_eq!(queue.leased_ids().await, ["flow_1"]);
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Running);
+        assert_eq!(row.resume_at_ms, None);
+        // Nothing but the lease holder may park, and only a flow may.
+        assert!(!queue.park("ghost", wall_now_ms() + 30_000).await.unwrap());
+        enqueue(
+            &queue,
+            &envelope("echo_1", REPO_B, serde_json::json!({}), None),
+        )
+        .await;
+        queue.take_next(REPO_B).await.unwrap().unwrap();
+        assert!(!queue.park("echo_1", wall_now_ms() + 30_000).await.unwrap());
+        let row = store.get_request("echo_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Running);
+        // Both leases are intact: completion still owns the terminal write.
+        for id in ["flow_1", "echo_1"] {
+            assert!(
+                queue
+                    .complete(id, RequestState::Done, None, execute_entry())
+                    .await
+                    .unwrap()
+            );
+        }
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn wake_due_expires_a_parked_ticket_and_parks_its_terminal_for_the_executor() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let repo = leased_flow(&store, &queue, "flow_1").await;
+        let lane = repo.path.as_str();
+        let resume = wall_now_ms() + 30_000;
+        assert!(queue.park("flow_1", resume).await.unwrap());
+        assert!(queue.take_parked_terminals().await.is_empty());
+
+        // Past the original monotonic deadline the checkpoint expires
+        // without dispatch: terminal timeout, audited as a reaped lease.
+        let past_deadline = Instant::now() + Duration::from_hours(2);
+        assert_eq!(queue.wake_due(past_deadline, resume - 1).await.unwrap(), 0);
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+        let audit = store.audit_for_request("flow_1").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_LEASE_REAPED);
+        assert_eq!(audit[0].decision, Decision::Timeout);
+        // The original waiter is finished through the executor loop's drain,
+        // exactly once.
+        assert_eq!(queue.take_parked_terminals().await, ["flow_1"]);
+        assert!(queue.take_parked_terminals().await.is_empty());
+        assert!(queue.take_next(lane).await.unwrap().is_none());
+        assert_eq!(queue.wake_due(past_deadline, resume).await.unwrap(), 0);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn wake_due_refuses_a_parked_ticket_whose_authorization_changed() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let repo = leased_flow(&store, &queue, "flow_1").await;
+        let lane = repo.path.as_str();
+        let resume = wall_now_ms() + 30_000;
+        assert!(queue.park("flow_1", resume).await.unwrap());
+        // A grant revoked while parked moves the revocation revision.
+        store.insert_grant("flow.parked.look").await.unwrap();
+        store.revoke_grant("flow.parked.look").await.unwrap();
+
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 0);
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some("authorization_changed"));
+        let audit = store.audit_for_request("flow_1").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, crate::queue::ACTION_RECOVERY_REFUSAL);
+        assert_eq!(audit[0].detail.as_deref(), Some("authorization_changed"));
+        assert_eq!(queue.take_parked_terminals().await, ["flow_1"]);
+        assert!(queue.take_next(lane).await.unwrap().is_none());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn cancel_of_a_parked_ticket_is_terminal_audited_and_never_woken() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let repo = leased_flow(&store, &queue, "flow_1").await;
+        let lane = repo.path.as_str();
+        let resume = wall_now_ms() + 30_000;
+        assert!(queue.park("flow_1", resume).await.unwrap());
+
+        let outcome = queue.cancel("flow_1", Actor::Human).await.unwrap();
+        assert_eq!(outcome, CancelOutcome::CancelledQueued);
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+        let audit = store.audit_for_request("flow_1").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_CANCEL);
+        assert_eq!(audit[0].actor, Actor::Human);
+        // Explicit cancellation answers its caller directly: it is not a
+        // parked terminal, and the due time no longer wakes anything.
+        assert!(queue.take_parked_terminals().await.is_empty());
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 0);
+        assert!(queue.take_next(lane).await.unwrap().is_none());
+        assert_eq!(
+            queue.cancel("flow_1", Actor::Human).await.unwrap(),
+            CancelOutcome::NotFound
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn rebuild_from_store_restores_parked_rows_as_parked_not_runnable() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let repo = leased_flow(&store, &queue, "flow_1").await;
+        let lane = repo.path.as_str();
+        let resume = wall_now_ms() + 30_000;
+        assert!(queue.park("flow_1", resume).await.unwrap());
+        // An ordinary queued row on the same repository sits in the lane.
+        enqueue(
+            &queue,
+            &envelope("plain", lane, serde_json::json!({}), None),
+        )
+        .await;
+
+        let restarted = QueueManager::new(Arc::clone(&store));
+        assert_eq!(restarted.rebuild_from_store().await.unwrap(), 2);
+        // The parked checkpoint keeps its schedule instead of racing the lane.
+        let work = restarted.take_next(lane).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "plain");
+        restarted
+            .complete("plain", RequestState::Done, None, execute_entry())
+            .await
+            .unwrap();
+        assert!(restarted.take_next(lane).await.unwrap().is_none());
+        let row = store.get_request("flow_1").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert_eq!(row.resume_at_ms, Some(resume));
+        assert_eq!(
+            restarted
+                .wake_due(Instant::now(), resume - 1)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(restarted.wake_due(Instant::now(), resume).await.unwrap(), 1);
+        let work = restarted.take_next(lane).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "flow_1");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test(start_paused = true)]
+async fn parked_terminal_backpressure_retains_admissions_until_the_executor_drains() {
+    use crate::queue::MAX_PARKED_TERMINALS;
+    // Fill the terminal notice buffer with reaped leases, one per repository
+    // (one lease per lane), through the background reaper's path.
+    let (store, queue) = manager().await;
+    for i in 0..MAX_PARKED_TERMINALS {
+        let mut env = envelope(
+            &format!("lease_{i:03}"),
+            &format!("/repo/{i}"),
+            serde_json::json!({ "i": i }),
+            None,
+        );
+        env.deadline_ms = 5_000;
+        enqueue(&queue, &env).await;
+        queue
+            .take_next(&format!("/repo/{i}"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        queue.reap_expired_notifying(Instant::now()).await.unwrap(),
+        MAX_PARKED_TERMINALS
+    );
+    assert!(queue.leased_ids().await.is_empty());
+
+    // A parked checkpoint whose deadline has passed is not terminalized
+    // while its notice cannot fit: the admission is retained as-is.
+    let _repo = leased_flow(&store, &queue, "flow_1").await;
+    let resume = wall_now_ms() + 30_000;
+    assert!(queue.park("flow_1", resume).await.unwrap());
+    let past_deadline = Instant::now() + Duration::from_hours(2);
+    assert_eq!(queue.wake_due(past_deadline, resume).await.unwrap(), 0);
+    let row = store.get_request("flow_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert_eq!(row.resume_at_ms, Some(resume));
+    // Likewise a queued row past its deadline stays queued rather than
+    // failing without a deliverable notice.
+    let mut stale = envelope("stale", REPO_B, serde_json::json!({}), None);
+    stale.deadline_ms = 5_000;
+    enqueue(&queue, &stale).await;
+    advance(Duration::from_secs(6)).await;
+    assert!(queue.take_next(REPO_B).await.unwrap().is_none());
+    let row = store.get_request("stale").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+
+    // Draining the notices releases the backpressure: the same sweeps
+    // now terminalize both, and their notices follow.
+    let drained = queue.take_parked_terminals().await;
+    assert_eq!(drained.len(), MAX_PARKED_TERMINALS);
+    assert!(drained.iter().all(|id| id.starts_with("lease_")));
+    assert_eq!(queue.wake_due(past_deadline, resume).await.unwrap(), 0);
+    assert!(queue.take_next(REPO_B).await.unwrap().is_none());
+    for id in ["flow_1", "stale"] {
+        let row = store.get_request(id).await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed, "{id}");
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED), "{id}");
+    }
+    let mut notices = queue.take_parked_terminals().await;
+    notices.sort();
+    assert_eq!(notices, ["flow_1", "stale"]);
+}

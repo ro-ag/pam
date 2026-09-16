@@ -37,6 +37,7 @@ mod landing_runtime;
 #[cfg(test)]
 #[path = "flow_landing_runtime_test.rs"]
 mod landing_runtime_test;
+pub(crate) use landing_runtime::{landing_workspace, release_workspace};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -505,7 +506,10 @@ impl FlowService {
 
     /// Replace the scope policy through private administration only.
     pub async fn set_scope_policy(&self, policy: ScopePolicy) -> Result<ScopePolicy, FlowRefusal> {
-        let policy = policy.normalize().map_err(|error| scope_refusal(&error))?;
+        let policy = policy
+            .normalize_blocking()
+            .await
+            .map_err(|error| scope_refusal(&error))?;
         policy
             .save(&self.store)
             .await
@@ -516,7 +520,8 @@ impl FlowService {
     async fn approved_repo(&self, repo: &Path) -> Result<PathBuf, FlowRefusal> {
         self.scope_policy()
             .await?
-            .authorize_repo(repo)
+            .authorize_repo_blocking(repo)
+            .await
             .map_err(|error| scope_refusal(&error))
     }
 

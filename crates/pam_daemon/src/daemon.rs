@@ -529,6 +529,9 @@ pub async fn run_daemon_with(
     ));
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
     queue.rebuild_from_store().await?;
+    // After recovery has settled every ticket's state and before any
+    // request can run: a landing workspace no live ticket names is gone.
+    crate::landing_sweep::sweep_orphaned_workspaces(&store).await;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CAPACITY);
     let transport = Transport::bind(&dirs, incoming_tx.clone()).await?;

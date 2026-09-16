@@ -619,6 +619,8 @@ async fn list_pending_approvals_joins_request_and_skips_resolved() {
     assert_eq!(pending[0].repo, "ro-ag/pam");
     assert_eq!(pending[0].caller_agent, "claude");
     assert!(pending[0].requested_ts > 0);
+    assert_eq!(pending[0].request_capability, "release");
+    assert_eq!(pending[0].args_json, "{}");
 }
 
 #[tokio::test]
@@ -912,6 +914,19 @@ async fn list_requests_filtered_hides_the_gui_own_probes() {
         .insert_request("req_3", "status", "/repo/a", "pam-gui", "{}", None)
         .await
         .unwrap();
+    // A hand-driven compression is an admin op the human asked for, not
+    // the GUI watching itself: it stays in the tide.
+    store
+        .insert_request(
+            "req_4",
+            "admin.log.compress",
+            "/repo/a",
+            "pam-gui",
+            "{}",
+            None,
+        )
+        .await
+        .unwrap();
 
     // The observatory watching itself is not activity.
     let real = store
@@ -919,14 +934,14 @@ async fn list_requests_filtered_hides_the_gui_own_probes() {
         .await
         .unwrap();
     let ids: Vec<&str> = real.iter().map(|row| row.id.as_str()).collect();
-    assert_eq!(ids, ["req_1"]);
+    assert_eq!(ids, ["req_4", "req_1"]);
 
     // Off by default: the audit view still sees everything.
     let all = store
         .list_requests_filtered(None, None, None, None, None, false)
         .await
         .unwrap();
-    assert_eq!(all.len(), 3);
+    assert_eq!(all.len(), 4);
 }
 
 #[tokio::test]

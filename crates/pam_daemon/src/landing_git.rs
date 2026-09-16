@@ -81,13 +81,16 @@ pub(crate) struct SyncObservation {
 /// What the mutating Git process itself reported. The journalled intent
 /// starts `Uncertain` before the process runs and is updated with the
 /// process verdict afterwards; only a fresh exact ref observation confirms
-/// either value.
+/// any value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PushState {
     /// `git push` exited zero.
     ReportedSuccess,
-    /// The process has not run, was cancelled, or exited non-zero.
+    /// `git push` ran to completion and exited non-zero: the remote (or
+    /// the transport in front of it) rejected the update.
+    Rejected,
+    /// The process has not run, or was cancelled before it reported.
     Uncertain,
 }
 /// A prepared or completed ref mutation, as journalled on the ticket. The
@@ -1488,7 +1491,7 @@ impl Session<'_> {
             state: if result.code == Some(0) {
                 PushState::ReportedSuccess
             } else {
-                PushState::Uncertain
+                PushState::Rejected
             },
         })
     }

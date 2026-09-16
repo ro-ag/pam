@@ -246,7 +246,7 @@ describe("Home shell", () => {
       ),
     ).toBeInTheDocument();
     await askQuestion("does pam start at login?");
-    expect(await screen.findByText("No: nothing starts me at login.")).toBeInTheDocument();
+    expect(await screen.findByText("No: PAM does not start at login.")).toBeInTheDocument();
     await askQuestion("which flows do I have?");
     expect(
       await screen.findByText("You have 2 flows: pr-readiness, after-merge-checks."),
@@ -276,7 +276,7 @@ describe("Home shell", () => {
   it("renders facts and deep links, and the link navigates", async () => {
     const router = renderHome();
     await askQuestion("does pam start at login?");
-    expect(await screen.findByText("No: nothing starts me at login.")).toBeInTheDocument();
+    expect(await screen.findByText("No: PAM does not start at login.")).toBeInTheDocument();
     const exchange = screen.getByRole("listitem");
     expect(within(exchange).getByText("unit")).toBeInTheDocument();
     expect(within(exchange).getByText(UNIT)).toBeInTheDocument();
@@ -315,14 +315,14 @@ describe("Home shell", () => {
     );
     expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
     expect(
-      screen.queryByText("answers stay in my own words: no light model is set"),
+      screen.queryByText("answers are not rephrased: no light model is set"),
     ).toBeNull();
     unmount();
 
     window.localStorage.setItem(rephraseStorageKey, "on");
     renderHome();
     expect(
-      await screen.findByText("answers stay in my own words: no light model is set"),
+      await screen.findByText("answers are not rephrased: no light model is set"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Models" })).toBeInTheDocument();
   });
@@ -369,7 +369,7 @@ describe("Home shell", () => {
     });
     renderHome();
     expect(
-      await screen.findByText("answers stay in my own words: qwen/x has no verified digest"),
+      await screen.findByText("answers are not rephrased: qwen/x has no verified digest"),
     ).toBeInTheDocument();
   });
 
@@ -383,7 +383,7 @@ describe("Home shell", () => {
     await askQuestion("what's waiting for my approval?");
     expect(
       await screen.findByText(
-        "I could not read the approval queue: the daemon socket refused the connection.",
+        "PAM could not read the approval queue: the daemon socket refused the connection.",
       ),
     ).toBeInTheDocument();
   });

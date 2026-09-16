@@ -297,6 +297,11 @@ pub struct PendingApproval {
     pub caller_agent: String,
     /// Unix seconds when the approval was requested.
     pub requested_ts: i64,
+    /// The request's own capability (`flow.run` for a gated flow step).
+    pub request_capability: String,
+    /// The arguments the agent submitted, as the JSON document stored on
+    /// the request row.
+    pub args_json: String,
 }
 
 /// One row of the `grant` table — history included: a revoked grant
@@ -1403,7 +1408,9 @@ impl Store {
     /// `hide_probes` drops the observatory's own traffic — every
     /// `admin.*` op and the `status` health probe — so the GUI polling
     /// itself every few seconds cannot crowd real agent work out of the
-    /// newest-N window. Auditors pass `false` and see everything.
+    /// newest-N window. `admin.log.compress` is exempt: a human asked for
+    /// that compression, so its row is activity, not a probe. Auditors
+    /// pass `false` and see everything.
     pub async fn list_requests_filtered(
         &self,
         limit: Option<u64>,
@@ -1431,9 +1438,13 @@ impl Store {
             }
         }
         if hide_probes {
-            // Literal, not a bound arg: the pattern is ours, never the
+            // Literals, not bound args: the patterns are ours, never the
             // caller's.
-            clauses.push("capability NOT LIKE 'admin.%' AND capability <> 'status'".to_owned());
+            clauses.push(
+                "(capability NOT LIKE 'admin.%' OR capability = 'admin.log.compress') \
+                 AND capability <> 'status'"
+                    .to_owned(),
+            );
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -1587,7 +1598,7 @@ impl Store {
             .conn
             .query(
                 "SELECT a.request_id, a.capability, r.repo, r.caller_agent,
-                        a.requested_ts
+                        a.requested_ts, r.capability, r.args_json
                  FROM approval a JOIN request r ON r.id = a.request_id
                  WHERE a.resolved_ts IS NULL
                  ORDER BY a.requested_ts, a.id",
@@ -1602,6 +1613,8 @@ impl Store {
                 repo: row.get(2)?,
                 caller_agent: row.get(3)?,
                 requested_ts: row.get(4)?,
+                request_capability: row.get(5)?,
+                args_json: row.get(6)?,
             });
         }
         Ok(out)

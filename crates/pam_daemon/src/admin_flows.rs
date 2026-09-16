@@ -224,7 +224,13 @@ impl AdminService {
                 });
             }
         };
-        let bytes = yaml.map_or(0, str::len);
+        // The audit row records what the GUI sent, in either spelling:
+        // the YAML text's length, or the object's serialized length.
+        let bytes = match (yaml, flow) {
+            (Some(text), _) => text.len(),
+            (None, Some(raw)) => raw.to_string().len(),
+            (None, None) => 0,
+        };
         let valid = parsed.is_ok();
         let body = match parsed {
             Ok(flow) => json!({
@@ -445,24 +451,36 @@ impl AdminService {
     }
 
     /// Replaces the named settings, refusing a shell in the allowlist.
+    ///
+    /// Everything refusable about the arguments — the scope policy's shape
+    /// and its repository paths, the settings' own checks — is validated
+    /// before the first write, so an argument refusal leaves both settings
+    /// untouched. The two are still separate settings rows: if the scope
+    /// write itself fails after the settings landed, the refusal says so.
     async fn flows_settings_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
-        let scope_policy = args
-            .get("scope_policy")
-            .map(|value| {
-                serde_json::from_value::<ScopePolicy>(value.clone())
-                    .map_err(|_| AdminRefusal {
-                        cause: CAUSE_SCOPE_INVALID,
-                        detail: "scope_policy must be a versioned policy object".to_owned(),
-                        recovery: RECOVERY_SCOPE,
-                    })?
-                    .normalize()
-                    .map_err(|error| AdminRefusal {
-                        cause: error.cause(),
-                        detail: error.to_string(),
-                        recovery: RECOVERY_SCOPE,
-                    })
-            })
-            .transpose()?;
+        let scope_policy = match args.get("scope_policy") {
+            None => None,
+            Some(value) => {
+                let policy =
+                    serde_json::from_value::<ScopePolicy>(value.clone()).map_err(|_| {
+                        AdminRefusal {
+                            cause: CAUSE_SCOPE_INVALID,
+                            detail: "scope_policy must be a versioned policy object".to_owned(),
+                            recovery: RECOVERY_SCOPE,
+                        }
+                    })?;
+                Some(
+                    policy
+                        .normalize_blocking()
+                        .await
+                        .map_err(|error| AdminRefusal {
+                            cause: error.cause(),
+                            detail: error.to_string(),
+                            recovery: RECOVERY_SCOPE,
+                        })?,
+                )
+            }
+        };
         let patch = SettingsPatch {
             allowed_programs: string_list(args, "allowed_programs", OP_FLOWS_SETTINGS_SET)?,
             extra_path: string_list(args, "extra_path", OP_FLOWS_SETTINGS_SET)?,
@@ -475,10 +493,20 @@ impl AdminService {
             .await
             .map_err(|refusal| refuse(&refusal))?;
         let scope_policy = match scope_policy {
-            Some(policy) => self.flows.set_scope_policy(policy).await,
-            None => self.flows.scope_policy().await,
-        }
-        .map_err(|error| refuse(&error))?;
+            Some(policy) => self.flows.set_scope_policy(policy).await.map_err(|error| {
+                let mut refusal = refuse(&error);
+                refusal.detail = format!(
+                    "{}; the other flow settings in this request were already applied and stand",
+                    refusal.detail
+                );
+                refusal
+            }),
+            None => self
+                .flows
+                .scope_policy()
+                .await
+                .map_err(|error| refuse(&error)),
+        }?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
             body: json!({

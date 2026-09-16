@@ -1,4 +1,32 @@
-use crate::{EvidenceViewInsert, Store};
+use crate::{EvidenceOrigins, EvidenceViewInsert, Store, StoreError};
+
+/// The origins as a plain `Option`: `Some` when the set is ready, `None`
+/// for both unusable states — the shape most of these tests assert on.
+trait OriginsReady {
+    async fn request_evidence_origins_ready(
+        &self,
+        ticket: &str,
+        repository: &str,
+    ) -> Result<Option<Vec<String>>, StoreError>;
+}
+
+impl OriginsReady for Store {
+    async fn request_evidence_origins_ready(
+        &self,
+        ticket: &str,
+        repository: &str,
+    ) -> Result<Option<Vec<String>>, StoreError> {
+        Ok(
+            match self
+                .request_evidence_origins_state(ticket, repository)
+                .await?
+            {
+                EvidenceOrigins::Ready(origins) => Some(origins),
+                EvidenceOrigins::Incomplete | EvidenceOrigins::Foreign => None,
+            },
+        )
+    }
+}
 
 #[tokio::test]
 async fn status_lookup_does_not_require_loading_large_request_arguments() {
@@ -86,7 +114,10 @@ async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
         .await
         .unwrap();
     assert_eq!(
-        store.request_evidence_origins("r", "/repo").await.unwrap(),
+        store
+            .request_evidence_origins_ready("r", "/repo")
+            .await
+            .unwrap(),
         Some(vec![])
     );
     store
@@ -95,7 +126,7 @@ async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
         .unwrap();
     assert!(
         store
-            .request_evidence_origins("r", "/repo")
+            .request_evidence_origins_ready("r", "/repo")
             .await
             .unwrap()
             .is_none()
@@ -115,7 +146,7 @@ async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
         .unwrap();
     assert_eq!(
         store
-            .request_evidence_origins("r", "/repo")
+            .request_evidence_origins_ready("r", "/repo")
             .await
             .unwrap()
             .unwrap()
@@ -124,7 +155,7 @@ async fn partial_evidence_without_captured_origin_is_not_treated_as_empty() {
     );
     assert!(
         store
-            .request_evidence_origins("r", "/other")
+            .request_evidence_origins_ready("r", "/other")
             .await
             .unwrap()
             .is_none()
@@ -181,7 +212,7 @@ async fn origins_state_tells_a_missing_view_from_a_foreign_one() {
     );
     assert!(
         store
-            .request_evidence_origins("r", "/repo")
+            .request_evidence_origins_ready("r", "/repo")
             .await
             .unwrap()
             .is_none(),
@@ -218,7 +249,7 @@ async fn origin_overflow_refuses_whole_set_instead_of_authorizing_prefix() {
         if index == 255 {
             assert_eq!(
                 store
-                    .request_evidence_origins("r", "/repo")
+                    .request_evidence_origins_ready("r", "/repo")
                     .await
                     .unwrap()
                     .unwrap()
@@ -229,7 +260,7 @@ async fn origin_overflow_refuses_whole_set_instead_of_authorizing_prefix() {
     }
     assert!(
         store
-            .request_evidence_origins("r", "/repo")
+            .request_evidence_origins_ready("r", "/repo")
             .await
             .unwrap()
             .is_none()
@@ -284,7 +315,10 @@ async fn private_checkpoint_does_not_block_public_result_but_other_missing_views
             .is_some()
     );
     assert_eq!(
-        store.request_evidence_origins("r", "/repo").await.unwrap(),
+        store
+            .request_evidence_origins_ready("r", "/repo")
+            .await
+            .unwrap(),
         Some(vec![r#"{"targets":[]}"#.to_owned()])
     );
     // A known protected handle is insufficient: evidence.read requires a view.
@@ -308,7 +342,7 @@ async fn private_checkpoint_does_not_block_public_result_but_other_missing_views
         .unwrap();
     assert!(
         store
-            .request_evidence_origins("r", "/repo")
+            .request_evidence_origins_ready("r", "/repo")
             .await
             .unwrap()
             .is_none()

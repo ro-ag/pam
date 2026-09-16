@@ -1,5 +1,5 @@
 use crate::flow_exec::{StepReport, StepStatus};
-use crate::flow_recovery::{Recovery, WatchState};
+use crate::flow_recovery::{Prepare, Recovery, WatchState};
 use pam_flow::Vars;
 use pam_store::Store;
 use serde_json::json;
@@ -59,7 +59,7 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
     };
     for poll in 1..=2 {
         recovery
-            .prepare(&store, "r", &flow.steps[0], true)
+            .prepare(&store, "r", &flow.steps[0], Prepare::Run)
             .await
             .unwrap();
         state.polls = poll;
@@ -80,7 +80,7 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
             .is_err()
     );
     recovery
-        .prepare(&store, "r", &flow.steps[0], true)
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
         .await
         .unwrap();
     recovery.settle(&store, "r", &snapshot, true).await.unwrap();
@@ -172,7 +172,7 @@ async fn substituted_run_is_committed_as_conflict_without_replacing_valid_pins()
         last_evidence: "ev_conflict".into(),
     };
     recovery
-        .prepare(&store, "r", &flow.steps[0], true)
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
         .await
         .unwrap();
     recovery
@@ -232,4 +232,22 @@ fn only_transient_connector_errors_consume_watch_outage_allowance() {
     assert!(!super::watch_runtime::watch_retryable(
         &InvokeError::CredentialMissing
     ));
+}
+
+#[test]
+fn only_connectors_with_a_status_call_can_be_watched() {
+    use super::watch_runtime::status_call;
+    assert_eq!(
+        status_call(pam_flow::ConnectorId::Github),
+        Some("run_status")
+    );
+    assert_eq!(
+        status_call(pam_flow::ConnectorId::Jenkins),
+        Some("build_status")
+    );
+    assert_eq!(
+        status_call(pam_flow::ConnectorId::Sonarqube),
+        Some("ce_status")
+    );
+    assert_eq!(status_call(pam_flow::ConnectorId::Jira), None);
 }

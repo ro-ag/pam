@@ -22,11 +22,11 @@
 
 pub mod compact;
 
+// The root re-exports what the daemon consumes; every other public type
+// stays reachable through [`compact`].
 pub use compact::{
-    ALGORITHM_VERSION, CompactError, Compacted, DEFAULT_BOUNDARY_RECORDS,
-    DEFAULT_FAILURE_CONTEXT_RECORDS, FailureKeyword, Fragment, FragmentKind,
-    MAX_FAILURE_CONTEXT_RECORDS, MAX_SOURCE_BYTES, MAX_SOURCE_RECORDS, OmissionReason, Policy,
-    RetentionReason, compact, estimate_tokens, sha256_hex,
+    ALGORITHM_VERSION, CompactError, Compacted, Fragment, FragmentKind, MAX_SOURCE_BYTES, Policy,
+    compact, estimate_tokens, sha256_hex,
 };
 
 #[cfg(test)]

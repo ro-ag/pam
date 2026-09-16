@@ -61,6 +61,7 @@ use crate::flow_exec::{
     CommandOutcome, CommandSpec, RunReport, StepReport, StepStatus, SummaryModel, cancelled,
     outcome_for, resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
 };
+use crate::flow_recovery::Prepare;
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
 use crate::model_readiness::Stage;
 use crate::model_service::Tier;
@@ -151,6 +152,9 @@ pub const CAUSE_STATUS_ASSERTION_REQUIRED: &str = "status_assertion_required";
 
 /// Step cause: the program could not be started at all.
 pub const CAUSE_SPAWN_FAILED: &str = "spawn_failed";
+
+/// Step cause: the program ran but the OS would not report how it ended.
+pub const CAUSE_WAIT_FAILED: &str = "wait_failed";
 
 /// Step cause: daemon-side bookkeeping failed mid-step.
 pub const CAUSE_INTERNAL: &str = "internal_error";
@@ -680,9 +684,16 @@ impl FlowService {
         if let Err(error) = self.approved_repo(&repo).await {
             blockers.push(json!({"cause": error.cause, "recovery": RECOVERY_SCOPE}));
         }
-        let (vars, missing) = crate::flow_contract::inspect_vars(flow, &args.inputs, &repo);
+        let crate::flow_contract::InspectedInputs {
+            vars,
+            missing,
+            unknown,
+        } = crate::flow_contract::inspect_vars(flow, &args.inputs, &repo);
         for name in missing {
             blockers.push(json!({"cause": "input_unavailable", "input": name, "recovery": "supply the declared input; runtime-derived values require execution"}));
+        }
+        for name in unknown {
+            blockers.push(json!({"cause": "input_unknown", "input": name, "recovery": "drop the input or declare it under the flow's `inputs:`"}));
         }
         let correlation = match &flow.correlation {
             None => json!({"status":"unbound"}),
@@ -999,7 +1010,11 @@ impl FlowService {
             .await?;
 
         let mut state = RunState::restore(self, ctx, flow, &settings, repo, vars, cancel).await?;
-        state.execute().await?;
+        let executed = state.execute().await;
+        // Anything but a parked continuation makes this ticket terminal, so
+        // the private landing workspace is released here, before the verdict.
+        state.landing_release(&executed).await;
+        executed?;
 
         if let Err(error) = state.correlation.check_mapping(&self.store).await {
             state.correlation.invalidate(&error);
@@ -1118,7 +1133,7 @@ impl FlowService {
             "steps": report.steps.len(),
             "failed": failed,
         });
-        if meta.to_string().len() > 16 * 1024 {
+        if meta.to_string().len() > crate::flow_recovery::MAX_INLINE_BYTES {
             return Err(CapabilityFailure::Failed {
                 detail: "flow result metadata exceeds its limit".to_owned(),
             });
@@ -1362,7 +1377,12 @@ async fn repo_origin(
     };
     let outcome = run_command_budgeted(
         CommandSpec {
-            containment: command_boundary(protected_base, repo, &program, false),
+            containment: command_boundary(
+                protected_base,
+                repo,
+                &program,
+                pam_flow::Effect::ReadOnly,
+            ),
             program,
             argv: vec![
                 "remote".to_owned(),
@@ -1613,13 +1633,17 @@ impl RunState<'_> {
             return Ok(());
         }
         for (index, step) in self.flow.steps.iter().enumerate().skip(self.reports.len()) {
-            let will_run = self.should_run(step);
+            let prepare = if self.should_run(step) {
+                Prepare::Run
+            } else {
+                Prepare::Skip
+            };
             self.watch_due(step)?;
             self.landing_due(step).await?;
             self.recovery
-                .prepare(&self.service.store, &self.ctx.request_id, step, will_run)
+                .prepare(&self.service.store, &self.ctx.request_id, step, prepare)
                 .await?;
-            if !will_run {
+            if prepare == Prepare::Skip {
                 self.reports
                     .push(StepReport::new(&step.id, step.kind(), StepStatus::Skipped));
                 self.checkpoint(index + 1 == total).await?;
@@ -2139,7 +2163,7 @@ impl RunState<'_> {
             &self.service.protected_base,
             &self.repo,
             resolved,
-            step.effect == pam_flow::Effect::Stateful,
+            step.effect,
         );
         let Some(artifacts) = self.prepare_artifacts(program).await? else {
             return Ok((containment, base_env(self.settings)));
@@ -2208,7 +2232,14 @@ impl RunState<'_> {
                 Ok(outcome) => outcome,
                 Err(error) => return Some(budget_attempt(error)),
             };
-        match outcome {
+        command_attempt(step, outcome)
+    }
+}
+
+/// How one child-process ending reads as an [`Attempt`]; `None` is the
+/// cancel signal.
+fn command_attempt(step: &Step, outcome: CommandOutcome) -> Option<Attempt> {
+    match outcome {
             CommandOutcome::Exited { status: 0, output }
                 if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
                 result: None,                    exit_status: Some(0),
@@ -2282,10 +2313,25 @@ impl RunState<'_> {
                 recovery: RECOVERY_EXTRA_PATH.to_owned(),
                 retry_after: None,
             }),
+            CommandOutcome::WaitFailed { detail, output } => Some(Attempt::Failed {
+                result: None,
+                exit_status: None,
+                output,
+                status: StepStatus::Failed,
+                cause: CAUSE_WAIT_FAILED,
+                detail: format!(
+                    "step {:?} ran but its exit status could not be collected: {detail}",
+                    step.id
+                ),
+                recovery: "read the step's evidence; the outcome of the command itself is unknown, so re-run the flow"
+                    .to_owned(),
+                retry_after: None,
+            }),
             CommandOutcome::Cancelled => None,
-        }
     }
+}
 
+impl RunState<'_> {
     /// Runs one connector step, retries included.
     async fn run_connector_step(
         &mut self,
@@ -2919,11 +2965,12 @@ fn product_observations(
 }
 
 /// Read grants come from daemon-owned tool locations, never broad HOME access.
+/// Only a [`pam_flow::Effect::Stateful`] command may write to the repository.
 fn command_boundary(
     protected_base: &Path,
     repo: &Path,
     program: &Path,
-    allow_repository_writes: bool,
+    effect: pam_flow::Effect,
 ) -> crate::command_containment::CommandContainment {
     let daemon_exe = std::env::current_exe()
         .and_then(|path| path.canonicalize())
@@ -2939,7 +2986,7 @@ fn command_boundary(
             daemon_exe.as_deref(),
             home.as_deref(),
         ),
-        allow_repository_writes,
+        allow_repository_writes: effect == pam_flow::Effect::Stateful,
         artifact_roots: Vec::new(),
     }
 }

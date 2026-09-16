@@ -334,3 +334,42 @@ fn builtin_names_stay_reserved_while_a_renamed_override_hides_them() {
         *original_name
     );
 }
+
+#[test]
+fn a_file_that_cannot_be_read_is_listed_with_the_read_error() {
+    let (_dir, library) = library();
+    fs::create_dir_all(library.dir()).expect("mkdir");
+    // Not UTF-8: `read_to_string` refuses it on every platform, which is
+    // the same shape as a permission error without needing root-free chmod.
+    fs::write(library.dir().join("garbled.yaml"), [0xff, 0xfe, 0x00, b'x']).expect("write");
+    fs::write(
+        library.dir().join("fine.yaml"),
+        DEMO.replace("demo", "fine"),
+    )
+    .expect("write");
+
+    let listed = library
+        .list()
+        .expect("one unreadable file does not fail the listing");
+    let garbled = listed
+        .iter()
+        .find(|entry| entry.id == "garbled")
+        .expect("the unreadable file is still listed");
+    assert_eq!(garbled.source, Source::Library);
+    assert!(garbled.yaml.is_empty());
+    match &garbled.parsed {
+        Err(FlowError::Io(detail)) => assert!(detail.contains("garbled.yaml"), "{detail}"),
+        other => panic!("expected Io, got {other:?}"),
+    }
+    let fine = listed
+        .iter()
+        .find(|entry| entry.id == "fine")
+        .expect("listed");
+    assert!(fine.parsed.is_ok());
+    assert_eq!(listed.len(), builtin().len() + 2);
+
+    match library.get("garbled") {
+        Err(FlowError::Io(_)) => {}
+        other => panic!("a single get still reports the read error, got {other:?}"),
+    }
+}

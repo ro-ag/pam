@@ -51,6 +51,46 @@ pub fn render_json(response: &Response) -> String {
     serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Stable cause of a follow that ran past its `--timeout-ms`.
+pub const CAUSE_FOLLOW_TIMEOUT: &str = "follow_timeout";
+
+/// The `--json` rendering of a follow that ended without a terminal
+/// event: `Some` refusal object — the same `kind: refusal` shape every
+/// other `--json` refusal has, with the ticket as `id` — for a refused
+/// follow or an observation timeout; `None` when `json` is off or the
+/// error is a client-side failure (transport, spawn), which stays a
+/// stderr line like every other command's.
+#[must_use]
+pub fn render_follow_failure(err: &crate::client::RequestError, json: bool) -> Option<String> {
+    use crate::client::RequestError;
+    if !json {
+        return None;
+    }
+    let response = match err {
+        RequestError::FollowRefused {
+            ticket,
+            cause,
+            detail,
+            recovery,
+        } => Response::Refusal {
+            id: ticket.clone(),
+            cause: cause.clone(),
+            detail: detail.clone(),
+            recovery: recovery.clone(),
+        },
+        RequestError::FollowTimeout { ticket, waited } => Response::Refusal {
+            id: ticket.clone(),
+            cause: CAUSE_FOLLOW_TIMEOUT.to_owned(),
+            detail: format!("no terminal event within {waited:?}; the request keeps running"),
+            recovery: format!(
+                "Follow it again with `pam wait {ticket}`, or read `pam flow result {ticket}` later."
+            ),
+        },
+        _ => return None,
+    };
+    Some(render_json(&response))
+}
+
 /// The stderr block for a refusal: cause, detail, recovery — always all
 /// three (see the module docs).
 #[must_use]

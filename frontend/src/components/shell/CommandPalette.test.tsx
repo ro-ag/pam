@@ -186,6 +186,30 @@ describe("CommandPalette", () => {
     expect(navigate).toHaveBeenCalledWith({ to: "/settings", hash: "connectors", search: {} });
   });
 
+  it("returns focus to the trigger after Enter opens a destination", () => {
+    mount();
+    const trigger = screen.getByRole("button", { name: "Open command palette" });
+    const input = open();
+    fireEvent.change(input, { target: { value: "activity" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith({ to: "/activity", hash: "", search: {} });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("returns focus to the trigger even when the opening click never focused it", () => {
+    mount();
+    // A WebKit mouse click leaves the body focused; the trigger is still the way back.
+    (document.activeElement as HTMLElement | null)?.blur();
+    const trigger = screen.getByRole("button", { name: "Open command palette" });
+    fireEvent.click(trigger);
+    const input = screen.getByRole("combobox");
+    expect(input).toHaveFocus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it("cycles focus inside the modal and restores the trigger after backdrop dismissal", () => {
     mount();
     const input = open();

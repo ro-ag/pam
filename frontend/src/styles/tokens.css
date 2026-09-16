@@ -45,6 +45,9 @@
   /* hairlines: line = borders on the surface, edge = rim of raised panels,
      separator = quiet separators; material edges use a shared gradient */
   --color-line: var(--pam-line);
+  /* line-strong: the outline of a card that sits on a ground of the same
+     color, so the outline is its only boundary (>= 3:1 in every palette) */
+  --color-line-strong: var(--pam-line-strong);
   --color-edge: var(--pam-edge);
   --color-control-line: var(--pam-control-line);
   /* Meaningful graph connections must not inherit decorative hairlines. */
@@ -81,6 +84,9 @@
 
   --color-focus: var(--pam-focus);
   --color-overlay: var(--pam-overlay);
+  /* the minimap mask: the chrome at 70%, so the viewport window reads as a
+     clearing rather than a grey block */
+  --color-minimap-mask: color-mix(in srgb, var(--pam-chrome) 70%, transparent);
 
   /* ---------------------------------------------------------------- *
    * Spacing — Tailwind's numeric scale, density-aware (v1 multiplier).
@@ -107,6 +113,10 @@
   --radius-badge: 0.25rem;
   --radius-overlay: 0.75rem;
   --radius-pill: 9999px; /* circular indicators and true toggles */
+
+  /* The one reading width for prose-shaped content (cards, notices, the
+     conversation): `max-w-content`. Tables and canvases run wider. */
+  --container-content: 60rem;
 
   /* Costa native typography: UI for prose and controls, mono for evidence. */
   --font-*: initial;
@@ -169,7 +179,7 @@
   --xy-selection-background-color: var(--color-accent-soft);
   --xy-selection-border: 1px solid var(--color-accent);
   --xy-minimap-background-color: var(--color-surface);
-  --xy-minimap-mask-background-color: var(--color-overlay);
+  --xy-minimap-mask-background-color: var(--color-minimap-mask);
   --xy-minimap-node-background-color: var(--color-accent-soft);
   --xy-minimap-node-stroke-color: var(--color-edge);
   --xy-node-background-color: var(--color-surface-raised);

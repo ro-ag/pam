@@ -1,7 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
+import { cn } from "../lib/cn";
 import { toBridgeFailure, type BridgeFailure } from "../lib/ipc";
 import {
   emptyLandingRepository,
@@ -12,8 +14,20 @@ import {
 } from "../lib/landing";
 
 const key = ["landing-policy"];
-const field =
-  "w-full rounded-control border border-control-line bg-inset px-2.5 py-2 font-data text-xs text-ink";
+const field = fieldClasses;
+const area = cn(fieldClasses, "h-auto min-h-16 py-2");
+
+/** The daemon's bounds for a check timeout, in seconds. */
+export const TIMEOUT_MIN_S = 1;
+export const TIMEOUT_MAX_S = 600;
+
+/** A whole number of seconds inside the daemon's bounds, or null. */
+export function parseTimeout(text: string): number | null {
+  if (!/^\d+$/.test(text.trim())) return null;
+  const seconds = Number(text.trim());
+  return seconds >= TIMEOUT_MIN_S && seconds <= TIMEOUT_MAX_S ? seconds : null;
+}
+
 function TextField({
   label,
   value,
@@ -29,7 +43,7 @@ function TextField({
     <label className="block space-y-1 text-xs text-ink-muted">
       <span>{label}</span>
       {multiline ? (
-        <textarea className={field} value={value} onChange={(e) => onChange(e.target.value)} />
+        <textarea className={area} value={value} onChange={(e) => onChange(e.target.value)} />
       ) : (
         <input className={field} value={value} onChange={(e) => onChange(e.target.value)} />
       )}
@@ -47,6 +61,16 @@ function CheckEditor({
   onChange: (check: LandingCheck) => void;
   onRemove: () => void;
 }) {
+  // The timeout is typed as text and only reaches the recipe once it is a
+  // whole number of seconds the daemon accepts; an empty field used to
+  // become NaN, then null, and the daemon refused the whole save.
+  const [timeoutText, setTimeoutText] = useState(String(check.timeout_seconds));
+  useEffect(() => {
+    setTimeoutText((current) =>
+      parseTimeout(current) === check.timeout_seconds ? current : String(check.timeout_seconds),
+    );
+  }, [check.timeout_seconds]);
+  const timeoutValid = parseTimeout(timeoutText) !== null;
   return (
     <div className="space-y-2 border border-line p-3">
       <TextField
@@ -77,15 +101,24 @@ function CheckEditor({
         </span>
         {label} timeout (seconds)
         <input
-          type="number"
-          className={field}
-          min={1}
-          max={600}
-          value={check.timeout_seconds}
-          onChange={(e) => onChange({ ...check, timeout_seconds: Number(e.target.value) })}
+          inputMode="numeric"
+          className={cn(field, !timeoutValid && "border-danger")}
+          aria-invalid={!timeoutValid || undefined}
+          value={timeoutText}
+          onChange={(e) => {
+            setTimeoutText(e.target.value);
+            const seconds = parseTimeout(e.target.value);
+            if (seconds !== null) onChange({ ...check, timeout_seconds: seconds });
+          }}
         />
+        {!timeoutValid && (
+          <span className="block text-danger">
+            Whole seconds between {TIMEOUT_MIN_S} and {TIMEOUT_MAX_S}; the saved value stands
+            until this is.
+          </span>
+        )}
       </label>
-      <Button size="sm" onClick={onRemove}>
+      <Button size="sm" variant="secondary" onClick={onRemove}>
         Remove {label.toLowerCase()}
       </Button>
     </div>
@@ -173,7 +206,11 @@ function RepositoryEditor({
       ))}
       <Button
         size="sm"
+        variant="secondary"
         disabled={repository.checks.length >= 8}
+        title={
+          repository.checks.length >= 8 ? "A recipe holds at most eight checks" : undefined
+        }
         onClick={() =>
           onChange({
             ...repository,
@@ -192,9 +229,13 @@ function RepositoryEditor({
             ["sync", "Sync local base branch"],
           ] as const
         ).map(([permission, label]) => (
-          <label key={permission} className="flex items-center gap-2 text-sm text-ink">
+          <label
+            key={permission}
+            className="flex min-h-8 cursor-pointer items-center gap-2 text-sm text-ink"
+          >
             <input
               type="checkbox"
+              className="size-4.5 accent-accent-strong"
               checked={repository.permissions[permission]}
               onChange={(e) =>
                 onChange({
@@ -207,7 +248,7 @@ function RepositoryEditor({
           </label>
         ))}
       </div>
-      <Button size="sm" onClick={onRemove}>
+      <Button size="sm" variant="secondary" onClick={onRemove}>
         Remove landing repository {index + 1}
       </Button>
     </div>
@@ -323,16 +364,29 @@ export function LandingSettings() {
         ))}
         <Button
           size="sm"
+          variant="secondary"
           disabled={current.length >= 32}
+          title={current.length >= 32 ? "The policy holds at most 32 repositories" : undefined}
           onClick={() => edit([...current, emptyLandingRepository()])}
         >
           Add landing repository
         </Button>
-        <Button size="sm" disabled={!draft || cacheOverflow} onClick={() => void save()}>
+        <Button
+          size="sm"
+          disabled={!draft || cacheOverflow}
+          title={
+            !draft
+              ? "Nothing changed yet"
+              : cacheOverflow
+                ? "Trim the cache directories to eight first"
+                : undefined
+          }
+          onClick={() => void save()}
+        >
           Save landing policy
         </Button>
       </fieldset>
-      <Button size="sm" disabled={pending} onClick={() => void reload()}>
+      <Button size="sm" variant="secondary" disabled={pending} onClick={() => void reload()}>
         Reload landing policy
       </Button>
     </section>

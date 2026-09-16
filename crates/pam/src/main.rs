@@ -4,15 +4,16 @@
 //! The CLI surface is deliberately static — agents interact exclusively
 //! through these subcommands (no raw-protocol escape hatch), and there
 //! are **no security commands**: grants, approvals, revocations, and
-//! profile changes live in the GUI only. See the crate docs in
-//! [`pam`] (`lib.rs`) for the subcommand list and the exit-code table.
+//! profile changes live in the GUI only. The subcommand table lives in
+//! `README.md` ("CLI surface"); the exit-code table is in the crate docs
+//! of [`pam`] (`lib.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use pam::client::{self, StopOutcome};
+use pam::client::{self, DEFAULT_FOLLOW_TIMEOUT_MS, StopOutcome};
 use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
 use pam_daemon::daemon::{DaemonError, run_daemon};
@@ -24,10 +25,6 @@ const EXIT_USAGE: u8 = 2;
 
 /// How long `pam daemon stop` waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(15);
-
-/// Default bound on `pam wait` / `pam subscribe`, in milliseconds
-/// (10 minutes — [`pam::client::DEFAULT_FOLLOW_TIMEOUT`]).
-const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 
 /// Default deadline for `pam flow run`, in milliseconds (30 minutes): a
 /// flow that runs `cargo test` is not a 60 s request.
@@ -58,11 +55,12 @@ enum Cmd {
     Echo {
         /// Capability arguments as a JSON object (default `{}`).
         args_json: Option<String>,
-        /// Wait for the result (the default).
+        /// Wait for the result (the default); given after `--no-wait`,
+        /// cancels it — the last of the two flags wins.
         #[arg(long, overrides_with = "no_wait")]
         wait: bool,
         /// Return a ticket immediately instead of waiting.
-        #[arg(long)]
+        #[arg(long, overrides_with = "wait")]
         no_wait: bool,
         /// Deadline for the request, in milliseconds.
         #[arg(long, default_value_t = DEFAULT_DEADLINE_MS)]
@@ -87,7 +85,7 @@ enum Cmd {
         /// The ticket to wait for.
         ticket: String,
         /// Give up after this many milliseconds.
-        #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS)]
+        #[arg(long, default_value_t = DEFAULT_FOLLOW_TIMEOUT_MS)]
         timeout_ms: u64,
     },
     /// Stream a ticket's events until its terminal event.
@@ -95,8 +93,12 @@ enum Cmd {
         /// The ticket to follow.
         ticket: String,
         /// Give up after this many milliseconds.
-        #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS)]
+        #[arg(long, default_value_t = DEFAULT_FOLLOW_TIMEOUT_MS)]
         timeout_ms: u64,
+        /// Print the durable terminal response as JSON (events still
+        /// stream as text lines first).
+        #[arg(long)]
+        json: bool,
     },
     /// Read bounded evidence retained for an authorized request.
     Evidence {
@@ -159,8 +161,10 @@ enum ServiceCmd {
 enum FlowCmd {
     /// List the flows this machine has: id, source, steps, and name.
     List {
+        /// How many flows to skip, for paging past the first page.
         #[arg(long, default_value_t = 0)]
         offset: u64,
+        /// Page size, from 1 through 50.
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=50))]
         limit: u32,
         /// Print the raw response JSON instead of the table.
@@ -169,14 +173,19 @@ enum FlowCmd {
     },
     /// Inspect inputs and readiness without running the flow.
     Inspect {
+        /// The flow id, as `pam flow list` spells it.
         id: String,
+        /// Values for the flow's declared inputs, as `key=value`.
         inputs: Vec<String>,
+        /// Print the raw response JSON.
         #[arg(long)]
         json: bool,
     },
     /// Retrieve the durable result of a flow ticket.
     Result {
+        /// The ticket `pam flow run --no-wait` printed.
         ticket: String,
+        /// Print the raw response JSON.
         #[arg(long)]
         json: bool,
     },
@@ -387,10 +396,10 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
         }
         Cmd::Echo {
             args_json,
+            wait,
             no_wait,
             deadline_ms,
             json,
-            ..
         } => {
             let args = match parse_args_object(args_json.as_deref()) {
                 Ok(args) => args,
@@ -399,7 +408,9 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
                     return ExitCode::from(EXIT_USAGE);
                 }
             };
-            request(base, "echo", args, !no_wait, Some(deadline_ms), json).await
+            // clap keeps only the last of `--wait` / `--no-wait`.
+            let wait = wait || !no_wait;
+            request(base, "echo", args, wait, Some(deadline_ms), json).await
         }
         Cmd::Cancel { ticket, json } => {
             let args = serde_json::json!({ "ticket": ticket });
@@ -409,10 +420,12 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             ticket,
             timeout_ms,
             json,
-        } => follow(base, &ticket, timeout_ms, false, json).await,
-        Cmd::Subscribe { ticket, timeout_ms } => {
-            follow(base, &ticket, timeout_ms, true, false).await
-        }
+        } => follow(base, "wait", &ticket, timeout_ms, json).await,
+        Cmd::Subscribe {
+            ticket,
+            timeout_ms,
+            json,
+        } => follow(base, "subscribe", &ticket, timeout_ms, json).await,
         Cmd::Evidence {
             action: EvidenceCmd::Read(args),
         } => match evidence_read_args(&args) {
@@ -616,27 +629,45 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
 
 /// Follow events, then resolve the durable response so workflow failure and
 /// advisory diagnosis cannot be mistaken for successful stream completion.
-async fn follow(base: &Path, ticket: &str, timeout_ms: u64, verbose: bool, json: bool) -> ExitCode {
+///
+/// `subcommand` is `wait` (quiet) or `subscribe` (prints each event); it
+/// also prefixes every error line. A follow that ends without a terminal
+/// event — refused, or past `timeout_ms` — is a stderr line, or with
+/// `--json` a refusal object on stdout ([`render::render_follow_failure`])
+/// so a machine reader never has to parse prose; the exit code is the
+/// same either way (refusal 3, timeout 1).
+async fn follow(
+    base: &Path,
+    subcommand: &str,
+    ticket: &str,
+    timeout_ms: u64,
+    json: bool,
+) -> ExitCode {
     let timeout = Duration::from_millis(timeout_ms);
+    let verbose = subcommand == "subscribe";
     let on_event = |event: &Event| {
         if verbose {
             println!("{}", render::render_event(event));
         }
     };
     match client::follow_ticket(base, ticket, timeout, on_event).await {
-        Ok(_) => terminal_result(base, ticket, json).await,
+        Ok(_) => terminal_result(base, subcommand, ticket, json).await,
         Err(err) => {
-            eprintln!("pam wait: {err}");
-            if matches!(err, client::RequestError::FollowRefused { .. }) {
+            let code = if matches!(err, client::RequestError::FollowRefused { .. }) {
                 ExitCode::from(render::EXIT_REFUSED)
             } else {
                 ExitCode::FAILURE
+            };
+            match render::render_follow_failure(&err, json) {
+                Some(object) => println!("{object}"),
+                None => eprintln!("pam {subcommand}: {err}"),
             }
+            code
         }
     }
 }
 
-async fn terminal_result(base: &Path, ticket: &str, json: bool) -> ExitCode {
+async fn terminal_result(base: &Path, subcommand: &str, ticket: &str, json: bool) -> ExitCode {
     let args = serde_json::json!({"ticket": ticket});
     match client::send_request(base, "query", args.clone(), true, DEFAULT_DEADLINE_MS, None).await {
         Ok(response) => {
@@ -648,7 +679,7 @@ async fn terminal_result(base: &Path, ticket: &str, json: bool) -> ExitCode {
             }
         }
         Err(error) => {
-            eprintln!("pam wait: {error}");
+            eprintln!("pam {subcommand}: {error}");
             ExitCode::FAILURE
         }
     }

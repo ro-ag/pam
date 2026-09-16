@@ -5,6 +5,8 @@ import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn } from "../lib/cn";
 import { activityList, toBridgeFailure, type ActivityRow, type OutcomeName } from "../lib/ipc";
+import { outcomeLabel } from "../lib/outcome";
+import { repoTail } from "../lib/repo";
 import { exactTime, relativeTime } from "../lib/time";
 import { EvidenceStrip } from "./EvidenceStrip";
 import { FlowVerdictPanel, OUTCOME_TONES } from "./FlowRunCard";
@@ -35,22 +37,16 @@ export function flowIdOf(args: unknown): string | null {
   return typeof id === "string" ? id : null;
 }
 
-/** Last path segment; the full path rides on the title attribute. */
-function repoTail(repo: string): string {
-  const segments = repo.split("/").filter(Boolean);
-  return segments[segments.length - 1] ?? repo;
-}
-
 /** The verdict badge for a row: the outcome when there is one, else state. */
 function runBadge(row: ActivityRow): { label: string; tone: BadgeProps["tone"] } {
   if (row.state === "queued") return { label: "queued", tone: "neutral" };
   if (row.state === "running") return { label: "running", tone: "accent" };
-  if (row.state === "waiting_approval") return { label: "approval held", tone: "warning" };
+  if (row.state === "waiting_approval") return { label: "awaiting review", tone: "warning" };
   if (!row.outcome) {
     return { label: row.state === "done" ? "done" : row.state, tone: "neutral" };
   }
   return {
-    label: row.outcome,
+    label: outcomeLabel(row.outcome),
     tone: OUTCOME_TONES[row.outcome as OutcomeName] ?? "danger",
   };
 }
@@ -83,11 +79,22 @@ function RunRow({
         <Badge tone={badge.tone} className="shrink-0">
           {badge.label}
         </Badge>
+        <span className="min-w-0 flex-1 truncate font-data text-xs text-ink">
+          {flowIdOf(row.args) ?? row.capability}
+          <span className="text-ink-muted" title={row.repo}>
+            {" · "}
+            {repoTail(row.repo)}
+          </span>
+          <span className="text-ink-faint">
+            {" · "}
+            {row.agent}
+          </span>
+        </span>
         <span
-          className="min-w-0 flex-1 truncate font-data text-xs text-ink-muted"
-          title={row.repo}
+          className="hidden shrink-0 font-data text-xs text-ink-faint sm:inline"
+          title={row.id}
         >
-          {repoTail(row.repo)}
+          {row.id}
         </span>
         <time
           dateTime={new Date(row.created_ts * 1000).toISOString()}

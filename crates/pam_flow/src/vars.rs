@@ -124,14 +124,16 @@ fn walk<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-enum Segment<'a> {
+pub(crate) enum Segment<'a> {
     Field(&'a str),
     Index(usize),
 }
 
 /// Splits `result.jobs[0].id` into field and index segments. `None` when the
 /// pointer is malformed (an empty field, an unclosed or non-numeric index).
-fn segments(pointer: &str) -> Option<Vec<Segment<'_>>> {
+/// Validation runs the same split over a flow's `${steps.<id>.result.…}`
+/// tails, so a pointer that could never resolve is refused before a run.
+pub(crate) fn segments(pointer: &str) -> Option<Vec<Segment<'_>>> {
     let mut out = Vec::new();
     let mut rest = pointer;
     loop {

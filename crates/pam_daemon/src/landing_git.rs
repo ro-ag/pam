@@ -3,7 +3,9 @@
 //! before push. No mutation retries; remote observation is a separate operation.
 //! Raw Git diagnostics are discarded because a server can echo credentials.
 use crate::{
-    landing_checkout::{self, CheckoutError, CheckoutReceipt, CheckoutRequest, Workspace},
+    landing_checkout::{
+        self, CANCELLED, CheckoutError, CheckoutReceipt, CheckoutRequest, Workspace, valid_oid,
+    },
     landing_pack::PackBounds,
     request_budget::RequestBudget,
 };
@@ -47,6 +49,18 @@ pub(crate) struct GitTarget {
     pub branch: String,
     pub expected_old: Option<String>,
 }
+/// Everything one guarded Git broker call needs besides its operation: the
+/// original ticket identity, the policy revision it was gated under, the
+/// exact target, and the shared budget, cancel signal and deadline.
+pub(crate) struct LandingCall<'a> {
+    pub repo: &'a Path,
+    pub ticket: &'a str,
+    pub policy_revision: &'a str,
+    pub target: &'a GitTarget,
+    pub budget: Arc<RequestBudget>,
+    pub cancel: &'a mut watch::Receiver<bool>,
+    pub deadline: Instant,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RemoteRef {
     pub ref_name: String,
@@ -64,12 +78,20 @@ pub(crate) struct SyncObservation {
     pub pack: String,
     pub bounds: PackBounds,
 }
+/// What the mutating Git process itself reported. The journalled intent
+/// starts `Uncertain` before the process runs and is updated with the
+/// process verdict afterwards; only a fresh exact ref observation confirms
+/// either value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PushState {
+    /// `git push` exited zero.
     ReportedSuccess,
+    /// The process has not run, was cancelled, or exited non-zero.
     Uncertain,
 }
+/// A prepared or completed ref mutation, as journalled on the ticket. The
+/// same shape carries a sync lease (`expected_old` is then always set).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushObservation {
     pub ref_name: String,
@@ -91,13 +113,6 @@ fn error(cause: &'static str, detail: &'static str) -> CheckoutError {
 }
 fn invalid(detail: &'static str) -> CheckoutError {
     error("landing_git_invalid", detail)
-}
-fn oid(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        && value.bytes().any(|b| b != b'0')
 }
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // Literal Git ref grammar.
 fn reference(branch: &str) -> Result<String, CheckoutError> {
@@ -126,7 +141,7 @@ fn validate_target(
         || receipt.remote_url != request.remote_url
         || receipt.repository != request.repository
         || receipt.commit != request.expected_commit
-        || !oid(&receipt.commit)
+        || !valid_oid(&receipt.commit)
     {
         return Err(invalid(
             "remote or source differs from the approved receipt",
@@ -396,7 +411,7 @@ impl Session<'_> {
         self.reserve_network(mutation).await?;
         tokio::select! {
             biased;
-            () = crate::flow_exec::cancelled(cancel) => return Err(error("cancelled", "Git authorization cancelled")),
+            () = crate::flow_exec::cancelled(cancel) => return Err(error(CANCELLED, "Git authorization cancelled")),
             () = tokio::time::sleep_until(self.deadline.into()) => return Err(error("deadline_exceeded", "Git authorization deadline elapsed")),
             result = self.authorization.authorize() => result?,
         }
@@ -483,7 +498,7 @@ impl Session<'_> {
         };
         let result = tokio::select! {
             biased;
-            () = crate::flow_exec::cancelled(cancel) => Err(error("cancelled", "Git operation cancelled")),
+            () = crate::flow_exec::cancelled(cancel) => Err(error(CANCELLED, "Git operation cancelled")),
             () = tokio::time::sleep_until(self.deadline.into()) => Err(error("deadline_exceeded", "Git operation deadline elapsed")),
             result = collect => result,
         };
@@ -531,7 +546,7 @@ fn indexed_pack_name(capture: &Capture) -> Result<String, CheckoutError> {
     let mut names = text
         .lines()
         .filter_map(|line| line.strip_prefix("pack\t"))
-        .filter(|hash| oid(hash));
+        .filter(|hash| valid_oid(hash));
     let name = names
         .next()
         .ok_or_else(|| invalid("index-pack did not report the pack identity"))?;
@@ -651,7 +666,7 @@ fn update_ref_exact(
 }
 fn active(cancel: &watch::Receiver<bool>, deadline: Instant) -> Result<(), CheckoutError> {
     if *cancel.borrow() || cancel.has_changed().is_err() {
-        return Err(error("cancelled", "Git operation cancelled"));
+        return Err(error(CANCELLED, "Git operation cancelled"));
     }
     if Instant::now() >= deadline {
         return Err(error("deadline_exceeded", "Git operation deadline elapsed"));
@@ -679,11 +694,11 @@ fn outbound_ids(output: &Capture) -> Result<Vec<String>, CheckoutError> {
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
     if ids.len() > MAX_OUTBOUND_OBJECTS
         || unique.len() != ids.len()
-        || ids.iter().any(|id| !oid(id))
+        || ids.iter().any(|id| !valid_oid(id))
     {
         return Err(error(
             "landing_git_outbound_limit",
-            "outbound object count exceeds16384 or contains invalid identities",
+            "outbound object count exceeds 16384 or contains invalid identities",
         ));
     }
     Ok(ids)
@@ -693,7 +708,11 @@ fn projection_boundaries(
     old: &str,
     new: &str,
 ) -> Result<Vec<String>, CheckoutError> {
-    if !oid(old) || !oid(new) || output.code != Some(0) || output.output.len() > METADATA_LIMIT {
+    if !valid_oid(old)
+        || !valid_oid(new)
+        || output.code != Some(0)
+        || output.output.len() > METADATA_LIMIT
+    {
         return Err(invalid("private projection ancestry is unproven"));
     }
     let text = std::str::from_utf8(&output.output)
@@ -702,7 +721,7 @@ fn projection_boundaries(
     let mut boundaries = Vec::new();
     for line in text.lines() {
         let id = line.strip_prefix('-').unwrap_or(line);
-        if !oid(id) || !seen.insert(id) || seen.len() > MAX_OUTBOUND_OBJECTS {
+        if !valid_oid(id) || !seen.insert(id) || seen.len() > MAX_OUTBOUND_OBJECTS {
             return Err(invalid(
                 "private projection ancestry exceeds its identity bound",
             ));
@@ -750,7 +769,7 @@ fn outbound_sizes(ids: &[String], output: &Capture) -> Result<u64, CheckoutError
         if size > 4 * 1024 * 1024 || total > MAX_OUTBOUND_BYTES {
             return Err(error(
                 "landing_git_outbound_limit",
-                "outbound objects exceed the4MiB individual or64MiB total limit",
+                "outbound objects exceed the 4 MiB individual or 64 MiB total limit",
             ));
         }
     }
@@ -792,7 +811,7 @@ fn parse_ref(capture: &Capture, reference: &str) -> Result<RemoteRef, CheckoutEr
         .strip_suffix('\n')
         .and_then(|line| line.split_once('\t'))
         .ok_or_else(|| invalid("remote ref response is malformed"))?;
-    if name != reference || !oid(value) {
+    if name != reference || !valid_oid(value) {
         return Err(invalid("remote ref response substituted an identity"));
     }
     Ok(RemoteRef {
@@ -873,7 +892,7 @@ async fn resolve_exec_path(
     };
     let (success, output, diagnostics) = tokio::select! {
         biased;
-        () = crate::flow_exec::cancelled(cancel) => return Err(error("cancelled", "Git resolver cancelled")),
+        () = crate::flow_exec::cancelled(cancel) => return Err(error(CANCELLED, "Git resolver cancelled")),
         () = tokio::time::sleep_until(deadline.into()) => return Err(error("deadline_exceeded", "Git resolver deadline elapsed")),
         result = collect => result?,
     };
@@ -996,7 +1015,7 @@ impl GitTransport {
         validate_target(request, receipt)?;
         let reference = reference(branch)?;
         let expected_old = target.expected_old.as_deref();
-        if reference != receipt.branch || expected_old.is_some_and(|value| !oid(value)) {
+        if reference != receipt.branch || expected_old.is_some_and(|value| !valid_oid(value)) {
             return Err(invalid(
                 "push branch or old commit differs from the approved shape",
             ));
@@ -1072,8 +1091,8 @@ impl GitTransport {
             ));
         };
         if reference != request.base_ref
-            || !oid(&expected_old)
-            || !oid(merge_commit)
+            || !valid_oid(&expected_old)
+            || !valid_oid(merge_commit)
             || expected_old == merge_commit
         {
             return Err(invalid(
@@ -1338,7 +1357,7 @@ impl Session<'_> {
             if !meta.is_file() || stored > 80 * 1024 * 1024 {
                 return Err(error(
                     "landing_git_outbound_limit",
-                    "private pack exceeds its80MiB disk bound",
+                    "private pack exceeds its 80 MiB disk bound",
                 ));
             }
         }

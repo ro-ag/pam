@@ -178,15 +178,30 @@ fn pagination_refuses_invalid_bounds() {
 #[test]
 fn inspection_does_not_resolve_git_or_prior_step_outputs() {
     let flow = pam_flow::parse("schema: 1\nid: inspect\nname: Inspect\ninputs:\n  origin:\n    default: '${repo.origin}'\n  local:\n    default: '${repo.name}'\nsteps:\n  - id: status\n    run: [git, status]\n").unwrap();
-    let (vars, missing) = inspect_vars(
+    let crate::flow_contract::InspectedInputs {
+        vars,
+        missing,
+        unknown,
+    } = inspect_vars(
         &flow,
         &BTreeMap::new(),
         std::path::Path::new("/tmp/repository"),
     );
     assert_eq!(missing, ["origin"]);
+    assert!(unknown.is_empty());
     assert_eq!(vars.resolve("inputs.local").as_deref(), Some("repository"));
     assert!(vars.resolve("repo.origin").is_none());
     assert!(vars.resolve("steps.status.exit_status").is_none());
+}
+
+#[test]
+fn inspection_reports_an_undeclared_input_apart_from_a_missing_one() {
+    let flow = pam_flow::parse("schema: 1\nid: inspect\nname: Inspect\ninputs:\n  origin:\n    default: '${repo.origin}'\nsteps:\n  - id: status\n    run: [git, status]\n").unwrap();
+    let supplied = BTreeMap::from([("typo".to_owned(), "x".to_owned())]);
+    let inspected = inspect_vars(&flow, &supplied, std::path::Path::new("/tmp/repository"));
+    assert_eq!(inspected.missing, ["origin"]);
+    assert_eq!(inspected.unknown, ["typo"]);
+    assert!(inspected.vars.resolve("inputs.typo").is_none());
 }
 
 #[test]

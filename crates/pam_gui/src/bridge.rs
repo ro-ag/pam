@@ -29,6 +29,7 @@ use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
 use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
+use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
 use pam_proto::Response;
 use serde::Serialize;
 
@@ -38,11 +39,12 @@ const STATUS_DEADLINE_MS: u64 = 5_000;
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
 
-/// Deadline for the two admin ops that do real work rather than a read:
-/// `admin.models.try` runs a generation, and `admin.log.compress` runs a
-/// 64 MiB compaction plus a generation. A cold prompt on a large model
-/// decodes for minutes, not seconds, so the shared 30 s ceiling would
-/// time out a working model.
+/// Deadline for the three admin ops that do real work rather than a read:
+/// `admin.models.try` runs a generation, `admin.log.compress` runs a
+/// 64 MiB compaction plus a generation, and `admin.models.engine.install`
+/// downloads and verifies the pinned inference engine. A cold prompt on a
+/// large model decodes for minutes, not seconds, so the shared 30 s
+/// ceiling would time out a working model.
 const LONG_DEADLINE_MS: u64 = 120_000;
 
 /// Deadline for `admin.connectors.test`: the daemon gives the remote
@@ -137,10 +139,11 @@ pub fn is_known_admin_op(op: &str) -> bool {
 /// How long the bridge waits for `op`'s answer.
 ///
 /// Every admin op is synchronous request/reply inside
-/// [`ADMIN_DEADLINE_MS`], except the two that do real work: a generation
-/// (`admin.models.try`), or a 64 MiB compaction plus a generation
-/// (`admin.log.compress`). `admin.connectors.test` gets its own
-/// [`CONNECTOR_TEST_DEADLINE_MS`]: it reaches a remote service the daemon
+/// `ADMIN_DEADLINE_MS`, except the three that do real work: a generation
+/// (`admin.models.try`), a 64 MiB compaction plus a generation
+/// (`admin.log.compress`), or an engine download and verification
+/// (`admin.models.engine.install`). `admin.connectors.test` gets its own
+/// `CONNECTOR_TEST_DEADLINE_MS`: it reaches a remote service the daemon
 /// already bounds at ten seconds.
 ///
 /// `admin.flows.run` is *not* long: it answers with a ticket the moment
@@ -208,7 +211,10 @@ impl From<RequestError> for BridgeError {
             | RequestError::Connect { .. } => Self::new(
                 "daemon_unreachable",
                 detail,
-                "Check that the pam daemon can start; see ~/.pam/log/daemon.log.",
+                format!(
+                    "Check that the pam daemon can start; see {}.",
+                    daemon_log_path()
+                ),
             ),
             RequestError::Transport { .. } => Self::new(
                 "transport_failure",
@@ -270,6 +276,16 @@ pub fn expect_result(response: Response) -> Result<serde_json::Value, BridgeErro
     }
 }
 
+/// Where the daemon writes its log, under the resolved base directory
+/// (`$PAM_BASE_DIR` or `~/.pam`), for recovery lines that point at it.
+/// Falls back to the documented default when no home directory resolves.
+pub(crate) fn daemon_log_path() -> String {
+    pam_client::default_base_dir().map_or_else(
+        || format!("~/.pam/{LOG_DIR}/{LOG_FILE}"),
+        |base| base.join(LOG_DIR).join(LOG_FILE).display().to_string(),
+    )
+}
+
 /// The base directory the bridge works under (`$PAM_BASE_DIR` or
 /// `~/.pam`), shared with the CLI via `pam_client`.
 pub(crate) fn resolve_base_dir() -> Result<PathBuf, BridgeError> {
@@ -289,6 +305,9 @@ pub struct DaemonStatusReply {
     pub connected: bool,
     /// The `status` capability's result body when connected.
     pub status: Option<serde_json::Value>,
+    /// The base directory the bridge resolved (`$PAM_BASE_DIR` or
+    /// `~/.pam`), so the GUI shows the live value instead of the rule.
+    pub base_dir: String,
 }
 
 /// Daemon health for the beacon and the status views: ensures the daemon
@@ -306,14 +325,17 @@ pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
         None,
     )
     .await;
+    let base_dir = base.display().to_string();
     match sent {
         Ok(response) => Ok(DaemonStatusReply {
             connected: true,
             status: Some(expect_result(response)?),
+            base_dir,
         }),
         Err(err) if is_disconnect(&err) => Ok(DaemonStatusReply {
             connected: false,
             status: None,
+            base_dir,
         }),
         Err(err) => Err(err.into()),
     }

@@ -1,25 +1,33 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Hand, LoaderCircle } from "lucide-react";
+import { Hand } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
+import { APPROVALS_PENDING_KEY } from "../components/shell/useDaemonStatus";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import { cn } from "../lib/cn";
 import {
+  activityList,
   approvalsPending,
   approvalsResolve,
   subscribeEvents,
   toBridgeFailure,
+  type ActivityRow,
   type BridgeFailure,
   type PendingApproval,
 } from "../lib/ipc";
-import { exactTime, relativeTime } from "../lib/time";
+import { repoTail } from "../lib/repo";
+import { exactTime, relativeTime, useNow } from "../lib/time";
 
 /**
  * Approvals — the raised hand: each pending approval renders as a full card (never a table row).
- * Approve is primary; Deny stays quiet until hovered — refusing is legitimate, not shouted.
+ * Approve is primary; Deny is the outlined secondary — refusing is legitimate, not shouted.
+ * The pending list names the capability but not what will run; the card joins the request's
+ * own row from the tide (`admin.activity.list`, state `waiting_approval`) to show its args.
  * Live-ness mirrors Activity: a ~300ms trailing debounce on the daemon event stream surfaces a
  * card under a second after `approval_pending`. Resolution is optimistic — it exits on answer and
  * returns with the uniform failure shape on a bridge failure.
@@ -39,15 +47,8 @@ export const WARNING_AFTER_S = 10 * 60;
 /** How often waiting durations re-render. */
 const CLOCK_TICK_MS = 10_000;
 
-/** A ticking now, for live waiting durations without per-card timers. */
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(timer);
-  }, [intervalMs]);
-  return now;
-}
+/** How many waiting requests the card join reads from the tide. */
+const WAITING_LIMIT = 100;
 
 // --- what approving means --------------------------------------------------
 
@@ -137,24 +138,38 @@ export function waitingClock(
   return { label: `${raised} · times out in ${Math.ceil(remaining / 60)}m`, urgent: true };
 }
 
-/** Last path segment; the full path rides on the title attribute. */
-function repoTail(repo: string): string {
-  const segments = repo.split("/").filter(Boolean);
-  return segments[segments.length - 1] ?? repo;
+/**
+ * What the request will actually run, read off its recorded args: an
+ * `argv` array joins into the command line; anything else renders as one
+ * compact JSON line so the human sees the exact payload, not a paraphrase.
+ */
+export function commandLine(args: unknown): string | null {
+  if (typeof args !== "object" || args === null) return null;
+  const body = args as Record<string, unknown>;
+  const argv = body.argv ?? body.run ?? body.command;
+  if (Array.isArray(argv) && argv.every((part) => typeof part === "string")) {
+    return argv.join(" ");
+  }
+  if (typeof argv === "string") return argv;
+  const line = JSON.stringify(args);
+  return line === "{}" ? null : line;
 }
 
 // --- one raised hand -------------------------------------------------------
 
 function ApprovalCard({
   approval,
+  request,
   now,
-  resolving,
+  busy,
   failure,
   onResolve,
 }: {
   approval: PendingApproval;
+  /** The request's own tide row, when the join found it. */
+  request: ActivityRow | undefined;
   now: number;
-  resolving: "approved" | "denied" | undefined;
+  busy: boolean;
   failure: BridgeFailure | undefined;
   onResolve: (
     resolution: "approved" | "denied",
@@ -166,7 +181,8 @@ function ApprovalCard({
   const [note, setNote] = useState("");
   const meaning = approvalMeaning(approval.capability);
   const clock = waitingClock(approval.requested_ts, now);
-  const busy = resolving !== undefined;
+  const command = commandLine(request?.args);
+  const options = () => ({ remember, ...(note.trim() ? { note: note.trim() } : {}) });
 
   return (
     <Panel
@@ -212,64 +228,70 @@ function ApprovalCard({
         {meaning.after}
       </p>
 
-      {failure && (
-        <div className="space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
-          <p className="font-data text-xs text-danger">resolve failed · {failure.cause}</p>
-          <p className="font-sans text-sm text-ink">{failure.detail}.</p>
-          <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
+      <dl aria-label="what will run" className="space-y-1 font-data text-xs text-ink-muted">
+        <div className="flex gap-3">
+          <dt className="w-20 shrink-0 text-ink-faint">Command</dt>
+          <dd className="min-w-0 break-all text-ink">
+            {command ?? (request ? "no arguments recorded" : "not in the tide yet")}
+          </dd>
         </div>
-      )}
+        <div className="flex gap-3">
+          <dt className="w-20 shrink-0 text-ink-faint">Repository</dt>
+          <dd className="min-w-0 break-all">{approval.repo}</dd>
+        </div>
+      </dl>
+
+      {failure && <FailureNote failure={failure} label="resolve failed" />}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-line pt-4">
-        <Button size="sm" disabled={busy} onClick={() => onResolve("approved", { remember })}>
-          {resolving === "approved" && (
-            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-          )}
+        <Button size="sm" disabled={busy} onClick={() => onResolve("approved", options())}>
           Approve
         </Button>
         <Button
           size="sm"
-          variant="ghost"
+          variant="secondary"
           disabled={busy}
-          onClick={() => onResolve("denied", note.trim() ? { note: note.trim() } : {})}
-          className="hover:bg-danger-soft hover:text-danger active:bg-danger-soft"
+          onClick={() => onResolve("denied", options())}
         >
-          {resolving === "denied" && (
-            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-          )}
           Deny
         </Button>
-        <label className="flex cursor-pointer items-center gap-2 font-data text-xs text-ink-muted">
+        <label className="flex min-h-8 cursor-pointer items-center gap-2 font-sans text-xs text-ink-muted">
           <input
             type="checkbox"
             checked={remember}
             onChange={(event) => setRemember(event.target.checked)}
-            className="size-3.5 accent-accent-strong"
+            className="size-4.5 accent-accent-strong"
           />
-          remember this capability
+          Remember this capability
         </label>
         {!noteOpen && (
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto"
             onClick={() => setNoteOpen(true)}
-            className="ml-auto font-data text-xs text-ink-faint transition-colors duration-150 hover:text-ink"
           >
-            add note
-          </button>
+            Add note
+          </Button>
         )}
       </div>
 
       {noteOpen && (
-        <input
-          aria-label="resolution note"
-          // The ghost button just unmounted under the pointer; the field
-          // it revealed inherits the keyboard.
-          autoFocus
-          value={note}
-          onChange={(event) => setNote(event.target.value)}
-          placeholder="why — this line travels with the audit trail"
-          className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint"
-        />
+        <label className="block space-y-1">
+          <span className="block font-sans text-xs text-ink-muted">
+            Note — travels with the audit trail
+          </span>
+          <input
+            aria-label="resolution note"
+            // The ghost button just unmounted under the pointer; the field
+            // it revealed inherits the keyboard.
+            autoFocus
+            value={note}
+            onChange={(event) => setNote(event.target.value)}
+            placeholder="Why you approved or denied"
+            className={fieldClasses}
+          />
+        </label>
       )}
     </Panel>
   );
@@ -314,7 +336,13 @@ export function ApprovalsScreen() {
   const [resolving, setResolving] = useState<Record<string, "approved" | "denied">>({});
   const [failures, setFailures] = useState<Record<string, BridgeFailure>>({});
 
-  const approvals = useQuery({ queryKey: ["approvals"], queryFn: approvalsPending });
+  const approvals = useQuery({ queryKey: APPROVALS_PENDING_KEY, queryFn: approvalsPending });
+  // The waiting requests' own rows, for what each hand will run.
+  const waiting = useQuery({
+    queryKey: ["activity", "waiting"],
+    queryFn: () => activityList({ state: "waiting_approval", limit: WAITING_LIMIT }),
+    enabled: (approvals.data?.pending.length ?? 0) > 0,
+  });
 
   // Stagger the entrance only for the first load; a hand raised later
   // slides in alone, undelayed.
@@ -335,6 +363,7 @@ export function ApprovalsScreen() {
       timer = window.setTimeout(() => {
         timer = undefined;
         void queryClient.invalidateQueries({ queryKey: ["approvals"] });
+        void queryClient.invalidateQueries({ queryKey: ["activity", "waiting"] });
       }, EVENT_REFRESH_MS);
     })
       .then((stop) => {
@@ -362,10 +391,12 @@ export function ApprovalsScreen() {
         delete next[requestId];
         return next;
       });
-      await queryClient.cancelQueries({ queryKey: ["approvals"] });
-      const previous = queryClient.getQueryData<{ pending: PendingApproval[] }>(["approvals"]);
+      await queryClient.cancelQueries({ queryKey: APPROVALS_PENDING_KEY });
+      const previous = queryClient.getQueryData<{ pending: PendingApproval[] }>(
+        APPROVALS_PENDING_KEY,
+      );
       queryClient.setQueryData<{ pending: PendingApproval[] }>(
-        ["approvals"],
+        APPROVALS_PENDING_KEY,
         (old) =>
           old && { pending: old.pending.filter((hand) => hand.request_id !== requestId) },
       );
@@ -373,7 +404,7 @@ export function ApprovalsScreen() {
     },
     onError: (error, { requestId }, context) => {
       // The hand comes back, carrying the uniform failure shape inline.
-      if (context?.previous) queryClient.setQueryData(["approvals"], context.previous);
+      if (context?.previous) queryClient.setQueryData(APPROVALS_PENDING_KEY, context.previous);
       setFailures((prev) => ({ ...prev, [requestId]: toBridgeFailure(error) }));
     },
     onSettled: (_reply, _error, { requestId }) => {
@@ -408,11 +439,18 @@ export function ApprovalsScreen() {
       </PageHeader>
       <div className="page-content" role="region" aria-label="Approval queue" tabIndex={0}>
         {failure && (
-          <section className="mt-2 max-w-xl space-y-2 rounded-card border border-danger/40 bg-danger-soft p-4">
-            <p className="font-data text-xs text-danger">disconnected · {failure.cause}</p>
-            <p className="font-sans text-sm text-ink">{failure.detail}.</p>
-            <p className="font-data text-xs text-ink-muted">{failure.recovery}</p>
-          </section>
+          <div className="mt-2">
+            <FailureNote failure={failure} label="disconnected">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={approvals.isFetching}
+                onClick={() => void approvals.refetch()}
+              >
+                Retry
+              </Button>
+            </FailureNote>
+          </div>
         )}
 
         {!failure && approvals.isPending && <RaisedSkeleton />}
@@ -426,17 +464,17 @@ export function ApprovalsScreen() {
               <Hand className="size-5 text-ink-faint" />
             </span>
             <p className="max-w-md font-sans text-lg text-ink-muted">
-              No hands raised. When an agent needs your yes, it appears here first.
+              No requests are waiting for review.
             </p>
-            <p className="font-data text-xs text-ink-faint">
-              approvals resolve only in this app — no agent or CLI can answer for you
+            <p className="max-w-md font-sans text-sm text-ink-muted">
+              When an agent needs a yes, its request appears here; only this app can answer it.
             </p>
           </div>
         )}
 
         {!failure && pending.length > 0 && (
           <>
-            <ul className="max-w-4xl space-y-4">
+            <ul className="max-w-content space-y-4">
               <AnimatePresence>
                 {pending.map((hand, index) => (
                   <motion.li
@@ -455,8 +493,9 @@ export function ApprovalsScreen() {
                   >
                     <ApprovalCard
                       approval={hand}
+                      request={waiting.data?.requests.find((row) => row.id === hand.request_id)}
                       now={now}
-                      resolving={resolving[hand.request_id]}
+                      busy={resolving[hand.request_id] !== undefined}
                       failure={failures[hand.request_id]}
                       onResolve={(resolution, options) =>
                         resolve.mutate({ requestId: hand.request_id, resolution, options })

@@ -85,8 +85,9 @@ const GRACE_SECS: u64 = 5;
 
 /// `curl` as an [`HttpTransport`].
 ///
-/// Only the verified operating-system curl may execute. The constructor's
-/// path is checked against that binary; it cannot select a PATH substitute.
+/// Only the verified operating-system curl may execute: [`Self::trusted`]
+/// resolves it, and a path handed to [`Self::new`] is checked against that
+/// binary before every spawn, so nothing can select a PATH substitute.
 #[derive(Debug, Clone)]
 pub struct CurlTransport {
     curl: PathBuf,
@@ -94,9 +95,22 @@ pub struct CurlTransport {
 }
 
 impl CurlTransport {
-    /// Selects the operating-system curl. A supplied path must resolve to the
-    /// trusted system binary; bare `curl` is an explicit system selector, never
-    /// a PATH lookup. Other executables fail closed before spawning.
+    /// The transport over the operating-system curl, or the policy refusal
+    /// when this platform has no verifiable one. This is the constructor:
+    /// there is exactly one executable a transport may run, so there is
+    /// nothing for a caller to choose.
+    pub fn trusted() -> Result<Self, TransportError> {
+        Ok(Self {
+            curl: trusted_curl_path()?,
+            allow_http: false,
+        })
+    }
+
+    /// [`Self::trusted`] with the path spelled out — kept for callers that
+    /// resolved [`Self::trusted_path`] themselves. The path is still checked
+    /// against the trusted binary at spawn; bare `curl` is an explicit system
+    /// selector, never a PATH lookup, and any other executable fails closed
+    /// before spawning. New code calls [`Self::trusted`].
     #[must_use]
     pub fn new(curl: PathBuf) -> Self {
         Self {

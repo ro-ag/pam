@@ -2,7 +2,7 @@ use pam_compact::{Policy, compact, sha256_hex};
 
 use crate::evidence_view::{
     ByteRange, MAX_SEGMENTS, POLICY_VERSION, Relation, Segment, ViewError, compact_segments,
-    compose_segments, redact, resolve_segments,
+    compose_segments, redact, resolve,
 };
 
 fn span(start: usize, end: usize) -> ByteRange {
@@ -47,7 +47,7 @@ fn evidence_view_masks_headers_assignments_urls_and_pem_as_one_artifact() {
             );
         }
     }
-    resolve_segments(&view.segments, span(0, view.bytes.len())).unwrap();
+    resolve(&view.segments, span(0, view.bytes.len())).unwrap();
 }
 
 #[test]
@@ -94,8 +94,7 @@ fn evidence_view_invalid_utf8_is_preserved_without_offset_drift() {
     let view = redact(source).unwrap();
     assert_eq!(view.bytes, b"\xff token=[REDACTED]\n\xfe keep");
     assert!(std::str::from_utf8(&view.bytes).is_err());
-    let tail =
-        resolve_segments(&view.segments, span(view.bytes.len() - 4, view.bytes.len())).unwrap();
+    let tail = resolve(&view.segments, span(view.bytes.len() - 4, view.bytes.len())).unwrap();
     assert_eq!(tail[0].parent, Some(span(source.len() - 4, source.len())));
 }
 
@@ -150,7 +149,7 @@ fn evidence_view_compact_substrings_cover_full_original_records() {
     let source = b"\x1b[31merror\x1b[0m:\tbad\xff\r\n";
     let report = compact(source, Some(1), &Policy::default()).unwrap();
     let map = compact_segments(&report, source).unwrap();
-    let resolved = resolve_segments(&map, span(0, 5)).unwrap();
+    let resolved = resolve(&map, span(0, 5)).unwrap();
     assert_eq!(resolved[0].relation, Relation::CoveringRecord);
     assert_eq!(resolved[0].parent, Some(span(0, source.len())));
     let footer = map.last().unwrap();
@@ -229,13 +228,9 @@ fn evidence_view_composition_keeps_redaction_and_normalization_coarse() {
 #[test]
 fn evidence_view_rejects_invalid_range_arithmetic_and_empty_reads_resolve_empty() {
     let view = redact(b"ordinary").unwrap();
-    assert!(
-        resolve_segments(&view.segments, span(3, 3))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(resolve(&view.segments, span(3, 3)).unwrap().is_empty());
     assert_eq!(
-        resolve_segments(
+        resolve(
             &view.segments,
             ByteRange {
                 start: 0,
@@ -249,10 +244,7 @@ fn evidence_view_rejects_invalid_range_arithmetic_and_empty_reads_resolve_empty(
         parent: Some(span(0, 2)),
         relation: Relation::Identity,
     }];
-    assert_eq!(
-        resolve_segments(&bad, span(0, 1)),
-        Err(ViewError::InvalidMap)
-    );
+    assert_eq!(resolve(&bad, span(0, 1)), Err(ViewError::InvalidMap));
     let child = [Segment {
         view: span(0, 1),
         parent: Some(span(8, 9)),

@@ -51,6 +51,32 @@ pam gui                 # open the desktop control center
 Grants, approvals, and profiles are managed in the GUI (Settings › Security),
 not on the command line.
 
+## CLI surface
+
+Every subcommand the binary has; there is no raw-protocol escape hatch and no
+security command. `--json` prints the daemon's response unchanged, and every
+subcommand maps its outcome to the same exit codes: `0` success (or a ticket
+handed off), `1` transport/client failure or observation timeout, `2` usage
+error, `3` refused, `4` unresolved, `5` blocked.
+
+| Subcommand | What it does |
+| --- | --- |
+| `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). |
+| `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. |
+| `pam cancel <ticket> [--json]` | Cancels a queued or running request. |
+| `pam wait <ticket> [--timeout-ms N] [--json]` | Blocks quietly until the ticket's terminal event, then prints its durable result. Past the timeout (default 10 minutes) it exits `1` and keeps the request running; with `--json` the refusal or timeout is a `kind: refusal` object on stdout. |
+| `pam subscribe <ticket> [--timeout-ms N] [--json]` | Like `wait`, but prints each event as it streams. |
+| `pam evidence read <evidence-id> --request <ticket> [--offset N] [--length N] [--view ID --digest SHA] [--json]` | Reads one byte range of retained evidence; continue with the returned view, digest and `next_offset`. |
+| `pam flow list [--offset N] [--limit 1..=50] [--json]` | The flows this machine has: id, source, steps, name. |
+| `pam flow show <id>` | One flow's canonical YAML. |
+| `pam flow inspect <id> [key=value…] [--json]` | Inputs and readiness (including whether a model summary will be available) without running. |
+| `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. |
+| `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket. |
+| `pam service install\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
+| `pam daemon` | Runs the daemon in the foreground. |
+| `pam daemon stop` | Signals the running daemon to drain and exit. |
+| `pam gui` | Opens the desktop control center. |
+
 ## Desktop workspace
 
 - Manage flows with the visible New, Duplicate, Rename and Delete actions.
@@ -90,7 +116,7 @@ Settings › Daemon in the GUI shows the same state with Install and Remove.
 ```sh
 rustup show                          # picks up rust-toolchain.toml
 npm --prefix frontend ci             # Node 22.22.2+, 24.15+, or 26+
-tools/check.sh                       # the whole local gate: fmt, clippy, tests, eslint, tsc + vite build, vitest
+tools/check.sh                       # the whole local gate: fmt, clippy, rustdoc, tests, eslint, tsc + vite build, vitest
 npm --prefix frontend run gui:build  # embedded-frontend binary
 npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb, NSIS)
 ```
@@ -101,7 +127,7 @@ provides the native compiler; the `typescript` alias provides Microsoft's
 support the TypeScript 7 API. Keep both aliases when updating dependencies.
 
 For PAM contributors, `pam flow run pam-pr-readiness` from this repository
-runs a clean-tree assertion followed by all six gates in `tools/check.sh`.
+runs a clean-tree assertion followed by the gates in `tools/check.sh`.
 The same flow is listed as **PAM PR readiness** in the GUI. Install frontend
 dependencies first with `npm --prefix frontend ci`. Failed gates remain
 unresolved and stop dependent gates. The generic **Rust PR readiness** starter

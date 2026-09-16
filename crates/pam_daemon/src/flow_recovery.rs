@@ -13,6 +13,9 @@ use std::{collections::BTreeMap, io::Write, path::Path};
 
 pub(crate) const KIND: &str = "flow.checkpoint";
 const MAX_BYTES: usize = 1024 * 1024;
+/// Largest watch state, landing note, poll observation or verdict metadata
+/// the journal keeps inline; the 1 MiB snapshot is the only larger record.
+pub(crate) const MAX_INLINE_BYTES: usize = 16 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +199,16 @@ pub(crate) struct Recovery {
     pub watch: Option<WatchState>,
     cursor: Cursor,
 }
+/// What the runtime is about to do with a step once its attempt is journaled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prepare {
+    /// The step executes; a stateful one is journaled as effectful.
+    Run,
+    /// The step is settled as skipped (its `when` clause did not hold), so
+    /// nothing runs and nothing is journaled as effectful.
+    Skip,
+}
+
 impl Recovery {
     pub async fn open(
         store: &Store,
@@ -224,19 +237,29 @@ impl Recovery {
             origins: BTreeMap::new(),
             all_origins: Vec::new(),
         };
-        let cursor = if prior.is_none() {
-            file(store, ticket, &empty).await?
+        // The journal row is bound before its first checkpoint is filed, so
+        // a conflicting identity leaves no orphaned checkpoint row behind.
+        let (cursor, initial) = if prior.is_none() {
+            let (cursor, evidence_id) = initial_cursor(&empty)?;
+            (cursor, Some(evidence_id))
         } else {
-            "{}".to_owned()
+            ("{}".to_owned(), None)
         };
-        if matches!(
-            store
-                .begin_flow_journal(&identity, &cursor)
-                .await
-                .map_err(|_| failure())?,
-            pam_store::FlowJournalBegin::Conflict
-        ) {
-            return Err(failure());
+        match store
+            .begin_flow_journal(&identity, &cursor)
+            .await
+            .map_err(|_| failure())?
+        {
+            pam_store::FlowJournalBegin::Conflict => return Err(failure()),
+            pam_store::FlowJournalBegin::Inserted => {
+                if let Some(evidence_id) = initial {
+                    store
+                        .insert_evidence(&evidence_id, ticket, KIND, &encode(&empty)?, None)
+                        .await
+                        .map_err(|_| failure())?;
+                }
+            }
+            pam_store::FlowJournalBegin::Existing => {}
         }
         let row = store
             .read_flow_journal(ticket)
@@ -271,12 +294,15 @@ impl Recovery {
             snapshot,
         ))
     }
+    /// Commits the intent to attempt `step` before any I/O. A
+    /// [`Prepare::Run`] of a stateful step is journaled as effectful; a
+    /// [`Prepare::Skip`] never is, whatever the step declares.
     pub async fn prepare(
         &mut self,
         store: &Store,
         ticket: &str,
         step: &pam_flow::Step,
-        will_run: bool,
+        prepare: Prepare,
     ) -> Result<(), CapabilityFailure> {
         if !store
             .prepare_flow_attempt(
@@ -284,7 +310,7 @@ impl Recovery {
                 self.revision,
                 &step.id,
                 1,
-                will_run && step.effect == pam_flow::Effect::Stateful,
+                prepare == Prepare::Run && step.effect == pam_flow::Effect::Stateful,
             )
             .await
             .map_err(|_| failure())?
@@ -301,7 +327,7 @@ impl Recovery {
         watch: WatchState,
         evidence: &[String],
     ) -> Result<(), CapabilityFailure> {
-        if encode(&watch)?.len() > 16 * 1024 {
+        if encode(&watch)?.len() > MAX_INLINE_BYTES {
             return Err(failure());
         }
         let cursor = Cursor {
@@ -411,7 +437,7 @@ impl Cursor {
         flow: &Flow,
     ) -> Result<(), CapabilityFailure> {
         if let Some(watch) = &self.watch {
-            if encode(watch)?.len() > 16 * 1024
+            if encode(watch)?.len() > MAX_INLINE_BYTES
                 || flow
                     .steps
                     .get(self.next_step)
@@ -452,16 +478,25 @@ async fn file(
     snapshot: &Snapshot,
 ) -> Result<String, CapabilityFailure> {
     let bytes = encode(snapshot)?;
-    let evidence_id = format!("ev_{}", ulid::Ulid::new());
+    let (cursor, evidence_id) = initial_cursor(snapshot)?;
     store
         .insert_evidence(&evidence_id, ticket, KIND, &bytes, None)
         .await
         .map_err(|_| failure())?;
-    serde_json::to_string(&Cursor {
-        evidence_id,
+    Ok(cursor)
+}
+/// A cursor at `snapshot`'s progress naming a fresh checkpoint evidence id
+/// that the caller files; encoding is checked first so an oversized
+/// snapshot refuses before any row is written.
+fn initial_cursor(snapshot: &Snapshot) -> Result<(String, String), CapabilityFailure> {
+    encode(snapshot)?;
+    let evidence_id = format!("ev_{}", ulid::Ulid::new());
+    let cursor = serde_json::to_string(&Cursor {
+        evidence_id: evidence_id.clone(),
         next_step: snapshot.reports.len(),
         watch: None,
         last_watch_evidence: None,
     })
-    .map_err(|_| failure())
+    .map_err(|_| failure())?;
+    Ok((cursor, evidence_id))
 }

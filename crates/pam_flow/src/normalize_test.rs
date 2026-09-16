@@ -121,10 +121,10 @@ fn a_stateful_step_keeps_its_forced_approval_visible() {
 
 #[test]
 fn an_empty_description_and_empty_maps_disappear() {
-    let yaml = "schema: 1\nid: demo\nname: Demo\ndescription: ''\nsteps:\n  - id: a\n    connector: aws\n    call: commands\n";
+    let yaml = "schema: 1\nid: demo\nname: Demo\ndescription: ''\nsteps:\n  - id: a\n    connector: jenkins\n    call: jobs\n";
     assert_eq!(
         normalized(yaml),
-        "schema: 1\nid: demo\nname: Demo\nsteps:\n- id: a\n  connector: aws\n  call: commands\n"
+        "schema: 1\nid: demo\nname: Demo\nsteps:\n- id: a\n  connector: jenkins\n  call: jobs\n"
     );
 }
 

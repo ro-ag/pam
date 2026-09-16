@@ -5,7 +5,7 @@
 //! here.
 
 #[path = "evidence_views.rs"]
-mod evidence_views;
+pub(crate) mod evidence_views;
 #[path = "request_budget.rs"]
 mod request_budget;
 pub use request_budget::*;
@@ -42,9 +42,10 @@ use crate::migrations;
 /// passes `None`.
 pub const DEFAULT_REQUEST_LIST_LIMIT: u64 = 100;
 
-/// Hard upper bound on [`Store::list_requests_filtered`]'s `limit`; a
-/// larger request is clamped, keeping the activity query bounded.
-pub const MAX_REQUEST_LIST_LIMIT: u64 = 500;
+/// Hard upper bound on the `limit` of [`Store::list_requests_filtered`]
+/// and [`Store::list_model_jobs`]; a larger request is clamped, keeping
+/// every list query bounded.
+pub const MAX_LIST_LIMIT: u64 = 500;
 
 /// Fixed startup subsets; never interpolate caller-supplied SQL predicates.
 #[derive(Clone, Copy)]
@@ -539,19 +540,14 @@ pub struct Store {
     /// Keeps the database itself alive alongside the connection.
     _db: Database,
     pub(crate) conn: Connection,
-    /// Serializes [`Store::finish_request`] transactions: the connection
-    /// is shared across tasks, and a statement issued between another
-    /// task's `BEGIN` and `COMMIT` would join that transaction. Only
-    /// `finish_request` opens transactions at runtime, so only it takes
-    /// this lock.
     /// Serializes every statement on `conn`. turso refuses concurrent use
     /// of one connection outright (`Misuse("concurrent use forbidden")`),
     /// and the daemon drives this store from many tasks at once —
     /// executor, dispatcher, reaper, admin. Each method holds the lock for
-    /// its statements; [`Self::finish_request`] holds it across its whole
-    /// `BEGIN`..`COMMIT` window so no other statement can join or break
-    /// the transaction.
-    conn_lock: tokio::sync::Mutex<()>,
+    /// its statements; the transactional methods ([`Self::finish_request`]
+    /// and the pruners) hold it across their whole `BEGIN`..`COMMIT`
+    /// window so no other statement can join or break the transaction.
+    pub(crate) conn_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -659,6 +655,7 @@ impl Store {
 
     /// Records pre-gate admission as running, with a durable absolute deadline
     /// and the grant-revocation revision captured atomically with insertion.
+    // One request row = one INSERT: every column the row needs at birth is an argument.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_admitted_request(
         &self,
@@ -802,6 +799,7 @@ impl Store {
     }
 
     // Keep the six public insertion fields intact; only the initial state differs.
+    // One request row = one INSERT: the arity is the row's column count, not a design choice.
     #[allow(clippy::too_many_arguments)]
     async fn insert_request_in_state(
         &self,
@@ -880,65 +878,6 @@ impl Store {
                     Self::REQUEST_COLUMNS
                 ),
                 params![id],
-            )
-            .await?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(Self::parse_request_row(&row)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Finds the oldest in-flight request carrying `idempotency_key`.
-    ///
-    /// In-flight means state `queued`, `running`, or `waiting_approval`;
-    /// terminal requests never match, so a retried key after completion
-    /// starts a fresh execution. Used by the queue manager's dedupe check.
-    pub async fn find_inflight_by_key(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {} FROM request
-                     WHERE idempotency_key = ?1
-                       AND state IN ('queued','running','waiting_approval')
-                     ORDER BY created_ts, id LIMIT 1",
-                    Self::REQUEST_COLUMNS
-                ),
-                params![idempotency_key],
-            )
-            .await?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(Self::parse_request_row(&row)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Finds the oldest in-flight request with the same shape: equal
-    /// `capability`, `repo`, and `args_json` (byte equality of the JSON
-    /// text). Fallback dedupe for envelopes without an idempotency key;
-    /// matches regardless of whether the in-flight request carries one.
-    pub async fn find_inflight_by_shape(
-        &self,
-        capability: &str,
-        repo: &str,
-        args_json: &str,
-    ) -> Result<Option<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {} FROM request
-                     WHERE capability = ?1 AND repo = ?2 AND args_json = ?3
-                       AND state IN ('queued','running','waiting_approval')
-                     ORDER BY created_ts, id LIMIT 1",
-                    Self::REQUEST_COLUMNS
-                ),
-                params![capability, repo, args_json],
             )
             .await?;
         match rows.next().await? {
@@ -1094,20 +1033,21 @@ impl Store {
     /// `failed`) must go through [`Self::finish_request`], which writes
     /// the state and its audit row in one transaction — every terminal
     /// state gets its own audit row, with no crash window in between and
-    /// no silent paths. No code path may call this helper with a terminal
-    /// state; a `debug_assert` enforces it as far as the type system
-    /// cannot.
+    /// no silent paths. A terminal `state` here is refused with
+    /// [`StoreError::TerminalTransition`] before any write, in every
+    /// build.
     pub async fn update_request_state(
         &self,
         id: &str,
         state: RequestState,
         outcome: Option<&str>,
     ) -> Result<(), StoreError> {
+        if state.is_terminal() {
+            return Err(StoreError::TerminalTransition {
+                state: state.as_str(),
+            });
+        }
         let _guard = self.conn_lock.lock().await;
-        debug_assert!(
-            !state.is_terminal(),
-            "terminal transitions must go through finish_request"
-        );
         let changed = self
             .conn
             .execute(
@@ -1151,21 +1091,10 @@ impl Store {
         }
         let _guard = self.conn_lock.lock().await;
         self.conn.execute("BEGIN", ()).await?;
+        // COMMIT on both `Ok` outcomes: the no-op path wrote nothing of
+        // its own, so committing it is free and keeps one exit path.
         let finished = self.finish_request_in_txn(id, state, outcome, audit).await;
-        match finished {
-            // COMMIT on both outcomes: the no-op path wrote nothing of
-            // its own, and a concurrent statement that joined the
-            // transaction window must not be rolled back with it.
-            Ok(finished) => {
-                self.conn.execute("COMMIT", ()).await?;
-                Ok(finished)
-            }
-            Err(err) => {
-                // Best effort: the returned error is the one that matters.
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                Err(err)
-            }
-        }
+        self.end_txn(finished).await
     }
 
     /// The statements inside [`Self::finish_request`]'s transaction.
@@ -1468,7 +1397,7 @@ impl Store {
     /// `repo`, `caller_agent`, and/or `state` — the GUI's activity feed.
     ///
     /// `limit` defaults to [`DEFAULT_REQUEST_LIST_LIMIT`] and is clamped
-    /// into `1..=`[`MAX_REQUEST_LIST_LIMIT`], so the query stays bounded
+    /// into `1..=`[`MAX_LIST_LIMIT`], so the query stays bounded
     /// no matter what the caller asks for.
     ///
     /// `hide_probes` drops the observatory's own traffic — every
@@ -1487,7 +1416,7 @@ impl Store {
         let _guard = self.conn_lock.lock().await;
         let limit = limit
             .unwrap_or(DEFAULT_REQUEST_LIST_LIMIT)
-            .clamp(1, MAX_REQUEST_LIST_LIMIT);
+            .clamp(1, MAX_LIST_LIMIT);
         let mut clauses: Vec<String> = Vec::new();
         let mut args: Vec<String> = Vec::new();
         for (column, value) in [
@@ -1825,10 +1754,10 @@ impl Store {
     }
 
     /// The most recent model jobs, newest first, bounded by `limit`
-    /// (clamped into `1..=`[`MAX_REQUEST_LIST_LIMIT`]).
+    /// (clamped into `1..=`[`MAX_LIST_LIMIT`]).
     pub async fn list_model_jobs(&self, limit: u64) -> Result<Vec<ModelJobRow>, StoreError> {
         let _guard = self.conn_lock.lock().await;
-        let limit = limit.clamp(1, MAX_REQUEST_LIST_LIMIT);
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
         let mut rows = self
             .conn
             .query(
@@ -2178,13 +2107,19 @@ impl Store {
 
     /// Closes an open transaction around `result`: `COMMIT` when the
     /// statements succeeded, best-effort `ROLLBACK` when they did not —
-    /// the original error is the one worth returning.
+    /// the original error is the one worth returning. A `COMMIT` that
+    /// fails is rolled back the same way: the caller holds
+    /// [`Self::conn_lock`], and a transaction left open on the shared
+    /// connection would swallow every later statement into it.
     async fn end_txn<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
         match result {
-            Ok(value) => {
-                self.conn.execute("COMMIT", ()).await?;
-                Ok(value)
-            }
+            Ok(value) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(value),
+                Err(err) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(err.into())
+                }
+            },
             Err(err) => {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
                 Err(err)

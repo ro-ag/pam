@@ -1,18 +1,26 @@
-import type { ButtonHTMLAttributes } from "react";
+import type { ButtonHTMLAttributes, Ref } from "react";
 import { cn, cva, type VariantProps } from "../../lib/cn";
 
 /**
- * Button — one accent per theme, so one primary per view. Ghost buttons are
- * furniture; danger buttons stay quiet (soft fill, firm ink) because PAM's
- * destructive actions confirm and explain rather than shout.
+ * Button — one accent per theme, so one primary per view. The rule for
+ * picking a variant: `primary` is the one main action of a card or form,
+ * `secondary` (outlined) is any other action with an effect, `ghost` is
+ * inline low-emphasis furniture (toolbars, links-as-buttons), and
+ * `danger` stays quiet (soft fill, firm ink) because PAM's destructive
+ * actions confirm and explain rather than shout.
+ *
+ * Disabled states keep at least 3:1: a disabled primary drops its
+ * gradient for a muted solid fill (ink-muted on inset, 5:1 in every
+ * palette) and the others fade to 70%, which the measured palettes keep
+ * above 3:1. Pair a disabled button with a `title` saying why.
  */
 export const buttonVariants = cva(
-  "inline-flex shrink-0 select-none items-center justify-center gap-2 rounded-control font-sans font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+  "inline-flex shrink-0 select-none items-center justify-center gap-2 rounded-control font-sans font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-70",
   {
     variants: {
       variant: {
         primary:
-          "action-control border border-control-line bg-accent-strong text-on-accent hover:bg-accent-hover active:bg-accent-pressed",
+          "action-control border border-control-line bg-accent-strong text-on-accent hover:bg-accent-hover active:bg-accent-pressed disabled:border-line-strong disabled:bg-inset disabled:text-ink-muted disabled:opacity-100",
         secondary:
           "field-control border border-control-line bg-surface-raised text-ink hover:bg-accent-soft",
         ghost: "text-ink-muted hover:bg-accent-soft hover:text-ink active:bg-accent-soft",
@@ -32,11 +40,12 @@ export const buttonVariants = cva(
 );
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> &
-  VariantProps<typeof buttonVariants>;
+  VariantProps<typeof buttonVariants> & { ref?: Ref<HTMLButtonElement> };
 
-export function Button({ variant, size, className, type, ...props }: ButtonProps) {
+export function Button({ variant, size, className, type, ref, ...props }: ButtonProps) {
   return (
     <button
+      ref={ref}
       type={type ?? "button"}
       className={cn(buttonVariants({ variant, size }), className)}
       {...props}

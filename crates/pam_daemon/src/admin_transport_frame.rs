@@ -64,13 +64,37 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let envelope: Envelope = serde_json::from_slice(&payload).map_err(invalid)?;
     validate_envelope(&envelope)?;
     let response = answer(&envelope, admin, phase).await;
-    let encoded = serde_json::to_vec(&response).map_err(invalid)?;
+    let encoded = encode_reply(&envelope.id, &response)?;
     tokio::time::timeout(
         HEADER_TIMEOUT,
         write_frame(stream, &encoded, MAX_RESPONSE_BYTES),
     )
     .await
     .map_err(|_| timed_out())?
+}
+
+/// Refusal cause for a reply that outgrew [`MAX_RESPONSE_BYTES`].
+pub(super) const CAUSE_RESPONSE_TOO_LARGE: &str = "admin_response_too_large";
+
+/// Encodes the reply to `request_id` for the wire. A reply larger than
+/// [`MAX_RESPONSE_BYTES`] is replaced by a small refusal naming the request:
+/// the op has already executed and been audited by now, so the client must
+/// learn *that* rather than see the frame write fail as a transport error.
+pub(super) fn encode_reply(request_id: &str, response: &Response) -> io::Result<Vec<u8>> {
+    let encoded = serde_json::to_vec(response).map_err(invalid)?;
+    if encoded.len() <= MAX_RESPONSE_BYTES {
+        return Ok(encoded);
+    }
+    let refusal = Response::Refusal {
+        id: request_id.to_owned(),
+        cause: CAUSE_RESPONSE_TOO_LARGE.to_owned(),
+        detail: format!(
+            "the reply to {request_id} is {} bytes, over the {MAX_RESPONSE_BYTES}-byte admin frame budget; the operation itself completed",
+            encoded.len()
+        ),
+        recovery: "Ask for less at a time (a smaller limit or max_bytes) and inspect the audit row for what the operation did.".to_owned(),
+    };
+    serde_json::to_vec(&refusal).map_err(invalid)
 }
 
 /// The client half once the peer is admitted: send the envelope, read the reply,

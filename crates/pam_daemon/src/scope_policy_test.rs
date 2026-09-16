@@ -653,3 +653,62 @@ async fn sharepoint_scope_revocation_after_membership_blocks_item_download() {
     assert_eq!(error.cause(), CAUSE_SCOPE_DENIED);
     assert_eq!(transport.inner.requests().len(), 2);
 }
+
+/// The lane-backed twins decide exactly as the synchronous checks do: same
+/// canonical root, same refusals for a nested directory, a relative path
+/// and a directory outside the policy.
+#[tokio::test]
+async fn the_blocking_twins_agree_with_the_synchronous_checks() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let scope = policy(root.path(), ConnectorId::Github, &["octo/repo"]);
+    let normalized = ScopePolicy {
+        version: 1,
+        repositories: vec![RepositoryScope {
+            root: root.path().to_path_buf(),
+            connectors: Vec::new(),
+        }],
+    }
+    .normalize_blocking()
+    .await
+    .expect("valid policy");
+    assert_eq!(
+        normalized.repositories[0].root,
+        root.path().canonicalize().unwrap()
+    );
+    assert_eq!(
+        scope.authorize_repo_blocking(root.path()).await.unwrap(),
+        scope.authorize_repo(root.path()).unwrap()
+    );
+    for denied in [
+        nested.as_path(),
+        Path::new("."),
+        Path::new("/nowhere/pam/does/not/exist"),
+    ] {
+        assert_eq!(
+            scope
+                .authorize_repo_blocking(denied)
+                .await
+                .unwrap_err()
+                .cause(),
+            scope.authorize_repo(denied).unwrap_err().cause(),
+            "{}",
+            denied.display()
+        );
+    }
+    let canonical = scope.authorize_repo_blocking(root.path()).await.unwrap();
+    let mut args = BTreeMap::new();
+    args.insert("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()));
+    assert!(
+        scope
+            .authorize_connector_at(&canonical, ConnectorId::Github, BASE, "runs", &args)
+            .is_ok()
+    );
+    assert!(
+        scope
+            .authorize_connector_at(&nested, ConnectorId::Github, BASE, "runs", &args)
+            .is_err(),
+        "a root that is not approved is refused even when handed in canonical form"
+    );
+}

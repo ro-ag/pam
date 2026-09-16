@@ -8,6 +8,7 @@ use super::{
 use crate::{
     connector_service::{ConfigurePatch, CredentialAction},
     daemon::CompletionRouter,
+    flow_recovery::Prepare,
     model_service::ModelService,
     queue::QueueManager,
     secrets::{FakeSecretBackend, SecretStore},
@@ -355,7 +356,9 @@ impl Fixture {
                 ConfigurePatch {
                     enabled: Some(true),
                     base_url: Some(Some(SERVER.into())),
-                    credential: Some(CredentialAction::Set("fixture-token".into())),
+                    credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                        "fixture-token".into(),
+                    ))),
                     ..ConfigurePatch::default()
                 },
             )
@@ -482,7 +485,7 @@ impl Fixture {
             }
             state
                 .recovery
-                .prepare(&self.ctx.store, &self.ctx.request_id, step, true)
+                .prepare(&self.ctx.store, &self.ctx.request_id, step, Prepare::Run)
                 .await
                 .unwrap();
             let report = state.run_step(step).await.unwrap();

@@ -23,14 +23,16 @@
 //!   is held across check-then-insert so concurrent admissions cannot both miss the check.
 //! - **Leases**: [`QueueManager::take_next`] marks the request `running` with a deadline from
 //!   `deadline_ms`, clamped to [`MAX_LEASE`]. An expired lease is reaped
-//!   ([`QueueManager::reap_expired`], driven by [`QueueManager::run_reaper`]): terminal
+//!   (`QueueManager::reap_expired_notifying`, driven by [`QueueManager::run_reaper`]): terminal
 //!   `failed`/[`CAUSE_LEASE_EXPIRED`], audited ([`ACTION_LEASE_REAPED`], decision `timeout`, actor
 //!   `system`), the holder's cancel signal fires, and the lane is freed.
 //! - **Cancellation**: [`QueueManager::cancel`] serves `pam cancel <ticket>` and the GUI, acting as
-//!   the caller-supplied [`Actor`] (the CLI passes the identity the pipeline assigned the ticket holder, the GUI [`Actor::Human`]). A queued request is removed from
-//!   its lane and terminal `failed`/[`CAUSE_CANCELLED`], audited ([`ACTION_CANCEL`], `deny`). A
-//!   running request is signalled cooperatively via the lease's cancel signal; its terminal
-//!   write/audit happen through [`QueueManager::complete`].
+//!   the caller-supplied [`Actor`]: the audit vocabulary has no per-agent identity, so the `cancel`
+//!   capability passes [`Actor::Human`] when the GUI asked (caller agent `pam-gui`) and
+//!   [`Actor::System`] for an agent's `pam cancel`; the drain at shutdown passes [`Actor::System`].
+//!   A queued request is removed from its lane and terminal `failed`/[`CAUSE_CANCELLED`], audited
+//!   ([`ACTION_CANCEL`], `deny`). A running request is signalled cooperatively via the lease's
+//!   cancel signal; its terminal write/audit happen through [`QueueManager::complete`].
 //! - **Audit invariant**: every terminal transition the queue performs — queued-cancellation, lease
 //!   reaping, executor completion via [`QueueManager::complete`] — goes through
 //!   [`Store::finish_request`], the choke point writing terminal state + audit row in one
@@ -77,6 +79,11 @@ pub const ACTION_CANCEL: &str = "cancel";
 
 /// `audit.action` for a lease the reaper collected.
 pub const ACTION_LEASE_REAPED: &str = "lease_reaped";
+
+/// `audit.action` for a queued row boot recovery refused to restore
+/// (`authorization_changed`, `admission_invalid`, `queue_recovery_limit`):
+/// nothing timed out, so it is not a reaped lease.
+pub const ACTION_RECOVERY_REFUSAL: &str = "recovery_refusal";
 
 /// What [`QueueManager::admit`] did with a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,16 +337,11 @@ impl QueueManager {
     }
 
     /// Places an admitted (and gate-allowed) request onto `repo`'s lane,
-    /// preserving the expiry recorded at admission. The deadline argument cannot
+    /// preserving the expiry recorded at admission; nothing at placement can
     /// extend it. Returns the number of requests already waiting
     /// ahead of it (0 = lane head; a currently leased request is not
     /// counted).
-    pub async fn place_in_lane(
-        &self,
-        request_id: &str,
-        repo: &str,
-        _deadline_ms: u64,
-    ) -> Result<usize, QueueError> {
+    pub async fn place_in_lane(&self, request_id: &str, repo: &str) -> Result<usize, QueueError> {
         let mut inner = self.inner.lock().await;
         let row = self
             .store
@@ -661,7 +663,10 @@ impl QueueManager {
     /// request becomes terminal `failed` (cause [`CAUSE_LEASE_EXPIRED`]),
     /// an audit row is written (action [`ACTION_LEASE_REAPED`], decision
     /// `timeout`, actor `system`), the holder's cancel signal fires, and
-    /// the lane is freed. Returns the reaped request ids.
+    /// the lane is freed. Returns the reaped request ids. Test-only: the
+    /// daemon reaps through [`Self::reap_expired_notifying`], which also
+    /// parks the terminal for the executor loop to finish.
+    #[cfg(test)]
     pub async fn reap_expired(&self, now: Instant) -> Result<Vec<String>, QueueError> {
         let mut inner = self.inner.lock().await;
         let expired: Vec<String> = inner
@@ -744,8 +749,10 @@ impl QueueManager {
         Ok(count)
     }
 
-    /// Spawns the background reaper: calls [`Self::reap_expired`] every
-    /// `interval` until `shutdown` changes (or its sender drops).
+    /// Spawns the background reaper: every `interval` until `shutdown`
+    /// changes (or its sender drops), reaps expired leases through
+    /// `Self::reap_expired_notifying` and wakes parked watches that are
+    /// due through [`Self::wake_due`].
     ///
     /// A store failure during one sweep is swallowed and retried on the
     /// next tick — the daemon's tracing setup (a later task) will log it.
@@ -853,7 +860,7 @@ impl QueueManager {
                 RequestState::Failed,
                 Some(cause),
                 AuditEntry {
-                    action: ACTION_LEASE_REAPED,
+                    action: ACTION_RECOVERY_REFUSAL,
                     decision: Decision::Refuse,
                     actor: Actor::System,
                     detail: Some(cause),

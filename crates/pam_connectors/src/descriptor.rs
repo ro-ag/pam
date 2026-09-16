@@ -47,18 +47,14 @@ pub struct Descriptor {
 ///
 /// Lazy rather than `static`, only because [`connector_calls`] is a plain
 /// function: the table it returns is itself `'static`, so nothing is copied.
+/// Callers that want them all iterate [`ConnectorId::ALL`] through
+/// [`descriptor`]; the daemon lists connectors from its own rows.
 static DESCRIPTORS: LazyLock<[Descriptor; 7]> = LazyLock::new(|| ConnectorId::ALL.map(build));
 
 /// Everything pam knows about one connector.
 #[must_use]
 pub fn descriptor(id: ConnectorId) -> &'static Descriptor {
     &DESCRIPTORS[index_of(id)]
-}
-
-/// Every descriptor, in the order the GUI lists connectors.
-#[must_use]
-pub fn descriptors() -> &'static [Descriptor; 7] {
-    &DESCRIPTORS
 }
 
 /// Where a connector sits in [`ConnectorId::ALL`].

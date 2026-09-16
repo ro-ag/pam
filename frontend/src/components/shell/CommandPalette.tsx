@@ -16,12 +16,37 @@ type Destination = {
 };
 
 const pages: Destination[] = [
-  { id: "home", label: "Home", detail: "Page · Ask Pam", to: "/" },
-  { id: "activity", label: "Activity", detail: "Page · Runs and evidence", to: "/activity" },
-  { id: "approvals", label: "Approvals", detail: "Page · Pending decisions", to: "/approvals" },
-  { id: "flows", label: "Flows", detail: "Page · CLI-callable actions", to: "/flows" },
-  { id: "models", label: "Models", detail: "Page · Local model library", to: "/models" },
-  { id: "settings", label: "Settings", detail: "Page · Your preferences", to: "/settings" },
+  { id: "home", label: "Home", detail: "Page · Ask about your local workspace", to: "/" },
+  {
+    id: "activity",
+    label: "Activity",
+    detail: "Page · Agent requests, results and evidence",
+    to: "/activity",
+  },
+  {
+    id: "approvals",
+    label: "Approvals",
+    detail: "Page · Review agent requests before they run",
+    to: "/approvals",
+  },
+  {
+    id: "flows",
+    label: "Flows",
+    detail: "Page · Reusable workflows and execution history",
+    to: "/flows",
+  },
+  {
+    id: "models",
+    label: "Models",
+    detail: "Page · Local models, runtime and downloads",
+    to: "/models",
+  },
+  {
+    id: "settings",
+    label: "Settings",
+    detail: "Page · Your machine, your defaults",
+    to: "/settings",
+  },
   ...[
     "Appearance",
     "Security",
@@ -43,10 +68,21 @@ const pages: Destination[] = [
 /** Navigation only: selecting a flow never executes it or changes its definition. */
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
 
+  // Whatever had focus when the palette opened, or the trigger button when
+  // nothing did — a WebKit mouse click never focuses a button, so the
+  // active element would otherwise be the body and Escape would drop
+  // focus on the floor.
+  function remember() {
+    const active = document.activeElement;
+    returnFocus.current =
+      active instanceof HTMLElement && active !== document.body ? active : trigger.current;
+  }
+
   function show() {
-    returnFocus.current = document.activeElement as HTMLElement | null;
+    remember();
     setOpen(true);
   }
 
@@ -62,7 +98,7 @@ export function CommandPalette() {
       // Do not steal shortcuts from another modal (or an editor inside one).
       if (document.querySelector('dialog[open], [aria-modal="true"]')) return;
       event.preventDefault();
-      returnFocus.current = document.activeElement as HTMLElement | null;
+      remember();
       setOpen(true);
     }
     document.addEventListener("keydown", shortcut);
@@ -71,7 +107,13 @@ export function CommandPalette() {
 
   return (
     <>
-      <Button variant="ghost" size="sm" onClick={show} aria-label="Open command palette">
+      <Button
+        ref={trigger}
+        variant="ghost"
+        size="sm"
+        onClick={show}
+        aria-label="Open command palette"
+      >
         <Search size={14} aria-hidden="true" />
         <span className="hidden sm:inline">Jump to…</span>
         <kbd className="hidden font-data text-xs text-ink-faint sm:inline">

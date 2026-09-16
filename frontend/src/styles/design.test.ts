@@ -31,6 +31,7 @@ const SEMANTIC_COLORS = [
   "ink-faint",
   // hairlines
   "line",
+  "line-strong",
   "edge",
   "control-line",
   "flow-edge",
@@ -62,6 +63,7 @@ const SEMANTIC_COLORS = [
   // interaction furniture
   "focus",
   "overlay",
+  "minimap-mask",
 ] as const;
 
 const SEMANTIC_SHADOWS = ["raise", "float"] as const;
@@ -316,6 +318,89 @@ function luminance(hex: string): number {
   });
   return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
 }
+
+function contrast(a: string, b: string): number {
+  const [x, y] = [luminance(a), luminance(b)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+
+describe("contrast floors", () => {
+  const palettes = THEME_COMBOS.map(
+    (theme) => [theme, declarationsOf(blockOf(themesCss, theme))] as const,
+  );
+
+  it("keeps ink-faint readable as small text on both working surfaces", () => {
+    for (const [theme, p] of palettes) {
+      for (const ground of ["--pam-surface", "--pam-surface-raised"]) {
+        expect(
+          contrast(p["--pam-ink-faint"], p[ground]),
+          `${theme} ink-faint on ${ground}`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+      expect(p["--pam-ink-faint"], `${theme} ink-faint is its own value`).not.toBe(
+        p["--pam-ink-muted"],
+      );
+    }
+  });
+
+  it("keeps line-strong, and the light-mode edge, at 3:1 as a card's only boundary", () => {
+    for (const [theme, p] of palettes) {
+      for (const ground of ["--pam-surface", "--pam-surface-raised", "--pam-chrome"]) {
+        expect(
+          contrast(p["--pam-line-strong"], p[ground]),
+          `${theme} line-strong on ${ground}`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+      if (theme.includes("light")) {
+        expect(
+          contrast(p["--pam-edge"], p["--pam-surface"]),
+          `${theme} edge on surface`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    }
+  });
+
+  it("gives warning a hue that still reads on the surface and on its soft fill", () => {
+    for (const [theme, p] of palettes) {
+      expect(
+        contrast(p["--pam-warning"], p["--pam-surface"]),
+        `${theme} warning on surface`,
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrast(p["--pam-warning"], p["--pam-warning-soft"]),
+        `${theme} warning on soft`,
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(p["--pam-warning"], `${theme} warning is not the ink`).not.toBe(p["--pam-ink"]);
+    }
+  });
+
+  it("keeps on-accent legible on accent-strong, the only accent a filled control pairs it with", () => {
+    for (const [theme, p] of palettes) {
+      expect(
+        contrast(p["--pam-on-accent"], p["--pam-accent-strong"]),
+        `${theme} on-accent`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    // Dark Ventisquero's bare accent is a text color; nothing may set it as a
+    // ground under on-accent (1.4:1 there).
+    expect(buttonVariants({ variant: "primary" })).toContain("bg-accent-strong");
+    expect(buttonVariants({ variant: "primary" })).not.toMatch(/(^|\s)bg-accent(\s|$)/);
+  });
+
+  it("keeps disabled controls at 3:1: a muted solid primary, 70% for the rest", () => {
+    const primary = buttonVariants({ variant: "primary" });
+    expect(primary).toContain("disabled:bg-inset");
+    expect(primary).toContain("disabled:text-ink-muted");
+    expect(primary).toContain("disabled:opacity-100");
+    for (const [theme, p] of palettes) {
+      expect(
+        contrast(p["--pam-ink-muted"], p["--pam-inset"]),
+        `${theme} disabled primary`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(buttonVariants({ variant: "ghost" })).toContain("disabled:opacity-70");
+  });
+});
 
 it("keeps every semantic flow edge above 3:1 on the actual opaque canvas in all themes", () => {
   expect(tokensCss).toContain("--color-flow-edge: var(--pam-ink-muted)");

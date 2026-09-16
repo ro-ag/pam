@@ -75,7 +75,7 @@ fn prepare_sync(
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let program = resolve_program(program, &settings.extra_path_dirs(), &inherited)
         .ok_or_else(|| invalid("The check program is unavailable on this workstation."))?;
-    let mut containment = command_boundary(protected, tree, &program, false);
+    let mut containment = command_boundary(protected, tree, &program, pam_flow::Effect::ReadOnly);
     containment
         .read_only_roots
         .extend(policy.read_cache_roots.iter().cloned());

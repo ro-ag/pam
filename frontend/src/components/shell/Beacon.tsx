@@ -1,31 +1,44 @@
 import { cn, cva, type VariantProps } from "../../lib/cn";
 
-/** Static daemon indicator with a visible state label and a material pending marker. */
-export type BeaconState = "connected" | "pending" | "down";
+/**
+ * Static daemon indicator with a visible state label and a material
+ * pending marker. "connecting" is the honest first frame: nothing has
+ * answered yet, so the beacon neither claims a daemon nor mourns one.
+ */
+export type BeaconState = "connecting" | "connected" | "pending" | "down";
 
 const beaconLabels: Record<BeaconState, string> = {
+  connecting: "daemon connecting",
   connected: "daemon connected",
   pending: "daemon approval pending",
   down: "daemon unreachable",
 };
 
+const beaconWords: Record<BeaconState, string> = {
+  connecting: "Connecting",
+  connected: "Connected",
+  pending: "Awaiting review",
+  down: "Offline",
+};
+
 const beaconVariants = cva("rounded-pill", {
   variants: {
     state: {
+      connecting: "bg-line-strong",
       connected: "bg-beacon-green",
       pending: "warm-marker bg-beacon-amber",
       down: "bg-beacon-red",
     },
   },
   defaultVariants: {
-    state: "down",
+    state: "connecting",
   },
 });
 
 type BeaconProps = VariantProps<typeof beaconVariants> & { className?: string };
 
 export function Beacon({ state, className }: BeaconProps) {
-  const resolved: BeaconState = state ?? "down";
+  const resolved: BeaconState = state ?? "connecting";
   return (
     <span
       role="status"
@@ -36,13 +49,7 @@ export function Beacon({ state, className }: BeaconProps) {
         aria-hidden="true"
         className={cn(beaconVariants({ state: resolved }), "size-2 shrink-0")}
       />
-      <span>
-        {resolved === "connected"
-          ? "Connected"
-          : resolved === "pending"
-            ? "Awaiting review"
-            : "Offline"}
-      </span>
+      <span>{beaconWords[resolved]}</span>
     </span>
   );
 }

@@ -5,9 +5,13 @@
 //! byte count and SHA-256 of the file it names (from the Hugging Face LFS
 //! metadata), and the download layer verifies against these numbers, never
 //! against what the server says, so a mirror or proxy cannot substitute a
-//! file. Growing the catalog is a reviewed code change. Every entry is a
-//! Qwen3-Coder-30B-A3B-Instruct quantization with a digest (a unit test
-//! enforces it: an entry without one could never be a tier default).
+//! file. Growing the catalog is a reviewed code change. Every entry carries a
+//! digest (a unit test enforces it: an entry without one could never be a
+//! tier default). The catalog is an offer to download, not a readiness
+//! claim: only `gpt-oss-20b-MXFP4` is qualified, and only on `macos-arm64`
+//! (`docs/model-qualification-decisions.md`, [`crate::qualification`]); the
+//! Qwen3-Coder entries are no-go as a job default and stay listed as
+//! test-only artifacts a human may still fetch and `admin.models.try`.
 //! [`Preset::min_host_ram_bytes`] is what the host needs (weights, KV cache
 //! and the rest of the working set), not the file size; the GUI hides
 //! entries that do not fit rather than greying them out.
@@ -64,9 +68,13 @@ impl Preset {
     }
 }
 
-/// Licence text for every entry below.
+/// Licence text for the Qwen entries below.
 const QWEN_LICENSE_URL: &str =
     "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/blob/main/LICENSE";
+
+/// Licence text for gpt-oss (Apache-2.0, on the source model's repository;
+/// the GGUF repository carries only the tag).
+const GPT_OSS_LICENSE_URL: &str = "https://huggingface.co/openai/gpt-oss-20b/blob/main/LICENSE";
 
 /// One decimal gigabyte, the unit the RAM figures are quoted in.
 const GB: u64 = 1_000_000_000;
@@ -75,8 +83,24 @@ const GB: u64 = 1_000_000_000;
 ///
 /// Sizes and digests are the Hugging Face LFS `oid` and `size` for each
 /// file; they are verified after transfer, so a wrong number here is a
-/// failed download, not a bad model.
+/// failed download, not a bad model. The gpt-oss entry's digest and size
+/// are the ones pinned in [`crate::qualification::QUALIFIED`] and its
+/// evidence record; the two must agree, and a unit test holds them together.
 pub const CATALOG: &[Preset] = &[
+    Preset {
+        id: "gpt-oss-20b-mxfp4",
+        label: "gpt-oss 20B · MXFP4",
+        vendor: "openai",
+        file_name: "gpt-oss-20b-MXFP4.gguf",
+        url: "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf",
+        size_bytes: 12_109_566_624,
+        sha256: "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+        license_id: "apache-2.0",
+        license_url: GPT_OSS_LICENSE_URL,
+        quant: "MXFP4_MOE",
+        params_label: "21B-A3.6B (MoE)",
+        min_host_ram_bytes: 16 * GB,
+    },
     Preset {
         id: "qwen3-coder-30b-a3b-q4_k_m",
         label: "Qwen3-Coder 30B-A3B · Q4_K_M",

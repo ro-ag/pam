@@ -5,9 +5,10 @@ use super::{
     ConnectorService, Future, Instant, InvokeError, Path, Pin, ScopePolicy, Store, configured_url,
 };
 use crate::{
-    landing_checkout::CheckoutError,
+    landing_checkout::{CANCELLED, CheckoutError, valid_oid},
     landing_git::{
-        GitAuthorization, GitTarget, GitTransport, PushObservation, RemoteRef, SyncObservation,
+        GitAuthorization, GitTarget, GitTransport, LandingCall, PushObservation, RemoteRef,
+        SyncObservation,
     },
     landing_pack::{self, PackBounds, PackLimits},
     request_budget::RequestBudget,
@@ -37,6 +38,29 @@ const SYNC_PACK_MAX_BYTES: u64 = 64 * 1024 * 1024;
 fn denied() -> InvokeError {
     InvokeError::Connector(ConnectorError::Policy { cause:"landing_git_denied", detail:"The current ticket, landing policy or exact Git remote/ref does not authorize this operation.".into() })
 }
+/// The cancel signal fired; distinct from a deadline so the run ends
+/// cancelled rather than blocked on a timeout it never hit.
+fn cancelled() -> InvokeError {
+    InvokeError::Connector(ConnectorError::Policy {
+        cause: CANCELLED,
+        detail: "The landing Git operation was cancelled before it started.".into(),
+    })
+}
+/// Refuses before any network work once the request is cancelled or out of
+/// time; the two are told apart because only one of them is a timeout.
+pub(super) fn check_live(
+    cancel: &watch::Receiver<bool>,
+    deadline: Instant,
+    budget: &RequestBudget,
+) -> Result<(), InvokeError> {
+    if *cancel.borrow() || cancel.has_changed().is_err() {
+        return Err(cancelled());
+    }
+    if Instant::now() >= deadline.min(budget.deadline()) {
+        return Err(ConnectorError::Timeout.into());
+    }
+    Ok(())
+}
 fn git_error(error: CheckoutError) -> InvokeError {
     InvokeError::Connector(ConnectorError::Policy {
         cause: error.cause,
@@ -50,7 +74,7 @@ fn pack_error(error: landing_pack::PackError) -> InvokeError {
     })
 }
 /// `<remote>/git-upload-pack` for the exact approved HTTPS remote.
-fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
+pub(super) fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
     let canonical = pam_flow::canonical_repository_url(remote_url).map_err(|_| denied())?;
     if canonical != remote_url {
         return Err(denied());
@@ -67,12 +91,6 @@ fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
     let path = format!("{}/git-upload-pack", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url)
-}
-fn sha(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 pub(super) struct GitGuard {
     store: Arc<Store>,
@@ -105,8 +123,11 @@ impl GitGuard {
             || target.request.remote_url != target.receipt.remote_url
             || target.request.base_ref != target.receipt.base_ref
             || target.request.expected_commit != target.receipt.commit
-            || !sha(&target.receipt.commit)
-            || target.expected_old.as_ref().is_some_and(|oid| !sha(oid))
+            || !valid_oid(&target.receipt.commit)
+            || target
+                .expected_old
+                .as_ref()
+                .is_some_and(|oid| !valid_oid(oid))
             || (role == GitRole::Push && target.branch != source_branch)
             || (role == GitRole::Sync
                 && (target.request.base_ref != format!("refs/heads/{}", target.branch)
@@ -205,25 +226,21 @@ impl GitAuthorization for GitGuard {
     }
 }
 impl ConnectorService {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep original request identity, policy revision, budget and cancellation explicit"
-    )]
     pub(crate) async fn landing_git_observe(
         &self,
-        repo: &Path,
-        ticket: &str,
-        policy_revision: &str,
-        target: &GitTarget,
-        budget: Arc<RequestBudget>,
-        cancel: &mut watch::Receiver<bool>,
-        deadline: Instant,
+        call: LandingCall<'_>,
     ) -> Result<RemoteRef, InvokeError> {
+        let identity = call_identity(&call);
+        let LandingCall {
+            target,
+            budget,
+            cancel,
+            deadline,
+            ..
+        } = call;
         let (transport, secret, guard) = self
             .landing_git_context(
-                repo,
-                ticket,
-                policy_revision,
+                &identity,
                 target,
                 Arc::clone(&budget),
                 cancel,
@@ -236,25 +253,21 @@ impl ConnectorService {
             .await
             .map_err(git_error)
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep original request identity, policy revision, budget and cancellation explicit"
-    )]
     pub(crate) async fn landing_git_push(
         &self,
-        repo: &Path,
-        ticket: &str,
-        policy_revision: &str,
-        target: &GitTarget,
-        budget: Arc<RequestBudget>,
-        cancel: &mut watch::Receiver<bool>,
-        deadline: Instant,
+        call: LandingCall<'_>,
     ) -> Result<PushObservation, InvokeError> {
+        let identity = call_identity(&call);
+        let LandingCall {
+            target,
+            budget,
+            cancel,
+            deadline,
+            ..
+        } = call;
         let (transport, secret, guard) = self
             .landing_git_context(
-                repo,
-                ticket,
-                policy_revision,
+                &identity,
                 target,
                 Arc::clone(&budget),
                 cancel,
@@ -270,27 +283,27 @@ impl ConnectorService {
     /// Fetches the synchronization pack for `merge_commit` through the fixed
     /// HTTP broker (never Git) and proves its bounds before returning it.
     /// `haves` name commits the canonical repository already holds, so the
-    /// server sends a thin pack of only what is new.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep original request identity, policy revision, budget and bounds explicit"
-    )]
+    /// server sends a thin pack of only what is new. The cancel signal stops
+    /// the download; a cancelled or expired call never reaches the network.
     pub(crate) async fn landing_fetch_pack(
         &self,
-        repo: &Path,
-        ticket: &str,
-        policy_revision: &str,
-        target: &GitTarget,
+        call: LandingCall<'_>,
         merge_commit: &str,
         haves: &[&str],
-        budget: Arc<RequestBudget>,
-        deadline: Instant,
     ) -> Result<(Vec<u8>, PackBounds), InvokeError> {
+        let identity = call_identity(&call);
+        let LandingCall {
+            target,
+            budget,
+            cancel,
+            deadline,
+            ..
+        } = call;
         let guard = GitGuard::new(
             Arc::clone(&self.store),
-            repo,
-            ticket,
-            policy_revision,
+            identity.repo,
+            identity.ticket,
+            identity.policy_revision,
             target,
             GitRole::Sync,
         )?;
@@ -302,9 +315,7 @@ impl ConnectorService {
                 detail: error.to_string(),
             })
         })?;
-        if Instant::now() >= deadline.min(budget.deadline()) {
-            return Err(ConnectorError::Timeout.into());
-        }
+        check_live(cancel, deadline, &budget)?;
         self.ensure_transport(ConnectorId::Github)?;
         let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
         let secret = connection.secret.ok_or(InvokeError::CredentialMissing)?;
@@ -332,13 +343,16 @@ impl ConnectorService {
         };
         // Authority is rechecked immediately before the credential leaves.
         guard.authorize_row().await?;
-        let response = crate::request_budget::BudgetTransport {
+        check_live(cancel, deadline, &budget)?;
+        let transport = crate::request_budget::BudgetTransport {
             inner: self.transport.as_ref(),
             budget,
-        }
-        .send(request, deadline)
-        .await
-        .map_err(ConnectorError::from)?;
+        };
+        let response = tokio::select! {
+            biased;
+            () = crate::flow_exec::cancelled(cancel) => return Err(cancelled()),
+            response = transport.send(request, deadline) => response.map_err(ConnectorError::from)?,
+        };
         if response.status != 200 {
             return Err(InvokeError::Connector(ConnectorError::Policy {
                 cause: "landing_sync_remote_error",
@@ -354,28 +368,24 @@ impl ConnectorService {
     }
     /// Installs a preflighted pack and fast-forwards the base ref; see
     /// [`GitTransport::sync_exact`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Keep original request identity, policy revision, budget and cancellation explicit"
-    )]
     pub(crate) async fn landing_git_sync(
         &self,
-        repo: &Path,
-        ticket: &str,
-        policy_revision: &str,
-        target: &GitTarget,
+        call: LandingCall<'_>,
         merge_commit: &str,
         pack: Vec<u8>,
         bounds: PackBounds,
-        budget: Arc<RequestBudget>,
-        cancel: &mut watch::Receiver<bool>,
-        deadline: Instant,
     ) -> Result<SyncObservation, InvokeError> {
+        let identity = call_identity(&call);
+        let LandingCall {
+            target,
+            budget,
+            cancel,
+            deadline,
+            ..
+        } = call;
         let (transport, _secret, guard) = self
             .landing_git_context(
-                repo,
-                ticket,
-                policy_revision,
+                &identity,
                 target,
                 Arc::clone(&budget),
                 cancel,
@@ -397,15 +407,9 @@ impl ConnectorService {
             .await
             .map_err(git_error)
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Broker forwards explicit authorization and execution bounds without exposing credentials"
-    )]
     async fn landing_git_context(
         &self,
-        repo: &Path,
-        ticket: &str,
-        revision: &str,
+        identity: &CallIdentity<'_>,
         target: &GitTarget,
         budget: Arc<RequestBudget>,
         cancel: &mut watch::Receiver<bool>,
@@ -414,9 +418,9 @@ impl ConnectorService {
     ) -> Result<(GitTransport, CallSecret, Arc<dyn GitAuthorization>), InvokeError> {
         let guard = Arc::new(GitGuard::new(
             Arc::clone(&self.store),
-            repo,
-            ticket,
-            revision,
+            identity.repo,
+            identity.ticket,
+            identity.policy_revision,
             target,
             role,
         )?);
@@ -426,14 +430,23 @@ impl ConnectorService {
                 .await
                 .map_err(git_error)?;
         let row = guard.authorize_row().await?;
-        if Instant::now() >= deadline.min(budget.deadline())
-            || *cancel.borrow()
-            || cancel.has_changed().is_err()
-        {
-            return Err(ConnectorError::Timeout.into());
-        }
+        check_live(cancel, deadline, &budget)?;
         let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
         let secret = connection.secret.ok_or(InvokeError::CredentialMissing)?;
         Ok((transport, secret, guard))
+    }
+}
+/// The borrowed identity half of a [`LandingCall`], so the mutable cancel
+/// receiver can be taken out of the call separately.
+struct CallIdentity<'a> {
+    repo: &'a Path,
+    ticket: &'a str,
+    policy_revision: &'a str,
+}
+fn call_identity<'a>(call: &LandingCall<'a>) -> CallIdentity<'a> {
+    CallIdentity {
+        repo: call.repo,
+        ticket: call.ticket,
+        policy_revision: call.policy_revision,
     }
 }

@@ -113,10 +113,15 @@ async fn apply(conn: &Connection, migration: &Migration) -> Result<(), StoreErro
     }
     .await;
     match applied {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await?;
-            Ok(())
-        }
+        Ok(()) => match conn.execute("COMMIT", ()).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                // A failed COMMIT leaves the transaction open; roll it
+                // back so the connection is not stuck inside it.
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err.into())
+            }
+        },
         Err(err) => {
             // Best effort: the returned error is the one that matters.
             let _ = conn.execute("ROLLBACK", ()).await;

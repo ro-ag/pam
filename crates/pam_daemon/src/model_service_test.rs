@@ -289,6 +289,21 @@ async fn boot_fails_the_jobs_a_dead_daemon_left_running() {
     );
 }
 
+/// The server's context is the admission envelope, lowered to what the GGUF
+/// header reports when that is smaller; absent, zero or oversized figures
+/// keep the envelope.
+#[test]
+fn context_tokens_follow_the_header_only_downwards() {
+    use crate::model_service::context_tokens_for;
+    let envelope = pam_model::runtime::CONTEXT_TOKENS;
+    assert_eq!(context_tokens_for(None), envelope);
+    assert_eq!(context_tokens_for(Some(0)), envelope);
+    assert_eq!(context_tokens_for(Some(2048)), 2048);
+    assert_eq!(context_tokens_for(Some(envelope as u64)), envelope);
+    assert_eq!(context_tokens_for(Some(131_072)), envelope);
+    assert_eq!(context_tokens_for(Some(u64::MAX)), envelope);
+}
+
 #[test]
 fn idle_unload_waits_out_the_window_and_zero_means_never() {
     let now = 1_700_000_000;
@@ -360,7 +375,7 @@ async fn reserved_model_operation_refuses_diagnostic_without_waiting_or_loading(
 
 #[tokio::test(start_paused = true)]
 async fn diagnostic_deadline_drop_signals_the_worker_receiver() {
-    let (guard, receiver) = crate::model_service::DiagnosticCancellation::new();
+    let (guard, receiver) = crate::model_service::CancelOnDrop::new();
     let waiting = async move {
         let _guard = guard;
         std::future::pending::<()>().await;
@@ -370,6 +385,25 @@ async fn diagnostic_deadline_drop_signals_the_worker_receiver() {
     assert!(
         *receiver.borrow(),
         "closing an unchanged sender alone would leave false"
+    );
+}
+
+/// A caller's deadline drops the generation future mid-await (the
+/// `admin.models.try` timeout, a bounded summary); `busy` must not stay
+/// stuck, or the idle-unload ticker would never drop the weights.
+#[tokio::test(start_paused = true)]
+async fn busy_clears_when_a_generation_future_is_dropped() {
+    let busy = std::sync::atomic::AtomicBool::new(false);
+    let generation = async {
+        let _busy = crate::model_service::BusyGuard::engage(&busy);
+        assert!(busy.load(std::sync::atomic::Ordering::Acquire));
+        std::future::pending::<()>().await;
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), generation).await;
+    assert!(result.is_err(), "the deadline dropped the generation");
+    assert!(
+        !busy.load(std::sync::atomic::Ordering::Acquire),
+        "a dropped generation leaves the runtime idle"
     );
 }
 
@@ -487,6 +521,11 @@ async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
     );
     assert_eq!(status["runtime"]["state"]["id"], "qwen/tiny");
     assert_eq!(status["runtime"]["busy"], false);
+    assert_eq!(
+        status["runtime"]["state"]["weight_bytes"],
+        std::fs::metadata(&path).unwrap().len(),
+        "the snapshot reports the size the registry recorded at load time"
+    );
 
     // The prompt limit is enforced by the engine's own tokenizer count.
     let too_long = service
@@ -515,4 +554,68 @@ async fn an_installed_engine_takes_over_load_generate_status_and_unload() {
     let status = service.status().await.unwrap();
     assert!(status["engine"]["loaded"].is_null());
     assert_eq!(status["runtime"]["state"]["state"], "idle");
+}
+
+/// A diagnostic runs only on the model the engine holds: naming another
+/// installed model is refused without loading or swapping, and an idle
+/// engine refuses rather than loading the model named.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_diagnostic_on_a_model_the_engine_does_not_hold_is_refused() {
+    let Some(fake) = fake_engine_binary() else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("pam-md-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let tiny = touch_model(dir.path(), "qwen", "tiny.gguf");
+    touch_model(dir.path(), "qwen", "other.gguf");
+    install_fake_engine(&service, &fake);
+
+    // Installed but idle: refused, nothing loaded.
+    let idle = service
+        .generate_diagnostic("qwen/tiny", diagnostic_request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(idle, ModelUnavailable::NotResident { resident: None, .. }),
+        "{idle:?}"
+    );
+    assert_eq!(service.snapshot().state, pam_model::RuntimeState::Idle);
+
+    let entry = service.find("qwen/tiny").await.unwrap().unwrap();
+    service.ensure_loaded(&entry).await.unwrap();
+    let refused = service
+        .generate_diagnostic("qwen/other", diagnostic_request())
+        .await
+        .unwrap_err();
+    match refused {
+        ModelUnavailable::NotResident {
+            requested,
+            resident,
+        } => {
+            assert_eq!(requested, "qwen/other");
+            assert_eq!(resident.as_deref(), Some("qwen/tiny"));
+        }
+        other => panic!("expected NotResident, got {other:?}"),
+    }
+    let status = service.status().await.unwrap();
+    assert_eq!(
+        status["engine"]["loaded"]["id"], "qwen/tiny",
+        "the resident model is untouched"
+    );
+    assert_eq!(
+        status["runtime"]["state"]["weight_bytes"],
+        std::fs::metadata(&tiny).unwrap().len()
+    );
+    let ok = service
+        .generate_diagnostic("qwen/tiny", diagnostic_request())
+        .await
+        .unwrap();
+    assert_eq!(ok.model.id, "qwen/tiny");
+    service.unload_all().await.unwrap();
 }

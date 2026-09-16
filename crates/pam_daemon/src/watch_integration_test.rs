@@ -188,7 +188,9 @@ impl Harness {
                 ConfigurePatch {
                     enabled: Some(true),
                     base_url: Some(Some("https://github.test/".to_owned())),
-                    credential: Some(CredentialAction::Set("fixture-only".to_owned())),
+                    credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                        "fixture-only".to_owned(),
+                    ))),
                     ..ConfigurePatch::default()
                 },
             )
@@ -246,7 +248,7 @@ impl Harness {
             .await
             .unwrap();
         self.queue
-            .place_in_lane(ticket, self.root.to_str().unwrap(), 25_000)
+            .place_in_lane(ticket, self.root.to_str().unwrap())
             .await
             .unwrap();
         let lease = self

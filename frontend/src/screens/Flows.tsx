@@ -1,8 +1,18 @@
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { Badge } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses } from "../components/ui/field";
 import { cn } from "../lib/cn";
 import { PageTabs } from "../components/ui/PageTabs";
 import { Panel } from "../components/ui/Panel";
@@ -49,43 +59,121 @@ export const YAML_QUIET_MS = 400;
 
 // --- the library rail ------------------------------------------------------
 
+/**
+ * One option of the library listbox. The list owns keyboard movement
+ * (roving tabindex, arrows, Home/End); an option only reports a click or
+ * an Enter/Space on itself.
+ */
 function LibraryEntry({
   entry,
   active,
+  tabbable,
+  focused,
   onSelect,
+  onFocusOption,
+  onKeyDown,
 }: {
   entry: FlowListEntry;
   active: boolean;
+  /** The one option in the tab order (roving tabindex). */
+  tabbable: boolean;
+  /** Whether the arrows just moved focus here. */
+  focused: boolean;
   onSelect: () => void;
+  onFocusOption: () => void;
+  onKeyDown: (event: KeyboardEvent<HTMLLIElement>) => void;
 }) {
+  const option = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (focused && document.activeElement !== option.current) option.current?.focus();
+  }, [focused]);
   return (
-    <li>
-      <button
-        type="button"
-        aria-current={active ? "true" : undefined}
-        title={entry.id}
-        onClick={onSelect}
-        className={cn(
-          "navigation-item w-full space-y-1 rounded-control px-2.5 py-2 text-left",
-          active && "bg-accent-soft",
-        )}
-      >
-        <span className="block font-sans text-sm font-medium text-ink">
-          {entry.name || entry.id}
-        </span>
-        {entry.source !== "builtin" && <Badge tone="accent">Custom</Badge>}
-        {!entry.valid && (
-          <>
-            <Badge tone="danger" title={entry.error ?? "this flow will not parse"}>
-              invalid
-            </Badge>
-            <span className="block font-data text-xs text-danger">
-              {entry.error ?? "this flow will not parse"}
-            </span>
-          </>
-        )}
-      </button>
+    <li
+      ref={option}
+      role="option"
+      aria-selected={active}
+      tabIndex={tabbable ? 0 : -1}
+      title={entry.id}
+      onClick={onSelect}
+      onFocus={onFocusOption}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+          return;
+        }
+        onKeyDown(event);
+      }}
+      className={cn(
+        "navigation-item w-full space-y-1 rounded-control px-2.5 py-2 text-left",
+        active && "bg-accent-soft",
+      )}
+    >
+      <span className="block font-sans text-sm font-medium text-ink">
+        {entry.name || entry.id}
+      </span>
+      {entry.source !== "builtin" && <Badge tone="accent">Custom</Badge>}
+      {!entry.valid && (
+        <>
+          <Badge tone="danger" title={entry.error ?? "this flow will not parse"}>
+            invalid
+          </Badge>
+          <span className="block font-data text-xs text-danger">
+            {entry.error ?? "this flow will not parse"}
+          </span>
+        </>
+      )}
     </li>
+  );
+}
+
+/** The library rail: a listbox whose keyboard focus roves with the arrows. */
+function LibraryList({
+  entries,
+  selectedId,
+  onPick,
+}: {
+  entries: FlowListEntry[];
+  selectedId: string;
+  onPick: (id: string) => void;
+}) {
+  // Focus follows the arrows; it starts on the selected flow and stays
+  // where the arrows left it until the selection moves.
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const focused = focusedId ?? selectedId;
+  const [armed, setArmed] = useState(false);
+  const move = (event: KeyboardEvent<HTMLLIElement>) => {
+    const index = entries.findIndex((entry) => entry.id === focused);
+    const next =
+      event.key === "ArrowDown"
+        ? Math.min(entries.length - 1, index + 1)
+        : event.key === "ArrowUp"
+          ? Math.max(0, index - 1)
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? entries.length - 1
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    setArmed(true);
+    setFocusedId(entries[next]?.id ?? null);
+  };
+  return (
+    <ul role="listbox" aria-label="Flow library" className="space-y-0.5">
+      {entries.map((entry) => (
+        <LibraryEntry
+          key={entry.id}
+          entry={entry}
+          active={entry.id === selectedId}
+          tabbable={entry.id === focused}
+          focused={armed && entry.id === focused}
+          onSelect={() => onPick(entry.id)}
+          onFocusOption={() => setFocusedId(entry.id)}
+          onKeyDown={move}
+        />
+      ))}
+    </ul>
   );
 }
 
@@ -504,7 +592,7 @@ function FlowDetailPane({
             busy={busy}
           />
         </div>
-        <div hidden={tab !== "run"} className="space-y-4">
+        <div hidden={tab !== "run"} className="max-w-content space-y-4">
           <p className="text-sm text-ink-muted">Choose a repository and run the saved flow.</p>
           {draft.dirty && (
             <p className="text-sm text-warning">
@@ -605,8 +693,12 @@ export function FlowsScreen({
 
       {controls.dialogs}
       {failure && (
-        <div className="max-w-xl pt-4">
-          <FailureNote failure={failure} label="flows" />
+        <div className="pt-4">
+          <FailureNote failure={failure} label="flows">
+            <Button size="sm" variant="secondary" onClick={() => void flows.refetch()}>
+              Retry
+            </Button>
+          </FailureNote>
         </div>
       )}
 
@@ -625,18 +717,13 @@ export function FlowsScreen({
         <div className="flow-library-layout flex flex-1">
           <section aria-label="flow library" className="flow-library min-w-0 shrink-0">
             <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
-            <ul className="space-y-0.5">
-              {entries.map((entry) => (
-                <LibraryEntry
-                  key={entry.id}
-                  entry={entry}
-                  active={entry.id === selected.id}
-                  onSelect={() => {
-                    if (entry.id !== selected.id) requestNavigation(() => setPicked(entry.id));
-                  }}
-                />
-              ))}
-            </ul>
+            <LibraryList
+              entries={entries}
+              selectedId={selected.id}
+              onPick={(id) => {
+                if (id !== selected.id) requestNavigation(() => setPicked(id));
+              }}
+            />
           </section>
 
           <section aria-label={`flow ${selected.id}`} className="flow-detail min-w-0 flex-1">
@@ -649,7 +736,7 @@ export function FlowsScreen({
                   const next = event.target.value;
                   requestNavigation(() => setPicked(next));
                 }}
-                className="field-control h-8 w-full rounded-control border border-control-line bg-inset px-2 text-sm"
+                className={cn(fieldClasses, "px-2 font-sans text-sm")}
               >
                 {entries.map((entry) => (
                   <option key={entry.id} value={entry.id}>

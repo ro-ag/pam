@@ -59,6 +59,15 @@ fn refusal(error: &EngineError) -> AdminRefusal {
     }
 }
 
+/// The cancel signal an install runs under: fires when the owning admin
+/// future is dropped (deadline, disconnected client).
+pub(crate) fn install_cancellation() -> (
+    crate::model_service::CancelOnDrop,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    crate::model_service::CancelOnDrop::new()
+}
+
 impl AdminService {
     pub(crate) fn engine_status(&self) -> AdminOk {
         let status = engine::status(&self.models.engine_base());
@@ -78,7 +87,10 @@ impl AdminService {
             });
         }
         let base = self.models.engine_base();
-        let (_keep, cancel) = tokio::sync::watch::channel(false);
+        // The install runs under the admin deadline: when that drops this
+        // future, the guard sends `true` so the transfer stops instead of
+        // running detached behind a closed channel.
+        let (_cancel_on_drop, cancel) = install_cancellation();
         let status = engine::install(&base, cancel)
             .await
             .map_err(|error| refusal(&error))?;

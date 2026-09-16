@@ -22,7 +22,14 @@ readiness claim for a machine that was not measured.
 
 Everything not named above is unqualified: the registry lists it as `engine` (verified)
 or `test only` (unverified), `admin.models.try` still runs it, and `admin.models.defaults.set`
-and every tier resolve refuse it with cause `unqualified` or `unverified`.
+and every tier resolve refuse it with cause `unqualified` or `unverified`. The download
+catalog (`pam_model::catalog`) offers gpt-oss-20b-MXFP4 under the digest and size pinned
+here (a unit test holds the preset to the qualification record) alongside the four
+Qwen3-Coder no-go quantizations, which stay downloadable as test-only artifacts; a
+catalog entry is an offer to fetch, never a readiness claim. Qualification is also
+enforced on the admission path, not only by the table's unit test:
+`pam_model::qualification::find_in` ignores a record whose engine tag is not the pinned
+one or whose figures no longer clear the gates.
 
 ## The gates, and what they do not cover
 

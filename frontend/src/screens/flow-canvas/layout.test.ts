@@ -6,7 +6,6 @@ import {
   LAYOUT_KEY,
   NODE_SIZE,
   NOTE_OFFSET,
-  applyPositions,
   autoLayout,
   clearPositions,
   loadPositions,
@@ -113,6 +112,7 @@ describe("autoLayout", () => {
     expect(graph.layoutOptions).toMatchObject({
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
+      "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
       "elk.spacing.nodeNode": "48",
       "elk.layered.spacing.nodeNodeBetweenLayers": "96",
       "elk.portConstraints": "FIXED_SIDE",
@@ -201,21 +201,5 @@ describe("autoLayout", () => {
     }));
     const { nodes, edges } = toGraph(spec);
     expect(await autoLayout(nodes, edges, {})).toEqual({ a: { x: 5, y: 6 } });
-  });
-});
-
-describe("applyPositions", () => {
-  it("keeps nodes without a stored position at their current place", () => {
-    const { nodes } = toGraph(spec);
-    const placed = nodes.map((node) => ({ ...node, position: { x: 5, y: 5 } }));
-    const after = applyPositions(placed, { a: { x: 50, y: 60 } });
-    expect(after.map((node) => [node.id, node.position])).toEqual([
-      ["inputs", { x: 5, y: 5 }],
-      ["a", { x: 50, y: 60 }],
-      ["b", { x: 5, y: 5 }],
-      ["verdict", { x: 5, y: 5 }],
-    ]);
-    expect(placed[1].position).toEqual({ x: 5, y: 5 });
-    expect(after[1].data).toBe(placed[1].data);
   });
 });

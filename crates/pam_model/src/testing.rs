@@ -39,6 +39,7 @@ pub struct Faults {
 pub struct TestServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<String>>>,
+    etag: Arc<Mutex<String>>,
     accepting: JoinHandle<()>,
 }
 
@@ -53,6 +54,13 @@ impl TestServer {
     #[must_use]
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Changes the `ETag` later responses carry — the file on the origin
+    /// was replaced. A resume that sends the old tag as `If-Range` then gets
+    /// the whole body with `200`, as a real server would answer.
+    pub fn set_etag(&self, etag: &str) {
+        etag.clone_into(&mut self.etag.lock().unwrap());
     }
 }
 
@@ -101,7 +109,8 @@ async fn serve_with(body: Vec<u8>, etag: &str, faults: Faults) -> TestServer {
     let requests = Arc::new(Mutex::new(Vec::new()));
 
     let seen = Arc::clone(&requests);
-    let etag = etag.to_owned();
+    let etag = Arc::new(Mutex::new(etag.to_owned()));
+    let current_etag = Arc::clone(&etag);
     let served = Arc::new(AtomicUsize::new(0));
     let accepting = tokio::spawn(async move {
         loop {
@@ -109,7 +118,7 @@ async fn serve_with(body: Vec<u8>, etag: &str, faults: Faults) -> TestServer {
                 return;
             };
             let body = body.clone();
-            let etag = etag.clone();
+            let etag = current_etag.lock().unwrap().clone();
             let seen = Arc::clone(&seen);
             let first = served.fetch_add(1, Ordering::SeqCst) == 0;
             tokio::spawn(async move {
@@ -121,11 +130,16 @@ async fn serve_with(body: Vec<u8>, etag: &str, faults: Faults) -> TestServer {
     TestServer {
         addr,
         requests,
+        etag,
         accepting,
     }
 }
 
 /// Reads one request, writes one response, closes.
+///
+/// `If-Range` is honoured the way RFC 7233 says: a range is served only when
+/// the tag it carries is the current one; otherwise the whole body comes
+/// back as `200`.
 async fn respond(
     mut stream: TcpStream,
     body: &[u8],
@@ -143,12 +157,17 @@ async fn respond(
         .to_owned();
     seen.lock().unwrap().append(&mut lines);
 
+    let range_allowed = request
+        .lines()
+        .find_map(|line| line.strip_prefix("If-Range: "))
+        .is_none_or(|sent| sent.trim() == format!("\"{etag}\""));
     let start = request
         .lines()
         .find_map(|line| {
             let value = line.strip_prefix("Range: bytes=")?;
             value.split('-').next()?.parse::<usize>().ok()
         })
+        .filter(|_| range_allowed)
         .unwrap_or(0);
     let start = start.min(body.len());
     let slice = &body[start..];

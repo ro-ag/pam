@@ -6,9 +6,12 @@ import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Panel } from "../components/ui/Panel";
+import { fieldClasses } from "../components/ui/field";
+import { START_TASKS } from "../lib/ask/intents";
 import { liveSources } from "../lib/ask/live";
 import { useRephrasePref } from "../lib/ask/prefs";
 import { INTENTS, ask, type Answer, type AskLink } from "../lib/ask/router";
+import { cn } from "../lib/cn";
 import {
   approvalsPending,
   daemonStatus,
@@ -32,33 +35,6 @@ const PROMPT_LABELS: Record<string, string> = {
   tokens_saved: "Tokens saved",
 };
 
-/**
- * Home's starters: no qualified model required, a run overview before
- * anything executes. Each opens its flow's run tab directly, the same
- * destination a bounded Ask Pam task request resolves to.
- */
-const START_TASKS: ReadonlyArray<{ id: string; title: string; needs: string }> = [
-  {
-    id: "summarize-build-log",
-    title: "Summarize a build log",
-    needs: "needs a repository to build",
-  },
-  {
-    id: "ci-failure-triage",
-    title: "Triage a CI failure",
-    needs: "needs the GitHub connector",
-  },
-  {
-    id: "pr-readiness",
-    title: "Check PR readiness",
-    needs: "needs a Rust repository",
-  },
-  {
-    id: "watch-github-run",
-    title: "Watch a GitHub run",
-    needs: "needs the GitHub connector and a run id",
-  },
-];
 /** How many exchanges Pam keeps — the number the placeholder promises. */
 const MEMORY_DEPTH = 3;
 
@@ -152,7 +128,7 @@ export function HomeScreen() {
       ? "Approval queue unavailable."
       : hands === 0
         ? "No requests need your approval."
-        : `${countWord(hands)} request${hands === 1 ? "" : "s"} awaiting your approval.`;
+        : `${countWord(hands)} request${hands === 1 ? "" : "s"} awaiting review.`;
 
   const submit = (text: string) => {
     const asked = text.trim();
@@ -228,7 +204,7 @@ export function HomeScreen() {
                   key={task.id}
                   to="/flows"
                   search={{ flow: task.id, tab: "run" }}
-                  className="block space-y-1 rounded-card border border-line bg-surface-raised p-4 transition-colors hover:bg-accent-soft"
+                  className="block space-y-1 rounded-card border border-line-strong bg-surface-raised p-4 transition-colors hover:bg-accent-soft"
                 >
                   <span className="block font-sans text-sm font-medium text-ink">
                     {task.title}
@@ -246,13 +222,13 @@ export function HomeScreen() {
                 </span>
                 <div>
                   <h2 className="text-lg font-semibold">
-                    <label htmlFor="ask-pam">Ask PAM</label>
+                    <label htmlFor="ask-pam">Ask Pam</label>
                   </h2>
                   <p className="text-xs text-ink-muted">Answers from your machine</p>
                 </div>
               </div>
               <form
-                aria-label="Ask PAM"
+                aria-label="Ask Pam"
                 className="flex items-center gap-2"
                 onSubmit={(event) => {
                   event.preventDefault();
@@ -270,18 +246,22 @@ export function HomeScreen() {
                   onKeyDown={(event) => {
                     if (event.key === "Escape") setQuestion("");
                   }}
-                  className="field-control h-8 min-w-0 flex-1 rounded-control border border-control-line bg-inset px-3 font-sans text-sm text-ink placeholder:text-ink-faint disabled:opacity-50"
+                  className={cn(
+                    fieldClasses,
+                    "w-auto min-w-0 flex-1 px-3 font-sans text-sm disabled:opacity-70",
+                  )}
                 />
                 <Button
                   type="submit"
                   disabled={asking || question.trim() === ""}
+                  title={question.trim() === "" ? "Type a question first" : undefined}
                   aria-busy={asking}
                 >
                   Ask <ArrowUpRight aria-hidden="true" className="size-4" />
                 </Button>
               </form>
               <p id="ask-pam-help" className="text-xs text-ink-muted">
-                Ask about PAM itself. I keep only this screen and the last three exchanges.
+                Ask about PAM itself. Only this screen and the last three exchanges are kept.
               </p>
             </div>
             <details ref={suggestions} className="border-t border-line px-5 py-3">
@@ -296,7 +276,7 @@ export function HomeScreen() {
                     disabled={asking}
                     aria-label={`ask: ${intent.canonical}`}
                     onClick={() => submit(intent.canonical)}
-                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors hover:bg-accent-soft disabled:opacity-50"
+                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors hover:bg-accent-soft disabled:opacity-70"
                   >
                     <span>{PROMPT_LABELS[intent.id] ?? intent.label}</span>
                     <ArrowUpRight

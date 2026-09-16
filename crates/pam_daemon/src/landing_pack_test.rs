@@ -1,6 +1,6 @@
 use super::{
-    PackBounds, PackError, PackLimits, preflight_pack, strip_upload_pack_preamble,
-    upload_pack_request,
+    MAX_VARINT_BYTES, PackBounds, PackError, PackLimits, preflight_pack,
+    strip_upload_pack_preamble, upload_pack_request,
 };
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write as _;
@@ -234,6 +234,15 @@ fn preamble_refuses_garbage() {
     assert!(strip_upload_pack_preamble(b"junk-not-a-pktline").is_err());
     assert!(strip_upload_pack_preamble(b"").is_err());
     assert!(strip_upload_pack_preamble(b"0004").is_err());
+}
+#[test]
+fn preamble_refuses_a_pkt_length_below_its_own_header() {
+    for header in [b"0001", b"0002", b"0003"] {
+        let mut body = header.to_vec();
+        body.extend_from_slice(b"NAK\nPACKdata");
+        let err = assert_refused(strip_upload_pack_preamble(&body));
+        assert_eq!(err.cause, "landing_sync_response_invalid", "{header:?}");
+    }
 }
 
 // -- preflight_pack: a valid mixed pack -----------------------------------
@@ -473,4 +482,47 @@ fn preflight_accepts_a_real_git_pack() {
     let bounds =
         preflight_pack(&output.stdout, generous_limits()).expect("real pack is within bounds");
     assert_eq!(bounds.objects, u32::try_from(expected_objects).unwrap());
+}
+
+// -- varint overflow arms ---------------------------------------------------
+
+#[test]
+fn preflight_refuses_an_ofs_delta_offset_that_overflows_before_the_varint_cap() {
+    // One base object, then an ofs-delta whose offset varint keeps every
+    // continuation bit set: the value overflows u64 at the ninth extra byte,
+    // one short of MAX_VARINT_BYTES, so the overflow arm must be the one
+    // that refuses it.
+    let mut body = Vec::new();
+    push_entry(&mut body, 3, b"base");
+    body.extend(encode_size_header(6, 8));
+    body.extend(std::iter::repeat_n(0xFF_u8, 11));
+    body.extend(zlib(&delta_payload(4, 4, 6)));
+    let pack = finish_pack(&body, 2, &[0; 20]);
+    let err = assert_refused(preflight_pack(&pack, generous_limits()));
+    assert_eq!(err.cause, "landing_sync_pack_invalid");
+    assert_eq!(err.detail, "ofs-delta offset overflows");
+}
+
+#[test]
+fn preflight_refuses_a_size_varint_that_would_shift_past_sixty_four_bits() {
+    let mut body = vec![0x30 | 0x80];
+    body.extend(std::iter::repeat_n(0xFF_u8, MAX_VARINT_BYTES as usize + 1));
+    let pack = finish_pack(&body, 1, &[0; 20]);
+    let err = assert_refused(preflight_pack(&pack, generous_limits()));
+    assert_eq!(err.cause, "landing_sync_pack_invalid");
+    assert_eq!(err.detail, "pack entry size overflows");
+}
+
+#[test]
+fn preflight_refuses_a_delta_size_varint_longer_than_the_cap() {
+    // A ref-delta whose payload is eleven continuation bytes: the delta
+    // size parser hits MAX_VARINT_BYTES before the shift can overflow.
+    let mut body = Vec::new();
+    push_entry(&mut body, 3, b"base");
+    let payload = vec![0xFF_u8; MAX_VARINT_BYTES as usize + 1];
+    push_ref_delta(&mut body, [0xAB; 20], &payload);
+    let pack = finish_pack(&body, 2, &[0; 20]);
+    let err = assert_refused(preflight_pack(&pack, generous_limits()));
+    assert_eq!(err.cause, "landing_sync_pack_invalid");
+    assert_eq!(err.detail, "delta size varint is too long");
 }

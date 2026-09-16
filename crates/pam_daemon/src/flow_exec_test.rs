@@ -387,6 +387,63 @@ async fn the_environment_reaches_the_child_and_nothing_else_does() {
     }
 }
 
+/// `/bin/sh` under the same boundary as [`git_spec`], for a child that
+/// must misbehave on purpose (`git` cannot be told to hang or flood).
+#[cfg(unix)]
+fn sh_spec(script: &str, timeout: Duration) -> (tempfile::TempDir, CommandSpec) {
+    let (fixture, mut spec) = git_spec(&[]);
+    spec.program = PathBuf::from("/bin/sh");
+    spec.argv = vec!["-c".to_owned(), script.to_owned()];
+    spec.timeout = timeout;
+    spec.containment.read_only_roots.push(PathBuf::from("/bin"));
+    spec.containment.read_only_roots.sort();
+    spec.containment.read_only_roots.dedup();
+    (fixture, spec)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_outlives_its_timeout_is_killed_and_reports_timed_out() {
+    let (_alive, mut cancel) = live_cancel();
+    let (_fixture, spec) = sh_spec("echo started; sleep 90", Duration::from_secs(5));
+    let started = std::time::Instant::now();
+    let outcome = run_command(spec, &mut cancel).await;
+    if assert_unsupported(&outcome) {
+        return;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the step must end on its timeout, not on the sleep"
+    );
+    match outcome {
+        CommandOutcome::TimedOut { output } => {
+            assert_eq!(String::from_utf8_lossy(&output).trim(), "started");
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_that_floods_the_output_cap_is_killed_at_the_cap() {
+    let (_alive, mut cancel) = live_cancel();
+    let (_fixture, spec) = sh_spec(
+        "while :; do printf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done",
+        Duration::from_secs(60),
+    );
+    let outcome = run_command(spec, &mut cancel).await;
+    if assert_unsupported(&outcome) {
+        return;
+    }
+    match outcome {
+        CommandOutcome::OutputLimit { output } => {
+            assert_eq!(output.len(), pam_compact::MAX_SOURCE_BYTES);
+            assert!(output.iter().all(|byte| *byte == b'x'));
+        }
+        other => panic!("expected the output cap, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_program_that_cannot_be_validated_never_starts() {
     let (_alive, mut cancel) = live_cancel();

@@ -487,9 +487,10 @@ impl LogService {
             });
             return;
         }
-        // Resolved once, up front: `generate` resolves for itself, but the
-        // report has to name the model that answered and the entry is the
-        // only place that id lives.
+        // Resolved once, up front, for the qualification record only: the
+        // id the report names is the one the generation itself returns,
+        // since `generate_bounded` resolves again and the default may
+        // have moved between the two reads.
         let entry = match self.models.resolve(Tier::Heavy).await {
             Ok(entry) => entry,
             Err(err) => {
@@ -524,10 +525,15 @@ impl LogService {
                 return;
             }
         };
-        let qualification = entry.qualification.as_ref().map(ModelQualification::from);
+        let model_id = result.model.id.clone();
+        // A qualification record vouches for one digest; it travels only
+        // when the model that answered is the entry it was read for.
+        let qualification = (entry.id == model_id)
+            .then(|| entry.qualification.as_ref().map(ModelQualification::from))
+            .flatten();
         let meta = json!({
             "name": name,
-            "model_id": entry.id,
+            "model_id": model_id,
             "model_qualification": qualification,
             "tier": Tier::Heavy.as_str(),
             "prompt_tokens": result.prompt_tokens,
@@ -555,7 +561,7 @@ impl LogService {
                 json!({"kind": "untrusted_model_output", "input_evidence_id": input["evidence_id"],
                     "input_sha256": input["sha256"], "offset_basis": input["offset_basis"],
                     "quotation_support": "not_asserted",
-                    "model": {"id": entry.id, "qualification": qualification}}),
+                    "model": {"id": model_id, "qualification": qualification}}),
             )
             .await
         {
@@ -570,7 +576,7 @@ impl LogService {
             bytes: as_u64(result.text.len()),
         });
         report.model = Some(ModelUse {
-            id: entry.id,
+            id: model_id,
             qualification,
             tier: Tier::Heavy.as_str(),
             prompt_tokens: result.prompt_tokens,
@@ -696,6 +702,7 @@ fn skipped(err: &ModelUnavailable) -> ModelSkipped {
         ModelUnavailable::Unverified(_) => CAUSE_MODEL_UNVERIFIED,
         ModelUnavailable::Unqualified(_) => CAUSE_MODEL_UNQUALIFIED,
         ModelUnavailable::Runtime(runtime) => runtime.cause(),
+        ModelUnavailable::NotResident { .. } => "model_not_loaded",
         ModelUnavailable::Store(_) => CAUSE_STORE_ERROR,
     };
     ModelSkipped {

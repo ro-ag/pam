@@ -59,30 +59,14 @@ impl Store {
         }))
     }
 
-    /// All captured origins, including retained tombstones. Missing ownership,
-    /// oversized metadata, or overflow refuses the complete set, never a prefix.
-    /// Empty means no evidence has yet been captured for this request.
-    pub async fn request_evidence_origins(
-        &self,
-        ticket: &str,
-        repository: &str,
-    ) -> Result<Option<Vec<String>>, StoreError> {
-        Ok(
-            match self
-                .request_evidence_origins_state(ticket, repository)
-                .await?
-            {
-                EvidenceOrigins::Ready(origins) => Some(origins),
-                EvidenceOrigins::Incomplete | EvidenceOrigins::Foreign => None,
-            },
-        )
-    }
-
-    /// [`Self::request_evidence_origins`] with the two ways the set can be
-    /// unusable told apart: evidence published under another repository
-    /// ([`EvidenceOrigins::Foreign`], never readable here) versus evidence whose
-    /// view has not been written yet ([`EvidenceOrigins::Incomplete`], which a
-    /// request still running will complete).
+    /// All captured origins, including retained tombstones, with the two
+    /// ways the set can be unusable told apart: evidence published under
+    /// another repository ([`EvidenceOrigins::Foreign`], never readable
+    /// here) versus evidence whose view has not been written yet
+    /// ([`EvidenceOrigins::Incomplete`], which a request still running will
+    /// complete). Missing ownership, oversized metadata, or overflow refuses
+    /// the complete set, never a prefix. An empty `Ready` set means no
+    /// evidence has yet been captured for this request.
     pub async fn request_evidence_origins_state(
         &self,
         ticket: &str,

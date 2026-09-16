@@ -10,7 +10,7 @@ use crate::client::{StopError, StopOutcome};
 use crate::service::{
     LAUNCHD_LABEL, MANAGED_STOPPED_NOTE, Platform, Runner, SYSTEMD_UNIT, ServiceEnv, ServiceError,
     ServiceState, StopFn, WINDOWS_TASK, install_with, render_launch_agent, render_systemd_unit,
-    status, uninstall, windows_task_action,
+    status, uninstall, windows_task_action, windows_task_loaded,
 };
 
 #[test]
@@ -48,7 +48,19 @@ fn systemd_unit_restarts_on_failure_and_wants_default_target() {
     assert!(unit.contains("WantedBy=default.target\n"));
     assert!(!unit.contains("Environment="));
     let with_base = render_systemd_unit(Path::new("/opt/pam"), Some(Path::new("/srv/pam")));
-    assert!(with_base.contains("Environment=PAM_BASE_DIR=/srv/pam\n"));
+    assert!(with_base.contains("Environment=\"PAM_BASE_DIR=/srv/pam\"\n"));
+}
+
+#[test]
+fn systemd_unit_quotes_and_escapes_a_base_override_with_spaces_and_quotes() {
+    let unit = render_systemd_unit(
+        Path::new("/opt/pam/pam"),
+        Some(Path::new(r#"/home/me/my "pam" dir/base\x"#)),
+    );
+    assert!(
+        unit.contains(r#"Environment="PAM_BASE_DIR=/home/me/my \"pam\" dir/base\\x""#),
+        "{unit}"
+    );
 }
 
 #[test]
@@ -311,6 +323,64 @@ fn windows_install_creates_the_logon_task_and_runs_it() {
             format!("schtasks /Run /TN {WINDOWS_TASK}"),
         ]
     );
+}
+
+#[test]
+fn windows_status_reads_the_task_status_column() {
+    let home = TempDir::new().unwrap();
+    let e = env(Platform::Windows, home.path());
+    let ready = FakeRunner::default().answer(
+        "schtasks /Query",
+        0,
+        "\r\nFolder: \\pam\r\nHostName:      BOX\r\nTaskName:      \\pam\\daemon\r\nStatus:        Ready\r\n",
+        "",
+    );
+    assert_eq!(
+        status(&e, &ready).unwrap().state,
+        ServiceState::Installed {
+            unit: WINDOWS_TASK.to_owned(),
+            loaded: true
+        }
+    );
+    assert_eq!(
+        ready.calls(),
+        vec![format!("schtasks /Query /TN {WINDOWS_TASK} /FO LIST")]
+    );
+    let disabled = FakeRunner::default().answer(
+        "schtasks /Query",
+        0,
+        "TaskName:      \\pam\\daemon\r\nStatus:        Disabled\r\n",
+        "",
+    );
+    assert_eq!(
+        status(&e, &disabled).unwrap().state,
+        ServiceState::Installed {
+            unit: WINDOWS_TASK.to_owned(),
+            loaded: false
+        }
+    );
+    let missing = FakeRunner::default().answer(
+        "schtasks /Query",
+        1,
+        "",
+        "ERROR: The system cannot find the file specified.\r\n",
+    );
+    assert_eq!(
+        status(&e, &missing).unwrap().state,
+        ServiceState::NotInstalled {
+            unit: WINDOWS_TASK.to_owned()
+        }
+    );
+}
+
+#[test]
+fn windows_task_status_parses_ready_running_disabled_and_garbage() {
+    assert!(windows_task_loaded("Status:        Ready\r\n"));
+    assert!(windows_task_loaded("status: running\n"));
+    assert!(!windows_task_loaded("Status:        Disabled\r\n"));
+    assert!(!windows_task_loaded("Status:        Could not start\r\n"));
+    assert!(!windows_task_loaded("TaskName: \\pam\\daemon\r\n"));
+    assert!(!windows_task_loaded(""));
 }
 
 #[test]

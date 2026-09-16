@@ -10,7 +10,6 @@
 //! The whole file is skipped, with a printed line, when the trusted OS `curl` is unavailable.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,7 +36,7 @@ async fn the_headers_pam_builds_arrive_on_the_wire() {
         return;
     };
     let (address, seen) = origin(Mode::Json).await;
-    let transport = CurlTransport::new(curl).allow_http_for_tests();
+    let transport = curl;
 
     let response = transport
         .send(request(address, "/probe", 64 * 1024), deadline(10))
@@ -70,7 +69,7 @@ async fn a_body_over_max_filesize_is_refused() {
         return;
     };
     let (address, _seen) = origin(Mode::Oversized).await;
-    let transport = CurlTransport::new(curl).allow_http_for_tests();
+    let transport = curl;
 
     let error = transport
         .send(request(address, "/big", 64), deadline(10))
@@ -87,7 +86,7 @@ async fn an_origin_that_never_answers_hits_max_time() {
         return;
     };
     let (address, _seen) = origin(Mode::Stall).await;
-    let transport = CurlTransport::new(curl).allow_http_for_tests();
+    let transport = curl;
 
     let error = transport
         .send(request(address, "/slow", 64 * 1024), deadline(2))
@@ -110,7 +109,7 @@ async fn a_refused_connection_is_a_network_failure() {
     let address = listener.local_addr().expect("the bound address");
     drop(listener);
 
-    let transport = CurlTransport::new(curl).allow_http_for_tests();
+    let transport = curl;
     let error = transport
         .send(request(address, "/gone", 1024), deadline(5))
         .await
@@ -220,9 +219,12 @@ fn deadline(seconds: u64) -> Instant {
     Instant::now() + Duration::from_secs(seconds)
 }
 
-/// The qualified OS curl, independent of the test process PATH.
-fn curl_on_path() -> Option<PathBuf> {
-    CurlTransport::trusted_path().ok()
+/// The transport over the qualified OS curl, independent of the test
+/// process PATH, speaking plain http to the loopback origin.
+fn curl_on_path() -> Option<CurlTransport> {
+    CurlTransport::trusted()
+        .ok()
+        .map(CurlTransport::allow_http_for_tests)
 }
 
 #[tokio::test]
@@ -279,10 +281,7 @@ async fn mutation_json_arrives_exactly_and_redirect_is_never_followed() {
         req.body = Some(body.clone());
         // Fifteen seconds, not five: spawning curl.exe on a loaded Windows
         // runner can eat most of a short deadline before the request is sent.
-        let result = CurlTransport::new(curl.clone())
-            .allow_http_for_tests()
-            .send(req, deadline(15))
-            .await;
+        let result = curl.clone().send(req, deadline(15)).await;
         if method == Method::Put {
             assert!(matches!(
                 result,

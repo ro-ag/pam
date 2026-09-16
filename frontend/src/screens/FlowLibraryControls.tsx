@@ -29,19 +29,26 @@ function FlowDialog({
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = ref.current;
+    // Whatever opened the dialog gets the keyboard back when it closes.
+    const opener =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (dialog?.showModal) dialog.showModal();
     else dialog?.setAttribute("open", "");
-    return () => dialog?.close?.();
+    return () => {
+      dialog?.close?.();
+      if (opener?.isConnected) opener.focus();
+    };
   }, []);
   return (
     <dialog
       ref={ref}
       aria-label={title}
+      aria-modal="true"
       onCancel={(event) => {
         event.preventDefault();
         onCancel();
       }}
-      className="m-auto w-full max-w-lg space-y-4 rounded-card border border-line bg-surface-raised p-5 text-ink shadow-xl backdrop:bg-black/40"
+      className="workspace-dialog m-auto w-full max-w-lg space-y-4 rounded-card border border-line bg-surface-raised p-5 text-ink shadow-float"
     >
       <h2 className="font-display text-lg">{title}</h2>
       {children}

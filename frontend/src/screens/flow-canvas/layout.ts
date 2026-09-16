@@ -110,6 +110,9 @@ export async function autoLayout(
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
+      // Independent steps keep their declared order top to bottom; without
+      // this ELK is free to stack step 3 above step 1.
+      "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
       "elk.spacing.nodeNode": "48",
       "elk.layered.spacing.nodeNodeBetweenLayers": "96",
       "elk.portConstraints": "FIXED_SIDE",
@@ -137,12 +140,4 @@ export async function autoLayout(
     if (step) positions[node.id] = noteBeside(step);
   }
   return positions;
-}
-
-/** Moves the nodes that have a stored position; the rest stay where they are. */
-export function applyPositions(nodes: CanvasNode[], positions: Positions): CanvasNode[] {
-  return nodes.map((node) => {
-    const position = positions[node.id];
-    return position ? { ...node, position: { ...position } } : node;
-  }) as CanvasNode[];
 }

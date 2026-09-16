@@ -466,25 +466,40 @@ async function flows(args: Args, sources: Sources): Promise<Answer> {
  * pr-readiness" — a flow id, hyphen and all — reading as the `flows`
  * intent's own run command rather than this one.
  */
-const START_TASKS: ReadonlyArray<{ id: string; title: string; match: RegExp }> = [
+export interface StartTask {
+  /** The flow id the task opens. */
+  id: string;
+  title: string;
+  /** What the card says the flow needs before it runs. */
+  needs: string;
+  /** The wording of a question that means this task. */
+  match: RegExp;
+}
+
+/** The one table Home's starter cards and the `start_task` intent share. */
+export const START_TASKS: readonly StartTask[] = [
   {
     id: "summarize-build-log",
     title: "Summarize a build log",
+    needs: "needs a repository to build",
     match: /(?=.*\bsummari[sz]e\b)(?=.*\blog\b)/i,
   },
   {
     id: "ci-failure-triage",
     title: "Triage a CI failure",
+    needs: "needs the GitHub connector",
     match: /(?=.*\btriage\b)(?=.*\b(?:ci|build|failure)\b)/i,
   },
   {
     id: "pr-readiness",
     title: "Check PR readiness",
+    needs: "needs a Rust repository",
     match: /(?:^|\s)readiness\b|\bpr ready\b/i,
   },
   {
     id: "watch-github-run",
     title: "Watch a GitHub run",
+    needs: "needs the GitHub connector and a run id",
     match: /(?=.*\bwatch\b)(?=.*\b(?:run|build|workflow)\b)/i,
   },
 ];
@@ -495,7 +510,8 @@ async function startTask(
   _ctx: AskContext,
   question: string,
 ): Promise<Answer> {
-  const task = START_TASKS.find((candidate) => candidate.match.test(question)) ?? START_TASKS[0];
+  const task =
+    START_TASKS.find((candidate) => candidate.match.test(question)) ?? START_TASKS[0];
   return {
     intent: "start_task",
     sentence: `${task.title} starts from its own card: open it to see what it needs before it runs.`,

@@ -1,15 +1,22 @@
 //! Fetching weights: system `curl` as a child process, integrity in Rust.
 //!
-//! No pure-Rust TLS stack is free of a C compiler, so PAM shells out to the system `curl`,
+//! No pure-Rust TLS stack is free of a C compiler, so PAM shells out to the operating
+//! system's own `curl` ([`curl_path`]: the fixed, root-owned binary, never a PATH lookup),
 //! which only moves bytes: size and SHA-256 are checked here after the transfer, against
-//! the catalog (missing curl is a named refusal via [`curl_recovery_line`]). Sidecar file
-//! names ([`sidecar_paths`]) are frozen to match pam-old, so multi-gigabyte partial
-//! downloads already on disk keep resuming instead of re-fetching. A checkpoint is never
-//! silently reused across a different URL or digest ([`DownloadError::CheckpointConflict`]).
-//! The `ETag` is saved but never sent as `--etag-compare`: a `304` would leave an empty
-//! transfer over a half-finished part file, so the digest stays the only integrity signal.
-//! Stalls are caught by [`TransferLimits`]; only a successful transfer or a digest mismatch
-//! deletes the part file — cancelling or failing keeps it so the next attempt resumes.
+//! the catalog (missing curl is a named refusal via [`curl_recovery_line`]). curl runs with
+//! `-q` (no `.curlrc`), `--proto =https,http`, and the URL after `--`, and [`start`] refuses
+//! a URL that is not `http(s)://` ([`DownloadError::InvalidUrl`]) so a pasted string can
+//! never become a curl option or a `file://` read. Sidecar file names ([`sidecar_paths`])
+//! are frozen to match pam-old, so multi-gigabyte partial downloads already on disk keep
+//! resuming instead of re-fetching. A checkpoint is never silently reused across a different
+//! URL or digest ([`DownloadError::CheckpointConflict`]). The `ETag` is saved and sent back
+//! as `If-Range` on a resume: a server whose file changed then answers the whole body
+//! (curl reports that as a refused resume), and the transfer starts over from zero rather
+//! than gluing new bytes onto an old part file. It is never sent as `--etag-compare`: a
+//! `304` would leave an empty transfer over a half-finished part file, so the digest stays
+//! the only integrity signal. Stalls are caught by [`TransferLimits`]; only a successful
+//! transfer or a digest mismatch deletes the part file — cancelling or failing keeps it so
+//! the next attempt resumes.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -154,9 +161,14 @@ impl DownloadState {
 /// them to.
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
-    /// No `curl` on `PATH`. See [`curl_recovery_line`].
-    #[error("curl not found on PATH")]
+    /// No trusted operating-system `curl`. See [`curl_recovery_line`].
+    #[error("the operating-system curl is not available")]
     CurlMissing,
+
+    /// The URL is not `http://` or `https://`: anything else (`file://`,
+    /// `ftp://`, a string starting with `-`) is refused before curl sees it.
+    #[error("{0:?} is not an http(s) URL")]
+    InvalidUrl(String),
 
     /// The destination file is already there. PAM never overwrites weights.
     #[error("{0:?} already exists")]
@@ -371,8 +383,14 @@ pub fn discard_partial(dest: &Path) -> Result<u64, DownloadError> {
     remove_if_present(&paths.part)?;
     remove_if_present(&paths.checkpoint)?;
     remove_if_present(&etag_path(&paths.checkpoint))?;
-    release_lock(lock);
+    // The lock file is unlinked while the lock is still held: a transfer
+    // that opens the path in this window either gets the old inode (and
+    // blocks on our lock until we release, then finds no part file) or a
+    // fresh one after the unlink. Releasing first would let a second
+    // transfer lock the old inode just before it disappears, after which a
+    // third could lock a new one — two writers on one part file.
     remove_if_present(&paths.lock)?;
+    release_lock(lock);
     Ok(bytes)
 }
 
@@ -429,15 +447,50 @@ fn remove_if_present(path: &Path) -> Result<(), DownloadError> {
     }
 }
 
-/// The `curl` executable on `PATH`, looked up once per process.
+/// The operating system's own `curl`, resolved once per process.
+///
+/// Never a `PATH` lookup: the same trusted-path rule `pam_connectors` applies
+/// to connector calls (duplicated here rather than imported — this crate does
+/// not depend on `pam_connectors`, and the check is a dozen lines). On macOS
+/// and Linux that is `/usr/bin/curl`, canonicalized, executable, with every
+/// ancestor root-owned and not group- or world-writable; on Windows it is
+/// `%SystemRoot%\System32\curl.exe`, canonicalized inside `System32`. Anything
+/// else fails closed as [`DownloadError::CurlMissing`].
 ///
 /// Cached because a download asks for it and so does the GUI, every time it
 /// draws the catalog; the answer does not change while PAM runs.
 pub fn curl_path() -> Result<PathBuf, DownloadError> {
     static CURL: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CURL.get_or_init(find_curl)
+    CURL.get_or_init(trusted_curl)
         .clone()
         .ok_or(DownloadError::CurlMissing)
+}
+
+/// Whether `url` is something curl may be pointed at: an `http://` or
+/// `https://` URL with a host. The scheme check is what keeps a pasted
+/// `file:///etc/passwd`, `ftp://…` or `-K/tmp/x` out of curl's hands; the
+/// argument vector also carries `--` before the URL and `--proto`
+/// restrictions, so this is the first of three fences, not the only one.
+pub fn check_url(url: &str) -> Result<(), DownloadError> {
+    let rest = url
+        .get(..8)
+        .filter(|head| head.eq_ignore_ascii_case("https://"))
+        .map(|_| &url[8..])
+        .or_else(|| {
+            url.get(..7)
+                .filter(|head| head.eq_ignore_ascii_case("http://"))
+                .map(|_| &url[7..])
+        });
+    let has_host = rest.is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric() || first == '[')
+    });
+    if has_host && !url.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err(DownloadError::InvalidUrl(url.to_owned()))
+    }
 }
 
 /// How to get curl on this platform, in one sentence.
@@ -575,6 +628,7 @@ pub fn start_with_limits(
     request: DownloadRequest,
     limits: TransferLimits,
 ) -> Result<DownloadHandle, DownloadError> {
+    check_url(&request.url)?;
     let curl = curl_path()?;
     if request.dest.exists() {
         return Err(DownloadError::AlreadyExists(request.dest.clone()));
@@ -670,43 +724,106 @@ pub(crate) fn publish_terminal(
 
 impl Job {
     /// Spawns curl, drives it, and verifies whatever it left behind.
+    ///
+    /// A resume carries the checkpoint's `ETag` as `If-Range`. When the
+    /// server's file has changed it ignores the range and answers `200`
+    /// with the whole body, which curl refuses as an unresumable transfer
+    /// (exit 33) after saving the new `ETag`. That exact shape — a resume
+    /// refused, and a different `ETag` than the one sent — means the old
+    /// bytes belong to another file: the part is discarded and curl runs
+    /// once more from zero. Any other refusal is reported as it is.
     async fn execute(&self, cancelled: watch::Receiver<bool>) -> DownloadState {
-        let child = match self.spawn_curl() {
-            Ok(child) => child,
-            Err(error) => {
-                return DownloadState::failed(
-                    "download_failed",
-                    format!("could not run curl: {error}"),
-                );
-            }
-        };
+        let mut resume_etag = self.resume_etag();
+        loop {
+            let child = match self.spawn_curl(resume_etag.as_deref()) {
+                Ok(child) => child,
+                Err(error) => {
+                    return DownloadState::failed(
+                        "download_failed",
+                        format!("could not run curl: {error}"),
+                    );
+                }
+            };
 
-        let outcome = self.drive(child, cancelled).await;
-        self.absorb_etag();
-        match outcome {
-            CurlOutcome::Cancelled => DownloadState::Cancelled,
-            CurlOutcome::Failed { cause, detail } => DownloadState::Failed { cause, detail },
-            CurlOutcome::Completed => self.finish().await,
+            let outcome = self.drive(child, cancelled.clone()).await;
+            let server_etag = self.saved_etag();
+            self.absorb_etag();
+            return match outcome {
+                CurlOutcome::Cancelled => DownloadState::Cancelled,
+                CurlOutcome::Failed { cause, detail } => {
+                    if cause == "resume_unsupported"
+                        && let Some(sent) = resume_etag.take()
+                        && server_etag.is_some_and(|fresh| fresh != sent)
+                        && self.restart_from_zero()
+                    {
+                        continue;
+                    }
+                    DownloadState::Failed { cause, detail }
+                }
+                CurlOutcome::Completed => self.finish().await,
+            };
         }
+    }
+
+    /// The `ETag` a resume should send: the checkpoint's, and only when
+    /// there are bytes to resume from.
+    fn resume_etag(&self) -> Option<String> {
+        if file_size(&self.paths.part) == 0 {
+            return None;
+        }
+        read_checkpoint(&self.paths.checkpoint)?.etag
+    }
+
+    /// The `ETag` curl saved from the last response, if it saved one.
+    fn saved_etag(&self) -> Option<String> {
+        let etag = std::fs::read_to_string(&self.etag_file).ok()?;
+        let etag = etag.trim();
+        (!etag.is_empty()).then(|| etag.to_owned())
+    }
+
+    /// Throws the part file away so the next curl run starts at byte zero,
+    /// and forgets the checkpoint's `ETag` so nothing is sent as `If-Range`.
+    /// Answers whether the disk agreed.
+    fn restart_from_zero(&self) -> bool {
+        if std::fs::remove_file(&self.paths.part).is_err() {
+            return false;
+        }
+        let Some(mut checkpoint) = read_checkpoint(&self.paths.checkpoint) else {
+            return false;
+        };
+        checkpoint.etag = None;
+        write_checkpoint(&self.paths.checkpoint, &checkpoint).is_ok()
     }
 
     /// The one curl invocation PAM makes.
     ///
-    /// `--fail` turns an HTTP error status into a nonzero exit instead of a
-    /// saved error page; `--continue-at -` resumes from whatever is in the
-    /// part file; `--retry 0` keeps retry policy here rather than inside
-    /// curl, where PAM cannot report it. `--connect-timeout`,
-    /// `--speed-limit` and `--speed-time` come from [`TransferLimits`] and
-    /// are the difference between a failed download and a hung one.
-    fn spawn_curl(&self) -> std::io::Result<Child> {
+    /// `-q` is first so no `.curlrc` (the human's, or one planted in
+    /// `CURL_HOME`) can add options; `--proto` and `--proto-redir` keep the
+    /// request and every redirect on http(s); `--fail` turns an HTTP error
+    /// status into a nonzero exit instead of a saved error page;
+    /// `--continue-at -` resumes from whatever is in the part file, with
+    /// `If-Range` when the checkpoint knows what those bytes belong to;
+    /// `--retry 0` keeps retry policy here rather than inside curl, where
+    /// PAM cannot report it. `--connect-timeout`, `--speed-limit` and
+    /// `--speed-time` come from [`TransferLimits`] and are the difference
+    /// between a failed download and a hung one. The URL comes last, after
+    /// `--`, so it is never parsed as an option even if [`check_url`] were
+    /// bypassed.
+    fn spawn_curl(&self, if_range: Option<&str>) -> std::io::Result<Child> {
         // `--speed-time` counts whole seconds, and 0 would disable the
         // check entirely; a sub-second window becomes one second rather
         // than no window at all.
         let stall_secs = self.limits.stall_window.as_secs().max(1);
         let connect_secs = self.limits.connect_timeout.as_secs().max(1);
-        Command::new(&self.curl)
+        let mut command = Command::new(&self.curl);
+        command
+            .arg("-q")
             .arg("--fail")
             .arg("--location")
+            .arg("--proto")
+            .arg("=https,http")
+            .arg("--proto-redir")
+            .arg("=https,http")
             .arg("--silent")
             .arg("--show-error")
             .arg("--connect-timeout")
@@ -722,7 +839,12 @@ impl Job {
             .arg("--etag-save")
             .arg(&self.etag_file)
             .arg("--retry")
-            .arg("0")
+            .arg("0");
+        if let Some(etag) = if_range {
+            command.arg("--header").arg(format!("If-Range: {etag}"));
+        }
+        command
+            .arg("--")
             .arg(&self.request.url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -812,22 +934,34 @@ impl Job {
     }
 
     /// Moves the part file into place and clears the sidecars.
+    ///
+    /// The move is a hard link followed by an unlink of the part, not a
+    /// rename: `rename` replaces whatever is at the destination, so a file
+    /// that appeared between an existence check and the rename — another
+    /// PAM, a human copying weights in by hand — would be silently
+    /// overwritten. `hard_link` refuses an existing destination inside the
+    /// filesystem, atomically, with no check-then-act window. Both names
+    /// are in one directory, so the link cannot cross a device.
     fn install(&self, sha256: &str, size_bytes: u64) -> Result<(), DownloadState> {
-        if self.request.dest.exists() {
-            return Err(DownloadState::failed(
-                "already_exists",
-                format!(
-                    "{} appeared while the download ran",
-                    self.request.dest.display()
-                ),
-            ));
-        }
-        if let Err(error) = std::fs::rename(&self.paths.part, &self.request.dest) {
+        if let Err(error) = std::fs::hard_link(&self.paths.part, &self.request.dest) {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(DownloadState::failed(
+                    "already_exists",
+                    format!(
+                        "{} appeared while the download ran",
+                        self.request.dest.display()
+                    ),
+                ));
+            }
             return Err(DownloadState::failed(
                 "io",
                 format!("could not move the finished file into place: {error}"),
             ));
         }
+        // The weights are in place under their final name; a part file that
+        // would not go away costs a resume check next time, and reporting a
+        // failed download here would be a lie.
+        let _ = std::fs::remove_file(&self.paths.part);
 
         if self.request.expected_sha256.is_some() {
             self.record_verification(sha256, size_bytes);
@@ -991,30 +1125,44 @@ fn now_unix_seconds() -> i64 {
         })
 }
 
-/// First executable named `curl` on `PATH`.
-fn find_curl() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "curl.exe" } else { "curl" };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable_file(candidate))
+/// The fixed operating-system curl, or `None` when it is absent or its
+/// ownership would let an ordinary same-user process replace it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn trusted_curl() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize("/usr/bin/curl").ok()?;
+    let binary = path.metadata().ok()?;
+    if !binary.is_file() || binary.mode() & 0o111 == 0 {
+        return None;
+    }
+    // Canonical paths hold no symlinks; every component must stay outside
+    // an ordinary same-user agent's write authority.
+    for ancestor in path.ancestors() {
+        let metadata = ancestor.symlink_metadata().ok()?;
+        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
+        {
+            return None;
+        }
+    }
+    Some(path)
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
+/// Windows has no root-owned file model readable without a platform crate,
+/// so trust comes from the one path the operating system itself services:
+/// `%SystemRoot%\System32\curl.exe`, canonicalized inside a canonicalized
+/// `System32`. PATH is never searched.
+#[cfg(target_os = "windows")]
+fn trusted_curl() -> Option<PathBuf> {
+    let system_root = std::env::var_os("SystemRoot")?;
+    let system32 = std::fs::canonicalize(Path::new(&system_root).join("System32")).ok()?;
+    let canonical = std::fs::canonicalize(system32.join("curl.exe")).ok()?;
+    if !canonical.is_file() || !canonical.starts_with(&system32) {
+        return None;
     }
+    Some(canonical)
+}
 
-    #[cfg(unix)]
-    let executable = {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let executable = true;
-
-    executable
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn trusted_curl() -> Option<PathBuf> {
+    None
 }

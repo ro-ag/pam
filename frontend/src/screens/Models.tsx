@@ -2,17 +2,19 @@ import { EngineCard } from "./EngineCard";
 import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { Check, LoaderCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Check, ChevronDown, LoaderCircle } from "lucide-react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
+import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { PageTabs, PagePane } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Section } from "../components/ui/Section";
 import { formatBytes, percentOf } from "../lib/bytes";
+import { cn } from "../lib/cn";
 import {
   modelsCatalog,
   modelsDefaultsSet,
@@ -151,32 +153,36 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** The admission badge plus, for anything short of qualified, the reason it is capped. */
+/**
+ * The admission badge plus, for anything short of qualified, the reason it
+ * is capped — one line, the whole sentence on the title, so a row stays
+ * two lines tall and six rows fit a 700px window.
+ */
 function ClassBadge({ entry }: { entry: ModelEntry }) {
   const qualification = entry.qualification;
-  if (qualification !== null) {
-    return (
-      <span className="space-y-1">
-        <Badge tone="success">qualified</Badge>
-        <span className="block font-sans text-xs text-ink-faint">
-          {qualification.contract} · {(qualification.accuracy * 100).toFixed(1)}% ·{" "}
-          {qualification.false_passes} false passes · {qualification.decided}
-        </span>
-      </span>
-    );
-  }
-  if (entry.class === "engine") {
-    return (
-      <span className="space-y-1">
-        <Badge tone="neutral">engine</Badge>
-        <span className="block font-sans text-xs text-ink-faint">{UNQUALIFIED_SENTENCE}</span>
-      </span>
-    );
-  }
+  const note =
+    qualification !== null
+      ? `${qualification.contract} · ${(qualification.accuracy * 100).toFixed(1)}% · ${qualification.false_passes} false passes · ${qualification.decided}`
+      : entry.class === "engine"
+        ? UNQUALIFIED_SENTENCE
+        : FLOOR_SENTENCE;
   return (
-    <span className="space-y-1">
-      <Badge tone="neutral">test only</Badge>
-      <span className="block font-sans text-xs text-ink-faint">{FLOOR_SENTENCE}</span>
+    <span className="flex items-center gap-2" title={note}>
+      {qualification !== null ? (
+        <Badge tone="success" className="shrink-0">
+          qualified
+        </Badge>
+      ) : (
+        <Badge tone="neutral" className="shrink-0">
+          {entry.class === "engine" ? "engine" : "test only"}
+        </Badge>
+      )}
+      <span
+        className="hidden min-w-0 truncate font-sans text-xs text-ink-muted @4xl:inline"
+        title={note}
+      >
+        {note}
+      </span>
     </span>
   );
 }
@@ -229,12 +235,16 @@ function RuntimeCard({
   // The try box exists to prove wiring, so test-only weights are loadable
   // here on purpose; only the tier defaults enforce verification.
   const selectable = models;
-  const pick = choice || selectable[0]?.id || "";
+  // A deleted model must not linger as the pick: the choice stands only
+  // while the library still holds it.
+  const pick = selectable.some((model) => model.id === choice)
+    ? choice
+    : (selectable[0]?.id ?? "");
 
   return (
     <Panel ground="raised" className="space-y-5 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">in memory</p>
+        <p className="font-data text-xs text-ink-faint">In memory</p>
         {runtime?.state === "loaded" && <Badge tone="success">loaded</Badge>}
         {runtime?.state === "loading" && (
           <Badge tone="warning">loading · {runtime.phase}</Badge>
@@ -275,10 +285,10 @@ function RuntimeCard({
             <Fact label="architecture" value={loaded.architecture} />
           </dl>
           <div className="space-y-0.5 text-right">
-            <p className="font-data text-xs text-ink-faint">last tokens/sec</p>
+            <p className="font-data text-xs text-ink-faint">Last tokens/sec</p>
             <p className="font-display text-title font-semibold text-ink tabular-nums">
               {loaded.last_tokens_per_sec === null
-                ? "—"
+                ? "not measured"
                 : loaded.last_tokens_per_sec.toFixed(1)}
             </p>
           </div>
@@ -291,7 +301,10 @@ function RuntimeCard({
           value={pick}
           disabled={selectable.length === 0 || load.isPending}
           onChange={(event) => setChoice(event.target.value)}
-          className="h-8 min-w-56 rounded-control field-control border border-control-line bg-inset px-2 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+          className={cn(
+            fieldClasses,
+            "w-auto min-w-56 px-2 disabled:cursor-not-allowed disabled:opacity-70",
+          )}
         >
           {selectable.length === 0 && <option value="">nothing installed</option>}
           {selectable.map((model) => (
@@ -304,6 +317,13 @@ function RuntimeCard({
         <Button
           size="sm"
           disabled={!pick || load.isPending || runtime?.state === "loading"}
+          title={
+            !pick
+              ? "Nothing is installed to load"
+              : runtime?.state === "loading"
+                ? "A model is already loading"
+                : undefined
+          }
           onClick={() => load.mutate(pick)}
         >
           {load.isPending && (
@@ -321,7 +341,7 @@ function RuntimeCard({
         </Button>
         <span className="ml-auto font-data text-xs text-ink-faint">
           {status === undefined
-            ? "—"
+            ? "idle unload unknown"
             : status.idle_unload_min === 0
               ? "stays resident until unloaded"
               : `idle unload after ${status.idle_unload_min} min`}
@@ -334,6 +354,125 @@ function RuntimeCard({
 }
 
 // --- 2. library ------------------------------------------------------------
+
+/**
+ * The row's secondary actions behind one button, so a row stays one line
+ * at any width: Load is the visible action; set-as-default, Verify and
+ * Delete open from "More". Escape or an outside focus closes the menu.
+ */
+function RowMenu({
+  entry,
+  busy,
+  blocker,
+  onDefault,
+  onVerify,
+  onDelete,
+}: {
+  entry: ModelEntry;
+  busy: boolean;
+  blocker: string | undefined;
+  onDefault: (tier: "light" | "heavy") => void;
+  onVerify: () => void;
+  onDelete: () => void;
+}) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const menu = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const close = () => {
+    setOpen(false);
+    trigger.current?.focus();
+  };
+  const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    }
+  };
+  const item =
+    "flex h-8 w-full items-center rounded-control px-2.5 text-left font-sans text-sm text-ink hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-70";
+  return (
+    <div
+      className="relative"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+      }}
+      onKeyDown={keyDown}
+    >
+      <Button
+        ref={trigger}
+        size="sm"
+        variant="ghost"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? id : undefined}
+        aria-label={`More actions for ${entry.id}`}
+        disabled={busy}
+        onClick={() => setOpen((value) => !value)}
+      >
+        More
+        <ChevronDown size={14} aria-hidden="true" />
+      </Button>
+      {open && (
+        <div
+          ref={menu}
+          id={id}
+          role="menu"
+          aria-label={`Actions for ${entry.id}`}
+          className="absolute right-0 z-10 mt-1 w-44 space-y-0.5 rounded-card border border-line-strong bg-surface-raised p-1 shadow-float"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={blocker !== undefined}
+            title={blocker}
+            className={item}
+            onClick={() => {
+              setOpen(false);
+              onDefault("light");
+            }}
+          >
+            Set light
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={blocker !== undefined}
+            title={blocker}
+            className={item}
+            onClick={() => {
+              setOpen(false);
+              onDefault("heavy");
+            }}
+          >
+            Set heavy
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className={item}
+            onClick={() => {
+              setOpen(false);
+              onVerify();
+            }}
+          >
+            Verify
+          </button>
+          <div role="none" className="border-t border-line pt-0.5">
+            <ConfirmButton
+              label="Delete"
+              confirmLabel="delete it?"
+              onConfirm={() => {
+                setOpen(false);
+                onDelete();
+              }}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function LibraryRow({
   entry,
@@ -355,63 +494,55 @@ function LibraryRow({
   const blocker = admissionBlocker(entry);
   return (
     <tr className="border-t border-line align-top">
-      <td className="py-2.5 pr-3">
-        <span className="block font-data text-sm text-ink">{entry.id}</span>
-        <span className="block font-data text-xs text-ink-faint">
-          {defaults?.light === entry.id && "light default · "}
-          {defaults?.heavy === entry.id && "heavy default · "}
-          {entry.vendor}
+      <td className="py-2 pr-3">
+        <span className="block truncate font-data text-sm text-ink" title={entry.path}>
+          {entry.id}
         </span>
-      </td>
-      <td className="py-2.5 pr-3">
-        {entry.info ? (
-          <span className="font-data text-xs text-ink-muted">{entry.info.quant_label}</span>
-        ) : (
-          <span className="font-data text-xs text-danger">
-            {entry.info_error ?? "header unreadable"}
+        {(defaults?.light === entry.id || defaults?.heavy === entry.id) && (
+          <span className="block font-data text-xs text-ink-faint">
+            {defaults?.light === entry.id && "light default"}
+            {defaults?.light === entry.id && defaults?.heavy === entry.id && " · "}
+            {defaults?.heavy === entry.id && "heavy default"}
           </span>
         )}
       </td>
-      <td className="py-2.5 pr-3 font-data text-xs text-ink-muted tabular-nums">
+      <td className="py-2 pr-3">
+        {entry.info ? (
+          <span className="font-data text-xs text-ink-muted">{entry.info.quant_label}</span>
+        ) : (
+          <span className="block space-y-0.5">
+            <span className="block font-data text-xs text-danger">unknown</span>
+            <span
+              className="block truncate font-sans text-xs text-ink-muted"
+              title={entry.info_error ?? ""}
+            >
+              {entry.info_error ?? "header unreadable"}
+            </span>
+          </span>
+        )}
+      </td>
+      <td className="py-2 pr-3 font-data text-xs whitespace-nowrap text-ink-muted tabular-nums">
         {formatBytes(entry.size_bytes)}
       </td>
-      <td className="py-2.5 pr-3">
+      <td className="py-2 pr-3">
         <ClassBadge entry={entry} />
       </td>
-      <td className="py-2.5 pr-3">
+      <td className="py-2 pr-3">
         <VerifiedBadge entry={entry} />
       </td>
-      <td className="py-2.5">
-        <div className="flex flex-wrap items-center justify-end gap-1.5">
-          <Button size="sm" variant="ghost" disabled={busy} onClick={onLoad}>
+      <td className="py-2">
+        <div className="flex items-center justify-end gap-1.5 whitespace-nowrap">
+          <Button size="sm" variant="secondary" disabled={busy} onClick={onLoad}>
+            {busy && <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />}
             Load
           </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={busy || blocker !== undefined}
-            title={blocker}
-            onClick={() => onDefault("light")}
-          >
-            Set light
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={busy || blocker !== undefined}
-            title={blocker}
-            onClick={() => onDefault("heavy")}
-          >
-            Set heavy
-          </Button>
-          <Button size="sm" variant="ghost" disabled={busy} onClick={onVerify}>
-            Verify
-          </Button>
-          <ConfirmButton
-            label="Delete"
-            confirmLabel="delete it?"
+          <RowMenu
+            entry={entry}
             busy={busy}
-            onConfirm={onDelete}
+            blocker={blocker}
+            onDefault={onDefault}
+            onVerify={onVerify}
+            onDelete={onDelete}
           />
         </div>
       </td>
@@ -471,7 +602,7 @@ function LibraryTable({
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">on disk</p>
+        <p className="font-data text-xs text-ink-faint">On disk</p>
         {modelsDir && (
           <span className="truncate font-data text-xs text-ink-faint">{modelsDir}</span>
         )}
@@ -485,15 +616,17 @@ function LibraryTable({
 
       {models.length > 0 && (
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse">
+          {/* Fixed layout so the id and the notes truncate instead of pushing
+              the actions off the panel at 1100px. */}
+          <table className="w-full table-fixed border-collapse">
             <thead>
               <tr className="text-left font-data text-xs text-ink-faint">
-                <th className="pb-2 pr-3 font-medium">model</th>
-                <th className="pb-2 pr-3 font-medium">quant</th>
-                <th className="pb-2 pr-3 font-medium">size</th>
-                <th className="pb-2 pr-3 font-medium">class</th>
-                <th className="pb-2 pr-3 font-medium">digest</th>
-                <th className="pb-2 font-medium" aria-label="actions" />
+                <th className="w-3/10 pb-2 pr-3 font-medium">model</th>
+                <th className="w-3/20 pb-2 pr-3 font-medium">quant</th>
+                <th className="w-1/10 pb-2 pr-3 font-medium">size</th>
+                <th className="w-3/20 pb-2 pr-3 font-medium">class</th>
+                <th className="w-1/10 pb-2 pr-3 font-medium">verification</th>
+                <th className="w-1/5 pb-2 font-medium" aria-label="actions" />
               </tr>
             </thead>
             <tbody>
@@ -675,13 +808,12 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
   // that can never be taken is noise, not information.
   const presets = (catalog.data?.presets ?? []).filter((preset) => preset.fits_host);
 
-  const inputClasses =
-    "h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink placeholder:text-ink-faint";
+  const inputClasses = fieldClasses;
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">curated presets</p>
+        <p className="font-data text-xs text-ink-faint">Curated presets</p>
         {catalog.data && (
           <span className="font-data text-xs text-ink-faint tabular-nums">
             host RAM {formatBytes(catalog.data.host_ram_bytes)}
@@ -690,6 +822,10 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
       </div>
 
       {listFailure && <FailureNote failure={listFailure} label="catalog" />}
+
+      {!listFailure && catalog.isPending && (
+        <p className="font-data text-xs text-ink-faint">reading the catalog…</p>
+      )}
 
       {!listFailure && presets.length === 0 && !catalog.isPending && (
         <p className="font-sans text-sm text-ink-muted">
@@ -726,10 +862,10 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           }
         }}
       >
-        <p className="font-data text-xs text-ink-faint">paste a URL</p>
+        <p className="font-data text-xs text-ink-faint">Paste a URL</p>
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-64 flex-1 space-y-1">
-            <span className="block font-data text-xs text-ink-faint">gguf url</span>
+            <span className={fieldLabelClasses}>GGUF URL</span>
             <input
               aria-label="gguf url"
               value={url}
@@ -739,7 +875,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
             />
           </label>
           <label className="w-40 space-y-1">
-            <span className="block font-data text-xs text-ink-faint">vendor</span>
+            <span className={fieldLabelClasses}>Vendor</span>
             <input
               aria-label="vendor"
               value={vendor}
@@ -752,6 +888,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
             size="sm"
             type="submit"
             disabled={download.isPending || !url.trim() || !vendor.trim()}
+            title={!url.trim() || !vendor.trim() ? "Enter a URL and a vendor first" : undefined}
           >
             Fetch
           </Button>
@@ -808,7 +945,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="font-data text-xs text-ink-faint">one prompt</p>
+        <p className="font-data text-xs text-ink-faint">One prompt</p>
         {closed && (
           <span className="font-data text-xs text-ink-faint">{TRY_DISABLED_REASON}</span>
         )}
@@ -821,12 +958,15 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
         disabled={closed}
         onChange={(event) => setPrompt(event.target.value)}
         placeholder="Say hello in five words."
-        className="w-full rounded-control field-control border border-control-line bg-inset p-2.5 font-data text-xs text-ink placeholder:text-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
+        className={cn(
+          fieldClasses,
+          "h-auto py-2 disabled:cursor-not-allowed disabled:opacity-70",
+        )}
       />
 
       <div className="flex flex-wrap items-end gap-2">
         <label className="w-32 space-y-1">
-          <span className="block font-data text-xs text-ink-faint">max tokens</span>
+          <span className={fieldLabelClasses}>Max tokens</span>
           <input
             type="number"
             min={1}
@@ -834,12 +974,15 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
             value={maxTokens}
             disabled={closed}
             onChange={(event) => setMaxTokens(event.target.value)}
-            className="h-8 w-full rounded-control field-control border border-control-line bg-inset px-2.5 font-data text-xs text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            className={cn(fieldClasses, "disabled:cursor-not-allowed disabled:opacity-70")}
           />
         </label>
         <Button
           size="sm"
           disabled={closed || run.isPending || !prompt.trim()}
+          title={
+            closed ? TRY_DISABLED_REASON : !prompt.trim() ? "Type a prompt first" : undefined
+          }
           onClick={() =>
             modelId &&
             run.mutate({
@@ -937,10 +1080,9 @@ export function ModelsScreen() {
       />
       <PagePane id="models" tab="runtime" active={tab === "runtime"}>
         <Section
-          eyebrow="runtime"
-          eyebrowExtra={<Badge tone="accent">GUI-only</Badge>}
+          eyebrow="Daemon runtime"
           title="Runtime"
-          blurb="What each job tier gets, and what is in memory right now."
+          blurb="What each job tier gets, and what is in memory right now. Only this app administers models."
         >
           <ReadinessCard status={status.data} failure={statusFailure} onRepair={repair} />
           <RuntimeCard status={status.data} models={models} failure={statusFailure} />
@@ -948,7 +1090,7 @@ export function ModelsScreen() {
       </PagePane>
       <PagePane id="models" tab="library" active={tab === "library"}>
         <Section
-          eyebrow="library"
+          eyebrow="On disk"
           title="Installed models"
           blurb="Every set of weights on disk, with what I know about each one."
         >
@@ -963,7 +1105,7 @@ export function ModelsScreen() {
       </PagePane>
       <PagePane id="models" tab="catalog" active={tab === "catalog"}>
         <Section
-          eyebrow="catalog"
+          eyebrow="Catalog"
           title="Downloads"
           blurb="The models I know how to fetch and verify — only the ones this machine can hold."
         >
@@ -973,7 +1115,7 @@ export function ModelsScreen() {
       </PagePane>
       <PagePane id="models" tab="test" active={tab === "test"}>
         <Section
-          eyebrow="diagnostics"
+          eyebrow="Diagnostics"
           title="Test model"
           blurb="One prompt against whatever is loaded, so you can see it answer before trusting it with a job."
         >

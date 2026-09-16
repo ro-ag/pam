@@ -1,9 +1,36 @@
 use std::sync::Arc;
 
 use crate::secrets::{
-    FakeSecretBackend, KeyringState, PROBE_CONNECTOR, SecretBackend, SecretError, SecretStore,
-    account_for,
+    FakeSecretBackend, KeyringState, PROBE_CONNECTOR, Secret, SecretBackend, SecretError,
+    SecretStore, account_for, keyring_error_kind,
 };
+
+/// What a platform error contributes to a log line is its variant name and
+/// nothing else: the payloads carry account identifiers and, on some
+/// backends, the secret itself.
+#[test]
+fn keyring_error_kind_names_the_variant_without_its_payload() {
+    let leaky =
+        keyring_core::Error::BadStoreFormat("account pam.connector.v1.github: hunter2".into());
+    assert_eq!(keyring_error_kind(&leaky), "bad_store_format");
+    assert_eq!(
+        keyring_error_kind(&keyring_core::Error::NoEntry),
+        "no_entry"
+    );
+    assert_eq!(
+        keyring_error_kind(&keyring_core::Error::Invalid(
+            "field".into(),
+            "hunter2".into()
+        )),
+        "invalid"
+    );
+    for kind in [
+        keyring_error_kind(&leaky),
+        keyring_error_kind(&keyring_core::Error::NoDefaultStore),
+    ] {
+        assert!(!kind.contains("hunter2") && !kind.contains("github"));
+    }
+}
 
 #[test]
 fn account_for_shapes_the_connector_id_into_the_v1_namespace() {
@@ -25,14 +52,20 @@ async fn set_get_present_clear_round_trip_through_the_fake_backend() {
     assert!(!store.present("github").await.unwrap());
     assert!(store.get("github").await.unwrap().is_none());
 
-    store.set("github", "ghp_abc123").await.unwrap();
+    store
+        .set("github", Secret::new("ghp_abc123".to_owned()))
+        .await
+        .unwrap();
     assert!(store.present("github").await.unwrap());
 
     let secret = store.get("github").await.unwrap().expect("secret present");
     assert_eq!(secret.expose(), "ghp_abc123");
 
     // Setting again replaces rather than duplicating.
-    store.set("github", "ghp_replacement").await.unwrap();
+    store
+        .set("github", Secret::new("ghp_replacement".to_owned()))
+        .await
+        .unwrap();
     let replaced = store
         .get("github")
         .await
@@ -51,8 +84,14 @@ async fn set_get_present_clear_round_trip_through_the_fake_backend() {
 #[tokio::test]
 async fn entries_for_different_connectors_never_collide() {
     let store = SecretStore::new(Arc::new(FakeSecretBackend::default()));
-    store.set("github", "gh-secret").await.unwrap();
-    store.set("jenkins", "jenkins-secret").await.unwrap();
+    store
+        .set("github", Secret::new("gh-secret".to_owned()))
+        .await
+        .unwrap();
+    store
+        .set("jenkins", Secret::new("jenkins-secret".to_owned()))
+        .await
+        .unwrap();
 
     assert_eq!(
         store.get("github").await.unwrap().unwrap().expose(),
@@ -75,7 +114,10 @@ async fn fail_with_denied_surfaces_from_every_operation() {
 
     assert_eq!(store.get("github").await.unwrap_err(), SecretError::Denied);
     assert_eq!(
-        store.set("github", "x").await.unwrap_err(),
+        store
+            .set("github", Secret::new("x".to_owned()))
+            .await
+            .unwrap_err(),
         SecretError::Denied
     );
     assert_eq!(
@@ -99,7 +141,10 @@ async fn fail_with_unavailable_surfaces_from_every_operation() {
         SecretError::Unavailable
     );
     assert_eq!(
-        store.set("github", "x").await.unwrap_err(),
+        store
+            .set("github", Secret::new("x".to_owned()))
+            .await
+            .unwrap_err(),
         SecretError::Unavailable
     );
     assert_eq!(

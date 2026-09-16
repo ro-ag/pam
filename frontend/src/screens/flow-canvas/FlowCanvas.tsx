@@ -459,26 +459,47 @@ function Canvas({
               </span>
             </div>
           )}
+          {/* Below the detail pane's 4xl width the labels fold into their
+              glyphs (the names stay on aria-label and title), so the row
+              never wraps onto the canvas at 1100x700. */}
           <div className="flex flex-wrap items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={() => add("command")}>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="Add command"
+              title="Add command"
+              onClick={() => add("command")}
+            >
               <Terminal size={14} aria-hidden="true" />
-              Add command
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => add("connector")}>
-              <Plug size={14} aria-hidden="true" />
-              Add connector
-            </Button>
-            <span className="flex-1" />
-            <Button variant="ghost" size="sm" onClick={tidy}>
-              <Wand2 size={14} aria-hidden="true" />
-              Tidy
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => void fitView(FIT)}>
-              <Maximize2 size={14} aria-hidden="true" />
-              Fit
+              <span className="hidden @4xl:inline">Add command</span>
             </Button>
             <Button
-              variant="secondary"
+              variant="ghost"
+              size="sm"
+              aria-label="Add connector"
+              title="Add connector"
+              onClick={() => add("connector")}
+            >
+              <Plug size={14} aria-hidden="true" />
+              <span className="hidden @4xl:inline">Add connector</span>
+            </Button>
+            <span className="flex-1" />
+            <Button variant="ghost" size="sm" aria-label="Tidy" title="Tidy" onClick={tidy}>
+              <Wand2 size={14} aria-hidden="true" />
+              <span className="hidden @4xl:inline">Tidy</span>
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="Fit"
+              title="Fit"
+              onClick={() => void fitView(FIT)}
+            >
+              <Maximize2 size={14} aria-hidden="true" />
+              <span className="hidden @4xl:inline">Fit</span>
+            </Button>
+            <Button
+              variant="ghost"
               size="sm"
               data-canvas-maximize=""
               aria-label={maximized ? "Restore canvas" : "Maximize canvas"}
@@ -495,7 +516,7 @@ function Canvas({
               ) : (
                 <Expand size={14} aria-hidden="true" />
               )}
-              {maximized ? "Restore" : "Maximize"}
+              <span className="hidden @4xl:inline">{maximized ? "Restore" : "Maximize"}</span>
             </Button>
             <ConfirmButton
               label="Remove"

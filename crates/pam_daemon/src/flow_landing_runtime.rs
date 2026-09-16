@@ -1,12 +1,15 @@
 //! Original-ticket typed landing orchestration. Recipes supply no commands or URLs.
 use super::{
-    Action, Arc, ArgValue, BTreeMap, CapabilityFailure, ConnectorId, Duration, FlowRefusal,
-    Instant, Path, PathBuf, RunState, Step, StepReport, StepStatus, Store, Value, digest, failed,
-    json, new_evidence_id, resolve_program,
+    Action, Arc, ArgValue, Attempt, BTreeMap, CapabilityFailure, ConnectorId, Duration,
+    FlowRefusal, Instant, Path, PathBuf, RunState, Step, StepReport, StepStatus, Store, Value,
+    digest, failed, json, new_evidence_id, resolve_program,
 };
-use crate::connector_service::LandingGithubOp;
-use crate::flow_recovery::failure;
-use crate::landing_checkout::{self, CheckoutReceipt, CheckoutRequest};
+use crate::connector_service::{InvokeError, LandingGithubOp};
+use crate::flow_recovery::{KIND, MAX_INLINE_BYTES, failure};
+use crate::landing_checkout::{self, CANCELLED, CheckoutReceipt, CheckoutRequest, valid_oid};
+use crate::landing_git::{
+    GitTarget, LandingCall, PushObservation, PushState, Reconciliation, RemoteRef, reconcile,
+};
 use crate::landing_policy::{Repository, Snapshot as Policy};
 use pam_connectors::github_landing::{CheckState, Checks, PullRequest, Target};
 use pam_flow::LandingOperation as Op;
@@ -75,8 +78,25 @@ fn refused(cause: &str, detail: impl Into<String>) -> CapabilityFailure {
         recovery: RECOVERY.into(),
     }
 }
-fn checkout_error(error: landing_checkout::CheckoutError) -> CapabilityFailure {
+/// A local checkout or Git failure; the cancel signal is the one cause that
+/// ends the run cancelled instead of blocked.
+pub(super) fn checkout_error(error: landing_checkout::CheckoutError) -> CapabilityFailure {
+    if error.cause == CANCELLED {
+        return CapabilityFailure::Cancelled;
+    }
     refused(error.cause, error.detail)
+}
+/// A broker (GitHub or Git) failure, with the same cancel mapping.
+pub(super) fn broker_error(error: &InvokeError) -> CapabilityFailure {
+    if error.cause() == CANCELLED {
+        return CapabilityFailure::Cancelled;
+    }
+    refused(error.cause(), error.detail())
+}
+/// A landing check's attempt; `None` is the cancel signal, never a settled
+/// step, so the run ends cancelled instead of blocked on an internal error.
+pub(super) fn attempted(attempt: Option<Attempt>) -> Result<Attempt, CapabilityFailure> {
+    attempt.ok_or(CapabilityFailure::Cancelled)
 }
 fn now_ms() -> i64 {
     i64::try_from(
@@ -190,11 +210,15 @@ impl RunState<'_> {
         policy: &Repository,
         commit: &str,
     ) -> Result<CheckoutRequest, CapabilityFailure> {
+        // The broker trusts only a canonical installation path, so a
+        // symlinked launcher (Homebrew's `bin/git`) resolves to its target here
+        // rather than passing freeze and refusing at push.
         let git_program = resolve_program(
             "git",
             &self.settings.extra_path_dirs(),
             &std::env::var_os("PATH").unwrap_or_default(),
         )
+        .and_then(|path| path.canonicalize().ok())
         .ok_or_else(|| refused("program_missing", "Git is unavailable"))?;
         Ok(CheckoutRequest {
             repository: self.repo.clone(),
@@ -493,7 +517,7 @@ impl RunState<'_> {
         let id = new_evidence_id();
         self.service
             .store
-            .insert_evidence(&id, &self.ctx.request_id, "flow.checkpoint", &bytes, None)
+            .insert_evidence(&id, &self.ctx.request_id, KIND, &bytes, None)
             .await
             .map_err(failed)?;
         let receipt = json!({"repository":target.repository,"commit":target.commit,"branch":branch,"tree":snapshot.receipt.tree,"manifest_sha256":snapshot.receipt.manifest_sha256});
@@ -556,8 +580,8 @@ impl RunState<'_> {
             spec.timeout = spec
                 .timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
-            let attempt = self.attempt_command(&spec, step).await;
-            self.settle(step, attempt, report).await;
+            let attempt = attempted(self.attempt_command(&spec, step).await)?;
+            self.settle(step, Some(attempt), report).await;
             if !report.evidence_unavailable.is_empty() {
                 report.fail(
                     StepStatus::Blocked,
@@ -608,7 +632,7 @@ impl RunState<'_> {
         metadata: Option<String>,
     ) -> Result<String, CapabilityFailure> {
         let bytes = crate::flow_recovery::encode(value)?;
-        if bytes.len() > 16 * 1024 {
+        if bytes.len() > MAX_INLINE_BYTES {
             return Err(failure());
         }
         let id = new_evidence_id();
@@ -652,7 +676,24 @@ impl RunState<'_> {
                 deadline,
             )
             .await
-            .map_err(|e| refused(e.cause(), e.detail()))
+            .map_err(|e| broker_error(&e))
+    }
+    /// One guarded Git broker call's identity, budget and cancel signal.
+    fn git_call<'a>(
+        &'a mut self,
+        loaded: &'a Loaded,
+        target: &'a GitTarget,
+        deadline: Instant,
+    ) -> LandingCall<'a> {
+        LandingCall {
+            repo: &self.repo,
+            ticket: &self.ctx.request_id,
+            policy_revision: &loaded.session.policy_revision,
+            target,
+            budget: Arc::clone(&self.ctx.budget),
+            cancel: &mut self.cancel,
+            deadline,
+        }
     }
     async fn intent(
         &self,
@@ -672,6 +713,17 @@ impl RunState<'_> {
             state: "prepared".into(),
             expected,
         });
+        self.landing_save(loaded).await
+    }
+    /// Journals what the mutating process itself reported, before the exact
+    /// ref is observed: a resume after a crash then knows the process ran.
+    async fn record_effect_state(
+        &self,
+        loaded: &mut Loaded,
+        state: PushState,
+    ) -> Result<(), CapabilityFailure> {
+        let intent = loaded.session.intent.as_mut().ok_or_else(failure)?;
+        intent.expected["state"] = serde_json::to_value(state).map_err(|_| failure())?;
         self.landing_save(loaded).await
     }
     async fn landing_ensure_pr(
@@ -720,8 +772,10 @@ impl RunState<'_> {
         deadline: Instant,
     ) -> Result<Value, CapabilityFailure> {
         self.landing_live(loaded, deadline).await?;
-        let mut target = crate::landing_git::GitTarget {
-            request: self.checkout_request(&loaded.policy, &loaded.receipt.commit)?,
+        let service = self.service;
+        let commit = loaded.receipt.commit.clone();
+        let mut target = GitTarget {
+            request: self.checkout_request(&loaded.policy, &commit)?,
             receipt: loaded.receipt.clone(),
             branch: loaded
                 .receipt
@@ -731,90 +785,48 @@ impl RunState<'_> {
                 .into(),
             expected_old: None,
         };
-        let observed = self
-            .service
+        let observed = service
             .connectors
-            .landing_git_observe(
-                &self.repo,
-                &self.ctx.request_id,
-                &loaded.session.policy_revision,
-                &target,
-                Arc::clone(&self.ctx.budget),
-                &mut self.cancel,
-                deadline,
-            )
+            .landing_git_observe(self.git_call(loaded, &target, deadline))
             .await
-            .map_err(|e| refused(e.cause(), e.detail()))?;
+            .map_err(|e| broker_error(&e))?;
+        let receipt = |observed: &RemoteRef| json!({"ref_name":observed.ref_name,"commit":commit,"confirmed_by":"exact_remote_ref"});
         if has_intent(loaded, step, Op::Push)? {
-            let prepared: crate::landing_git::PushObservation = serde_json::from_value(
-                loaded
-                    .session
-                    .intent
-                    .as_ref()
-                    .ok_or_else(failure)?
-                    .expected
-                    .clone(),
-            )
-            .map_err(|_| failure())?;
-            if prepared.requested_commit != loaded.receipt.commit {
-                return Err(failure());
-            }
-            if crate::landing_git::reconcile(&observed, &prepared).map_err(checkout_error)?
-                != crate::landing_git::Reconciliation::Matched
-            {
-                return Err(refused(
-                    "landing_effect_uncertain",
-                    "The prepared push is not confirmed by the exact remote ref; PAM will not resend it",
-                ));
-            }
-            return Ok(
-                json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
-            );
+            let prepared = prepared_effect(loaded, &commit)?;
+            effect_verdict(&observed, &prepared, Op::Push, EffectPhase::Resumed)?;
+            return Ok(receipt(&observed));
         }
-        if observed.oid.as_deref() == Some(loaded.receipt.commit.as_str()) {
-            return Ok(
-                json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
-            );
+        if observed.oid.as_deref() == Some(commit.as_str()) {
+            return Ok(receipt(&observed));
         }
         target.expected_old = observed.oid.clone();
-        self.intent(loaded,step,Op::Push,json!({"ref_name":observed.ref_name,"expected_old":target.expected_old,"requested_commit":loaded.receipt.commit,"state":"uncertain"})).await?;
-        self.landing_live(loaded, deadline).await?;
-        self.service
-            .connectors
-            .landing_git_push(
-                &self.repo,
-                &self.ctx.request_id,
-                &loaded.session.policy_revision,
-                &target,
-                Arc::clone(&self.ctx.budget),
-                &mut self.cancel,
-                deadline,
-            )
-            .await
-            .map_err(|e| refused(e.cause(), e.detail()))?;
-        let observed = self
-            .service
-            .connectors
-            .landing_git_observe(
-                &self.repo,
-                &self.ctx.request_id,
-                &loaded.session.policy_revision,
-                &target,
-                Arc::clone(&self.ctx.budget),
-                &mut self.cancel,
-                deadline,
-            )
-            .await
-            .map_err(|e| refused(e.cause(), e.detail()))?;
-        if observed.oid.as_deref() != Some(loaded.receipt.commit.as_str()) {
-            return Err(refused(
-                "landing_effect_uncertain",
-                "Push response did not yield a confirmed exact remote ref",
-            ));
-        }
-        Ok(
-            json!({"ref_name":observed.ref_name,"commit":loaded.receipt.commit,"confirmed_by":"exact_remote_ref"}),
+        let prepared = PushObservation {
+            ref_name: observed.ref_name,
+            expected_old: target.expected_old.clone(),
+            requested_commit: commit.clone(),
+            state: PushState::Uncertain,
+        };
+        self.intent(
+            loaded,
+            step,
+            Op::Push,
+            serde_json::to_value(&prepared).map_err(|_| failure())?,
         )
+        .await?;
+        self.landing_live(loaded, deadline).await?;
+        let reported = service
+            .connectors
+            .landing_git_push(self.git_call(loaded, &target, deadline))
+            .await
+            .map_err(|e| broker_error(&e))?;
+        self.record_effect_state(loaded, reported.state).await?;
+        let observed = service
+            .connectors
+            .landing_git_observe(self.git_call(loaded, &target, deadline))
+            .await
+            .map_err(|e| broker_error(&e))?;
+        effect_verdict(&observed, &reported, Op::Push, EffectPhase::JustRan)?;
+        Ok(receipt(&observed))
     }
     async fn landing_merge(
         &mut self,
@@ -835,8 +847,10 @@ impl RunState<'_> {
         )
         .map_err(|_| failure())?;
         if pr.merged {
+            // GitHub already shows the merge, whether this ticket prepared it
+            // or not: the receipt says it was observed, not requested here.
             return Ok(
-                json!({"number":number,"sha":pr.merge_sha.ok_or_else(failure)?,"head_sha":target.head_sha,"base_sha_observed":pr.base_sha}),
+                json!({"number":number,"sha":pr.merge_sha.ok_or_else(failure)?,"head_sha":target.head_sha,"base_sha_observed":pr.base_sha,"confirmed_by":"observed_merged"}),
             );
         }
         if has_intent(loaded, step, Op::Merge)? {
@@ -877,7 +891,7 @@ impl RunState<'_> {
             )
             .await?;
         Ok(
-            json!({"number":number,"sha":response["sha"],"head_sha":target.head_sha,"base_sha_observed":pr.base_sha}),
+            json!({"number":number,"sha":response["sha"],"head_sha":target.head_sha,"base_sha_observed":pr.base_sha,"confirmed_by":"merge_response"}),
         )
     }
     /// Brings the verified merge commit into the canonical repository and
@@ -894,8 +908,9 @@ impl RunState<'_> {
         if !loaded.session.receipts.contains_key("verify_main") {
             return Err(failure());
         }
+        let service = self.service;
         let merge_commit = merge_commit(loaded)?;
-        let mut target = crate::landing_git::GitTarget {
+        let mut target = GitTarget {
             request: self.checkout_request(&loaded.policy, &loaded.receipt.commit)?,
             receipt: loaded.receipt.clone(),
             branch: loaded.policy.base.clone(),
@@ -904,7 +919,15 @@ impl RunState<'_> {
         let observed = observe_base(&target)?;
         let receipt = |pack: Value, bounds: Value| json!({"ref_name":observed.ref_name,"commit":merge_commit,"pack":pack,"bounds":bounds,"confirmed_by":"exact_local_ref"});
         if has_intent(loaded, step, Op::Sync)? {
-            let intent = reconciled_sync_intent(loaded, &observed, &merge_commit)?;
+            let prepared = prepared_effect(loaded, &merge_commit)?;
+            effect_verdict(&observed, &prepared, Op::Sync, EffectPhase::Resumed)?;
+            let intent = loaded
+                .session
+                .intent
+                .as_ref()
+                .ok_or_else(failure)?
+                .expected
+                .clone();
             return Ok(receipt(intent["pack"].clone(), intent["bounds"].clone()));
         }
         if observed.oid.as_deref() == Some(merge_commit.as_str()) {
@@ -920,57 +943,49 @@ impl RunState<'_> {
             ));
         }
         target.expected_old = Some(base.clone());
-        let (pack, bounds) = self
-            .service
+        let (pack, bounds) = service
             .connectors
             .landing_fetch_pack(
-                &self.repo,
-                &self.ctx.request_id,
-                &loaded.session.policy_revision,
-                &target,
+                self.git_call(loaded, &target, deadline),
                 &merge_commit,
                 &[base.as_str(), loaded.receipt.commit.as_str()],
-                Arc::clone(&self.ctx.budget),
-                deadline,
             )
             .await
-            .map_err(|e| refused(e.cause(), e.detail()))?;
+            .map_err(|e| broker_error(&e))?;
         let bounds = serde_json::to_value(&bounds).map_err(|_| failure())?;
-        self.intent(
-            loaded,
-            step,
-            Op::Sync,
-            json!({"ref_name":observed.ref_name,"expected_old":base,"requested_commit":merge_commit,"state":"uncertain","bounds":bounds}),
-        )
-        .await?;
+        let mut expected = serde_json::to_value(PushObservation {
+            ref_name: observed.ref_name.clone(),
+            expected_old: Some(base),
+            requested_commit: merge_commit.clone(),
+            state: PushState::Uncertain,
+        })
+        .map_err(|_| failure())?;
+        expected["bounds"] = bounds.clone();
+        self.intent(loaded, step, Op::Sync, expected).await?;
         self.landing_live(loaded, deadline).await?;
-        let installed = self
-            .service
+        let installed = service
             .connectors
             .landing_git_sync(
-                &self.repo,
-                &self.ctx.request_id,
-                &loaded.session.policy_revision,
-                &target,
+                self.git_call(loaded, &target, deadline),
                 &merge_commit,
                 pack,
                 serde_json::from_value(bounds.clone()).map_err(|_| failure())?,
-                Arc::clone(&self.ctx.budget),
-                &mut self.cancel,
-                deadline,
             )
             .await
-            .map_err(|e| refused(e.cause(), e.detail()))?;
+            .map_err(|e| broker_error(&e))?;
         if let Some(intent) = loaded.session.intent.as_mut() {
             intent.expected["pack"] = json!(installed.pack);
         }
+        self.record_effect_state(loaded, PushState::ReportedSuccess)
+            .await?;
         let observed = observe_base(&target)?;
-        if observed.oid.as_deref() != Some(merge_commit.as_str()) {
-            return Err(refused(
-                "landing_effect_uncertain",
-                "Synchronization did not yield the merge commit on the exact local base ref",
-            ));
-        }
+        let reported = PushObservation {
+            ref_name: installed.ref_name,
+            expected_old: Some(installed.expected_old),
+            requested_commit: installed.requested_commit,
+            state: PushState::ReportedSuccess,
+        };
+        effect_verdict(&observed, &reported, Op::Sync, EffectPhase::JustRan)?;
         Ok(receipt(json!(installed.pack), bounds))
     }
     async fn landing_checks(
@@ -1043,7 +1058,10 @@ impl RunState<'_> {
         polls: u32,
     ) -> Result<Value, CapabilityFailure> {
         let next = now_ms().saturating_add(POLL_MS);
-        if crate::request_budget::Limits::default()
+        if self
+            .ctx
+            .budget
+            .limits()
             .http_calls
             .saturating_sub(self.ctx.budget.usage().http_calls)
             < 12
@@ -1128,7 +1146,7 @@ impl RunState<'_> {
     ) -> Result<String, CapabilityFailure> {
         let id = new_evidence_id();
         let bytes = crate::flow_recovery::encode(value)?;
-        if bytes.len() > 16 * 1024 {
+        if bytes.len() > MAX_INLINE_BYTES {
             return Err(failure());
         }
         let metadata=json!({"watch_progress":{"step":step.id,"connector":"github","status":"pending","watch_state":"pending","polls":polls,"next_poll_at":next,"evidence_id":id,"omissions":0}}).to_string();
@@ -1158,6 +1176,60 @@ impl RunState<'_> {
         .map_err(|_| failure())?;
         self.evidence.push(id.clone());
         Ok(id)
+    }
+    /// Releases the private landing workspace (`<workspace_root>/landing-<ulid>`)
+    /// once the ticket can no longer resume: a parked continuation keeps it,
+    /// every other ending is terminal. Nothing is removed unless the session
+    /// still belongs to this run and the checktree has the exact shape freeze
+    /// created under the current policy's workspace root.
+    pub(super) async fn landing_release(&self, executed: &Result<(), CapabilityFailure>) {
+        if matches!(executed, Err(CapabilityFailure::Parked { .. }))
+            || !self
+                .flow
+                .steps
+                .iter()
+                .any(|step| matches!(step.action, Action::Landing { .. }))
+        {
+            return;
+        }
+        let Ok(Some((_, session))) = self.landing_session().await else {
+            return;
+        };
+        let Ok((_, policy)) = self.landing_policy().await else {
+            return;
+        };
+        let checktree = session.checktree;
+        let root = policy.workspace_root;
+        let _ =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
+                release_workspace(&checktree, &root)
+            })
+            .await;
+    }
+}
+/// The workspace directory a sealed checktree lives in, when `checktree` is
+/// exactly `<root>/landing-<ulid>/tree`; any other path is not ours to remove.
+pub(super) fn landing_workspace(checktree: &Path, root: &Path) -> Option<PathBuf> {
+    if checktree.file_name()? != "tree" {
+        return None;
+    }
+    let workspace = checktree.parent()?;
+    if workspace.parent()? != root {
+        return None;
+    }
+    let ulid = workspace.file_name()?.to_str()?.strip_prefix("landing-")?;
+    ulid::Ulid::from_string(ulid).ok()?;
+    Some(workspace.to_path_buf())
+}
+/// Removes the workspace named by [`landing_workspace`]; `true` when it is
+/// gone afterwards. A path of any other shape is left untouched.
+pub(super) fn release_workspace(checktree: &Path, root: &Path) -> bool {
+    let Some(workspace) = landing_workspace(checktree, root) else {
+        return false;
+    };
+    match std::fs::remove_dir_all(&workspace) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 fn require_predecessor(session: &Session, operation: Op) -> Result<(), CapabilityFailure> {
@@ -1197,34 +1269,68 @@ fn github_target(loaded: &Loaded) -> Result<Target, CapabilityFailure> {
         head_sha: loaded.receipt.commit.clone(),
     })
 }
-/// On resume with a prepared sync intent nothing is repeated: the local base
-/// ref either already names the merge commit (matched) or the run refuses.
-fn reconciled_sync_intent(
-    loaded: &Loaded,
-    observed: &crate::landing_git::RemoteRef,
-    merge_commit: &str,
-) -> Result<Value, CapabilityFailure> {
-    let intent = loaded
-        .session
-        .intent
-        .as_ref()
-        .ok_or_else(failure)?
-        .expected
-        .clone();
-    let prepared: crate::landing_git::PushObservation =
-        serde_json::from_value(intent.clone()).map_err(|_| failure())?;
-    if prepared.requested_commit != merge_commit {
+/// Whether the process verdict in a [`PushObservation`] was produced just
+/// now or read back from the journal on resume.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectPhase {
+    /// The mutating process ran in this attempt and its exit is known.
+    JustRan,
+    /// The intent was journalled by an earlier attempt; nothing is repeated.
+    Resumed,
+}
+/// The journalled intent of this step, checked to name `commit`.
+fn prepared_effect(loaded: &Loaded, commit: &str) -> Result<PushObservation, CapabilityFailure> {
+    let prepared: PushObservation = serde_json::from_value(
+        loaded
+            .session
+            .intent
+            .as_ref()
+            .ok_or_else(failure)?
+            .expected
+            .clone(),
+    )
+    .map_err(|_| failure())?;
+    if prepared.requested_commit != commit {
         return Err(failure());
     }
-    if crate::landing_git::reconcile(observed, &prepared).map_err(checkout_error)?
-        != crate::landing_git::Reconciliation::Matched
-    {
-        return Err(refused(
-            "landing_effect_uncertain",
-            "The prepared synchronization is not confirmed by the exact local base ref; PAM will not repeat it",
-        ));
+    Ok(prepared)
+}
+/// Confirms a prepared push or sync against the exact ref it was meant to
+/// move. Only a matched ref succeeds. A push that just exited non-zero and
+/// left the ref unchanged is `landing_push_rejected`; every other unchanged,
+/// moved or missing ref is `landing_effect_uncertain`, with the detail saying
+/// which. PAM never repeats the effect in any of these cases.
+pub(super) fn effect_verdict(
+    observed: &RemoteRef,
+    prepared: &PushObservation,
+    operation: Op,
+    phase: EffectPhase,
+) -> Result<(), CapabilityFailure> {
+    let (what, ref_kind) = match operation {
+        Op::Sync => ("synchronization", "local base"),
+        _ => ("push", "remote"),
+    };
+    let uncertain = |detail: String| Err(refused("landing_effect_uncertain", detail));
+    match reconcile(observed, prepared).map_err(checkout_error)? {
+        Reconciliation::Matched => Ok(()),
+        Reconciliation::Unchanged => match (phase, prepared.state) {
+            (EffectPhase::JustRan, PushState::Uncertain) => Err(refused(
+                "landing_push_rejected",
+                format!(
+                    "The remote rejected the {what} and the exact {ref_kind} ref still holds its observed old value; PAM will not resend it"
+                ),
+            )),
+            (EffectPhase::JustRan, PushState::ReportedSuccess) => uncertain(format!(
+                "Git reported the {what} as complete but the exact {ref_kind} ref still holds its observed old value; PAM will not repeat it"
+            )),
+            (EffectPhase::Resumed, _) => uncertain(format!(
+                "The prepared {what} left the exact {ref_kind} ref at its observed old value; PAM will not repeat it"
+            )),
+        },
+        Reconciliation::Conflicting => uncertain(format!(
+            "The prepared {what} is not confirmed by the exact {ref_kind} ref; PAM will not repeat it"
+        )),
     }
-    Ok(intent)
 }
 /// The merge commit GitHub reported in the `merge` receipt.
 fn merge_commit(loaded: &Loaded) -> Result<String, CapabilityFailure> {
@@ -1233,24 +1339,17 @@ fn merge_commit(loaded: &Loaded) -> Result<String, CapabilityFailure> {
         .receipts
         .get("merge")
         .and_then(|v| v["sha"].as_str())
-        .filter(|sha| {
-            sha.len() == 40
-                && sha
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        })
+        .filter(|sha| valid_oid(sha))
         .map(str::to_owned)
         .ok_or_else(failure)
 }
 /// The canonical repository's base ref, read from its files: no process,
 /// no network, no credential.
-fn observe_base(
-    target: &crate::landing_git::GitTarget,
-) -> Result<crate::landing_git::RemoteRef, CapabilityFailure> {
+fn observe_base(target: &GitTarget) -> Result<RemoteRef, CapabilityFailure> {
     landing_checkout::validate_layout(&target.request).map_err(checkout_error)?;
     let oid = landing_checkout::resolve_local_ref(&target.request, &target.request.base_ref)
         .map_err(checkout_error)?;
-    Ok(crate::landing_git::RemoteRef {
+    Ok(RemoteRef {
         ref_name: target.request.base_ref.clone(),
         oid: Some(oid),
     })

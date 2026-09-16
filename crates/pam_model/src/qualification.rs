@@ -94,19 +94,31 @@ pub fn find(sha256: &str, target: Target) -> Option<&'static Qualification> {
 
 /// [`find`] over an explicit table, so a registry built for a test can carry
 /// its own records.
+///
+/// A record only counts when it names the digest, covers the target, was
+/// measured on the pinned engine, and its figures clear the gates. The last
+/// two are checked here, on the admission path, and not only by the unit
+/// test over the compiled-in table: a record that stops clearing them stops
+/// qualifying anything the moment the constants move.
 #[must_use]
 pub fn find_in(
     records: &'static [Qualification],
     sha256: &str,
     target: Target,
 ) -> Option<&'static Qualification> {
-    records
-        .iter()
-        .find(|record| record.sha256 == sha256 && record.covers(target))
+    records.iter().find(|record| {
+        record.sha256 == sha256
+            && record.covers(target)
+            && record.engine_tag == ENGINE_TAG
+            && record.meets_gates()
+    })
 }
 
 /// Whether the table's records are all measured on the engine this build pins.
-#[must_use]
-pub fn all_on_pinned_engine(records: &[Qualification]) -> bool {
+/// [`find_in`] refuses a stale record one at a time; this is the whole-table
+/// assertion the unit test makes so a stale record is a failed build, not a
+/// silently unqualified artifact.
+#[cfg(test)]
+pub(crate) fn all_on_pinned_engine(records: &[Qualification]) -> bool {
     records.iter().all(|record| record.engine_tag == ENGINE_TAG)
 }

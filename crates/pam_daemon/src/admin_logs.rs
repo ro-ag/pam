@@ -229,7 +229,19 @@ impl AdminService {
                 recovery: RECOVERY_EVIDENCE_PICK,
             })?;
 
-        let (text, text_bytes, truncated) = readable_text(&row, max_bytes);
+        // A `log.compact` blob can be tens of MiB of JSON to deserialize;
+        // that runs on the compaction lane, not the runtime thread.
+        let (row, (text, text_bytes, truncated)) =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
+                let readable = readable_text(&row, max_bytes);
+                (row, readable)
+            })
+            .await
+            .map_err(|error| AdminRefusal {
+                cause: error.cause(),
+                detail: error.to_string(),
+                recovery: error.recovery(),
+            })?;
         // `bytes` is the blob length, exactly as `admin.evidence.list`
         // reports it, so one handle never shows two sizes across the two
         // ops. `text_bytes` is the length of what `text` is a prefix of —

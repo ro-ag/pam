@@ -79,7 +79,9 @@ async fn fixture(store: Arc<Store>, transport: Arc<dyn HttpTransport>) -> Fixtur
             ConfigurePatch {
                 enabled: Some(true),
                 base_url: Some(Some("https://api.github.com/".into())),
-                credential: Some(CredentialAction::Set("private-token".into())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    "private-token".into(),
+                ))),
                 ..ConfigurePatch::default()
             },
         )

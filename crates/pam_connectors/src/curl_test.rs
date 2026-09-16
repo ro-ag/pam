@@ -97,7 +97,7 @@ fn connector_command_uses_only_trusted_curl_without_argv_credentials() {
     let Ok(path) = CurlTransport::trusted_path() else {
         return;
     };
-    let transport = CurlTransport::new(path.clone());
+    let transport = CurlTransport::trusted().unwrap();
     let command = transport.command(&request(), 12).unwrap();
     let command = command.as_std();
     assert_eq!(command.get_program(), path.as_os_str());
@@ -143,7 +143,7 @@ fn windows_resolves_the_operating_system_curl_from_system32() {
 #[cfg(target_os = "windows")]
 #[test]
 fn windows_child_keeps_the_os_roots_and_a_neutral_working_directory() {
-    let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
+    let transport = CurlTransport::trusted().unwrap();
     let command = transport.command(&request(), 12).unwrap();
     let command = command.as_std();
     assert!(
@@ -203,8 +203,7 @@ async fn hostile_environment_child() {
     if std::env::var_os("PAM_CURL_ENV_PROBE").is_none() {
         return;
     }
-    let path = CurlTransport::trusted_path().unwrap();
-    let transport = CurlTransport::new(path);
+    let transport = CurlTransport::trusted().unwrap();
     let mut child = transport.command(&request(), 1).unwrap().spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
     input
@@ -236,7 +235,7 @@ fn mutation_body_and_credentials_stay_in_escaped_stdin_config() {
     assert!(config.contains("data-binary = \"{\\n"));
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let transport = CurlTransport::new(CurlTransport::trusted_path().unwrap());
+        let transport = CurlTransport::trusted().unwrap();
         let command = transport.command(&req, 5).unwrap();
         let argv = command
             .as_std()

@@ -104,64 +104,51 @@ async fn idempotency_key_round_trips() {
 }
 
 #[tokio::test]
-async fn find_inflight_by_key_matches_only_active_states() {
+async fn a_failure_inside_the_finish_transaction_leaves_the_connection_usable() {
     let store = Store::open_in_memory().await.unwrap();
-    assert!(store.find_inflight_by_key("k").await.unwrap().is_none());
-
-    store
-        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", Some("k"))
+    // The lookup inside the transaction fails after BEGIN: the missing
+    // row is only discovered once the UPDATE matched nothing.
+    let err = store
+        .finish_request("absent", RequestState::Done, Some("ok"), entry("execute"))
         .await
-        .unwrap();
-    let row = store.find_inflight_by_key("k").await.unwrap().unwrap();
-    assert_eq!(row.id, "req_1");
-
-    // Running and waiting_approval still count as in-flight.
-    for state in [RequestState::Running, RequestState::WaitingApproval] {
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound { .. }), "{err:?}");
+    // The transaction was rolled back: plain statements run, and a fresh
+    // BEGIN is accepted (a transaction left open would refuse it).
+    insert_demo_request(&store, "req_1").await;
+    assert!(store.get_request("req_1").await.unwrap().is_some());
+    assert!(
         store
-            .update_request_state("req_1", state, None)
+            .finish_request("req_1", RequestState::Done, Some("ok"), entry("execute"))
             .await
-            .unwrap();
-        assert!(store.find_inflight_by_key("k").await.unwrap().is_some());
-    }
-
-    // A terminal request stops matching: retries start fresh work.
-    store
-        .finish_request("req_1", RequestState::Done, Some("ok"), entry("execute"))
-        .await
-        .unwrap();
-    assert!(store.find_inflight_by_key("k").await.unwrap().is_none());
+            .unwrap()
+    );
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Done);
 }
 
 #[tokio::test]
-async fn find_inflight_by_shape_requires_full_equality() {
+async fn a_terminal_state_is_refused_by_update_request_state_in_every_build() {
     let store = Store::open_in_memory().await.unwrap();
-    store
-        .insert_request("req_1", "echo", "ro-ag/pam", "claude", r#"{"n":1}"#, None)
-        .await
-        .unwrap();
-
-    let row = store
-        .find_inflight_by_shape("echo", "ro-ag/pam", r#"{"n":1}"#)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.id, "req_1");
-
-    // Any differing component misses.
-    for (capability, repo, args) in [
-        ("status", "ro-ag/pam", r#"{"n":1}"#),
-        ("echo", "other/repo", r#"{"n":1}"#),
-        ("echo", "ro-ag/pam", r#"{"n":2}"#),
+    insert_demo_request(&store, "req_1").await;
+    for state in [
+        RequestState::Done,
+        RequestState::Refused,
+        RequestState::Failed,
     ] {
+        let err = store
+            .update_request_state("req_1", state, Some("sneaky"))
+            .await
+            .unwrap_err();
         assert!(
-            store
-                .find_inflight_by_shape(capability, repo, args)
-                .await
-                .unwrap()
-                .is_none(),
-            "unexpected match for {capability}/{repo}/{args}"
+            matches!(err, StoreError::TerminalTransition { state: s } if s == state.as_str()),
+            "{err:?}"
         );
     }
+    let row = store.get_request("req_1").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Queued);
+    assert_eq!(row.outcome, None);
+    assert!(store.audit_for_request("req_1").await.unwrap().is_empty());
 }
 
 #[tokio::test]

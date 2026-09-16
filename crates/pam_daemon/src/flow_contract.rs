@@ -338,24 +338,34 @@ pub fn pagination(args: &Value) -> Result<(usize, usize), ContractError> {
     Ok((offset, limit))
 }
 
+/// What a read-only inspection could resolve from the supplied inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InspectedInputs {
+    /// Local and input variables only; never git, prior steps or network state.
+    pub vars: pam_flow::Vars,
+    /// Declared inputs with neither a value nor a resolvable default.
+    pub missing: Vec<String>,
+    /// Supplied names the flow does not declare.
+    pub unknown: Vec<String>,
+}
+
 /// Resolve only local/input variables; never git, prior steps, or network state.
 pub(crate) fn inspect_vars(
     flow: &pam_flow::Flow,
     supplied: &BTreeMap<String, String>,
     repo: &std::path::Path,
-) -> (pam_flow::Vars, Vec<String>) {
+) -> InspectedInputs {
     let mut vars = pam_flow::Vars::new();
     vars.set("repo.path", repo.to_string_lossy().into_owned());
     if let Some(name) = repo.file_name().and_then(|value| value.to_str()) {
         vars.set("repo.name", name);
     }
-    let mut missing = Vec::new();
-    for name in supplied
+    let unknown = supplied
         .keys()
         .filter(|name| !flow.inputs.contains_key(*name))
-    {
-        missing.push(name.clone());
-    }
+        .cloned()
+        .collect();
+    let mut missing = Vec::new();
     for (name, input) in &flow.inputs {
         let value = supplied.get(name).cloned().or_else(|| {
             input
@@ -369,7 +379,11 @@ pub(crate) fn inspect_vars(
             missing.push(name.clone());
         }
     }
-    (vars, missing)
+    InspectedInputs {
+        vars,
+        missing,
+        unknown,
+    }
 }
 
 /// Read-only preview of `PolicyGate`'s classification rules; does not auto-grant.

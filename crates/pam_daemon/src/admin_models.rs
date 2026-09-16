@@ -132,6 +132,14 @@ pub const CAUSE_MODEL_LOADED: &str = "model_loaded";
 /// Refusal cause: the target is not inside the models directory.
 pub const CAUSE_OUTSIDE_MODELS_DIR: &str = "outside_models_dir";
 
+/// Refusal cause: a diagnostic named a model the engine does not hold;
+/// diagnostics never load or swap, so the human loads it first.
+pub const CAUSE_MODEL_NOT_LOADED: &str = "model_not_loaded";
+
+/// Refusal cause: the models directory would sit inside (or around) the
+/// daemon's own base directory.
+pub const CAUSE_MODELS_DIR_OVERLAPS_BASE: &str = "models_dir_overlaps_base";
+
 /// Refusal cause: a transfer is writing to that file right now.
 pub const CAUSE_DOWNLOAD_IN_PROGRESS: &str = "download_in_progress";
 
@@ -188,6 +196,13 @@ const RECOVERY_CANCEL_DOWNLOAD: &str =
 
 /// Recovery line for an empty runtime.
 const RECOVERY_LOAD_A_MODEL: &str = "Load a model on the PAM GUI Models screen first.";
+
+/// Recovery line for a diagnostic on a model the engine does not hold.
+const RECOVERY_LOAD_THAT_MODEL: &str =
+    "Load that exact model on the PAM GUI Models screen, then run the diagnostic again.";
+
+/// Recovery line for a models directory overlapping the PAM base.
+const RECOVERY_MODELS_DIR_ELSEWHERE: &str = "Pick a models directory outside PAM's own base directory (the folder holding state.sqlite3 and the engine).";
 
 /// Recovery line for an over-long prompt.
 const RECOVERY_SHORTEN_PROMPT: &str = "Shorten the prompt; the context holds 8192 tokens.";
@@ -380,11 +395,25 @@ impl AdminService {
                     detail: format!("{url:?} does not end in a .gguf file name"),
                     recovery: RECOVERY_FIX_ARGS,
                 })?;
+                // Both names came from the caller: the registry refuses
+                // anything but one plain segment each (`..`, separators, an
+                // absolute or hidden name), so the destination is always
+                // exactly `<models dir>/<vendor>/<file>`.
+                let dest = registry
+                    .checked_dest_for(vendor, &file_name)
+                    .map_err(|error| match error {
+                        RegistryError::InvalidName(_) => AdminRefusal {
+                            cause: CAUSE_INVALID_ADMIN_ARGS,
+                            detail: error.to_string(),
+                            recovery: RECOVERY_FIX_ARGS,
+                        },
+                        other => registry_refusal(other),
+                    })?;
                 let stem = file_name.trim_end_matches(".gguf").to_owned();
                 (
                     DownloadRequest {
                         url: url.to_owned(),
-                        dest: registry.dest_for(vendor, &file_name),
+                        dest,
                         expected_size: None,
                         expected_sha256: None,
                         license_id: None,
@@ -392,6 +421,17 @@ impl AdminService {
                     format!("{vendor}/{stem}"),
                 )
             };
+        // Belt and braces over the segment checks: whatever the registry
+        // joined, the destination stays under the models directory, since
+        // this path is what `start_download` creates and `discard_partial`
+        // unlinks sidecars beside.
+        if !request.dest.starts_with(self.models.models_dir()) {
+            return Err(AdminRefusal {
+                cause: CAUSE_OUTSIDE_MODELS_DIR,
+                detail: format!("{} is outside the models directory", request.dest.display()),
+                recovery: RECOVERY_OUTSIDE_DIR,
+            });
+        }
         Ok((request, model_id))
     }
 
@@ -592,18 +632,42 @@ impl AdminService {
     }
 
     /// Moves the models directory and/or the idle-unload window.
+    ///
+    /// The directory is canonicalised off the async threads (symlinks
+    /// resolved, so the registry's containment checks compare like with
+    /// like) and refused when it would overlap the daemon's own base:
+    /// weights are not PAM state and a registry scan or delete must never
+    /// reach `state.sqlite3` or the engine.
     async fn models_settings_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         if let Some(raw) = args.get("models_dir").and_then(Value::as_str) {
-            let dir = PathBuf::from(raw);
-            if !dir.is_dir() {
-                return Err(AdminRefusal {
+            let requested = PathBuf::from(raw);
+            let canonical =
+                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                    let canonical = requested.canonicalize().ok()?;
+                    canonical.is_dir().then_some(canonical)
+                })
+                .await
+                .map_err(blocking_refusal)?
+                .ok_or_else(|| AdminRefusal {
                     cause: CAUSE_INVALID_ADMIN_ARGS,
                     detail: format!("{raw:?} is not a directory that exists"),
                     recovery: RECOVERY_FIX_ARGS,
+                })?;
+            if let Some(base) = self.models.daemon_base()
+                && (canonical.starts_with(&base) || base.starts_with(&canonical))
+            {
+                return Err(AdminRefusal {
+                    cause: CAUSE_MODELS_DIR_OVERLAPS_BASE,
+                    detail: format!(
+                        "{} overlaps PAM's base directory {}",
+                        canonical.display(),
+                        base.display()
+                    ),
+                    recovery: RECOVERY_MODELS_DIR_ELSEWHERE,
                 });
             }
             self.models
-                .set_models_dir(&dir)
+                .set_models_dir(&canonical)
                 .await
                 .map_err(diagnostic_refusal)?;
         }
@@ -835,6 +899,11 @@ fn file_name_from_url(url: &str) -> Option<String> {
 
 fn diagnostic_refusal(error: ModelUnavailable) -> AdminRefusal {
     match error {
+        ModelUnavailable::NotResident { .. } => AdminRefusal {
+            cause: CAUSE_MODEL_NOT_LOADED,
+            detail: error.to_string(),
+            recovery: RECOVERY_LOAD_THAT_MODEL,
+        },
         ModelUnavailable::Runtime(error) => runtime_refusal(&error),
         ModelUnavailable::Service(error) => download_refusal(error),
         ModelUnavailable::Store(error) => AdminRefusal::from(error),
@@ -931,6 +1000,11 @@ fn registry_refusal(err: RegistryError) -> AdminRefusal {
             cause: CAUSE_UNKNOWN_MODEL,
             detail: format!("no model {id} in the models directory"),
             recovery: RECOVERY_LIBRARY,
+        },
+        RegistryError::InvalidName(_) => AdminRefusal {
+            cause: CAUSE_INVALID_ADMIN_ARGS,
+            detail: err.to_string(),
+            recovery: RECOVERY_FIX_ARGS,
         },
         other => AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,

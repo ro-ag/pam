@@ -21,6 +21,11 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- `pam subscribe` takes `--json` like `pam wait`, and with it a refused or
+  timed-out follow is a `kind: refusal` object on stdout (the ticket as
+  `id`, cause `follow_timeout` for an observation timeout) instead of a
+  prose line on stderr; exit codes are unchanged. The README now carries a
+  table of every subcommand and its exit codes.
 - Windows builds can be administered: the GUI's private administration
   channel now exists on Windows as loopback TCP behind an owner-only nonce.
   The daemon writes the port and a fresh nonce to `<base>\admin\control.json`
@@ -48,6 +53,22 @@ All notable changes to pam are documented in this file. The format follows
   heavy tier's stage, and the blocker with cause and recovery when the
   summary will be skipped. `pam status --json` carries the per-tier stage
   and cause under `model.readiness`.
+- A straight answer to "can PAM reach the keychain?", in three places:
+  `pam status` prints a `keyring:` line with the recovery sentence when it
+  is blocked, Settings → Connectors carries a banner with a Re-check
+  button, and Home flags a blocked keychain in the workspace overview. New
+  admin op `admin.connectors.keyring { fresh? }`, and the daemon's `status`
+  capability publishes a read-only `keyring` block. Reachability only — no
+  capability can read a credential, and the probe reads an account nothing
+  ever writes.
+- Partial downloads can be thrown away from the Models screen: a preset
+  card that has bytes on disk offers Resume and Start over, says how much
+  is already here, and confirms before discarding. New admin op
+  `admin.models.download.discard`, and `admin.models.catalog` now reports
+  `partial_bytes` per preset — a part file is a dotfile a registry scan
+  cannot see, so a resumable transfer no longer depends on a job row that
+  may have aged out. This is also the way out of a checkpoint conflict,
+  which previously needed a manual `rm`.
 
 ### Fixed
 
@@ -68,28 +89,61 @@ All notable changes to pam are documented in this file. The format follows
   closing the handle, so a curl process another task forked in that
   window can no longer hold the inherited lock past the next start. The
   same explicit release covers discarding a partial download.
+- The store rolls back a transaction whose `COMMIT` fails instead of
+  leaving it open on the shared connection, and refuses a terminal state
+  handed to the non-terminal state update in release builds too, not only
+  under `debug_assert`. An evidence range starting at the view's end is
+  refused as invalid rather than charged against the read allowance.
+- The client's readiness wait for a freshly spawned daemon no longer sleeps
+  on a runtime worker; the GUI's event subscriber no longer creates or
+  chmods the daemon's runtime directory; the daemon-log tail reads the last
+  mebibyte of the file instead of the whole file; a systemd unit with a
+  `PAM_BASE_DIR` override quotes and escapes the path; and `pam service
+  status` on Windows reads the scheduled task's status column instead of
+  reporting every registered task as loaded.
 
-### Added
-
-- A straight answer to "can PAM reach the keychain?", in three places:
-  `pam status` prints a `keyring:` line with the recovery sentence when it
-  is blocked, Settings → Connectors carries a banner with a Re-check
-  button, and Home flags a blocked keychain in the workspace overview. New
-  admin op `admin.connectors.keyring { fresh? }`, and the daemon's `status`
-  capability publishes a read-only `keyring` block. Reachability only — no
-  capability can read a credential, and the probe reads an account nothing
-  ever writes.
-
-### Added
-
-- Partial downloads can be thrown away from the Models screen: a preset
-  card that has bytes on disk offers Resume and Start over, says how much
-  is already here, and confirms before discarding. New admin op
-  `admin.models.download.discard`, and `admin.models.catalog` now reports
-  `partial_bytes` per preset — a part file is a dotfile a registry scan
-  cannot see, so a resumable transfer no longer depends on a job row that
-  may have aged out. This is also the way out of a checkpoint conflict,
-  which previously needed a manual `rm`.
+- Daemon review fixes: a cancel during a landing check, pack fetch or
+  push now ends the run `cancelled` instead of blocked with a timeout or an
+  internal error; a rejected `git push` whose remote ref did not move is a
+  typed `landing_push_rejected` refusal, not an uncertain effect; sealed
+  landing checktrees are removed when their ticket terminates; a flow
+  checkpoint row is no longer orphaned by a journal conflict; the model
+  runtime's busy flag clears when a generation future is dropped; an
+  engine install cancelled by the admin deadline stops its transfer; the
+  Windows admin channel admits a peer before it takes a served slot; a lease
+  whose stored arguments cannot be parsed fails instead of running with
+  empty arguments; a caller-supplied vendor is one plain path segment and
+  the destination must stay inside the models directory; keyring errors log
+  their kind only; credential patches carry a zeroing secret and print
+  redacted; a diagnostic on a model the engine does not hold is refused
+  rather than loading it; the status snapshot no longer touches the file
+  system on the runtime thread.
+- Model tooling: the download curl is the operating system's own, runs with
+  `-q`, restricts protocols to https and http, and always passes the URL
+  after `--`; a resume sends `If-Range` with the saved ETag so an origin
+  change restarts the transfer; a completed download never overwrites a
+  file that appeared meanwhile; a verification sidecar whose size or
+  mtime no longer matches the weights counts as absent; the GGUF reader
+  accepts every ggml type llama.cpp writes (MXFP4, the IQ and TQ families,
+  integer and F64 tensors) and no longer preallocates a header-declared
+  string length; the engine's API key comes from a process-seeded CSPRNG on
+  every platform and the health check confirms the server's model path
+  before a load is accepted; the curated catalog carries the qualified
+  gpt-oss-20b preset; a flow that names the `aws` connector fails
+  validation with a named blocker until containment lands.
+- GUI: a running flow can be cancelled; the expanded request row shows its
+  audit trail; approving with a note keeps the note; a run that finishes
+  before the event stream attaches no longer sticks on queued; renaming an
+  input onto an existing key is refused; the daemon card shows the real base
+  directory and restart asks for confirmation; the beacon reports
+  connecting and needs two missed polls before offline; independent steps
+  lay out in declaration order; the installed-models table folds its
+  actions into a menu and fits 1100x700; every chip, checkbox and radio has
+  at least a 24 px hit area; the palette returns focus to its opener; the
+  flow library is a keyboard listbox; faint ink, strong lines and a real
+  amber warning pair are tokens that meet WCAG contrast in all four
+  palettes; copy uses one phrase for a request awaiting review and one
+  casing for labels.
 
 ## [0.3.1] - 2026-09-09
 

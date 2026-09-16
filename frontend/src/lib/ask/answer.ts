@@ -10,6 +10,8 @@
 
 import { formatDuration, relativeTime } from "../time";
 
+export { repoTail } from "../repo";
+
 /** The nine intents plus the honest "I don't know that" answer. */
 export type IntentId =
   | "approvals_waiting"
@@ -73,12 +75,6 @@ export interface AskOptions {
 /** `1 request`, `2 requests` — the count and its noun, agreeing. */
 export function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
-}
-
-/** The last segment of a repo path: `/Users/me/pam` → `pam`. */
-export function repoTail(repo: string): string {
-  const segments = repo.split("/").filter(Boolean);
-  return segments[segments.length - 1] ?? repo;
 }
 
 /** `1m ago`, `2h ago` — the same age the tide shows. */

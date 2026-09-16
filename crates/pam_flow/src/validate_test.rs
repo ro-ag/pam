@@ -4,8 +4,8 @@ use std::time::Duration;
 use super::duration::format_duration;
 use super::schema::{Action, Approval, ConnectorId, Effect, Flow, OutputPolicy, Role, When};
 use super::validate::{
-    FlowError, MAX_FILE_BYTES, connector_calls, is_sensitive_arg, is_shell, looks_secret_like,
-    parse, parse_value,
+    AWS_BLOCKER, FlowError, MAX_FILE_BYTES, connector_blocker, connector_calls, is_sensitive_arg,
+    is_shell, looks_secret_like, parse, parse_value,
 };
 
 /// Wraps step YAML in the smallest valid flow around it.
@@ -114,7 +114,7 @@ fn a_step_note_is_optional_trimmed_and_bounded() {
     assert_eq!(flow.steps[0].note, "Why this runs first.\nKeep it short.");
 
     let flow = good(&wrap(
-        "  - id: a\n    connector: aws\n    call: commands\n    note: connector steps carry notes too\n",
+        "  - id: a\n    connector: jenkins\n    call: jobs\n    note: connector steps carry notes too\n",
     ));
     assert_eq!(flow.steps[0].note, "connector steps carry notes too");
 
@@ -718,4 +718,77 @@ fn status_assertions_are_bounded_connector_literals() {
         bad_step("  - id: command\n    run: [git, status]\n    expect_status: OK\n").0,
         "steps[0].expect_status"
     );
+}
+
+#[test]
+fn a_flow_naming_the_aws_connector_is_refused_with_the_named_blocker() {
+    for step in [
+        "  - id: a\n    connector: aws\n    call: commands\n",
+        "  - id: a\n    connector: aws\n    call: cli\n    with: { service: sts, command: get-caller-identity }\n",
+        "  - id: a\n    connector: aws\n    call: nonsense\n",
+    ] {
+        let (path, message) = bad_step(step);
+        assert_eq!(path, "steps[0].connector");
+        assert_eq!(message, AWS_BLOCKER);
+        assert!(
+            message.contains("unavailable until containment lands"),
+            "{message}"
+        );
+    }
+    assert_eq!(connector_blocker(ConnectorId::Aws), Some(AWS_BLOCKER));
+    for id in ConnectorId::ALL {
+        if id != ConnectorId::Aws {
+            assert_eq!(connector_blocker(id), None, "{id}");
+        }
+    }
+    // The table itself stays, so descriptors can still say what will exist.
+    assert!(!connector_calls(ConnectorId::Aws).is_empty());
+}
+
+#[test]
+fn a_result_pointer_the_run_could_never_walk_is_refused() {
+    for tail in [
+        "result.",
+        "result.jobs[a]",
+        "result.jobs[0",
+        "result..id",
+        "result.jobs[]",
+    ] {
+        let (path, message) = bad_step(&format!(
+            "  - id: a\n    run: [git]\n  - id: b\n    run: [git, '${{steps.a.{tail}}}']\n"
+        ));
+        assert_eq!(path, "steps[1].run[1]", "{tail}");
+        assert!(message.contains("unknown variable"), "{tail}: {message}");
+    }
+    for tail in [
+        "result",
+        "exit_status",
+        "result.id",
+        "result.jobs[0].id",
+        "result.a[1][2].b",
+    ] {
+        good(&wrap(&format!(
+            "  - id: a\n    run: [git]\n  - id: b\n    run: [git, '${{steps.a.{tail}}}']\n"
+        )));
+    }
+}
+
+#[test]
+fn secret_like_strings_are_refused_in_prose_fields_too() {
+    let secret = "ghp_0123456789abcdef";
+    let (path, message) = bad(&format!(
+        "schema: 1\nid: demo\nname: 'Demo {secret}'\nsteps:\n  - id: a\n    run: [git]\n"
+    ));
+    assert_eq!(path, "name");
+    assert!(message.contains("secret"), "{message}");
+
+    let (path, _) = bad(&format!(
+        "schema: 1\nid: demo\nname: Demo\ndescription: 'token {secret}'\nsteps:\n  - id: a\n    run: [git]\n"
+    ));
+    assert_eq!(path, "description");
+
+    let (path, _) = bad(&format!(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  k:\n    description: 'use {secret}'\nsteps:\n  - id: a\n    run: [git]\n"
+    ));
+    assert_eq!(path, "inputs.k.description");
 }

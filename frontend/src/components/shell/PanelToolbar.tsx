@@ -50,7 +50,12 @@ export function PanelToolbar() {
       <span data-tauri-drag-region="" className="flex items-center pr-1">
         <Beacon state={daemon} />
       </span>
-      <Button variant="ghost" size="sm" onClick={cycleTheme}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={cycleTheme}
+        aria-label={`Palette ${themeDefinition(theme).label}, switch to ${themeDefinition(nextTheme(theme)).label}`}
+      >
         <span aria-hidden="true" className="warm-marker size-2 rounded-pill" />
         {themeDefinition(theme).label}
       </Button>

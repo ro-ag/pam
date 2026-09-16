@@ -1,7 +1,8 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use crate::logs::{LogTail, MAX_LINES, MIN_LINES, clamp_lines, tail_daemon_log};
+use crate::logs::{LogTail, MAX_LINES, MIN_LINES, TAIL_WINDOW_BYTES, clamp_lines, tail_daemon_log};
 
 /// Builds `<base>/log/<name>` with one line per entry in `lines`.
 fn write_log(base: &Path, name: &str, lines: &[&str]) {
@@ -116,4 +117,39 @@ fn the_tail_serializes_as_file_and_lines() {
             "lines": ["INFO ready"],
         })
     );
+}
+
+#[test]
+fn a_huge_log_is_read_from_its_tail_window_only_and_never_starts_mid_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("log");
+    fs::create_dir_all(&dir).expect("log dir builds");
+    // Every line is 100 bytes wide so the 1 MiB window boundary lands
+    // inside a line, and the file is three windows long.
+    let mut log = String::new();
+    let count = usize::try_from(3 * TAIL_WINDOW_BYTES / 100).expect("fits");
+    for i in 0..count {
+        let _ = writeln!(log, "{i:0>99}");
+    }
+    fs::write(dir.join("daemon.log"), &log).expect("log file writes");
+    let tail = tail_daemon_log(tmp.path(), MAX_LINES).expect("tail reads");
+    assert_eq!(tail.lines.len(), usize::try_from(MAX_LINES).expect("fits"));
+    assert_eq!(
+        tail.lines.last().map(String::as_str),
+        Some(format!("{:0>99}", count - 1).as_str())
+    );
+    assert!(
+        tail.lines.iter().all(|line| line.len() == 99),
+        "no fragment"
+    );
+    // A file exactly one window long is read whole: no fragment dropped.
+    let mut exact = String::new();
+    for i in 0..TAIL_WINDOW_BYTES / 8 {
+        let _ = writeln!(exact, "{:0>7}", i % 10_000_000);
+    }
+    assert_eq!(u64::try_from(exact.len()).expect("fits"), TAIL_WINDOW_BYTES);
+    fs::write(dir.join("daemon.log"), &exact).expect("log file writes");
+    let tail = tail_daemon_log(tmp.path(), MIN_LINES).expect("tail reads");
+    assert_eq!(tail.lines.len(), usize::try_from(MIN_LINES).expect("fits"));
+    assert!(tail.lines.iter().all(|line| line.len() == 7));
 }

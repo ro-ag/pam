@@ -65,6 +65,9 @@ fn references_reject_indirection_and_nonfull_commits() {
     assert!(valid_ref("refs/remotes/origin/main"));
     assert!(!valid_oid(&"0".repeat(40)));
     assert!(!valid_oid(&"a".repeat(64)));
+    assert!(!valid_oid(&"A".repeat(40)));
+    assert!(!valid_oid(&"g".repeat(40)));
+    assert!(valid_oid(&"a".repeat(40)));
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(directory.path().join("refs/heads")).unwrap();
     std::fs::write(
@@ -73,6 +76,32 @@ fn references_reject_indirection_and_nonfull_commits() {
     )
     .unwrap();
     assert!(resolve_ref(directory.path(), "refs/heads/main").is_err());
+}
+
+#[test]
+fn an_absent_reference_without_packed_refs_is_unavailable_not_an_io_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("refs/heads")).unwrap();
+    let error = resolve_ref(directory.path(), "refs/heads/missing").unwrap_err();
+    assert_eq!(error.cause, "landing_checkout_unsupported");
+    assert_eq!(
+        error.detail,
+        "requested base or branch reference is unavailable"
+    );
+    std::fs::write(
+        directory.path().join("packed-refs"),
+        format!("{} refs/heads/other\n", "a".repeat(40)),
+    )
+    .unwrap();
+    let error = resolve_ref(directory.path(), "refs/heads/missing").unwrap_err();
+    assert_eq!(
+        error.detail,
+        "requested base or branch reference is unavailable"
+    );
+    assert_eq!(
+        resolve_ref(directory.path(), "refs/heads/other").unwrap(),
+        "a".repeat(40)
+    );
 }
 
 #[cfg(target_os = "macos")]

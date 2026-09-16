@@ -151,7 +151,7 @@ export function AppearancePanel() {
             </span>
             <div>
               <h3>Ambient motion</h3>
-              <p>A different path inward and back home.</p>
+              <p>Let the background texture drift behind the panels.</p>
             </div>
           </header>
           <PreferenceToggle

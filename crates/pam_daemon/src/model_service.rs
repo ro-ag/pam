@@ -334,9 +334,17 @@ impl ModelService {
 
     /// The llama.cpp supervisor when the pinned engine is installed under
     /// the engine base; `None` keeps generation on the in-process runtime.
+    /// Reads the engine manifest on the calling thread; a status read that
+    /// already holds one passes it to [`Self::engine_server_for`].
     pub fn engine_server(&self) -> Option<Arc<EngineServer>> {
+        self.engine_server_for(&engine::status(&self.engine_base()))
+    }
+
+    /// [`Self::engine_server`] for an engine status already read, so the
+    /// manifest is not read twice (nor on the async thread).
+    pub fn engine_server_for(&self, status: &engine::EngineStatus) -> Option<Arc<EngineServer>> {
         let base = self.engine_base();
-        let server = engine::status(&base).server_path?;
+        let server = status.server_path.clone()?;
         let mut slot = self
             .engine
             .lock()
@@ -851,8 +859,18 @@ impl ModelService {
             .chain(settled.iter().take(STATUS_JOB_HISTORY))
             .map(job_json)
             .collect();
-        let engine_status = engine::status(&self.engine_base());
-        let engine_loaded = self.engine_server().and_then(|engine| engine.model());
+        // The manifest read is a filesystem round trip: it runs on the
+        // model lane, like every other registry read behind this status.
+        let base = self.engine_base();
+        let engine_status =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                engine::status(&base)
+            })
+            .await
+            .map_err(ModelServiceError::from)?;
+        let engine_loaded = self
+            .engine_server_for(&engine_status)
+            .and_then(|engine| engine.model());
         let resident = engine_loaded.as_ref().map(|loaded| loaded.id.clone());
         let readiness = json!({
             "light": self

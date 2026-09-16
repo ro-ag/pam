@@ -127,6 +127,12 @@ it("sizes the flow canvas from the remaining pane and gives the inspector its ow
   expect(styles).toMatch(/\.flow-canvas-pane\s*\{[^}]*overflow: hidden/);
   expect(styles).toMatch(/\.flow-inspector\s*\{[^}]*max-height: 35%;[^}]*overflow: auto/);
 });
+it("lets an activity lane grow with its row share above a readable floor", () => {
+  expect(styles).toMatch(/\.activity-lanes\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap/);
+  expect(styles).toMatch(
+    /\.activity-lane\s*\{[^}]*flex: var\(--lane-share, 1\) 1 0%;[^}]*min-width: min\(100%, 360px\)/,
+  );
+});
 it("preserves measured connection anchors and a 24px screen target at every supported zoom", () => {
   expect(tokens).toMatch(/\.flow-connection-handle\s*\{[^}]*width: 10px;[^}]*height: 10px/);
   for (const dimension of ["width", "height"]) {

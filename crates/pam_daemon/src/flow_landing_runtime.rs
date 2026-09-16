@@ -1209,7 +1209,7 @@ impl RunState<'_> {
 }
 /// The workspace directory a sealed checktree lives in, when `checktree` is
 /// exactly `<root>/landing-<ulid>/tree`; any other path is not ours to remove.
-pub(super) fn landing_workspace(checktree: &Path, root: &Path) -> Option<PathBuf> {
+pub(crate) fn landing_workspace(checktree: &Path, root: &Path) -> Option<PathBuf> {
     if checktree.file_name()? != "tree" {
         return None;
     }
@@ -1223,7 +1223,7 @@ pub(super) fn landing_workspace(checktree: &Path, root: &Path) -> Option<PathBuf
 }
 /// Removes the workspace named by [`landing_workspace`]; `true` when it is
 /// gone afterwards. A path of any other shape is left untouched.
-pub(super) fn release_workspace(checktree: &Path, root: &Path) -> bool {
+pub(crate) fn release_workspace(checktree: &Path, root: &Path) -> bool {
     let Some(workspace) = landing_workspace(checktree, root) else {
         return false;
     };
@@ -1296,10 +1296,11 @@ fn prepared_effect(loaded: &Loaded, commit: &str) -> Result<PushObservation, Cap
     Ok(prepared)
 }
 /// Confirms a prepared push or sync against the exact ref it was meant to
-/// move. Only a matched ref succeeds. A push that just exited non-zero and
-/// left the ref unchanged is `landing_push_rejected`; every other unchanged,
-/// moved or missing ref is `landing_effect_uncertain`, with the detail saying
-/// which. PAM never repeats the effect in any of these cases.
+/// move. Only a matched ref succeeds. A push whose process verdict is
+/// rejected (it exited non-zero, just now or as journalled before a crash)
+/// and left the ref unchanged is `landing_push_rejected`; every other
+/// unchanged, moved or missing ref is `landing_effect_uncertain`, with the
+/// detail saying which. PAM never repeats the effect in any of these cases.
 pub(super) fn effect_verdict(
     observed: &RemoteRef,
     prepared: &PushObservation,
@@ -1314,16 +1315,22 @@ pub(super) fn effect_verdict(
     match reconcile(observed, prepared).map_err(checkout_error)? {
         Reconciliation::Matched => Ok(()),
         Reconciliation::Unchanged => match (phase, prepared.state) {
-            (EffectPhase::JustRan, PushState::Uncertain) => Err(refused(
-                "landing_push_rejected",
-                format!(
-                    "The remote rejected the {what} and the exact {ref_kind} ref still holds its observed old value; PAM will not resend it"
-                ),
-            )),
-            (EffectPhase::JustRan, PushState::ReportedSuccess) => uncertain(format!(
+            // A process that ran and exited non-zero is a rejection in
+            // both phases; a fresh run with no verdict recorded is the same
+            // thing, since the process has just returned.
+            (_, PushState::Rejected) | (EffectPhase::JustRan, PushState::Uncertain) => {
+                Err(refused(
+                    "landing_push_rejected",
+                    format!(
+                        "The remote rejected the {what} and the exact {ref_kind} ref still holds its observed old value; PAM will not resend it"
+                    ),
+                ))
+            }
+            (_, PushState::ReportedSuccess) => uncertain(format!(
                 "Git reported the {what} as complete but the exact {ref_kind} ref still holds its observed old value; PAM will not repeat it"
             )),
-            (EffectPhase::Resumed, _) => uncertain(format!(
+            // No verdict was journalled: the process may never have run.
+            (EffectPhase::Resumed, PushState::Uncertain) => uncertain(format!(
                 "The prepared {what} left the exact {ref_kind} ref at its observed old value; PAM will not repeat it"
             )),
         },

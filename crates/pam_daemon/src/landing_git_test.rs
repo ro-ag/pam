@@ -960,3 +960,29 @@ fn a_journalled_sync_intent_reconciles_like_a_push_intent() {
         Reconciliation::Matched
     );
 }
+
+#[test]
+fn a_journalled_rejected_verdict_reads_back_and_reconciles_as_unchanged() {
+    // The runtime journals the process verdict after `git push` returns;
+    // a resume after a crash must read `rejected` back by its wire name.
+    let intent = serde_json::json!({
+        "ref_name": "refs/heads/feat/a",
+        "expected_old": "a".repeat(40),
+        "requested_commit": "b".repeat(40),
+        "state": "rejected",
+    });
+    let prepared: PushObservation = serde_json::from_value(intent).unwrap();
+    assert_eq!(prepared.state, PushState::Rejected);
+    assert_eq!(
+        serde_json::to_value(PushState::Rejected).unwrap(),
+        serde_json::json!("rejected")
+    );
+    let observed = RemoteRef {
+        ref_name: "refs/heads/feat/a".into(),
+        oid: Some("a".repeat(40)),
+    };
+    assert_eq!(
+        reconcile(&observed, &prepared).unwrap(),
+        Reconciliation::Unchanged
+    );
+}

@@ -82,7 +82,7 @@ export const NO_RECORD_SENTENCE =
 
 /** What persists and what does not, said once. */
 export const PERSISTENCE_SENTENCE =
-  "A tier default is a setting I keep. Residency is not: weights leave memory when idle and come back on the next job.";
+  "A tier default is a saved setting. Residency is not: weights leave memory when idle and come back on the next job.";
 
 /** The compression fact, so nobody looks for a knob that is not there. */
 export const COMPRESSION_SENTENCE =

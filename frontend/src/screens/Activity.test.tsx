@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { createAppRouter } from "../router";
 import type { ActivityRow, PamEventPayload } from "../lib/ipc";
-import { EVENT_REFRESH_MS, rowEnter } from "./Activity";
+import { EVENT_REFRESH_MS, rowEnter, toLanes } from "./Activity";
 
 /**
  * The Activity tide against a mocked bridge. The whole App mounts (shell
@@ -148,9 +148,9 @@ describe("the tide", () => {
     expect(router.state.location.search.state).toBe("refused");
   });
 
-  it("opens the compression's own row after a compress, even though the tide hides admin rows", async () => {
-    // The daemon drops every `admin.*` row under hide_probes, so the
-    // compress row only ever arrives through the capability-filtered read.
+  it("opens the compression's own row after a compress from the tide itself", async () => {
+    // The store keeps `admin.log.compress` rows under hide_probes (a human
+    // asked for them), so the compress row arrives with the tide.
     const compressRow = row({
       id: "req_zip",
       capability: "admin.log.compress",
@@ -158,11 +158,7 @@ describe("the tide", () => {
       args: { path: "/tmp/build.log" },
       created_ts: Math.floor(Date.now() / 1000) - 5,
     });
-    mocks.activityList.mockImplementation((args: { capability?: string }) =>
-      Promise.resolve({
-        requests: args.capability === "admin.log.compress" ? [compressRow] : TIDE,
-      }),
-    );
+    mocks.activityList.mockResolvedValue({ requests: [...TIDE, compressRow] });
     mocks.logCompress.mockResolvedValue({
       source: { id: "source", bytes: 1000 },
       compact: { id: "compact", bytes: 100 },
@@ -373,6 +369,21 @@ describe("lanes", () => {
     // The lane header carries the agent once; the rows no longer repeat it.
     expect(claude.getAllByText("claude")).toHaveLength(1);
     expect(screen.getByText(/3 requests · 2 lanes · newest first/)).toBeInTheDocument();
+    // Width follows traffic: each lane grows by its row count.
+    expect(lanes.map((lane) => lane.style.getPropertyValue("--lane-share"))).toEqual(["2", "1"]);
+  });
+
+  it("gives each lane a width share equal to its (capped) row count", () => {
+    const tide = [
+      ...Array.from({ length: 7 }, (_, index) => row({ id: `codex_${index}`, agent: "codex" })),
+      ...Array.from({ length: 60 }, (_, index) => row({ id: `claude_${index}` })),
+    ];
+    const lanes = toLanes(tide);
+    expect(lanes.map((lane) => [lane.agent, lane.share])).toEqual([
+      ["claude", 50],
+      ["codex", 7],
+    ]);
+    expect(lanes[0]?.rows).toHaveLength(50);
   });
 
   it("labels the filter groups and keeps every chip a 32px target", async () => {
@@ -476,8 +487,7 @@ describe("live updates", () => {
     renderActivity();
     await screen.findByText("compress.log");
     await waitFor(() => expect(eventHandlers.length).toBeGreaterThan(0));
-    // Count the tide's own reads: the compress-row query shares the
-    // `["activity"]` prefix and refetches alongside it.
+    // Count the tide's own reads.
     const tideCalls = () =>
       mocks.activityList.mock.calls.filter(([args]) => args.hide_probes === true).length;
     const initialCalls = tideCalls();

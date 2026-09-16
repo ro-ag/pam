@@ -173,7 +173,7 @@ describe("ask", () => {
     });
     const answer = await ask("why was that refused?", ctx, sources, off);
     expect(answer.sentence).toBe(
-      "I refused repo.push from codex: not_granted — repo.push is not granted. Grant it in Settings › Security.",
+      "PAM refused repo.push from codex: not_granted — repo.push is not granted. Grant it in Settings › Security.",
     );
     expect(answer.facts).toContainEqual(["ticket", "r9"]);
     expect(answer.links.map((l) => l.to)).toEqual(["/activity", "/settings"]);
@@ -271,18 +271,18 @@ describe("ask", () => {
       "The daemon answers: version 0.1.0, up for 1h 02m, 1 active request.",
     );
     expect((await ask("does pam start at login?", ctx, fakeSources(), off)).sentence).toBe(
-      "No: nothing starts me at login.",
+      "No: PAM does not start at login.",
     );
     expect((await ask("which flows do I have?", ctx, fakeSources(), off)).sentence).toBe(
       "You have 2 flows: pr-readiness, after-merge-checks.",
     );
     const run = await ask("run pr-readiness", ctx, fakeSources(), off);
     expect(run.sentence).toBe(
-      "I do not run flows from here; open pr-readiness on the Flows screen.",
+      "Flows do not run from here; open pr-readiness on the Flows screen.",
     );
     expect(run.links[0]).toMatchObject({ to: "/flows", search: { flow: "pr-readiness" } });
     expect((await ask("how many tokens did I save?", ctx, fakeSources(), off)).sentence).toBe(
-      "This week I avoided about 67,500 tokens across 3 compressions (293 KB → 29 KB).",
+      "This week PAM avoided about 67,500 tokens across 3 compressions (293 KB → 29 KB).",
     );
   });
 
@@ -313,7 +313,7 @@ describe("ask", () => {
   it("answers honestly when nothing matches, and when the daemon is down", async () => {
     const none = await ask("tell me a joke", ctx, fakeSources(), off);
     expect(none.intent).toBe("fallback");
-    expect(none.sentence).toMatch(/^I can answer about pam itself:/);
+    expect(none.sentence).toMatch(/^Ask about PAM itself:/);
     const down = await ask(
       "is the daemon running?",
       ctx,
@@ -456,18 +456,18 @@ describe("ask failure paths", () => {
       }),
       off,
     );
-    expect(answer.sentence).toBe("I could not read the approval queue: no socket.");
+    expect(answer.sentence).toBe("PAM could not read the approval queue: no socket.");
     expect(answer.facts).toEqual([]);
   });
 
   it("says so when nothing has been refused lately", async () => {
     const answer = await ask("why was that refused?", ctx, fakeSources(), off);
-    expect(answer.sentence).toBe("I have refused nothing lately.");
+    expect(answer.sentence).toBe("Nothing has been refused lately.");
   });
 
   it("asks which setting when no topic is recognisable", async () => {
     const answer = await ask("where do I change it", ctx, fakeSources(), off);
-    expect(answer.sentence).toMatch(/^Tell me which setting: /);
+    expect(answer.sentence).toMatch(/^Name the setting: /);
     expect(answer.links[0]).toMatchObject({ to: "/settings" });
   });
 

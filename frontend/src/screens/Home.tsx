@@ -169,7 +169,7 @@ export function HomeScreen() {
         </p>
       </PageHeader>
       <div className="page-content" role="region" aria-label="Home content" tabIndex={0}>
-        <div className="home-conversation space-y-5">
+        <div className="max-w-content space-y-5">
           <aside
             className="home-status border-b border-line text-sm"
             aria-label="Workspace overview"
@@ -217,7 +217,7 @@ export function HomeScreen() {
           <Panel ground="command" className="min-w-0 overflow-hidden" aria-busy={asking}>
             <div className="space-y-4 p-5">
               <div className="flex items-center gap-3">
-                <span className="warm-badge flex size-10 shrink-0 items-center justify-center rounded-card">
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-card bg-accent-soft text-accent">
                   <MessageSquare aria-hidden="true" className="size-5" />
                 </span>
                 <div>
@@ -290,7 +290,7 @@ export function HomeScreen() {
             {rephrase && lightBlocked && (
               <div className="flex flex-wrap items-center gap-3 border-t border-line px-5 py-3">
                 <p className="min-w-0 flex-1 text-xs text-ink-muted">
-                  answers stay in my own words: {lightBlocked}
+                  answers are not rephrased: {lightBlocked}
                 </p>
                 <Button
                   size="sm"

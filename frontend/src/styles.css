@@ -588,10 +588,6 @@
     gap: 12px 24px;
     padding-bottom: 16px;
   }
-  .home-conversation {
-    max-width: var(--container-content);
-    margin-inline: auto;
-  }
   .flow-library-layout {
     min-height: 0;
     overflow: hidden;
@@ -906,10 +902,17 @@
     color: var(--pam-ink);
   }
   .activity-lanes {
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
   }
+  /* A lane grows with its row share (`--lane-share`, set per lane), so a
+     busy agent takes more of the width than a quiet one; the floor keeps
+     every row readable and wraps lanes instead of squeezing them. */
   .activity-lane {
     container-type: inline-size;
+    flex: var(--lane-share, 1) 1 0%;
+    min-width: min(100%, 360px);
   }
   .lane-repo {
     display: none;

@@ -45,7 +45,7 @@ type Tier = (typeof TIERS)[number];
 /** What each tier is for, in one serif sentence. */
 const TIER_SENTENCES: Record<Tier, string> = {
   light: "Classification and short answers — the quick reads.",
-  heavy: "Summaries and briefs; when this one is empty I fall back to light.",
+  heavy: "Summaries and briefs; falls back to light when this one is empty.",
 };
 
 /** Every agent CLI PAM knows how to invoke, in detection order. */

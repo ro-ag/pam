@@ -86,7 +86,10 @@ impl Snapshot {
         repo: &Path,
     ) -> Result<(), CapabilityFailure> {
         let policy = ScopePolicy::load(store).await.map_err(|_| failure())?;
-        let repo = policy.authorize_repo(repo).map_err(|_| failure())?;
+        let repo = policy
+            .authorize_repo_blocking(repo)
+            .await
+            .map_err(|_| failure())?;
         let mut targets = self.all_origins.clone();
         targets.extend(self.origins.values().cloned());
         authorize_origin(store, &policy, &repo, &EvidenceOrigin { targets }).await?;

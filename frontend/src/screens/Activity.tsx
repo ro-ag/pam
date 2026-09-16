@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronRight } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -49,14 +49,6 @@ export const EVENT_REFRESH_MS = 300;
 
 /** How often the "3m ago" column re-renders. */
 const CLOCK_TICK_MS = 30_000;
-
-/**
- * How many hand-driven compressions the tide keeps alongside the agents'
- * rows. `hide_probes` drops every `admin.*` request — the GUI's own
- * polling, but also `admin.log.compress`, which a human asked for and
- * wants to find. So the tide asks for those separately and merges them.
- */
-const COMPRESS_LIMIT = 10;
 
 // --- state → visuals -------------------------------------------------------
 
@@ -393,18 +385,20 @@ function AuditTrail({ requestId }: { requestId: string }) {
 /** At most this many rows per lane; the daemon clamps the tide to 100. */
 const LANE_ROW_CAP = 50;
 
-/** One agent's current: its rows newest first, and when it last moved. */
-interface Lane {
+/** One agent's current: its rows newest first, when it last moved, and its share of the width. */
+export interface Lane {
   agent: string;
   rows: ActivityRow[];
   latest: number;
+  /** The lane's `flex-grow`: its row count, so width follows traffic. */
+  share: number;
 }
 
 /**
  * Rows into lanes: one per agent present, alphabetical so a lane never
  * trades places with its neighbour while the owner is reading it.
  */
-function toLanes(rows: ActivityRow[]): Lane[] {
+export function toLanes(rows: ActivityRow[]): Lane[] {
   const byAgent = new Map<string, ActivityRow[]>();
   for (const row of rows) {
     const lane = byAgent.get(row.agent);
@@ -417,10 +411,12 @@ function toLanes(rows: ActivityRow[]): Lane[] {
       const newestFirst = [...laneRows].sort(
         (left, right) => right.created_ts - left.created_ts,
       );
+      const rows = newestFirst.slice(0, LANE_ROW_CAP);
       return {
         agent,
-        rows: newestFirst.slice(0, LANE_ROW_CAP),
+        rows,
         latest: newestFirst[0]?.created_ts ?? 0,
+        share: rows.length,
       };
     });
 }
@@ -494,24 +490,11 @@ export function ActivityScreen() {
         state: serverState,
         // The observatory polls this op (and `status`) every few
         // seconds; without this the newest-N window fills with the GUI
-        // watching itself and the real lanes wash out.
+        // watching itself and the real lanes wash out. The store keeps
+        // `admin.log.compress` rows — a human asked for those.
         hide_probes: true,
       }),
     // Keep the previous tide on screen while a narrower lens loads.
-    placeholderData: (previous) => previous,
-  });
-
-  // The hand-driven compressions, which `hide_probes` would otherwise drop
-  // with the GUI's own polling rows (see COMPRESS_LIMIT).
-  const compressions = useQuery({
-    queryKey: ["activity", "compress", search.repo ?? null, search.agent ?? null],
-    queryFn: () =>
-      activityList({
-        limit: COMPRESS_LIMIT,
-        capability: COMPRESS_CAPABILITY,
-        repo: search.repo,
-        agent: search.agent,
-      }),
     placeholderData: (previous) => previous,
   });
 
@@ -545,15 +528,7 @@ export function ActivityScreen() {
     };
   }, [queryClient]);
 
-  const tideRequests = activity.data?.requests;
-  const compressRequests = compressions.data?.requests;
-  // One tide: the agents' rows plus the human's compressions, each id once.
-  const requests = useMemo(() => {
-    if (!tideRequests) return undefined;
-    const seen = new Set(tideRequests.map((row) => row.id));
-    const extra = (compressRequests ?? []).filter((row) => !seen.has(row.id));
-    return extra.length === 0 ? tideRequests : [...tideRequests, ...extra];
-  }, [tideRequests, compressRequests]);
+  const requests = activity.data?.requests;
   useEffect(() => {
     if (!pendingExpand || !requests) return;
     const compressed = [...requests]
@@ -694,7 +669,7 @@ export function ActivityScreen() {
 
         {!failure && rows.length > 0 && (
           <>
-            <div role="group" aria-label="lanes" className="activity-lanes grid gap-4">
+            <div role="group" aria-label="lanes" className="activity-lanes gap-4">
               <AnimatePresence initial={false}>
                 {lanes.map((lane) => (
                   <motion.section
@@ -703,6 +678,7 @@ export function ActivityScreen() {
                     aria-label={lane.agent}
                     exit={fade}
                     transition={settle}
+                    style={{ "--lane-share": lane.share } as CSSProperties}
                     className="activity-lane min-w-0 rounded-card border border-line-strong bg-surface-raised p-2"
                   >
                     <header className="flex items-center gap-2 px-2 pb-2">

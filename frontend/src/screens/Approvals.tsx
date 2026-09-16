@@ -11,13 +11,12 @@ import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import { cn } from "../lib/cn";
 import {
-  activityList,
   approvalsPending,
   approvalsResolve,
   subscribeEvents,
   toBridgeFailure,
-  type ActivityRow,
   type BridgeFailure,
+  type FlowEffect,
   type PendingApproval,
 } from "../lib/ipc";
 import { repoTail } from "../lib/repo";
@@ -26,8 +25,8 @@ import { exactTime, relativeTime, useNow } from "../lib/time";
 /**
  * Approvals — the raised hand: each pending approval renders as a full card (never a table row).
  * Approve is primary; Deny is the outlined secondary — refusing is legitimate, not shouted.
- * The pending list names the capability but not what will run; the card joins the request's
- * own row from the tide (`admin.activity.list`, state `waiting_approval`) to show its args.
+ * Each pending entry carries what will run (its args), the repository it acts on and the gated
+ * step's declared effect, so the card reads everything off `admin.approvals.pending` alone.
  * Live-ness mirrors Activity: a ~300ms trailing debounce on the daemon event stream surfaces a
  * card under a second after `approval_pending`. Resolution is optimistic — it exits on answer and
  * returns with the uniform failure shape on a bridge failure.
@@ -46,9 +45,6 @@ export const WARNING_AFTER_S = 10 * 60;
 
 /** How often waiting durations re-render. */
 const CLOCK_TICK_MS = 10_000;
-
-/** How many waiting requests the card join reads from the tide. */
-const WAITING_LIMIT = 100;
 
 // --- what approving means --------------------------------------------------
 
@@ -138,6 +134,11 @@ export function waitingClock(
   return { label: `${raised} · times out in ${Math.ceil(remaining / 60)}m`, urgent: true };
 }
 
+/** The step's declared effect in plain words; the daemon sends the enum. */
+export function effectLabel(effect: FlowEffect): string {
+  return effect === "read_only" ? "read only" : "stateful";
+}
+
 /**
  * What the request will actually run, read off its recorded args: an
  * `argv` array joins into the command line; anything else renders as one
@@ -159,15 +160,12 @@ export function commandLine(args: unknown): string | null {
 
 function ApprovalCard({
   approval,
-  request,
   now,
   busy,
   failure,
   onResolve,
 }: {
   approval: PendingApproval;
-  /** The request's own tide row, when the join found it. */
-  request: ActivityRow | undefined;
   now: number;
   busy: boolean;
   failure: BridgeFailure | undefined;
@@ -181,7 +179,7 @@ function ApprovalCard({
   const [note, setNote] = useState("");
   const meaning = approvalMeaning(approval.capability);
   const clock = waitingClock(approval.requested_ts, now);
-  const command = commandLine(request?.args);
+  const command = commandLine(approval.args);
   const options = () => ({ remember, ...(note.trim() ? { note: note.trim() } : {}) });
 
   return (
@@ -232,13 +230,19 @@ function ApprovalCard({
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-ink-faint">Command</dt>
           <dd className="min-w-0 break-all text-ink">
-            {command ?? (request ? "no arguments recorded" : "not in the tide yet")}
+            {command ?? "no arguments recorded"}
           </dd>
         </div>
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-ink-faint">Repository</dt>
-          <dd className="min-w-0 break-all">{approval.repo}</dd>
+          <dd className="min-w-0 break-all">{approval.repository ?? approval.repo}</dd>
         </div>
+        {approval.effect !== null && (
+          <div className="flex gap-3">
+            <dt className="w-20 shrink-0 text-ink-faint">Effect</dt>
+            <dd className="min-w-0 text-ink">{effectLabel(approval.effect)}</dd>
+          </div>
+        )}
       </dl>
 
       {failure && <FailureNote failure={failure} label="resolve failed" />}
@@ -337,12 +341,6 @@ export function ApprovalsScreen() {
   const [failures, setFailures] = useState<Record<string, BridgeFailure>>({});
 
   const approvals = useQuery({ queryKey: APPROVALS_PENDING_KEY, queryFn: approvalsPending });
-  // The waiting requests' own rows, for what each hand will run.
-  const waiting = useQuery({
-    queryKey: ["activity", "waiting"],
-    queryFn: () => activityList({ state: "waiting_approval", limit: WAITING_LIMIT }),
-    enabled: (approvals.data?.pending.length ?? 0) > 0,
-  });
 
   // Stagger the entrance only for the first load; a hand raised later
   // slides in alone, undelayed.
@@ -363,7 +361,6 @@ export function ApprovalsScreen() {
       timer = window.setTimeout(() => {
         timer = undefined;
         void queryClient.invalidateQueries({ queryKey: ["approvals"] });
-        void queryClient.invalidateQueries({ queryKey: ["activity", "waiting"] });
       }, EVENT_REFRESH_MS);
     })
       .then((stop) => {
@@ -493,7 +490,6 @@ export function ApprovalsScreen() {
                   >
                     <ApprovalCard
                       approval={hand}
-                      request={waiting.data?.requests.find((row) => row.id === hand.request_id)}
                       now={now}
                       busy={resolving[hand.request_id] !== undefined}
                       failure={failures[hand.request_id]}

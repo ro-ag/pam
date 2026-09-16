@@ -145,6 +145,19 @@ All notable changes to pam are documented in this file. The format follows
   palettes; copy uses one phrase for a request awaiting review and one
   casing for labels.
 
+- Review remainder: a rejected push keeps its `landing_push_rejected`
+  cause when the run resumes; the Activity tide shows `admin.log.compress`
+  rows under `hide_probes`; `admin.approvals.pending` entries carry `args`,
+  `repository` and `effect`, so the Approvals card shows what will run and
+  where without a second query; the engine manifest is read off the runtime
+  thread; repository authorisation in flow, recovery, result and landing
+  paths runs on the blocking lane; a startup sweep removes landing
+  workspaces whose ticket died with the daemon. The GUI speaks in a system
+  voice, Home is full-bleed like every other screen, Activity lanes size by
+  row share, the built-in watch flows are named "Watch GitHub run", "Watch
+  Jenkins build" and "Watch Sonar analysis", and the fake llama server can
+  serve a loopback port for the Windows engine path.
+
 ## [0.3.1] - 2026-09-09
 
 ### Fixed

@@ -220,7 +220,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
             Compress
           </Button>
           <span className="font-sans text-sm text-ink-muted">
-            I read the file as myself, so name a path I can reach.
+            The daemon reads the file as your user, so name a path it can reach.
           </span>
         </div>
         {compress.data && <CompressedNote report={compress.data} />}

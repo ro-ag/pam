@@ -109,7 +109,12 @@ resume with a prepared intent the stage only reads: it resolves
 `refs/heads/<base>` and applies the shared `reconcile` rule — `M` means matched
 (the receipt is emitted), `B0` means the effect never happened (the stage
 refuses with `landing_effect_uncertain` and is not replayed automatically), any
-other value is conflicting and refuses. A crashed copy can leave a temporary
+other value is conflicting and refuses. The intent's journalled process
+verdict (`uncertain` before the process reports, `reported_success` or
+`rejected` afterwards) is shared with push; sync only ever journals
+`reported_success`, since a failed install refuses as
+`landing_sync_install_failed` before any verdict is written, so a resumed
+sync never reports `landing_push_rejected`. A crashed copy can leave a temporary
 `tmp_pam_*.pack` file under the pack directory; it is never referenced and Git's
 garbage collection removes it.
 

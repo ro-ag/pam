@@ -29,6 +29,9 @@ const approval: PendingApproval = {
   repo: "/tmp/repo",
   agent: "claude",
   requested_ts: 1_756_684_800,
+  args: null,
+  repository: null,
+  effect: null,
 };
 
 const up = { connected: true, status: {}, base_dir: "/tmp/pam" };

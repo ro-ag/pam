@@ -102,12 +102,15 @@ state remains uncertain and requires reconciliation. Ordinary stateful command
 steps do not acquire this typed recovery behavior.
 
 For push and sync the intent also records what the Git process itself reported
-once it has run. A push that Git rejected, leaving the exact remote ref at the
-old value PAM observed, refuses as `landing_push_rejected`. A prepared push or
-sync found unchanged on resume, one Git reported complete while the ref stayed
-put, and a ref that moved to anything else all refuse as
-`landing_effect_uncertain`, with the detail saying which of the three it was.
-None of them is resent automatically.
+once it has run: `uncertain` until it reports, then `reported_success` or
+`rejected`. A push that Git rejected, leaving the exact remote ref at the
+old value PAM observed, refuses as `landing_push_rejected` — on the attempt
+that ran it and again on resume, when the journalled verdict says `rejected`
+and the ref is still unchanged. A prepared push or sync found unchanged on
+resume with no verdict journalled (the daemon died before Git reported), one
+Git reported complete while the ref stayed put, and a ref that moved to
+anything else all refuse as `landing_effect_uncertain`, with the detail saying
+which of the three it was. None of them is resent automatically.
 
 Policy revision, original admission, grant revision, scope, expiry and shared
 budget are checked again before work. Git credentials are supplied only to the

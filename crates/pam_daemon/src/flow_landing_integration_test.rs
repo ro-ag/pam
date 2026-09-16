@@ -1037,6 +1037,11 @@ async fn prepared_sync_recovers_from_the_exact_local_ref_without_a_second_fetch(
     .unwrap();
 }
 
+/// A prepared intent whose journalled process verdict is still `uncertain`
+/// (the daemon died before the process reported) is a truly unknown
+/// outcome: resume reads the ref, finds it unchanged, and refuses as
+/// `landing_effect_uncertain`. Only a journalled `rejected` verdict earns
+/// the typed `landing_push_rejected` cause on resume.
 #[tokio::test]
 async fn prepared_sync_whose_effect_never_landed_stays_uncertain_without_replay() {
     tokio::time::timeout(
@@ -1114,4 +1119,53 @@ async fn sync_refuses_a_moved_base_before_fetching() {
     )
     .await
     .unwrap();
+}
+
+/// The push step cannot resume in this fixture (its exact-ref observation
+/// needs the real remote), so the resumed verdict is exercised directly: a
+/// journalled `rejected` process verdict with the remote ref still at its
+/// observed old value is the typed refusal, the same as the fresh path,
+/// while a verdict-less intent stays uncertain.
+#[test]
+fn a_journalled_rejected_push_resumes_as_the_typed_refusal() {
+    use super::landing_runtime::{EffectPhase, effect_verdict};
+    use crate::landing_git::{PushObservation, PushState, RemoteRef};
+    use pam_flow::LandingOperation as Op;
+
+    let old = "a".repeat(40);
+    let observed = RemoteRef {
+        ref_name: "refs/heads/feature/work".into(),
+        oid: Some(old.clone()),
+    };
+    let prepared = |state: PushState| PushObservation {
+        ref_name: "refs/heads/feature/work".into(),
+        expected_old: Some(old.clone()),
+        requested_commit: "b".repeat(40),
+        state,
+    };
+    let cause = |failure: super::CapabilityFailure| match failure {
+        super::CapabilityFailure::Refused { cause, .. } => cause,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    for phase in [EffectPhase::Resumed, EffectPhase::JustRan] {
+        let rejected =
+            effect_verdict(&observed, &prepared(PushState::Rejected), Op::Push, phase).unwrap_err();
+        assert_eq!(cause(rejected), "landing_push_rejected");
+    }
+    let unknown = effect_verdict(
+        &observed,
+        &prepared(PushState::Uncertain),
+        Op::Push,
+        EffectPhase::Resumed,
+    )
+    .unwrap_err();
+    assert_eq!(cause(unknown), "landing_effect_uncertain");
+    let contradiction = effect_verdict(
+        &observed,
+        &prepared(PushState::ReportedSuccess),
+        Op::Push,
+        EffectPhase::Resumed,
+    )
+    .unwrap_err();
+    assert_eq!(cause(contradiction), "landing_effect_uncertain");
 }

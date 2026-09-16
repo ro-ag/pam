@@ -183,7 +183,8 @@ pub(crate) async fn authorized_metadata(
 ) -> Result<(RequestStatusMeta, Option<FlowResultMeta>), CapabilityFailure> {
     let policy = ScopePolicy::load(store).await.map_err(|_| unavailable())?;
     let repo = policy
-        .authorize_repo(Path::new(caller_repo))
+        .authorize_repo_blocking(Path::new(caller_repo))
+        .await
         .map_err(|_| unavailable())?;
     let status = store
         .request_status_meta(ticket)
@@ -237,7 +238,10 @@ pub(crate) async fn authorized_metadata(
             .map_err(|_| unavailable())?;
     }
     let current = ScopePolicy::load(store).await.map_err(|_| unavailable())?;
-    current.authorize_repo(&repo).map_err(|_| unavailable())?;
+    current
+        .authorize_repo_blocking(&repo)
+        .await
+        .map_err(|_| unavailable())?;
     for origin in &origins {
         authorize_origin(store, &current, &repo, origin)
             .await

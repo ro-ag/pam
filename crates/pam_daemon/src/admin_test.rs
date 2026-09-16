@@ -418,10 +418,78 @@ async fn approvals_pending_lists_the_waiting_request() {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["request_id"], "req_w1");
         assert_eq!(pending[0]["capability"], "release");
+        // A plain request: its args ride along, nothing else is known.
+        assert_eq!(pending[0]["args"], serde_json::json!({}));
+        assert_eq!(pending[0]["repository"], serde_json::Value::Null);
+        assert_eq!(pending[0]["effect"], serde_json::Value::Null);
 
         // Clean the wait up so the task does not outlive the test.
         approvals
             .resolve("req_w1", crate::approval::Resolution::Deny)
+            .await
+            .unwrap();
+        wait.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn approvals_pending_carries_the_flow_step_repository_and_effect() {
+    timeout(DEADLINE, async {
+        let (store, admin, approvals, mut events) = service_with_approvals().await;
+        // A gated push of the builtin guarded-land flow: the request row is
+        // the flow run itself, the approval names the step.
+        let args = serde_json::json!({
+            "id": "guarded-land",
+            "inputs": {
+                "repository": "https://github.test/team/repo.git",
+                "commit": "a".repeat(40),
+            },
+        });
+        store
+            .insert_request(
+                "req_w5",
+                "flow.run",
+                "/repo/a",
+                "claude",
+                &args.to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let waiting = Arc::clone(&approvals);
+        let wait = tokio::spawn(async move {
+            waiting
+                .request_approval("req_w5", "flow.step:guarded-land/push", &mut cancel_rx)
+                .await
+        });
+        let (topic, event) = events.recv().await.expect("pending event");
+        assert_eq!(topic, "req_w5");
+        assert_eq!(event, Event::ApprovalPending);
+
+        let response = admin
+            .handle(&admin_envelope(
+                "req_p5",
+                OP_APPROVALS_PENDING,
+                serde_json::json!({}),
+            ))
+            .await;
+
+        let body = expect_result(response, Outcome::Verified);
+        let pending = body["pending"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["capability"], "flow.step:guarded-land/push");
+        assert_eq!(pending[0]["args"], args);
+        assert_eq!(
+            pending[0]["repository"],
+            "https://github.test/team/repo.git"
+        );
+        assert_eq!(pending[0]["effect"], "stateful");
+
+        approvals
+            .resolve("req_w5", crate::approval::Resolution::Deny)
             .await
             .unwrap();
         wait.await.unwrap().unwrap();
@@ -606,6 +674,18 @@ async fn activity_list_hides_the_gui_own_probes_when_asked() {
             )
             .await
             .unwrap();
+        // The one admin op a human drives by hand stays visible.
+        store
+            .insert_request(
+                "req_p4",
+                "admin.log.compress",
+                "/repo/a",
+                "pam-gui",
+                "{}",
+                None,
+            )
+            .await
+            .unwrap();
 
         let response = admin
             .handle(&admin_envelope(
@@ -621,7 +701,7 @@ async fn activity_list_hides_the_gui_own_probes_when_asked() {
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["req_p1"]);
+        assert_eq!(ids, ["req_p4", "req_p1"]);
     })
     .await
     .unwrap();

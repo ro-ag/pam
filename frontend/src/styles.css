@@ -56,6 +56,25 @@
 }
 
 @layer components {
+  .navigation-item {
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease,
+      box-shadow 160ms ease;
+  }
+  @media (hover: hover) {
+    .navigation-item:hover {
+      color: var(--color-ink);
+      background-color: var(--color-accent-soft);
+      box-shadow: inset 3px 0 0 var(--color-accent);
+    }
+    .navigation-item[aria-current]:hover {
+      background-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-accent-soft));
+    }
+  }
   /* One softly blurred wave field stretched across the frame. No surface grain. */
   .desktop-shell {
     isolation: isolate;

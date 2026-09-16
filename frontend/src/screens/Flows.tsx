@@ -66,8 +66,8 @@ function LibraryEntry({
         title={entry.id}
         onClick={onSelect}
         className={cn(
-          "w-full space-y-1 rounded-control px-2.5 py-2 text-left transition-colors duration-150",
-          active ? "bg-accent-soft" : "hover:bg-accent-soft/40",
+          "navigation-item w-full space-y-1 rounded-control px-2.5 py-2 text-left",
+          active && "bg-accent-soft",
         )}
       >
         <span className="block font-sans text-sm font-medium text-ink">
@@ -572,6 +572,7 @@ export function FlowsScreen({
     onSelected: setPicked,
     onDiscard: discard,
   });
+  const { requestNavigation } = controls;
   const handledNavigation = useRef<(() => void) | undefined>(undefined);
   useEffect(() => {
     if (!navigation?.pending) {
@@ -580,19 +581,19 @@ export function FlowsScreen({
     }
     if (handledNavigation.current !== navigation.proceed && navigation.proceed) {
       handledNavigation.current = navigation.proceed;
-      controls.requestNavigation(navigation.proceed, navigation.cancel);
+      requestNavigation(navigation.proceed, navigation.cancel);
     }
-  }, [navigation, controls.requestNavigation]);
+  }, [navigation, requestNavigation]);
   const previousInitialFlow = useRef(initialFlow);
   useEffect(() => {
     if (initialFlow && initialFlow !== previousInitialFlow.current) {
       previousInitialFlow.current = initialFlow;
-      controls.requestNavigation(() => {
+      requestNavigation(() => {
         setPicked(initialFlow);
         if (initialTab) setTab(initialTab);
       });
     }
-  }, [initialFlow, initialTab, controls.requestNavigation]);
+  }, [initialFlow, initialTab, requestNavigation]);
 
   return (
     <div className="page-workspace">
@@ -631,8 +632,7 @@ export function FlowsScreen({
                   entry={entry}
                   active={entry.id === selected.id}
                   onSelect={() => {
-                    if (entry.id !== selected.id)
-                      controls.requestNavigation(() => setPicked(entry.id));
+                    if (entry.id !== selected.id) requestNavigation(() => setPicked(entry.id));
                   }}
                 />
               ))}
@@ -647,7 +647,7 @@ export function FlowsScreen({
                 value={selected.id}
                 onChange={(event) => {
                   const next = event.target.value;
-                  controls.requestNavigation(() => setPicked(next));
+                  requestNavigation(() => setPicked(next));
                 }}
                 className="field-control h-8 w-full rounded-control border border-control-line bg-inset px-2 text-sm"
               >
@@ -680,7 +680,7 @@ export function FlowsScreen({
                   (next === "canvas" || next === "yaml")
                 )
                   setTab(next);
-                else controls.requestNavigation(() => setTab(next));
+                else requestNavigation(() => setTab(next));
               }}
               onDraft={setDraft}
               busy={controls.busy}

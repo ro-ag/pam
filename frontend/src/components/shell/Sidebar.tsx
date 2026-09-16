@@ -16,11 +16,11 @@ import { cn, cva } from "../../lib/cn";
  * The full-height column keeps its brand below native macOS traffic lights.
  */
 const navItemVariants = cva(
-  "flex h-9 w-full items-center gap-2.5 rounded-control px-3 font-sans text-sm font-medium transition-colors duration-100",
+  "navigation-item flex h-9 w-full items-center gap-2.5 rounded-control px-3 font-sans text-sm font-medium",
   {
     variants: {
       state: {
-        idle: "text-ink-muted hover:bg-accent-soft/60 hover:text-ink",
+        idle: "text-ink-muted",
         active: "nav-current bg-accent-soft text-selection-ink",
       },
     },

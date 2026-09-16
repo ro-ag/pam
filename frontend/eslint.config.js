@@ -27,7 +27,15 @@ export default tseslint.config(
     extends: [
       js.configs.recommended,
       ...tseslint.configs.recommended,
-      reactHooks.configs["recommended-latest"],
+      // Preserve the existing hooks checks; the v7 preset also opts into
+      // React Compiler rules, which this app does not use.
+      {
+        plugins: { "react-hooks": reactHooks },
+        rules: {
+          "react-hooks/rules-of-hooks": "error",
+          "react-hooks/exhaustive-deps": "warn",
+        },
+      },
     ],
     languageOptions: {
       globals: globals.browser,

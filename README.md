@@ -89,11 +89,16 @@ Settings › Daemon in the GUI shows the same state with Install and Remove.
 
 ```sh
 rustup show                          # picks up rust-toolchain.toml
-npm --prefix frontend ci             # Node 22
+npm --prefix frontend ci             # Node 22.22.2+, 24.15+, or 26+
 tools/check.sh                       # the whole local gate: fmt, clippy, tests, eslint, tsc + vite build, vitest
 npm --prefix frontend run gui:build  # embedded-frontend binary
 npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb, NSIS)
 ```
+
+The frontend builds with TypeScript 7 (`tsc`). Its `@typescript/native` npm alias
+provides the native compiler; the `typescript` alias provides Microsoft's
+`@typescript/typescript6` compatibility API for ESLint, which does not yet
+support the TypeScript 7 API. Keep both aliases when updating dependencies.
 
 For PAM contributors, `pam flow run pam-pr-readiness` from this repository
 runs a clean-tree assertion followed by all six gates in `tools/check.sh`.

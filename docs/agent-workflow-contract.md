@@ -168,7 +168,8 @@ not authorize using real production effects as tests.
 
 ## Using today's implementation
 
-The existing CLI can discover flows and execute the deterministic Jenkins slice:
+The existing CLI can discover flows and execute the deterministic Jenkins slice
+(a distilled copy of this playbook ships inside the binary as `pam playbook`):
 
 ```sh
 pam status --json

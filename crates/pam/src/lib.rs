@@ -17,6 +17,12 @@ pub use pam_client::{base_dir_from, caller, client, default_base_dir, request};
 
 pub mod render;
 
+/// The agent playbook, shipped inside the binary (`pam playbook`): the
+/// discover/run/read loop, refusal handling, exit codes and the sandbox
+/// case, distilled from `docs/agent-workflow-contract.md`, which stays the
+/// authoritative long form.
+pub const PLAYBOOK: &str = include_str!("../../../docs/pam-playbook.md");
+
 /// True when `exe` sits inside a macOS application bundle
 /// (`…/Something.app/Contents/MacOS/pam`): a bare double-click launch,
 /// which should open the GUI. A bare terminal launch prints help.

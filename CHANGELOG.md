@@ -32,6 +32,14 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- `pam playbook`: the agent guide ships inside the binary. It prints the
+  discover/run/read loop (`pam status` → `pam flow list` → `pam flow inspect`
+  → `pam flow run --no-wait` → `pam wait` → `pam flow result` → `pam evidence
+  read`), how to read refusals and exit codes, the sandbox-relay case
+  (`PAM_SOCKET_DIR`, never started from inside the sandbox), and a drop-in
+  snippet for a project's AGENTS.md — so an agent that only has the binary
+  can still learn how to drive pam. `pam --help` and the `pam status` summary
+  point at it, and it needs no daemon.
 - `pam listen <dir>` (unix): a session socket relay for agents whose
   sandbox blocks the daemon's unix socket. It binds `pam.sock` and
   `events.sock` inside a directory the sandbox permits (created `0700`)

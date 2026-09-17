@@ -544,9 +544,13 @@ async fn exchange(dirs: &RuntimeDir, envelope: &Envelope) -> Result<Response, Re
 }
 
 /// Deadline for each store reconciliation `query` request a follow
-/// makes (see [`follow_ticket`]); small because the answer is a single
-/// indexed row read.
-const QUERY_DEADLINE_MS: u64 = 5_000;
+/// makes (see [`follow_ticket`]). Small in the common case — the answer
+/// is a single indexed row read — but bounded generously: on a loaded
+/// runner the daemon can serialize the read behind an active flow's
+/// store work, and a too-tight deadline turned a healthy follow into a
+/// `deadline_exceeded` refusal (Windows CI, 2026-09-17). The follow's
+/// own timeout still bounds the whole wait.
+const QUERY_DEADLINE_MS: u64 = 15_000;
 
 /// First pause before a follow re-reconciles against the store; each
 /// subsequent reconcile doubles it up to [`RECONCILE_MAX`], so a long

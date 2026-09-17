@@ -35,6 +35,7 @@ const FLOW_DEADLINE_MS: u64 = 1_800_000;
     name = "pam",
     version,
     about = "A local lifeguard for developers and AI agents.",
+    after_help = "Agents: `pam playbook` prints the guide for driving pam from an AI agent.",
     arg_required_else_help = true
 )]
 struct Cli {
@@ -44,6 +45,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Print the agent playbook: how to discover and drive pam.
+    Playbook,
     /// Show the daemon's health snapshot.
     Status {
         /// Print the raw response JSON instead of the summary.
@@ -343,6 +346,12 @@ fn main() -> ExitCode {
         return gui_mode();
     }
     match Cli::parse().command {
+        // The playbook is static text: it needs no home directory, no
+        // daemon and no sandbox probe, so it answers before any of those.
+        Cmd::Playbook => {
+            print!("{}", pam::PLAYBOOK);
+            ExitCode::SUCCESS
+        }
         Cmd::Daemon { action: None } => daemon_mode(),
         Cmd::Daemon {
             action: Some(DaemonCmd::Stop),
@@ -454,7 +463,9 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             }
         },
         Cmd::Flow { action } => run_flow_command(base, action).await,
-        Cmd::Daemon { .. } | Cmd::Gui | Cmd::Service { .. } => unreachable!("handled in main"),
+        Cmd::Daemon { .. } | Cmd::Gui | Cmd::Service { .. } | Cmd::Playbook => {
+            unreachable!("handled in main")
+        }
     }
 }
 

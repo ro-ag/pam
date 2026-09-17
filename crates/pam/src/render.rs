@@ -112,7 +112,7 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  playbook:        pam playbook (the agent guide)",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")

@@ -616,6 +616,28 @@ fn seed_flow(tmp: &tempfile::TempDir, id: &str, yaml: &str) {
     std::fs::write(dir.join(format!("{id}.yaml")), yaml).expect("the flow file is written");
 }
 
+/// `pam playbook` is static text: it answers without a daemon, a base dir
+/// or any sandbox, which is the whole point for an agent that only has the
+/// binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_playbook_prints_the_agent_guide_without_touching_the_daemon() {
+    warm_binary();
+    let tmp = short_tempdir();
+    let run = run_pam(&base_of(&tmp), tmp.path(), &["playbook"]).await;
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    assert!(run.stderr.is_empty(), "{}", run.stderr);
+    for marker in [
+        "pam flow list --json",
+        "pam flow inspect <id> key=value --json",
+        "pam flow run <id> key=value --no-wait --json",
+        "pam wait <ticket> --json",
+        "PAM_SOCKET_DIR",
+        "Exit codes",
+    ] {
+        assert!(run.stdout.contains(marker), "stdout: {}", run.stdout);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn flow_list_prints_every_builtin_and_exits_zero() {
     warm_binary();

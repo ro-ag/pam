@@ -61,6 +61,7 @@ error, `3` refused, `4` unresolved, `5` blocked.
 
 | Subcommand | What it does |
 | --- | --- |
+| `pam playbook` | The agent guide as static text: the discover/run/read loop, refusal handling, exit codes, and the sandbox case. No daemon needed. |
 | `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). |
 | `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. |
 | `pam cancel <ticket> [--json]` | Cancels a queued or running request. |

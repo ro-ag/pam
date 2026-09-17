@@ -792,3 +792,44 @@ fn secret_like_strings_are_refused_in_prose_fields_too() {
     ));
     assert_eq!(path, "inputs.k.description");
 }
+
+#[test]
+fn a_declared_input_nobody_reads_is_refused() {
+    let (path, message) = bad(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  extra:\n    description: unused\nsteps:\n  - id: status\n    run: [git, status]\n",
+    );
+    assert_eq!(path, "inputs.extra");
+    assert!(
+        message.contains("no step argument"),
+        "the message names what would have to read it: {message}"
+    );
+}
+
+#[test]
+fn a_default_alone_does_not_make_an_input_used() {
+    let (path, _) = bad(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  repo:\n    description: owner/name\n    default: '${repo.origin}'\nsteps:\n  - id: status\n    run: [git, status]\n",
+    );
+    assert_eq!(path, "inputs.repo");
+}
+
+#[test]
+fn environment_connector_and_correlation_reads_all_count() {
+    let flow = good(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  who:\n    description: greeter\n  repo:\n    description: owner/name\nsteps:\n  - id: status\n    run: [git, status]\n    env: { WHO: '${inputs.who}' }\n  - id: runs\n    connector: github\n    call: runs\n    with: { repo: '${inputs.repo}' }\n",
+    );
+    assert_eq!(flow.inputs.len(), 2, "env and connector reads count");
+    let correlated = good(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  repository:\n    description: clone url\n  commit:\n    description: full sha\ncorrelation:\n  repository: '${inputs.repository}'\n  commit: '${inputs.commit}'\nsteps:\n  - id: status\n    run: [git, status]\n",
+    );
+    assert!(correlated.correlation.is_some(), "correlation reads count");
+}
+
+#[test]
+fn an_input_name_may_not_start_with_a_dash() {
+    let (path, message) = bad(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  -bad:\n    description: x\nsteps:\n  - id: status\n    run: [git, status]\n",
+    );
+    assert_eq!(path, "inputs.-bad");
+    assert!(message.contains("does not start with"), "{message}");
+}

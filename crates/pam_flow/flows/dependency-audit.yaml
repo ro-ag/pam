@@ -4,8 +4,9 @@ name: Dependency audit
 description: >-
   Look for advisories against the locked dependencies and for crates that
   appear at more than one version. The first step needs cargo-audit
-  installed (cargo install cargo-audit); without it the step fails and the
-  duplicate report still runs.
+  installed (cargo install cargo-audit), and it needs network access to clone
+  or refresh the advisory database, which command containment denies; without
+  either, the step fails and the duplicate report still runs.
 steps:
   - id: audit
     run: [cargo, audit]

@@ -528,6 +528,9 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
         steps.push(step);
     }
 
+    let read = read_inputs(raw.correlation.as_ref(), &steps);
+    check_inputs_are_read(&inputs, &read)?;
+
     let correlation = raw
         .correlation
         .map(|value| value.validated(&inputs))
@@ -967,6 +970,7 @@ fn check_id(id: &str, path: &str, what: &str) -> Result<(), FlowError> {
 fn check_input_name(name: &str) -> Result<(), FlowError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_ID_BYTES
+        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
@@ -976,9 +980,77 @@ fn check_input_name(name: &str) -> Result<(), FlowError> {
     Err(FlowError::invalid(
         format!("inputs.{name}"),
         format!(
-            "`{name}` is not an input name: lower-case letters, digits, `-` and `_`, 1 to {MAX_ID_BYTES} bytes"
+            "`{name}` is not an input name: lower-case letters, digits, `-` and `_`, \
+             1 to {MAX_ID_BYTES} bytes, and it does not start with `-`"
         ),
     ))
+}
+
+/// Refuses a declared input nothing reads: the GUI would keep offering an
+/// input field the recipe ignores, and a caller could keep supplying a value
+/// no step would ever use.
+fn check_inputs_are_read(
+    inputs: &BTreeMap<String, Input>,
+    read: &BTreeSet<String>,
+) -> Result<(), FlowError> {
+    for name in inputs.keys() {
+        if !read.contains(name) {
+            return Err(FlowError::invalid(
+                format!("inputs.{name}"),
+                format!(
+                    "input `{name}` is declared but no step argument, environment value or \
+                     correlation target reads it"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every declared input name the flow actually reads: from the correlation
+/// declaration, a command argument, a connector argument, or an environment
+/// value. A default that references the repository does not count — an input
+/// only the GUI would show and no step would use is refused by the caller.
+fn read_inputs(
+    correlation: Option<&crate::correlation::Correlation>,
+    steps: &[Step],
+) -> BTreeSet<String> {
+    let mut read = BTreeSet::new();
+    if let Some(correlation) = correlation {
+        for key in correlation.references() {
+            if let Some(name) = key.strip_prefix("inputs.") {
+                read.insert(name.to_owned());
+            }
+        }
+    }
+    let mut scan = |text: &str| {
+        for key in crate::vars::references(text) {
+            if let Some(name) = key.strip_prefix("inputs.") {
+                read.insert(name.to_owned());
+            }
+        }
+    };
+    for step in steps {
+        match &step.action {
+            Action::Landing { .. } => {}
+            Action::Command { argv } => {
+                for argument in argv {
+                    scan(argument);
+                }
+            }
+            Action::Connector { with, .. } => {
+                for value in with.values() {
+                    if let ArgValue::Text(text) = value {
+                        scan(text);
+                    }
+                }
+            }
+        }
+        for value in step.env.values() {
+            scan(value);
+        }
+    }
+    read
 }
 
 fn is_program_name(program: &str) -> bool {

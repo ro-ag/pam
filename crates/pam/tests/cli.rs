@@ -530,6 +530,7 @@ inputs:
 steps:
   - id: version
     run: [git, --version]
+    env: { PAM_LABEL: '${inputs.label}' }
 ";
 
 /// What one execution of the compiled binary produced.
@@ -1249,4 +1250,84 @@ async fn workflow_discovery_wait_and_durable_result_use_the_actual_binary() {
     })
     .await
     .expect("workflow CLI contract within deadline");
+}
+
+/// A typo'd input name used to run silently against the declared default;
+/// the run now refuses with the same cause `flow inspect` reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_with_an_undeclared_input_is_refused_without_a_ticket() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "after-merge-checks", "nope=1", "--json"],
+        )
+        .await;
+
+        assert_eq!(
+            run.code,
+            i32::from(render::EXIT_REFUSED),
+            "{} {}",
+            run.stdout,
+            run.stderr
+        );
+        let response: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
+        assert_eq!(response["kind"], "refusal", "{response}");
+        assert_eq!(response["cause"], "input_unknown", "{response}");
+        assert!(run.stderr.is_empty(), "{}", run.stderr);
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("undeclared-input refusal within deadline");
+}
+
+/// The inspect step's credential status is a status sentinel, not a secret,
+/// so it must reach the agent instead of being masked like a credential.
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_inspect_reports_the_credential_probe_without_masking_it() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+
+        let run = run_pam(
+            &daemon.base(),
+            daemon.tmp.path(),
+            &[
+                "flow",
+                "inspect",
+                "jenkins-build-investigation",
+                "job=a",
+                "build=1",
+                "--json",
+            ],
+        )
+        .await;
+
+        assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+        let inspected: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("the --json output is one JSON document");
+        let step = &inspected["body"]["steps"][0];
+        assert_eq!(
+            step["auth_probe"], "unknown_not_probed",
+            "the never-probed sentinel survives redaction: {}",
+            run.stdout
+        );
+        assert!(step.get("credential").is_none(), "{}", run.stdout);
+        assert!(
+            !run.stdout.contains("[REDACTED]"),
+            "nothing in an inspection of literal inputs is secret-shaped: {}",
+            run.stdout
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("inspect credential-probe test within deadline");
 }

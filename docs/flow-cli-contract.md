@@ -16,6 +16,9 @@ pam evidence read <evidence-id> --request <ticket> --json
 ```
 
 Run these from the approved repository. A ticket is a reference, not authority.
+Run refuses inputs the flow does not declare (`input_unknown`) and input
+values that are not scalars (`input_invalid`) before a ticket exists; a
+declared input with neither a value nor a default refuses as `input_missing`.
 List pages default to 20 entries and accept at most 50. Continue using the
 returned `next_offset`; a byte limit may end a page before its entry limit.
 

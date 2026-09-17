@@ -3339,6 +3339,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "keyring-core",
+ "pam_client",
  "pam_compact",
  "pam_connectors",
  "pam_flow",

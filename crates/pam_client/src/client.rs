@@ -34,6 +34,73 @@ use crate::request::{build_envelope, new_request_id};
 /// ready, per spawn attempt.
 pub const READINESS_WAIT: Duration = Duration::from_secs(3);
 
+/// The session socket override: when `$PAM_SOCKET_DIR` names a directory,
+/// public dials use the `pam.sock` and `events.sock` directly inside it
+/// instead of `<base>/run`'s — the layout [`crate::relay`] (`pam listen`)
+/// binds — and lazy daemon auto-start is off. The relay is the transport,
+/// so a missing relay is an error naming `pam listen`, never a spawned
+/// daemon.
+pub const SOCKET_DIR_ENV: &str = "PAM_SOCKET_DIR";
+
+/// [`SOCKET_DIR_ENV`] as the client sees it: set and non-empty.
+fn session_socket_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os(SOCKET_DIR_ENV)?;
+    (!dir.is_empty()).then_some(PathBuf::from(dir))
+}
+
+/// The runtime directories one public dial uses: the session override's
+/// flat layout when set, `<base>/run` otherwise.
+fn dial_dirs(base_dir: &Path) -> Result<RuntimeDir, RuntimeDirError> {
+    dial_dirs_with(session_socket_dir().as_deref(), base_dir)
+}
+
+/// [`dial_dirs`] with the override injected — the resolution rule itself,
+/// unit-testable without mutating process environment (which the
+/// workspace's `unsafe` denial forbids in edition 2024).
+pub(crate) fn dial_dirs_with(
+    session_dir: Option<&Path>,
+    base_dir: &Path,
+) -> Result<RuntimeDir, RuntimeDirError> {
+    match session_dir {
+        Some(dir) => RuntimeDir::paths_at_dir(dir),
+        None => RuntimeDir::paths_at_base(base_dir),
+    }
+}
+
+/// The daemon-half of a public dial: probe for (or lazily spawn) a daemon,
+/// unless the session override is active — the relay is then the
+/// transport, and probing a base whose lock nobody holds would only
+/// trigger a pointless spawn.
+async fn ensure_daemon_for_dial(base_dir: &Path) -> Result<(), RequestError> {
+    ensure_for_dial_off_thread(
+        session_socket_dir().as_deref(),
+        base_dir,
+        spawn_detached_daemon,
+        READINESS_WAIT,
+        READINESS_POLL,
+    )
+    .await
+    .map_err(RequestError::from)
+}
+
+/// [`ensure_daemon_for_dial`] with the override and spawner injected, so
+/// the never-spawn guarantee is unit-testable without process environment
+/// (which the workspace's `unsafe` denial forbids in edition 2024).
+pub(crate) async fn ensure_for_dial_off_thread(
+    session_dir: Option<&Path>,
+    base_dir: &Path,
+    spawn: impl FnMut() -> io::Result<()> + Send + 'static,
+    wait: Duration,
+    poll: Duration,
+) -> Result<(), ClientError> {
+    if session_dir.is_some() {
+        return Ok(());
+    }
+    ensure_daemon_off_thread(base_dir, spawn, wait, poll)
+        .await
+        .map(|_| ())
+}
+
 /// How often the readiness wait re-probes.
 const READINESS_POLL: Duration = Duration::from_millis(50);
 
@@ -257,6 +324,20 @@ pub enum RequestError {
         #[source]
         source: zeromq::ZmqError,
     },
+    /// The session relay (`PAM_SOCKET_DIR`) is not answering. The client
+    /// never spawns a daemon while the override is set — the relay is the
+    /// transport — so this names the way to start it instead.
+    #[error(
+        "no session relay answered in {dir} ($PAM_SOCKET_DIR); start one \
+         outside the sandbox with `pam listen {dir}`"
+    )]
+    SessionUnreachable {
+        /// The override directory whose sockets did not answer.
+        dir: PathBuf,
+        /// The underlying zmq error.
+        #[source]
+        source: zeromq::ZmqError,
+    },
     /// The zmq exchange itself failed.
     #[error("transport failure talking to the daemon: {source}")]
     Transport {
@@ -403,12 +484,14 @@ pub async fn send_admin(
 
 /// The public exchange loop behind [`send_request`]:
 /// ensure the daemon, exchange over `pam.sock`, retry exactly once
-/// after a `daemon_outdated` refusal.
+/// after a `daemon_outdated` refusal. With the session override active
+/// the daemon probe is skipped and both endpoints come from the relay
+/// directory instead of `<base>/run`.
 async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response, RequestError> {
     let mut retried = false;
     loop {
-        ensure_daemon_async(base_dir).await?;
-        let dirs = RuntimeDir::paths_at_base(base_dir)?;
+        ensure_daemon_for_dial(base_dir).await?;
+        let dirs = dial_dirs(base_dir)?;
         let response = exchange(&dirs, envelope).await?;
         if should_retry(&response) && !retried {
             retried = true;
@@ -416,6 +499,19 @@ async fn send_envelope(base_dir: &Path, envelope: &Envelope) -> Result<Response,
             continue;
         }
         return Ok(response);
+    }
+}
+
+/// Maps a socket connect failure to its error: under the session override
+/// the relay directory is the transport, so the error names `pam listen`
+/// rather than an endpoint the sandboxed caller could not reach anyway.
+fn connect_error(dirs: &RuntimeDir, source: zeromq::ZmqError) -> RequestError {
+    match session_socket_dir() {
+        Some(dir) => RequestError::SessionUnreachable { dir, source },
+        None => RequestError::Connect {
+            endpoint: dirs.router_endpoint(),
+            source,
+        },
     }
 }
 
@@ -427,7 +523,7 @@ async fn exchange(dirs: &RuntimeDir, envelope: &Envelope) -> Result<Response, Re
     dealer
         .connect(&endpoint)
         .await
-        .map_err(|source| RequestError::Connect { endpoint, source })?;
+        .map_err(|source| connect_error(dirs, source))?;
     let payload = serde_json::to_vec(envelope).map_err(|source| RequestError::Parse { source })?;
     dealer
         .send(ZmqMessage::from(payload))
@@ -479,7 +575,7 @@ pub async fn follow_ticket(
     timeout: Duration,
     mut on_event: impl FnMut(&Event),
 ) -> Result<Event, RequestError> {
-    ensure_daemon_async(base_dir).await?;
+    ensure_daemon_for_dial(base_dir).await?;
     let deadline = Instant::now() + timeout;
     let timed_out = || RequestError::FollowTimeout {
         ticket: ticket.to_owned(),
@@ -493,12 +589,15 @@ pub async fn follow_ticket(
         on_event(&event);
         return Ok(event);
     }
-    let dirs = RuntimeDir::paths_at_base(base_dir)?;
+    let dirs = dial_dirs(base_dir)?;
     let endpoint = dirs.events_endpoint();
     let mut sub = SubSocket::new();
     sub.connect(&endpoint)
         .await
-        .map_err(|source| RequestError::Connect { endpoint, source })?;
+        .map_err(|source| match session_socket_dir() {
+            Some(dir) => RequestError::SessionUnreachable { dir, source },
+            None => RequestError::Connect { endpoint, source },
+        })?;
     sub.subscribe(ticket)
         .await
         .map_err(|source| RequestError::Transport { source })?;

@@ -73,6 +73,7 @@ error, `3` refused, `4` unresolved, `5` blocked.
 | `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. |
 | `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket. |
 | `pam service install\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
+| `pam listen <dir>` (unix) | Serves a session socket relay: binds `pam.sock`/`events.sock` in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). |
 | `pam daemon` | Runs the daemon in the foreground. |
 | `pam daemon stop` | Signals the running daemon to drain and exit. |
 | `pam gui` | Opens the desktop control center. |

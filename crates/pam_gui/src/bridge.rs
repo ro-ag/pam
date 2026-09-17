@@ -216,6 +216,14 @@ impl From<RequestError> for BridgeError {
                     daemon_log_path()
                 ),
             ),
+            RequestError::SessionUnreachable { dir, .. } => Self::new(
+                "session_relay_unreachable",
+                detail,
+                format!(
+                    "Start the session relay outside the sandbox with `pam listen {}`.",
+                    dir.display()
+                ),
+            ),
             RequestError::Transport { .. } => Self::new(
                 "transport_failure",
                 detail,

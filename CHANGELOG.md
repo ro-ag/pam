@@ -32,6 +32,18 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- `pam listen <dir>` (unix): a session socket relay for agents whose
+  sandbox blocks the daemon's unix socket. It binds `pam.sock` and
+  `events.sock` inside a directory the sandbox permits (created `0700`)
+  and forwards bytes to the daemon's runtime sockets, so every client
+  subcommand — `pam wait` and `pam subscribe` included — works through a
+  path the sandbox already allows. Point sandboxed clients at it with
+  `PAM_SOCKET_DIR=<dir>`: while set, the client dials the relay's sockets
+  and never lazily spawns a daemon, so a dead relay is a clean error
+  naming `pam listen` instead of a surprising spawn. The relay is a dumb
+  byte pipe — admission, scope and budgets stay in the daemon — and it
+  refuses to take over a directory where another relay already answers.
+  Boundaries and placement trade-offs in `docs/session-socket-relay.md`.
 - `pam subscribe` takes `--json` like `pam wait`, and with it a refused or
   timed-out follow is a `kind: refusal` object on stdout (the ticket as
   `id`, cause `follow_timeout` for an observation timeout) instead of a

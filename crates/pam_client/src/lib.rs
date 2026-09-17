@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub mod caller;
 pub mod client;
+pub mod relay;
 pub mod request;
 pub mod service;
 
@@ -23,6 +24,8 @@ mod caller_test;
 mod client_test;
 #[cfg(test)]
 mod lib_test;
+#[cfg(test)]
+mod relay_test;
 #[cfg(test)]
 mod request_test;
 #[cfg(test)]

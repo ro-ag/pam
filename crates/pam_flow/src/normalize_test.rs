@@ -27,7 +27,7 @@ steps:
   - id: a
     connector: github
     call: runs
-    with: { repo: '${inputs.repo}', limit: 5 }
+    with: { repo: '${inputs.repo}', status: '${inputs.zebra}', limit: 5 }
     timeout: 90s
     output: summarize
     needs: [b]
@@ -64,7 +64,8 @@ fn renders_canonical_yaml_with_defaults_omitted() {
            call: runs\n  \
            with:\n    \
              limit: 5\n    \
-             repo: ${inputs.repo}\n  \
+             repo: ${inputs.repo}\n    \
+             status: ${inputs.zebra}\n  \
            timeout: 90s\n  \
            output: summarize\n  \
            needs:\n  \

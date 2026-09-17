@@ -3,9 +3,11 @@ id: pr-readiness
 name: Rust PR readiness
 description: >-
   A Rust-only starting point: a clean tree, an up-to-date remote, the
-  commits the branch adds, and format, clippy and Rust tests. It does not
-  cover frontend or other project-specific gates. For PAM itself, use
-  pam-pr-readiness.
+  commits the branch adds, and format, clippy and Rust tests. The fetch step
+  needs network access, which command containment denies, so under containment
+  the fetch (and the branch commits that read it) fail and only the local
+  gates run. It does not cover frontend or other project-specific gates. For
+  PAM itself, use pam-pr-readiness.
 steps:
   - id: clean-tree
     run: [git, status, --porcelain=v1, --untracked-files=all, --ignore-submodules=none]

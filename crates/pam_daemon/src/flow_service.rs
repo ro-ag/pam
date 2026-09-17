@@ -11,8 +11,9 @@
 //! A denied/expired approval, gate refusal, disabled connector or
 //! non-allowlisted program ends the run `blocked` with the step naming why:
 //! the request finishes `done` and the verdict is filed as evidence. Only
-//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`], [`CAUSE_INPUT_MISSING`]
-//! and [`CAUSE_REPO_MISSING`] are refusals ([`CapabilityFailure::Refused`]).
+//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`], [`CAUSE_INPUT_MISSING`],
+//! [`CAUSE_INPUT_UNKNOWN`], [`CAUSE_INPUT_INVALID`] and [`CAUSE_REPO_MISSING`]
+//! are refusals ([`CapabilityFailure::Refused`]).
 //! Step output goes through [`LogService::compress`](crate::log_service::LogService::compress)
 //! (`compact` default, `summarize` adds a model paragraph, `discard` keeps
 //! nothing; empty output is not filed). The verdict body is written verbatim
@@ -112,6 +113,12 @@ pub const CAUSE_FLOW_INVALID: &str = "flow_invalid";
 
 /// Refusal cause: a declared input has neither a value nor a default.
 pub const CAUSE_INPUT_MISSING: &str = "input_missing";
+
+/// Refusal cause: the run was handed an input name the flow does not declare.
+pub const CAUSE_INPUT_UNKNOWN: &str = "input_unknown";
+
+/// Refusal cause: an input value is present but is not a string or number.
+pub const CAUSE_INPUT_INVALID: &str = "input_invalid";
 
 /// Refusal cause: the caller's repo is not a directory on this machine.
 pub const CAUSE_REPO_MISSING: &str = "repo_missing";
@@ -377,7 +384,9 @@ impl RunArgs {
     /// # Errors
     ///
     /// [`CAUSE_FLOW_NOT_FOUND`] when no id was named — there is nothing to
-    /// look up, and the recovery is the same list command.
+    /// look up, and the recovery is the same list command. [`CAUSE_INPUT_INVALID`]
+    /// when `inputs` is present but is not an object of scalar values: a value
+    /// that cannot reach a `${…}` substitution is refused, never dropped.
     pub fn from_value(args: &Value) -> Result<Self, FlowRefusal> {
         let id = args
             .get("id")
@@ -390,15 +399,29 @@ impl RunArgs {
                     RECOVERY_FLOW_LIST,
                 )
             })?;
-        let inputs = args
-            .get("inputs")
-            .and_then(Value::as_object)
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(name, value)| scalar_text(value).map(|text| (name.clone(), text)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut inputs = BTreeMap::new();
+        match args.get("inputs") {
+            None => {}
+            Some(Value::Object(map)) => {
+                for (name, value) in map {
+                    let Some(text) = scalar_text(value) else {
+                        return Err(FlowRefusal::new(
+                            CAUSE_INPUT_INVALID,
+                            format!("input {name:?} must be a string or number, not {value}"),
+                            "re-run with each input as a string, e.g. name=value",
+                        ));
+                    };
+                    inputs.insert(name.clone(), text);
+                }
+            }
+            Some(other) => {
+                return Err(FlowRefusal::new(
+                    CAUSE_INPUT_INVALID,
+                    format!("flow.run inputs must be an object of scalars, not {other}"),
+                    "re-run with an inputs object of string values",
+                ));
+            }
+        }
         Ok(Self {
             id: id.to_owned(),
             inputs,
@@ -698,7 +721,7 @@ impl FlowService {
             blockers.push(json!({"cause": "input_unavailable", "input": name, "recovery": "supply the declared input; runtime-derived values require execution"}));
         }
         for name in unknown {
-            blockers.push(json!({"cause": "input_unknown", "input": name, "recovery": "drop the input or declare it under the flow's `inputs:`"}));
+            blockers.push(json!({"cause": CAUSE_INPUT_UNKNOWN, "input": name, "recovery": "drop the input or declare it under the flow's `inputs:`"}));
         }
         let correlation = match &flow.correlation {
             None => json!({"status":"unbound"}),
@@ -871,7 +894,10 @@ impl FlowService {
                         blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "AWS CLI helper containment is not qualified"}));
                     }
                     item["operation"] = json!(call);
-                    item["credential"] = json!("unknown_not_probed");
+                    // Named to stay off the redactor's sensitive-key list: a
+                    // `credential`-shaped key would mask the sentinel itself,
+                    // and "never probed" must survive redaction to reach agents.
+                    item["auth_probe"] = json!("unknown_not_probed");
                     let row = self
                         .store
                         .get_connector(connector.as_str())
@@ -967,7 +993,7 @@ impl FlowService {
     ///
     /// # Errors
     ///
-    /// [`CapabilityFailure::Refused`] for the four things that stop a run
+    /// [`CapabilityFailure::Refused`] for the six things that stop a run
     /// before it starts (see the module docs),
     /// [`CapabilityFailure::Cancelled`] when the request is cancelled
     /// mid-step, and [`CapabilityFailure::Failed`] when the daemon's own
@@ -986,6 +1012,7 @@ impl FlowService {
                 RECOVERY_FLOW_EDIT,
             )
         })?;
+        refuse_undeclared_inputs(flow, &args)?;
 
         let repo = PathBuf::from(&ctx.caller.repo);
         if !repo.is_dir() {
@@ -2900,6 +2927,31 @@ fn contract_refusal(error: crate::flow_contract::ContractError) -> FlowRefusal {
         error.to_string(),
         RECOVERY_FLOW_LIST,
     )
+}
+
+/// Refuses supplied input names the flow does not declare — the run-side
+/// twin of the `input_unknown` blockers `flow.inspect` reports — so a typo
+/// cannot start a run against the declared defaults.
+fn refuse_undeclared_inputs(flow: &Flow, args: &RunArgs) -> Result<(), CapabilityFailure> {
+    let undeclared: Vec<&str> = args
+        .inputs
+        .keys()
+        .filter(|name| !flow.inputs.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    Err(FlowRefusal::new(
+        CAUSE_INPUT_UNKNOWN,
+        format!(
+            "flow {:?} does not declare the supplied input(s) {}",
+            args.id,
+            undeclared.join(", ")
+        ),
+        "drop the input or declare it under the flow's `inputs:`",
+    )
+    .into())
 }
 
 /// Validate the inspection request without reading configuration or evaluating gates.

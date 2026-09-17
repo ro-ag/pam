@@ -7,8 +7,15 @@ const SHA: &str = "abcdef1234567890abcdef1234567890abcdef12";
 const HEAD: &str = "fedcba1234567890fedcba1234567890fedcba12";
 
 fn yaml(declaration: &str) -> String {
+    // Inputs ride along only when the declaration references them; an input
+    // nothing reads is refused by validation.
+    let inputs = if declaration.contains("${inputs.") {
+        "inputs:\n  repository: {}\n  commit: {}\n  pr: {}\n  head: {}\n"
+    } else {
+        ""
+    };
     format!(
-        "schema: 1\nid: correlated\nname: Correlated\ninputs:\n  repository: {{}}\n  commit: {{}}\n  pr: {{}}\n  head: {{}}\ncorrelation:\n{declaration}\nsteps:\n  - id: inspect\n    run: [git, status]\n"
+        "schema: 1\nid: correlated\nname: Correlated\n{inputs}correlation:\n{declaration}\nsteps:\n  - id: inspect\n    run: [git, status]\n"
     )
 }
 

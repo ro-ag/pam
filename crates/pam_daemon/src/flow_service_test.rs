@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::flow_service::{
-    ArtifactsRootPatch, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_NOT_FOUND,
-    CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings, SETTING_ALLOWED_PROGRAMS,
+    ArtifactsRootPatch, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_NOT_FOUND, CAUSE_INPUT_INVALID,
+    CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings, RunArgs, SETTING_ALLOWED_PROGRAMS,
     SETTING_ARTIFACTS_ROOT, SETTING_EXTRA_PATH, SettingsPatch, boundary_read_roots,
     step_capability,
 };
@@ -83,7 +83,7 @@ fn flow_yaml(id: &str) -> String {
     format!(
         "schema: 1\nid: {id}\nname: A local flow\ndescription: says hello\n\
          inputs:\n  who:\n    description: who to greet\n    default: world\n\
-         steps:\n  - id: look\n    run: [git, status, --short]\n"
+         steps:\n  - id: look\n    run: [git, status, --short]\n    env: {{ WHO: '${{inputs.who}}' }}\n"
     )
 }
 
@@ -518,4 +518,32 @@ async fn the_read_cache_roots_are_a_list_setting_like_the_extra_path() {
         .await
         .expect("the caches save");
     assert_eq!(settings.read_cache_roots, ["~/.cargo/registry"]);
+}
+
+#[test]
+fn a_non_scalar_input_value_is_refused_not_dropped() {
+    let error = RunArgs::from_value(&serde_json::json!({
+        "id": "demo",
+        "inputs": { "repo": ["owner/name"] },
+    }))
+    .expect_err("an array cannot reach a ${…} substitution");
+    assert_eq!(error.cause, CAUSE_INPUT_INVALID);
+
+    let error = RunArgs::from_value(&serde_json::json!({
+        "id": "demo",
+        "inputs": "owner/name",
+    }))
+    .expect_err("inputs must be an object");
+    assert_eq!(error.cause, CAUSE_INPUT_INVALID);
+
+    let args = RunArgs::from_value(&serde_json::json!({
+        "id": "demo",
+        "inputs": { "repo": "owner/name", "page": 3 },
+    }))
+    .expect("strings and numbers are scalar inputs");
+    assert_eq!(args.inputs.get("page").map(String::as_str), Some("3"));
+
+    let args = RunArgs::from_value(&serde_json::json!({ "id": "demo" }))
+        .expect("a run needs no inputs at all");
+    assert!(args.inputs.is_empty());
 }

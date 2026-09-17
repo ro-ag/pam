@@ -3,7 +3,9 @@ id: after-merge-checks
 name: After-merge checks
 description: >-
   Refresh the local view of the remote after a merge, prove the working tree
-  is clean, and show the commits that landed.
+  is clean, and show the commits that landed. The fetch step needs network
+  access, which command containment denies, so under containment the fetch
+  fails and only the local checks run.
 steps:
   - id: fetch
     run: [git, fetch, --prune]

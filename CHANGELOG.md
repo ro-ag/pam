@@ -18,6 +18,17 @@ All notable changes to pam are documented in this file. The format follows
   still works on any installed model. The Models screen badges
   qualified / engine / test only with the reason, and the tier selects
   disable what cannot serve.
+- `pam flow run` no longer accepts inputs the flow does not declare: an
+  undeclared name refuses as `input_unknown` (the same cause `pam flow
+  inspect` already reported), and an `inputs` value that is not a string or
+  number refuses as `input_invalid`, both before a ticket exists. A typo
+  against an input with a default used to run silently on that default, and
+  the public projection does not echo inputs, so the run never showed which
+  values it had used. The flow CLI contract records the two causes.
+- The `after-merge-checks`, `pr-readiness` and `dependency-audit` recipes
+  now say in their descriptions that their network-dependent steps (`git
+  fetch`, the cargo-audit advisory database) fail under command containment
+  instead of implying the remote refresh succeeds.
 
 ### Added
 
@@ -72,6 +83,16 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Fixed
 
+- `pam flow inspect` now reports each connector step's credential status
+  under `auth_probe` instead of `credential`. The response redactor masks
+  every value whose JSON key looks credential-shaped, so the honest
+  `unknown_not_probed` sentinel never reached agents — they saw
+  `[REDACTED]` and could not tell an unconfigured connector from a masked
+  field. The field is a status, not a secret: credentials stay in the OS
+  keychain and are set only from the GUI. Validation also refuses a flow
+  input no step, environment value or correlation declaration reads, and an
+  input name starting with `-` (unusable as a `key=value` CLI argument),
+  both at `inputs.<name>` so a recipe fails before it is saved.
 - Two Windows-only test flakes on loaded runners are hardened rather than
   retried: the curl mutation test's stand-in server now reports an early
   hang-up through the client assertion instead of panicking, with a 15 s

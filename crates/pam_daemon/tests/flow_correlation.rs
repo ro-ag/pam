@@ -523,11 +523,22 @@ async fn only_a_job_from_the_matched_attempt_can_supply_a_log() {
 #[tokio::test]
 async fn a_live_sonar_green_measure_cannot_verify_a_declared_commit() {
     with_deadline(async {
+        // The swap leaves the declared `run` input without a reader, so the
+        // declaration goes too: an input nothing reads is refused.
         let yaml = FLOW.replace("    connector: github\n    call: run\n    with: { repo: 'team/project', run_id: '${inputs.run}' }",
-            "    connector: sonarqube\n    call: quality_gate\n    with: { project: project }\n    role: verify\n    expect_status: OK");
+            "    connector: sonarqube\n    call: quality_gate\n    with: { project: project }\n    role: verify\n    expect_status: OK")
+            .replace("  run: { default: '9' }\n", "");
         let transport = Arc::new(FakeTransport::new().json(200, r#"{"projectStatus":{"status":"OK","conditions":[]}}"#));
         let fx = Fixture::new(&yaml, transport.clone()).await;
-        let body = fx.run("live_sonar").await;
+        let mut request = fx.request(0, "live_sonar", SHA, 9);
+        request
+            .args
+            .get_mut("inputs")
+            .and_then(Value::as_object_mut)
+            .expect("inputs are an object")
+            .remove("run");
+        let mut client = fx.daemon.client().await;
+        let body = projection(client.request(&request).await);
         assert_eq!(body["workflow"]["outcome"], "blocked");
         assert_eq!(body["correlation"]["status"], "missing");
         let report = fx.report("live_sonar").await;

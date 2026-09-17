@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "pam"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "pam_client",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "pam_client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "pam_daemon",
  "pam_proto",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "pam_compact"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "pam_connectors"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "pam_flow",
  "serde",
@@ -3332,7 +3332,7 @@ dependencies = [
 
 [[package]]
 name = "pam_daemon"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "apple-native-keyring-store",
  "flate2",
@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "pam_flow"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -3378,7 +3378,7 @@ dependencies = [
 
 [[package]]
 name = "pam_gui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "pam_client",
  "pam_daemon",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "pam_model"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "pam_proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "pam_store"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde_json",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "pam_testkit"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "pam_connectors",
  "pam_daemon",

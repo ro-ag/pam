@@ -236,3 +236,20 @@ fn client_path_resolution_does_not_change_existing_permissions() {
     );
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn a_flat_socket_directory_resolves_the_relay_layout() {
+    // No filesystem access: `paths_at_dir` only resolves and validates.
+    let dir = PathBuf::from("/tmp/pam-relay-fixture");
+    let dirs = RuntimeDir::paths_at_dir(&dir).expect("flat layout resolves");
+    assert_eq!(dirs.router_socket(), dir.join("pam.sock"));
+    assert_eq!(dirs.events_socket(), dir.join("events.sock"));
+    assert_eq!(dirs.run_dir(), dir, "the run dir is the socket dir itself");
+
+    let base = PathBuf::from(format!("/tmp/{}", "y".repeat(MAX_SOCKET_PATH_BYTES)));
+    let err = RuntimeDir::paths_at_dir(&base).expect_err("flat paths validate too");
+    assert!(
+        matches!(err, RuntimeDirError::SocketPathTooLong { .. }),
+        "{err:?}"
+    );
+}

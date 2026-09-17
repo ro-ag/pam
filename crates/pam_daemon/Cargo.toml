@@ -69,6 +69,9 @@ getrandom.workspace = true
 # dev-only cycle (pam_testkit depends on pam_daemon); path-only
 # dev-deps are stripped at publish time.
 pam_testkit.workspace = true
+# the session-relay test dials a real envelope through pam_client's
+# `pam listen` relay, the exact bytes a sandboxed client sends.
+pam_client.workspace = true
 # the admin download op is proved end to end against pam_model own
 # range-serving origin rather than a second copy of it.
 pam_model = { workspace = true, features = ["testing"] }

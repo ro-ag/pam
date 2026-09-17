@@ -87,6 +87,25 @@ impl RuntimeDir {
         })
     }
 
+    /// Resolve and validate endpoint paths for an explicit socket directory
+    /// with the same flat layout (`pam.sock` and `events.sock` directly
+    /// inside it). This is the session relay's (`pam listen`) view of its
+    /// own directory and the client's `PAM_SOCKET_DIR` view of it: the
+    /// `run` field is the directory itself, so lock-based probes under it
+    /// answer "no daemon" — callers that hold the override must skip the
+    /// daemon probe, which the client's dial path does.
+    pub fn paths_at_dir(dir: &Path) -> Result<Self, RuntimeDirError> {
+        let router = dir.join("pam.sock");
+        let events = dir.join("events.sock");
+        validate_socket_path(&router)?;
+        validate_socket_path(&events)?;
+        Ok(Self {
+            run: dir.to_path_buf(),
+            router,
+            events,
+        })
+    }
+
     /// The `<base>/run` directory holding the sockets.
     #[must_use]
     pub fn run_dir(&self) -> &Path {

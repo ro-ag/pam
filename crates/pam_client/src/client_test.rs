@@ -497,3 +497,44 @@ fn connecting_to_running_daemon_preserves_read_only_runtime_permissions() {
     assert_eq!(run_mode, 0o500);
     assert_eq!(lock_mode, 0o400);
 }
+
+#[test]
+fn the_session_override_redirects_dials_to_a_flat_socket_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let session = tmp.path().join("session");
+
+    let over = crate::client::dial_dirs_with(Some(&session), tmp.path()).expect("override dirs");
+    assert_eq!(over.router_socket(), session.join("pam.sock"));
+    assert_eq!(over.events_socket(), session.join("events.sock"));
+    assert_eq!(over.run_dir(), session, "the relay dir has no run/ layout");
+
+    let base = crate::client::dial_dirs_with(None, tmp.path()).expect("base dirs");
+    assert_eq!(base.router_socket(), tmp.path().join("run/pam.sock"));
+    assert_eq!(base.events_socket(), tmp.path().join("run/events.sock"));
+}
+
+#[tokio::test]
+async fn the_session_override_never_spawns_a_daemon() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let session = tmp.path().join("session");
+    let spawn = || panic!("an active session override must not spawn a daemon");
+    crate::client::ensure_for_dial_off_thread(Some(&session), tmp.path(), spawn, WAIT, POLL)
+        .await
+        .expect("the override short-circuits the daemon probe");
+
+    // Without the override, the same probe does spawn (and the fake
+    // spawner marks the attempt) — here it must fail fast, not hang.
+    let spawned = Arc::new(Mutex::new(0_u32));
+    let counter = Arc::clone(&spawned);
+    let spawn = move || {
+        *counter.lock().expect("counter lock") += 1;
+        Err(io::Error::other("no real daemon in this test"))
+    };
+    let result =
+        crate::client::ensure_for_dial_off_thread(None, tmp.path(), spawn, WAIT, POLL).await;
+    assert!(result.is_err(), "no daemon can become ready");
+    assert!(
+        *spawned.lock().expect("counter lock") > 0,
+        "the probe tried to spawn"
+    );
+}

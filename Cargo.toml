@@ -42,7 +42,7 @@ serde_json = "1"
 # Same-version patches below remove mandatory SimSIMD C compilation and
 # the unused aegis cc build dependency; runtime cryptography stays upstream.
 turso = { version = "0.7", default-features = false, features = ["pure-rust-crypto"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 # pure-Rust ZeroMQ (zmq.rs) — NEVER the `zmq` crate (libzmq C bindings).
 # Only the tokio runtime and ipc transport; async-std/async-dispatcher off.
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "ipc-transport"] }

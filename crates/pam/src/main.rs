@@ -88,6 +88,22 @@ enum Cmd {
         #[arg(long, default_value_t = DEFAULT_FOLLOW_TIMEOUT_MS)]
         timeout_ms: u64,
     },
+    /// Serve a session socket relay for sandboxed clients (unix only).
+    ///
+    /// Binds `pam.sock` and `events.sock` directly inside `<dir>` and
+    /// forwards bytes to the daemon's runtime sockets, so a client running
+    /// under an agent sandbox that blocks the daemon's own socket can dial
+    /// a path the sandbox permits. Point sandboxed clients at it with
+    /// `PAM_SOCKET_DIR=<dir>` — while that is set they never start a
+    /// daemon themselves, so a dead relay is a clean error, not a spawn.
+    /// The relay is a dumb byte pipe: all admission and authority stays
+    /// with the daemon. See docs/session-socket-relay.md.
+    #[cfg(unix)]
+    Listen {
+        /// Directory to bind the session sockets in (created private).
+        #[arg(default_value = ".pam-session")]
+        dir: PathBuf,
+    },
     /// Stream a ticket's events until its terminal event.
     Subscribe {
         /// The ticket to follow.
@@ -421,6 +437,8 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             timeout_ms,
             json,
         } => follow(base, "wait", &ticket, timeout_ms, json).await,
+        #[cfg(unix)]
+        Cmd::Listen { dir } => listen_mode(base, &dir),
         Cmd::Subscribe {
             ticket,
             timeout_ms,
@@ -711,6 +729,27 @@ fn daemon_stop() -> ExitCode {
         }
         Err(err) => {
             eprintln!("pam daemon stop: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pam listen <dir>`: serves the session socket relay until ctrl-c.
+/// Exit codes: 0 on a clean shutdown, 1 when the relay could not start or
+/// failed. Unix only — the subcommand does not exist elsewhere.
+#[cfg(unix)]
+fn listen_mode(base: &Path, dir: &Path) -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("pam listen: cannot start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(pam_client::relay::run(dir, base)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("pam listen: {err}");
             ExitCode::FAILURE
         }
     }

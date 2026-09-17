@@ -6,6 +6,10 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+- Nothing yet.
+
+## [0.4.0] - 2026-09-17
+
 ### Changed
 
 - A tier default now needs more than a verified digest: the model's exact

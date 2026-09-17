@@ -30,7 +30,10 @@ A task is bound to project/repository identity, exact revision or build identity
 recipe version and declared effects. Paths and arguments are validated against
 the approved operation, not merely concatenated into a shell command. An
 approved git check cannot become an arbitrary git invocation. Host policy must
-permit PAM execution and IPC; PAM is not an invisible sandbox bypass.
+permit PAM execution and IPC; PAM is not an invisible sandbox bypass. When the
+policy cannot permit the daemon's socket, the human-side
+[session relay](session-socket-relay.md) is the sanctioned alternative — not a
+relay the sandboxed side starts itself.
 
 If an optional model is unavailable, perform the useful deterministic task.
 If a required capability is absent, return one clear refusal with the GUI
@@ -189,6 +192,16 @@ Scoped redacted evidence retrieval is available through `pam evidence read`.
 Bounded results and scoped durable inspection are available through the
 [flow CLI contract](flow-cli-contract.md); a `land-watch` flow remains future work. Microsoft setup lives in Models → Catalog;
 keep it off until its input class and resource envelope qualify.
+
+If `pam status` fails with a client-side transport error before any refusal, the
+agent sandbox is blocking the daemon's unix socket. Ask the human to run
+`pam listen <dir>` outside the sandbox and to export `PAM_SOCKET_DIR=<dir>` for
+the session, then start over: every command above works unchanged through the
+relay, and with the override set the client never starts a daemon itself — a
+dead relay is an error naming `pam listen`, which means the human restarts the
+relay rather than anything inside the sandbox. The relay is a dumb byte pipe to
+the same admission path; see [session socket relay](session-socket-relay.md)
+for the boundaries and where to place `<dir>`.
 
 ## Instructions for the next implementation session
 

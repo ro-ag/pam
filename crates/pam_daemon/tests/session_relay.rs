@@ -3,6 +3,7 @@
 //! the exact bytes a sandboxed `pam` client sends with `$PAM_SOCKET_DIR`
 //! set. Exercised in process: no process environment is mutated and no
 //! binary is spawned, so the test runs wherever unix domain sockets do.
+#![cfg(unix)]
 
 use std::time::{Duration, Instant};
 

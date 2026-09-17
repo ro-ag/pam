@@ -14,6 +14,9 @@ use std::path::PathBuf;
 
 pub mod caller;
 pub mod client;
+// The session relay's transport is unix domain sockets; on Windows a
+// session channel would follow the admin transport's loopback design.
+#[cfg(unix)]
 pub mod relay;
 pub mod request;
 pub mod service;
@@ -24,6 +27,7 @@ mod caller_test;
 mod client_test;
 #[cfg(test)]
 mod lib_test;
+#[cfg(unix)]
 #[cfg(test)]
 mod relay_test;
 #[cfg(test)]

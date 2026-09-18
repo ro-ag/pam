@@ -8,6 +8,28 @@ All notable changes to pam are documented in this file. The format follows
 
 - Nothing yet.
 
+## [0.4.2] - 2026-09-18
+
+### Fixed
+
+- Make the original sidebar logo visible, with the version beneath it.
+- Keep Activity lanes wide enough for request labels and timestamps, wrapping
+  smaller groups instead of squeezing their contents.
+- Use consistent button cursors and prevent hover effects on disabled actions.
+- Keep model action menus outside scrolling containers, with keyboard navigation
+  and reliable focus restoration.
+- Disable accidental selection of interface labels while keeping inputs, logs,
+  results and diagnostic text selectable.
+- Keep Save and Discard changes visible above the flow editor. Saving updates
+  custom flows; discarding restores the saved draft without writing it. Save uses
+  the editor's latest validated draft, even while parent state is catching up.
+
+### Changed
+
+- Consolidate form controls and action menus into shared typed widgets.
+- Remove manual log-compression controls and implementation-focused UI copy;
+  compression remains part of the internal model pipeline.
+
 ## [0.4.1] - 2026-09-17
 
 ### Fixed

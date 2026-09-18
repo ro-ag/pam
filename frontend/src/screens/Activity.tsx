@@ -637,14 +637,14 @@ export function ActivityScreen() {
                     exit={fade}
                     transition={settle}
                     style={{ "--lane-share": lane.share } as CSSProperties}
-                    className="activity-lane min-w-0 rounded-card border border-line-strong bg-surface-raised p-2"
+                    className="activity-lane rounded-card border border-line-strong bg-surface-raised p-2"
                   >
                     <header className="flex items-center gap-2 px-2 pb-2">
                       <Badge tone="accent">{lane.agent}</Badge>
                       <span className="font-data text-xs text-ink-faint">
                         {lane.rows.length}
                       </span>
-                      <span className="ml-auto font-data text-xs text-ink-faint">
+                      <span className="ml-auto shrink-0 whitespace-nowrap font-data text-xs text-ink-faint">
                         {relativeTime(lane.latest, now)}
                       </span>
                     </header>

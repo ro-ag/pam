@@ -236,3 +236,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-activity-lane-minimum
+- kind: habit
+- scope: project
+- rule: Do not pair a CSS minimum-width layout guarantee with min-w-0 on the same Activity lane; utility-layer precedence defeats the floor and crushes labels.
+- fix: Removed lane min-w-0, kept 360px wrapping floor and nonwrapping timestamps, and inspected native Activity with uneven lane counts.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+

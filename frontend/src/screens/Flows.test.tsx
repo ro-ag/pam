@@ -459,12 +459,14 @@ describe("the YAML tab", () => {
 
   it("saves a library flow under its own id", async () => {
     await renderFlows();
-    await pick("mine");
+    const editor = await pick("mine");
+    fireEvent.change(editor, { target: { value: editor.value + "# edited\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
       expect(mocks.flowsSave).toHaveBeenCalledWith(
         "mine",
-        "id: mine\nname: PR readiness\nsteps: []\n",
+        "id: mine\nname: PR readiness\nsteps: []\n# edited\n",
       ),
     );
   });
@@ -476,7 +478,9 @@ describe("the YAML tab", () => {
       recovery: "Open Pam → Flows and fix the file.",
     });
     await renderFlows();
-    await pick("mine");
+    const editor = await pick("mine");
+    fireEvent.change(editor, { target: { value: editor.value + "# edited\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText(/flow library · flow_invalid/)).toBeInTheDocument();
     expect(screen.getByText(/steps\[1\]\.connector/)).toBeInTheDocument();
@@ -835,7 +839,9 @@ describe("the canvas tab", () => {
     // The canvas keeps the resolved reply, not its own guess.
     fireEvent.click(screen.getByRole("tab", { name: "Canvas" }));
     expect(await nodeFor("step-1")).toBeInTheDocument();
-    expect(screen.getByLabelText("draft status")).toHaveTextContent("Save writes it");
+    expect(screen.getByLabelText("draft status")).toHaveTextContent(
+      "Duplicate to save your own copy",
+    );
   });
 
   it("a yaml edit re-parses into the canvas after the debounce", async () => {
@@ -1109,4 +1115,20 @@ it("waits for the newest canvas normalization before saving through navigation",
   fireEvent.click(save);
   await waitFor(() => expect(mocks.flowsSave).toHaveBeenCalledWith("mine", newestYaml));
   expect(raw.steps.some((step) => step.id === "step-1")).toBe(true);
+});
+
+it("discards edits in place and restores the last saved flow without writing", async () => {
+  await renderFlows();
+  const editor = await pick("mine");
+  const saved = editor.value;
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  const actions = screen.getByRole("toolbar", { name: "Flow draft actions" });
+  expect(within(actions).getByRole("button", { name: "Discard changes" })).toBeDisabled();
+  fireEvent.change(editor, { target: { value: saved + "# discard me\n" } });
+  fireEvent.click(within(actions).getByRole("button", { name: "Discard changes" }));
+  expect(editor).toHaveValue(saved + "# discard me\n");
+  fireEvent.click(within(actions).getByRole("button", { name: "Discard edits?" }));
+  await waitFor(() => expect(screen.getByLabelText("mine yaml")).toHaveValue(saved));
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  expect(mocks.flowsSave).not.toHaveBeenCalled();
 });

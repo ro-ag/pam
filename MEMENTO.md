@@ -155,3 +155,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 40
 - status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
 
+## pam-ui-shell-scroll-containment
+- kind: habit
+- scope: project
+- rule: Keep animated desktop backgrounds clipped inside a viewport-fixed shell; overflow hidden alone can still allow focus or keyboard scrolling of decorative overflow.
+- fix: Verify actual shell scrollTop and panel coordinates after keyboard and wheel scrolling at the minimum window size. PAM uses fixed inset-0 h-dvh overflow-clip and explicit pane scroll ownership.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

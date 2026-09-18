@@ -370,7 +370,10 @@ describe("lanes", () => {
     expect(claude.getAllByText("claude")).toHaveLength(1);
     expect(screen.getByText(/3 requests · 2 lanes · newest first/)).toBeInTheDocument();
     // Width follows traffic: each lane grows by its row count.
-    expect(lanes.map((lane) => lane.style.getPropertyValue("--lane-share"))).toEqual(["2", "1"]);
+    expect(lanes.map((lane) => lane.style.getPropertyValue("--lane-share"))).toEqual([
+      "2",
+      "1",
+    ]);
   });
 
   it("gives each lane a width share equal to its (capped) row count", () => {

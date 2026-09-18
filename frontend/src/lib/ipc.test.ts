@@ -210,12 +210,7 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     ["modelsStatus", () => modelsStatus(), "admin.models.status", {}],
     ["modelsUnload", () => modelsUnload(), "admin.models.unload", {}],
     ["engineStatus", () => engineStatus(), "admin.models.engine.status", {}],
-    [
-      "engineInstall",
-      () => engineInstall(),
-      "admin.models.engine.install",
-      { confirm: true },
-    ],
+    ["engineInstall", () => engineInstall(), "admin.models.engine.install", { confirm: true }],
     ["curatorList", () => curatorList(), "admin.curator.list", {}],
     ["curatorTest", () => curatorTest(), "admin.curator.test", {}],
     [

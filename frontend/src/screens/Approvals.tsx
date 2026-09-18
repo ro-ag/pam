@@ -229,9 +229,7 @@ function ApprovalCard({
       <dl aria-label="what will run" className="space-y-1 font-data text-xs text-ink-muted">
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-ink-faint">Command</dt>
-          <dd className="min-w-0 break-all text-ink">
-            {command ?? "no arguments recorded"}
-          </dd>
+          <dd className="min-w-0 break-all text-ink">{command ?? "no arguments recorded"}</dd>
         </div>
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-ink-faint">Repository</dt>

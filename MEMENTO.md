@@ -200,3 +200,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-frontend-format-gate
+- kind: habit
+- scope: project
+- rule: When asked to clear frontend validation failures, fix baseline formatting failures too and provide saved evidence for the complete formatting, lint, build and test runs.
+- fix: Formatted all seven reported files and reran the full frontend checks with logs saved beside the visual review.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

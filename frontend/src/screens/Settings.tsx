@@ -691,9 +691,9 @@ function RetentionPanel() {
       {failure && <FailureNote failure={failure} label="retention" />}
 
       <p className="font-sans text-sm text-ink-muted">
-        Pruning runs at daemon start, every hour after that, and whenever you change these. Evidence
-        goes first; a request&apos;s verdict stays until its audit rows go, then the whole
-        record leaves together.
+        Pruning runs at daemon start, every hour after that, and whenever you change these.
+        Evidence goes first; a request&apos;s verdict stays until its audit rows go, then the
+        whole record leaves together.
       </p>
     </Panel>
   );

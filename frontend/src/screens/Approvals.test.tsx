@@ -329,7 +329,9 @@ describe("lowered hands and broken water", () => {
     mocks.approvalsPending.mockResolvedValue({ pending: [] });
     renderApprovals();
     expect(await screen.findByText(/No requests are waiting for review/)).toBeInTheDocument();
-    expect(screen.getByText(/only this app can answer it/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Requests that need your permission will appear here for review/),
+    ).toBeInTheDocument();
     expect(screen.getByText("0 requests awaiting review")).toBeInTheDocument();
   });
 

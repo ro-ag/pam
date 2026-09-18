@@ -1,3 +1,4 @@
+import { TextField, SelectField } from "../components/ui/Fields";
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -11,6 +12,7 @@ import {
 } from "react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
+import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
 import { fieldClasses } from "../components/ui/field";
 import { cn } from "../lib/cn";
@@ -418,6 +420,7 @@ function FlowDetailPane({
   onDraft,
   busy,
   onSave,
+  onDiscard,
   isLocked,
 }: {
   entry: FlowListEntry;
@@ -425,7 +428,8 @@ function FlowDetailPane({
   onTab: (tab: Tab) => void;
   onDraft: (draft: LibraryDraft) => void;
   busy: boolean;
-  onSave: () => void;
+  onSave: (draft: LibraryDraft) => void;
+  onDiscard: () => void;
   isLocked: () => boolean;
 }) {
   const { detail, draft, normalizing, changeSpec, changeYaml, flush } = useFlowDraft(entry);
@@ -474,7 +478,8 @@ function FlowDetailPane({
   );
 
   const loadFailure = detail.isError ? toBridgeFailure(detail.error) : null;
-  const saveDisabled = draft.error !== null || normalizing;
+  const saveDisabled =
+    !draft.dirty || draft.spec === null || draft.error !== null || normalizing;
   // A marker the canvas cannot pin on a node (the flow's own `id`, `name`,
   // an unparseable file) is said above the canvas instead.
   const flowIssue =
@@ -505,6 +510,55 @@ function FlowDetailPane({
           onTab(candidate);
         }}
       />
+      {(tab === "canvas" || tab === "yaml") && (
+        <div
+          role="toolbar"
+          aria-label="Flow draft actions"
+          className="page-toolbar flex flex-wrap items-center gap-3"
+        >
+          <p
+            aria-label="draft status"
+            aria-live="polite"
+            className="mr-auto flex flex-wrap items-center gap-2 font-data text-xs"
+          >
+            <Badge tone={draft.dirty ? "warning" : "neutral"}>
+              {draft.dirty ? "unsaved" : "Saved"}
+            </Badge>
+            <span className="text-ink-muted">
+              {normalizing
+                ? "checking the flow…"
+                : draft.error
+                  ? "the flow will not run as written"
+                  : entry.source === "builtin"
+                    ? "Duplicate to save your own copy"
+                    : draft.dirty
+                      ? "Save writes it to this flow"
+                      : "Editing updates this flow when you save"}
+            </span>
+          </p>
+          <ConfirmButton
+            label="Discard changes"
+            confirmLabel="Discard edits?"
+            variant="secondary"
+            disabled={!draft.dirty || busy}
+            onConfirm={() => {
+              if (!busy && !isLocked()) onDiscard();
+            }}
+          />
+          {entry.source !== "builtin" && (
+            <Button
+              size="sm"
+              disabled={busy || saveDisabled}
+              onClick={() => {
+                if (!busy && !saveDisabled && !isLocked())
+                  onSave({ id: entry.id, yaml: draft.yaml, dirty: draft.dirty, saveDisabled });
+              }}
+            >
+              {busy ? "Saving…" : "Save"}
+            </Button>
+          )}
+        </div>
+      )}
       {TABS.filter((candidate) => candidate !== tab).map((candidate) => (
         <div
           key={candidate}
@@ -525,19 +579,6 @@ function FlowDetailPane({
         {tab === "runs" && <FlowRuns flowId={entry.id} />}
         <div className="flow-editor-pane space-y-4" hidden={tab === "run" || tab === "runs"}>
           {loadFailure && <FailureNote failure={loadFailure} label="flow" />}
-
-          {draft.dirty && (
-            <p aria-label="draft status" className="flex items-center gap-2 font-data text-xs">
-              <Badge tone="warning">unsaved</Badge>
-              <span className="text-ink-faint">
-                {normalizing
-                  ? "checking the flow…"
-                  : draft.error
-                    ? "the flow will not run as written"
-                    : "both tabs show this draft; Save writes it"}
-              </span>
-            </p>
-          )}
 
           {tab === "canvas" && (
             <div className="flow-workbench flex gap-4">
@@ -591,8 +632,6 @@ function FlowDetailPane({
               yaml={draft.yaml}
               showYaml={tab === "yaml"}
               onYamlChange={onYamlChange}
-              saveDisabled={saveDisabled}
-              onSave={onSave}
               busy={busy}
             />
           )}
@@ -729,7 +768,7 @@ export function FlowsScreen({
         <div className="flow-library-layout flex flex-1">
           <section aria-label="flow library" className="flow-library min-w-0 shrink-0">
             <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
-            <input
+            <TextField
               type="search"
               aria-label="Search flows"
               placeholder="Search workflows…"
@@ -755,7 +794,7 @@ export function FlowsScreen({
           <section aria-label={`flow ${selected.id}`} className="flow-detail min-w-0 flex-1">
             <label className="flow-picker shrink-0 items-center gap-3">
               <span className="block text-xs font-medium text-ink-muted">Flow library</span>
-              <select
+              <SelectField
                 aria-label="Choose flow"
                 value={selected.id}
                 onChange={(event) => {
@@ -770,7 +809,7 @@ export function FlowsScreen({
                     {entry.valid ? "" : " (invalid)"}
                   </option>
                 ))}
-              </select>
+              </SelectField>
             </label>
             <div className="flow-detail-header shrink-0 space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>
@@ -803,6 +842,7 @@ export function FlowsScreen({
               onDraft={setDraft}
               busy={controls.busy}
               onSave={controls.saveDraft}
+              onDiscard={discard}
               isLocked={controls.isLocked}
             />
           </section>

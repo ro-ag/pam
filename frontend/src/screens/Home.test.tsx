@@ -314,9 +314,7 @@ describe("Home shell", () => {
       <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
     );
     expect(await screen.findByText("No requests need your approval.")).toBeInTheDocument();
-    expect(
-      screen.queryByText("answers are not rephrased: no light model is set"),
-    ).toBeNull();
+    expect(screen.queryByText("answers are not rephrased: no light model is set")).toBeNull();
     unmount();
 
     window.localStorage.setItem(rephraseStorageKey, "on");

@@ -1,3 +1,4 @@
+import { SelectField, TextField, TextArea } from "../../components/ui/Fields";
 import { ChevronDown, ChevronUp, Plus, X } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { Badge } from "../../components/ui/Badge";
@@ -57,7 +58,7 @@ const toggleVariants = cva(
     variants: {
       state: {
         active: "bg-accent-soft text-ink",
-        idle: "text-ink-faint hover:text-ink",
+        idle: "text-ink-faint enabled:hover:text-ink",
       },
     },
     defaultVariants: { state: "idle" },
@@ -112,7 +113,7 @@ function Select<T extends string>({
 }) {
   return (
     <Field label={label}>
-      <select
+      <SelectField
         aria-label={label}
         value={value}
         disabled={disabled}
@@ -124,7 +125,7 @@ function Select<T extends string>({
             {option}
           </option>
         ))}
-      </select>
+      </SelectField>
     </Field>
   );
 }
@@ -172,15 +173,14 @@ function FlowFields({
   return (
     <>
       <Field label="flow name">
-        <input
+        <TextField
           aria-label="flow name"
           value={spec.name}
           onChange={(event) => onChange({ ...spec, name: event.target.value })}
-          className={fieldClasses}
         />
       </Field>
       <Field label="flow description">
-        <textarea
+        <TextArea
           aria-label="flow description"
           rows={3}
           value={spec.description}
@@ -230,7 +230,7 @@ function InputsFields({
       {names.map((name, index) => (
         <div key={index} className="space-y-2 rounded-card border border-line p-3">
           <div className="flex items-center gap-2">
-            <input
+            <TextField
               aria-label="input name"
               value={name}
               onChange={(event) => rename(name, event.target.value)}
@@ -246,21 +246,19 @@ function InputsFields({
               <X size={14} aria-hidden="true" />
             </Button>
           </div>
-          <input
+          <TextField
             aria-label="input description"
             placeholder="what this input is for"
             value={inputs[name].description}
             onChange={(event) => patch(name, { description: event.target.value })}
-            className={fieldClasses}
           />
-          <input
+          <TextField
             aria-label="input default"
             placeholder="default — empty means required"
             value={inputs[name].default ?? ""}
             onChange={(event) =>
               patch(name, { default: event.target.value === "" ? null : event.target.value })
             }
-            className={fieldClasses}
           />
         </div>
       ))}
@@ -314,7 +312,7 @@ function ArgvLine({ step, commit }: { step: FlowStep; commit: (argv: string[]) =
   };
   return (
     <Field label="argv">
-      <input
+      <TextField
         aria-label="argv"
         value={line}
         onChange={(event) => setLine(event.target.value)}
@@ -323,7 +321,6 @@ function ArgvLine({ step, commit }: { step: FlowStep; commit: (argv: string[]) =
           if (event.key === "Enter") flush();
         }}
         placeholder='git status --porcelain  ·  quote "two words" to keep them whole'
-        className={fieldClasses}
       />
     </Field>
   );
@@ -342,7 +339,7 @@ function NoteField({ step, commit }: { step: FlowStep; commit: (note: string) =>
   };
   return (
     <Field label="note">
-      <textarea
+      <TextArea
         aria-label="note"
         rows={3}
         value={draft}
@@ -422,7 +419,7 @@ function ConnectorFields({
               <span className="w-20 shrink-0 truncate font-data text-xs text-ink-muted">
                 {arg.name}
               </span>
-              <input
+              <TextField
                 aria-label={`with ${arg.name}`}
                 required={arg.required || undefined}
                 placeholder={arg.required ? "required" : "optional"}
@@ -463,13 +460,13 @@ function EnvRows({
       {refused && <Refusal refused={refused} label="rename refused" />}
       {names.map((name, index) => (
         <div key={index} className="flex items-center gap-2">
-          <input
+          <TextField
             aria-label="env name"
             value={name}
             onChange={(event) => rename(name, event.target.value)}
             className={cn(fieldClasses, "w-28 shrink-0")}
           />
-          <input
+          <TextField
             aria-label="env value"
             value={step.env[name]}
             onChange={(event) => write({ ...step.env, [name]: event.target.value })}
@@ -547,7 +544,7 @@ function StepFields({
   return (
     <>
       <Field label="step id">
-        <input
+        <TextField
           aria-label="step id"
           value={draftId}
           onChange={(event) => rename(event.target.value)}
@@ -580,7 +577,7 @@ function StepFields({
 
       {step.action.kind === "landing" ? (
         <Field label="operation">
-          <input
+          <TextField
             aria-label="operation"
             readOnly
             value={step.action.operation}
@@ -596,12 +593,11 @@ function StepFields({
 
       <Group>
         <Field label="timeout">
-          <input
+          <TextField
             aria-label="timeout"
             value={step.timeout}
             onChange={(event) => patch({ timeout: event.target.value })}
             placeholder="5m"
-            className={fieldClasses}
           />
         </Field>
         <div className="grid grid-cols-2 gap-3">
@@ -643,7 +639,7 @@ function StepFields({
       <Group>
         <div className="grid grid-cols-2 gap-3">
           <Field label="retry attempts">
-            <input
+            <TextField
               aria-label="retry attempts"
               type="number"
               min={1}
@@ -652,18 +648,16 @@ function StepFields({
               onChange={(event) =>
                 patch({ retry: { ...step.retry, attempts: clampAttempts(event.target.value) } })
               }
-              className={fieldClasses}
             />
           </Field>
           <Field label="retry backoff">
-            <input
+            <TextField
               aria-label="retry backoff"
               value={step.retry.backoff}
               onChange={(event) =>
                 patch({ retry: { ...step.retry, backoff: event.target.value } })
               }
               placeholder="500ms"
-              className={fieldClasses}
             />
           </Field>
         </div>
@@ -737,7 +731,7 @@ function StepList({
                 aria-label={`move ${step.id} up`}
                 disabled={index === 0}
                 onClick={() => move(step.id, -1)}
-                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted enabled:hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronUp size={14} aria-hidden="true" />
               </button>
@@ -746,7 +740,7 @@ function StepList({
                 aria-label={`move ${step.id} down`}
                 disabled={index === last}
                 onClick={() => move(step.id, 1)}
-                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted enabled:hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronDown size={14} aria-hidden="true" />
               </button>

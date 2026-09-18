@@ -2,7 +2,6 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelsStatus, TierReadiness } from "../lib/ipc";
 import {
-  COMPRESSION_SENTENCE,
   NO_RECORD_SENTENCE,
   ReadinessCard,
   ReadinessLine,
@@ -130,7 +129,7 @@ describe("ReadinessCard", () => {
     expect(
       screen.getByText(/answer-contract-v2 · 98\.0% · 0 false passes · b10938/),
     ).toBeInTheDocument();
-    expect(screen.getByText(COMPRESSION_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByText(/Semantic compression/)).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Choose a model" }));
     expect(onRepair).toHaveBeenCalledWith("settings");

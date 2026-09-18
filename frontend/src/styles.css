@@ -32,6 +32,9 @@
   }
 
   body {
+    /* Desktop chrome is not document text; opt copyable content back in. */
+    -webkit-user-select: none;
+    user-select: none;
     margin: 0;
     min-width: 320px;
     font-family: var(--font-sans);
@@ -41,9 +44,26 @@
     background: var(--color-chrome);
   }
 
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable="plaintext-only"],
+  pre,
+  .select-text {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
   ::selection {
     color: var(--color-on-accent);
     background: var(--color-accent-strong);
+  }
+
+  button:enabled {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
   }
 
   button:focus-visible,
@@ -135,6 +155,15 @@
   }
   .desktop-sidebar {
     width: 208px;
+  }
+  .sidebar-brand-logo {
+    /* Frame the original square SVG around its visible semicircle:
+       bounds (42, 310)–(982, 780), centered at y=545 of 1024.
+       A 2:1 cover box removes empty margins without changing the artwork. */
+    object-position: 50% 56.4453125%;
+  }
+  .action-menu {
+    max-height: calc(100dvh - 16px);
   }
   [data-workspace-sidebar="compact"] .desktop-sidebar {
     width: 68px;

@@ -1,3 +1,4 @@
+import { TextField } from "../ui/Fields";
 import { useRouter, useRouterState } from "@tanstack/react-router";
 import { Columns2, Maximize2, PanelLeftClose, PanelLeftOpen, Trash2, X } from "lucide-react";
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
@@ -192,7 +193,7 @@ export function WorkspaceMenu() {
                   Layout name
                 </label>
                 <div className="flex gap-2">
-                  <input
+                  <TextField
                     id={`${id}-name`}
                     value={name}
                     maxLength={40}

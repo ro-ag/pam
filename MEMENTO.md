@@ -182,3 +182,75 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-logo-painted-bounds
+- kind: habit
+- scope: project
+- rule: Size and position brand artwork from its painted bounds, not its SVG viewBox; inspect the native window and both sidebar modes before declaring it visible.
+- fix: Framed the original PAM SVG in a 2:1 image box and increased expanded artwork to 118 by 59 painted pixels; verified native and light/dark screenshots.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+
+## pam-model-menu-scroll-clipping
+- kind: habit
+- scope: project
+- rule: Inspect menus on the final row of an overflow container; position popups outside the scrolling ancestor and verify focus and disabled hover behavior.
+- fix: Portaled Models More menu to the body with viewport bounds, resize/scroll repositioning, outside dismissal, arrow navigation and Escape focus restoration.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+
+## pam-frontend-format-gate
+- kind: habit
+- scope: project
+- rule: When asked to clear frontend validation failures, fix baseline formatting failures too and provide saved evidence for the complete formatting, lint, build and test runs.
+- fix: Formatted all seven reported files and reran the full frontend checks with logs saved beside the visual review.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+
+## pam-desktop-label-selection
+- kind: habit
+- scope: project
+- rule: PAM interface labels should be nonselectable by default; explicitly preserve selection for inputs and copyable output, including WebKit.
+- fix: Set body user-select none with WebKit prefix and opt text controls, evidence, logs, answers and diagnostics back in; verify real heading and input selection.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+
+## pam-ui-copy-implementation-details
+- kind: habit
+- scope: project
+- rule: Keep GUI-only and only-this-app implementation restrictions out of normal PAM labels and descriptions; describe the user action and retain only actionable permission explanations.
+- fix: Removed redundant Settings restriction copy and simplified Models and Approvals descriptions; kept internal security comments and enforcement unchanged.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+
+## pam-compression-is-internal
+- kind: habit
+- scope: project
+- rule: Log compression is an internal model-input optimization, not a PAM user workflow; do not expose compression forms or unsolicited implementation status in the UI.
+- fix: Removed Activity compression tab/form and its dead component, plus Models compression-status prose; preserved internal IPC and backend processing.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+
+## pam-activity-lane-minimum
+- kind: habit
+- scope: project
+- rule: Do not pair a CSS minimum-width layout guarantee with min-w-0 on the same Activity lane; utility-layer precedence defeats the floor and crushes labels.
+- fix: Removed lane min-w-0, kept 360px wrapping floor and nonwrapping timestamps, and inspected native Activity with uneven lane counts.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+
+## pam-save-current-editor-snapshot
+- kind: habit
+- scope: project
+- rule: A Save action must consume the validated draft shown by the editor, not a parent snapshot delivered later by a passive effect.
+- fix: The full landing gate caught an enabled Save silently skipping a just-validated draft. Pass the current draft with the Save event; add a regression with a stale disabled parent draft.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+

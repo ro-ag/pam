@@ -7,7 +7,6 @@ import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn, cva } from "../lib/cn";
-import { PageTabs, PagePane } from "../components/ui/PageTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import {
   activityList,
@@ -21,7 +20,6 @@ import {
 import { outcomeLabel } from "../lib/outcome";
 import { repoTail } from "../lib/repo";
 import { exactTime, relativeTime, useNow } from "../lib/time";
-import { COMPRESS_CAPABILITY, EvidenceBand } from "./EvidenceBand";
 import { EvidenceStrip } from "./EvidenceStrip";
 import {
   STATE_FILTERS,
@@ -459,7 +457,6 @@ function PamMoment({ children, aside }: { children: ReactNode; aside?: ReactNode
 // --- the screen ------------------------------------------------------------
 
 export function ActivityScreen() {
-  const [tab, setTab] = useState<"requests" | "compression">("requests");
   const search = useSearch({ from: "/activity" });
   const navigate = useNavigate({ from: "/activity" });
   const queryClient = useQueryClient();
@@ -472,11 +469,6 @@ export function ActivityScreen() {
   const settle = { duration: reduced ? 0 : 0.18, ease: "easeOut" } as const;
   const fade = { opacity: 0, transition: { duration: reduced ? 0 : 0.12 } };
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  // A compression answers with its report, not with the request id it
-  // was filed under. So the band raises this flag, and the next tide to
-  // land opens the newest compress row — which is where its evidence is.
-  const [pendingExpand, setPendingExpand] = useState(false);
-
   const stateFilter: StateFilter = search.state ?? "all";
   const serverState = serverStateFor(stateFilter);
 
@@ -529,16 +521,6 @@ export function ActivityScreen() {
   }, [queryClient]);
 
   const requests = activity.data?.requests;
-  useEffect(() => {
-    if (!pendingExpand || !requests) return;
-    const compressed = [...requests]
-      .filter((row) => row.capability === COMPRESS_CAPABILITY)
-      .sort((left, right) => right.created_ts - left.created_ts)[0];
-    if (!compressed) return;
-    setExpandedId(compressed.id);
-    setPendingExpand(false);
-  }, [pendingExpand, requests]);
-
   const rows = useMemo(
     () => (requests ?? []).filter((row) => matchesStateFilter(row.state, stateFilter)),
     [requests, stateFilter],
@@ -592,20 +574,7 @@ export function ActivityScreen() {
         <h1 className="font-sans text-title font-semibold text-ink">Activity</h1>
         <p className="text-sm text-ink-muted">Agent requests, results and evidence.</p>
       </PageHeader>
-      <PageTabs
-        id="activity"
-        label="Activity views"
-        tabs={[
-          { id: "requests", label: "Requests" },
-          { id: "compression", label: "Log compression" },
-        ]}
-        selected={tab}
-        onSelect={setTab}
-      />
-      <div
-        className="page-toolbar flex flex-wrap items-center gap-x-4 gap-y-2"
-        hidden={tab !== "requests"}
-      >
+      <div className="page-toolbar flex flex-wrap items-center gap-x-4 gap-y-2">
         <StateSegments value={stateFilter} onChange={(state) => setFilters({ state })} />
         <ChipBar
           agents={agentOptions}
@@ -616,18 +585,7 @@ export function ActivityScreen() {
           onRepo={(repo) => setFilters({ repo })}
         />
       </div>
-      <PagePane id="activity" tab="compression" active={tab === "compression"}>
-        <h2 className="text-lg font-semibold">Log compression</h2>
-        <p className="mb-4 text-sm text-ink-muted">
-          Compress a local log; the request and its evidence then open in Requests.
-        </p>
-        <EvidenceBand
-          onCompressed={() => {
-            setPendingExpand(true);
-          }}
-        />
-      </PagePane>
-      <PagePane id="activity" tab="requests" active={tab === "requests"}>
+      <section aria-label="Requests" className="page-content">
         {failure && (
           <div className="mt-2">
             <FailureNote failure={failure} label="disconnected">
@@ -679,14 +637,14 @@ export function ActivityScreen() {
                     exit={fade}
                     transition={settle}
                     style={{ "--lane-share": lane.share } as CSSProperties}
-                    className="activity-lane min-w-0 rounded-card border border-line-strong bg-surface-raised p-2"
+                    className="activity-lane rounded-card border border-line-strong bg-surface-raised p-2"
                   >
                     <header className="flex items-center gap-2 px-2 pb-2">
                       <Badge tone="accent">{lane.agent}</Badge>
                       <span className="font-data text-xs text-ink-faint">
                         {lane.rows.length}
                       </span>
-                      <span className="ml-auto font-data text-xs text-ink-faint">
+                      <span className="ml-auto shrink-0 whitespace-nowrap font-data text-xs text-ink-faint">
                         {relativeTime(lane.latest, now)}
                       </span>
                     </header>
@@ -723,7 +681,7 @@ export function ActivityScreen() {
             </p>
           </>
         )}
-      </PagePane>
+      </section>
     </div>
   );
 }

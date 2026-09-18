@@ -1,3 +1,4 @@
+import { TextField } from "../components/ui/Fields";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ArrowUpRight, MessageSquare } from "lucide-react";
@@ -235,7 +236,7 @@ export function HomeScreen() {
                   submit(question);
                 }}
               >
-                <input
+                <TextField
                   id="ask-pam"
                   aria-label="ask pam"
                   aria-describedby="ask-pam-help"
@@ -276,7 +277,7 @@ export function HomeScreen() {
                     disabled={asking}
                     aria-label={`ask: ${intent.canonical}`}
                     onClick={() => submit(intent.canonical)}
-                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors hover:bg-accent-soft disabled:opacity-70"
+                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors enabled:hover:bg-accent-soft disabled:opacity-70"
                   >
                     <span>{PROMPT_LABELS[intent.id] ?? intent.label}</span>
                     <ArrowUpRight
@@ -363,14 +364,17 @@ function AnswerCard({
 }) {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-sans text-sm text-ink">{answer.sentence}</p>
+      <p className="select-text font-sans text-sm text-ink">{answer.sentence}</p>
 
       {answer.facts.length > 0 && (
         <dl className="home-answer-facts grid gap-x-6 gap-y-3">
           {answer.facts.map(([label, value], index) => (
             <div key={`${label}-${index}`} className="min-w-0 space-y-0.5">
               <dt className="font-data text-xs text-ink-faint">{label}</dt>
-              <dd className="break-words font-data text-sm text-ink tabular-nums" title={value}>
+              <dd
+                className="select-text break-words font-data text-sm text-ink tabular-nums"
+                title={value}
+              >
                 {value}
               </dd>
             </div>

@@ -17,6 +17,7 @@ export function ConfirmButton({
   onConfirm,
   size = "sm",
   variant = "danger",
+  role,
 }: {
   label: string;
   confirmLabel: string;
@@ -27,10 +28,12 @@ export function ConfirmButton({
   onConfirm: () => void;
   size?: "sm" | "md";
   variant?: "danger" | "secondary";
+  role?: "menuitem";
 }) {
   const [armed, setArmed] = useState(false);
   return (
     <Button
+      role={role}
       variant={variant}
       size={size}
       title={title}

@@ -3,12 +3,7 @@ import { LoaderCircle } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
-import {
-  engineInstall,
-  engineStatus,
-  toBridgeFailure,
-  type EngineStatus,
-} from "../lib/ipc";
+import { engineInstall, engineStatus, toBridgeFailure, type EngineStatus } from "../lib/ipc";
 
 /**
  * EngineCard — the truth about the pinned llama.cpp engine: installed or

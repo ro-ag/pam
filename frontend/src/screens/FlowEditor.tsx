@@ -1,4 +1,4 @@
-import { Button } from "../components/ui/Button";
+import { TextArea } from "../components/ui/Fields";
 import type { FlowListEntry } from "../lib/ipc";
 
 /** The shared flow draft as YAML; library actions own persistence and navigation. */
@@ -7,22 +7,19 @@ export function FlowEditor({
   yaml,
   showYaml = true,
   onYamlChange,
-  saveDisabled,
   busy,
-  onSave,
 }: {
   entry: FlowListEntry;
   yaml: string;
   showYaml?: boolean;
   onYamlChange: (yaml: string) => void;
-  saveDisabled: boolean;
   busy: boolean;
-  onSave: () => void;
 }) {
   return (
     <div className="space-y-3">
       {showYaml && (
-        <textarea
+        <TextArea
+          appearance="plain"
           aria-label={`${entry.id} yaml`}
           spellCheck={false}
           value={yaml}
@@ -39,18 +36,6 @@ export function FlowEditor({
           <p className="min-w-0 break-all font-data text-xs text-ink-faint" title={entry.path}>
             {entry.path}
           </p>
-        )}
-        <span className="flex-1" />
-        {entry.source !== "builtin" && (
-          <Button
-            size="sm"
-            disabled={busy || saveDisabled}
-            onClick={() => {
-              if (!busy && !saveDisabled) onSave();
-            }}
-          >
-            {busy ? "Saving…" : "Save"}
-          </Button>
         )}
       </div>
       {entry.source === "builtin" && (

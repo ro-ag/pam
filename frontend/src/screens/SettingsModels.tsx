@@ -1,3 +1,4 @@
+import { SelectField, TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -73,7 +74,7 @@ function TierSelect({
   return (
     <label className="space-y-1.5">
       <span className={fieldLabelClasses}>{tier === "light" ? "Light" : "Heavy"}</span>
-      <select
+      <SelectField
         aria-label={`${tier} tier default`}
         value={value ?? ""}
         disabled={disabled}
@@ -94,7 +95,7 @@ function TierSelect({
             </option>
           );
         })}
-      </select>
+      </SelectField>
       <span className="block font-sans text-sm text-ink-muted">{TIER_SENTENCES[tier]}</span>
       <ReadinessLine readiness={readiness} idleUnloadMin={idleUnloadMin} />
     </label>
@@ -413,7 +414,7 @@ function StoragePanel() {
       >
         <label className="min-w-0 flex-1 space-y-1">
           <span className={fieldLabelClasses}>Models directory</span>
-          <input
+          <TextField
             aria-label="models directory"
             value={dir}
             disabled={busy}
@@ -446,7 +447,7 @@ function StoragePanel() {
       >
         <label className="w-40 space-y-1">
           <span className={fieldLabelClasses}>Idle unload (minutes)</span>
-          <input
+          <TextField
             type="number"
             min={0}
             aria-label="idle unload minutes"

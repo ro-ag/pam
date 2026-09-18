@@ -1,3 +1,4 @@
+import { TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -227,25 +228,25 @@ function ConnectorRow({
         {connector.needs_base_url && (
           <label className="space-y-1">
             <span className={fieldLabelClasses}>Base URL</span>
-            <input
+            <TextField
+              className={fieldClasses}
               aria-label={`${connector.name} base URL`}
               value={baseUrl}
               disabled={busy}
               onChange={(event) => edit(() => setBaseUrl(event.target.value))}
               placeholder={guidance?.url ?? "https://service.example.com"}
-              className={fieldClasses}
             />
           </label>
         )}
         {connector.username_label && (
           <label className="space-y-1">
             <span className={fieldLabelClasses}>{connector.username_label}</span>
-            <input
+            <TextField
+              className={fieldClasses}
               aria-label={`${connector.name} ${connector.username_label}`}
               value={username}
               disabled={busy}
               onChange={(event) => edit(() => setUsername(event.target.value))}
-              className={fieldClasses}
             />
           </label>
         )}
@@ -253,7 +254,8 @@ function ConnectorRow({
       {!profile && (
         <label className="block space-y-1">
           <span className={fieldLabelClasses}>Credential</span>
-          <input
+          <TextField
+            className={fieldClasses}
             type="password"
             autoComplete="new-password"
             aria-label={`${connector.name} credential`}
@@ -263,7 +265,6 @@ function ConnectorRow({
             placeholder={
               connector.credential_present ? "Stored; type to replace it" : "Paste the token"
             }
-            className={fieldClasses}
           />
         </label>
       )}

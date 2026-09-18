@@ -114,83 +114,15 @@ function renderActivity(path = "/activity") {
 }
 
 describe("the tide", () => {
-  it("keeps a successful compression visible and preserves the request filters", async () => {
-    mocks.logCompress.mockResolvedValue({
-      source: { id: "source", bytes: 1000 },
-      compact: { id: "compact", bytes: 100 },
-      summary: null,
-      compact_text: "Build completed",
-      summary_text: null,
-      stats: {
-        source_bytes: 1000,
-        compact_bytes: 100,
-        source_records: 10,
-        retained_records: 1,
-        tokens_source_est: 250,
-        tokens_compact_est: 25,
-        tokens_avoided_est: 225,
-      },
-      model: null,
-      model_skipped: null,
-    });
+  it("shows requests directly without exposing internal compression controls", async () => {
     const router = renderActivity("/activity?state=refused");
-    const compression = await screen.findByRole("tab", { name: "Log compression" });
-    fireEvent.click(compression);
-    fireEvent.change(screen.getByLabelText("log path"), {
-      target: { value: "/tmp/audit.log" },
-    });
-    const button = screen.getByRole("button", { name: "Compress" });
-    button.focus();
-    fireEvent.click(button);
-    expect(await screen.findByText(/225 tokens avoided/)).toBeVisible();
-    expect(compression).toHaveAttribute("aria-selected", "true");
-    expect(button).toHaveFocus();
+    await screen.findByRole("region", { name: "Requests" });
+    expect(screen.queryByRole("tablist", { name: "Activity views" })).toBeNull();
+    expect(screen.queryByText("Log compression")).toBeNull();
+    expect(screen.queryByLabelText("log path")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Compress" })).toBeNull();
+    expect(mocks.logCompress).not.toHaveBeenCalled();
     expect(router.state.location.search.state).toBe("refused");
-  });
-
-  it("opens the compression's own row after a compress from the tide itself", async () => {
-    // The store keeps `admin.log.compress` rows under hide_probes (a human
-    // asked for them), so the compress row arrives with the tide.
-    const compressRow = row({
-      id: "req_zip",
-      capability: "admin.log.compress",
-      agent: "pam-gui",
-      args: { path: "/tmp/build.log" },
-      created_ts: Math.floor(Date.now() / 1000) - 5,
-    });
-    mocks.activityList.mockResolvedValue({ requests: [...TIDE, compressRow] });
-    mocks.logCompress.mockResolvedValue({
-      source: { id: "source", bytes: 1000 },
-      compact: { id: "compact", bytes: 100 },
-      summary: null,
-      compact_text: "Build completed",
-      summary_text: null,
-      stats: {
-        source_bytes: 1000,
-        compact_bytes: 100,
-        source_records: 10,
-        retained_records: 1,
-        tokens_source_est: 250,
-        tokens_compact_est: 25,
-        tokens_avoided_est: 225,
-      },
-      model: null,
-      model_skipped: null,
-    });
-    renderActivity();
-    await screen.findByText("compress.log");
-    // The compress row sits in the tide beside the agents' rows.
-    expect(await screen.findByText("admin.log.compress")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Log compression" }));
-    fireEvent.change(screen.getByLabelText("log path"), {
-      target: { value: "/tmp/build.log" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Compress" }));
-    await screen.findByText(/225 tokens avoided/);
-    fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
-    const rowButton = screen.getByText("admin.log.compress").closest("button") as HTMLElement;
-    await waitFor(() => expect(rowButton).toHaveAttribute("aria-expanded", "true"));
-    expect(screen.getByText(/"path": "\/tmp\/build.log"/)).toBeInTheDocument();
   });
 
   it("renders one row per request with capability, agent, repo tail, and verdict", async () => {
@@ -370,7 +302,10 @@ describe("lanes", () => {
     expect(claude.getAllByText("claude")).toHaveLength(1);
     expect(screen.getByText(/3 requests · 2 lanes · newest first/)).toBeInTheDocument();
     // Width follows traffic: each lane grows by its row count.
-    expect(lanes.map((lane) => lane.style.getPropertyValue("--lane-share"))).toEqual(["2", "1"]);
+    expect(lanes.map((lane) => lane.style.getPropertyValue("--lane-share"))).toEqual([
+      "2",
+      "1",
+    ]);
   });
 
   it("gives each lane a width share equal to its (capped) row count", () => {

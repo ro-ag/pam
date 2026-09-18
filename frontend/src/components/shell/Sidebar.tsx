@@ -80,25 +80,28 @@ function SidebarHead() {
     <div
       data-tauri-drag-region=""
       className={cn(
-        "flex w-full shrink-0 items-center gap-3 px-3 pb-5",
+        "flex w-full shrink-0 flex-col items-center gap-2 px-3 pb-5",
         hasTrafficLights() ? "pt-10" : "pt-4",
-        compact && "flex-col gap-1 px-0",
+        compact && "gap-2 px-0",
       )}
     >
       <img
         src={pamLogo}
         alt="PAM"
-        width={48}
-        height={48}
+        width={compact ? 48 : 128}
+        height={compact ? 24 : 64}
         draggable={false}
         data-tauri-drag-region=""
-        className="size-12 shrink-0 object-contain"
+        className={cn(
+          "sidebar-brand-logo shrink-0 object-cover",
+          compact ? "h-6 w-12" : "h-16 w-32",
+        )}
       />
-      <div data-tauri-drag-region="" className="flex min-w-0 flex-col gap-0.5">
+      <div data-tauri-drag-region="" className="flex min-w-0 items-baseline gap-2">
         {!compact && (
           <span
             data-tauri-drag-region=""
-            className="font-display text-sm font-semibold text-ink"
+            className="font-display text-lg font-semibold text-ink"
           >
             PAM
           </span>

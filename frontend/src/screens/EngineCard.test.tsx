@@ -100,14 +100,17 @@ describe("installed", () => {
     ["stale_release", "Installed b1233, expected b1234", manifest({ tag: "b1233" })],
     ["server_missing", "Broken install", null],
     ["manifest_invalid", "Broken install", null],
-  ] as const)("offers Reinstall engine when %s", async (cause, expectedText, brokenManifest) => {
-    mockBridge({
-      "admin.models.engine.status": () => status({ cause, manifest: brokenManifest }),
-    });
-    mount();
-    expect(await screen.findByText(expectedText)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reinstall engine" })).toBeInTheDocument();
-  });
+  ] as const)(
+    "offers Reinstall engine when %s",
+    async (cause, expectedText, brokenManifest) => {
+      mockBridge({
+        "admin.models.engine.status": () => status({ cause, manifest: brokenManifest }),
+      });
+      mount();
+      expect(await screen.findByText(expectedText)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Reinstall engine" })).toBeInTheDocument();
+    },
+  );
 });
 
 describe("unsupported target", () => {
@@ -146,7 +149,8 @@ describe("install", () => {
     );
     expect(
       bridge.invoke.mock.calls.filter(
-        ([, args]) => (args as { op?: string } | undefined)?.op === "admin.models.engine.install",
+        ([, args]) =>
+          (args as { op?: string } | undefined)?.op === "admin.models.engine.install",
       ),
     ).toHaveLength(1);
     expect(await screen.findByRole("button", { name: "Installing…" })).toBeDisabled();

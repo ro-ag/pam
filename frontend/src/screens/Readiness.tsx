@@ -84,10 +84,6 @@ export const NO_RECORD_SENTENCE =
 export const PERSISTENCE_SENTENCE =
   "A tier default is a saved setting. Residency is not: weights leave memory when idle and come back on the next job.";
 
-/** The compression fact, so nobody looks for a knob that is not there. */
-export const COMPRESSION_SENTENCE =
-  "Semantic compression is off: evidence is reduced deterministically, and summaries come from the heavy tier only.";
-
 function Chain({ readiness }: { readiness: TierReadiness }) {
   const stop = stopIndex(readiness.stage);
   return (
@@ -201,7 +197,7 @@ export function ReadinessLine({
   );
 }
 
-/** Both tiers, the persistence sentence, and the compression fact. */
+/** Both tiers and their persistence behavior. */
 export function ReadinessCard({
   status,
   failure,
@@ -239,7 +235,6 @@ export function ReadinessCard({
 
       <div className="space-y-1 border-t border-line pt-3">
         <p className="font-sans text-xs text-ink-muted">{PERSISTENCE_SENTENCE}</p>
-        <p className="font-sans text-xs text-ink-muted">{COMPRESSION_SENTENCE}</p>
       </div>
     </Panel>
   );

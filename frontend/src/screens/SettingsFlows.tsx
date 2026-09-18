@@ -1,3 +1,4 @@
+import { TextField, SelectField, TextArea } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { LandingSettings } from "./LandingSettings";
@@ -57,7 +58,7 @@ function ListChip({
         onClick={() => {
           if (!disabled) onRemove();
         }}
-        className="flex size-6 items-center justify-center rounded-badge text-ink-muted transition-colors duration-150 hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-70"
+        className="flex size-6 items-center justify-center rounded-badge text-ink-muted transition-colors duration-150 enabled:hover:bg-danger-soft enabled:hover:text-danger disabled:cursor-not-allowed disabled:opacity-70"
       >
         <X aria-hidden="true" className="size-3.5" />
       </button>
@@ -115,7 +116,7 @@ function ListEditor({
       >
         <label className="min-w-40 flex-1 space-y-1">
           <span className={fieldLabelClasses}>{addLabel}</span>
-          <input
+          <TextField
             aria-label={addLabel}
             value={draft}
             disabled={busy}
@@ -123,7 +124,6 @@ function ListEditor({
               if (!busy) setDraft(event.target.value);
             }}
             placeholder={placeholder}
-            className={fieldClasses}
           />
         </label>
         <Button
@@ -181,7 +181,7 @@ function DirectoryEditor({
       >
         <label className="min-w-40 flex-1 space-y-1">
           <span className={fieldLabelClasses}>Directory</span>
-          <input
+          <TextField
             aria-label="build output directory"
             value={shown}
             disabled={busy}
@@ -189,7 +189,6 @@ function DirectoryEditor({
               if (!busy) setDraft(event.target.value);
             }}
             placeholder="e.g. ~/pam-builds"
-            className={fieldClasses}
           />
         </label>
         <Button
@@ -452,7 +451,7 @@ function ScopeEditor({
           setRoot("");
         }}
       >
-        <input
+        <TextField
           aria-label="repository root"
           className={rowFieldClasses}
           value={root}
@@ -545,7 +544,7 @@ function ConnectorScopeForm({
       }}
     >
       <div className="flex flex-wrap gap-2">
-        <select
+        <SelectField
           aria-label={`connector for ${root}`}
           className={rowFieldClasses}
           value={connector}
@@ -561,8 +560,8 @@ function ConnectorScopeForm({
               {name}
             </option>
           ))}
-        </select>
-        <input
+        </SelectField>
+        <TextField
           aria-label={`service URL for ${root}`}
           className={rowFieldClasses}
           value={url}
@@ -587,7 +586,7 @@ function ConnectorScopeForm({
             {TARGET_HELP[connector]}. One per line. Searches require explicit access to all
             connector targets.
           </p>
-          <textarea
+          <TextArea
             aria-label={`exact targets for ${root}`}
             className={cn(fieldClasses, "h-auto min-h-16 py-2")}
             value={targets}

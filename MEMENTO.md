@@ -173,3 +173,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-deadline-audit-scheduling
+- kind: habit
+- scope: project
+- rule: A short-deadline audit test must account for expiry before leasing as well as expiry of a running lease; do not assume the executor wins the scheduler race.
+- fix: Require failed/lease_expired and exactly deadline_refusal plus either recovery_refusal from take_next or lease_reaped from the reaper.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

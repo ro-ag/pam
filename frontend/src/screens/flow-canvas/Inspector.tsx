@@ -57,7 +57,7 @@ const toggleVariants = cva(
     variants: {
       state: {
         active: "bg-accent-soft text-ink",
-        idle: "text-ink-faint hover:text-ink",
+        idle: "text-ink-faint enabled:hover:text-ink",
       },
     },
     defaultVariants: { state: "idle" },
@@ -737,7 +737,7 @@ function StepList({
                 aria-label={`move ${step.id} up`}
                 disabled={index === 0}
                 onClick={() => move(step.id, -1)}
-                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted enabled:hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronUp size={14} aria-hidden="true" />
               </button>
@@ -746,7 +746,7 @@ function StepList({
                 aria-label={`move ${step.id} down`}
                 disabled={index === last}
                 onClick={() => move(step.id, 1)}
-                className="flex size-8 items-center justify-center rounded-control text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
+                className="flex size-8 items-center justify-center rounded-control text-ink-muted enabled:hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <ChevronDown size={14} aria-hidden="true" />
               </button>

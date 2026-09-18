@@ -20,12 +20,13 @@ export const buttonVariants = cva(
     variants: {
       variant: {
         primary:
-          "action-control border border-control-line bg-accent-strong text-on-accent hover:bg-accent-hover active:bg-accent-pressed disabled:border-line-strong disabled:bg-inset disabled:text-ink-muted disabled:opacity-100",
+          "action-control border border-control-line bg-accent-strong text-on-accent enabled:hover:bg-accent-hover enabled:active:bg-accent-pressed disabled:border-line-strong disabled:bg-inset disabled:text-ink-muted disabled:opacity-100",
         secondary:
-          "field-control border border-control-line bg-surface-raised text-ink hover:bg-accent-soft",
-        ghost: "text-ink-muted hover:bg-accent-soft hover:text-ink active:bg-accent-soft",
+          "field-control border border-control-line bg-surface-raised text-ink enabled:hover:bg-accent-soft",
+        ghost:
+          "text-ink-muted enabled:hover:bg-accent-soft enabled:hover:text-ink enabled:active:bg-accent-soft",
         danger:
-          "border border-danger/40 bg-danger-soft text-danger hover:border-danger active:border-danger",
+          "border border-danger/40 bg-danger-soft text-danger enabled:hover:border-danger enabled:active:border-danger",
       },
       size: {
         sm: "h-8 px-2.5 text-xs",

@@ -182,3 +182,21 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-logo-painted-bounds
+- kind: habit
+- scope: project
+- rule: Size and position brand artwork from its painted bounds, not its SVG viewBox; inspect the native window and both sidebar modes before declaring it visible.
+- fix: Framed the original PAM SVG in a 2:1 image box and increased expanded artwork to 118 by 59 painted pixels; verified native and light/dark screenshots.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+
+## pam-model-menu-scroll-clipping
+- kind: habit
+- scope: project
+- rule: Inspect menus on the final row of an overflow container; position popups outside the scrolling ancestor and verify focus and disabled hover behavior.
+- fix: Portaled Models More menu to the body with viewport bounds, resize/scroll repositioning, outside dismissal, arrow navigation and Escape focus restoration.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

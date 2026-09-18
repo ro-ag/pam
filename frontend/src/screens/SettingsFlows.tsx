@@ -57,7 +57,7 @@ function ListChip({
         onClick={() => {
           if (!disabled) onRemove();
         }}
-        className="flex size-6 items-center justify-center rounded-badge text-ink-muted transition-colors duration-150 hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-70"
+        className="flex size-6 items-center justify-center rounded-badge text-ink-muted transition-colors duration-150 enabled:hover:bg-danger-soft enabled:hover:text-danger disabled:cursor-not-allowed disabled:opacity-70"
       >
         <X aria-hidden="true" className="size-3.5" />
       </button>

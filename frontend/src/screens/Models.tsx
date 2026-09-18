@@ -3,7 +3,8 @@ import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Check, ChevronDown, LoaderCircle } from "lucide-react";
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -335,6 +336,13 @@ function RuntimeCard({
           size="sm"
           variant="ghost"
           disabled={(!loaded && !engine?.loaded) || unload.isPending}
+          title={
+            !loaded && !engine?.loaded
+              ? "No model is loaded"
+              : unload.isPending
+                ? "Unloading the model"
+                : undefined
+          }
           onClick={() => unload.mutate()}
         >
           Unload
@@ -379,6 +387,36 @@ function RowMenu({
   const [open, setOpen] = useState(false);
   const menu = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const element = menu.current!;
+    const opener = trigger.current!;
+    const position = () => {
+      const rect = opener.getBoundingClientRect();
+      const roomBelow = window.innerHeight - rect.bottom - 8;
+      const top =
+        roomBelow >= element.offsetHeight
+          ? rect.bottom + 4
+          : Math.max(8, rect.top - element.offsetHeight - 4);
+      element.style.top = `${top}px`;
+      element.style.left = `${Math.max(8, Math.min(rect.right - element.offsetWidth, window.innerWidth - element.offsetWidth - 8))}px`;
+    };
+    const outside = (event: PointerEvent) => {
+      if (!element.contains(event.target as Node) && !opener.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    position();
+    element.querySelector<HTMLButtonElement>("button:enabled")?.focus();
+    window.addEventListener("resize", position);
+    document.addEventListener("scroll", position, true);
+    document.addEventListener("pointerdown", outside);
+    return () => {
+      window.removeEventListener("resize", position);
+      document.removeEventListener("scroll", position, true);
+      document.removeEventListener("pointerdown", outside);
+    };
+  }, [open]);
   const close = () => {
     setOpen(false);
     trigger.current?.focus();
@@ -388,14 +426,30 @@ function RowMenu({
       event.preventDefault();
       close();
     }
+    if (!open || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(
+      menu.current?.querySelectorAll<HTMLButtonElement>("button:enabled") ?? [],
+    );
+    if (items.length === 0) return;
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? items.length - 1
+          : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+    items[next]?.focus();
   };
   const item =
-    "flex h-8 w-full items-center rounded-control px-2.5 text-left font-sans text-sm text-ink hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-70";
+    "flex h-8 w-full items-center rounded-control px-2.5 text-left font-sans text-sm text-ink enabled:hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-70";
   return (
     <div
       className="relative"
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+        const next = event.relatedTarget as Node | null;
+        if (!event.currentTarget.contains(next) && !menu.current?.contains(next))
+          setOpen(false);
       }}
       onKeyDown={keyDown}
     >
@@ -413,63 +467,66 @@ function RowMenu({
         More
         <ChevronDown size={14} aria-hidden="true" />
       </Button>
-      {open && (
-        <div
-          ref={menu}
-          id={id}
-          role="menu"
-          aria-label={`Actions for ${entry.id}`}
-          className="absolute right-0 z-10 mt-1 w-44 space-y-0.5 rounded-card border border-line-strong bg-surface-raised p-1 shadow-float"
-        >
-          <button
-            type="button"
-            role="menuitem"
-            disabled={blocker !== undefined}
-            title={blocker}
-            className={item}
-            onClick={() => {
-              setOpen(false);
-              onDefault("light");
-            }}
+      {open &&
+        createPortal(
+          <div
+            ref={menu}
+            id={id}
+            role="menu"
+            aria-label={`Actions for ${entry.id}`}
+            className="model-actions-menu fixed z-50 w-44 space-y-0.5 overflow-y-auto rounded-card border border-line-strong bg-surface-raised p-1 text-ink shadow-float"
           >
-            Set light
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            disabled={blocker !== undefined}
-            title={blocker}
-            className={item}
-            onClick={() => {
-              setOpen(false);
-              onDefault("heavy");
-            }}
-          >
-            Set heavy
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className={item}
-            onClick={() => {
-              setOpen(false);
-              onVerify();
-            }}
-          >
-            Verify
-          </button>
-          <div role="none" className="border-t border-line pt-0.5">
-            <ConfirmButton
-              label="Delete"
-              confirmLabel="delete it?"
-              onConfirm={() => {
-                setOpen(false);
-                onDelete();
+            <button
+              type="button"
+              role="menuitem"
+              disabled={blocker !== undefined}
+              title={blocker}
+              className={item}
+              onClick={() => {
+                close();
+                onDefault("light");
               }}
-            />
-          </div>
-        </div>
-      )}
+            >
+              Set light
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={blocker !== undefined}
+              title={blocker}
+              className={item}
+              onClick={() => {
+                close();
+                onDefault("heavy");
+              }}
+            >
+              Set heavy
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className={item}
+              onClick={() => {
+                close();
+                onVerify();
+              }}
+            >
+              Verify
+            </button>
+            <div role="none" className="border-t border-line pt-0.5">
+              <ConfirmButton
+                role="menuitem"
+                label="Delete"
+                confirmLabel="delete it?"
+                onConfirm={() => {
+                  close();
+                  onDelete();
+                }}
+              />
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

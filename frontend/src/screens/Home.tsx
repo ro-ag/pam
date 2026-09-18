@@ -276,7 +276,7 @@ export function HomeScreen() {
                     disabled={asking}
                     aria-label={`ask: ${intent.canonical}`}
                     onClick={() => submit(intent.canonical)}
-                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors hover:bg-accent-soft disabled:opacity-70"
+                    className="flex min-h-9 items-center justify-between gap-2 rounded-control px-2 py-2 text-left text-sm text-ink transition-colors enabled:hover:bg-accent-soft disabled:opacity-70"
                   >
                     <span>{PROMPT_LABELS[intent.id] ?? intent.label}</span>
                     <ArrowUpRight

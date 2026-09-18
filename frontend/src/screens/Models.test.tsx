@@ -381,7 +381,7 @@ describe("runtime card", () => {
 /** Opens a row's More menu and scopes queries to it. */
 function openMenu(table: ReturnType<typeof within>, modelId: string) {
   fireEvent.click(table.getByRole("button", { name: `More actions for ${modelId}` }));
-  return within(table.getByRole("menu", { name: `Actions for ${modelId}` }));
+  return within(screen.getByRole("menu", { name: `Actions for ${modelId}` }));
 }
 
 describe("library", () => {
@@ -404,6 +404,14 @@ describe("library", () => {
     const menu = openMenu(table, "qwen/Qwen3-0.6B-Q8_0");
     expect(menu.getByRole("menuitem", { name: "Set light" })).toBeDisabled();
     expect(menu.getByRole("menuitem", { name: "Set heavy" })).toBeDisabled();
+    // The popup escapes the table's scroll clipping and skips unavailable actions.
+    expect(table.queryByRole("menu")).toBeNull();
+    expect(menu.getByRole("menuitem", { name: "Verify" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+    expect(menu.getByRole("menuitem", { name: "Delete" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+    expect(menu.getByRole("menuitem", { name: "Verify" })).toHaveFocus();
+
     expect(menu.getByRole("menuitem", { name: "Set light" })).toHaveAttribute(
       "title",
       FLOOR_SENTENCE,
@@ -412,6 +420,8 @@ describe("library", () => {
     expect(table.getByText("unverified")).toBeInTheDocument();
     // Loading a test-only model is allowed — that is what it is for.
     expect(table.getByRole("button", { name: "Load" })).toBeEnabled();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   it("badges a verified but unqualified row and refuses it as a tier default, with the reason", async () => {
@@ -445,7 +455,7 @@ describe("library", () => {
     const menu = openMenu(table, "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M");
     fireEvent.click(menu.getByRole("menuitem", { name: "Set heavy" }));
     // Choosing closes the menu.
-    expect(table.queryByRole("menu")).toBeNull();
+    expect(screen.queryByRole("menu")).toBeNull();
     await waitFor(() =>
       expect(mocks.modelsDefaultsSet).toHaveBeenCalledWith(
         "heavy",
@@ -491,7 +501,7 @@ describe("library", () => {
     // Escape closes an open menu and hands focus back to its button.
     const menu = openMenu(table, "qwen/model-0");
     fireEvent.keyDown(menu.getByRole("menuitem", { name: "Verify" }), { key: "Escape" });
-    expect(table.queryByRole("menu")).toBeNull();
+    expect(screen.queryByRole("menu")).toBeNull();
     expect(table.getByRole("button", { name: "More actions for qwen/model-0" })).toHaveFocus();
   });
 
@@ -502,9 +512,9 @@ describe("library", () => {
     const table = within(await screen.findByRole("region", { name: "Installed models" }));
     await table.findByText("qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M");
     const menu = openMenu(table, "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M");
-    fireEvent.click(menu.getByRole("button", { name: "Delete" }));
+    fireEvent.click(menu.getByRole("menuitem", { name: "Delete" }));
     expect(mocks.modelsDelete).not.toHaveBeenCalled();
-    fireEvent.click(menu.getByRole("button", { name: "delete it?" }));
+    fireEvent.click(menu.getByRole("menuitem", { name: "delete it?" }));
     await waitFor(() =>
       expect(mocks.modelsDelete).toHaveBeenCalledWith(
         "qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",

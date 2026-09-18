@@ -1,3 +1,4 @@
+import { TextArea } from "../components/ui/Fields";
 import { Button } from "../components/ui/Button";
 import type { FlowListEntry } from "../lib/ipc";
 
@@ -22,7 +23,8 @@ export function FlowEditor({
   return (
     <div className="space-y-3">
       {showYaml && (
-        <textarea
+        <TextArea
+          appearance="plain"
           aria-label={`${entry.id} yaml`}
           spellCheck={false}
           value={yaml}

@@ -1,3 +1,4 @@
+import { TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { animate, useMotionValue, useReducedMotion, useTransform } from "motion/react";
 import { useEffect, useState } from "react";
@@ -173,7 +174,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-56 flex-1 space-y-1">
             <span className={fieldLabelClasses}>Log path</span>
-            <input
+            <TextField
               aria-label="log path"
               value={path}
               disabled={compress.isPending}
@@ -184,7 +185,7 @@ export function EvidenceBand({ onCompressed }: { onCompressed: () => void }) {
           </label>
           <label className="w-24 space-y-1">
             <span className={fieldLabelClasses}>Exit status</span>
-            <input
+            <TextField
               type="number"
               aria-label="exit status"
               value={exitStatus}

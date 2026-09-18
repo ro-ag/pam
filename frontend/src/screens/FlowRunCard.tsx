@@ -1,3 +1,4 @@
+import { SelectField, TextField } from "../components/ui/Fields";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { LoaderCircle, Play } from "lucide-react";
@@ -531,7 +532,7 @@ export function FlowRunCard({
         {repos.length > 0 && (
           <label className="block space-y-1">
             <span className={fieldLabelClasses}>Known repository</span>
-            <select
+            <SelectField
               aria-label="known repo"
               value={repos.includes(repo) ? repo : ""}
               onChange={(event) => setRepo(event.target.value)}
@@ -543,17 +544,16 @@ export function FlowRunCard({
                   {known}
                 </option>
               ))}
-            </select>
+            </SelectField>
           </label>
         )}
         <label className="block space-y-1">
           <span className={fieldLabelClasses}>Repository path</span>
-          <input
+          <TextField
             aria-label="repo path"
             value={repo}
             onChange={(event) => setRepo(event.target.value)}
             placeholder="/absolute/path/to/repository"
-            className={fieldClasses}
           />
           <span className="block font-sans text-xs text-ink-muted">
             An absolute path to the repository the flow runs in.
@@ -566,7 +566,7 @@ export function FlowRunCard({
           {flow.inputs.map((input) => (
             <label key={input.name} className="block space-y-1">
               <span className={fieldLabelClasses}>{input.name}</span>
-              <input
+              <TextField
                 aria-label={input.name}
                 ref={(el) => {
                   inputRefs.current[input.name] = el;
@@ -575,7 +575,6 @@ export function FlowRunCard({
                 onChange={(event) =>
                   setValues((prev) => ({ ...prev, [input.name]: event.target.value }))
                 }
-                className={fieldClasses}
               />
               {input.description && (
                 <span className="block font-sans text-sm text-ink-muted">

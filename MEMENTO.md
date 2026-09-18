@@ -218,3 +218,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-ui-copy-implementation-details
+- kind: habit
+- scope: project
+- rule: Keep GUI-only and only-this-app implementation restrictions out of normal PAM labels and descriptions; describe the user action and retain only actionable permission explanations.
+- fix: Removed redundant Settings restriction copy and simplified Models and Approvals descriptions; kept internal security comments and enforcement unchanged.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+

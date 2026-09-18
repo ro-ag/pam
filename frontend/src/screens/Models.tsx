@@ -1,10 +1,11 @@
+import { SelectField, TextField, TextArea } from "../components/ui/Fields";
 import { EngineCard } from "./EngineCard";
 import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { Check, ChevronDown, LoaderCircle } from "lucide-react";
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
-import { createPortal } from "react-dom";
+import { Check, LoaderCircle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ActionMenu, MenuItem } from "../components/ui/ActionMenu";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
@@ -297,7 +298,7 @@ function RuntimeCard({
       )}
 
       <div className="flex flex-wrap items-center gap-2 border-t border-line pt-4">
-        <select
+        <SelectField
           aria-label="model to load"
           value={pick}
           disabled={selectable.length === 0 || load.isPending}
@@ -314,7 +315,7 @@ function RuntimeCard({
               {model.class === "test_only" ? " (test only)" : ""}
             </option>
           ))}
-        </select>
+        </SelectField>
         <Button
           size="sm"
           disabled={!pick || load.isPending || runtime?.state === "loading"}
@@ -383,151 +384,56 @@ function RowMenu({
   onVerify: () => void;
   onDelete: () => void;
 }) {
-  const id = useId();
-  const [open, setOpen] = useState(false);
-  const menu = useRef<HTMLDivElement>(null);
-  const trigger = useRef<HTMLButtonElement>(null);
-  useLayoutEffect(() => {
-    if (!open) return;
-    const element = menu.current!;
-    const opener = trigger.current!;
-    const position = () => {
-      const rect = opener.getBoundingClientRect();
-      const roomBelow = window.innerHeight - rect.bottom - 8;
-      const top =
-        roomBelow >= element.offsetHeight
-          ? rect.bottom + 4
-          : Math.max(8, rect.top - element.offsetHeight - 4);
-      element.style.top = `${top}px`;
-      element.style.left = `${Math.max(8, Math.min(rect.right - element.offsetWidth, window.innerWidth - element.offsetWidth - 8))}px`;
-    };
-    const outside = (event: PointerEvent) => {
-      if (!element.contains(event.target as Node) && !opener.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    position();
-    element.querySelector<HTMLButtonElement>("button:enabled")?.focus();
-    window.addEventListener("resize", position);
-    document.addEventListener("scroll", position, true);
-    document.addEventListener("pointerdown", outside);
-    return () => {
-      window.removeEventListener("resize", position);
-      document.removeEventListener("scroll", position, true);
-      document.removeEventListener("pointerdown", outside);
-    };
-  }, [open]);
-  const close = () => {
-    setOpen(false);
-    trigger.current?.focus();
-  };
-  const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      close();
-    }
-    if (!open || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    event.preventDefault();
-    const items = Array.from(
-      menu.current?.querySelectorAll<HTMLButtonElement>("button:enabled") ?? [],
-    );
-    if (items.length === 0) return;
-    const current = items.indexOf(document.activeElement as HTMLButtonElement);
-    const next =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? items.length - 1
-          : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
-    items[next]?.focus();
-  };
-  const item =
-    "flex h-8 w-full items-center rounded-control px-2.5 text-left font-sans text-sm text-ink enabled:hover:bg-accent-soft disabled:cursor-not-allowed disabled:opacity-70";
   return (
-    <div
-      className="relative"
-      onBlur={(event) => {
-        const next = event.relatedTarget as Node | null;
-        if (!event.currentTarget.contains(next) && !menu.current?.contains(next))
-          setOpen(false);
-      }}
-      onKeyDown={keyDown}
+    <ActionMenu
+      triggerLabel={`More actions for ${entry.id}`}
+      menuLabel={`Actions for ${entry.id}`}
+      disabled={busy}
     >
-      <Button
-        ref={trigger}
-        size="sm"
-        variant="ghost"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-controls={open ? id : undefined}
-        aria-label={`More actions for ${entry.id}`}
-        disabled={busy}
-        onClick={() => setOpen((value) => !value)}
-      >
-        More
-        <ChevronDown size={14} aria-hidden="true" />
-      </Button>
-      {open &&
-        createPortal(
-          <div
-            ref={menu}
-            id={id}
-            role="menu"
-            aria-label={`Actions for ${entry.id}`}
-            className="model-actions-menu fixed z-50 w-44 space-y-0.5 overflow-y-auto rounded-card border border-line-strong bg-surface-raised p-1 text-ink shadow-float"
+      {(close) => (
+        <>
+          <MenuItem
+            disabled={blocker !== undefined}
+            title={blocker}
+            onClick={() => {
+              close();
+              onDefault("light");
+            }}
           >
-            <button
-              type="button"
+            Set light
+          </MenuItem>
+          <MenuItem
+            disabled={blocker !== undefined}
+            title={blocker}
+            onClick={() => {
+              close();
+              onDefault("heavy");
+            }}
+          >
+            Set heavy
+          </MenuItem>
+          <MenuItem
+            onClick={() => {
+              close();
+              onVerify();
+            }}
+          >
+            Verify
+          </MenuItem>
+          <div role="none" className="border-t border-line pt-0.5">
+            <ConfirmButton
               role="menuitem"
-              disabled={blocker !== undefined}
-              title={blocker}
-              className={item}
-              onClick={() => {
+              label="Delete"
+              confirmLabel="delete it?"
+              onConfirm={() => {
                 close();
-                onDefault("light");
+                onDelete();
               }}
-            >
-              Set light
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              disabled={blocker !== undefined}
-              title={blocker}
-              className={item}
-              onClick={() => {
-                close();
-                onDefault("heavy");
-              }}
-            >
-              Set heavy
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              className={item}
-              onClick={() => {
-                close();
-                onVerify();
-              }}
-            >
-              Verify
-            </button>
-            <div role="none" className="border-t border-line pt-0.5">
-              <ConfirmButton
-                role="menuitem"
-                label="Delete"
-                confirmLabel="delete it?"
-                onConfirm={() => {
-                  close();
-                  onDelete();
-                }}
-              />
-            </div>
-          </div>,
-          document.body,
-        )}
-    </div>
+            />
+          </div>
+        </>
+      )}
+    </ActionMenu>
   );
 }
 
@@ -923,7 +829,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
         <div className="flex flex-wrap items-end gap-2">
           <label className="min-w-64 flex-1 space-y-1">
             <span className={fieldLabelClasses}>GGUF URL</span>
-            <input
+            <TextField
               aria-label="gguf url"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
@@ -933,7 +839,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           </label>
           <label className="w-40 space-y-1">
             <span className={fieldLabelClasses}>Vendor</span>
-            <input
+            <TextField
               aria-label="vendor"
               value={vendor}
               onChange={(event) => setVendor(event.target.value)}
@@ -1008,7 +914,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
         )}
       </div>
 
-      <textarea
+      <TextArea
         aria-label="prompt"
         rows={3}
         value={prompt}
@@ -1024,7 +930,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
       <div className="flex flex-wrap items-end gap-2">
         <label className="w-32 space-y-1">
           <span className={fieldLabelClasses}>Max tokens</span>
-          <input
+          <TextField
             type="number"
             min={1}
             aria-label="max tokens"
@@ -1139,7 +1045,7 @@ export function ModelsScreen() {
         <Section
           eyebrow="Daemon runtime"
           title="Runtime"
-          blurb="What each job tier gets, and what is in memory right now. Only this app administers models."
+          blurb="Default models for each task and what is loaded in memory."
         >
           <ReadinessCard status={status.data} failure={statusFailure} onRepair={repair} />
           <RuntimeCard status={status.data} models={models} failure={statusFailure} />

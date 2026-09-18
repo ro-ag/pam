@@ -1,3 +1,4 @@
+import { TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Hand } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
@@ -6,7 +7,6 @@ import { APPROVALS_PENDING_KEY } from "../components/shell/useDaemonStatus";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
-import { fieldClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import { cn } from "../lib/cn";
@@ -283,7 +283,7 @@ function ApprovalCard({
           <span className="block font-sans text-xs text-ink-muted">
             Note — travels with the audit trail
           </span>
-          <input
+          <TextField
             aria-label="resolution note"
             // The ghost button just unmounted under the pointer; the field
             // it revealed inherits the keyboard.
@@ -291,7 +291,6 @@ function ApprovalCard({
             value={note}
             onChange={(event) => setNote(event.target.value)}
             placeholder="Why you approved or denied"
-            className={fieldClasses}
           />
         </label>
       )}
@@ -462,7 +461,7 @@ export function ApprovalsScreen() {
               No requests are waiting for review.
             </p>
             <p className="max-w-md font-sans text-sm text-ink-muted">
-              When an agent needs a yes, its request appears here; only this app can answer it.
+              Requests that need your permission will appear here for review.
             </p>
           </div>
         )}

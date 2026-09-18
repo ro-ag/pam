@@ -1,3 +1,4 @@
+import { TextField, SelectField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { Check, Copy, LoaderCircle, RefreshCw } from "lucide-react";
@@ -284,13 +285,12 @@ function GrantsPanel() {
       >
         <label className="min-w-48 flex-1 space-y-1">
           <span className={fieldLabelClasses}>Capability to grant</span>
-          <input
+          <TextField
             aria-label="capability to grant"
             list="known-capabilities"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="e.g. flow.run"
-            className={fieldClasses}
           />
         </label>
         <datalist id="known-capabilities">
@@ -633,7 +633,8 @@ function RetentionPanel() {
   ) => (
     <label className="space-y-1">
       <span className={fieldLabelClasses}>{caption}</span>
-      <select
+      <SelectField
+        appearance="plain"
         aria-label={label}
         value={windowValue(days)}
         disabled={busy}
@@ -647,7 +648,7 @@ function RetentionPanel() {
             {windowLabel(choice)}
           </option>
         ))}
-      </select>
+      </SelectField>
     </label>
   );
 
@@ -747,7 +748,7 @@ function LogsPanel({ active }: { active: boolean }) {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <p className="font-data text-xs text-ink-faint">daemon.log</p>
         <span className="flex-1" />
-        <select
+        <SelectField
           aria-label="lines to show"
           value={lineCount}
           onChange={(event) => setLineCount(Number(event.target.value))}
@@ -758,7 +759,7 @@ function LogsPanel({ active }: { active: boolean }) {
               {choice} lines
             </option>
           ))}
-        </select>
+        </SelectField>
         <label className="flex min-h-8 cursor-pointer items-center gap-1.5 font-sans text-xs text-ink-muted">
           <input
             type="checkbox"
@@ -966,10 +967,6 @@ export function SettingsScreen() {
           <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
           <p className="text-sm text-ink-muted">Your machine. Your defaults.</p>
         </div>
-        <p className="settings-context max-w-xs text-right font-sans text-xs text-ink-muted">
-          Appearance stays in this app. Every other category administers the daemon and can only
-          be changed here — never by an agent or the CLI.
-        </p>
       </header>
       <LayoutGroup id={motionGroup}>
         <motion.div

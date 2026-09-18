@@ -1,3 +1,4 @@
+import { TextField } from "../ui/Fields";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowUpRight, Search, X } from "lucide-react";
@@ -244,7 +245,8 @@ function PaletteDialog({
       </div>
       <div className="mx-4 mb-3 flex items-center gap-2 rounded-control border border-control-line bg-surface-raised px-3">
         <Search size={16} className="shrink-0 text-ink-muted" aria-hidden="true" />
-        <input
+        <TextField
+          appearance="plain"
           ref={input}
           role="combobox"
           aria-label="Search pages, settings, flows, and models"

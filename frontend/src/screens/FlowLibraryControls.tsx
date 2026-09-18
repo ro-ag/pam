@@ -1,8 +1,8 @@
+import { TextField, SelectField, TextArea } from "../components/ui/Fields";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
-import { fieldClasses } from "../components/ui/field";
 import {
   flowsDelete,
   flowsGet,
@@ -327,10 +327,9 @@ export function useFlowLibraryControls({
             <>
               <label className="block space-y-1 text-sm">
                 Flow name
-                <input
+                <TextField
                   autoFocus
                   aria-label="Flow name"
-                  className={fieldClasses}
                   value={name}
                   disabled={busy}
                   onChange={(event) => setName(event.target.value)}
@@ -338,9 +337,8 @@ export function useFlowLibraryControls({
               </label>
               <label className="block space-y-1 text-sm">
                 Flow ID
-                <input
+                <TextField
                   aria-label="Flow ID"
-                  className={fieldClasses}
                   value={id}
                   disabled={busy || mode === "rename"}
                   onChange={(event) => setId(event.target.value)}
@@ -361,9 +359,8 @@ export function useFlowLibraryControls({
                 <>
                   <label className="block space-y-1 text-sm">
                     Starting point
-                    <select
+                    <SelectField
                       aria-label="Starting point"
-                      className={fieldClasses}
                       value={template}
                       disabled={busy}
                       onChange={(event) => setTemplate(event.target.value)}
@@ -376,15 +373,14 @@ export function useFlowLibraryControls({
                             {entry.name}
                           </option>
                         ))}
-                    </select>
+                    </SelectField>
                   </label>
                   {!template && (
                     <label className="block space-y-1 text-sm">
                       First program
-                      <input
+                      <TextField
                         aria-label="First program"
                         placeholder="e.g. git"
-                        className={fieldClasses}
                         value={program}
                         disabled={busy}
                         onChange={(event) => setProgram(event.target.value)}
@@ -398,9 +394,8 @@ export function useFlowLibraryControls({
                   {!template && (
                     <label className="block space-y-1 text-sm">
                       Arguments (one per line)
-                      <textarea
+                      <TextArea
                         aria-label="Arguments (one per line)"
-                        className={fieldClasses}
                         value={argumentsText}
                         disabled={busy}
                         onChange={(event) => setArgumentsText(event.target.value)}

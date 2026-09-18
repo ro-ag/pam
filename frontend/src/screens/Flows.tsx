@@ -1,3 +1,4 @@
+import { TextField, SelectField } from "../components/ui/Fields";
 import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -729,7 +730,7 @@ export function FlowsScreen({
         <div className="flow-library-layout flex flex-1">
           <section aria-label="flow library" className="flow-library min-w-0 shrink-0">
             <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
-            <input
+            <TextField
               type="search"
               aria-label="Search flows"
               placeholder="Search workflows…"
@@ -755,7 +756,7 @@ export function FlowsScreen({
           <section aria-label={`flow ${selected.id}`} className="flow-detail min-w-0 flex-1">
             <label className="flow-picker shrink-0 items-center gap-3">
               <span className="block text-xs font-medium text-ink-muted">Flow library</span>
-              <select
+              <SelectField
                 aria-label="Choose flow"
                 value={selected.id}
                 onChange={(event) => {
@@ -770,7 +771,7 @@ export function FlowsScreen({
                     {entry.valid ? "" : " (invalid)"}
                   </option>
                 ))}
-              </select>
+              </SelectField>
             </label>
             <div className="flow-detail-header shrink-0 space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>

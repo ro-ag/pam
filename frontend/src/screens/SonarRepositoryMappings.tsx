@@ -1,8 +1,8 @@
+import { TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
-import { fieldClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import {
   sonarMappingsGet,
@@ -87,8 +87,7 @@ export function SonarRepositoryMappingsEditor() {
                 : field === "project"
                   ? "Project key"
                   : "HTTPS repository URL"}
-              <input
-                className={fieldClasses}
+              <TextField
                 aria-label={`Mapping ${index + 1} ${field}`}
                 value={mapping[field]}
                 disabled={save.isPending}

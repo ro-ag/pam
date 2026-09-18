@@ -1,3 +1,4 @@
+import { TextArea, TextField } from "../components/ui/Fields";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
@@ -28,7 +29,7 @@ export function parseTimeout(text: string): number | null {
   return seconds >= TIMEOUT_MIN_S && seconds <= TIMEOUT_MAX_S ? seconds : null;
 }
 
-function TextField({
+function LabeledField({
   label,
   value,
   onChange,
@@ -43,9 +44,19 @@ function TextField({
     <label className="block space-y-1 text-xs text-ink-muted">
       <span>{label}</span>
       {multiline ? (
-        <textarea className={area} value={value} onChange={(e) => onChange(e.target.value)} />
+        <TextArea
+          appearance="plain"
+          className={area}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
       ) : (
-        <input className={field} value={value} onChange={(e) => onChange(e.target.value)} />
+        <TextField
+          appearance="plain"
+          className={field}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
       )}
     </label>
   );
@@ -73,17 +84,17 @@ function CheckEditor({
   const timeoutValid = parseTimeout(timeoutText) !== null;
   return (
     <div className="space-y-2 border border-line p-3">
-      <TextField
+      <LabeledField
         label={`${label} name`}
         value={check.name}
         onChange={(name) => onChange({ ...check, name })}
       />
-      <TextField
+      <LabeledField
         label={`${label} program`}
         value={check.argv[0] ?? ""}
         onChange={(program) => onChange({ ...check, argv: [program, ...check.argv.slice(1)] })}
       />
-      <TextField
+      <LabeledField
         label={`${label} arguments (one per line)`}
         value={check.argv.slice(1).join("\n")}
         multiline
@@ -100,7 +111,8 @@ function CheckEditor({
           Arguments are literal; shell expansion is unavailable.
         </span>
         {label} timeout (seconds)
-        <input
+        <TextField
+          appearance="plain"
           inputMode="numeric"
           className={cn(field, !timeoutValid && "border-danger")}
           aria-invalid={!timeoutValid || undefined}
@@ -157,7 +169,7 @@ function RepositoryEditor({
       </h4>
       <div className="grid gap-3 sm:grid-cols-2">
         {fields.map(([name, label]) => (
-          <TextField
+          <LabeledField
             key={name}
             label={`${prefix} ${label}`}
             value={repository[name]}
@@ -166,7 +178,7 @@ function RepositoryEditor({
         ))}
       </div>
       {lists.map(([name, label]) => (
-        <TextField
+        <LabeledField
           key={name}
           label={`${prefix} ${label} (one per line)`}
           value={(repository[name] ?? []).join("\n")}

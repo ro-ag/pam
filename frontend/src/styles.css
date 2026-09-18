@@ -162,7 +162,7 @@
        A 2:1 cover box removes empty margins without changing the artwork. */
     object-position: 50% 56.4453125%;
   }
-  .model-actions-menu {
+  .action-menu {
     max-height: calc(100dvh - 16px);
   }
   [data-workspace-sidebar="compact"] .desktop-sidebar {

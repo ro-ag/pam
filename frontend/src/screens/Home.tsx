@@ -1,3 +1,4 @@
+import { TextField } from "../components/ui/Fields";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ArrowUpRight, MessageSquare } from "lucide-react";
@@ -235,7 +236,7 @@ export function HomeScreen() {
                   submit(question);
                 }}
               >
-                <input
+                <TextField
                   id="ask-pam"
                   aria-label="ask pam"
                   aria-describedby="ask-pam-help"

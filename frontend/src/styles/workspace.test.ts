@@ -82,14 +82,12 @@ describe("Settings layout contract", () => {
     expect(styles).toContain("var(--glass-opacity, 84%)");
   });
 
-  it("adds page entrances without transforming the scroll container", () => {
-    expect(styles).toContain(".workspace-scroll:not([data-settings]) > *");
-    expect(styles).toContain("animation: workspace-enter 180ms");
+  it("keeps workspace content visible without a transform or opacity entrance", () => {
+    expect(styles).not.toContain("animation: workspace-enter");
+    expect(styles).not.toContain("animation: settings-pane-enter");
+    expect(styles).not.toContain("transform: translateY(4px)");
   });
-  it("animates only active pane contents, preserving the static pane container", () => {
-    expect(styles).toContain(".settings-pane:not([hidden]) > section");
-    expect(styles).toContain("animation: settings-pane-enter 180ms");
-    expect(styles).toContain("transform: translateY(4px)");
+  it("preserves a static selected-tab indicator for reduced motion", () => {
     const reduced = styles.slice(styles.indexOf("@media (prefers-reduced-motion: reduce)"));
     expect(reduced).toMatch(/\.settings-tab-indicator\s*\{\s*display: none/);
     expect(reduced).toContain("box-shadow: inset 0 -2px 0 var(--pam-accent)");
@@ -124,7 +122,8 @@ it("sizes the flow canvas from the remaining pane and gives the inspector its ow
   expect(styles).not.toContain("height: 520px");
   expect(styles).toMatch(/\.canvas-dock,\s*\.canvas-host\s*\{[^}]*height: 100%/);
   expect(styles).toMatch(/\.canvas-viewport\s*\{[^}]*flex: 1;[^}]*min-height: 0/);
-  expect(styles).toMatch(/\.flow-canvas-pane\s*\{[^}]*overflow: hidden/);
+  expect(styles).toMatch(/\.flow-canvas-pane\s*\{[^}]*overflow: auto/);
+  expect(styles).not.toContain("min-height: 420px");
   expect(styles).toMatch(/\.flow-inspector\s*\{[^}]*max-height: 35%;[^}]*overflow: auto/);
 });
 it("lets an activity lane grow with its row share above a readable floor", () => {

@@ -15,7 +15,10 @@ use pam_daemon::daemon::{
     CAUSE_APPROVAL_TIMEOUT, CAUSE_DEADLINE_EXCEEDED, CAUSE_EXECUTION_FAILED,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
-use pam_daemon::queue::{ACTION_CANCEL, ACTION_LEASE_REAPED, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED};
+use pam_daemon::queue::{
+    ACTION_CANCEL, ACTION_LEASE_REAPED, ACTION_RECOVERY_REFUSAL, CAUSE_CANCELLED,
+    CAUSE_LEASE_EXPIRED,
+};
 use pam_proto::{Outcome, Response};
 use pam_store::{Decision, RequestState};
 use pam_testkit::{TestDaemon, envelope, open_store, short_tempdir, with_deadline};
@@ -310,13 +313,17 @@ async fn deadline_teardown_writes_one_expiry_row_plus_the_deadline_row() {
             .await;
         assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
 
-        // Exactly one terminal expiry row; the deadline row is its
-        // documented companion recording the refusal sent to the caller.
+        // The 200 ms deadline may expire before the executor takes a lease
+        // on a busy runner. take_next then records recovery_refusal; a live
+        // lease instead records lease_reaped. Both must leave exactly one
+        // expiry row plus the deadline refusal sent to the caller.
         let mut actions = daemon.terminal_audit_actions("req_late").await;
         actions.sort_unstable();
-        let mut expected = [ACTION_LEASE_REAPED, ACTION_DEADLINE_REFUSAL];
-        expected.sort_unstable();
-        assert_eq!(actions, expected);
+        assert!(
+            actions == [ACTION_DEADLINE_REFUSAL, ACTION_LEASE_REAPED]
+                || actions == [ACTION_DEADLINE_REFUSAL, ACTION_RECOVERY_REFUSAL],
+            "expected one deadline refusal and one expiry audit row, got {actions:?}"
+        );
         daemon.assert_invariant_clean().await;
 
         daemon.stop().await;

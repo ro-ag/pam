@@ -140,7 +140,10 @@ function LibraryList({
   // Focus follows the arrows; it starts on the selected flow and stays
   // where the arrows left it until the selection moves.
   const [focusedId, setFocusedId] = useState<string | null>(null);
-  const focused = focusedId ?? selectedId;
+  const preferredFocus = focusedId ?? selectedId;
+  const focused = entries.some((entry) => entry.id === preferredFocus)
+    ? preferredFocus
+    : entries[0]?.id;
   const [armed, setArmed] = useState(false);
   const move = (event: KeyboardEvent<HTMLLIElement>) => {
     const index = entries.findIndex((entry) => entry.id === focused);
@@ -581,16 +584,18 @@ function FlowDetailPane({
             </div>
           )}
 
-          <FlowEditor
-            key={entry.id}
-            entry={entry}
-            yaml={draft.yaml}
-            showYaml={tab === "yaml"}
-            onYamlChange={onYamlChange}
-            saveDisabled={saveDisabled}
-            onSave={onSave}
-            busy={busy}
-          />
+          {(tab === "yaml" || entry.source !== "builtin") && (
+            <FlowEditor
+              key={entry.id}
+              entry={entry}
+              yaml={draft.yaml}
+              showYaml={tab === "yaml"}
+              onYamlChange={onYamlChange}
+              saveDisabled={saveDisabled}
+              onSave={onSave}
+              busy={busy}
+            />
+          )}
         </div>
         <div hidden={tab !== "run"} className="max-w-content space-y-4">
           <p className="text-sm text-ink-muted">Choose a repository and run the saved flow.</p>
@@ -631,6 +636,7 @@ export function FlowsScreen({
 } = {}) {
   const flows = useQuery({ queryKey: ["flows"], queryFn: flowsList });
   const [picked, setPicked] = useState<string | null>(initialFlow ?? null);
+  const [search, setSearch] = useState("");
   const [tab, setTab] = useState<Tab>(initialTab ?? "canvas");
   const [draft, setDraft] = useState<LibraryDraft | null>(null);
   const [revision, setRevision] = useState(0);
@@ -648,6 +654,10 @@ export function FlowsScreen({
   // falls through to the shelf's own fallback below.
 
   const entries = flows.data?.flows ?? [];
+  const query = search.trim().toLocaleLowerCase();
+  const visibleEntries = entries.filter((entry) =>
+    `${entry.name} ${entry.id} ${entry.description}`.toLocaleLowerCase().includes(query),
+  );
   // Nothing picked yet means the top of the shelf; a flow that just went
   // away (deleted, or renamed by a clone) falls back the same way.
   const selected = entries.find((entry) => entry.id === picked) ?? entries[0] ?? null;
@@ -685,9 +695,11 @@ export function FlowsScreen({
 
   return (
     <div className="page-workspace">
-      <PageHeader>
-        <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
-        <p className="text-sm text-ink-muted">Reusable workflows and execution history.</p>
+      <PageHeader className="flow-page-header">
+        <div>
+          <h1 className="font-sans text-title font-semibold text-ink">Flows</h1>
+          <p className="text-sm text-ink-muted">Review, edit and run workflows.</p>
+        </div>
         {controls.toolbar}
       </PageHeader>
 
@@ -708,8 +720,8 @@ export function FlowsScreen({
 
       {!failure && !flows.isPending && selected === null && (
         <p className="max-w-md pt-6 font-sans text-lg text-ink-muted">
-          There are no flows installed at all — not even the built-in ones. Something is wrong with the flow
-          library; the daemon log will say what.
+          There are no flows installed at all — not even the built-in ones. Something is wrong
+          with the flow library; the daemon log will say what.
         </p>
       )}
 
@@ -717,8 +729,22 @@ export function FlowsScreen({
         <div className="flow-library-layout flex flex-1">
           <section aria-label="flow library" className="flow-library min-w-0 shrink-0">
             <h2 className="mb-2 px-2 text-xs font-medium text-ink-muted">Flow library</h2>
+            <input
+              type="search"
+              aria-label="Search flows"
+              placeholder="Search workflows…"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              className={cn(fieldClasses, "mb-3 w-full")}
+            />
+            {visibleEntries.length === 0 && (
+              <p role="status" className="px-2 text-sm text-ink-muted">
+                No workflows match. Try a different name or task.
+              </p>
+            )}
             <LibraryList
-              entries={entries}
+              key={query}
+              entries={visibleEntries}
               selectedId={selected.id}
               onPick={(id) => {
                 if (id !== selected.id) requestNavigation(() => setPicked(id));
@@ -727,7 +753,7 @@ export function FlowsScreen({
           </section>
 
           <section aria-label={`flow ${selected.id}`} className="flow-detail min-w-0 flex-1">
-            <label className="flow-picker space-y-1">
+            <label className="flow-picker shrink-0 items-center gap-3">
               <span className="block text-xs font-medium text-ink-muted">Flow library</span>
               <select
                 aria-label="Choose flow"
@@ -748,13 +774,18 @@ export function FlowsScreen({
             </label>
             <div className="flow-detail-header shrink-0 space-y-1.5">
               <h2 className="font-display text-lg font-semibold text-ink">{selected.name}</h2>
-              <p className="max-w-xl font-sans text-sm text-ink-muted">
-                {selected.description || "This flow describes itself in its own YAML."}
-              </p>
               <p className="font-data text-xs text-ink-faint">
                 {selected.steps} step{selected.steps === 1 ? "" : "s"} ·{" "}
-                {selected.source === "builtin" ? "Built-in flow" : "Custom flow"}
+                {selected.source === "builtin"
+                  ? "Built-in · Duplicate to save changes"
+                  : "Custom flow"}
               </p>
+              <details className="flow-description text-sm text-ink-muted">
+                <summary className="cursor-pointer">About this flow</summary>
+                <p className="mt-2 max-w-xl">
+                  {selected.description || "This flow describes itself in its own YAML."}
+                </p>
+              </details>
             </div>
 
             <FlowDetailPane

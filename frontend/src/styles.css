@@ -27,6 +27,8 @@
   body,
   #root {
     height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
   }
 
   body {
@@ -157,19 +159,6 @@
     width: 100%;
     max-width: 1440px;
     margin-inline: auto;
-  }
-  .workspace-scroll:not([data-settings]) > * {
-    animation: workspace-enter 180ms cubic-bezier(0.2, 0, 0, 1);
-  }
-  @keyframes workspace-enter {
-    from {
-      opacity: 0;
-      transform: translateY(4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
   }
   .appearance-panel {
     width: 100%;
@@ -608,10 +597,15 @@
     padding: 14px 20px;
     overflow-wrap: anywhere;
   }
+  .flow-description {
+    max-height: 120px;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
   .flow-canvas-pane {
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    overflow: auto;
   }
   .flow-canvas-pane .flow-editor-pane,
   .flow-canvas-column {
@@ -628,8 +622,12 @@
     min-height: 0;
   }
   .flow-picker {
+    display: flex;
     padding: 12px 20px;
     border-bottom: 1px solid var(--pam-line);
+  }
+  .flow-picker > span {
+    flex-shrink: 0;
   }
   .flow-library-layout > .flow-library {
     display: none;
@@ -706,23 +704,11 @@
     min-width: 0;
     padding: 20px;
     overflow: auto;
+    overscroll-behavior: contain;
     scrollbar-gutter: stable;
   }
   .settings-pane[hidden] {
     display: none;
-  }
-  .settings-pane:not([hidden]) > section {
-    animation: settings-pane-enter 180ms cubic-bezier(0.2, 0, 0, 1);
-  }
-  @keyframes settings-pane-enter {
-    from {
-      opacity: 0;
-      transform: translateY(4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
   }
   .settings-pane:focus-visible {
     outline-offset: -3px;
@@ -934,8 +920,7 @@
   }
   .flow-workbench {
     flex: 1;
-    /* The canvas keeps a working height at 1100x700; the pane scrolls instead. */
-    min-height: 420px;
+    min-height: 0;
     flex-direction: column;
   }
   .flow-inspector {
@@ -944,6 +929,27 @@
     max-height: 35%;
     overflow: auto;
     overscroll-behavior: contain;
+  }
+  .flow-page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+  }
+  .flow-page-header > * {
+    margin: 0;
+  }
+  .flow-canvas-column {
+    min-width: 0;
+    min-height: 240px;
+  }
+  .flow-canvas-pane .flow-editor-pane {
+    flex: 1 0 auto;
+    min-height: 300px;
+  }
+  .flow-canvas-pane .flow-workbench {
+    flex-basis: 0;
   }
   @container (min-width: 640px) {
     .flow-workbench {

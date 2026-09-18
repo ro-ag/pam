@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import App from "../../App";
 import { createAppRouter } from "../../router";
 import { Beacon } from "./Beacon";
+import { version } from "../../../../crates/pam/tauri.conf.json";
 import { initWorkspace } from "../../lib/workspace";
 
 /** Mount the whole shell on a fresh, isolated memory history. */
@@ -153,7 +154,13 @@ describe("shell layout", () => {
     const wordmark = screen.getByText("PAM");
     expect(column).toContainElement(wordmark);
     expect(wordmark).toHaveAttribute("data-tauri-drag-region");
-    expect(within(column).getByText("personal agent machine")).toHaveAttribute(
+    expect(within(column).getByRole("img", { name: "PAM" })).toHaveAttribute(
+      "data-tauri-drag-region",
+    );
+    expect(within(column).getByLabelText(`PAM version ${version}`)).toHaveTextContent(
+      `v${version}`,
+    );
+    expect(within(column).getByLabelText(`PAM version ${version}`)).toHaveAttribute(
       "data-tauri-drag-region",
     );
   });
@@ -179,7 +186,7 @@ describe("shell layout", () => {
     stubTrafficLights(true);
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
-    const head = screen.getByText("PAM").parentElement as HTMLElement;
+    const head = screen.getByRole("img", { name: "PAM" }).parentElement as HTMLElement;
     expect(head.className).toContain("pt-10");
     expect(head.className).not.toContain("pt-4");
   });
@@ -188,7 +195,7 @@ describe("shell layout", () => {
     stubTrafficLights(false);
     renderShell("/activity");
     await screen.findByRole("heading", { name: "Activity" });
-    const head = screen.getByText("PAM").parentElement as HTMLElement;
+    const head = screen.getByRole("img", { name: "PAM" }).parentElement as HTMLElement;
     expect(head.className).toContain("pt-4");
     expect(head.className).not.toContain("pt-10");
   });

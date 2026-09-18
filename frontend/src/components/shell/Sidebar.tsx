@@ -1,5 +1,7 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useSyncExternalStore } from "react";
+import pamLogo from "../../../../docs/assets/pam-mark.svg";
+import { version } from "../../../../crates/pam/tauri.conf.json";
 import { subscribeWorkspace, workspaceSnapshot } from "../../lib/workspace";
 import {
   Activity,
@@ -78,19 +80,37 @@ function SidebarHead() {
     <div
       data-tauri-drag-region=""
       className={cn(
-        "flex w-full shrink-0 flex-col gap-0.5 px-3 pb-5",
+        "flex w-full shrink-0 items-center gap-3 px-3 pb-5",
         hasTrafficLights() ? "pt-10" : "pt-4",
-        compact && "items-center px-0",
+        compact && "flex-col gap-1 px-0",
       )}
     >
-      <span data-tauri-drag-region="" className="font-display text-sm font-semibold text-ink">
-        PAM
-      </span>
-      {!compact && (
-        <span data-tauri-drag-region="" className="font-sans text-xs text-ink-faint">
-          personal agent machine
+      <img
+        src={pamLogo}
+        alt="PAM"
+        width={48}
+        height={48}
+        draggable={false}
+        data-tauri-drag-region=""
+        className="size-12 shrink-0 object-contain"
+      />
+      <div data-tauri-drag-region="" className="flex min-w-0 flex-col gap-0.5">
+        {!compact && (
+          <span
+            data-tauri-drag-region=""
+            className="font-display text-sm font-semibold text-ink"
+          >
+            PAM
+          </span>
+        )}
+        <span
+          data-tauri-drag-region=""
+          aria-label={`PAM version ${version}`}
+          className="whitespace-nowrap font-mono text-xs text-ink-muted"
+        >
+          v{version}
         </span>
-      )}
+      </div>
     </div>
   );
 }

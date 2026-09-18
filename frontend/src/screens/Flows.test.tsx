@@ -374,6 +374,43 @@ describe("the library column", () => {
     expect(await screen.findByRole("heading", { name: "PR readiness" })).toBeInTheDocument();
   });
 
+  it("filters workflows without discarding the selected draft and keeps results keyboard reachable", async () => {
+    await renderFlows();
+    const editor = await editorFor("pr-readiness");
+    fireEvent.change(editor, { target: { value: "name: unsaved draft" } });
+    const search = screen.getByRole("searchbox", { name: "Search flows" });
+    fireEvent.change(search, { target: { value: "AFTER-MERGE" } });
+    const library = within(screen.getByRole("listbox", { name: "Flow library" }));
+    const result = library.getByRole("option", { name: "After-merge checks" });
+    expect(result).toHaveAttribute("tabindex", "0");
+    expect(library.getAllByRole("option")).toHaveLength(1);
+    expect(editor).toHaveValue("name: unsaved draft");
+    fireEvent.change(search, { target: { value: "no workflow matches" } });
+    expect(screen.getByRole("status")).toHaveTextContent("No workflows match");
+    expect(editor).toHaveValue("name: unsaved draft");
+    fireEvent.change(search, { target: { value: "" } });
+    expect(
+      within(screen.getByRole("listbox", { name: "Flow library" })).getAllByRole("option"),
+    ).toHaveLength(FLOWS.length);
+  });
+
+  it("keeps search focus after keyboard navigation changes the library's focused option", async () => {
+    await renderFlows();
+    const library = within(await screen.findByRole("listbox", { name: "Flow library" }));
+    const options = library.getAllByRole("option");
+    fireEvent.keyDown(options[0], { key: "ArrowDown" });
+    await waitFor(() => expect(options[1]).toHaveFocus());
+    const search = screen.getByRole("searchbox", { name: "Search flows" });
+    search.focus();
+    fireEvent.change(search, { target: { value: "Mine" } });
+    expect(search).toHaveFocus();
+    expect(
+      within(screen.getByRole("listbox", { name: "Flow library" })).getByRole("option", {
+        name: /Mine/,
+      }),
+    ).toHaveAttribute("tabindex", "0");
+  });
+
   it("preselects the flow named by the route search", async () => {
     render(
       <QueryClientProvider client={createAppQueryClient()}>

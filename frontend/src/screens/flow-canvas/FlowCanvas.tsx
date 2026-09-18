@@ -459,10 +459,11 @@ function Canvas({
               </span>
             </div>
           )}
-          {/* Below the detail pane's 4xl width the labels fold into their
-              glyphs (the names stay on aria-label and title), so the row
-              never wraps onto the canvas at 1100x700. */}
-          <div className="flex flex-wrap items-center gap-2">
+          <div
+            role="toolbar"
+            aria-label="Canvas actions"
+            className="flex shrink-0 flex-wrap items-center gap-2"
+          >
             <Button
               variant="ghost"
               size="sm"
@@ -471,7 +472,7 @@ function Canvas({
               onClick={() => add("command")}
             >
               <Terminal size={14} aria-hidden="true" />
-              <span className="hidden @4xl:inline">Add command</span>
+              <span>Add command</span>
             </Button>
             <Button
               variant="ghost"
@@ -481,7 +482,7 @@ function Canvas({
               onClick={() => add("connector")}
             >
               <Plug size={14} aria-hidden="true" />
-              <span className="hidden @4xl:inline">Add connector</span>
+              <span>Add connector</span>
             </Button>
             <span className="flex-1" />
             <Button variant="ghost" size="sm" aria-label="Tidy" title="Tidy" onClick={tidy}>
@@ -503,6 +504,7 @@ function Canvas({
               size="sm"
               data-canvas-maximize=""
               aria-label={maximized ? "Restore canvas" : "Maximize canvas"}
+              title={maximized ? "Restore canvas" : "Maximize canvas"}
               aria-pressed={maximized}
               onClick={() => {
                 // Measure before rendering the fixed canvas or detaching its host.

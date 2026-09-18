@@ -164,3 +164,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-original-brand-artwork
+- kind: habit
+- scope: project
+- rule: Use the original PAM brand SVG for in-app branding rather than the packaged application icon.
+- fix: Import docs/assets/pam-mark.svg, the artwork used by the README, in Sidebar.tsx.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

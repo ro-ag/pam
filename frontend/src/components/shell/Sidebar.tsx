@@ -1,6 +1,6 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useSyncExternalStore } from "react";
-import pamLogo from "../../../../crates/pam/icons/icon.png";
+import pamLogo from "../../../../docs/assets/pam-mark.svg";
 import { version } from "../../../../crates/pam/tauri.conf.json";
 import { subscribeWorkspace, workspaceSnapshot } from "../../lib/workspace";
 import {

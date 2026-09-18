@@ -227,3 +227,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-compression-is-internal
+- kind: habit
+- scope: project
+- rule: Log compression is an internal model-input optimization, not a PAM user workflow; do not expose compression forms or unsolicited implementation status in the UI.
+- fix: Removed Activity compression tab/form and its dead component, plus Models compression-status prose; preserved internal IPC and backend processing.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+

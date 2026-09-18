@@ -8,6 +8,23 @@ All notable changes to pam are documented in this file. The format follows
 
 - Nothing yet.
 
+## [0.4.1] - 2026-09-17
+
+### Fixed
+
+- Keep the desktop panel anchored while scrolling, with content scrolling
+  inside its own pane. Remove entrance transforms that could leave content
+  blank in the macOS webview after navigation.
+- Keep the flow canvas, inspector and actions reachable in short windows,
+  with a compact header and expandable flow descriptions.
+
+### Changed
+
+- Search the flow library by name, identifier or description without losing
+  unsaved edits. Keyboard navigation stays usable while filtering.
+- Show readable canvas action labels and the original PAM logo with the
+  application version in both expanded and compact sidebars.
+
 ## [0.4.0] - 2026-09-17
 
 ### Changed

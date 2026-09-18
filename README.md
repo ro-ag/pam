@@ -49,7 +49,9 @@ pam gui                 # open the desktop control center
 ```
 
 Grants, approvals, and profiles are managed in the GUI (Settings › Security),
-not on the command line.
+not on the command line. The sidebar shows the PAM logo and installed version;
+Flows provides a searchable library and a canvas that stays usable in compact
+windows.
 
 ## CLI surface
 

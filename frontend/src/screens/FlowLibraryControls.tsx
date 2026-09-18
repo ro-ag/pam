@@ -214,11 +214,13 @@ export function useFlowLibraryControls({
       setMode(null);
     });
   }
-  const saveDraft = () =>
+  // Save the editor snapshot supplied by the click. Its validation can finish
+  // before the parent's passive onDraft effect publishes the same revision.
+  const saveDraft = (current: LibraryDraft) =>
     void perform(async () => {
-      if (!draft || draft.id !== selected?.id || draft.saveDisabled) return;
-      await flowsSave(draft.id, draft.yaml);
-      await refresh(draft.id);
+      if (!current.dirty || current.id !== selected?.id || current.saveDisabled) return;
+      await flowsSave(current.id, current.yaml);
+      await refresh(current.id);
     });
   const cancelMode = () => {
     if (!locked.current) {

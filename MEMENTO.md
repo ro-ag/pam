@@ -245,3 +245,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-save-current-editor-snapshot
+- kind: habit
+- scope: project
+- rule: A Save action must consume the validated draft shown by the editor, not a parent snapshot delivered later by a passive effect.
+- fix: The full landing gate caught an enabled Save silently skipping a just-validated draft. Pass the current draft with the Save event; add a regression with a stale disabled parent draft.
+- hits: 2026-09-18
+- cost: 0
+- status: watching
+

@@ -428,7 +428,7 @@ function FlowDetailPane({
   onTab: (tab: Tab) => void;
   onDraft: (draft: LibraryDraft) => void;
   busy: boolean;
-  onSave: () => void;
+  onSave: (draft: LibraryDraft) => void;
   onDiscard: () => void;
   isLocked: () => boolean;
 }) {
@@ -550,7 +550,8 @@ function FlowDetailPane({
               size="sm"
               disabled={busy || saveDisabled}
               onClick={() => {
-                if (!busy && !saveDisabled && !isLocked()) onSave();
+                if (!busy && !saveDisabled && !isLocked())
+                  onSave({ id: entry.id, yaml: draft.yaml, dirty: draft.dirty, saveDisabled });
               }}
             >
               {busy ? "Saving…" : "Save"}

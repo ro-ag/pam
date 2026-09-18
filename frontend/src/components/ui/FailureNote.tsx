@@ -22,7 +22,7 @@ export function FailureNote({
   children?: ReactNode;
 }) {
   return (
-    <div className="max-w-content space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
+    <div className="select-text max-w-content space-y-1 rounded-card border border-danger/40 bg-danger-soft p-3">
       <p className="font-data text-xs text-danger">
         {label} · {failure.cause}
       </p>

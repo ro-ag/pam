@@ -32,6 +32,9 @@
   }
 
   body {
+    /* Desktop chrome is not document text; opt copyable content back in. */
+    -webkit-user-select: none;
+    user-select: none;
     margin: 0;
     min-width: 320px;
     font-family: var(--font-sans);
@@ -39,6 +42,16 @@
     line-height: 1.5;
     color: var(--color-ink);
     background: var(--color-chrome);
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable="plaintext-only"],
+  pre,
+  .select-text {
+    -webkit-user-select: text;
+    user-select: text;
   }
 
   ::selection {

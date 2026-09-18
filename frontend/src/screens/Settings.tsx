@@ -807,7 +807,7 @@ function LogsPanel({ active }: { active: boolean }) {
           </p>
           <ol
             aria-label="daemon log lines"
-            className="max-h-96 space-y-0.5 overflow-x-auto overflow-y-auto rounded-card border border-line bg-chrome p-3"
+            className="select-text max-h-96 space-y-0.5 overflow-x-auto overflow-y-auto rounded-card border border-line bg-chrome p-3"
           >
             {lines.length === 0 && (
               <li className="font-data text-xs text-ink-faint">the log file is empty</li>

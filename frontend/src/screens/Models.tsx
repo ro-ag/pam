@@ -1061,7 +1061,7 @@ function TryBox({ status }: { status: ModelsStatus | undefined }) {
 
       {result && (
         <div className="space-y-2">
-          <p className="rounded-card border border-line bg-chrome p-3 font-data text-sm whitespace-pre-wrap text-ink">
+          <p className="select-text rounded-card border border-line bg-chrome p-3 font-data text-sm whitespace-pre-wrap text-ink">
             {result.text}
           </p>
           <p className="font-data text-xs text-ink-faint tabular-nums">

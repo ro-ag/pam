@@ -85,7 +85,7 @@ function StepSummary({ text }: { text: string }) {
     <span className="mt-1 block max-w-md">
       <span
         className={cn(
-          "block font-sans text-sm text-ink-muted",
+          "block select-text font-sans text-sm text-ink-muted",
           long && !open && "line-clamp-3",
         )}
       >
@@ -174,7 +174,7 @@ function FlowVerdict({ result }: { result: FlowResult }) {
           {result.flow.id} · {result.repo}
         </span>
       </div>
-      <p className="max-w-xl font-sans text-sm text-ink">{result.summary}</p>
+      <p className="max-w-xl select-text font-sans text-sm text-ink">{result.summary}</p>
       <StepTable steps={result.steps} />
     </div>
   );

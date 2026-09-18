@@ -209,3 +209,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-desktop-label-selection
+- kind: habit
+- scope: project
+- rule: PAM interface labels should be nonselectable by default; explicitly preserve selection for inputs and copyable output, including WebKit.
+- fix: Set body user-select none with WebKit prefix and opt text controls, evidence, logs, answers and diagnostics back in; verify real heading and input selection.
+- hits: 2026-09-17
+- cost: 0
+- status: watching
+

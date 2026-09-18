@@ -363,14 +363,17 @@ function AnswerCard({
 }) {
   return (
     <Panel ground="raised" className="space-y-4 p-5">
-      <p className="font-sans text-sm text-ink">{answer.sentence}</p>
+      <p className="select-text font-sans text-sm text-ink">{answer.sentence}</p>
 
       {answer.facts.length > 0 && (
         <dl className="home-answer-facts grid gap-x-6 gap-y-3">
           {answer.facts.map(([label, value], index) => (
             <div key={`${label}-${index}`} className="min-w-0 space-y-0.5">
               <dt className="font-data text-xs text-ink-faint">{label}</dt>
-              <dd className="break-words font-data text-sm text-ink tabular-nums" title={value}>
+              <dd
+                className="select-text break-words font-data text-sm text-ink tabular-nums"
+                title={value}
+              >
                 {value}
               </dd>
             </div>

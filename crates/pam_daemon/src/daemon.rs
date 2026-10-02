@@ -1611,8 +1611,13 @@ impl Pipeline {
                 if audience.follows_events() {
                     self.register_ticket(&envelope, origin);
                 }
+                // A bypass ends in this handler. Its terminal event already
+                // removed it from the hub; an ending that published none
+                // (a verdict parked for retry) is forgotten here, before the
+                // caller can see the response.
                 if envelope.wait {
                     let response = self.execute_bypass(&envelope, origin, audience).await;
+                    self.events.hub().unregister(&envelope.id);
                     guard.send(response);
                 } else {
                     guard.send(Response::Ticket {
@@ -1622,11 +1627,8 @@ impl Pipeline {
                     });
                     // Result reaches the store and event stream only.
                     let _ = self.execute_bypass(&envelope, origin, audience).await;
+                    self.events.hub().unregister(&envelope.id);
                 }
-                // A bypass ends in this handler. Its terminal event already
-                // removed it from the hub; an ending that published none
-                // (a verdict parked for retry) is forgotten here.
-                self.events.hub().unregister(&envelope.id);
             }
             AdmitOutcome::Admitted => {
                 self.register_ticket(&envelope, origin);

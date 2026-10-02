@@ -14,15 +14,21 @@ impl Store {
         if now_ms < 0 || resume_at_ms <= now_ms {
             return Ok(false);
         }
-        let _guard = self.conn_lock.lock().await;
-        Ok(self.conn.execute(
-            "UPDATE request SET state='queued',resume_at_ms=?2,updated_ts=?4
+        let conn = self.lock().await?;
+        Ok(conn
+            .execute(
+                &format!(
+                    "UPDATE request SET state='queued',resume_at_ms=?2,updated_ts=?4
              WHERE id=?1 AND capability='flow.run' AND state='running'
              AND queue_authorized=1 AND expires_at_ms>?3 AND expires_at_ms>=?2
-             AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+             AND {admission}
              AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
-            params![id, resume_at_ms, now_ms, now_ts()],
-        ).await? == 1)
+                    admission = super::ADMISSION_STANDS
+                ),
+                params![id, resume_at_ms, now_ms, now_ts()],
+            )
+            .await?
+            == 1)
     }
 
     /// Check a recovered schedule using only scalar metadata, before indexing
@@ -32,15 +38,20 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query(
-            "SELECT 1 FROM request WHERE id=?1 AND capability='flow.run' AND state='queued'
+        let conn = self.lock().await?;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT 1 FROM request WHERE id=?1 AND capability='flow.run' AND state='queued'
              AND resume_at_ms>0 AND resume_at_ms<=expires_at_ms
              AND queue_authorized=1 AND expires_at_ms>?2
-             AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+             AND {admission}
              AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
-            params![id, now_ms],
-        ).await?;
+                    admission = super::ADMISSION_STANDS
+                ),
+                params![id, now_ms],
+            )
+            .await?;
         Ok(rows.next().await?.is_some())
     }
 
@@ -51,9 +62,8 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT 1 FROM request WHERE id=?1 AND expires_at_ms<=?2",
                 params![id, now_ms],
@@ -69,15 +79,21 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        Ok(self.conn.execute(
-            "UPDATE request SET resume_at_ms=NULL,updated_ts=?3
+        let conn = self.lock().await?;
+        Ok(conn
+            .execute(
+                &format!(
+                    "UPDATE request SET resume_at_ms=NULL,updated_ts=?3
              WHERE id=?1 AND capability='flow.run' AND state='queued'
              AND resume_at_ms IS NOT NULL AND resume_at_ms<=?2
              AND queue_authorized=1 AND expires_at_ms>?2
-             AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
+             AND {admission}
              AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
-            params![id, now_ms, now_ts()],
-        ).await? == 1)
+                    admission = super::ADMISSION_STANDS
+                ),
+                params![id, now_ms, now_ts()],
+            )
+            .await?
+            == 1)
     }
 }

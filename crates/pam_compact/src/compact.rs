@@ -655,9 +655,33 @@ fn render_omission(reason: &OmissionReason, record_count: usize) -> String {
 }
 
 fn render_exit_status(rendered: &mut String, exit_status: Option<i32>) {
+    rendered.push_str(&exit_status_line(exit_status));
+}
+
+/// The footer line `compact` appends last: the host's own exit status, in the same
+/// bracketed shape as the omission markers.
+fn exit_status_line(exit_status: Option<i32>) -> String {
     match exit_status {
-        Some(status) => writeln!(rendered, "[exit status: {status}]").expect(WRITE_TO_STRING),
-        None => rendered.push_str("[exit status: unknown]\n"),
+        Some(status) => format!("[exit status: {status}]\n"),
+        None => "[exit status: unknown]\n".to_owned(),
+    }
+}
+
+impl Compacted {
+    /// [`Self::rendered_text`] without the host's `[exit status: N]` footer: only text that
+    /// came from the log (and the host's omission markers), never a line the host wrote
+    /// about the process. A caller that quotes the log to a model passes this and states
+    /// [`Self::exit_status`] separately, so a log line that merely looks like the footer
+    /// cannot be mistaken for the host's own.
+    ///
+    /// The footer is a pure function of `exit_status` and always the last bytes appended, so
+    /// removing it is exact; a report whose text does not end with it (a hand-edited stored
+    /// row) is returned whole rather than guessed at.
+    #[must_use]
+    pub fn evidence_text(&self) -> &str {
+        self.rendered_text
+            .strip_suffix(exit_status_line(self.exit_status).as_str())
+            .unwrap_or(&self.rendered_text)
     }
 }
 

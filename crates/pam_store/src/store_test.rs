@@ -46,10 +46,16 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 11);
+    assert_eq!(store.schema_version().await.unwrap(), 12);
 
     // WAL is the engine's native journal mode.
-    let mut rows = store.conn.query("PRAGMA journal_mode", ()).await.unwrap();
+    let mut rows = store
+        .lock()
+        .await
+        .unwrap()
+        .query("PRAGMA journal_mode", ())
+        .await
+        .unwrap();
     let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
 }
@@ -177,7 +183,9 @@ async fn queued_recovery_pages_preserve_timestamp_then_id_order() {
         insert_demo_request(&store, &id).await;
         let created = 100 + number / 7;
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute(
                 "UPDATE request SET created_ts = ?2 WHERE id = ?1",
                 params![id.as_str(), created],
@@ -249,7 +257,9 @@ async fn stuck_recovery_filters_states_and_rejects_oversized_payloads() {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].id, "stuck");
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute(
                 "UPDATE request SET args_json = ?1 WHERE id = 'stuck'",
                 params![format!("\0{}", "é".repeat(200))],
@@ -292,7 +302,9 @@ async fn queued_recovery_rejects_each_oversized_text_field_before_materializatio
         insert_demo_request(&store, "legacy").await;
         let oversized = format!("\0{}", "é".repeat(200));
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute(
                 &format!("UPDATE request SET {column} = ?1 WHERE id = 'legacy'"),
                 params![oversized],
@@ -356,7 +368,9 @@ async fn audit_append_works() {
         .unwrap();
 
     let mut rows = store
-        .conn
+        .lock()
+        .await
+        .unwrap()
         .query(
             "SELECT count(*) FROM audit WHERE request_id = ?1",
             ["req_1"],
@@ -433,7 +447,9 @@ async fn active_grant_tracks_insert_and_revocation() {
     // A revoked row (GUI-side administration, no helper yet) stops
     // counting; history stays in the table.
     store
-        .conn
+        .lock()
+        .await
+        .unwrap()
         .execute(
             "UPDATE \"grant\" SET revoked_ts = granted_ts WHERE capability = ?1",
             params!["release"],
@@ -446,7 +462,9 @@ async fn active_grant_tracks_insert_and_revocation() {
     store.insert_grant("release").await.unwrap();
     assert!(store.active_grant("release").await.unwrap());
     let mut rows = store
-        .conn
+        .lock()
+        .await
+        .unwrap()
         .query(
             "SELECT count(*) FROM \"grant\" WHERE capability = ?1",
             params!["release"],
@@ -485,7 +503,9 @@ async fn setting_round_trip() {
 async fn grant_table_insert_works_despite_keyword_name() {
     let store = Store::open_in_memory().await.unwrap();
     store
-        .conn
+        .lock()
+        .await
+        .unwrap()
         .execute(
             "INSERT INTO \"grant\" (capability, granted_ts) VALUES (?1, ?2)",
             params!["release", 1_756_684_800_i64],
@@ -494,7 +514,9 @@ async fn grant_table_insert_works_despite_keyword_name() {
         .unwrap();
 
     let mut rows = store
-        .conn
+        .lock()
+        .await
+        .unwrap()
         .query("SELECT capability, scope, revoked_ts FROM \"grant\"", ())
         .await
         .unwrap();
@@ -1498,16 +1520,23 @@ async fn record_connector_test_creates_row_when_absent_and_updates_it() {
 async fn age_request(store: &Store, id: &str, ts: i64) {
     for sql in [
         "UPDATE request SET created_ts = ?2, updated_ts = ?2 WHERE id = ?1",
-        "UPDATE audit SET ts = ?2 WHERE request_id = ?1",
+        // Audit rows are append-only (the `audit_append_only` trigger), and
+        // no prune filter reads their timestamp, so they keep theirs.
         "UPDATE evidence SET ts = ?2 WHERE request_id = ?1",
     ] {
-        store.conn.execute(sql, params![id, ts]).await.unwrap();
+        store
+            .lock()
+            .await
+            .unwrap()
+            .execute(sql, params![id, ts])
+            .await
+            .unwrap();
     }
 }
 
 /// One counting query, straight through the connection.
 async fn count(store: &Store, sql: &str) -> i64 {
-    let mut rows = store.conn.query(sql, ()).await.unwrap();
+    let mut rows = store.lock().await.unwrap().query(sql, ()).await.unwrap();
     rows.next().await.unwrap().unwrap().get(0).unwrap()
 }
 

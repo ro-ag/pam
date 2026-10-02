@@ -244,12 +244,33 @@ async fn revocation_invalidates_previous_evidence_authorization() {
     let mut fixture = Fixture::new().await;
     result(fixture.read("before-revocation", args()).await);
     let store = fixture.daemon.store();
-    store.insert_grant("fixture.revoked").await.unwrap();
-    store.revoke_grant("fixture.revoked").await.unwrap();
+    // The originating ticket ran `echo`, which the relaxed profile granted
+    // on first use. Revoking that grant withdraws the ticket's evidence ...
+    store.revoke_grant("echo").await.unwrap();
     refusal(
         fixture.read("after-revocation", args()).await,
         "evidence_unavailable",
     );
+    // ... and granting it again does not bring the old admission back.
+    store.insert_grant("echo").await.unwrap();
+    refusal(
+        fixture.read("after-regrant", args()).await,
+        "evidence_unavailable",
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn revoking_an_unrelated_capability_leaves_evidence_readable() {
+    let mut fixture = Fixture::new().await;
+    result(fixture.read("before-revocation", args()).await);
+    let store = fixture.daemon.store();
+    // A grant the originating `echo` ticket never depended on: its
+    // revocation used to orphan every older ticket's evidence.
+    store.insert_grant("flow.step:other/deploy").await.unwrap();
+    store.revoke_grant("flow.step:other/deploy").await.unwrap();
+    let body = result(fixture.read("after-unrelated-revocation", args()).await);
+    assert_eq!(body["returned_bytes"], 2);
     fixture.stop().await;
 }
 

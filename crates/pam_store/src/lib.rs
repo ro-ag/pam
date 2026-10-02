@@ -4,16 +4,18 @@
 //! of typed helpers); richer queries belong to the services that own them.
 //!
 //! Engine: [Turso](https://docs.rs/turso) (formerly Limbo), a pure-Rust `SQLite` rewrite,
-//! file-format compatible; `mimalloc` (bundled C allocator) is disabled and
-//! `pure-rust-crypto` is enabled, but `turso_core` still unconditionally links `simsimd`, a
-//! small C SIMD kernel for vector distance — the one residue in an otherwise pure-Rust
-//! stack. WAL is native (nothing switches it on); `PRAGMA user_version`, CHECK constraints,
-//! and `PRAGMA foreign_keys = ON` all work. The API is async; Turso drives its own I/O, and
-//! this crate's only `tokio` dependency is the `sync` mutex serializing every statement on
-//! the one connection (held across each `BEGIN`..`COMMIT` window).
+//! file-format compatible; `mimalloc` (bundled C allocator) is disabled, `pure-rust-crypto`
+//! is enabled, and the workspace patches in a vendored `turso_core` whose vector distances
+//! are plain Rust, so `simsimd`'s C kernel is not linked (see `vendor/turso_core/PATCH.md`).
+//! WAL is native (nothing switches it on); `PRAGMA user_version`, CHECK constraints,
+//! triggers, and `PRAGMA foreign_keys = ON` all work. The API is async; Turso drives its
+//! own I/O, and this crate's only `tokio` dependency is the `sync` mutex that owns the one
+//! connection: every statement runs through its guard, and a `BEGIN`..`COMMIT` window that a
+//! dropped caller abandons is rolled back before the next statement (see `conn_gate`).
 //! Integrity is enforced twice — CHECK and foreign-key constraints in the database, typed enums in
 //! Rust — and the daemon still owns threading and task placement.
 
+mod conn_gate;
 mod error;
 mod migrations;
 mod store;
@@ -25,16 +27,21 @@ pub use store::{
     Decision, EVIDENCE_KIND_FLOW_CHECKPOINT, EVIDENCE_KIND_LOG_COMPACT, EvidenceMeta,
     EvidenceOrigins, EvidencePrune, EvidenceRange, EvidenceRangeOutcome, EvidenceRangeRequest,
     EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin,
-    FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantRow, LandingSession,
+    FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantChange, GrantChangeOutcome,
+    GrantRow, LandingSession, MAX_EVIDENCE_MAP_BYTES, MAX_EVIDENCE_MAP_SEGMENTS, MAX_EXPIRY_BATCH,
     MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_LIST_LIMIT, ModelJobRow,
-    PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestPrune, RequestRow,
-    RequestState, RequestStatusMeta, Store,
+    OUTCOME_ADMIN_DENIED, PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestPrune,
+    RequestRow, RequestState, RequestStatusMeta, Store,
 };
 
+#[cfg(test)]
+mod conn_gate_test;
 #[cfg(test)]
 mod evidence_views_test;
 #[cfg(test)]
 mod migrations_test;
+#[cfg(test)]
+mod store_integrity_test;
 #[cfg(test)]
 mod store_test;
 

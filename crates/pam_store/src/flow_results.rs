@@ -13,8 +13,13 @@ pub struct RequestStatusMeta {
     pub state: RequestState,
     /// Terminal outcome or cause, bounded to 128 bytes.
     pub outcome: Option<String>,
-    /// Captured admission revision.
+    /// Captured admission revision: the global revocation count at
+    /// admission. Prefer [`Self::authorization_current`].
     pub authorization_revision: Option<i64>,
+    /// Whether the admission still stands, read with the rest of this row:
+    /// false once a grant the request depended on was revoked after it was
+    /// admitted (see [`Store::request_authorization_current`]).
+    pub authorization_current: bool,
 }
 
 /// The usable state of a request's captured evidence origins under one repository.
@@ -44,9 +49,9 @@ impl Store {
         &self,
         ticket: &str,
     ) -> Result<Option<RequestStatusMeta>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query(
-            "SELECT capability,repo,state,outcome,authorization_revision FROM request WHERE id=?1 AND LENGTH(CAST(state AS BLOB))<=32 AND LENGTH(CAST(capability AS BLOB))<=128 AND LENGTH(CAST(repo AS BLOB))<=8192 AND (outcome IS NULL OR LENGTH(CAST(outcome AS BLOB))<=128)",params![ticket]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query(
+            &format!("SELECT capability,repo,state,outcome,authorization_revision,CASE WHEN {admission} THEN 1 ELSE 0 END FROM request WHERE id=?1 AND LENGTH(CAST(state AS BLOB))<=32 AND LENGTH(CAST(capability AS BLOB))<=128 AND LENGTH(CAST(repo AS BLOB))<=8192 AND (outcome IS NULL OR LENGTH(CAST(outcome AS BLOB))<=128)", admission = super::ADMISSION_STANDS),params![ticket]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -56,6 +61,7 @@ impl Store {
             state: RequestState::parse(&row.get::<String>(2)?)?,
             outcome: row.get(3)?,
             authorization_revision: row.get(4)?,
+            authorization_current: row.get::<i64>(5)? == 1,
         }))
     }
 
@@ -72,9 +78,8 @@ impl Store {
         ticket: &str,
         repository: &str,
     ) -> Result<EvidenceOrigins, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut foreign = self
-            .conn
+        let conn = self.lock().await?;
+        let mut foreign = conn
             .query(
                 "SELECT EXISTS(SELECT 1 FROM evidence_view WHERE request_id=?1 AND repository!=?2)",
                 params![ticket, repository],
@@ -86,7 +91,7 @@ impl Store {
             return Ok(EvidenceOrigins::Foreign);
         }
         drop(foreign);
-        let mut missing=self.conn.query(
+        let mut missing=conn.query(
             "SELECT EXISTS(SELECT 1 FROM evidence e WHERE e.request_id=?1 AND e.kind!='flow.checkpoint' AND NOT EXISTS(SELECT 1 FROM evidence_view v WHERE v.evidence_id=e.id AND v.request_id=e.request_id AND v.repository=?2))",params![ticket,repository]).await?;
         if let Some(row) = missing.next().await?
             && row.get::<i64>(0)? != 0
@@ -94,7 +99,7 @@ impl Store {
             return Ok(EvidenceOrigins::Incomplete);
         }
         drop(missing);
-        let mut rows=self.conn.query(
+        let mut rows=conn.query(
             "SELECT DISTINCT CASE WHEN LENGTH(CAST(origin_json AS BLOB))<=16384 THEN origin_json ELSE NULL END FROM evidence_view WHERE request_id=?1 AND repository=?2 LIMIT 257",params![ticket,repository]).await?;
         let mut origins = Vec::new();
         let mut bytes = 0usize;
@@ -118,8 +123,8 @@ impl Store {
         ticket: &str,
         repository: &str,
     ) -> Result<Option<FlowResultMeta>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query(
+        let conn = self.lock().await?;
+        let mut rows = conn.query(
             "SELECT v.origin_json,e.meta_json FROM evidence e JOIN evidence_view v ON v.evidence_id=e.id AND v.request_id=e.request_id WHERE e.request_id=?1 AND v.repository=?2 AND e.kind='flow.result' AND LENGTH(CAST(e.meta_json AS BLOB))<=16384 AND LENGTH(CAST(v.origin_json AS BLOB))<=16384 ORDER BY e.ts DESC,e.id DESC LIMIT 1",params![ticket,repository]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);

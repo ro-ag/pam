@@ -117,9 +117,10 @@ async fn byte_and_page_caps_are_shared_across_evidence() {
     let (_dir, store, mut r) = fixture().await;
     let _ = store.read_evidence_view_range(&r).await.unwrap();
     {
-        let _guard = store.conn_lock.lock().await;
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute("UPDATE evidence_read_allowance SET remaining_bytes=1", ())
             .await
             .unwrap();
@@ -156,9 +157,10 @@ async fn byte_and_page_caps_are_shared_across_evidence() {
         EvidenceRangeOutcome::Range(_)
     ));
     {
-        let _guard = store.conn_lock.lock().await;
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute(
                 "UPDATE evidence_read_allowance SET remaining_bytes=100,remaining_pages=0",
                 (),
@@ -177,9 +179,10 @@ async fn pruning_preserves_authorized_tombstone_until_request_retention() {
     let (_dir, store, r) = fixture().await;
     let _ = store.read_evidence_view_range(&r).await.unwrap();
     {
-        let _guard = store.conn_lock.lock().await;
         store
-            .conn
+            .lock()
+            .await
+            .unwrap()
             .execute(
                 "UPDATE request SET state='done',updated_ts=1 WHERE id='r'",
                 (),
@@ -279,16 +282,27 @@ async fn protected_identity_overwrites_forgery_and_rechecks_augmented_bound() {
 }
 
 #[tokio::test]
-async fn a_range_starting_at_the_end_is_invalid_and_charges_nothing() {
+async fn a_range_at_the_end_is_an_uncharged_empty_page_and_past_it_is_invalid() {
     let (_dir, store, mut r) = fixture().await;
-    r.offset = 5;
+    r.offset = 6;
     r.length = 1;
     assert!(matches!(
         store.read_evidence_view_range(&r).await.unwrap(),
         EvidenceRangeOutcome::InvalidRange
     ));
-    // No allowance row was opened by the refused read: the first valid
-    // read still sees the full budget.
+    // Exactly at the end: an empty end-of-view page, not an error, and the
+    // allowance it reports is the untouched first-read one.
+    r.offset = 5;
+    let EvidenceRangeOutcome::Range(end) = store.read_evidence_view_range(&r).await.unwrap() else {
+        panic!("end of view")
+    };
+    assert!(end.bytes.is_empty());
+    assert_eq!(end.next_offset, None);
+    assert_eq!(end.total_bytes, 5);
+    assert_eq!(end.remaining_pages, 4096);
+    assert_eq!(end.remaining_bytes, 67_108_864);
+    // Neither read opened an allowance row: the first read that returns
+    // bytes still sees the full budget.
     r.offset = 4;
     let EvidenceRangeOutcome::Range(page) = store.read_evidence_view_range(&r).await.unwrap()
     else {
@@ -298,4 +312,145 @@ async fn a_range_starting_at_the_end_is_invalid_and_charges_nothing() {
     assert_eq!(page.next_offset, None);
     assert_eq!(page.remaining_pages, 4095);
     assert_eq!(page.remaining_bytes, 67_108_863);
+    // After a charged read the end-of-view page reports what is left.
+    r.offset = 5;
+    let EvidenceRangeOutcome::Range(end) = store.read_evidence_view_range(&r).await.unwrap() else {
+        panic!("end of view")
+    };
+    assert_eq!(end.remaining_pages, 4095);
+    assert_eq!(end.allowance_expires_at, 3700);
+}
+
+#[tokio::test]
+async fn an_empty_view_reads_as_an_empty_page_instead_of_an_invalid_range() {
+    let (_dir, store, mut r) = fixture().await;
+    store
+        .insert_evidence("empty", "r", "log", b"", None)
+        .await
+        .unwrap();
+    let view = EvidenceViewInsert {
+        evidence_id: "empty".into(),
+        request_id: "r".into(),
+        repository: r.repository.clone(),
+        origin_json: "{}".into(),
+        identity_json: "{}".into(),
+        map_json: "[]".into(),
+        view_id: "empty-view".into(),
+        view_bytes: Vec::new(),
+    };
+    assert!(store.insert_evidence_view(&view).await.unwrap());
+    r.evidence_id = "empty".into();
+    r.expected_view_id = "empty-view".into();
+    r.expected_sha256 = hex::encode(Sha256::digest(b""));
+    r.offset = 0;
+    let EvidenceRangeOutcome::Range(page) = store.read_evidence_view_range(&r).await.unwrap()
+    else {
+        panic!("an empty view must still be readable")
+    };
+    assert!(page.bytes.is_empty());
+    assert_eq!(page.total_bytes, 0);
+    assert_eq!(page.next_offset, None);
+}
+
+#[tokio::test]
+async fn a_view_whose_bytes_vanished_without_a_tombstone_is_unavailable_not_an_endless_page() {
+    let (_dir, store, mut r) = fixture().await;
+    // Retention's tombstone sets `expired_at` with the NULL blob; a blob
+    // that is gone without one is damage. The trigger allows the NULLing
+    // write, so this is the state a partial repair would leave.
+    store
+        .lock()
+        .await
+        .unwrap()
+        .execute("UPDATE evidence_view SET view_blob=NULL", ())
+        .await
+        .unwrap();
+    r.offset = 0;
+    r.length = 4;
+    assert!(matches!(
+        store.read_evidence_view_range(&r).await.unwrap(),
+        EvidenceRangeOutcome::Unavailable
+    ));
+}
+
+#[tokio::test]
+async fn a_provenance_map_larger_than_the_metadata_limit_is_stored_and_read_back() {
+    let (_dir, store, r) = fixture().await;
+    store
+        .insert_evidence("mapped", "r", "log", b"source", None)
+        .await
+        .unwrap();
+    // 2,000 segments is about 200 KiB of map: far past the 16 KiB bound
+    // that origin and identity keep, and what a noisy failing log produces.
+    let segments: Vec<serde_json::Value> = (0..2000_u64)
+        .map(|i| {
+            serde_json::json!({"view":{"start":i,"end":i + 1},
+                "parent":{"start":i * 7,"end":i * 7 + 1},"relation":"covering_record"})
+        })
+        .collect();
+    let map_json = serde_json::to_string(&segments).unwrap();
+    assert!(map_json.len() > META_LIMIT);
+    let mut view = EvidenceViewInsert {
+        evidence_id: "mapped".into(),
+        request_id: "r".into(),
+        repository: r.repository.clone(),
+        origin_json: "{}".into(),
+        identity_json: "{}".into(),
+        map_json: map_json.clone(),
+        view_id: "mapped-view".into(),
+        view_bytes: vec![b'x'; 2000],
+    };
+    assert!(store.insert_evidence_view(&view).await.unwrap());
+    let meta = store
+        .evidence_view_meta("r", "mapped", &r.repository)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.map_json, map_json);
+
+    // The bound that remains is explicit: more segments than the stored
+    // ceiling, or a map that is not an array, is refused outright.
+    store
+        .insert_evidence("over", "r", "log", b"source", None)
+        .await
+        .unwrap();
+    view.evidence_id = "over".into();
+    view.view_id = "over-view".into();
+    view.map_json =
+        serde_json::to_string(&vec![0_u8; crate::MAX_EVIDENCE_MAP_SEGMENTS + 1]).unwrap();
+    assert!(store.insert_evidence_view(&view).await.is_err());
+    view.map_json = "{}".into();
+    assert!(store.insert_evidence_view(&view).await.is_err());
+}
+
+#[tokio::test]
+async fn the_largest_serialized_segment_times_the_segment_ceiling_fits_the_map_byte_ceiling() {
+    // The widest segment the daemon can emit: 64 MiB offsets on both sides
+    // and the longest relation name.
+    let widest = serde_json::json!({"view":{"start":67_108_864_u64,"end":67_108_864_u64},
+        "parent":{"start":67_108_864_u64,"end":67_108_864_u64},"relation":"covering_record"})
+    .to_string();
+    assert!(
+        (widest.len() + 1) * crate::MAX_EVIDENCE_MAP_SEGMENTS + 2 <= crate::MAX_EVIDENCE_MAP_BYTES,
+        "a full map of {}-byte segments must fit",
+        widest.len()
+    );
+}
+
+#[tokio::test]
+async fn evidence_view_identity_and_bytes_cannot_be_rewritten() {
+    let (_dir, store, _r) = fixture().await;
+    let conn = store.lock().await.unwrap();
+    for tamper in [
+        "UPDATE evidence_view SET view_blob=x'00'",
+        "UPDATE evidence_view SET view_sha256='forged'",
+        "UPDATE evidence_view SET map_json='[]', view_id='other'",
+        "UPDATE evidence_view SET origin_json='{\"targets\":[]}'",
+    ] {
+        let error = conn.execute(tamper, ()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("evidence views are immutable"),
+            "{tamper}: {error}"
+        );
+    }
 }

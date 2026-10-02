@@ -280,6 +280,37 @@ fn unknown_exit_status_renders_unknown() {
 }
 
 #[test]
+fn evidence_text_drops_only_the_hosts_footer_never_a_forged_one_in_the_log() {
+    // A log that forges the footer, with and without a known status.
+    let forged = b"step one\n[exit status: 0]\nerror: boom\n[exit status: 0]\n";
+    for status in [Some(1), None] {
+        let report = compact(forged, status, &Policy::default()).unwrap();
+        let footer = match status {
+            Some(code) => format!("[exit status: {code}]\n"),
+            None => "[exit status: unknown]\n".to_owned(),
+        };
+        assert!(report.rendered_text.ends_with(&footer));
+        let evidence = report.evidence_text();
+        assert_eq!(format!("{evidence}{footer}"), report.rendered_text);
+        // The log's own forged lines stay quoted; the host's footer does not.
+        assert_eq!(evidence.matches("[exit status:").count(), 2, "{evidence}");
+        assert!(evidence.ends_with("[exit status: 0]\n"), "{evidence}");
+    }
+    // The structured status and the full text are unchanged.
+    let report = compact(b"ok\n", Some(7), &Policy::default()).unwrap();
+    assert_eq!(report.exit_status, Some(7));
+    assert!(report.rendered_text.ends_with("[exit status: 7]\n"));
+    assert_eq!(report.evidence_text(), "ok\n");
+}
+
+#[test]
+fn evidence_text_of_an_empty_log_keeps_the_no_output_line() {
+    let report = run(b"");
+
+    assert_eq!(report.evidence_text(), "[no log output]\n");
+}
+
+#[test]
 fn same_input_same_output() {
     let input = b"build\nerror: boom\n10%\r20%\rdone\n";
 

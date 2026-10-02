@@ -35,8 +35,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, params};
 
+use crate::conn_gate::{ConnGate, ConnGuard};
 use crate::error::StoreError;
 use crate::migrations;
+
+/// Runs a future's statements on a held [`ConnGuard`] as one transaction:
+/// `BEGIN`, the future, then `COMMIT` on `Ok` or `ROLLBACK` on `Err`.
+///
+/// A macro rather than a function taking a closure on purpose. The terminal
+/// write runs at the bottom of the daemon's deepest call chains, and a debug
+/// build's engine frames already take most of a 2 MiB test-thread stack; the
+/// future is polled directly from the calling method, with no helper future
+/// wrapped around it. Cancel-safety does not depend on this macro:
+/// whatever cuts the sequence short, the next [`Store::lock`] finds the open
+/// transaction and rolls it back.
+macro_rules! transact {
+    ($conn:expr, $body:expr) => {{
+        $conn.begin().await?;
+        let result: Result<_, StoreError> = $body.await;
+        $conn.end(result).await
+    }};
+}
 
 /// Default `limit` for [`Store::list_requests_filtered`] when the caller
 /// passes `None`.
@@ -46,6 +65,32 @@ pub const DEFAULT_REQUEST_LIST_LIMIT: u64 = 100;
 /// and [`Store::list_model_jobs`]; a larger request is clamped, keeping
 /// every list query bounded.
 pub const MAX_LIST_LIMIT: u64 = 500;
+
+/// The `request.outcome` the daemon's admin tripwire records for a refused
+/// `admin.*` attempt (a forged or public-socket caller). Activity never hides
+/// those rows, whatever `hide_probes` says.
+pub const OUTCOME_ADMIN_DENIED: &str = "admin_denied";
+
+/// Largest database file [`Store::open`] checks for structural damage at
+/// boot. The check reads every page, so past this size it would hold up
+/// daemon start; [`Store::check_integrity`] runs it on demand instead.
+const BOOT_CHECK_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Longest batch [`Store::fail_expired_requests`] finishes in one transaction.
+pub const MAX_EXPIRY_BATCH: u32 = 64;
+
+/// SQL predicate over a `request` row: its admission still stands.
+///
+/// A request snapshots the number of revocations that existed when it was
+/// admitted (`authorization_revision`), and every revocation is numbered in
+/// order (`grant.revoked_seq`). The admission is void once a grant the request
+/// depends on was revoked after that snapshot — its own capability, or, for a
+/// `flow.run` ticket, any `flow.step:` capability, since the steps a run
+/// reaches are gated under those names. Re-granting does not restore it. A
+/// revocation of anything else leaves the request alone: it never depended on
+/// that grant. A revoked row without a sequence number counts as later than
+/// every admission, so a gap can only invalidate, never authorize.
+const ADMISSION_STANDS: &str = "request.authorization_revision IS NOT NULL AND NOT EXISTS (     SELECT 1 FROM \"grant\" g WHERE g.revoked_ts IS NOT NULL      AND (g.revoked_seq IS NULL OR g.revoked_seq > request.authorization_revision)      AND (g.capability = request.capability           OR (request.capability = 'flow.run' AND g.capability LIKE 'flow.step:%')))";
 
 /// Fixed startup subsets; never interpolate caller-supplied SQL predicates.
 #[derive(Clone, Copy)]
@@ -348,6 +393,27 @@ pub struct AuditEntry<'a> {
     pub detail: Option<&'a str>,
 }
 
+/// One change to the `grant` table, for the audited single-transaction
+/// methods ([`Store::apply_grant_change_audited`],
+/// [`Store::finish_request_with_grant_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantChange<'a> {
+    /// Record a new active global grant for this capability.
+    Add(&'a str),
+    /// Revoke this capability's active grant; the row stays as history.
+    Revoke(&'a str),
+}
+
+/// What an audited grant change did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantChangeOutcome {
+    /// The grant table changed and its audit row committed with it.
+    Applied,
+    /// Nothing was written: an `Add` found an active grant already, or a
+    /// `Revoke` found none.
+    Unchanged,
+}
+
 /// One row of the `audit` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
@@ -544,15 +610,15 @@ pub struct ConnectorPatch<'a> {
 pub struct Store {
     /// Keeps the database itself alive alongside the connection.
     _db: Database,
-    pub(crate) conn: Connection,
-    /// Serializes every statement on `conn`. turso refuses concurrent use
-    /// of one connection outright (`Misuse("concurrent use forbidden")`),
-    /// and the daemon drives this store from many tasks at once —
-    /// executor, dispatcher, reaper, admin. Each method holds the lock for
-    /// its statements; the transactional methods ([`Self::finish_request`]
-    /// and the pruners) hold it across their whole `BEGIN`..`COMMIT`
-    /// window so no other statement can join or break the transaction.
-    pub(crate) conn_lock: tokio::sync::Mutex<()>,
+    /// The one connection, behind the only lock that reaches it. turso
+    /// refuses concurrent use of one connection outright
+    /// (`Misuse("concurrent use forbidden")`), and the daemon drives this
+    /// store from many tasks at once — executor, dispatcher, reaper, admin.
+    /// Each method takes [`Self::lock`] for its statements; the transactional
+    /// methods run their whole `BEGIN`..`COMMIT` window through
+    /// [`ConnGuard::begin`]..[`ConnGuard::end`], and a call dropped inside one is rolled
+    /// back before the next caller is handed the connection.
+    gate: ConnGate,
 }
 
 impl std::fmt::Debug for Store {
@@ -576,33 +642,58 @@ impl Store {
                 source,
             })?;
         }
+        // The boot check reads every page, so it is only run while that is
+        // cheap; a larger file is checked on demand ([`Self::check_integrity`]).
+        let check = std::fs::metadata(path).map_or(0, |meta| meta.len()) <= BOOT_CHECK_MAX_BYTES;
         let path = path.to_str().ok_or_else(|| StoreError::NonUtf8Path {
             path: path.to_path_buf(),
         })?;
-        Self::init(Builder::new_local(path).build().await?).await
+        Self::init(Builder::new_local(path).build().await?, check).await
     }
 
     /// Opens a fresh in-memory database, for tests.
     pub async fn open_in_memory() -> Result<Self, StoreError> {
-        Self::init(Builder::new_local(":memory:").build().await?).await
+        Self::init(Builder::new_local(":memory:").build().await?, false).await
     }
 
-    async fn init(db: Database) -> Result<Self, StoreError> {
+    async fn init(db: Database, check: bool) -> Result<Self, StoreError> {
         let conn = db.connect()?;
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
+        if check {
+            // Before migrating: a damaged file must be refused as it is,
+            // not rewritten further.
+            integrity_check(&conn).await?;
+        } else {
+            tracing::debug!("skipping the boot integrity check for this database");
+        }
         migrations::run(&conn).await?;
         Ok(Self {
             _db: db,
-            conn,
-            conn_lock: tokio::sync::Mutex::new(()),
+            gate: ConnGate::new(conn),
         })
+    }
+
+    /// Exclusive use of the connection, guaranteed outside a transaction.
+    /// Every statement in this crate goes through the guard it returns.
+    pub(crate) async fn lock(&self) -> Result<ConnGuard<'_>, StoreError> {
+        self.gate.lock().await
+    }
+
+    /// Runs the engine's structural check over the whole file and answers
+    /// [`StoreError::Corrupt`] with what it found. [`Self::open`] runs the
+    /// same check at boot for files up to 256 MiB; this is the on-demand
+    /// form for larger ones (it reads every page under the connection lock,
+    /// so it belongs behind a deliberate operator action, not on a timer).
+    pub async fn check_integrity(&self) -> Result<(), StoreError> {
+        let conn = self.lock().await?;
+        integrity_check(&conn).await
     }
 
     /// The schema version currently recorded in the database.
     pub async fn schema_version(&self) -> Result<i64, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        migrations::current_version(&self.conn).await
+        let conn = self.lock().await?;
+        migrations::current_version(&conn).await
     }
 
     /// Inserts a new request in the `queued` state.
@@ -694,14 +785,15 @@ impl Store {
         repo: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
+        let conn = self.lock().await?;
+        let changed = conn
             .execute(
-                "UPDATE request SET state = 'queued', queue_authorized = 1, updated_ts = ?1
+                &format!(
+                    "UPDATE request SET state = 'queued', queue_authorized = 1, updated_ts = ?1
              WHERE id = ?2 AND repo = ?3 AND queue_authorized = 0
              AND state IN ('running','waiting_approval') AND expires_at_ms > ?4
-             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)",
+             AND {ADMISSION_STANDS}"
+                ),
                 params![now_ts(), id, repo, now_ms],
             )
             .await?;
@@ -711,13 +803,15 @@ impl Store {
     /// Restores only a safe journaled flow under its original admission and expiry.
     /// The startup lock must be held; runtime authorization is checked again on dispatch.
     pub async fn requeue_journaled_flow(&self, id: &str, now_ms: i64) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self.conn.execute(
-            "UPDATE request SET state = 'queued', updated_ts = ?1 WHERE id = ?2
+        let conn = self.lock().await?;
+        let changed = conn.execute(
+            &format!(
+                "UPDATE request SET state = 'queued', updated_ts = ?1 WHERE id = ?2
              AND capability = 'flow.run' AND state IN ('running','waiting_approval')
              AND queue_authorized = 1 AND expires_at_ms > ?3
-             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
-             AND EXISTS (SELECT 1 FROM flow_journal WHERE request_id = ?2 AND state IN ('ready','completed'))",
+             AND {ADMISSION_STANDS}
+             AND EXISTS (SELECT 1 FROM flow_journal WHERE request_id = ?2 AND state IN ('ready','completed'))"
+            ),
             params![now_ts(), id, now_ms],
         ).await?;
         Ok(changed == 1)
@@ -726,24 +820,29 @@ impl Store {
     /// Starts only a still-queued authorized request before its original expiry.
     /// A cancellation or terminal transition cannot be resurrected by a stale lane.
     pub async fn start_queued_request(&self, id: &str, now_ms: i64) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
+        let conn = self.lock().await?;
+        let changed = conn
             .execute(
-                "UPDATE request SET state = 'running', resume_at_ms = NULL, updated_ts = ?1 WHERE id = ?2
+                &format!(
+                    "UPDATE request SET state = 'running', resume_at_ms = NULL, updated_ts = ?1 WHERE id = ?2
              AND resume_at_ms IS NULL AND state = 'queued' AND queue_authorized = 1 AND expires_at_ms > ?3
-             AND authorization_revision = (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)",
+             AND {ADMISSION_STANDS}"
+                ),
                 params![now_ts(), id, now_ms],
             )
             .await?;
         Ok(changed == 1)
     }
 
-    /// Monotonic revision while revoked grant rows are retained.
+    /// Monotonic revision while revoked grant rows are retained: how many
+    /// revocations exist, of any capability. A request snapshots this at
+    /// admission. Comparing the snapshot to this figure by equality voids
+    /// every older request on any revocation; prefer
+    /// [`Self::request_authorization_current`], which voids only the requests
+    /// that depended on the revoked grant.
     pub async fn grant_revocation_revision(&self) -> Result<i64, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL",
                 (),
@@ -756,24 +855,157 @@ impl Store {
         Ok(row.get(0)?)
     }
 
+    /// True while `request_id`'s admission still stands: it captured a
+    /// revision, and no grant it depends on has been revoked since (its own
+    /// capability; for a `flow.run` ticket also any `flow.step:` capability).
+    /// False for a missing request, a row admitted without a revision, or
+    /// once a relevant revocation landed — re-granting never restores it.
+    ///
+    /// This is the scoped replacement for comparing
+    /// `authorization_revision` with [`Self::grant_revocation_revision`].
+    pub async fn request_authorization_current(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock().await?;
+        let mut rows = conn
+            .query(
+                &format!("SELECT 1 FROM request WHERE id = ?1 AND {ADMISSION_STANDS}"),
+                params![request_id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    /// How many revocations a request for `capability` depends on: the same
+    /// relevance rule as [`Self::request_authorization_current`], as a
+    /// monotonic counter. A long-running watcher stamps it once and compares
+    /// later; the figure moves only when a grant that capability depends on
+    /// is revoked.
+    pub async fn grant_revocation_revision_for(&self, capability: &str) -> Result<i64, StoreError> {
+        let conn = self.lock().await?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM \"grant\" g WHERE g.revoked_ts IS NOT NULL
+                 AND (g.capability = ?1 OR (?1 = 'flow.run' AND g.capability LIKE 'flow.step:%'))",
+                params![capability],
+            )
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| StoreError::NotFound {
+            table: "grant",
+            id: "scoped revocation revision".into(),
+        })?;
+        Ok(row.get(0)?)
+    }
+
     /// Count and UTF-8 bytes of retained identity/argument fields for active admissions.
+    ///
+    /// Every in-flight row with a deadline counts, expired or not. A row
+    /// stranded past its deadline therefore holds its slot until something
+    /// finishes it; [`Self::admission_usage_at`] counts only live admissions.
     pub async fn admission_usage(&self) -> Result<(u64, u64), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(id AS BLOB)) + LENGTH(CAST(capability AS BLOB))
-             + LENGTH(CAST(repo AS BLOB)) + LENGTH(CAST(caller_agent AS BLOB))
-             + LENGTH(CAST(args_json AS BLOB)) + COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0)), 0)
+        self.admission_usage_where("").await
+    }
+
+    /// [`Self::admission_usage`] over the admissions whose deadline is still
+    /// ahead of `now_ms`. A request past its deadline can no longer be
+    /// authorized, started, or woken, so it must not count against the
+    /// admission cap; [`Self::fail_expired_requests`] gives such rows their
+    /// terminal state.
+    pub async fn admission_usage_at(&self, now_ms: i64) -> Result<(u64, u64), StoreError> {
+        // An integer of ours, not caller text: safe to place in the SQL.
+        self.admission_usage_where(&format!(" AND expires_at_ms > {now_ms}"))
+            .await
+    }
+
+    async fn admission_usage_where(&self, extra: &str) -> Result<(u64, u64), StoreError> {
+        let conn = self.lock().await?;
+        // One SUM per field, added here: a single `SUM(a + b + ...)` nests
+        // deeply enough to cost the engine about a megabyte of stack in a
+        // debug build, and admission runs this under the daemon's handlers.
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(id AS BLOB))), 0),
+             COALESCE(SUM(LENGTH(CAST(capability AS BLOB))), 0),
+             COALESCE(SUM(LENGTH(CAST(repo AS BLOB))), 0),
+             COALESCE(SUM(LENGTH(CAST(caller_agent AS BLOB))), 0),
+             COALESCE(SUM(LENGTH(CAST(args_json AS BLOB))), 0),
+             COALESCE(SUM(LENGTH(CAST(idempotency_key AS BLOB))), 0)
              FROM request WHERE expires_at_ms IS NOT NULL
-             AND state IN ('queued','running','waiting_approval')", (),
-        ).await?;
+             AND state IN ('queued','running','waiting_approval'){extra}"
+                ),
+                (),
+            )
+            .await?;
         let row = rows.next().await?.ok_or_else(|| StoreError::NotFound {
             table: "request",
             id: "admission usage".into(),
         })?;
-        Ok((
-            u64::try_from(row.get::<i64>(0)?).unwrap_or(u64::MAX),
-            u64::try_from(row.get::<i64>(1)?).unwrap_or(u64::MAX),
-        ))
+        let mut bytes = 0_u64;
+        for column in 1..=6 {
+            bytes =
+                bytes.saturating_add(u64::try_from(row.get::<i64>(column)?).unwrap_or(u64::MAX));
+        }
+        Ok((u64::try_from(row.get::<i64>(0)?).unwrap_or(u64::MAX), bytes))
+    }
+
+    /// Finishes in-flight requests whose admission deadline passed at or
+    /// before `now_ms`: state `failed`, `outcome`, and one `audit` row each,
+    /// oldest deadline first, at most `limit` (clamped into
+    /// `1..=`[`MAX_EXPIRY_BATCH`]) in one transaction. Returns the ids this
+    /// call finished; call again while it returns `limit` ids.
+    ///
+    /// Every row goes through the same statements as
+    /// [`Self::finish_request`], so a flow with an unresolved effect is still
+    /// sealed as `flow_effect_uncertain` rather than hidden behind `outcome`,
+    /// and a row another finisher reached first is left alone. The caller
+    /// decides when a row is stranded: pass a `now_ms` far enough behind the
+    /// clock that a handler still running past its deadline has had time to
+    /// write its own verdict.
+    pub async fn fail_expired_requests(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        outcome: &str,
+        audit: AuditEntry<'_>,
+    ) -> Result<Vec<String>, StoreError> {
+        let limit = limit.clamp(1, MAX_EXPIRY_BATCH);
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT id FROM request
+                         WHERE state IN ('queued','running','waiting_approval')
+                           AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1
+                           AND LENGTH(CAST(id AS BLOB)) <= 128
+                         ORDER BY expires_at_ms, id LIMIT {limit}"
+                    ),
+                    params![now_ms],
+                )
+                .await?;
+            let mut ids: Vec<String> = Vec::new();
+            while let Some(row) = rows.next().await? {
+                ids.push(row.get(0)?);
+            }
+            drop(rows);
+            let mut finished = Vec::with_capacity(ids.len());
+            for id in ids {
+                if Self::finish_request_in_txn(
+                    &conn,
+                    &id,
+                    RequestState::Failed,
+                    Some(outcome),
+                    audit,
+                )
+                .await?
+                {
+                    finished.push(id);
+                }
+            }
+            Ok(finished)
+        })
     }
 
     /// Scope a dedupe key to the entire authorized operation shape, including expiry.
@@ -785,18 +1017,18 @@ impl Store {
         key: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows =
-            self.conn
-                .query(
-                    &format!(
-            "SELECT {} FROM request WHERE capability = ?1 AND repo = ?2 AND args_json = ?3
+        let conn = self.lock().await?;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {} FROM request WHERE capability = ?1 AND repo = ?2 AND args_json = ?3
              AND (?4 IS NULL OR idempotency_key = ?4) AND expires_at_ms > ?5
              AND state IN ('queued','running','waiting_approval') ORDER BY created_ts, id LIMIT 1",
-            Self::REQUEST_COLUMNS),
-                    params![capability, repo, args_json, key, now_ms],
-                )
-                .await?;
+                    Self::REQUEST_COLUMNS
+                ),
+                params![capability, repo, args_json, key, now_ms],
+            )
+            .await?;
         rows.next()
             .await?
             .map(|row| Self::parse_request_row(&row))
@@ -817,11 +1049,10 @@ impl Store {
         state: RequestState,
         expires_at_ms: Option<i64>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let now = now_ts();
-        self.conn
-            .execute(
-                "INSERT INTO request
+        conn.execute(
+            "INSERT INTO request
                      (id, capability, repo, caller_agent, args_json,
                       idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms,
                       authorization_revision)
@@ -829,19 +1060,19 @@ impl Store {
                       CASE WHEN ?9 IS NOT NULL THEN
                         (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
                       ELSE NULL END)",
-                params![
-                    id,
-                    capability,
-                    repo,
-                    caller_agent,
-                    args_json,
-                    idempotency_key,
-                    state.as_str(),
-                    now,
-                    expires_at_ms
-                ],
-            )
-            .await?;
+            params![
+                id,
+                capability,
+                repo,
+                caller_agent,
+                args_json,
+                idempotency_key,
+                state.as_str(),
+                now,
+                expires_at_ms
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -874,9 +1105,8 @@ impl Store {
 
     /// Reads one request by id, or `None` if it does not exist.
     pub async fn get_request(&self, id: &str) -> Result<Option<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT {} FROM request WHERE id = ?1",
@@ -894,9 +1124,8 @@ impl Store {
     /// Reads every `queued` request. Intended for bounded test fixtures;
     /// startup recovery must use [`Self::queued_recovery_page`] instead.
     pub async fn list_queued_ordered(&self) -> Result<Vec<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT {} FROM request
@@ -949,25 +1178,25 @@ impl Store {
         after: Option<(i64, &str)>,
         maximum_bytes: u64,
     ) -> Result<Option<Vec<RequestRow>>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let maximum = i64::try_from(maximum_bytes.min(8 * 1024 * 1024)).unwrap_or(0);
-        let Some(ids) = self.recovery_ids(subset, after, maximum).await? else {
+        let Some(ids) = Self::recovery_ids(&conn, subset, after, maximum).await? else {
             return Ok(None);
         };
         let mut page = Vec::with_capacity(ids.len());
         for id in ids {
             // Keep the SQL bound at the payload query too. The same connection
             // mutex covers both reads; no local writer can enlarge a row between
-            // the metadata pass and materialization.
-            let mut rows = self
-                .conn
+            // the metadata pass and materialization. Each text column is
+            // withheld by SQL when it alone exceeds the bound, and the row's
+            // total is checked before any of it is parsed.
+            let mut rows = conn
                 .query(
                     &format!(
-                        "SELECT {} FROM request WHERE id = ?1 AND ({})
-                     AND ({}) <= ?2",
-                        Self::REQUEST_COLUMNS,
+                        "SELECT {}, {} FROM request WHERE id = ?1 AND ({})",
+                        Self::RECOVERY_GUARDED_COLUMNS,
+                        Self::RECOVERY_LENGTH_COLUMNS,
                         subset.predicate(),
-                        Self::RECOVERY_TEXT_BYTES,
                     ),
                     params![id, maximum],
                 )
@@ -975,36 +1204,85 @@ impl Store {
             let Some(row) = rows.next().await? else {
                 return Ok(None);
             };
+            match Self::recovery_row_bytes(&row, Self::RECOVERY_GUARDED_COUNT)? {
+                Some(size) if size <= maximum => {}
+                _ => return Ok(None),
+            }
             page.push(Self::parse_request_row(&row)?);
         }
         Ok(Some(page))
     }
 
-    // Include every selected text field, especially nullable legacy outcome/key.
-    // CAST AS BLOB counts UTF-8 bytes, not characters or a prefix before NUL.
-    const RECOVERY_TEXT_BYTES: &'static str =
-        "LENGTH(CAST(id AS BLOB)) + LENGTH(CAST(capability AS BLOB))
-         + LENGTH(CAST(repo AS BLOB)) + LENGTH(CAST(caller_agent AS BLOB))
-         + LENGTH(CAST(args_json AS BLOB)) + LENGTH(CAST(state AS BLOB))
-         + COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0)
-         + COALESCE(LENGTH(CAST(outcome AS BLOB)), 0)";
+    /// The byte length of every text field a recovery row carries, one
+    /// column each. Nullable legacy outcome/key included; `CAST AS BLOB`
+    /// counts UTF-8 bytes, not characters or a prefix before NUL.
+    ///
+    /// Separate columns, added up in Rust by [`Self::recovery_row_bytes`],
+    /// rather than one `a + b + ...` in SQL: the engine translates an
+    /// expression recursively with one very large frame per level in a debug
+    /// build, and an eight-term sum inside a comparison was deep enough to
+    /// take the daemon's boot recovery to within a few kilobytes of a 2 MiB
+    /// thread stack.
+    const RECOVERY_LENGTH_COLUMNS: &'static str = "LENGTH(CAST(id AS BLOB)), \
+         LENGTH(CAST(capability AS BLOB)), LENGTH(CAST(repo AS BLOB)), \
+         LENGTH(CAST(caller_agent AS BLOB)), LENGTH(CAST(args_json AS BLOB)), \
+         LENGTH(CAST(state AS BLOB)), COALESCE(LENGTH(CAST(idempotency_key AS BLOB)), 0), \
+         COALESCE(LENGTH(CAST(outcome AS BLOB)), 0)";
 
-    /// Metadata-only page; called with `conn_lock` held by the page reader.
+    /// How many length columns [`Self::RECOVERY_LENGTH_COLUMNS`] selects.
+    const RECOVERY_LENGTH_COUNT: usize = 8;
+
+    /// [`Self::REQUEST_COLUMNS`] in the same order, with every text column
+    /// replaced by NULL when it alone is longer than `?2`, so an oversized
+    /// legacy value is never handed to Rust.
+    const RECOVERY_GUARDED_COLUMNS: &'static str = "\
+         CASE WHEN LENGTH(CAST(id AS BLOB)) <= ?2 THEN id END, \
+         CASE WHEN LENGTH(CAST(capability AS BLOB)) <= ?2 THEN capability END, \
+         CASE WHEN LENGTH(CAST(repo AS BLOB)) <= ?2 THEN repo END, \
+         CASE WHEN LENGTH(CAST(caller_agent AS BLOB)) <= ?2 THEN caller_agent END, \
+         CASE WHEN LENGTH(CAST(args_json AS BLOB)) <= ?2 THEN args_json END, \
+         CASE WHEN LENGTH(CAST(idempotency_key AS BLOB)) <= ?2 THEN idempotency_key END, \
+         CASE WHEN LENGTH(CAST(state AS BLOB)) <= ?2 THEN state END, \
+         CASE WHEN LENGTH(CAST(outcome AS BLOB)) <= ?2 THEN outcome END, \
+         created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision, \
+         resume_at_ms";
+
+    /// How many columns [`Self::RECOVERY_GUARDED_COLUMNS`] selects: the
+    /// index of the first length column that follows them.
+    const RECOVERY_GUARDED_COUNT: usize = 14;
+
+    /// Adds up the length columns starting at `first`. `None` when a length
+    /// is negative: the row is refused, never guessed at.
+    fn recovery_row_bytes(row: &turso::Row, first: usize) -> Result<Option<i64>, StoreError> {
+        let mut size = 0_i64;
+        for column in first..first + Self::RECOVERY_LENGTH_COUNT {
+            let length = row.get::<i64>(column)?;
+            if length < 0 {
+                return Ok(None);
+            }
+            size = size.saturating_add(length);
+        }
+        Ok(Some(size))
+    }
+
+    /// Metadata-only page; `conn` is the page reader's locked connection.
+    /// The identifier is withheld by SQL when it alone exceeds the bound,
+    /// and a row whose total exceeds it stops the page before the
+    /// identifier is read.
     async fn recovery_ids(
-        &self,
+        conn: &Connection,
         subset: RecoveryRows,
         after: Option<(i64, &str)>,
         maximum: i64,
     ) -> Result<Option<Vec<String>>, StoreError> {
-        let mut rows = self
-            .conn
+        let mut rows = conn
             .query(
                 &format!(
-                    "SELECT CASE WHEN ({size}) <= ?3 THEN id ELSE NULL END, ({size})
+                    "SELECT CASE WHEN LENGTH(CAST(id AS BLOB)) <= ?3 THEN id END, {lengths}
                  FROM request WHERE ({predicate})
                  AND (?1 IS NULL OR created_ts > ?1 OR (created_ts = ?1 AND id > ?2))
                  ORDER BY created_ts, id LIMIT 16",
-                    size = Self::RECOVERY_TEXT_BYTES,
+                    lengths = Self::RECOVERY_LENGTH_COLUMNS,
                     predicate = subset.predicate(),
                 ),
                 params![after.map(|(ts, _)| ts), after.map(|(_, id)| id), maximum],
@@ -1013,8 +1291,10 @@ impl Store {
         let mut ids = Vec::new();
         let mut bytes = 0_i64;
         while let Some(row) = rows.next().await? {
-            let size = row.get::<i64>(1)?;
-            if size < 0 || size > maximum {
+            let Some(size) = Self::recovery_row_bytes(&row, 1)? else {
+                return Ok(None);
+            };
+            if size > maximum {
                 return Ok(None);
             }
             if bytes.saturating_add(size) > maximum {
@@ -1041,6 +1321,14 @@ impl Store {
     /// no silent paths. A terminal `state` here is refused with
     /// [`StoreError::TerminalTransition`] before any write, in every
     /// build.
+    ///
+    /// # Invariant: terminal states are absorbing
+    ///
+    /// The `UPDATE` itself only matches an in-flight row. A request that
+    /// already finished — cancelled, reaped, or timed out while its caller
+    /// was parked — keeps its verdict and its cause: the call fails with
+    /// [`StoreError::AlreadyTerminal`] and writes nothing, so a late
+    /// approval or wake-up can never bring a finished request back to life.
     pub async fn update_request_state(
         &self,
         id: &str,
@@ -1052,21 +1340,33 @@ impl Store {
                 state: state.as_str(),
             });
         }
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
+        let conn = self.lock().await?;
+        let changed = conn
             .execute(
-                "UPDATE request SET state = ?2, outcome = ?3, updated_ts = ?4 WHERE id = ?1",
+                "UPDATE request SET state = ?2, outcome = ?3, updated_ts = ?4
+                 WHERE id = ?1 AND state IN ('queued','running','waiting_approval')",
                 params![id, state.as_str(), outcome, now_ts()],
             )
             .await?;
         if changed == 0 {
-            return Err(StoreError::NotFound {
-                table: "request",
-                id: id.to_owned(),
-            });
+            return Err(Self::missing_or_terminal(&conn, id).await?);
         }
         Ok(())
+    }
+
+    /// Why an in-flight-only write matched nothing: the request finished
+    /// already, or was never there.
+    async fn missing_or_terminal(conn: &Connection, id: &str) -> Result<StoreError, StoreError> {
+        let mut rows = conn
+            .query("SELECT 1 FROM request WHERE id = ?1", params![id])
+            .await?;
+        Ok(match rows.next().await? {
+            Some(_) => StoreError::AlreadyTerminal { id: id.to_owned() },
+            None => StoreError::NotFound {
+                table: "request",
+                id: id.to_owned(),
+            },
+        })
     }
 
     /// Moves a request into terminal `state`, recording `outcome` and
@@ -1094,23 +1394,24 @@ impl Store {
                 state: state.as_str(),
             });
         }
-        let _guard = self.conn_lock.lock().await;
-        self.conn.execute("BEGIN", ()).await?;
+        let conn = self.lock().await?;
         // COMMIT on both `Ok` outcomes: the no-op path wrote nothing of
         // its own, so committing it is free and keeps one exit path.
-        let finished = self.finish_request_in_txn(id, state, outcome, audit).await;
-        self.end_txn(finished).await
+        transact!(
+            conn,
+            Self::finish_request_in_txn(&conn, id, state, outcome, audit)
+        )
     }
 
     /// The statements inside [`Self::finish_request`]'s transaction.
     async fn finish_request_in_txn(
-        &self,
+        conn: &Connection,
         id: &str,
         state: RequestState,
         outcome: Option<&str>,
         audit: AuditEntry<'_>,
     ) -> Result<bool, StoreError> {
-        let uncertain = self.terminal_flow_uncertainty_locked(id).await?;
+        let uncertain = Self::terminal_flow_uncertainty_locked(conn, id).await?;
         let uncertainty_detail = uncertain.then(|| {
             serde_json::json!({
                 "cause": "flow_effect_uncertain",
@@ -1135,8 +1436,7 @@ impl Store {
         } else {
             (state, outcome, audit)
         };
-        let changed = self
-            .conn
+        let changed = conn
             .execute(
                 "UPDATE request SET state = ?2, outcome = ?3, updated_ts = ?4
                  WHERE id = ?1 AND state IN ('queued','running','waiting_approval')",
@@ -1146,8 +1446,7 @@ impl Store {
         if changed == 0 {
             // Nothing matched: either the row is already terminal (the
             // idempotent no-op) or it does not exist at all.
-            let mut rows = self
-                .conn
+            let mut rows = conn
                 .query("SELECT 1 FROM request WHERE id = ?1", params![id])
                 .await?;
             return match rows.next().await? {
@@ -1158,29 +1457,31 @@ impl Store {
                 }),
             };
         }
-        self.conn
-            .execute(
-                "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+        conn.execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    audit.action,
-                    audit.decision.as_str(),
-                    audit.actor.as_str(),
-                    audit.detail,
-                    now_ts()
-                ],
-            )
-            .await?;
+            params![
+                id,
+                audit.action,
+                audit.decision.as_str(),
+                audit.actor.as_str(),
+                audit.detail,
+                now_ts()
+            ],
+        )
+        .await?;
         Ok(true)
     }
 
-    /// The caller owns the connection lock and terminal transaction. Seal an
+    /// `conn` is the caller's locked connection, inside its terminal transaction. Seal an
     /// unresolved effect before any terminal writer can hide it behind success,
     /// cancellation, or a deadline. A terminal row remains an idempotent no-op.
-    async fn terminal_flow_uncertainty_locked(&self, id: &str) -> Result<bool, StoreError> {
-        let landing_intent = self.landing_prepared_intent_locked(id).await?;
-        self.conn
+    async fn terminal_flow_uncertainty_locked(
+        conn: &Connection,
+        id: &str,
+    ) -> Result<bool, StoreError> {
+        let landing_intent = Self::landing_prepared_intent_locked(conn, id).await?;
+        conn
             .execute(
                 "UPDATE flow_journal SET state='uncertain',revision=revision+1
                  WHERE request_id=?1 AND (state='prepared' OR (state='ready' AND ?2=1)) AND effectful=1
@@ -1189,8 +1490,7 @@ impl Store {
                 params![id, i64::from(landing_intent)],
             )
             .await?;
-        let mut rows = self
-            .conn
+        let mut rows = conn
             .query(
                 "SELECT 1 FROM flow_journal j JOIN request r ON r.id=j.request_id
                  WHERE j.request_id=?1 AND j.state='uncertain'
@@ -1211,7 +1511,7 @@ impl Store {
         &self,
         terminal_actions: &[&str],
     ) -> Result<Vec<String>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let sql = if terminal_actions.is_empty() {
             // No action can match, so every terminal request is missing.
             "SELECT id FROM request
@@ -1233,7 +1533,7 @@ impl Store {
             )
         };
         let actions: Vec<String> = terminal_actions.iter().map(|a| (*a).to_owned()).collect();
-        let mut rows = self.conn.query(&sql, actions).await?;
+        let mut rows = conn.query(&sql, actions).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(row.get(0)?);
@@ -1245,9 +1545,8 @@ impl Store {
     /// `waiting_approval`). Feeds the `status` capability's
     /// `active_requests` figure.
     pub async fn count_inflight(&self) -> Result<i64, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM request
                  WHERE state IN ('queued','running','waiting_approval')",
@@ -1270,29 +1569,27 @@ impl Store {
         actor: Actor,
         detail: Option<&str>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    request_id,
-                    action,
-                    decision.as_str(),
-                    actor.as_str(),
-                    detail,
-                    now_ts()
-                ],
-            )
-            .await?;
+            params![
+                request_id,
+                action,
+                decision.as_str(),
+                actor.as_str(),
+                detail,
+                now_ts()
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     /// Reads every audit row for one request, oldest first.
     pub async fn audit_for_request(&self, request_id: &str) -> Result<Vec<AuditRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, request_id, action, decision, actor, detail, ts
                  FROM audit WHERE request_id = ?1 ORDER BY id",
@@ -1319,9 +1616,8 @@ impl Store {
     /// True when `capability` currently has an active global grant
     /// (a `grant` row whose `revoked_ts` is NULL).
     pub async fn active_grant(&self, capability: &str) -> Result<bool, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT 1 FROM \"grant\"
                  WHERE capability = ?1 AND revoked_ts IS NULL LIMIT 1",
@@ -1339,46 +1635,200 @@ impl Store {
     /// Granting and revoking are GUI-only administration (the daemon's
     /// admin surface); the policy gate only ever *adds* grants, on the
     /// relaxed profile's auto-grant path.
+    ///
+    /// This write carries no audit row. A caller that owes one uses
+    /// [`Self::apply_grant_change_audited`] or
+    /// [`Self::finish_request_with_grant_change`], which commit the grant and
+    /// its audit row together.
     pub async fn insert_grant(&self, capability: &str) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO \"grant\" (capability, scope, granted_ts)
-                 VALUES (?1, 'global', ?2)",
-                params![capability, now_ts()],
-            )
-            .await?;
+        let conn = self.lock().await?;
+        Self::insert_grant_row(&conn, capability).await
+    }
+
+    async fn insert_grant_row(conn: &Connection, capability: &str) -> Result<(), StoreError> {
+        conn.execute(
+            "INSERT INTO \"grant\" (capability, scope, granted_ts)
+             VALUES (?1, 'global', ?2)",
+            params![capability, now_ts()],
+        )
+        .await?;
         Ok(())
     }
 
     /// Revokes `capability`'s active grant by setting `revoked_ts` — the
     /// row stays, as history. Errors with [`StoreError::NotFound`] when
     /// no active grant exists (never granted, or already revoked).
+    ///
+    /// Like [`Self::insert_grant`] this carries no audit row; see the
+    /// audited variants.
     pub async fn revoke_grant(&self, capability: &str) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE \"grant\" SET revoked_ts = ?2
-                 WHERE capability = ?1 AND revoked_ts IS NULL",
-                params![capability, now_ts()],
-            )
-            .await?;
-        if changed == 0 {
-            return Err(StoreError::NotFound {
+        let conn = self.lock().await?;
+        let revoked = transact!(conn, Self::revoke_grant_rows(&conn, capability))?;
+        if revoked {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound {
                 table: "grant",
                 id: capability.to_owned(),
-            });
+            })
         }
+    }
+
+    /// Revokes inside the caller's transaction, numbering the revocation one
+    /// past every earlier one so [`ADMISSION_STANDS`] can tell which requests
+    /// were admitted before it. False when no active grant exists.
+    async fn revoke_grant_rows(conn: &Connection, capability: &str) -> Result<bool, StoreError> {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL",
+                (),
+            )
+            .await?;
+        let revoked_before: i64 = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        };
+        drop(rows);
+        let changed = conn
+            .execute(
+                "UPDATE \"grant\" SET revoked_ts = ?2, revoked_seq = ?3
+                 WHERE capability = ?1 AND revoked_ts IS NULL",
+                params![capability, now_ts(), revoked_before.saturating_add(1)],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// Applies one grant change inside the caller's transaction.
+    async fn apply_grant_change(
+        conn: &Connection,
+        change: GrantChange<'_>,
+    ) -> Result<GrantChangeOutcome, StoreError> {
+        let applied = match change {
+            GrantChange::Add(capability) => {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM \"grant\"
+                         WHERE capability = ?1 AND revoked_ts IS NULL LIMIT 1",
+                        params![capability],
+                    )
+                    .await?;
+                let active = rows.next().await?.is_some();
+                drop(rows);
+                if !active {
+                    Self::insert_grant_row(conn, capability).await?;
+                }
+                !active
+            }
+            GrantChange::Revoke(capability) => Self::revoke_grant_rows(conn, capability).await?,
+        };
+        Ok(if applied {
+            GrantChangeOutcome::Applied
+        } else {
+            GrantChangeOutcome::Unchanged
+        })
+    }
+
+    async fn insert_audit_row(
+        conn: &Connection,
+        request_id: &str,
+        audit: AuditEntry<'_>,
+    ) -> Result<(), StoreError> {
+        conn.execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                request_id,
+                audit.action,
+                audit.decision.as_str(),
+                audit.actor.as_str(),
+                audit.detail,
+                now_ts()
+            ],
+        )
+        .await?;
         Ok(())
+    }
+
+    /// Applies `change` and appends `audit` to `request_id` in **one
+    /// transaction**: the grant table never changes without the row that
+    /// says who changed it, and no audit row claims a change that did not
+    /// commit.
+    ///
+    /// The request stays in whatever state it was; this is for a grant made
+    /// in the middle of a request (the relaxed profile's auto-grant).
+    /// [`GrantChangeOutcome::Unchanged`] — an `Add` over an active grant, a
+    /// `Revoke` with none — writes nothing at all, audit row included. A
+    /// missing request fails the audit row's foreign key and rolls the grant
+    /// change back.
+    pub async fn apply_grant_change_audited(
+        &self,
+        request_id: &str,
+        change: GrantChange<'_>,
+        audit: AuditEntry<'_>,
+    ) -> Result<GrantChangeOutcome, StoreError> {
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            let outcome = Self::apply_grant_change(&conn, change).await?;
+            if outcome == GrantChangeOutcome::Applied {
+                Self::insert_audit_row(&conn, request_id, audit).await?;
+            }
+            Ok(outcome)
+        })
+    }
+
+    /// Applies `change`, moves request `id` to `done` with `outcome`, and
+    /// appends `audit` — all in **one transaction**. This is the admin
+    /// path's grant and revoke: the mutation, the terminal state and the
+    /// audit row commit together or not at all.
+    ///
+    /// - [`GrantChangeOutcome::Applied`]: all three are durable.
+    /// - [`GrantChangeOutcome::Unchanged`]: the change did not apply (an
+    ///   active grant already exists, or none to revoke). Nothing was
+    ///   written and the request is still in flight, so the caller finishes
+    ///   it as a refusal through [`Self::finish_request`].
+    /// - [`StoreError::AlreadyTerminal`]: the request finished first (its
+    ///   deadline, say). The grant table was **not** changed: an operation
+    ///   that was recorded as failed must not have taken effect.
+    /// - [`StoreError::NotFound`]: no such request; nothing written.
+    pub async fn finish_request_with_grant_change(
+        &self,
+        id: &str,
+        change: GrantChange<'_>,
+        outcome: Option<&str>,
+        audit: AuditEntry<'_>,
+    ) -> Result<GrantChangeOutcome, StoreError> {
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM request
+                     WHERE id = ?1 AND state IN ('queued','running','waiting_approval')",
+                    params![id],
+                )
+                .await?;
+            let in_flight = rows.next().await?.is_some();
+            drop(rows);
+            if !in_flight {
+                return Err(Self::missing_or_terminal(&conn, id).await?);
+            }
+            if Self::apply_grant_change(&conn, change).await? == GrantChangeOutcome::Unchanged {
+                return Ok(GrantChangeOutcome::Unchanged);
+            }
+            if !Self::finish_request_in_txn(&conn, id, RequestState::Done, outcome, audit).await? {
+                // Unreachable while this transaction holds the connection;
+                // an error here rolls the grant change back with it.
+                return Err(StoreError::AlreadyTerminal { id: id.to_owned() });
+            }
+            Ok(GrantChangeOutcome::Applied)
+        })
     }
 
     /// Every grant row, revoked history included, newest first — the
     /// GUI's capability view.
     pub async fn list_grants(&self) -> Result<Vec<GrantRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, capability, scope, granted_ts, revoked_ts
                  FROM \"grant\" ORDER BY granted_ts DESC, id DESC",
@@ -1409,8 +1859,11 @@ impl Store {
     /// `admin.*` op and the `status` health probe — so the GUI polling
     /// itself every few seconds cannot crowd real agent work out of the
     /// newest-N window. `admin.log.compress` is exempt: a human asked for
-    /// that compression, so its row is activity, not a probe. Auditors
-    /// pass `false` and see everything.
+    /// that compression, so its row is activity, not a probe. So is every
+    /// `admin.*` attempt the tripwire refused ([`OUTCOME_ADMIN_DENIED`]):
+    /// that row is somebody other than the GUI trying to administer PAM, and
+    /// hiding it with the GUI's own polls would hide the one thing the
+    /// tripwire exists to show. Auditors pass `false` and see everything.
     pub async fn list_requests_filtered(
         &self,
         limit: Option<u64>,
@@ -1420,16 +1873,26 @@ impl Store {
         capability: Option<&str>,
         hide_probes: bool,
     ) -> Result<Vec<RequestRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let limit = limit
             .unwrap_or(DEFAULT_REQUEST_LIST_LIMIT)
             .clamp(1, MAX_LIST_LIMIT);
         let mut clauses: Vec<String> = Vec::new();
         let mut args: Vec<String> = Vec::new();
+        // A terminal state matches most of the table: the unary plus keeps
+        // `request_state_idx` out of the plan, so the engine walks
+        // `request_created_idx` newest first and stops at the limit instead
+        // of collecting and sorting every finished request. An in-flight
+        // state is rare, and there the state index is the short way in.
+        let state_column = if state.is_some_and(RequestState::is_terminal) {
+            "+state"
+        } else {
+            "state"
+        };
         for (column, value) in [
             ("repo", repo),
             ("caller_agent", agent),
-            ("state", state.map(RequestState::as_str)),
+            (state_column, state.map(RequestState::as_str)),
             ("capability", capability),
         ] {
             if let Some(value) = value {
@@ -1440,11 +1903,11 @@ impl Store {
         if hide_probes {
             // Literals, not bound args: the patterns are ours, never the
             // caller's.
-            clauses.push(
-                "(capability NOT LIKE 'admin.%' OR capability = 'admin.log.compress') \
+            clauses.push(format!(
+                "(capability NOT LIKE 'admin.%' OR capability = 'admin.log.compress' \
+                 OR (state = 'refused' AND outcome = '{OUTCOME_ADMIN_DENIED}')) \
                  AND capability <> 'status'"
-                    .to_owned(),
-            );
+            ));
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -1456,7 +1919,7 @@ impl Store {
              ORDER BY created_ts DESC, id DESC LIMIT {limit}",
             Self::REQUEST_COLUMNS
         );
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = conn.query(&sql, args).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(Self::parse_request_row(&row)?);
@@ -1469,24 +1932,22 @@ impl Store {
     /// registry is advisory (see [`CallerRow`]); the pipeline calls this
     /// on every admitted request.
     pub async fn upsert_caller(&self, agent: &str, repo: &str) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO caller (agent, repo, first_seen, last_seen)
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO caller (agent, repo, first_seen, last_seen)
                  VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT (agent, repo) DO UPDATE SET last_seen = excluded.last_seen",
-                params![agent, repo, now_ts()],
-            )
-            .await?;
+            params![agent, repo, now_ts()],
+        )
+        .await?;
         Ok(())
     }
 
     /// Every observed agent+repo pair, most recently seen first — feeds
     /// the GUI sidebar and activity filters.
     pub async fn list_callers(&self) -> Result<Vec<CallerRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT agent, repo, first_seen, last_seen
                  FROM caller ORDER BY last_seen DESC, agent, repo",
@@ -1512,15 +1973,101 @@ impl Store {
         request_id: &str,
         capability: &str,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO approval (request_id, capability, requested_ts)
+                 VALUES (?1, ?2, ?3)",
+            params![request_id, capability, now_ts()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Parks `request_id` on a new approval: inserts the unresolved
+    /// `approval` row and moves the request to `waiting_approval` in **one
+    /// transaction**, so a crash can leave neither a pending approval on a
+    /// request that still reads `running` nor a waiting request with nothing
+    /// to approve.
+    ///
+    /// A request that already finished is refused with
+    /// [`StoreError::AlreadyTerminal`] and gets no approval row; a missing
+    /// one with [`StoreError::NotFound`].
+    pub async fn insert_approval_waiting(
+        &self,
+        request_id: &str,
+        capability: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            let now = now_ts();
+            let changed = conn
+                .execute(
+                    "UPDATE request SET state = 'waiting_approval', outcome = NULL, updated_ts = ?2
+                     WHERE id = ?1 AND state IN ('queued','running','waiting_approval')",
+                    params![request_id, now],
+                )
+                .await?;
+            if changed == 0 {
+                return Err(Self::missing_or_terminal(&conn, request_id).await?);
+            }
+            conn.execute(
                 "INSERT INTO approval (request_id, capability, requested_ts)
                  VALUES (?1, ?2, ?3)",
-                params![request_id, capability, now_ts()],
+                params![request_id, capability, now],
             )
             .await?;
-        Ok(())
+            Ok(())
+        })
+    }
+
+    /// Resolves `request_id`'s pending approval and appends `audit` — and,
+    /// when `remember` names a capability, records the grant that approval
+    /// creates together with its own audit row — all in **one
+    /// transaction**. A persisted authorization therefore always has the
+    /// audit rows that explain it, and a resolved approval is never missing
+    /// its decision in the trail.
+    ///
+    /// Returns `true` when a new grant row was written. With `remember` set
+    /// and a grant already active, no second active row is added and the
+    /// grant's audit row is not written (nothing was granted); the
+    /// resolution and its audit row still commit. Errors with
+    /// [`StoreError::NotFound`], writing nothing, when the request has no
+    /// unresolved approval — the same race guard as
+    /// [`Self::resolve_approval`].
+    pub async fn resolve_approval_audited(
+        &self,
+        request_id: &str,
+        resolution: ApprovalResolution,
+        note: Option<&str>,
+        audit: AuditEntry<'_>,
+        remember: Option<(&str, AuditEntry<'_>)>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            let changed = conn
+                .execute(
+                    "UPDATE approval SET resolved_ts = ?2, resolution = ?3, note = ?4
+                     WHERE request_id = ?1 AND resolved_ts IS NULL",
+                    params![request_id, now_ts(), resolution.as_str(), note],
+                )
+                .await?;
+            if changed == 0 {
+                return Err(StoreError::NotFound {
+                    table: "approval",
+                    id: request_id.to_owned(),
+                });
+            }
+            Self::insert_audit_row(&conn, request_id, audit).await?;
+            let Some((capability, grant_audit)) = remember else {
+                return Ok(false);
+            };
+            let granted = Self::apply_grant_change(&conn, GrantChange::Add(capability)).await?
+                == GrantChangeOutcome::Applied;
+            if granted {
+                Self::insert_audit_row(&conn, request_id, grant_audit).await?;
+            }
+            Ok(granted)
+        })
     }
 
     /// Resolves `request_id`'s pending approval: sets `resolved_ts`,
@@ -1536,9 +2083,8 @@ impl Store {
         resolution: ApprovalResolution,
         note: Option<&str>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
+        let conn = self.lock().await?;
+        let changed = conn
             .execute(
                 "UPDATE approval SET resolved_ts = ?2, resolution = ?3, note = ?4
                  WHERE request_id = ?1 AND resolved_ts IS NULL",
@@ -1560,9 +2106,8 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Option<ApprovalRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, request_id, capability, requested_ts, resolved_ts,
                         resolution, note
@@ -1590,17 +2135,22 @@ impl Store {
         }
     }
 
-    /// Every unresolved approval joined with its request, oldest first —
-    /// the GUI's pending list.
+    /// Every unresolved approval whose request is still in flight, joined
+    /// with that request, oldest first — the GUI's pending list.
+    ///
+    /// A request that already finished can no longer be approved: nothing is
+    /// waiting on the answer. A crash between a terminal write and the
+    /// approval's own resolution leaves such a row behind, and listing it
+    /// would advertise an approval nobody can grant.
     pub async fn list_pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT a.request_id, a.capability, r.repo, r.caller_agent,
                         a.requested_ts, r.capability, r.args_json
                  FROM approval a JOIN request r ON r.id = a.request_id
                  WHERE a.resolved_ts IS NULL
+                   AND r.state IN ('queued','running','waiting_approval')
                  ORDER BY a.requested_ts, a.id",
                 (),
             )
@@ -1622,9 +2172,8 @@ impl Store {
 
     /// Reads a setting value (JSON text), or `None` if unset.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query("SELECT value FROM setting WHERE key = ?1", params![key])
             .await?;
         match rows.next().await? {
@@ -1640,8 +2189,8 @@ impl Store {
         maximum: usize,
     ) -> Result<Option<String>, StoreError> {
         let maximum = i64::try_from(maximum).unwrap_or(i64::MAX).min(32_768);
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=?2 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key,maximum]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=?2 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key,maximum]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -1667,8 +2216,8 @@ impl Store {
                 value: "CAS value exceeds 32 KiB".to_owned(),
             });
         }
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=32768 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=32768 THEN value ELSE NULL END FROM setting WHERE key=?1", params![key]).await?;
         let prior =
             match rows.next().await? {
                 Some(row) => Some(row.get::<Option<String>>(0)?.ok_or_else(|| {
@@ -1683,21 +2232,39 @@ impl Store {
         if prior.as_deref() != expected {
             return Ok(false);
         }
-        self.conn.execute("INSERT INTO setting(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value]).await?;
+        conn.execute("INSERT INTO setting(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value]).await?;
         Ok(true)
     }
 
     /// Writes a setting value (JSON text), replacing any previous value.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO setting (key, value) VALUES (?1, ?2)
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .await?;
+            params![key, value],
+        )
+        .await?;
         Ok(())
+    }
+
+    /// Writes several settings in **one transaction**: every pair lands or
+    /// none does. A group of settings that is only valid together (the two
+    /// retention windows) is saved through this, so neither a crash nor a
+    /// concurrent save can persist half of one decision.
+    pub async fn set_settings(&self, pairs: &[(&str, &str)]) -> Result<(), StoreError> {
+        let conn = self.lock().await?;
+        transact!(conn, async {
+            for (key, value) in pairs {
+                conn.execute(
+                    "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![*key, *value],
+                )
+                .await?;
+            }
+            Ok(())
+        })
     }
 
     /// Records a new `running` model job.
@@ -1709,16 +2276,15 @@ impl Store {
         source: Option<&str>,
         bytes_total: Option<i64>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO model_job
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO model_job
                      (id, kind, model_id, source, state, bytes_done, bytes_total,
                       created_ts, updated_ts)
                  VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?6, ?6)",
-                params![id, kind, model_id, source, bytes_total, now_ts()],
-            )
-            .await?;
+            params![id, kind, model_id, source, bytes_total, now_ts()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -1732,15 +2298,14 @@ impl Store {
         bytes_done: i64,
         bytes_total: Option<i64>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "UPDATE model_job
+        let conn = self.lock().await?;
+        conn.execute(
+            "UPDATE model_job
                     SET bytes_done = ?2, bytes_total = ?3, updated_ts = ?4
                   WHERE id = ?1 AND state = 'running'",
-                params![id, bytes_done, bytes_total, now_ts()],
-            )
-            .await?;
+            params![id, bytes_done, bytes_total, now_ts()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -1754,25 +2319,23 @@ impl Store {
         state: &str,
         detail: Option<&str>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn
-            .execute(
-                "UPDATE model_job
+        let conn = self.lock().await?;
+        conn.execute(
+            "UPDATE model_job
                     SET state = ?2, detail = ?3, updated_ts = ?4
                   WHERE id = ?1 AND state = 'running'",
-                params![id, state, detail, now_ts()],
-            )
-            .await?;
+            params![id, state, detail, now_ts()],
+        )
+        .await?;
         Ok(())
     }
 
     /// The most recent model jobs, newest first, bounded by `limit`
     /// (clamped into `1..=`[`MAX_LIST_LIMIT`]).
     pub async fn list_model_jobs(&self, limit: u64) -> Result<Vec<ModelJobRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let limit = limit.clamp(1, MAX_LIST_LIMIT);
-        let mut rows = self
-            .conn
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT id, kind, model_id, source, state, bytes_done, bytes_total,
@@ -1807,9 +2370,8 @@ impl Store {
     /// Terminal rows are untouched: a job that already succeeded or was
     /// cancelled keeps its verdict across the restart.
     pub async fn fail_running_model_jobs(&self, detail: &str) -> Result<u64, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let changed = self
-            .conn
+        let conn = self.lock().await?;
+        let changed = conn
             .execute(
                 "UPDATE model_job
                     SET state = 'failed', detail = ?1, updated_ts = ?2
@@ -1834,33 +2396,34 @@ impl Store {
         content: &[u8],
         meta_json: Option<&str>,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        // Hash and copy before taking the connection: a 64 MiB blob is
+        // tens of milliseconds of CPU nobody else should wait behind.
         let content_hash = hex::encode(Sha256::digest(content));
-        self.conn
-            .execute(
-                "INSERT INTO evidence
+        let content = content.to_vec();
+        let conn = self.lock().await?;
+        conn.execute(
+            "INSERT INTO evidence
                      (id, request_id, kind, content, path, content_hash, meta_json, ts)
                  VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                params![
-                    id,
-                    request_id,
-                    kind,
-                    content.to_vec(),
-                    content_hash,
-                    meta_json,
-                    now_ts()
-                ],
-            )
-            .await?;
+            params![
+                id,
+                request_id,
+                kind,
+                content,
+                content_hash,
+                meta_json,
+                now_ts()
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     /// Reads one evidence row by id, blob included, or `None` if it does
     /// not exist.
     pub async fn get_evidence(&self, id: &str) -> Result<Option<EvidenceRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, request_id, kind, content, content_hash, meta_json, ts
                  FROM evidence WHERE id = ?1",
@@ -1884,9 +2447,8 @@ impl Store {
     /// Every evidence row for one request, oldest first, without the
     /// blobs — the GUI's evidence strip.
     pub async fn list_evidence(&self, request_id: &str) -> Result<Vec<EvidenceMeta>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, request_id, kind, LENGTH(content), content_hash, meta_json, ts
                  FROM evidence WHERE request_id = ?1 ORDER BY ts ASC, id ASC",
@@ -1917,9 +2479,8 @@ impl Store {
     /// counts as a compression — it happened — but contributes no
     /// figures, and says so in the log.
     pub async fn compression_stats(&self, since_ts: i64) -> Result<CompressionStats, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT id, meta_json FROM evidence WHERE kind = ?1 AND ts >= ?2",
                 params![EVIDENCE_KIND_LOG_COMPACT, since_ts],
@@ -1954,122 +2515,186 @@ impl Store {
         Ok(stats)
     }
 
-    /// The `evidence` rows an evidence-window pass removes: older than
-    /// `cutoff_ts`, not `keep_kind`, and hanging off a request that has
-    /// already finished.
+    /// Evidence rows one prune transaction removes: the oldest
+    /// [`Self::EVIDENCE_PRUNE_BATCH`] older than `?1`, not kind `?2`, and
+    /// hanging off a request that has already finished.
     ///
     /// A running request keeps its evidence whatever its age — the
     /// executor is still writing it, and a half-pruned working set is
-    /// worse than an old one.
-    const EVIDENCE_PRUNE_FILTER: &'static str = "ts < ?1 AND kind <> ?2 AND request_id IN \
-         (SELECT id FROM request WHERE state IN ('done','refused','failed'))";
+    /// worse than an old one. Written as an ordered range over `ts` with a
+    /// per-row request lookup so the engine walks `evidence_ts_idx` and
+    /// stops at the batch size, instead of collecting every terminal
+    /// request first and sorting what hangs off them.
+    pub(crate) fn evidence_prune_batch_sql() -> String {
+        format!(
+            "SELECT e.id FROM evidence e WHERE e.ts < ?1 AND e.kind <> ?2 AND EXISTS \
+             (SELECT 1 FROM request r WHERE r.id = e.request_id \
+              AND r.state IN ('done','refused','failed')) \
+             ORDER BY e.ts, e.id LIMIT {}",
+            Self::EVIDENCE_PRUNE_BATCH
+        )
+    }
 
-    /// The `request` rows an audit-window pass removes: terminal, and
-    /// untouched since `cutoff_ts`.
-    const REQUEST_PRUNE_FILTER: &'static str =
-        "state IN ('done','refused','failed') AND updated_ts < ?1";
+    /// Request records one prune transaction removes: the oldest
+    /// [`Self::REQUEST_PRUNE_BATCH`] terminal rows untouched since `?1`.
+    ///
+    /// "Terminal" is spelled as "not in flight" on purpose: the schema's
+    /// CHECK admits exactly six states, so the two say the same thing, but
+    /// this form leaves `request_state_idx` out of the plan and lets the
+    /// engine walk `request_updated_idx` in order and stop at the batch
+    /// size.
+    pub(crate) fn request_prune_batch_sql() -> String {
+        format!(
+            "SELECT id FROM request \
+             WHERE state NOT IN ('queued','running','waiting_approval') AND updated_ts < ?1 \
+             ORDER BY updated_ts, id LIMIT {}",
+            Self::REQUEST_PRUNE_BATCH
+        )
+    }
 
-    /// The same rows as a subquery, for the child tables.
-    const REQUEST_PRUNE_CHILDREN: &'static str = "request_id IN (SELECT id FROM request WHERE \
-         state IN ('done','refused','failed') AND updated_ts < ?1)";
+    /// Evidence rows one prune transaction removes. Blobs run to 64 MiB
+    /// each, so the batch stays small: the connection lock is released
+    /// between batches and a terminal write never waits behind a whole
+    /// backlog.
+    const EVIDENCE_PRUNE_BATCH: u64 = 64;
+
+    /// Request records one prune transaction removes, children included.
+    const REQUEST_PRUNE_BATCH: u64 = 256;
 
     /// Deletes evidence rows older than `cutoff_ts` whose kind is not
     /// `keep_kind` and whose request is already terminal.
     ///
     /// This is the evidence half of retention: the bulky blobs go first
     /// and the verdict (`keep_kind`) stays, so activity history keeps
-    /// reading straight after a pass. One transaction under the
-    /// connection lock; the figures are counted before the delete, so the
-    /// report is exact whatever the engine reports for a multi-row
-    /// statement.
+    /// reading straight after a pass. The work runs oldest first in
+    /// bounded batches, one transaction each, and the connection lock is
+    /// released between them, so a first pass over months of data cannot
+    /// hold every other store call behind it. The figures are counted
+    /// before each delete, so the report is exact whatever the engine
+    /// reports for a multi-row statement. Dropping the call keeps the
+    /// batches already committed; the next pass finishes the rest.
     pub async fn prune_evidence_before(
         &self,
         cutoff_ts: i64,
         keep_kind: &str,
     ) -> Result<EvidencePrune, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn.execute("BEGIN", ()).await?;
-        let pruned = self.prune_evidence_in_txn(cutoff_ts, keep_kind).await;
-        self.end_txn(pruned).await
+        let mut total = EvidencePrune::default();
+        loop {
+            let batch = {
+                let conn = self.lock().await?;
+                transact!(
+                    conn,
+                    Self::prune_evidence_batch(&conn, cutoff_ts, keep_kind)
+                )?
+            };
+            total.rows = total.rows.saturating_add(batch.rows);
+            total.bytes = total.bytes.saturating_add(batch.bytes);
+            if batch.rows < Self::EVIDENCE_PRUNE_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
-    /// The statements inside [`Self::prune_evidence_before`]'s transaction.
-    async fn prune_evidence_in_txn(
-        &self,
+    /// One batch of [`Self::prune_evidence_before`], inside its transaction.
+    async fn prune_evidence_batch(
+        conn: &Connection,
         cutoff_ts: i64,
         keep_kind: &str,
     ) -> Result<EvidencePrune, StoreError> {
-        let filter = Self::EVIDENCE_PRUNE_FILTER;
-        let (rows, bytes) = self
-            .measure(
+        // The same oldest-first id set three times; nothing between the
+        // statements changes which evidence rows the filter selects.
+        let batch = Self::evidence_prune_batch_sql();
+        let (rows, bytes) = Self::measure(
+            conn,
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
+                 FROM evidence WHERE id IN ({batch})"
+            ),
+            params![cutoff_ts, keep_kind],
+        )
+        .await?;
+        if rows > 0 {
+            conn.execute(
                 &format!(
-                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
-                     FROM evidence WHERE {filter}"
+                    "UPDATE evidence_view SET view_blob = NULL, expired_at = ?3 \
+                     WHERE evidence_id IN ({batch})"
                 ),
+                params![cutoff_ts, keep_kind, now_ts()],
+            )
+            .await?;
+            conn.execute(
+                &format!("DELETE FROM evidence WHERE id IN ({batch})"),
                 params![cutoff_ts, keep_kind],
             )
             .await?;
-        if rows > 0 {
-            self.conn.execute(
-                &format!("UPDATE evidence_view SET view_blob = NULL, expired_at = ?3 WHERE evidence_id IN (SELECT id FROM evidence WHERE {filter})"),
-                params![cutoff_ts, keep_kind, now_ts()],
-            ).await?;
-            self.conn
-                .execute(
-                    &format!("DELETE FROM evidence WHERE {filter}"),
-                    params![cutoff_ts, keep_kind],
-                )
-                .await?;
         }
         Ok(EvidencePrune { rows, bytes })
     }
 
     /// Deletes terminal requests older than `cutoff_ts` together with
-    /// their audit, approval, and evidence rows — children first, one
-    /// transaction under the connection lock.
+    /// their audit, approval, and evidence rows — children first.
     ///
     /// This is the audit half of retention, and the destructive one: a
     /// record leaves whole, verdict included, so nothing dangles and the
     /// foreign keys stay satisfied. In-flight requests are never touched,
-    /// however old they look.
+    /// however old they look. Like the evidence half it works oldest first
+    /// in bounded batches: each batch is one transaction, so a record is
+    /// never half-removed, and the connection lock is released between
+    /// batches.
     pub async fn prune_requests_before(&self, cutoff_ts: i64) -> Result<RequestPrune, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        self.conn.execute("BEGIN", ()).await?;
-        let pruned = self.prune_requests_in_txn(cutoff_ts).await;
-        self.end_txn(pruned).await
+        let mut total = RequestPrune::default();
+        loop {
+            let batch = {
+                let conn = self.lock().await?;
+                transact!(conn, Self::prune_requests_batch(&conn, cutoff_ts))?
+            };
+            total.requests = total.requests.saturating_add(batch.requests);
+            total.audit_rows = total.audit_rows.saturating_add(batch.audit_rows);
+            total.approvals = total.approvals.saturating_add(batch.approvals);
+            total.evidence_rows = total.evidence_rows.saturating_add(batch.evidence_rows);
+            total.evidence_bytes = total.evidence_bytes.saturating_add(batch.evidence_bytes);
+            if batch.requests < Self::REQUEST_PRUNE_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
-    /// The statements inside [`Self::prune_requests_before`]'s transaction.
-    async fn prune_requests_in_txn(&self, cutoff_ts: i64) -> Result<RequestPrune, StoreError> {
-        let children = Self::REQUEST_PRUNE_CHILDREN;
-        let requests_filter = Self::REQUEST_PRUNE_FILTER;
-        let (evidence_rows, evidence_bytes) = self
-            .measure(
-                &format!(
-                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
-                     FROM evidence WHERE {children}"
-                ),
-                params![cutoff_ts],
-            )
-            .await?;
-        let (audit_rows, _) = self
-            .measure(
-                &format!("SELECT COUNT(*), 0 FROM audit WHERE {children}"),
-                params![cutoff_ts],
-            )
-            .await?;
-        let (approvals, _) = self
-            .measure(
-                &format!("SELECT COUNT(*), 0 FROM approval WHERE {children}"),
-                params![cutoff_ts],
-            )
-            .await?;
-        let (requests, _) = self
-            .measure(
-                &format!("SELECT COUNT(*), 0 FROM request WHERE {requests_filter}"),
-                params![cutoff_ts],
-            )
-            .await?;
+    /// One batch of [`Self::prune_requests_before`], inside its transaction.
+    async fn prune_requests_batch(
+        conn: &Connection,
+        cutoff_ts: i64,
+    ) -> Result<RequestPrune, StoreError> {
+        // The same oldest-first id set for every table. The `request` rows
+        // themselves go last, so each child statement still sees them.
+        let batch = Self::request_prune_batch_sql();
+        let children = format!("request_id IN ({batch})");
+        let (evidence_rows, evidence_bytes) = Self::measure(
+            conn,
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) \
+                 FROM evidence WHERE {children}"
+            ),
+            params![cutoff_ts],
+        )
+        .await?;
+        let (audit_rows, _) = Self::measure(
+            conn,
+            &format!("SELECT COUNT(*), 0 FROM audit WHERE {children}"),
+            params![cutoff_ts],
+        )
+        .await?;
+        let (approvals, _) = Self::measure(
+            conn,
+            &format!("SELECT COUNT(*), 0 FROM approval WHERE {children}"),
+            params![cutoff_ts],
+        )
+        .await?;
+        let (requests, _) = Self::measure(
+            conn,
+            &format!("SELECT COUNT(*), 0 FROM request WHERE id IN ({batch})"),
+            params![cutoff_ts],
+        )
+        .await?;
         if requests > 0 {
             // Children first: the foreign keys point at `request`.
             for sql in [
@@ -2084,9 +2709,9 @@ impl Store {
                 format!("DELETE FROM evidence WHERE {children}"),
                 format!("DELETE FROM approval WHERE {children}"),
                 format!("DELETE FROM audit WHERE {children}"),
-                format!("DELETE FROM request WHERE {requests_filter}"),
+                format!("DELETE FROM request WHERE id IN ({batch})"),
             ] {
-                self.conn.execute(&sql, params![cutoff_ts]).await?;
+                conn.execute(&sql, params![cutoff_ts]).await?;
             }
         }
         Ok(RequestPrune {
@@ -2102,11 +2727,11 @@ impl Store {
     /// missing row or a negative figure reads as zero: a prune report
     /// never invents work it did not do.
     async fn measure<P: turso::IntoParams>(
-        &self,
+        conn: &Connection,
         sql: &str,
         params: P,
     ) -> Result<(u64, u64), StoreError> {
-        let mut rows = self.conn.query(sql, params).await?;
+        let mut rows = conn.query(sql, params).await?;
         let Some(row) = rows.next().await? else {
             return Ok((0, 0));
         };
@@ -2116,28 +2741,6 @@ impl Store {
             u64::try_from(count).unwrap_or(0),
             u64::try_from(bytes).unwrap_or(0),
         ))
-    }
-
-    /// Closes an open transaction around `result`: `COMMIT` when the
-    /// statements succeeded, best-effort `ROLLBACK` when they did not —
-    /// the original error is the one worth returning. A `COMMIT` that
-    /// fails is rolled back the same way: the caller holds
-    /// [`Self::conn_lock`], and a transaction left open on the shared
-    /// connection would swallow every later statement into it.
-    async fn end_txn<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
-        match result {
-            Ok(value) => match self.conn.execute("COMMIT", ()).await {
-                Ok(_) => Ok(value),
-                Err(err) => {
-                    let _ = self.conn.execute("ROLLBACK", ()).await;
-                    Err(err.into())
-                }
-            },
-            Err(err) => {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                Err(err)
-            }
-        }
     }
 
     /// The `connector` column list every row query selects, in the order
@@ -2163,9 +2766,8 @@ impl Store {
 
     /// Every connector row, ordered by id.
     pub async fn list_connectors(&self) -> Result<Vec<ConnectorRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT {} FROM connector ORDER BY id",
@@ -2184,9 +2786,8 @@ impl Store {
     /// Reads one connector row by id, or `None` if it has never been
     /// configured or tested.
     pub async fn get_connector(&self, id: &str) -> Result<Option<ConnectorRow>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT {} FROM connector WHERE id = ?1",
@@ -2213,7 +2814,7 @@ impl Store {
         id: &str,
         patch: ConnectorPatch<'_>,
     ) -> Result<ConnectorRow, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let enabled = patch.enabled.unwrap_or(false);
         let base_url = patch.base_url.flatten();
         let username = patch.username.flatten();
@@ -2250,15 +2851,13 @@ impl Store {
              ON CONFLICT (id) DO UPDATE SET {}",
             set_clauses.join(", ")
         );
-        self.conn
-            .execute(
-                &sql,
-                params![id, i64::from(enabled), base_url, username, now_ts()],
-            )
-            .await?;
+        conn.execute(
+            &sql,
+            params![id, i64::from(enabled), base_url, username, now_ts()],
+        )
+        .await?;
 
-        let mut rows = self
-            .conn
+        let mut rows = conn
             .query(
                 &format!(
                     "SELECT {} FROM connector WHERE id = ?1",
@@ -2287,12 +2886,11 @@ impl Store {
         passed: bool,
         detail: &str,
     ) -> Result<(), StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let status = if passed { "passed" } else { "failed" };
         let now = now_ts();
-        self.conn
-            .execute(
-                "INSERT INTO connector
+        conn.execute(
+            "INSERT INTO connector
                      (id, enabled, last_test_status, last_test_detail, last_test_ts, updated_ts)
                  VALUES (?1, 0, ?2, ?3, ?4, ?4)
                  ON CONFLICT (id) DO UPDATE SET
@@ -2300,10 +2898,37 @@ impl Store {
                      last_test_detail = excluded.last_test_detail,
                      last_test_ts = excluded.last_test_ts,
                      updated_ts = excluded.updated_ts",
-                params![id, status, detail, now],
-            )
-            .await?;
+            params![id, status, detail, now],
+        )
+        .await?;
         Ok(())
+    }
+}
+
+/// Asks the engine whether the file is structurally sound before anything
+/// reads or migrates it. `quick_check` skips the index cross-checks, so it
+/// stays cheap; a database that fails it is refused with a legible
+/// [`StoreError::Corrupt`] instead of surfacing later as a random engine
+/// error half-way through a request. A file the engine cannot read at all
+/// reaches the same variant through [`StoreError`]'s conversion.
+async fn integrity_check(conn: &Connection) -> Result<(), StoreError> {
+    let mut rows = conn.query("PRAGMA quick_check", ()).await?;
+    let mut problems: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let line = match row.get_value(0)? {
+            turso::Value::Text(text) => text,
+            other => format!("{other:?}"),
+        };
+        if line != "ok" && problems.len() < 4 {
+            problems.push(line.chars().take(200).collect());
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt {
+            detail: problems.join("; "),
+        })
     }
 }
 

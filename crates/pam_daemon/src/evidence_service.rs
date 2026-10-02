@@ -56,7 +56,16 @@ pub(crate) async fn publish(
     view: crate::evidence_view::RedactedView,
     parent: serde_json::Value,
 ) -> Result<(), String> {
-    let identity = json!({
+    // A finely fragmented map (a noisy failing log, many redactions) is
+    // coarsened to the stored ceiling, never a reason to drop the view: an
+    // evidence row without a view makes its whole ticket unreadable.
+    let source_segments = view.segments.len();
+    let segments = crate::evidence_view::coarsen_segments(
+        &view.segments,
+        pam_store::MAX_EVIDENCE_MAP_SEGMENTS,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut identity = json!({
         "schema_version": 1, "evidence_id": evidence_id, "request_id": request_id,
         "captured_at": now(), "input_sha256": view.source_sha256,
         "input_bytes": view.source_bytes, "offset_basis": "view_bytes",
@@ -65,6 +74,15 @@ pub(crate) async fn publish(
         "completeness": "not_asserted", "parent": parent,
         "products": scope.origin.targets.iter().map(|target| target.connector.as_str()).collect::<Vec<_>>()
     });
+    if segments.len() < source_segments {
+        // Say so where the reader sees it: provenance for this view answers
+        // with covering ranges, and how much detail was merged away.
+        identity["provenance_map"] = json!({
+            "resolution": "coarsened", "segments": segments.len(),
+            "source_segments": source_segments,
+            "merged_segments": source_segments - segments.len(),
+        });
+    }
     let insert = EvidenceViewInsert {
         evidence_id: evidence_id.to_owned(),
         request_id: request_id.to_owned(),
@@ -73,7 +91,7 @@ pub(crate) async fn publish(
         identity_json: identity.to_string(),
         view_id: format!("view_{}", ulid::Ulid::new()),
         view_bytes: view.bytes,
-        map_json: serde_json::to_string(&view.segments).map_err(|err| err.to_string())?,
+        map_json: serde_json::to_string(&segments).map_err(|err| err.to_string())?,
     };
     if !store
         .insert_evidence_view(&insert)
@@ -172,12 +190,11 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
         .await
         .map_err(store_failure)?
         .ok_or_else(unavailable)?;
-    let revision = ctx
-        .store
-        .grant_revocation_revision()
-        .await
-        .map_err(store_failure)?;
-    if meta.authorization_revision != Some(revision) {
+    // The originating request's admission must still stand: a grant it
+    // depended on, revoked since, withdraws its evidence. A revocation of
+    // some other capability does not — the live scope recheck below still
+    // runs on every read either way.
+    if !meta.authorization_current {
         return Err(unavailable());
     }
     let origin: EvidenceOrigin =
@@ -208,12 +225,11 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
         .map_err(|_| unavailable())?;
     current.authorize_repo(&repo).map_err(|_| unavailable())?;
     authorize_origin(&ctx.store, &current, &repo, &origin).await?;
-    if ctx
+    if !ctx
         .store
-        .grant_revocation_revision()
+        .request_authorization_current(&request.request_id)
         .await
         .map_err(store_failure)?
-        != revision
     {
         return Err(unavailable());
     }

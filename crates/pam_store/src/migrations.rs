@@ -61,7 +61,58 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: SCHEMA_V11,
     },
+    Migration {
+        version: 12,
+        sql: SCHEMA_V12,
+    },
 ];
+
+/// Migration 12: indexes for the hot scans, scoped revocation, immutability.
+///
+/// - The Activity list (`ORDER BY created_ts DESC, id DESC LIMIT n`), both
+///   prune passes (`updated_ts`, evidence `ts`) and the compression odometer
+///   (`kind`, `ts`) used to scan and sort their whole table under the
+///   connection lock; each gets the index its ordering needs.
+/// - `grant.revoked_seq` numbers revocations in the order they happened, so a
+///   request is invalidated only by a revocation that is both later than its
+///   admission and about a capability it depends on. Rows revoked before this
+///   migration are ranked by `revoked_ts`; revocations inside one second share
+///   the highest rank of that second, which can only invalidate more, never
+///   less.
+/// - Audit rows are append-only and an evidence view's bytes and identity are
+///   immutable: the triggers refuse any `UPDATE` of `audit`, and any `UPDATE`
+///   of `evidence_view` other than retention's tombstone (blob to NULL with
+///   every identity column unchanged). Retention still deletes whole records.
+const SCHEMA_V12: &str = r#"
+CREATE INDEX request_created_idx ON request (created_ts DESC, id DESC);
+CREATE INDEX request_updated_idx ON request (updated_ts, id);
+CREATE INDEX evidence_ts_idx ON evidence (ts, id);
+CREATE INDEX evidence_kind_ts_idx ON evidence (kind, ts);
+ALTER TABLE "grant" ADD COLUMN revoked_seq INTEGER;
+UPDATE "grant" SET revoked_seq = (
+    SELECT COUNT(*) FROM "grant" earlier
+    WHERE earlier.revoked_ts IS NOT NULL AND earlier.revoked_ts <= "grant".revoked_ts
+) WHERE revoked_ts IS NOT NULL;
+CREATE INDEX grant_capability_idx ON "grant" (capability);
+CREATE TRIGGER audit_append_only BEFORE UPDATE ON audit
+BEGIN
+    SELECT RAISE(ABORT, 'audit rows are append-only');
+END;
+CREATE TRIGGER evidence_view_immutable BEFORE UPDATE ON evidence_view
+WHEN NEW.view_blob IS NOT NULL
+  OR NEW.evidence_id IS NOT OLD.evidence_id
+  OR NEW.request_id IS NOT OLD.request_id
+  OR NEW.repository IS NOT OLD.repository
+  OR NEW.origin_json IS NOT OLD.origin_json
+  OR NEW.identity_json IS NOT OLD.identity_json
+  OR NEW.map_json IS NOT OLD.map_json
+  OR NEW.view_id IS NOT OLD.view_id
+  OR NEW.view_sha256 IS NOT OLD.view_sha256
+  OR NEW.view_bytes IS NOT OLD.view_bytes
+BEGIN
+    SELECT RAISE(ABORT, 'evidence views are immutable');
+END;
+"#;
 
 const SCHEMA_V11: &str = "CREATE TABLE landing_session(request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision>=0), document TEXT NOT NULL CHECK(length(CAST(document AS BLOB))<=131072));";
 

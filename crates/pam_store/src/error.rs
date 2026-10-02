@@ -71,7 +71,54 @@ pub enum StoreError {
         value: String,
     },
 
+    /// A request already reached `done`, `refused` or `failed`; those states
+    /// are absorbing, so a later non-terminal transition is refused rather
+    /// than written over the recorded verdict.
+    #[error(
+        "request {id} is already terminal; a finished request never returns \
+         to an in-flight state"
+    )]
+    AlreadyTerminal {
+        /// The request that had already finished.
+        id: String,
+    },
+
+    /// A store call was dropped inside a transaction and the rollback that
+    /// should have cleared it failed; the connection is refused rather than
+    /// reused inside somebody else's transaction.
+    #[error(
+        "the store connection is stuck inside an abandoned transaction; \
+         restart the pam daemon to recover it"
+    )]
+    AbandonedTransaction,
+
+    /// The database file failed the engine's own consistency check, or the
+    /// engine could not read its structure at all.
+    #[error(
+        "database integrity check failed: {detail}; stop the daemon and keep a \
+         copy of the state file before repairing it or restoring a backup"
+    )]
+    Corrupt {
+        /// What the engine reported, bounded.
+        detail: String,
+    },
+
     /// Any underlying database engine failure.
     #[error("database error: {0}")]
-    Database(#[from] turso::Error),
+    Database(#[source] turso::Error),
+}
+
+impl From<turso::Error> for StoreError {
+    /// The engine's own corruption verdicts become [`StoreError::Corrupt`]
+    /// wherever they surface, so a damaged file reads the same at open, in
+    /// the boot check, and half-way through a request; every other engine
+    /// failure stays [`StoreError::Database`].
+    fn from(error: turso::Error) -> Self {
+        match error {
+            turso::Error::Corrupt(detail) | turso::Error::NotAdb(detail) => Self::Corrupt {
+                detail: detail.chars().take(200).collect(),
+            },
+            other => Self::Database(other),
+        }
+    }
 }

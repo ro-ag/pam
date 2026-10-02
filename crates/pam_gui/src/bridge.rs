@@ -19,8 +19,8 @@
 //! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so the
 //! GUI sends no other public capability: cancelling a run is the admin op `admin.requests.cancel`,
 //! on the private channel like every other human act.
-//! The GUI's own status polls are marked in [`crate::own_requests`] before they are sent, so their
-//! lifecycle events never feed back into its refresh loop.
+//! The GUI's own status polls publish no events (the daemon keeps none for control requests), so
+//! they never feed back into its refresh loop through the event stream ([`crate::events`]).
 //! Daemon refusals pass through verbatim; client-side errors are mapped onto the same shape here.
 //! The envelope carries the GUI process's own advisory (not authenticated) caller identity.
 
@@ -28,7 +28,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pam_client::client::{self, RequestError};
-use pam_client::request::new_request_id;
 use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_AUDIT_REQUEST,
     OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET,
@@ -337,21 +336,16 @@ pub struct DaemonStatusReply {
 
 /// Daemon health for the beacon and the status views: ensures the daemon
 /// (lazy start) and asks the ordinary read-only `status` capability.
-/// An unreachable daemon is `{ connected: false }`, not an error. The
-/// request id is generated here and registered as the GUI's own, so the
-/// daemon's `started`/`done` events for this poll are not forwarded back to
-/// the webview (see [`crate::own_requests`]), and the whole call is bounded
-/// by `STATUS_CLIENT_TIMEOUT`.
+/// An unreachable daemon is `{ connected: false }`, not an error. The poll
+/// publishes no lifecycle events, so it cannot come back through the event
+/// stream, and the whole call is bounded by `STATUS_CLIENT_TIMEOUT`.
 #[tauri::command]
 pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
     let base = resolve_base_dir()?;
-    let id = new_request_id();
-    crate::own_requests::register(&id);
     let sent = tokio::time::timeout(
         STATUS_CLIENT_TIMEOUT,
-        client::send_request_with_id(
+        client::send_request(
             &base,
-            id,
             "status",
             serde_json::json!({}),
             true,

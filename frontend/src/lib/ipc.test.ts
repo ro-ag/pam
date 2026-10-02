@@ -53,6 +53,7 @@ import {
   type PendingApproval,
   subscribeEvents,
   toBridgeFailure,
+  versionMismatchNote,
 } from "./ipc";
 
 /**
@@ -233,6 +234,51 @@ describe("toBridgeFailure", () => {
   it("wraps partially-shaped objects instead of trusting them", () => {
     const failure = toBridgeFailure({ cause: 42, detail: "x", recovery: "y" });
     expect(failure.cause).toBe("unknown_failure");
+  });
+});
+
+describe("versionMismatchNote", () => {
+  const refusal = {
+    cause: "client_version_mismatch",
+    detail:
+      "client version 0.4.3 does not match daemon version 0.5.0 running from /opt/pam/bin/pam; " +
+      "that binary has not changed on disk, so the daemon keeps running",
+    recovery: "Use the pam binary this daemon was started from.",
+  };
+
+  it("lifts the daemon's version and path out of the refusal and keeps its recovery line", () => {
+    expect(versionMismatchNote(refusal)).toEqual({
+      cause: "client_version_mismatch",
+      detail:
+        "This window is not the build the running daemon was started from; the daemon is " +
+        "version 0.5.0, running from /opt/pam/bin/pam",
+      recovery: "Use the pam binary this daemon was started from.",
+    });
+  });
+
+  it("keeps a path with spaces and still reads a refusal whose detail it cannot parse", () => {
+    const spaced = versionMismatchNote({
+      ...refusal,
+      detail: refusal.detail.replace("/opt/pam/bin/pam", "/Users/Jo Doe/My Apps/pam"),
+    });
+    expect(spaced?.detail).toContain("running from /Users/Jo Doe/My Apps/pam");
+
+    const opaque = versionMismatchNote({ ...refusal, detail: "different builds" });
+    expect(opaque?.detail).toBe(
+      "This window is not the build the running daemon was started from",
+    );
+    expect(opaque?.recovery).toBe(refusal.recovery);
+  });
+
+  it("is only for client_version_mismatch", () => {
+    for (const cause of [
+      "daemon_outdated",
+      "client_outdated",
+      "reply_timeout",
+      "unknown_failure",
+    ]) {
+      expect(versionMismatchNote({ ...refusal, cause })).toBeNull();
+    }
   });
 });
 

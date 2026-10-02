@@ -217,6 +217,20 @@ describe("useDaemonStatus", () => {
       expect(mockPending.mock.calls.length).toBe(pendingCalls);
     });
 
+    it("re-reads the approvals once when the stream says it may have missed events", async () => {
+      vi.useFakeTimers();
+      const { emit } = await mountWithEvents();
+      const pendingCalls = mockPending.mock.calls.length;
+      const statusCalls = mockStatus.mock.calls.length;
+      // The pump sends a resync after every reconnect and at a counter skip: an approval raised
+      // while the stream was down must not wait out the poll interval.
+      emit({ ticket: "", event: { kind: "resync" } });
+      emit({ ticket: "", event: { kind: "resync" } });
+      await tick(2_000);
+      expect(mockPending.mock.calls.length).toBe(pendingCalls + 1);
+      expect(mockStatus.mock.calls.length).toBe(statusCalls);
+    });
+
     it("never restarts a poll that is still in flight when events arrive", async () => {
       vi.useFakeTimers();
       let release: (value: typeof up) => void = () => {};

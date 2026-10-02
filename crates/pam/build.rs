@@ -7,9 +7,11 @@
 //! Which frontend ships is fixed at compile time by the `tauri` crate's `custom-protocol` feature
 //! (via `tauri::generate_context!`): off (any plain `cargo build`) loads `devUrl`
 //! (`http://127.0.0.1:1420`) and never reads `frontend/dist`, so a clean checkout builds without
-//! npm; offline this shows an expected empty white window. On (this crate's `gui-embed` feature)
-//! embeds `frontend/dist` at compile time — run `npm --prefix frontend run build` first, or
-//! codegen panics naming the missing path.
+//! npm; offline this shows an expected empty white window. That window holds the full admin
+//! bridge, so such a build refuses to start `pam gui` unless `PAM_GUI_DEV=1` asks for the
+//! development server (`pam_gui::frontend`). On (this crate's `gui-embed` feature) embeds
+//! `frontend/dist` at compile time — run `npm --prefix frontend run build` first, or codegen
+//! panics naming the missing path.
 
 fn main() {
     let manifest = tauri_build::AppManifest::new().commands(&[

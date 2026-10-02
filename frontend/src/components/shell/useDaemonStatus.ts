@@ -32,13 +32,16 @@ export const approvalsRefetchInterval = backoffRefetchInterval<unknown>({
 
 /**
  * Which daemon events can change what the beacon shows: an approval raised, or a request
- * ending (terminal events resolve waits). `queued`/`started`/`progress` change neither the
- * pending count nor liveness, and ignoring them is what keeps a burst of agent traffic from
- * becoming a burst of admin polls.
+ * ending (terminal events resolve waits), or a `resync` (the stream reconnected or skipped, so
+ * an approval may have been missed). `queued`/`started`/`progress` change neither the pending
+ * count nor liveness, and ignoring them is what keeps a burst of agent traffic from becoming a
+ * burst of admin polls.
  */
 export function isBeaconEvent(payload: PamEventPayload): boolean {
   const kind = payload.event.kind;
-  return kind === "approval_pending" || kind === "done" || kind === "refused";
+  return (
+    kind === "approval_pending" || kind === "done" || kind === "refused" || kind === "resync"
+  );
 }
 
 /**

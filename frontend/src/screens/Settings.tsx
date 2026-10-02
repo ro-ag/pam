@@ -34,6 +34,7 @@ import {
   serviceStatus,
   serviceUninstall,
   toBridgeFailure,
+  versionMismatchNote,
   type BridgeFailure,
   type DaemonStopReply,
   type GrantRow,
@@ -478,6 +479,9 @@ function DaemonPanel({ active }: { active: boolean }) {
   const body = status.data?.status;
   const uptime = body?.["uptime_s"];
   const bridgeDown = status.isError ? toBridgeFailure(status.error) : null;
+  // A window that is not the daemon's build is refused at the handshake: say so plainly, and keep
+  // Stop available, because stopping (a signal, not a request) is the way out the refusal names.
+  const mismatch = bridgeDown ? versionMismatchNote(bridgeDown) : null;
 
   const facts: Array<[string, string]> = [
     ["version", statusField(body, "daemon_version")],
@@ -498,7 +502,7 @@ function DaemonPanel({ active }: { active: boolean }) {
           ))}
       </div>
 
-      {bridgeDown && <FailureNote failure={bridgeDown} label="daemon" />}
+      {bridgeDown && <FailureNote failure={mismatch ?? bridgeDown} label="daemon" />}
 
       {!bridgeDown && (
         <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
@@ -569,8 +573,8 @@ function DaemonPanel({ active }: { active: boolean }) {
           label="Stop daemon"
           confirmLabel="stop it?"
           busy={stop.isPending}
-          disabled={!connected}
-          title={!connected ? "The daemon is not running" : undefined}
+          disabled={!connected && !mismatch}
+          title={!connected && !mismatch ? "The daemon is not running" : undefined}
           onConfirm={() =>
             stop.mutate(undefined, {
               onSuccess: (reply) => setNote(stopNote(reply, false)),
@@ -584,8 +588,8 @@ function DaemonPanel({ active }: { active: boolean }) {
           confirmLabel="restart it?"
           variant="secondary"
           busy={stop.isPending}
-          disabled={!connected}
-          title={!connected ? "The daemon is not running" : undefined}
+          disabled={!connected && !mismatch}
+          title={!connected && !mismatch ? "The daemon is not running" : undefined}
           onConfirm={() =>
             stop.mutate(undefined, {
               onSuccess: (reply) => {

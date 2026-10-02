@@ -39,6 +39,15 @@ function tier(overrides: Partial<TierReadiness> = {}): TierReadiness {
       warm_p95_ms: 593,
       decided: "2026-09-15",
     },
+    note:
+      "Qualified on the capability bench (contract v2). Summaries are advisory and not " +
+      "separately measured.",
+    summary_contract: {
+      task: "summary",
+      fingerprint: "ab12cd34",
+      measured: false,
+      note: "Summaries are advisory and labelled untrusted.",
+    },
     blocker: null,
     ...overrides,
   };
@@ -134,6 +143,37 @@ describe("ReadinessCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose a model" }));
     expect(onRepair).toHaveBeenCalledWith("settings");
     expect(screen.queryByRole("button", { name: /another model|Verify|Install/ })).toBeNull();
+  });
+
+  it("says what the qualification covers, once, where the record is shown", () => {
+    render(<ReadinessCard status={status()} failure={null} onRepair={vi.fn()} />);
+    // Only the heavy tier carries a record; its note sits under it, in the daemon's words.
+    expect(
+      screen.getAllByText(/Qualified on the capability bench \(contract v2\)/),
+    ).toHaveLength(1);
+    expect(
+      screen.getByText(/Summaries are advisory and not separately measured/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no note for a tier without a record, or from a daemon that sends none", () => {
+    render(
+      <ReadinessCard
+        status={status({
+          readiness: {
+            light: tier({ tier: "light", qualification: null, note: null }),
+            heavy: tier({ note: undefined, summary_contract: undefined }),
+          },
+        })}
+        failure={null}
+        onRepair={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/capability bench/)).toBeNull();
+    // The record line itself is unchanged.
+    expect(
+      screen.getByText(/answer-contract-v2 · 98\.0% · 0 false passes/),
+    ).toBeInTheDocument();
   });
 
   it("badges residency beside the verdict and names a borrowed model", () => {

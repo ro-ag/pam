@@ -20,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 tokio.workspace = true
-zeromq.workspace = true
 
 [dev-dependencies]
 pam_testkit.workspace = true

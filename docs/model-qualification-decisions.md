@@ -14,7 +14,7 @@ readiness claim for a machine that was not measured.
 | Subject | Decision | Envelope | Evidence |
 | --- | --- | --- | --- |
 | gpt-oss-20b-MXFP4 (`27cd6c43…35901`, 12.1 GB) | **Qualified** for bounded local investigation | llama.cpp b10938, `macos-arm64` (Metal), answer contract v2, reasoning budget 0, 8,192-token context, 160-token output cap, 16-token engine floor | [2026-09-15-answer-contract-v2](benchmarks/2026-09-15-answer-contract-v2/record.json) run 3: accuracy 0.980, 0 false passes, 0 false alarms, 0 over-abstentions, coverage 0.974, warm p95 593 ms |
-| gpt-oss-20b-MXFP4 on `ubuntu-*`, `macos-x64`, `win-cpu-*` | **Not qualified** | — | No measurement on those backends; Metal figures are not carried over |
+| gpt-oss-20b-MXFP4 on `win-cpu-*` | **Not qualified** | — | No measurement on that backend; Metal figures are not carried over |
 | Qwen3-Coder-30B-A3B-Instruct Q4_K_M / Q5_K_M / Q6_K / Q8_0 (catalog) | **No-go** as a job default | — | [2026-09-13-llama-engine-screen](benchmarks/2026-09-13-llama-engine-screen/record.json): Q4_K_M 0.853, 7 false passes on contract v1; not re-run on v2 (user decision 2026-09-15: gpt-oss-20b only) |
 | Qwen3.8-27B, Qwen3.6-35B-A3B, gemma-4-26B-A4B, GLM-4.7-Flash, Nemotron-3.5-Lightning, Devstral-Small-2-24B | **No-go** | — | [2026-09-14-engine-candidate-screen](benchmarks/2026-09-14-engine-candidate-screen/record.json): none met the gates on contract v1; see the table below |
 | gpt-oss-120b, Qwen3-Coder-Next | **Not screened** | — | 63 GB and 48 GB; do not fit the screening host |
@@ -99,7 +99,7 @@ What the qualification does **not** say:
 Requalification is mandatory, and mechanically forced, when any of these move: the
 engine tag (`ENGINE_TAG`, a unit test refuses a record on another tag), the artifact
 digest, the contract or case set, the prompt framing, sampler settings, or the output
-envelope. A new target needs its own measurement; adding `ubuntu-x64` to the record
+envelope. A new target needs its own measurement; adding another target to the record
 without a run on that backend is not permitted.
 
 ## Candidate screens: no-go
@@ -152,5 +152,5 @@ Decision: no semantic compression ships; evidence reduction is deterministic fra
   resolve time with a named cause, and keep answering `admin.models.try`.
 - No hosted fallback exists or is planned to make a qualification graph turn green.
 - Open after this checkpoint: the three missing-answer cases; a second artifact on v2;
-  Linux and Windows measurements; the held-out corpus; #105 surfacing configured /
+  Windows measurements; the held-out corpus; #105 surfacing configured /
   installed / verified / qualified / admitted as distinct readiness states in the GUI.

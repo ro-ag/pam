@@ -97,11 +97,12 @@ Standing rules for any agent working in this project (from ~/dev/ai):
 - **Releases only on explicit request**, and only via CI on tag push — never a
   local publish. Keep tag, changelog, and README consistent; tests green first.
 - **CI stays cheap.** No new workflows without an explicit request; triggers on
-  merge to `main` / release tags only. When CI exists or is requested: lint and
-  portable unit tests on Linux only, Windows gated to PRs + `main`, macOS
-  UI/AppKit tests gated to approved PRs / `main` / nightly / releases. Cancel
-  superseded PR runs (`concurrency`), filter paths, cache dependencies, and
-  make expensive jobs `needs:` the cheap Linux checks first.
+  merge to `main` / release tags only. When CI exists or is requested: there is
+  no Linux runner; the fmt, clippy and unit gate runs on a macOS arm64 runner
+  with the Windows targets gated behind it, and macOS UI/AppKit tests are gated
+  to approved PRs / `main` / nightly / releases. Cancel superseded PR runs
+  (`concurrency`), filter paths, cache dependencies, and make expensive jobs
+  `needs:` the cheap gate first.
 - **No repo or no remote → stop and ask** before making changes.
 <!-- ptrack:end -->
 

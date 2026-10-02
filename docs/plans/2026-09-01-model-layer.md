@@ -1,5 +1,7 @@
 # Model Layer Implementation Plan
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give the daemon a pure-Rust local inference engine (candle, GGUF, Qwen3 dense + MoE), assisted model download, a registry with an 18 GB engine floor, per-tier defaults, vendor-CLI curator detection, GUI-only administration with a full `/models` screen, and the CI workflow that lands it.

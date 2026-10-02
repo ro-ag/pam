@@ -1,5 +1,7 @@
 # Packaging + OS integration — design
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Plan #9. Owner decisions recorded 2026-09-03. Companion plan:
 `docs/plans/2026-09-03-packaging.md`.
 

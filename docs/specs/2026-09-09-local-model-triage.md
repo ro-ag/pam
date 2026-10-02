@@ -1,5 +1,7 @@
 # Local investigation through the PAM CLI
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Status: proposed, revised 2026-09-10. Supersedes this document's original
 credential-holding worker, model gate, and verdict-driven effect design.
 Companions: [prompt contract](2026-09-09-local-model-prompts.md) and

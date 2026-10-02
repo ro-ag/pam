@@ -1,5 +1,7 @@
 # The llama.cpp engine as a pinned external binary
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Status: decision and acquisition contract, 2026-09-13 (plan 36). The user
 switched local inference from the in-process candle runtime to llama.cpp,
 delivered as the upstream GitHub release binaries. PAM's own build stays pure

@@ -10,9 +10,9 @@ Companion to [the llama.cpp engine spec](2026-09-13-llama-cpp-engine.md) and
 
 Supported platforms for this work (owner scope change, 2026-10-02): macOS arm64
 and Windows amd64/arm64. Linux and Intel macOS are not supported and nothing here
-is designed, tested or documented for them. Their rows in `ENGINE_ASSETS` are
-left alone by this plan and are not advertised; deleting them is a separate
-chore.
+is designed, tested or documented for them. Their `ENGINE_ASSETS` rows are
+removed by [the drop-Linux-and-Intel-Mac plan](../plans/2026-10-02-drop-linux-and-intel-mac.md),
+so the table has exactly the three supported targets.
 
 Line references are to the working tree on `feat/framed-public-transport`
 (HEAD 7a6bf46 plus uncommitted plan 49 edits to `admin.rs`, `daemon.rs`,
@@ -1226,7 +1226,7 @@ Decided here, not open:
 - Mirror allowlist is policy-only.
 - Engine remove op added, so "how to remove it" has a button as well as a folder.
 - Plain-http pasted model URLs are no longer accepted.
-- Linux and Intel macOS are untouched and undocumented.
+- Linux and Intel macOS are not supported and are not documented.
 
 ## Open questions
 

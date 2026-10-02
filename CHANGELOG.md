@@ -50,6 +50,9 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- Supported platforms are macOS 12+ on Apple Silicon and Windows on amd64 and
+  arm64. Linux and Intel Macs are not supported, and CI no longer builds or
+  tests for them.
 - The public transport is PAM's own framed protocol on the same socket,
   `<base>/run/pam.sock`: length-prefixed JSON, a `hello`, then one request per
   connection. On Windows it is a loopback port behind an owner nonce published
@@ -155,6 +158,11 @@ All notable changes to pam are documented in this file. The format follows
 - The AWS CLI adapter, which was always refused, is removed. A flow that still
   names `connector: aws` fails validation as a removed connector; a stored `aws`
   connector row is ignored, and a keychain item left behind for it is harmless.
+- Linux support: the AppImage and `.deb` packages, the systemd user login unit
+  (`pam service install` on Linux), the Secret Service credential backend and
+  the Linux llama.cpp engine builds (`ubuntu-x64`, `ubuntu-arm64`).
+- Intel Mac support: the `macos-x64` engine build. Apple Silicon Macs are
+  unaffected.
 
 ### Fixed
 
@@ -225,6 +233,9 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Compatibility
 
+- `pam service status --json` no longer reports `"platform": "linux"`; on a
+  platform with no login-start integration it reports the `unsupported` state
+  with its reason.
 - Schema version 12 adds indexes for Activity and retention and makes audit
   rows append-only and evidence views immutable. Version 13 adds the origin
   columns to request rows. A store upgraded by this version is refused by

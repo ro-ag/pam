@@ -1,5 +1,7 @@
 # Spine (daemon core) — design
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Status: approved by owner (brainstorming session, 2026-09-01). The transport described here (ZeroMQ `ROUTER`/`PUB`, `events.sock`) is superseded by [the framed public transport](2026-10-02-framed-public-transport.md).
 Umbrella vision: `~/dev/rs/new-map.md` (to be folded into `docs/product-brief.md`)
 

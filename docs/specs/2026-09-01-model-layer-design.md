@@ -1,5 +1,7 @@
 # Model layer — design
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Status: approved by owner (brainstorming session, 2026-09-01)
 Plan: ptrack #3 "Model layer: llama.cpp runtime adapter + vendor agent CLIs"
 Umbrella vision: `docs/vision.md` (goal 1, "Local models first-class")

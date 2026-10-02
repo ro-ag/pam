@@ -18,7 +18,8 @@
 //!   cargo test -p pam_model --release --test capability_bench -- --ignored --nocapture
 //! ```
 
-use pam_model::engine_server::{EngineServer, ServerOptions};
+use pam_model::engine_server::{EngineContract, EngineServer, ServerOptions};
+use pam_model::qualification::BenchContract;
 use pam_model::{
     registry::{Registry, sha256_file},
     runtime::GenerateRequest,
@@ -62,6 +63,20 @@ const WARM_EVERY: usize = 5;
 /// minute of prefill plus decode on the slowest screened backend, so a case
 /// that runs this long has lost the engine, not the argument.
 const CASE_LIMIT: Duration = Duration::from_mins(5);
+
+/// The fingerprint of what this bench asks, under `options`: the value a qualification
+/// record measured by this code carries as its `bench_contract`. Every run emits it, so
+/// the record a run becomes can state it.
+fn bench_contract_fingerprint(options: &ServerOptions) -> String {
+    BenchContract {
+        contract: &format!("answer-contract-{CONTRACT}"),
+        case_set_sha256: &case_digest(&cases()),
+        system_sha256: &format!("{:x}", Sha256::digest(SYSTEM.as_bytes())),
+        output_cap: OUTPUT_CAP,
+        input_limit: INPUT_LIMIT,
+    }
+    .fingerprint(&EngineContract::of(options))
+}
 
 fn required(name: &str) -> String {
     let value = std::env::var(name)
@@ -906,7 +921,8 @@ async fn load_generator(entry: &pam_model::registry::ModelEntry, path: &Path) ->
         .expect("engine load");
     emit(
         &json!({"schema_version":1,"phase":"engine","build_info":loaded.build_info,
-        "endpoint":format!("{:?}", engine.endpoint()),"gpu_layers":options.gpu_layers}),
+        "endpoint":format!("{:?}", engine.endpoint()),"gpu_layers":options.gpu_layers,
+        "bench_contract":bench_contract_fingerprint(&options)}),
     );
     Generator::Llama(engine)
 }
@@ -1064,6 +1080,30 @@ fn summarize(
 // ---------------------------------------------------------------------------
 // Contract v2: the host parses exit codes; these tests pin what it says.
 // ---------------------------------------------------------------------------
+
+/// The bench in the tree is the bench the shipped record was measured with: its case
+/// set, system turn, output cap and input limit, under the supervisor's default options,
+/// have the fingerprint the qualification table carries. Editing a case, a question, the
+/// system turn or an envelope constant fails here until the artifact is measured again
+/// and the new record's fingerprint replaces the old one.
+#[test]
+fn the_bench_in_the_tree_is_the_one_the_shipped_record_was_measured_with() {
+    let record = &pam_model::QUALIFIED[0];
+    assert_eq!(case_digest(&cases()), record.case_set_sha256);
+    assert_eq!(format!("answer-contract-{CONTRACT}"), record.contract);
+    assert_eq!(OUTPUT_CAP, record.output_cap);
+    assert_eq!(INPUT_LIMIT, record.input_limit);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(SYSTEM.as_bytes())),
+        record.system_sha256
+    );
+    // What `load_generator` starts the server with when no bench knob is set.
+    let options = ServerOptions {
+        context_tokens: pam_model::runtime::CONTEXT_TOKENS,
+        ..ServerOptions::default()
+    };
+    assert_eq!(bench_contract_fingerprint(&options), record.bench_contract);
+}
 
 #[test]
 fn the_case_set_is_the_v2_contract_and_the_families_keep_their_sizes() {

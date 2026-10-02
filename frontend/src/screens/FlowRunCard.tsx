@@ -2,13 +2,14 @@ import { SelectField, TextField } from "../components/ui/Fields";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { LoaderCircle, Play } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
 import { FailureNote } from "../components/ui/FailureNote";
 import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
+import { SafeText } from "../components/ui/SafeText";
 import { cn } from "../lib/cn";
 import {
   adminCall,
@@ -75,23 +76,94 @@ function stepDuration(ms: number): string {
 /** A summary longer than this many characters is clamped to three lines until opened. */
 const SUMMARY_CLAMP_CHARS = 240;
 
+/** The label above every step summary a local model wrote; `pam flow run` prints the same words. */
+export const UNTRUSTED_SUMMARY_LABEL = "[untrusted local-model summary]";
+
+/**
+ * Whether a step's `summary` was written by a local model, decided exactly as the CLI decides it
+ * (`is_model_summary` in `crates/pam/src/render.rs`): the daemon marks it with a `summary_model`
+ * object, and an explicit `model_summary`, `untrusted` or `summary_untrusted` set to true says
+ * the same. Any one marker is enough: the label fails towards showing.
+ */
+export function isModelSummary(step: FlowStepReport): boolean {
+  const fields = step as unknown as Record<string, unknown>;
+  const model = fields.summary_model;
+  if (typeof model === "object" && model !== null) return true;
+  return ["model_summary", "untrusted", "summary_untrusted"].some((key) => fields[key] === true);
+}
+
+/** What every model-written summary is, whatever the model: said beside each one. */
+const SUMMARY_ADVISORY = "Summaries are advisory and not separately measured.";
+
+/**
+ * What stands behind a model-written summary, in the daemon's own words (`qualification_note`
+ * in `model_readiness.rs`): the model was qualified on the capability bench under the contract
+ * its record names, and the summary prompt itself was never measured. A summary whose step
+ * carries no qualification record gets only the second half.
+ */
+export function summaryProvenance(step: FlowStepReport): string {
+  const model = (step as unknown as Record<string, unknown>).summary_model;
+  const qualification =
+    typeof model === "object" && model !== null
+      ? (model as Record<string, unknown>).qualification
+      : null;
+  const contract =
+    typeof qualification === "object" && qualification !== null
+      ? (qualification as Record<string, unknown>).contract
+      : null;
+  if (typeof contract !== "string" || contract === "") return SUMMARY_ADVISORY;
+  const prefix = "answer-contract-";
+  const version = contract.startsWith(prefix)
+    ? `contract ${contract.slice(prefix.length)}`
+    : contract;
+  return `Qualified on the capability bench (${version}). ${SUMMARY_ADVISORY}`;
+}
+
 /**
  * A step's own words. A model observation can run to a paragraph; the
  * table shows three lines of it and a way to read the rest, so the step
  * column never dwarfs the columns of fact beside it.
+ *
+ * A summary a local model wrote is text the step's output influenced, so anything in it can be a
+ * hostile echo of that output: it is labelled as untrusted, and every line goes through
+ * `SafeText`, which shows hidden and control characters as visible escapes instead of letting
+ * them reorder or hide what is read.
  */
-function StepSummary({ text }: { text: string }) {
+function StepSummary({
+  text,
+  modelWritten,
+  provenance,
+}: {
+  text: string;
+  modelWritten: boolean;
+  provenance: string;
+}) {
   const [open, setOpen] = useState(false);
   const long = text.length > SUMMARY_CLAMP_CHARS;
   return (
     <span className="mt-1 block max-w-md">
+      {modelWritten && (
+        <>
+          <span className="block font-data text-xs text-warning">{UNTRUSTED_SUMMARY_LABEL}</span>
+          <span className="block font-sans text-xs text-ink-faint">
+            <SafeText value={provenance} />
+          </span>
+        </>
+      )}
       <span
         className={cn(
           "block select-text font-sans text-sm text-ink-muted",
           long && !open && "line-clamp-3",
         )}
       >
-        {text}
+        {modelWritten
+          ? text.split(/\r\n|\n|\r/).map((line, index) => (
+              <Fragment key={index}>
+                {index > 0 && <br />}
+                <SafeText value={line} />
+              </Fragment>
+            ))
+          : text}
       </span>
       {long && (
         <button
@@ -114,7 +186,7 @@ function StepSummary({ text }: { text: string }) {
  * table speaks in the data voice; the only prose is a step's own summary
  * or the reason it did not succeed.
  */
-function StepTable({ steps }: { steps: FlowStepReport[] }) {
+export function StepTable({ steps }: { steps: FlowStepReport[] }) {
   if (steps.length === 0) {
     return <p className="font-sans text-sm text-ink-muted">This run took no steps at all.</p>;
   }
@@ -136,7 +208,13 @@ function StepTable({ steps }: { steps: FlowStepReport[] }) {
             <tr key={step.id} className="border-t border-line align-top">
               <td className="py-2.5 pr-3 font-data text-sm text-ink">
                 {step.id}
-                {step.summary && <StepSummary text={step.summary} />}
+                {step.summary && (
+                  <StepSummary
+                    text={step.summary}
+                    modelWritten={isModelSummary(step)}
+                    provenance={summaryProvenance(step)}
+                  />
+                )}
                 {step.error && (
                   <span className="mt-1 block max-w-md font-data text-xs text-danger">
                     {step.error.cause} · {step.error.detail}

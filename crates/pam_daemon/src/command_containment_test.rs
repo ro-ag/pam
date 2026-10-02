@@ -282,3 +282,301 @@ fn unsupported_platform_refuses_without_even_resolving_paths() {
         .unwrap_err();
     assert!(error.contains("only on macOS"));
 }
+
+/// A hand-made Git directory: enough layout for path rules, no Git process.
+#[cfg(target_os = "macos")]
+fn seed_git_dir(dir: &std::path::Path) {
+    for sub in ["hooks", "objects", "refs/heads", "logs"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::write(dir.join("config"), "[core]\n\tbare = false\n").unwrap();
+    std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+}
+
+/// Runs `script` under the stateful profile with the repository as `$0`'s cwd.
+#[cfg(target_os = "macos")]
+fn stateful_sh(fixture: &mut Fixture, script: &str) -> bool {
+    fixture.config.allow_repository_writes = true;
+    fixture.config.read_only_roots.push(PathBuf::from("/bin"));
+    let prepared = fixture
+        .config
+        .prepare(
+            std::path::Path::new("/bin/sh"),
+            &fixture.config.repository,
+            &[],
+        )
+        .unwrap();
+    std::process::Command::new(prepared.program)
+        .args(prepared.argv)
+        .args(["-c", script])
+        .current_dir(&fixture.config.repository)
+        .env_clear()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn git_control_surface_is_carved_out_of_repository_writes_only() {
+    let mut fixture = fixture();
+    let (read_only, _) = profile(
+        &fixture.config,
+        &fixture.program,
+        &fixture.config.repository,
+    )
+    .unwrap();
+    assert!(!read_only.contains("(deny file-write* (require-all"));
+    fixture.config.allow_repository_writes = true;
+    let (text, _) = profile(
+        &fixture.config,
+        &fixture.program,
+        &fixture.config.repository,
+    )
+    .unwrap();
+    let repo = serde_json::to_string(fixture.config.repository.to_str().unwrap()).unwrap();
+    let allow = text
+        .find(&format!("(allow file-write* (subpath {repo}))"))
+        .unwrap();
+    let denies: Vec<usize> = text
+        .match_indices(&format!(
+            "(deny file-write* (require-all (subpath {repo}) (regex #\""
+        ))
+        .map(|(at, _)| at)
+        .collect();
+    // SBPL applies the last matching rule, so every carve-out follows the allow.
+    assert_eq!(denies.len(), 3);
+    assert!(denies.iter().all(|at| *at > allow));
+    for needle in [
+        "[Hh][Oo][Oo][Kk][Ss]",
+        "[Cc][Oo][Nn][Ff][Ii][Gg]",
+        "[Cc][Oo][Mm][Mm][Oo][Nn][Dd][Ii][Rr]",
+    ] {
+        assert!(text.contains(needle), "{needle} missing from {text}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stateful_writes_cannot_plant_hooks_or_rewrite_git_configuration() {
+    let mut fixture = fixture();
+    let repo = fixture.config.repository.clone();
+    seed_git_dir(&repo.join(".git"));
+    std::fs::create_dir_all(repo.join(".git/modules/vendor/lib")).unwrap();
+    std::fs::create_dir(repo.join("nested")).unwrap();
+    // Each attempt must fail on its own: `!` inverts, `&&` requires them all.
+    let denied = [
+        "printf x > .git/hooks/post-checkout",
+        "printf x >> .git/config",
+        "printf x > staged && mv staged .git/config",
+        "printf x > .git/CONFIG",
+        "printf x > .git/config.worktree",
+        "printf ../evil > .git/commondir",
+        "mkdir .git/modules/vendor/lib/hooks",
+        "printf x > .git/modules/vendor/lib/config",
+        "mv .git/hooks .git/hooks-moved",
+        "mv .git .git-moved",
+        "printf 'gitdir: ../evil' > nested/.git",
+        "mkdir nested/.GIT",
+    ];
+    let script = denied
+        .iter()
+        .map(|attempt| format!("! ({attempt})"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    assert!(stateful_sh(&mut fixture, &script), "{script}");
+    assert_eq!(
+        std::fs::read_dir(repo.join(".git/hooks")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/config")).unwrap(),
+        "[core]\n\tbare = false\n"
+    );
+    assert!(!repo.join(".git/commondir").exists());
+    assert!(!repo.join("nested/.git").exists());
+    assert!(repo.join(".git").is_dir());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stateful_writes_still_reach_objects_index_refs_and_head() {
+    let mut fixture = fixture();
+    let repo = fixture.config.repository.clone();
+    seed_git_dir(&repo.join(".git"));
+    let script = "mkdir .git/objects/ab && printf blob > .git/objects/ab/cdef \
+        && printf index > .git/index.lock && mv .git/index.lock .git/index \
+        && printf 0000 > .git/refs/heads/main && printf 0000 > .git/refs/heads/hooks \
+        && printf 0000 > .git/refs/heads/config && printf 'ref: refs/heads/hooks' > .git/HEAD \
+        && printf log > .git/logs/HEAD && printf tracked > tracked.txt";
+    assert!(stateful_sh(&mut fixture, script));
+    assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), b"index");
+    assert_eq!(
+        std::fs::read(repo.join(".git/objects/ab/cdef")).unwrap(),
+        b"blob"
+    );
+    assert_eq!(std::fs::read(repo.join("tracked.txt")).unwrap(), b"tracked");
+}
+
+/// Git as the flow tests resolve it: the real binary, not Apple's `xcrun` shim.
+#[cfg(target_os = "macos")]
+fn real_git() -> PathBuf {
+    for installed in [
+        "/Library/Developer/CommandLineTools/usr/bin/git",
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+    ] {
+        let path = PathBuf::from(installed);
+        if path.is_file() {
+            return path;
+        }
+    }
+    crate::flow_exec::resolve_program("git", &[], &std::env::var_os("PATH").unwrap())
+        .expect("git is installed wherever this workspace builds")
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_commit_succeeds_while_git_itself_cannot_change_its_configuration() {
+    let mut fixture = fixture();
+    let repo = fixture.config.repository.clone();
+    let git = real_git().canonicalize().unwrap();
+    let host = |args: &[&str]| {
+        assert!(
+            std::process::Command::new(&git)
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{args:?}"
+        );
+    };
+    host(&["init", "-q", "."]);
+    std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+    fixture.config.allow_repository_writes = true;
+    fixture
+        .config
+        .read_only_roots
+        .push(git.parent().unwrap().to_path_buf());
+    for root in ["/Library/Developer", "/Applications/Xcode.app"] {
+        if std::path::Path::new(root).is_dir() {
+            fixture.config.read_only_roots.push(PathBuf::from(root));
+        }
+    }
+    let env = vec![
+        ("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()),
+        ("GIT_CONFIG_SYSTEM".to_owned(), "/dev/null".to_owned()),
+    ];
+    let contained = |args: &[&str]| {
+        let prepared = fixture.config.prepare(&git, &repo, &env).unwrap();
+        std::process::Command::new(prepared.program)
+            .args(prepared.argv)
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .output()
+            .unwrap()
+    };
+    let identity = [
+        "-c",
+        "user.name=pam",
+        "-c",
+        "user.email=pam@example.invalid",
+    ];
+    assert!(contained(&["add", "tracked.txt"]).status.success());
+    let commit = contained(&[&identity[..], &["commit", "-q", "-m", "first"]].concat());
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    // A branch whose name collides with a protected leaf is still a ref.
+    assert!(contained(&["branch", "hooks"]).status.success());
+    let before = std::fs::read(repo.join(".git/config")).unwrap();
+    assert!(
+        !contained(&["config", "core.hooksPath", "planted"])
+            .status
+            .success()
+    );
+    assert!(
+        !contained(&["config", "core.fsmonitor", "./planted.sh"])
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read(repo.join(".git/config")).unwrap(), before);
+    host(&["rev-parse", "--verify", "HEAD"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_gitfile_redirect_inside_the_repository_is_protected_at_its_target() {
+    let mut fixture = fixture();
+    let repo = fixture.config.repository.clone();
+    seed_git_dir(&repo.join("meta"));
+    std::fs::write(repo.join(".git"), "gitdir: meta\n").unwrap();
+    let script = "! (printf x > meta/hooks/post-checkout) && ! (printf x >> meta/config) \
+        && ! (printf 'gitdir: evil' > .git) && ! (mv meta meta-moved) \
+        && mkdir meta/objects/ab && printf blob > meta/objects/ab/cdef \
+        && printf index > meta/index";
+    assert!(stateful_sh(&mut fixture, script));
+    assert_eq!(
+        std::fs::read_dir(repo.join("meta/hooks")).unwrap().count(),
+        0
+    );
+    assert_eq!(std::fs::read(repo.join("meta/index")).unwrap(), b"index");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unresolvable_git_pointer_refuses_the_stateful_profile() {
+    let mut fixture = fixture();
+    fixture.config.allow_repository_writes = true;
+    let dot_git = fixture.config.repository.join(".git");
+    for pointer in ["gitdir: missing\n", "not a pointer\n", ""] {
+        std::fs::write(&dot_git, pointer).unwrap();
+        let error = profile(
+            &fixture.config,
+            &fixture.program,
+            &fixture.config.repository,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Git directory pointer"),
+            "{pointer:?}: {error}"
+        );
+    }
+    // A read-only step never gains repository writes, so nothing is resolved.
+    fixture.config.allow_repository_writes = false;
+    assert!(
+        profile(
+            &fixture.config,
+            &fixture.program,
+            &fixture.config.repository
+        )
+        .is_ok()
+    );
+    // A linked worktree: the common directory holds hooks and configuration.
+    fixture.config.allow_repository_writes = true;
+    let common = fixture.config.repository.join("common");
+    let linked = common.join("worktrees/feature");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::write(linked.join("commondir"), "../..\n").unwrap();
+    std::fs::write(&dot_git, "gitdir: common/worktrees/feature\n").unwrap();
+    let (text, _) = profile(
+        &fixture.config,
+        &fixture.program,
+        &fixture.config.repository,
+    )
+    .unwrap();
+    for directory in [&linked, &common] {
+        let quoted = serde_json::to_string(directory.to_str().unwrap()).unwrap();
+        assert!(
+            text.contains(&format!("(deny file-write* (literal {quoted})")),
+            "{quoted} missing from {text}"
+        );
+    }
+}

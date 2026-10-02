@@ -562,14 +562,20 @@ fn indexed_pack_name(capture: &Capture) -> Result<String, CheckoutError> {
 /// through temporary names, so the source repository only ever sees a
 /// complete pack. A pack already present under the same content hash is
 /// left alone.
-fn install_pack(source: &Path, target: &Path, name: &str) -> Result<(), CheckoutError> {
+///
+/// `git` is the source repository's Git directory. The layout check that
+/// refuses symlinked metadata ran before `index-pack` and the ancestry
+/// proof, which take long enough for whoever controls the repository to swap
+/// a directory for a symlink; the path is therefore walked again here, one
+/// real directory at a time, immediately before the first write.
+fn install_pack(source: &Path, git: &Path, name: &str) -> Result<(), CheckoutError> {
     let failed = || {
         error(
             "landing_sync_install_failed",
             "the verified pack could not be installed into the source object store",
         )
     };
-    fs::create_dir_all(target).map_err(|_| failed())?;
+    let target = real_directories(git, Path::new("objects/pack"))?;
     for extension in ["pack", "idx"] {
         let installed = target.join(format!("{name}.{extension}"));
         if installed.exists() {
@@ -590,6 +596,41 @@ fn install_pack(source: &Path, target: &Path, name: &str) -> Result<(), Checkout
     }
     Ok(())
 }
+/// Walks `relative` below the Git directory `git` one component at a time,
+/// creating what is missing, and refuses anything that is not a real
+/// directory. `create_dir_all` and plain path joins follow symlinks; the
+/// daemon writes here with its own authority, into a tree the calling agent
+/// can rearrange, so a swapped-in symlink must stop the write rather than
+/// steer it. A swap in the instants between this walk and the write itself
+/// is not excluded: the workspace has no `openat`-style handle API.
+fn real_directories(git: &Path, relative: &Path) -> Result<PathBuf, CheckoutError> {
+    let refused = || {
+        error(
+            "landing_sync_install_failed",
+            "a Git metadata directory was replaced by something that is not a directory",
+        )
+    };
+    let real =
+        |path: &Path| fs::symlink_metadata(path).map(|metadata| metadata.file_type().is_dir());
+    if !real(git).map_err(|_| refused())? {
+        return Err(refused());
+    }
+    let mut path = git.to_owned();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(refused());
+        };
+        path.push(name);
+        match real(&path) {
+            Ok(true) => {}
+            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(|_| refused())?;
+            }
+            Ok(false) | Err(_) => return Err(refused()),
+        }
+    }
+    Ok(path)
+}
 /// Moves one branch ref from `old` to `new` with Git's own lock protocol:
 /// the `.lock` file is created exclusively, the current value is re-read
 /// under the lock and must still be `old`, then the lock is renamed over the
@@ -604,17 +645,17 @@ fn update_ref_exact(
 ) -> Result<(), CheckoutError> {
     use std::io::Write as _;
     let git = request.repository.join(".git");
-    let path = git.join(reference);
-    let lock = git.join(format!("{reference}.lock"));
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("base ref has no parent directory"))?;
-    fs::create_dir_all(parent).map_err(|_| {
-        error(
-            "landing_sync_install_failed",
-            "the base ref directory could not be prepared",
-        )
-    })?;
+    let relative = Path::new(reference);
+    let (Some(parent), Some(leaf)) = (relative.parent(), relative.file_name()) else {
+        return Err(invalid("base ref has no parent directory"));
+    };
+    // Every directory down to the ref is real at the moment of the write;
+    // see `real_directories` for why the earlier layout check is not enough.
+    let directory = real_directories(&git, parent)?;
+    let path = directory.join(leaf);
+    let mut lock = leaf.to_owned();
+    lock.push(".lock");
+    let lock = directory.join(lock);
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -646,24 +687,29 @@ fn update_ref_exact(
         let _ = fs::remove_file(&lock);
     }
     committed?;
-    let log = git.join("logs").join(reference);
-    if let Some(parent) = log.parent() {
+    // Best effort, like Git's own reflog — but never through a symlink: the
+    // log directory is walked the same way, and an existing log must be a
+    // regular file.
+    if let Ok(directory) = real_directories(&git, &Path::new("logs").join(parent)) {
+        let log = directory.join(leaf);
         let seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let _ = fs::create_dir_all(parent).and_then(|()| {
-            fs::OpenOptions::new()
+        if fs::symlink_metadata(&log).map_or(true, |metadata| metadata.is_file()) {
+            let _ = fs::OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open(&log)?
-                .write_all(
-                    format!(
-                        "{old} {new} PAM <pam@localhost> {seconds} +0000\tpam guarded-land sync\n"
+                .open(&log)
+                .and_then(|mut file| {
+                    file.write_all(
+                        format!(
+                            "{old} {new} PAM <pam@localhost> {seconds} +0000\tpam guarded-land sync\n"
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-        });
+                });
+        }
     }
     Ok(())
 }
@@ -1243,11 +1289,7 @@ impl Session<'_> {
         }
         active(cancel, self.deadline)?;
         self.started.store(true, Ordering::SeqCst);
-        install_pack(
-            &directory,
-            &self.request.repository.join(".git/objects/pack"),
-            &name,
-        )?;
+        install_pack(&directory, &self.request.repository.join(".git"), &name)?;
         update_ref_exact(self.request, reference, expected_old, merge_commit)?;
         Ok(SyncObservation {
             ref_name: reference.to_owned(),

@@ -179,7 +179,10 @@ pub enum OutputPolicy {
 /// demand a YAML tag (`!succeeded build`), which is not what a human writes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum When {
-    /// Every step in `needs` succeeded; the default.
+    /// Every step in `needs` succeeded; the default. A step with no `needs`
+    /// is a root of the graph and runs whatever unrelated steps did — except
+    /// a stateful one, which never follows a failure it did not opt into
+    /// (see [`Step::should_run`]).
     #[default]
     NeedsSucceeded,
     /// Always, whatever came before.
@@ -320,7 +323,47 @@ pub struct Step {
     pub note: String,
 }
 
+/// How an earlier step ended, as far as a later step's condition cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prior {
+    /// It ran and succeeded.
+    Succeeded,
+    /// It ran and failed (a non-zero exit, a timeout, a failed assertion).
+    Failed,
+    /// It did not run to a verdict of its own: skipped, blocked, cancelled.
+    Other,
+}
+
 impl Step {
+    /// Whether the step runs, given how every earlier step ended (in file
+    /// order). The one definition of `when` the engine and the tests share.
+    ///
+    /// `always` runs; `{ succeeded: x }` / `{ failed: x }` look at that one
+    /// step; the default runs when every step in `needs` succeeded. `needs`
+    /// is the dependency graph: a read-only step that names none depends on
+    /// nothing, so independent gates all report after one of them failed. A
+    /// **stateful** step that names none is the exception: it changes
+    /// something, and it never does so after an earlier step failed unless
+    /// the flow says so (`needs`, or an explicit `when`).
+    #[must_use]
+    pub fn should_run(&self, earlier: &[(&str, Prior)]) -> bool {
+        let ended = |id: &str, wanted: Prior| {
+            earlier
+                .iter()
+                .any(|(step, prior)| *step == id && *prior == wanted)
+        };
+        match &self.when {
+            When::Always => true,
+            When::Succeeded(id) => ended(id, Prior::Succeeded),
+            When::Failed(id) => ended(id, Prior::Failed),
+            When::NeedsSucceeded if self.needs.is_empty() => {
+                self.effect != Effect::Stateful
+                    || earlier.iter().all(|(_, prior)| *prior != Prior::Failed)
+            }
+            When::NeedsSucceeded => self.needs.iter().all(|id| ended(id, Prior::Succeeded)),
+        }
+    }
+
     /// The action kind used by the verdict body.
     #[must_use]
     pub fn kind(&self) -> &'static str {

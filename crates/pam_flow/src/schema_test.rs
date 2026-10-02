@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::schema::{
-    Action, Approval, ArgValue, ConnectorId, Effect, Flow, OutputPolicy, RawFlow, Retry, Role,
-    Step, When,
+    Action, Approval, ArgValue, ConnectorId, Effect, Flow, OutputPolicy, Prior, RawFlow, Retry,
+    Role, Step, When,
 };
 
 const FULL: &str = r"
@@ -243,4 +243,51 @@ fn step_defaults() -> Step {
 fn default_output_assertion_is_absent_from_resolved_json() {
     let json = serde_json::to_value(step_defaults()).unwrap();
     assert!(json.get("expect_empty_output").is_none());
+}
+
+/// The steps of a three-step fixture, by id, with `last`'s own YAML tail.
+fn third_step(tail: &str) -> Step {
+    let yaml = format!(
+        "schema: 1\nid: order\nname: Order\nsteps:\n  - id: first\n    run: [git, status]\n  \
+         - id: second\n    run: [git, status]\n  - id: last\n    run: [git, status]\n{tail}"
+    );
+    crate::parse(&yaml)
+        .expect("the fixture parses")
+        .steps
+        .remove(2)
+}
+
+#[test]
+fn a_read_only_step_without_needs_is_independent_of_earlier_failures() {
+    let step = third_step("");
+    assert!(step.should_run(&[("first", Prior::Failed), ("second", Prior::Other)]));
+}
+
+#[test]
+fn a_stateful_step_without_needs_never_follows_a_failure_by_default() {
+    let step = third_step("    effect: stateful\n");
+    assert!(step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Other)]));
+    assert!(!step.should_run(&[("first", Prior::Failed), ("second", Prior::Succeeded)]));
+    assert!(!step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Failed)]));
+}
+
+#[test]
+fn a_stateful_step_follows_a_failure_only_when_the_flow_says_so() {
+    let earlier = [("first", Prior::Failed), ("second", Prior::Succeeded)];
+    // Its declared dependency succeeded: the unrelated failure is not its concern.
+    assert!(third_step("    effect: stateful\n    needs: [second]\n").should_run(&earlier));
+    assert!(!third_step("    effect: stateful\n    needs: [first]\n").should_run(&earlier));
+    assert!(third_step("    effect: stateful\n    when: always\n").should_run(&earlier));
+    assert!(third_step("    effect: stateful\n    when: { failed: first }\n").should_run(&earlier));
+    assert!(
+        !third_step("    effect: stateful\n    when: { succeeded: first }\n").should_run(&earlier)
+    );
+}
+
+#[test]
+fn needs_must_all_have_succeeded_not_merely_ended() {
+    let step = third_step("    needs: [first, second]\n");
+    assert!(step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Succeeded)]));
+    assert!(!step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Other)]));
+    assert!(!step.should_run(&[("first", Prior::Succeeded)]));
 }

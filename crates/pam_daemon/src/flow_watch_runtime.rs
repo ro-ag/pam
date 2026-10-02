@@ -92,13 +92,10 @@ impl RunState<'_> {
     }
 
     pub(super) async fn watch_stamp(&self) -> Result<(String, i64), CapabilityFailure> {
-        let profile = self
-            .service
-            .store
-            .get_setting_bounded(crate::policy::PROFILE_SETTING_KEY, 128)
-            .await
-            .map_err(|_| failure())?
-            .ok_or_else(failure)?;
+        // The daemon's one live profile source is the gate it enforces, not
+        // the persisted setting. Its JSON is the same string the setting
+        // stores, so stamps stay byte-compatible.
+        let profile = serde_json::to_string(&self.service.gate.profile()).map_err(|_| failure())?;
         let row = self
             .service
             .store
@@ -106,17 +103,19 @@ impl RunState<'_> {
             .await
             .map_err(|_| failure())?
             .ok_or_else(failure)?;
-        let revision = row.authorization_revision.ok_or_else(failure)?;
-        if self
-            .service
-            .store
-            .grant_revocation_revision()
-            .await
-            .map_err(|_| failure())?
-            != revision
-        {
+        // The row's own admission must still stand (no revocation of a grant
+        // it depends on since admission).
+        if !row.authorization_current {
             return Err(failure());
         }
+        // Stamp the scoped count of revocations a flow run depends on, so an
+        // unrelated revoke does not kill a parked watch.
+        let revision = self
+            .service
+            .store
+            .grant_revocation_revision_for(crate::flow_service::CAP_FLOW_RUN)
+            .await
+            .map_err(|_| failure())?;
         Ok((pam_compact::sha256_hex(profile.as_bytes()), revision))
     }
 

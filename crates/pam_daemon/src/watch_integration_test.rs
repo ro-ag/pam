@@ -104,6 +104,7 @@ fn args(id: &str) -> RunArgs {
     RunArgs {
         id: id.to_owned(),
         inputs: BTreeMap::new(),
+        expected_digest: None,
     }
 }
 fn entry() -> AuditEntry<'static> {
@@ -259,6 +260,11 @@ impl Harness {
             .unwrap();
         assert_eq!(lease.request_id, ticket);
         ExecContext {
+            origin: crate::ingress::Origin::Public,
+            status: crate::status_cache::StatusCache::new(
+                self.models.clone(),
+                self.secrets.clone(),
+            ),
             budget: crate::request_budget::RequestBudget::load_persistent(
                 self.store.clone(),
                 ticket,

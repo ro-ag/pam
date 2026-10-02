@@ -17,7 +17,7 @@ use crate::flow_service::{
     ArtifactsRootPatch, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_NOT_FOUND, CAUSE_INPUT_INVALID,
     CAUSE_PROGRAM_NOT_ALLOWED, FlowService, FlowSettings, RunArgs, SETTING_ALLOWED_PROGRAMS,
     SETTING_ARTIFACTS_ROOT, SETTING_EXTRA_PATH, SettingsPatch, boundary_read_roots,
-    step_capability,
+    origin_from_output, step_capability,
 };
 use crate::log_service::LogService;
 use crate::policy::PolicyGate;
@@ -546,4 +546,70 @@ fn a_non_scalar_input_value_is_refused_not_dropped() {
     let args = RunArgs::from_value(&serde_json::json!({ "id": "demo" }))
         .expect("a run needs no inputs at all");
     assert!(args.inputs.is_empty());
+}
+
+#[test]
+fn an_expected_digest_must_look_like_one() {
+    let digest = "0123456789abcdef".repeat(4);
+    let pinned = RunArgs::from_value(&serde_json::json!({"id": "demo", "expected_digest": digest}))
+        .expect("a well-formed pin is accepted");
+    assert_eq!(pinned.expected_digest.as_deref(), Some(digest.as_str()));
+    for absent in [
+        serde_json::json!({"id": "demo"}),
+        serde_json::json!({"id": "demo", "expected_digest": null}),
+    ] {
+        assert_eq!(RunArgs::from_value(&absent).unwrap().expected_digest, None);
+    }
+    for malformed in [
+        serde_json::json!("latest"),
+        serde_json::json!(digest.to_uppercase()),
+        serde_json::json!(&digest[..63]),
+        serde_json::json!(12),
+        serde_json::json!(""),
+    ] {
+        let refusal =
+            RunArgs::from_value(&serde_json::json!({"id": "demo", "expected_digest": malformed}))
+                .expect_err("a pin that can never match is refused");
+        assert_eq!(refusal.cause, CAUSE_INPUT_INVALID, "{malformed}");
+    }
+}
+
+/// Carried over from the 2026-09 flows review: the origin used to be whatever
+/// followed the first `github.com` anywhere in the output.
+#[test]
+fn only_an_exact_github_host_names_the_origin() {
+    for (url, expected) in [
+        ("https://github.com/ro-ag/pam.git\n", Some("ro-ag/pam")),
+        ("https://github.com/ro-ag/pam", Some("ro-ag/pam")),
+        ("git@github.com:ro-ag/pam.git", Some("ro-ag/pam")),
+        ("ssh://git@github.com/ro-ag/pam.git", Some("ro-ag/pam")),
+        ("ssh://git@github.com:22/ro-ag/pam", Some("ro-ag/pam")),
+        ("https://token@GitHub.com/ro-ag/pam.git", Some("ro-ag/pam")),
+        // Not GitHub, whatever the name contains.
+        ("https://evil.github.com.ua/ro-ag/pam.git", None),
+        ("https://github.com.evil.example/ro-ag/pam", None),
+        ("https://notgithub.com/ro-ag/pam", None),
+        ("https://example.com/github.com/ro-ag", None),
+        ("git@evilgithub.com:ro-ag/pam.git", None),
+        ("https://github.com@evil.example/ro-ag/pam", None),
+        ("file:///srv/github.com/ro-ag/pam", None),
+        ("https://github.com/ro-ag", None),
+        ("https://github.com/ro-ag/pam/extra", None),
+        ("", None),
+    ] {
+        assert_eq!(origin_from_output(url).as_deref(), expected, "{url:?}");
+    }
+    // A warning on stderr is interleaved with the URL; it is not the origin,
+    // and two different repositories are no answer at all.
+    assert_eq!(
+        origin_from_output(
+            "warning: see https://example.com/github.com/x/y\nhttps://github.com/ro-ag/pam.git\n"
+        )
+        .as_deref(),
+        Some("ro-ag/pam")
+    );
+    assert_eq!(
+        origin_from_output("https://github.com/other/repo\nhttps://github.com/ro-ag/pam\n"),
+        None
+    );
 }

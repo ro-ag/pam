@@ -203,7 +203,7 @@ fn with_after(yaml: &str) -> String {
 
 #[tokio::test]
 async fn matching_target_is_public_and_allows_exact_downstream_reads() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let metadata = metadata(9, 3, SHA);
         let transport = Arc::new(
             scripted(&metadata)
@@ -222,13 +222,13 @@ async fn matching_target_is_public_and_allows_exact_downstream_reads() {
         assert_eq!(report["steps"][1]["status"], "succeeded");
         assert_eq!(fx.target("matching").await["target"]["repository"], SOURCE);
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn different_sha_host_or_fork_blocks_and_retains_the_actual_product_answer() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         for (index, (sha, source)) in [
             (OTHER_SHA, SOURCE),
             (SHA, "https://other.example/team/project.git"),
@@ -269,13 +269,13 @@ async fn different_sha_host_or_fork_blocks_and_retains_the_actual_product_answer
             assert_eq!(fx.target(&ticket).await["target"]["commit"], SHA);
             fx.finish().await;
         }
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn missing_source_identity_and_rebased_pr_head_cannot_match() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let mut missing = metadata(9, 3, SHA);
         missing.as_object_mut().unwrap().remove("head_repository");
         let transport = Arc::new(scripted(&missing));
@@ -303,13 +303,13 @@ async fn missing_source_identity_and_rebased_pr_head_cannot_match() {
             SHA
         );
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn retry_cannot_replace_a_previously_bound_run_attempt() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let first = metadata(9, 3, SHA);
         let second = metadata(9, 4, SHA);
         let transport = Arc::new(
@@ -347,7 +347,7 @@ async fn retry_cannot_replace_a_previously_bound_run_attempt() {
         assert_eq!(retained[1]["run_attempt"], 4);
         assert_eq!(transport.requests().len(), 4);
         fx.finish().await;
-    })
+    }))
     .await;
 }
 
@@ -496,7 +496,7 @@ async fn durable_result_keeps_the_frozen_target_after_checkout_changes() {
 
 #[tokio::test]
 async fn only_a_job_from_the_matched_attempt_can_supply_a_log() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         for (job, expected) in [(71, "matched"), (72, "missing")] {
             let yaml = format!("{FLOW}  - id: after\n    connector: github\n    call: job_log\n    needs: [inspect]\n    with: {{ repo: 'team/project', job_id: {job} }}\n");
             let transport = Arc::new(scripted(&metadata(9, 3, SHA))
@@ -517,12 +517,12 @@ async fn only_a_job_from_the_matched_attempt_can_supply_a_log() {
             }
             fx.finish().await;
         }
-    }).await;
+    })).await;
 }
 
 #[tokio::test]
 async fn a_live_sonar_green_measure_cannot_verify_a_declared_commit() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         // The swap leaves the declared `run` input without a reader, so the
         // declaration goes too: an input nothing reads is refused.
         let yaml = FLOW.replace("    connector: github\n    call: run\n    with: { repo: 'team/project', run_id: '${inputs.run}' }",
@@ -548,12 +548,12 @@ async fn a_live_sonar_green_measure_cannot_verify_a_declared_commit() {
         assert_eq!(retained[0]["analysis_basis"], "live_measure");
         assert_eq!(transport.requests().len(), 1);
         fx.finish().await;
-    }).await;
+    })).await;
 }
 
 #[tokio::test]
 async fn matched_remote_evidence_does_not_authorize_unassociated_local_verification() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = format!("{FLOW}  - id: after\n    run: [git, --version]\n    role: verify\n    needs: [inspect]\n");
         let transport = Arc::new(scripted(&metadata(9, 3, SHA)));
         let fx = Fixture::new(&yaml, transport.clone()).await;
@@ -572,12 +572,12 @@ async fn matched_remote_evidence_does_not_authorize_unassociated_local_verificat
         assert_eq!(report["budget_usage"]["command_bytes"], 0);
         assert_eq!(transport.requests().len(), 2);
         fx.finish().await;
-    }).await;
+    })).await;
 }
 
 #[tokio::test]
 async fn inspection_reports_target_validity_without_collecting_or_freezing() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let transport = Arc::new(FakeTransport::new());
         let fx = Fixture::new(FLOW, transport.clone()).await;
         let mut client = fx.daemon.client().await;
@@ -622,6 +622,6 @@ async fn inspection_reports_target_validity_without_collecting_or_freezing() {
             "inspection must not collect product state"
         );
         fx.finish().await;
-    })
+    }))
     .await;
 }

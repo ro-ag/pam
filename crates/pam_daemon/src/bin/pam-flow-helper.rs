@@ -9,6 +9,8 @@
 //! pam-flow-helper spew <bytes>      # writes <bytes> to stdout and exits 0
 //! pam-flow-helper exit <code>       # exits with <code>
 //! pam-flow-helper echo-env <NAME>   # prints the value of $NAME, or nothing
+//! pam-flow-helper spawn-sleeper <ms> # starts a `sleep <ms>` child of its own, records that
+//!                                    # child's pid in ./grandchild.pid, then sleeps <ms> itself
 //! ```
 //!
 //! It is always built, never feature-gated: Cargo only sets `CARGO_BIN_EXE_pam-flow-helper` for an
@@ -41,14 +43,34 @@ fn main() -> ExitCode {
             println!("{}", std::env::var(argument).unwrap_or_default());
             ExitCode::SUCCESS
         }
+        "spawn-sleeper" => spawn_sleeper(argument),
         other => {
             eprintln!(
                 "pam-flow-helper: unknown command {other:?}; \
-                 expected sleep, spew, exit or echo-env"
+                 expected sleep, spew, exit, echo-env or spawn-sleeper"
             );
             ExitCode::from(2)
         }
     }
+}
+
+/// Starts a second helper that sleeps on its own, records its pid, and then
+/// sleeps too: the process tree a build tool leaves when only it is killed.
+fn spawn_sleeper(millis: &str) -> ExitCode {
+    let Ok(program) = std::env::current_exe() else {
+        return ExitCode::from(3);
+    };
+    let Ok(child) = std::process::Command::new(program)
+        .args(["sleep", millis])
+        .spawn()
+    else {
+        return ExitCode::from(3);
+    };
+    if std::fs::write("grandchild.pid", child.id().to_string()).is_err() {
+        return ExitCode::from(3);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(number(millis)));
+    ExitCode::SUCCESS
 }
 
 /// Parses a numeric argument, defaulting to zero so the helper never

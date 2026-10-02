@@ -497,3 +497,93 @@ async fn command_attempt_budget_blocks_a_retry_before_process_spawn() {
     }
     assert!(budget.usage().command_bytes < 1024);
 }
+
+/// Finding 9 of the 2026-10 design review: the outcome lattice says how a
+/// run ended, and used to be the only thing said about a run that pushed and
+/// then failed.
+#[test]
+fn effects_list_every_state_change_that_ran_whatever_the_outcome() {
+    use crate::flow_exec::{EFFECT_APPLIED, EFFECT_POSSIBLY_APPLIED, effects_for, effects_note};
+    let flow = flow_with(
+        "  - id: look\n    run: [git, status]\n\
+         \x20 - id: applied\n    run: [git, status]\n    effect: stateful\n\
+         \x20 - id: half\n    run: [git, status]\n    effect: stateful\n    when: always\n\
+         \x20 - id: unspawned\n    run: [git, status]\n    effect: stateful\n    when: always\n\
+         \x20 - id: unresolved-argument\n    run: [git, status]\n    effect: stateful\n    when: always\n\
+         \x20 - id: skipped\n    run: [git, status]\n    effect: stateful\n\
+         \x20 - id: denied\n    run: [git, status]\n    effect: stateful\n    when: always\n",
+    );
+    let ran = |id: &str, status: StepStatus, cause: Option<&str>, attempts: u8| {
+        let mut step = report(id, status);
+        step.attempts = attempts;
+        if let Some(cause) = cause {
+            step.fail(status, cause, String::new(), String::new());
+        }
+        step
+    };
+    let steps = [
+        ran("look", StepStatus::Succeeded, None, 1),
+        ran("applied", StepStatus::Succeeded, None, 1),
+        ran("half", StepStatus::Failed, Some("timeout"), 1),
+        ran("unspawned", StepStatus::Failed, Some("spawn_failed"), 1),
+        ran(
+            "unresolved-argument",
+            StepStatus::Failed,
+            Some("variable_unavailable"),
+            0,
+        ),
+        ran("skipped", StepStatus::Skipped, None, 0),
+        ran("denied", StepStatus::Blocked, Some("approval_denied"), 0),
+    ];
+    let effects = effects_for(&steps, &flow);
+    let listed: Vec<(&str, &str)> = effects
+        .iter()
+        .map(|effect| (effect.step.as_str(), effect.state.as_str()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("applied", EFFECT_APPLIED),
+            ("half", EFFECT_POSSIBLY_APPLIED)
+        ]
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|effect| effect.kind == "command" && effect.landing.is_none())
+    );
+    assert_eq!(outcome_for(&steps, &flow), Outcome::Blocked);
+    assert_eq!(
+        effects_note(Outcome::Blocked, &effects).as_deref(),
+        Some(
+            "state was changed before the run stopped: applied (applied), half (possibly applied)"
+        )
+    );
+    // A run that completed says `changed`; the note is for the ones that did not.
+    assert_eq!(effects_note(Outcome::Changed, &effects), None);
+    assert_eq!(effects_note(Outcome::Unresolved, &[]), None);
+}
+
+#[test]
+fn a_landing_effect_names_its_operation() {
+    use crate::flow_exec::effects_for;
+    let flow = parse(
+        "schema: 1\nid: land\nname: Land\n\
+         correlation:\n  repository: https://github.com/org/repo\n  commit: abcdef1234567890abcdef1234567890abcdef12\n\
+         steps:\n  - id: freeze\n    landing: freeze\n  - id: validate\n    landing: validate\n    needs: [freeze]\n  \
+         - id: push\n    landing: push\n    needs: [validate]\n",
+    )
+    .expect("the landing prefix parses");
+    let mut steps: Vec<StepReport> = ["freeze", "validate", "push"]
+        .into_iter()
+        .map(|id| StepReport::new(id, "landing", StepStatus::Succeeded))
+        .collect();
+    let effects = effects_for(&steps, &flow);
+    assert_eq!(effects.len(), 1, "freeze and validate change nothing");
+    assert_eq!(effects[0].step, "push");
+    assert_eq!(effects[0].kind, "landing");
+    assert_eq!(effects[0].landing.as_deref(), Some("push"));
+    // A push the broker refused is a blocked step, not an effect.
+    steps[2].status = StepStatus::Blocked;
+    assert!(effects_for(&steps, &flow).is_empty());
+}

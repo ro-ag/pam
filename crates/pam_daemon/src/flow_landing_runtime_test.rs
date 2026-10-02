@@ -417,7 +417,7 @@ mod seeded {
     struct Github {
         /// `success`, `failure`, or a pending status such as `in_progress`.
         checks: &'static str,
-        /// `open` or `closed`.
+        /// `open`, `closed` (without a merge) or `merged`.
         pr_state: &'static str,
         requests: Mutex<Vec<String>>,
     }
@@ -443,7 +443,9 @@ mod seeded {
                 } else if path.ends_with("/status") {
                     json!({"sha":sha(),"total_count":0,"statuses":[]})
                 } else if path.ends_with("/pulls/7") {
-                    json!({"number":7,"state":self.pr_state,"merged":false,"merge_commit_sha":null,
+                    let merged = self.pr_state == "merged";
+                    json!({"number":7,"state":if merged {"closed"} else {self.pr_state},"merged":merged,
+                        "merge_commit_sha":merged.then(|| "c".repeat(40)),
                         "head":{"ref":"feature/work","sha":sha(),"repo":{"full_name":"team/repo"}},
                         "base":{"ref":"main","sha":base_sha(),"repo":{"full_name":"team/repo"}}})
                 } else {
@@ -530,6 +532,8 @@ mod seeded {
             admit(&store, &repo).await;
             let (cancel, rx) = tokio::sync::watch::channel(false);
             let ctx = ExecContext {
+                origin: crate::ingress::Origin::Public,
+                status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
                 budget: RequestBudget::with_limits(
                     Instant::now() + Duration::from_mins(2),
                     Limits {
@@ -770,6 +774,34 @@ mod seeded {
         let session = fx.session().await;
         assert!(session["receipts"].get("verify_pr").is_none());
         assert!(session["poll"].is_null(), "a failure never parks");
+    }
+
+    /// The stranded-ticket case: an earlier ticket (or a human) already
+    /// merged the exact frozen head, and `merge` will observe that. The PR
+    /// checks are still verified for that head; only the "still open" demand
+    /// is dropped.
+    #[tokio::test]
+    async fn a_verified_pr_already_merged_at_the_frozen_head_is_accepted() {
+        let fx = Fixture::new("success", "merged", 128).await;
+        fx.seed_session(Fixture::receipts("ensure_pr"), |_| {})
+            .await;
+        let (report, result) = fx.run(4).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(report.status, StepStatus::Succeeded, "{report:?}");
+        let requests = fx.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(requests[2].ends_with("/pulls/7"));
+        assert_eq!(fx.session().await["receipts"]["verify_pr"]["passed"], true);
+    }
+
+    #[tokio::test]
+    async fn a_merged_pr_whose_checks_failed_is_not_reported_as_verified() {
+        let fx = Fixture::new("failure", "merged", 128).await;
+        fx.seed_session(Fixture::receipts("ensure_pr"), |_| {})
+            .await;
+        let report = blocked(fx.run(4).await);
+        assert_eq!(report.error.unwrap().cause, "landing_checks_failed");
+        assert!(fx.session().await["receipts"].get("verify_pr").is_none());
     }
 
     #[tokio::test]

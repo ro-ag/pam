@@ -40,7 +40,7 @@ pub use duration::{DurationError, format_duration, parse_duration};
 pub use library::{Entry, Library, Source};
 pub use normalize::{digest, to_normalized_yaml};
 pub use schema::{
-    Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Retry, Role,
+    Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Prior, Retry, Role,
     SCHEMA_VERSION, Step, Watch, When,
 };
 pub use validate::{
@@ -49,7 +49,7 @@ pub use validate::{
     MAX_NAME_BYTES, MAX_RETRY_ATTEMPTS, MAX_RETRY_BACKOFF, MAX_STEPS, MAX_TIMEOUT, SHELLS,
     connector_calls, is_sensitive_arg, is_shell, looks_secret_like, parse, parse_value,
 };
-pub use vars::{VarError, Vars, references, substitute};
+pub use vars::{ArgvError, VarError, Vars, references, substitute, substitute_argv};
 
 #[cfg(test)]
 mod builtin_test;

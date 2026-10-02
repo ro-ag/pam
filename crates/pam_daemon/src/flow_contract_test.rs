@@ -420,3 +420,114 @@ fn handoff_projection_survives_the_credential_redaction_pass_unchanged() {
         "rechecked_per_read"
     );
 }
+
+/// Finding 15 of the 2026-10 design review: the step that explains a long
+/// run is usually its last, and it used to be the first one dropped.
+#[test]
+fn a_projection_that_must_shrink_keeps_the_steps_that_did_not_succeed() {
+    let mut steps = Vec::new();
+    for index in 0..60 {
+        let mut step = StepReport::new(&format!("gate-{index}"), "command", StepStatus::Succeeded);
+        step.summary = Some("ok".to_owned());
+        step.evidence = (0..4)
+            .map(|part| format!("ev_{index}_{part}_{}", "r".repeat(90)))
+            .collect();
+        steps.push(step);
+    }
+    let mut blocked = StepReport::new("deploy", "command", StepStatus::Blocked);
+    blocked.fail(
+        StepStatus::Blocked,
+        "approval_denied",
+        "a human denied the deploy".to_owned(),
+        "open Pam → Approvals".to_owned(),
+    );
+    let mut failed = StepReport::new("tests", "command", StepStatus::Failed);
+    failed.summary = Some("3 tests failed".to_owned());
+    steps.insert(30, failed);
+    steps.push(blocked);
+    let report = RunReport {
+        outcome: Outcome::Blocked,
+        summary: "62 steps".to_owned(),
+        steps,
+    };
+    let result =
+        project_result("ticket", "flow", "digest", &report, &[], &BTreeMap::new()).unwrap();
+    assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_RESULT_BYTES);
+    assert!(
+        result.omitted.observations > 0,
+        "the fixture must not fit whole"
+    );
+    let kept: Vec<&str> = result
+        .observations
+        .iter()
+        .filter(|observation| observation.status != "succeeded")
+        .map(|observation| observation.step.as_str())
+        .collect();
+    assert_eq!(kept, ["tests", "deploy"]);
+    assert_eq!(
+        result.observations.last().unwrap().text,
+        "a human denied the deploy"
+    );
+    // What was dropped is the tail of the quiet steps, never a reordering.
+    assert_eq!(result.observations[0].step, "gate-0");
+}
+
+#[test]
+fn effects_are_reported_beside_an_unresolved_outcome_and_never_dropped() {
+    use crate::flow_exec::{EFFECT_APPLIED, EFFECT_POSSIBLY_APPLIED, EffectRecord};
+    let effects = vec![
+        EffectRecord {
+            step: "push".to_owned(),
+            kind: "landing".to_owned(),
+            state: EFFECT_APPLIED.to_owned(),
+            landing: Some("push".to_owned()),
+        },
+        EffectRecord {
+            step: "migrate".to_owned(),
+            kind: "command".to_owned(),
+            state: EFFECT_POSSIBLY_APPLIED.to_owned(),
+            landing: None,
+        },
+    ];
+    let mut big = report(StepStatus::Failed, Outcome::Unresolved, &"x".repeat(5000));
+    big.steps = vec![big.steps[0].clone(); 40];
+    for step in &mut big.steps {
+        step.evidence = (0..4)
+            .map(|part| format!("ev_{part}_{}", "r".repeat(100)))
+            .collect();
+    }
+    let result = project_result("ticket", "flow", "digest", &big, &[], &BTreeMap::new())
+        .unwrap()
+        .with_effects(effects.clone())
+        .unwrap();
+    assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_RESULT_BYTES);
+    assert_eq!(result.effects, effects);
+    assert_eq!(result.workflow.outcome, "unresolved");
+    let handoff = result.handoff.as_ref().unwrap();
+    assert_eq!(handoff.state, "escalation_required");
+    assert_eq!(handoff.reason, "workflow_not_completed_after_state_change");
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["effects"][0]["landing"], "push");
+    assert!(value["effects"][1].get("landing").is_none());
+
+    // A completed run keeps its ordinary handoff; a run with no effect has no key,
+    // and a projection stored before the field existed still reads back.
+    let done = project_result(
+        "ticket",
+        "flow",
+        "digest",
+        &report(StepStatus::Succeeded, Outcome::Changed, "done"),
+        &[],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let with = done.clone().with_effects(effects).unwrap();
+    assert_eq!(
+        with.handoff.unwrap().reason,
+        "workflow_outcome_recorded_diagnosis_not_attempted"
+    );
+    let stored = serde_json::to_value(done).unwrap();
+    assert!(stored.get("effects").is_none());
+    let decoded: crate::flow_contract::AgentResult = serde_json::from_value(stored).unwrap();
+    assert!(decoded.effects.is_empty());
+}

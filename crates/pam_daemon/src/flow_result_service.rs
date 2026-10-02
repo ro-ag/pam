@@ -203,11 +203,9 @@ pub(crate) async fn authorized_metadata(
     if owner != Path::new(&status.repository) {
         return Err(unavailable());
     }
-    let revision = store
-        .grant_revocation_revision()
-        .await
-        .map_err(|_| unavailable())?;
-    if status.authorization_revision != Some(revision) {
+    // Scoped check: only a revocation of a grant this ticket depends on voids
+    // it; an unrelated revoke leaves its result readable.
+    if !status.authorization_current {
         return Err(unavailable());
     }
     let result = store
@@ -247,11 +245,10 @@ pub(crate) async fn authorized_metadata(
             .await
             .map_err(|_| unavailable())?;
     }
-    if store
-        .grant_revocation_revision()
+    if !store
+        .request_authorization_current(ticket)
         .await
         .map_err(|_| unavailable())?
-        != revision
     {
         return Err(unavailable());
     }

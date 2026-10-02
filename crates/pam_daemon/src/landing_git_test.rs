@@ -986,3 +986,73 @@ fn a_journalled_rejected_verdict_reads_back_and_reconciles_as_unchanged() {
         Reconciliation::Unchanged
     );
 }
+
+/// Finding 12 of the 2026-10 design review: the layout check that refuses
+/// symlinked Git metadata ran seconds before the daemon's own writes, which
+/// then followed whatever the repository's owner had swapped in meanwhile.
+#[cfg(unix)]
+#[test]
+fn sync_writes_refuse_git_directories_swapped_for_symlinks() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let repository = parent.join("repo");
+    let git = repository.join(".git");
+    let elsewhere = parent.join("elsewhere");
+    let staged = parent.join("staged");
+    for directory in [&git.join("refs"), &git.join("objects"), &elsewhere, &staged] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(staged.join("pack-x.pack"), b"pack").unwrap();
+    fs::write(staged.join("pack-x.idx"), b"idx").unwrap();
+    let request = CheckoutRequest {
+        repository: repository.clone(),
+        protected_base: parent.join("private"),
+        checkouts_root: parent.join("workspaces"),
+        git_program: PathBuf::from("/usr/bin/git"),
+        expected_commit: "a".repeat(40),
+        base_ref: "refs/heads/main".into(),
+        remote_url: "https://github.test/team/repo.git".into(),
+    };
+    let (old, new) = ("b".repeat(40), "c".repeat(40));
+
+    // The pack directory and the branch directory both point out of the repository.
+    std::os::unix::fs::symlink(&elsewhere, git.join("objects/pack")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, git.join("refs/heads")).unwrap();
+    fs::write(elsewhere.join("main"), format!("{old}\n")).unwrap();
+    let refused = install_pack(&staged, &git, "pack-x").unwrap_err();
+    assert_eq!(refused.cause, "landing_sync_install_failed");
+    let refused = update_ref_exact(&request, "refs/heads/main", &old, &new).unwrap_err();
+    assert_eq!(refused.cause, "landing_sync_install_failed");
+    let outside: Vec<_> = fs::read_dir(&elsewhere)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        outside,
+        ["main"],
+        "nothing was written through the symlinks"
+    );
+    assert_eq!(
+        fs::read_to_string(elsewhere.join("main")).unwrap(),
+        format!("{old}\n")
+    );
+
+    // Real directories: the same two writes land, and a symlinked reflog
+    // directory costs the log line, never the ref.
+    fs::remove_file(git.join("objects/pack")).unwrap();
+    fs::remove_file(git.join("refs/heads")).unwrap();
+    fs::create_dir(git.join("refs/heads")).unwrap();
+    fs::write(git.join("refs/heads/main"), format!("{old}\n")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, git.join("logs")).unwrap();
+    install_pack(&staged, &git, "pack-x").unwrap();
+    assert!(git.join("objects/pack/pack-x.pack").is_file());
+    update_ref_exact(&request, "refs/heads/main", &old, &new).unwrap();
+    assert_eq!(
+        fs::read_to_string(git.join("refs/heads/main")).unwrap(),
+        format!("{new}\n")
+    );
+    assert!(
+        !elsewhere.join("refs").exists(),
+        "no reflog through a symlink"
+    );
+}

@@ -5,7 +5,10 @@
 //! granted. Only the immutable system trees (including the system TLS
 //! configuration under `/private/etc/ssl`) and explicitly supplied repository
 //! and toolchain reads are allowed; repository writes require a stateful
-//! operation. No implicit HOME/cache/temp exception exists. Unsupported configurations never fall back to raw exec.
+//! operation, and even then never reach Git's control surface (hooks,
+//! configuration, the `.git` entry itself): what an approved step plants there
+//! would later run outside this profile. No implicit HOME/cache/temp exception
+//! exists. Unsupported configurations never fall back to raw exec.
 //!
 //! Host provisioning must keep protected assets outside writable repositories,
 //! including pre-existing hardlink aliases. New hardlinks are denied. This does
@@ -223,6 +226,8 @@ pub(crate) fn profile(
     }
     if config.allow_repository_writes {
         let _ = writeln!(text, "(allow file-write* (subpath {}))", quoted(&repo));
+        // Later rules win: the carve-out must follow the allow it narrows.
+        git_control_denies(&mut text, &repo)?;
     }
     for root in &artifacts {
         let _ = writeln!(
@@ -241,6 +246,121 @@ pub(crate) fn profile(
         return Err("command containment profile exceeds its limit".to_owned());
     }
     Ok((text, program))
+}
+
+/// Git's control surface inside a writable repository, as path regexes. A
+/// stateful step may write objects, the index, refs, logs and `HEAD` — an
+/// ordinary `git add`/`git commit` — but never what Git later *executes or
+/// obeys* outside this profile: hook directories, configuration (`core.hooksPath`,
+/// `core.fsmonitor`, `core.sshCommand`, filters, aliases, includes), the
+/// `commondir` pointer that selects another configuration, and the `.git`
+/// entry itself (replacing it repoints the repository). The optional prefix
+/// covers submodule (`.git/modules/<path>/`) and linked-worktree
+/// (`.git/worktrees/<name>/`) metadata. Every literal is spelled per letter
+/// because the default macOS volume is case-insensitive and a not-yet-existing
+/// `HOOKS` directory is reported to the policy as typed.
+#[cfg(any(target_os = "macos", test))]
+const GIT_CONTROL_PATTERNS: &[&str] = &[
+    r"/\.[Gg][Ii][Tt]$",
+    r"/\.[Gg][Ii][Tt]/(modules/.+/|worktrees/[^/]+/)?[Hh][Oo][Oo][Kk][Ss](/|$)",
+    r"/\.[Gg][Ii][Tt]/(modules/.+/|worktrees/[^/]+/)?([Cc][Oo][Nn][Ff][Ii][Gg](\.[Ww][Oo][Rr][Kk][Tt][Rr][Ee][Ee])?|[Cc][Oo][Mm][Mm][Oo][Nn][Dd][Ii][Rr])$",
+];
+
+/// The same surface inside a Git directory that is not at `<repo>/.git`
+/// (a gitfile or symlink names it): any `hooks`, `config`, `config.worktree`
+/// or `commondir` path component. This over-denies a branch literally named
+/// `hooks` or `config` in that layout rather than interpolate a path into a
+/// regex.
+#[cfg(any(target_os = "macos", test))]
+const GIT_REDIRECTED_PATTERN: &str = r"/([Hh][Oo][Oo][Kk][Ss]|[Cc][Oo][Nn][Ff][Ii][Gg](\.[Ww][Oo][Rr][Kk][Tt][Rr][Ee][Ee])?|[Cc][Oo][Mm][Mm][Oo][Nn][Dd][Ii][Rr])(/|$)";
+
+/// Largest gitfile or `commondir` pointer read while building a profile.
+#[cfg(any(target_os = "macos", test))]
+const MAX_GIT_POINTER_BYTES: u64 = 4096;
+
+/// Deny writes to Git's control surface below a writable repository. The
+/// patterns are constants scoped by `subpath`, so no repository text ever
+/// becomes regex syntax.
+#[cfg(any(target_os = "macos", test))]
+fn git_control_denies(text: &mut String, repo: &std::path::Path) -> Result<(), String> {
+    let scope = quoted(repo);
+    for pattern in GIT_CONTROL_PATTERNS {
+        let _ = writeln!(
+            text,
+            "(deny file-write* (require-all (subpath {scope}) (regex #\"{pattern}\")))"
+        );
+    }
+    for directory in redirected_git_dirs(repo)? {
+        let directory = quoted(&directory);
+        let _ = writeln!(
+            text,
+            "(deny file-write* (literal {directory}) (require-all (subpath {directory}) (regex #\"{GIT_REDIRECTED_PATTERN}\")))"
+        );
+    }
+    Ok(())
+}
+
+/// Git directories the repository's own `.git` entry redirects to: the target
+/// of a gitfile (`gitdir: <path>`, as linked worktrees, submodules and
+/// `--separate-git-dir` write it) or of a symlink, plus the common directory
+/// each of those names. A pointer that cannot be read or resolved refuses the
+/// profile: a stateful step never runs against a control surface PAM could not
+/// locate. Directories outside the repository are returned too; they are not
+/// writable anyway, and the extra deny is harmless.
+#[cfg(any(target_os = "macos", test))]
+fn redirected_git_dirs(repo: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let unresolved = || "repository Git directory pointer cannot be resolved".to_owned();
+    let entry = repo.join(".git");
+    let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
+        // No `.git` at all: creating one is denied by the patterns above.
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    if metadata.is_file() {
+        let pointer = read_git_pointer(&entry).ok_or_else(unresolved)?;
+        let target = pointer.strip_prefix("gitdir:").ok_or_else(unresolved)?;
+        found.push(canonical(&repo.join(target.trim())).map_err(|_| unresolved())?);
+    } else if metadata.file_type().is_symlink() {
+        found.push(canonical(&entry).map_err(|_| unresolved())?);
+    } else if !metadata.is_dir() {
+        return Err(unresolved());
+    }
+    // A linked worktree's hooks and configuration live in its common directory.
+    let roots = if found.is_empty() {
+        vec![entry]
+    } else {
+        found.clone()
+    };
+    for root in roots {
+        let pointer = root.join("commondir");
+        if std::fs::symlink_metadata(&pointer).is_err() {
+            continue;
+        }
+        let target = read_git_pointer(&pointer).ok_or_else(unresolved)?;
+        found.push(canonical(&root.join(target.trim())).map_err(|_| unresolved())?);
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// One bounded, single-line Git pointer file; `None` when it is not that.
+#[cfg(any(target_os = "macos", test))]
+fn read_git_pointer(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    let text = text.trim_end_matches(['\n', '\r']);
+    (!text.is_empty()
+        && u64::try_from(text.len()).is_ok_and(|length| length <= MAX_GIT_POINTER_BYTES)
+        && !text.contains(['\n', '\r', '\0']))
+    .then(|| text.to_owned())
 }
 
 // Only the macOS profile builder calls this; without the same gate it is dead

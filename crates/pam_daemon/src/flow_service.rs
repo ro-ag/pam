@@ -11,9 +11,9 @@
 //! A denied/expired approval, gate refusal, disabled connector or
 //! non-allowlisted program ends the run `blocked` with the step naming why:
 //! the request finishes `done` and the verdict is filed as evidence. Only
-//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`], [`CAUSE_INPUT_MISSING`],
-//! [`CAUSE_INPUT_UNKNOWN`], [`CAUSE_INPUT_INVALID`] and [`CAUSE_REPO_MISSING`]
-//! are refusals ([`CapabilityFailure::Refused`]).
+//! [`CAUSE_FLOW_NOT_FOUND`], [`CAUSE_FLOW_INVALID`], [`CAUSE_FLOW_CHANGED`],
+//! [`CAUSE_INPUT_MISSING`], [`CAUSE_INPUT_UNKNOWN`], [`CAUSE_INPUT_INVALID`] and
+//! [`CAUSE_REPO_MISSING`] are refusals ([`CapabilityFailure::Refused`]).
 //! Step output goes through [`LogService::compress`](crate::log_service::LogService::compress)
 //! (`compact` default, `summarize` adds a model paragraph, `discard` keeps
 //! nothing; empty output is not filed). The verdict body is written verbatim
@@ -47,21 +47,22 @@ use std::time::{Duration, Instant};
 
 use pam_connectors::{CallResult, ConnectorId};
 use pam_flow::{
-    Action, ArgValue, Entry, Flow, Library, OutputPolicy, Retry, Role, Step, Vars, When, digest,
-    is_shell, references, substitute, to_normalized_yaml,
+    Action, ArgValue, ArgvError, Entry, Flow, Library, OutputPolicy, Prior, Retry, Role, Step,
+    Vars, digest, is_shell, references, substitute, substitute_argv, to_normalized_yaml,
 };
 use pam_proto::Outcome;
 use pam_store::{RequestState, Store, StoreError};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use crate::approval::{ApprovalOutcome, ApprovalService};
+use crate::approval::{ApprovalOutcome, ApprovalService, StepSnapshot};
 use crate::connector_service::{ConnectorService, InvokeError};
 use crate::daemon::{CAUSE_APPROVAL_DENIED, CAUSE_APPROVAL_TIMEOUT};
 use crate::executor::{CapabilityFailure, CapabilityOutput, ExecContext, outcome_str};
 use crate::flow_exec::{
-    CommandOutcome, CommandSpec, RunReport, StepReport, StepStatus, SummaryModel, cancelled,
-    outcome_for, resolve_program, run_command_budgeted, scrub_env, sleep_or_cancel, summary_for,
+    CommandOutcome, CommandSpec, EffectRecord, RunReport, StepReport, StepStatus, SummaryModel,
+    cancelled, effects_for, effects_note, outcome_for, resolve_program, run_command_budgeted,
+    scrub_env, sleep_or_cancel, summary_for,
 };
 use crate::flow_recovery::Prepare;
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
@@ -122,6 +123,19 @@ pub const CAUSE_INPUT_INVALID: &str = "input_invalid";
 
 /// Refusal cause: the caller's repo is not a directory on this machine.
 pub const CAUSE_REPO_MISSING: &str = "repo_missing";
+
+/// Refusal cause: the run pinned a flow digest (`expected_digest`) and the
+/// library's flow no longer has it — it was edited after `flow.inspect`.
+pub const CAUSE_FLOW_CHANGED: &str = "flow_changed";
+
+/// Recovery line for [`CAUSE_FLOW_CHANGED`].
+pub const RECOVERY_FLOW_CHANGED: &str = "run `pam flow inspect` again, review what the flow does now, and re-run with the digest it reports";
+
+/// Step cause: a supplied value would have become a command-line option.
+pub const CAUSE_ARGUMENT_OPTION: &str = "argument_option_refused";
+
+/// Recovery line for [`CAUSE_ARGUMENT_OPTION`].
+pub const RECOVERY_ARGUMENT_OPTION: &str = "pass a value that does not start with `-`, or edit the flow so a literal `--` comes before the argument";
 
 /// Refusal cause: the flow library directory could not be read.
 pub const CAUSE_LIBRARY_UNREADABLE: &str = "library_unreadable";
@@ -376,6 +390,9 @@ pub struct RunArgs {
     pub id: String,
     /// Values for the flow's declared inputs.
     pub inputs: BTreeMap<String, String>,
+    /// The digest `flow.inspect` reported, when the caller pins the run to
+    /// what it inspected; the run refuses [`CAUSE_FLOW_CHANGED`] otherwise.
+    pub expected_digest: Option<String>,
 }
 
 impl RunArgs {
@@ -386,7 +403,9 @@ impl RunArgs {
     /// [`CAUSE_FLOW_NOT_FOUND`] when no id was named — there is nothing to
     /// look up, and the recovery is the same list command. [`CAUSE_INPUT_INVALID`]
     /// when `inputs` is present but is not an object of scalar values: a value
-    /// that cannot reach a `${…}` substitution is refused, never dropped.
+    /// that cannot reach a `${…}` substitution is refused, never dropped. The
+    /// same cause refuses an `expected_digest` that is not a flow digest: a
+    /// pin that could never match must not read as "the flow changed".
     pub fn from_value(args: &Value) -> Result<Self, FlowRefusal> {
         let id = args
             .get("id")
@@ -422,11 +441,33 @@ impl RunArgs {
                 ));
             }
         }
+        let expected_digest = match args.get("expected_digest") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(digest)) if is_flow_digest(digest) => Some(digest.clone()),
+            Some(_) => {
+                return Err(FlowRefusal::new(
+                    CAUSE_INPUT_INVALID,
+                    "expected_digest must be the 64 lower-case hex characters `pam flow inspect` \
+                     reports as the flow's digest"
+                        .to_owned(),
+                    RECOVERY_FLOW_CHANGED,
+                ));
+            }
+        };
         Ok(Self {
             id: id.to_owned(),
             inputs,
+            expected_digest,
         })
     }
+}
+
+/// Whether `text` has the shape of [`pam_flow::digest`]'s output.
+fn is_flow_digest(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A JSON scalar as the text a `${…}` substitution would insert.
@@ -452,6 +493,12 @@ pub struct FlowService {
 }
 
 impl FlowService {
+    /// The policy gate this engine evaluates steps through — the daemon's
+    /// one live copy of the profile (see [`crate::policy`]).
+    pub(crate) fn gate(&self) -> &Arc<PolicyGate> {
+        &self.gate
+    }
+
     pub(crate) fn protected_base(&self) -> &Path {
         &self.protected_base
     }
@@ -1012,6 +1059,7 @@ impl FlowService {
                 RECOVERY_FLOW_EDIT,
             )
         })?;
+        refuse_changed_flow(flow, &args)?;
         refuse_undeclared_inputs(flow, &args)?;
 
         let repo = PathBuf::from(&ctx.caller.repo);
@@ -1053,13 +1101,23 @@ impl FlowService {
         }
 
         let products = product_observations(flow, &state.observed);
+        let outcome = state.correlation.outcome(outcome_for(&state.reports, flow));
+        // The outcome says how the run ended; what it changed on the way is
+        // reported beside it, so a failure never hides an effect.
+        let effects = effects_for(&state.reports, flow);
+        let mut summary = summary_for(&state.reports);
+        if let Some(note) = effects_note(outcome, &effects) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         let report = RunReport {
-            outcome: state.correlation.outcome(outcome_for(&state.reports, flow)),
-            summary: summary_for(&state.reports),
+            outcome,
+            summary,
             steps: state.reports,
         };
         let body = json!({
             "correlation": state.correlation.report(),
+            "effects": effects,
             "budget_usage": ctx.budget.usage(),
             "flow": {
                 "id": flow.id,
@@ -1089,6 +1147,7 @@ impl FlowService {
                 &capture,
                 &state.evidence,
                 &products,
+                effects,
                 state.correlation.summary(),
                 state.correlation.target().cloned(),
             )
@@ -1130,6 +1189,7 @@ impl FlowService {
         capture: &crate::evidence_service::CaptureScope,
         evidence: &[String],
         products: &BTreeMap<String, crate::flow_contract::ProductObservation>,
+        effects: Vec<EffectRecord>,
         correlation: crate::flow_contract::CorrelationSummary,
         target: Option<pam_flow::CorrelationTarget>,
     ) -> Result<(String, Value), CapabilityFailure> {
@@ -1154,6 +1214,7 @@ impl FlowService {
         })?;
         let projection = projection
             .with_handoff_target(target)
+            .and_then(|p| p.with_effects(effects))
             .and_then(|p| p.with_correlation(correlation))
             .map_err(|error| CapabilityFailure::Failed {
                 detail: error.to_string(),
@@ -1307,6 +1368,11 @@ fn inspect_command_step(
     if !cfg!(target_os = "macos") {
         blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
     }
+    // The values known now are the caller's inputs: one that would become an
+    // option is refused at run time, so inspection says so before anything runs.
+    if let Err(error @ ArgvError::Option { .. }) = substitute_argv(argv, vars) {
+        blockers.push(json!({"step": step.id, "cause": CAUSE_ARGUMENT_OPTION, "detail": error.to_string(), "recovery": RECOVERY_ARGUMENT_OPTION}));
+    }
     let program = argv.first().and_then(|value| substitute(value, vars).ok());
     item["program"] = json!(program);
     if !program
@@ -1386,6 +1452,9 @@ fn flow_references(flow: &Flow) -> Vec<String> {
                 }
             }
         }
+        for value in step.env.values() {
+            found.extend(references(value));
+        }
     }
     found
 }
@@ -1432,16 +1501,50 @@ async fn repo_origin(
     let CommandOutcome::Exited { status: 0, output } = outcome else {
         return Ok(None);
     };
-    Ok(github_owner_name(&String::from_utf8_lossy(&output)))
+    Ok(origin_from_output(&String::from_utf8_lossy(&output)))
+}
+
+/// The one GitHub remote in `git remote get-url` output. The child's stdout
+/// and stderr arrive interleaved, so a warning line may sit beside the URL:
+/// each line is read on its own, and two lines naming different repositories
+/// answer nothing rather than whichever came first.
+pub(crate) fn origin_from_output(output: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for candidate in output.lines().filter_map(github_owner_name) {
+        if found.as_ref().is_some_and(|earlier| *earlier != candidate) {
+            return None;
+        }
+        found = Some(candidate);
+    }
+    found
 }
 
 /// `owner/name` out of a GitHub remote URL, in any of the shapes git
-/// stores one (`https://`, `ssh://`, `git@host:owner/name`).
+/// stores one (`https://`, `ssh://`, `git@host:owner/name`). The host must be
+/// exactly `github.com`: `evil.github.com.example` and a path that merely
+/// contains the name are not GitHub.
 fn github_owner_name(url: &str) -> Option<String> {
     let url = url.trim();
     let url = url.strip_suffix(".git").unwrap_or(url);
-    let (_, tail) = url.split_once("github.com")?;
-    let mut segments = tail.trim_start_matches([':', '/']).split('/');
+    let (authority, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+                return None;
+            }
+            rest.split_once('/')?
+        }
+        // scp-like: `git@github.com:owner/name`.
+        None => url.split_once(':')?,
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    // An explicit port is part of the authority, not of the host.
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let mut segments = path.trim_matches('/').split('/');
     let owner = segments.next().filter(|part| !part.is_empty())?;
     let name = segments.next().filter(|part| !part.is_empty())?;
     segments.next().is_none().then(|| format!("{owner}/{name}"))
@@ -1665,13 +1768,23 @@ impl RunState<'_> {
             return Ok(());
         }
         for (index, step) in self.flow.steps.iter().enumerate().skip(self.reports.len()) {
-            let prepare = if self.should_run(step) {
-                Prepare::Run
-            } else {
-                Prepare::Skip
-            };
             self.watch_due(step)?;
             self.landing_due(step).await?;
+            // A state-changing step is journaled as not started while its
+            // scope check and approval are outstanding: nothing has run, so a
+            // cancel, an expired lease or a restart during that wait is not an
+            // uncertain effect. `run_step` arms the effect once the gate has
+            // passed. A landing intent left by an earlier attempt is the one
+            // exception: the effect may already exist, so it stays effectful.
+            let prepare = if !self.should_run(step) {
+                Prepare::Skip
+            } else if step.effect == pam_flow::Effect::Stateful
+                && !self.landing_intent_outstanding(step).await?
+            {
+                Prepare::Gate
+            } else {
+                Prepare::Run
+            };
             self.recovery
                 .prepare(&self.service.store, &self.ctx.request_id, step, prepare)
                 .await?;
@@ -1749,19 +1862,24 @@ impl RunState<'_> {
             .await
     }
 
-    /// Whether this step's `when` condition holds, given what ran before.
+    /// Whether this step's `when` condition holds, given what ran before
+    /// ([`Step::should_run`] is the definition).
     fn should_run(&self, step: &Step) -> bool {
-        let is = |id: &str, status: StepStatus| {
-            self.reports
-                .iter()
-                .any(|report| report.id == id && report.status == status)
-        };
-        match &step.when {
-            When::Always => true,
-            When::NeedsSucceeded => step.needs.iter().all(|id| is(id, StepStatus::Succeeded)),
-            When::Succeeded(id) => is(id, StepStatus::Succeeded),
-            When::Failed(id) => is(id, StepStatus::Failed),
-        }
+        let earlier: Vec<(&str, Prior)> = self
+            .reports
+            .iter()
+            .map(|report| {
+                let prior = match report.status {
+                    StepStatus::Succeeded => Prior::Succeeded,
+                    StepStatus::Failed => Prior::Failed,
+                    StepStatus::Skipped | StepStatus::Blocked | StepStatus::Cancelled => {
+                        Prior::Other
+                    }
+                };
+                (report.id.as_str(), prior)
+            })
+            .collect();
+        step.should_run(&earlier)
     }
 
     /// Tells subscribers which step is starting.
@@ -1833,6 +1951,10 @@ impl RunState<'_> {
         {
             return Ok(blocked);
         }
+        // The gate has passed: from here on the step may change something.
+        self.recovery
+            .arm_effect(&self.service.store, &self.ctx.request_id, step)
+            .await?;
         let started = Instant::now();
         match &step.action {
             Action::Landing { operation } => {
@@ -1877,6 +1999,73 @@ impl RunState<'_> {
         Ok(())
     }
 
+    /// What a gated step will run, as this run resolved it: the hand-off to
+    /// [`crate::approval`] for the approval card. A command step shows the
+    /// program as found on this machine, its substituted arguments, the
+    /// directory and the names of the environment it sets; a connector
+    /// step shows its call and substituted arguments; a landing step its
+    /// fixed operation. A value that cannot be substituted is shown as
+    /// written — the step fails after approval and the card must still say
+    /// what was asked. The digest binds all of it to the flow's own digest.
+    fn approval_snapshot(&self, step: &Step, capability: &str) -> StepSnapshot {
+        let flow_digest = digest(self.flow);
+        let cwd = Some(self.repo.display().to_string());
+        match &step.action {
+            Action::Command { argv } => {
+                let mut scratch = StepReport::new(&step.id, step.kind(), StepStatus::Failed);
+                let argv = self
+                    .command_line(step, argv, &mut scratch)
+                    .map_or_else(|| argv.clone(), |(argv, _env)| argv);
+                let program = argv.first().cloned().unwrap_or_default();
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let resolved = resolve_program(&program, &self.settings.extra_path_dirs(), &path)
+                    .map_or(program, |found| found.display().to_string());
+                StepSnapshot::new(
+                    &flow_digest,
+                    capability,
+                    resolved,
+                    argv.get(1..).unwrap_or_default().to_vec(),
+                    cwd,
+                    step.env.keys().cloned().collect(),
+                )
+            }
+            Action::Connector {
+                connector,
+                call,
+                with,
+            } => {
+                let filled = self.substitute_args(with).unwrap_or_else(|_| with.clone());
+                let mut argv = vec![call.clone()];
+                argv.extend(filled.iter().map(|(name, value)| match value {
+                    ArgValue::Text(text) => format!("{name}={text}"),
+                    ArgValue::Int(number) => format!("{name}={number}"),
+                }));
+                StepSnapshot::new(
+                    &flow_digest,
+                    capability,
+                    format!("connector:{}", connector.as_str()),
+                    argv,
+                    None,
+                    Vec::new(),
+                )
+            }
+            Action::Landing { operation } => {
+                let operation = serde_json::to_value(operation)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                StepSnapshot::new(
+                    &flow_digest,
+                    capability,
+                    format!("landing:{operation}"),
+                    Vec::new(),
+                    cwd,
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
     /// The step gate (see the module docs). `Some(report)` means the step
     /// is blocked and the run stops.
     async fn gate_step(
@@ -1890,16 +2079,11 @@ impl RunState<'_> {
         } else {
             CapabilityClass::Destructive
         };
-        let current_gate;
-        let gate = if step.watch.is_some() || matches!(step.action, Action::Landing { .. }) {
-            current_gate = crate::policy::PolicyGate::new(Arc::clone(&self.service.store))
-                .await
-                .map_err(failed)?;
-            &current_gate
-        } else {
-            &self.service.gate
-        };
-        let decision = gate
+        // One gate for every step: the daemon's live profile (see
+        // `crate::policy`), which is also what the watch stamp hashes.
+        let decision = self
+            .service
+            .gate
             .evaluate_classified(&self.ctx.request_id, &name, class)
             .await
             .map_err(failed)?;
@@ -1919,10 +2103,18 @@ impl RunState<'_> {
                 {
                     return Ok(None);
                 }
+                // What this run will execute, captured now for the human's
+                // card: an answer is pinned to this snapshot's digest.
+                let snapshot = self.approval_snapshot(step, &name);
                 let outcome = self
                     .service
                     .approvals
-                    .request_approval(&self.ctx.request_id, &name, &mut self.cancel)
+                    .request_approval_with(
+                        &self.ctx.request_id,
+                        &name,
+                        Some(snapshot),
+                        &mut self.cancel,
+                    )
                     .await
                     .map_err(failed)?;
                 match outcome {
@@ -2043,6 +2235,10 @@ fn assert_connector_attempt(step: &Step, attempt: Attempt) -> Attempt {
     }
 }
 
+/// A command step's argument vector and its environment additions, every
+/// `${…}` filled in.
+type CommandLine = (Vec<String>, Vec<(String, String)>);
+
 /// What one attempt of a step produced.
 enum Attempt {
     /// It ran and reported success.
@@ -2084,17 +2280,8 @@ impl RunState<'_> {
         argv: &[String],
         report: &mut StepReport,
     ) -> Result<(), CapabilityFailure> {
-        let argv = match self.substitute_all(argv) {
-            Ok(argv) => argv,
-            Err(error) => {
-                report.fail(
-                    StepStatus::Failed,
-                    CAUSE_VARIABLE_UNAVAILABLE,
-                    error,
-                    "supply the input the step references, or edit the flow's YAML".to_owned(),
-                );
-                return Ok(());
-            }
+        let Some((argv, step_env)) = self.command_line(step, argv, report) else {
+            return Ok(());
         };
         // Validation guarantees a command step has at least its program.
         let program = argv.first().cloned().unwrap_or_default();
@@ -2134,9 +2321,7 @@ impl RunState<'_> {
                 return Ok(());
             }
         };
-        for (name, value) in &step.env {
-            env.push((name.clone(), value.clone()));
-        }
+        env.extend(step_env);
         env.push(("PAM_FLOW".to_owned(), self.flow.id.clone()));
         env.push(("PAM_STEP".to_owned(), step.id.clone()));
         let spec = CommandSpec {
@@ -2174,6 +2359,52 @@ impl RunState<'_> {
         }
         self.settle(step, attempt, report).await;
         Ok(())
+    }
+
+    /// The step's argument vector and environment additions with every
+    /// `${…}` filled in; `None` when the step cannot run, with `report`
+    /// already saying why.
+    fn command_line(
+        &self,
+        step: &Step,
+        argv: &[String],
+        report: &mut StepReport,
+    ) -> Option<CommandLine> {
+        let unavailable = |report: &mut StepReport, detail: String| {
+            report.fail(
+                StepStatus::Failed,
+                CAUSE_VARIABLE_UNAVAILABLE,
+                detail,
+                "supply the input the step references, or edit the flow's YAML".to_owned(),
+            );
+        };
+        let argv = match substitute_argv(argv, &self.vars) {
+            Ok(argv) => argv,
+            Err(error @ ArgvError::Unresolved { .. }) => {
+                unavailable(report, error.to_string());
+                return None;
+            }
+            // A value that would change what the program is asked to do is a
+            // refusal, not a failed attempt: the run stops here.
+            Err(error @ ArgvError::Option { .. }) => {
+                report.fail(
+                    StepStatus::Blocked,
+                    CAUSE_ARGUMENT_OPTION,
+                    format!("step {:?}: {error}", step.id),
+                    RECOVERY_ARGUMENT_OPTION.to_owned(),
+                );
+                return None;
+            }
+        };
+        // Environment values take the same variables as arguments; validation
+        // already counted an input one of them names as read.
+        match self.substitute_env(&step.env) {
+            Ok(env) => Some((argv, env)),
+            Err(error) => {
+                unavailable(report, error);
+                None
+            }
+        }
     }
 
     /// The boundary and environment one command step runs under: the
@@ -2782,6 +3013,8 @@ impl RunState<'_> {
                     use_model: summarize,
                 },
                 Some(&capture),
+                // The step's own cancel: a cancelled run stops its summary too.
+                self.cancel.clone(),
             )
             .await;
         let compressed = match compressed {
@@ -2838,10 +3071,18 @@ impl RunState<'_> {
         sleep_or_cancel(delay, &mut self.cancel).await
     }
 
-    /// Substitutes `${…}` in every argument, naming the first that fails.
-    fn substitute_all(&self, argv: &[String]) -> Result<Vec<String>, String> {
-        argv.iter()
-            .map(|argument| substitute(argument, &self.vars).map_err(|error| error.to_string()))
+    /// Substitutes `${…}` in every environment value of a command step,
+    /// naming the first variable that fails.
+    fn substitute_env(
+        &self,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, String> {
+        env.iter()
+            .map(|(name, value)| {
+                substitute(value, &self.vars)
+                    .map(|value| (name.clone(), value))
+                    .map_err(|error| format!("env.{name}: {error}"))
+            })
             .collect()
     }
 
@@ -2927,6 +3168,29 @@ fn contract_refusal(error: crate::flow_contract::ContractError) -> FlowRefusal {
         error.to_string(),
         RECOVERY_FLOW_LIST,
     )
+}
+
+/// Refuses a run pinned to a digest the flow no longer has. The flow a run
+/// executes is the one in memory from here on; a pin makes it the one the
+/// caller inspected, or nothing runs.
+fn refuse_changed_flow(flow: &Flow, args: &RunArgs) -> Result<(), CapabilityFailure> {
+    let Some(expected) = &args.expected_digest else {
+        return Ok(());
+    };
+    let current = digest(flow);
+    if *expected == current {
+        return Ok(());
+    }
+    Err(FlowRefusal::new(
+        CAUSE_FLOW_CHANGED,
+        format!(
+            "flow {:?} now has digest {current}, not the pinned {expected}: it was edited after \
+             it was inspected",
+            args.id
+        ),
+        RECOVERY_FLOW_CHANGED,
+    )
+    .into())
 }
 
 /// Refuses supplied input names the flow does not declare — the run-side

@@ -344,3 +344,85 @@ async fn a_fresh_open_binds_the_journal_and_files_exactly_one_checkpoint() {
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(cursor["evidence_id"], checkpoints[0].id);
 }
+
+/// A terminal write on ticket `r`, as the cancel and lease-expiry paths make it.
+async fn end_cancelled(store: &Store) -> Option<String> {
+    store
+        .finish_request(
+            "r",
+            pam_store::RequestState::Failed,
+            Some("cancelled"),
+            pam_store::AuditEntry {
+                action: "execute",
+                decision: pam_store::Decision::Refuse,
+                actor: pam_store::Actor::System,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+    store.get_request("r").await.unwrap().unwrap().outcome
+}
+
+/// Finding 6 of the 2026-10 design review: the effect of a state-changing
+/// step used to be journaled before its approval gate, so ending the ticket
+/// while a human was still deciding reported an effect nothing had made.
+#[tokio::test]
+async fn a_gated_effect_is_not_started_until_it_is_armed() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, _) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    let mut effect = flow.steps[0].clone();
+    effect.effect = pam_flow::Effect::Stateful;
+    recovery
+        .prepare(&store, "r", &effect, Prepare::Gate)
+        .await
+        .unwrap();
+    let gating = store.read_flow_journal("r").await.unwrap().unwrap();
+    assert_eq!(gating.state, pam_store::FlowJournalState::Prepared);
+    assert!(!gating.effectful);
+    // Arming a different step is a no-op: only the gated one becomes an effect.
+    recovery
+        .arm_effect(&store, "r", &flow.steps[1])
+        .await
+        .unwrap();
+    assert_eq!(store.read_flow_journal("r").await.unwrap().unwrap(), gating);
+    // A restart here finds an attempt that never started and redoes it.
+    assert!(
+        store
+            .abandon_read_attempt("r", gating.revision)
+            .await
+            .unwrap()
+    );
+    assert_eq!(end_cancelled(&store).await.as_deref(), Some("cancelled"));
+}
+
+#[tokio::test]
+async fn an_armed_effect_is_uncertain_when_the_ticket_ends_before_it_settles() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, _) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    let mut effect = flow.steps[0].clone();
+    effect.effect = pam_flow::Effect::Stateful;
+    recovery
+        .prepare(&store, "r", &effect, Prepare::Gate)
+        .await
+        .unwrap();
+    recovery.arm_effect(&store, "r", &effect).await.unwrap();
+    let armed = store.read_flow_journal("r").await.unwrap().unwrap();
+    assert_eq!(armed.state, pam_store::FlowJournalState::Prepared);
+    assert!(
+        armed.effectful,
+        "the gate passed: the intent precedes the I/O"
+    );
+    assert_eq!(armed.step_id.as_deref(), Some("first"));
+    // Arming twice changes nothing; the journal revision is still ours.
+    recovery.arm_effect(&store, "r", &effect).await.unwrap();
+    assert_eq!(store.read_flow_journal("r").await.unwrap().unwrap(), armed);
+    assert_eq!(
+        end_cancelled(&store).await.as_deref(),
+        Some("flow_effect_uncertain")
+    );
+}

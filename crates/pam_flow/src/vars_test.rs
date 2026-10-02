@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::vars::{VarError, Vars, references, substitute};
+use super::vars::{ArgvError, VarError, Vars, references, substitute, substitute_argv};
 
 fn vars() -> Vars {
     let mut vars = Vars::new();
@@ -122,5 +122,79 @@ fn resolve_answers_one_key_at_a_time() {
     assert_eq!(
         vars().resolve("steps.latest-failed.exit_status").as_deref(),
         Some("101")
+    );
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+#[test]
+fn a_supplied_value_cannot_become_an_option() {
+    let mut vars = Vars::new();
+    vars.set("inputs.rev", "--output=/tmp/planted");
+    vars.set("inputs.script", "-e");
+    vars.set("inputs.empty", "");
+    for (template, position) in [
+        (argv(&["git", "log", "${inputs.rev}"]), 2),
+        (argv(&["node", "${inputs.script}", "x"]), 1),
+        // An empty leading value does not hide the dash behind it.
+        (argv(&["git", "log", "${inputs.empty}${inputs.script}"]), 2),
+    ] {
+        assert_eq!(
+            substitute_argv(&template, &vars),
+            Err(ArgvError::Option { position }),
+            "{template:?}"
+        );
+    }
+}
+
+#[test]
+fn the_template_itself_may_mark_an_option_or_end_them() {
+    let mut vars = Vars::new();
+    vars.set("inputs.rev", "--output=/tmp/planted");
+    vars.set("inputs.day", "-1 day");
+    vars.set("inputs.plain", "main");
+    // After the author's `--`, everything is an operand.
+    assert_eq!(
+        substitute_argv(&argv(&["git", "log", "--", "${inputs.rev}"]), &vars).unwrap(),
+        argv(&["git", "log", "--", "--output=/tmp/planted"])
+    );
+    // Literal text in front confines the value to that option's argument.
+    assert_eq!(
+        substitute_argv(&argv(&["git", "log", "--since=${inputs.day}"]), &vars).unwrap(),
+        argv(&["git", "log", "--since=-1 day"])
+    );
+    assert_eq!(
+        substitute_argv(&argv(&["git", "log", "${inputs.plain}", "-20"]), &vars).unwrap(),
+        argv(&["git", "log", "main", "-20"])
+    );
+}
+
+#[test]
+fn a_substituted_double_dash_does_not_end_option_parsing() {
+    let mut vars = Vars::new();
+    vars.set("inputs.sep", "--");
+    vars.set("inputs.rev", "--output=/tmp/planted");
+    // The first value is itself refused; were it allowed, the second would ride on it.
+    assert_eq!(
+        substitute_argv(
+            &argv(&["git", "log", "${inputs.sep}", "${inputs.rev}"]),
+            &vars
+        ),
+        Err(ArgvError::Option { position: 2 })
+    );
+}
+
+#[test]
+fn an_unfilled_argument_names_its_position() {
+    assert_eq!(
+        substitute_argv(&argv(&["git", "log", "${inputs.nope}"]), &Vars::new()),
+        Err(ArgvError::Unresolved {
+            position: 2,
+            source: VarError::Unresolved {
+                key: "inputs.nope".to_owned()
+            }
+        })
     );
 }

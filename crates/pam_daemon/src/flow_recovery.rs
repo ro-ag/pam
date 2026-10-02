@@ -201,12 +201,19 @@ pub(crate) struct Recovery {
     pub revision: i64,
     pub watch: Option<WatchState>,
     cursor: Cursor,
+    /// The step journaled by [`Prepare::Gate`] whose effect is not armed yet.
+    gating: Option<String>,
 }
 /// What the runtime is about to do with a step once its attempt is journaled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prepare {
     /// The step executes; a stateful one is journaled as effectful.
     Run,
+    /// The step still has to pass its scope check and approval gate. It is
+    /// journaled as an attempt that has not started — recovery and the
+    /// terminal writer treat it like an interrupted read, safe to redo —
+    /// until [`Recovery::arm_effect`] journals the effect itself.
+    Gate,
     /// The step is settled as skipped (its `when` clause did not hold), so
     /// nothing runs and nothing is journaled as effectful.
     Skip,
@@ -293,12 +300,14 @@ impl Recovery {
                 revision: row.revision,
                 watch: cursor.watch.clone(),
                 cursor,
+                gating: None,
             },
             snapshot,
         ))
     }
     /// Commits the intent to attempt `step` before any I/O. A
     /// [`Prepare::Run`] of a stateful step is journaled as effectful; a
+    /// [`Prepare::Gate`] is not until [`Self::arm_effect`], and a
     /// [`Prepare::Skip`] never is, whatever the step declares.
     pub async fn prepare(
         &mut self,
@@ -307,13 +316,14 @@ impl Recovery {
         step: &pam_flow::Step,
         prepare: Prepare,
     ) -> Result<(), CapabilityFailure> {
+        let stateful = step.effect == pam_flow::Effect::Stateful;
         if !store
             .prepare_flow_attempt(
                 ticket,
                 self.revision,
                 &step.id,
                 1,
-                prepare == Prepare::Run && step.effect == pam_flow::Effect::Stateful,
+                prepare == Prepare::Run && stateful,
             )
             .await
             .map_err(|_| failure())?
@@ -321,6 +331,42 @@ impl Recovery {
             return Err(failure());
         }
         self.revision += 1;
+        self.gating = (prepare == Prepare::Gate && stateful).then(|| step.id.clone());
+        Ok(())
+    }
+    /// Journals the effect of a step that was prepared with [`Prepare::Gate`]
+    /// and has now passed its gate; a no-op for every other step. The intent
+    /// still precedes the I/O: the not-started attempt is released and the
+    /// effectful one committed before the caller spawns or dispatches
+    /// anything. Between the two statements the journal is `ready` — exactly
+    /// what it says, nothing has run — so an interruption there is redone
+    /// from this step rather than reported as an uncertain effect.
+    pub async fn arm_effect(
+        &mut self,
+        store: &Store,
+        ticket: &str,
+        step: &pam_flow::Step,
+    ) -> Result<(), CapabilityFailure> {
+        if self.gating.as_deref() != Some(step.id.as_str()) {
+            return Ok(());
+        }
+        if !store
+            .abandon_read_attempt(ticket, self.revision)
+            .await
+            .map_err(|_| failure())?
+        {
+            return Err(failure());
+        }
+        self.revision += 1;
+        if !store
+            .prepare_flow_attempt(ticket, self.revision, &step.id, 1, true)
+            .await
+            .map_err(|_| failure())?
+        {
+            return Err(failure());
+        }
+        self.revision += 1;
+        self.gating = None;
         Ok(())
     }
     pub async fn settle_watch(
@@ -464,9 +510,11 @@ impl Cursor {
                 .await
                 .map_err(|_| failure())?
                 .ok_or_else(failure)?;
-            if view.expired_at.is_some()
-                || view.authorization_revision != Some(watch.authorization_revision)
-            {
+            // The watch stamp is a scoped revocation count, no longer the
+            // request's admission snapshot: ask the store whether the
+            // request's own admission still stands. The stamp itself is
+            // compared by `watch_approval_valid`.
+            if view.expired_at.is_some() || !view.authorization_current {
                 return Err(failure());
             }
             let origin = serde_json::from_str(&view.origin_json).map_err(|_| failure())?;

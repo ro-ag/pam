@@ -1,12 +1,12 @@
 //! Loopback fixtures real curl is driven against. No fixture leaves the
 //! machine.
 //!
-//! * [`Origin`]: a plain HTTP/1.1 server that records what arrived.
-//! * [`FakeProxy`]: a forward proxy. `CONNECT` to *any* name is tunnelled to
+//! * [`Origin`](crate::testing::Origin): a plain HTTP/1.1 server that records what arrived.
+//! * [`FakeProxy`](crate::testing::FakeProxy): a forward proxy. `CONNECT` to *any* name is tunnelled to
 //!   one configured loopback address, so a test can ask for
 //!   `origin.pam-test.invalid` and prove the proxy — not DNS — carried it.
 //!   It records every request line and every `Proxy-Authorization` it saw.
-//! * [`TlsOrigin`]: `openssl s_server` with the committed test certificates
+//! * [`TlsOrigin`](crate::testing::TlsOrigin): `openssl s_server` with the committed test certificates
 //!   under `tests/fixtures/` (a private test CA, a leaf for
 //!   `origin.pam-test.invalid`/`localhost`/`127.0.0.1`, a leaf for another
 //!   name, an expired leaf, and an unrelated CA). No TLS crate is involved;

@@ -10,6 +10,9 @@ mod admin_engine_test;
 pub mod admin_flows;
 pub mod admin_logs;
 pub mod admin_models;
+pub mod admin_network;
+#[cfg(test)]
+mod admin_network_test;
 pub mod admin_retention;
 pub mod admin_transport;
 pub mod approval;
@@ -69,6 +72,9 @@ pub mod lifecycle;
 pub mod log_service;
 pub mod model_readiness;
 pub mod model_service;
+pub mod network_service;
+#[cfg(test)]
+mod network_service_test;
 pub mod policy;
 pub mod public_transport;
 #[cfg(test)]

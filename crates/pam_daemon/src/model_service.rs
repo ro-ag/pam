@@ -389,6 +389,10 @@ pub struct ModelService {
     /// human saves applies to the next download. Until the daemon sets its
     /// own, a direct connection with the platform's trust.
     network: RwLock<Arc<dyn NetworkSource>>,
+    /// The daemon's network settings service, when it has one: where the
+    /// engine and models mirrors are read from, per transfer. Unset (tests)
+    /// means no mirror.
+    mirrors: RwLock<Option<Arc<crate::network_service::NetworkService>>>,
     /// Lets the in-crate tests fetch from a plain-http loopback origin;
     /// production has no such switch.
     #[cfg(test)]
@@ -470,6 +474,7 @@ impl ModelService {
             qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
             network: RwLock::new(Arc::new(Arc::new(NetSettings::direct()))),
+            mirrors: RwLock::new(None),
             #[cfg(test)]
             plain_http_for_tests: AtomicBool::new(false),
             engine: std::sync::Mutex::new(None),
@@ -495,8 +500,9 @@ impl ModelService {
     }
 
     /// Spawns one of the service's own tasks where [`Self::shutdown`] can
-    /// join it, forgetting the ones that have already ended.
-    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+    /// join it, forgetting the ones that have already ended. Crate-visible
+    /// so a test can plant a task that ends only when it says.
+    pub(crate) fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self
             .tasks
             .lock()
@@ -882,6 +888,33 @@ impl ModelService {
             .network
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
+    }
+
+    /// Points transfers at the daemon's network settings service: the
+    /// profile source and the mirrors in one. What the daemon calls at boot.
+    pub fn set_network_service(&self, network: Arc<crate::network_service::NetworkService>) {
+        self.set_network_source(Arc::clone(&network) as Arc<dyn NetworkSource>);
+        *self
+            .mirrors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(network);
+    }
+
+    /// The engine and models mirrors the next transfer would use, read
+    /// now from the network settings; `(None, None)` when the daemon set no
+    /// service. Settings that cannot be used refuse, never fall back.
+    pub async fn mirrors(
+        &self,
+    ) -> Result<(Option<pam_net::MirrorBase>, Option<pam_net::MirrorBase>), NetFailure> {
+        let service = self
+            .mirrors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match service {
+            Some(network) => network.mirrors().await,
+            None => Ok((None, None)),
+        }
     }
 
     /// The source transfers read their network profile from.

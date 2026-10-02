@@ -66,6 +66,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ca;
 pub mod config;
 pub mod failure;
 pub mod launch;
@@ -80,6 +81,7 @@ pub mod trusted;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use ca::{CaError, NormalizedBundle, normalize_pem};
 pub use config::{EscapeError, escape};
 pub use failure::{Diagnostics, NetFailure, curl_install_line};
 pub use launch::{CURL_ARGV, CurlChild, CurlOutput, CurlRequest, DEFAULT_CAPTURE_BYTES, Method};
@@ -91,6 +93,8 @@ pub use settings::{
 pub use trusted::{CurlInfo, TlsBackend, TrustedCurl, WINDOWS_KEPT_ENV};
 pub use url::Url;
 
+#[cfg(test)]
+mod ca_test;
 #[cfg(test)]
 mod config_test;
 #[cfg(test)]

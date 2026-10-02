@@ -1075,6 +1075,14 @@ async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_c
 
 /// The wait for the followers is bounded: one that has not ended in time is
 /// reported and left running, and the shutdown returns.
+///
+/// The task that does not end in time is one this test holds shut: a
+/// zero wait is not "no time" on tokio — `timeout(ZERO, ..)` yields once
+/// when the task's cooperative budget is spent, and in that one yield a
+/// cancelled follower can finish on a fast host, which left nothing to
+/// report and an empty log to assert on (1 run in 11 on Windows). The
+/// verify follower is still started and still checked below: left, not
+/// aborted, it records why its job ended.
 #[tokio::test]
 async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
@@ -1088,8 +1096,15 @@ async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
         .unwrap();
     let entry = service.find("qwen/big").await.unwrap().unwrap();
     let job = service.start_verify(entry).await.unwrap();
+    // A task of the service's own that ends only when this test says so:
+    // whatever the scheduler does, the join cannot complete before the
+    // wait does.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    service.spawn_task({
+        let gate = Arc::clone(&gate);
+        async move { gate.notified().await }
+    });
 
-    // No time at all: the follower cannot have recorded its verdict yet.
     let (log, logging) = Captured::start();
     let started = std::time::Instant::now();
     service.shutdown_within(std::time::Duration::ZERO).await;
@@ -1098,7 +1113,16 @@ async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
     let text = log.text();
     assert!(text.contains("WARN"), "{text}");
     assert!(text.contains("did not stop in time"), "{text}");
-    assert!(text.contains("left=1") || text.contains("left=2"), "{text}");
+    // The held task for certain; the follower and the idle ticker if they
+    // had not ended by then.
+    let left: usize = text
+        .lines()
+        .find_map(|line| line.split("left=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the warning names how many were left: {text}"));
+    assert!((1..=3).contains(&left), "{text}");
+    gate.notify_one();
 
     // Left, not aborted: it still records why its job ended.
     let row = finished_job(&service, &job).await;

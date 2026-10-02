@@ -1086,24 +1086,50 @@ mod live {
     /// ends. Its verdict cannot be recorded by this daemon, so it is not
     /// parked and its waiter is not told a result the next boot will not
     /// show: it is told the daemon is shutting down.
+    ///
+    /// The store must close while the echo is still running. The test
+    /// waits for the hub's `Started` event — published by the executor
+    /// right before the handler runs — rather than polling the row for
+    /// `running` (set at the lease, and read through the store's blocking
+    /// lane, which under a loaded gate could land after a short echo had
+    /// already finished and been recorded: a flake seen once on macOS).
+    /// The echo is long enough that the close lands inside it on any host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leased_request_that_ends_on_a_closed_store_is_not_parked_and_not_reported_done() {
+        use crate::event_hub::Subscribed;
+
         let live = Live::start("relaxed", |_| {}).await;
         let store = live.store();
         let terminals = Arc::clone(&live.handle.admin().terminals);
+        let mut events = live
+            .handle
+            .event_hub()
+            .subscribe_all()
+            .expect("a subscriber slot");
 
         let mut slow = request(
             "outlived",
             "echo",
-            serde_json::json!({ "delay_ms": 600 }),
+            serde_json::json!({ "delay_ms": 2_000 }),
             true,
         );
         slow.deadline_ms = 30_000;
         let answer = live.submit(slow).await;
-        eventually("the echo is running", || async {
-            state_of(&store, "outlived").await == Some(RequestState::Running)
-        })
-        .await;
+        loop {
+            match tokio::time::timeout(PATIENCE, events.next()).await {
+                Ok(Subscribed::Event(event))
+                    if event.ticket == "outlived" && event.event == pam_proto::Event::Started =>
+                {
+                    break;
+                }
+                Ok(Subscribed::Event(_)) => {}
+                other => panic!("expected the echo to start, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            state_of(&store, "outlived").await,
+            Some(RequestState::Running)
+        );
         store.close().await.unwrap();
 
         let started = std::time::Instant::now();
@@ -1117,9 +1143,9 @@ mod live {
             "{response:?}"
         );
         assert_eq!(terminals.parked_count(), 0);
-        // The echo's own 600 ms, without two backoff pauses on top that a
-        // closed store would have made pointless; generous for a loaded host.
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The echo's own 2 s and nothing on top: a closed store is not
+        // retried through the backoff pauses; generous for a loaded host.
+        assert!(started.elapsed() < Duration::from_secs(8));
         live.stop().await;
     }
 

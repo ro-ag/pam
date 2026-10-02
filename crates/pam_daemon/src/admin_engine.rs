@@ -102,7 +102,19 @@ impl AdminService {
                 detail: failure.sentence(),
                 recovery: failure.recovery(),
             })?;
-        let status = engine::install(&base, cancel, net, None)
+        // The mirror, when the human set one, changes only where the pinned
+        // archive is fetched from; the digest, size and build it is held to
+        // are this build's constants.
+        let (engine_mirror, _) = self
+            .models
+            .mirrors()
+            .await
+            .map_err(|failure| AdminRefusal {
+                cause: failure.cause(),
+                detail: failure.sentence(),
+                recovery: failure.recovery(),
+            })?;
+        let status = engine::install(&base, cancel, net, engine_mirror.as_ref())
             .await
             .map_err(|error| refusal(&error))?;
         Ok(AdminOk {

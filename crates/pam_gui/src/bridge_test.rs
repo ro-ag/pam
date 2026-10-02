@@ -3,8 +3,8 @@ use pam_proto::{Outcome, Response};
 use serde_json::json;
 
 use crate::bridge::{
-    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_RELAXED, admin_call, check_confirmation,
-    deadline_for, is_disconnect, is_known_admin_op, required_confirmation,
+    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_NETWORK, CONFIRM_RELAXED, admin_call,
+    check_confirmation, deadline_for, is_disconnect, is_known_admin_op, required_confirmation,
 };
 
 #[test]
@@ -24,9 +24,20 @@ fn every_daemon_admin_op_is_whitelisted() {
             + pam_daemon::admin_logs::LOG_ADMIN_OPS.len()
             + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
             + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len()
-            + pam_daemon::admin_retention::RETENTION_ADMIN_OPS.len(),
+            + pam_daemon::admin_retention::RETENTION_ADMIN_OPS.len()
+            + pam_daemon::admin_network::NETWORK_ADMIN_OPS.len(),
         "new admin ops need explicit wiring"
     );
+}
+
+#[test]
+fn every_network_admin_op_is_whitelisted() {
+    // Same for the network surface behind Settings → Network: the three
+    // ops the frontend names, spliced in from the daemon's own list.
+    for op in pam_daemon::admin_network::NETWORK_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+    }
+    assert_eq!(pam_daemon::admin_network::NETWORK_ADMIN_OPS.len(), 3);
 }
 
 #[test]
@@ -96,8 +107,14 @@ fn only_the_working_ops_get_the_long_deadline() {
         15_000,
         "{test_op} rides just above the daemon's own 10 s connector budget"
     );
+    let network_test = pam_daemon::admin_network::OP_NETWORK_TEST;
+    assert_eq!(
+        deadline_for(network_test),
+        25_000,
+        "{network_test} rides just above the daemon's own 20 s probe budget"
+    );
     for op in ADMIN_OPS {
-        if long.contains(&op) || op == test_op {
+        if long.contains(&op) || op == test_op || op == network_test {
             continue;
         }
         assert_eq!(deadline_for(op), 30_000, "{op} answers synchronously");
@@ -377,6 +394,68 @@ fn authority_expanding_ops_need_a_typed_confirmation() {
     ] {
         assert_eq!(required_confirmation(op, &args), None, "{op} {args}");
     }
+}
+
+/// The phrase rule for the network settings is exactly what the frontend sends: `network`
+/// whenever the patch carries a non-null proxy object (the frontend sends one only when it
+/// differs from the stored one in any field), a `credential.set` or a `ca_bundle` import — and
+/// never for clearing any of them, editing the no-proxy list or setting a mirror.
+#[test]
+fn network_settings_that_route_traffic_elsewhere_need_the_network_phrase() {
+    let proxy =
+        json!({"url": "http://proxy.corp.example:3128", "auth": "basic", "username": "svc"});
+    for args in [
+        json!({"proxy": proxy}),
+        json!({"proxy": {"url": "http://proxy.corp.example:3128", "auth": "none", "username": null}}),
+        json!({"credential": {"set": "hunter2"}}),
+        json!({"ca_bundle": {"path": "/etc/corp/ca.pem"}}),
+        // A proxy change alongside one-click fields still needs the phrase.
+        json!({"proxy": proxy, "no_proxy": ["corp.example"], "engine_mirror": null}),
+        json!({"credential": {"set": "hunter2"}, "proxy": null}),
+    ] {
+        assert_eq!(
+            required_confirmation("admin.network.set", &args),
+            Some(CONFIRM_NETWORK),
+            "{args}"
+        );
+    }
+    for args in [
+        json!({"proxy": null}),
+        json!({"credential": {"clear": true}}),
+        json!({"ca_bundle": null}),
+        json!({"no_proxy": ["corp.example", "10.0.0.0/8"]}),
+        json!({"engine_mirror": "https://artifacts.corp.example/llama/"}),
+        json!({"models_mirror": null}),
+        json!({"proxy": null, "credential": {"clear": true}, "ca_bundle": null}),
+        json!({}),
+    ] {
+        assert_eq!(
+            required_confirmation("admin.network.set", &args),
+            None,
+            "{args}"
+        );
+    }
+    // An extra phrase on a one-click save is accepted, never refused.
+    check_confirmation(
+        "admin.network.set",
+        &json!({"proxy": null}),
+        Some("network"),
+    )
+    .expect("a phrase nothing asked for is harmless");
+    // The other network ops never ask.
+    assert_eq!(required_confirmation("admin.network.get", &json!({})), None);
+    assert_eq!(
+        required_confirmation("admin.network.test", &json!({"target": "github"})),
+        None
+    );
+    let error = check_confirmation("admin.network.set", &json!({"proxy": proxy}), None)
+        .expect_err("a proxy needs the phrase");
+    assert_eq!(error.cause, "confirmation_required");
+    assert!(
+        error.recovery.contains(CONFIRM_NETWORK),
+        "{}",
+        error.recovery
+    );
 }
 
 #[test]

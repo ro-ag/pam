@@ -4,7 +4,8 @@
 //! `crates/pam` depends on `pam_gui` (single-binary law: `pam gui` hands
 //! the process to the Tauri event loop), so the GUI cannot depend on the
 //! `pam` crate without a cycle. Everything both sides need — daemon
-//! lifecycle ([`client`]), envelope building ([`request`]), advisory
+//! lifecycle and the request flow ([`client`]), the framed exchange with
+//! the daemon ([`transport`]), envelope building ([`request`]), advisory
 //! caller identity ([`caller`]), and the base-dir resolution below —
 //! lives here instead; `pam` re-exports these modules so its public
 //! surface (`pam::client`, …) is unchanged.
@@ -20,6 +21,7 @@ pub mod client;
 pub mod relay;
 pub mod request;
 pub mod service;
+pub mod transport;
 
 #[cfg(test)]
 mod caller_test;
@@ -34,6 +36,8 @@ mod relay_test;
 mod request_test;
 #[cfg(test)]
 mod service_test;
+#[cfg(test)]
+mod transport_test;
 
 /// The base directory every pam mode works under: `$PAM_BASE_DIR` when
 /// set and non-empty, otherwise `~/.pam`. `None` only when neither the

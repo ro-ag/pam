@@ -1,29 +1,47 @@
-//! Client-side daemon lifecycle: lazy auto-start. [`ensure_daemon`] probes for a daemon behind
-//! `pam.sock`, spawns `pam daemon` detached if none, and waits (bounded, ~3 s, one respawn retry)
-//! for readiness. Readiness is an **actual connect**: `daemon.lock` has an exclusive holder (a
-//! shared-lock probe conflicts with it) **and** the socket accepts a connection, so a stale
-//! `pam.sock` left behind by a crash never reads as ready. A lock holder whose socket is not up
-//! yet is a daemon still booting (crash recovery, warm-up): the client waits for it instead of
-//! spawning another process. The spawned daemon is isolated from the caller: its own process
-//! group, a fixed working directory, and an explicit environment allowlist ([`daemon_env`])
-//! instead of the caller's environment. Client path resolution never creates or chmods the
-//! runtime directory; only daemon startup prepares it.
+//! Client-side daemon lifecycle and the public request flow.
 //!
-//! [`send_request`] ensures the daemon, builds the envelope, and exchanges it over a zmq `DEALER`
-//! (timeout `deadline_ms` + margin; the connect is bounded at 5 s and retries a restarting daemon's
-//! socket inside that window), refusing the reserved GUI-only
-//! `admin.*` namespace before touching the socket ([`send_admin`] is the GUI's path instead).
-//! After a [`CAUSE_DAEMON_OUTDATED`] refusal the old daemon drains and a new one takes over: the
-//! client waits for that replacement to be ready, then retries exactly once.
-//! [`send_request_with_id`] takes the request id from the caller, so the id is known before
-//! anything is sent. [`follow_ticket`] subscribes to `events.sock` and streams to a terminal
-//! `done`/`refused`, reconciling against the daemon's store since zmq `PUB` has no replay; `pam
-//! wait` follows quietly, `pam subscribe` prints each event. Events are hints only: transient
-//! daemon refusals (capacity, rate, shutting down, restarting) and transport failures are retried
-//! with bounded backoff until the caller's timeout, unknown event kinds are skipped, and a closed
-//! event stream is reconnected, so a healthy request is never reported refused because the daemon
-//! was briefly busy. Intermediate events stream at normal `PUB` latency; only a missed terminal
-//! event falls back to the reconcile cadence.
+//! **Lazy start.** [`ensure_daemon`] looks for a daemon behind the public endpoint, spawns
+//! `pam daemon` detached if there is none, and waits (bounded, ~3 s, one respawn retry) for
+//! readiness. Readiness is a **successful hello**: `daemon.lock` has an exclusive holder (a
+//! shared-lock probe conflicts with it) **and** the daemon acknowledged this build's hello
+//! ([`crate::transport::probe`]), so a stale socket file left behind by a crash never reads as
+//! ready. A lock holder whose endpoint is not up yet is a daemon still booting (crash recovery,
+//! warm-up): the client waits for it instead of spawning another process. The spawned daemon is
+//! isolated from the caller: its own process group, a fixed working directory, and an explicit
+//! environment allowlist ([`daemon_env`]) instead of the caller's environment. Client path
+//! resolution never creates or chmods the runtime directory; only daemon startup prepares it.
+//!
+//! **What the hello can find instead.** A daemon whose binary was replaced on disk answers
+//! `daemon_outdated` and restarts itself: the client waits for the replacement. A daemon of
+//! another build whose binary is unchanged answers `client_version_mismatch`: it is running and
+//! it is left alone — the request that follows gets that refusal, with the daemon's version, its
+//! executable and what to do, and the client never stops a daemon over it. A peer that greets in
+//! ZMTP is a pre-migration daemon: an unsandboxed client stops it the way `pam daemon stop` does
+//! (the pid in the instance lock, `SIGTERM`, a bounded wait for the lock), then starts its own
+//! build; a client that may not signal it, or that dials through `PAM_SOCKET_DIR`, fails with the
+//! instruction for the human ([`ClientError::LegacyDaemon`], [`ClientError::LegacyBehindRelay`]).
+//! That is the only case in which a client stops a daemon on its own.
+//!
+//! **Requests.** [`send_request`] ensures the daemon, builds the envelope, and exchanges it over
+//! one framed connection (hello, `request`, `reply`; the connect is bounded at 5 s and retries a
+//! restarting daemon's endpoint inside that window, the reply at `deadline_ms` plus a margin),
+//! refusing the reserved GUI-only `admin.*` namespace before touching the socket ([`send_admin`]
+//! is the GUI's path instead). A hello the daemon refuses with an `error` frame comes back as the
+//! refusal it is, naming the request: cause, detail and recovery are the daemon's. After a
+//! [`CAUSE_DAEMON_OUTDATED`] refusal the old daemon drains and a new one takes over: the client
+//! waits for that replacement to be ready, then retries exactly once. [`send_request_with_id`]
+//! takes the request id from the caller, so the id is known before anything is sent.
+//!
+//! **Follows.** [`follow_ticket`] follows one ticket on one framed connection (`pam wait`
+//! quietly, `pam subscribe` printing each event): hello, `follow`, then the ticket's events and
+//! an `end` frame that carries the durable result, so nothing is queried afterwards
+//! ([`follow_ticket_to_end`] returns it). A follow that attaches late receives what the daemon
+//! still holds of the earlier events, and one that attaches after the ticket finished ends at
+//! once. The daemon's momentary condition is not a verdict: transient refusals (capacity, rate,
+//! shutting down, restarting) and a dropped connection are retried with bounded backoff until the
+//! caller's timeout, resuming after the last sequence number seen; a changed daemon epoch is a
+//! restarted daemon and starts the position over. An event kind or frame type this build does
+//! not know is skipped.
 
 use std::ffi::OsString;
 use std::fs::{File, TryLockError};
@@ -36,22 +54,23 @@ use pam_daemon::admin::{ADMIN_CALLER_AGENT, ADMIN_PREFIX, ADMIN_REPO};
 use pam_daemon::daemon::CAUSE_DAEMON_OUTDATED;
 use pam_daemon::lifecycle::LOCK_FILE;
 use pam_daemon::runtime_dir::{RuntimeDir, RuntimeDirError};
+use pam_proto::wire::{End, ErrorFrame, Via, cause};
 use pam_proto::{Caller, Envelope, Event, PROTOCOL_VERSION, Response};
 use thiserror::Error;
-use zeromq::{DealerSocket, Socket, SocketOptions, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-use crate::request::{build_envelope_with_id, new_request_id};
+use crate::request::{build_envelope, build_envelope_with_id, new_request_id};
+use crate::transport::{self, Dial, Probe, Resume, TransportError};
 
 /// How long [`ensure_daemon`] waits for a spawned daemon to become
 /// ready, per spawn attempt.
 pub const READINESS_WAIT: Duration = Duration::from_secs(3);
 
 /// The session socket override: when `$PAM_SOCKET_DIR` names a directory,
-/// public dials use the `pam.sock` and `events.sock` directly inside it
-/// instead of `<base>/run`'s — the layout [`crate::relay`] (`pam listen`)
-/// binds — and lazy daemon auto-start is off. The relay is the transport,
-/// so a missing relay is an error naming `pam listen`, never a spawned
-/// daemon.
+/// public dials use the public socket directly inside it instead of
+/// `<base>/run`'s — the layout [`crate::relay`] (`pam listen`) binds — and
+/// lazy daemon auto-start is off. The relay is the transport, so a missing
+/// relay is an error naming `pam listen`, never a spawned daemon, and a
+/// pre-migration daemon behind it is an error for the human, never a signal.
 pub const SOCKET_DIR_ENV: &str = "PAM_SOCKET_DIR";
 
 /// [`SOCKET_DIR_ENV`] as the client sees it: set and non-empty.
@@ -61,14 +80,10 @@ fn session_socket_dir() -> Option<PathBuf> {
 }
 
 /// The runtime directories one public dial uses: the session override's
-/// flat layout when set, `<base>/run` otherwise.
-fn dial_dirs(base_dir: &Path) -> Result<RuntimeDir, RuntimeDirError> {
-    dial_dirs_with(session_socket_dir().as_deref(), base_dir)
-}
-
-/// [`dial_dirs`] with the override injected — the resolution rule itself,
-/// unit-testable without mutating process environment (which the
-/// workspace's `unsafe` denial forbids in edition 2024).
+/// flat layout when set, `<base>/run` otherwise — the resolution rule with
+/// the override injected, unit-testable without mutating process
+/// environment (which the workspace's `unsafe` denial forbids in edition
+/// 2024).
 pub(crate) fn dial_dirs_with(
     session_dir: Option<&Path>,
     base_dir: &Path,
@@ -150,7 +165,29 @@ const READINESS_POLL: Duration = Duration::from_millis(50);
 /// "retry once".
 const SPAWN_ATTEMPTS: u32 = 2;
 
-/// Why the daemon could not be ensured.
+/// How long one readiness hello may take. A listener that has not answered
+/// by then is a live daemon too busy to greet, so a timeout counts as ready
+/// and the request's own exchange reports what it meets.
+const HELLO_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a daemon that is stopping or restarting may take to release the
+/// instance lock: the drain is up to ten seconds (`DEFAULT_DRAIN_TIMEOUT`),
+/// and a successor then has to boot.
+pub(crate) const HANDOVER_WAIT: Duration = Duration::from_secs(20);
+
+/// File name of the socket a pre-migration daemon listens on. On Windows it
+/// is an `AF_UNIX` socket this build cannot open, so its presence beside a
+/// held lock and no public control file is how such a daemon is recognised.
+const LEGACY_SOCKET_FILE: &str = "pam.sock";
+
+/// What the human does about a pre-migration daemon this process may not stop.
+const LEGACY_RECOVERY: &str = if cfg!(windows) {
+    "end that pam daemon process, then retry"
+} else {
+    "run `pam daemon stop` outside the sandbox, then retry"
+};
+
+/// Why no daemon this build can talk to could be ensured.
 #[derive(Debug, Error)]
 pub enum ClientError {
     /// The runtime directory is unusable (home unresolvable, socket
@@ -191,21 +228,60 @@ pub enum ClientError {
         #[source]
         source: tokio::task::JoinError,
     },
+    /// A pre-migration daemon holds the instance lock and this process could
+    /// not stop it: the lock names no pid, or signalling is not permitted
+    /// (as under a sandbox that denies signals).
+    #[error(
+        "a pre-migration pam daemon ({}) is running and this process may not stop it ({detail}); \
+         {LEGACY_RECOVERY}",
+        .pid.map_or_else(|| "pid unknown".to_owned(), |holder| format!("pid {holder}"))
+    )]
+    LegacyDaemon {
+        /// The pid in the instance lock, when it names one.
+        pid: Option<u32>,
+        /// Why it could not be stopped.
+        detail: String,
+    },
+    /// A pre-migration daemon was told to stop and has not released the
+    /// instance lock yet. Transient: it exits when its drain completes.
+    #[error(
+        "a pre-migration pam daemon (pid {pid}) was told to stop and is still draining after \
+         {waited:?}; it exits when the drain completes, then retry"
+    )]
+    LegacyDraining {
+        /// The draining daemon's pid.
+        pid: u32,
+        /// How long the client waited for the lock.
+        waited: Duration,
+    },
+    /// The session relay (`PAM_SOCKET_DIR`) leads to a pre-migration daemon.
+    /// A client that dials through a relay never signals anything.
+    #[error(
+        "the pam daemon behind the session relay in {} ($PAM_SOCKET_DIR) predates this pam's \
+         wire protocol; run `pam daemon stop` outside the sandbox and try again",
+        dir.display()
+    )]
+    LegacyBehindRelay {
+        /// The override directory that was dialled.
+        dir: PathBuf,
+    },
 }
 
 /// What [`ensure_daemon`] found or did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureOutcome {
-    /// A daemon already held the lock and served the socket.
+    /// A daemon already held the lock and answered the hello.
     AlreadyRunning,
-    /// No daemon was there; one was spawned and became ready.
+    /// No daemon was there (or only a pre-migration one, which was stopped);
+    /// one was spawned and became ready.
     Started,
 }
 
-/// Makes sure a daemon serves `base_dir` (default `~/.pam` in the real
-/// CLI): probes for a live one, otherwise spawns `pam daemon` detached
-/// and waits — up to [`READINESS_WAIT`] per attempt, one retry — for it
-/// to hold the lock and bind the socket.
+/// Makes sure a daemon of this build serves `base_dir` (default `~/.pam` in
+/// the real CLI): greets a live one, otherwise spawns `pam daemon` detached
+/// and waits — up to [`READINESS_WAIT`] per attempt, one retry — for it to
+/// hold the lock and acknowledge a hello. A pre-migration daemon found
+/// there is stopped first (module docs).
 pub fn ensure_daemon(base_dir: &Path) -> Result<EnsureOutcome, ClientError> {
     ensure_daemon_with(
         base_dir,
@@ -245,120 +321,228 @@ pub(crate) async fn ensure_daemon_off_thread(
 /// [`ensure_daemon`] with the spawner and timing injected — the
 /// decision logic, unit-testable with a fake spawner (a test binary
 /// cannot spawn the real `pam`; the real spawner is the thin
-/// [`spawn_daemon_process`] wrapper).
-///
-/// A daemon that is already **booting** (it holds the instance lock but its
-/// socket does not accept yet) is waited for, never raced with a second
-/// spawn: the extra process would only lose the lock and exit.
+/// [`spawn_daemon_process`] wrapper). The signal is the real one
+/// (`signal_terminate`); [`Ensure`] takes that too.
 pub(crate) fn ensure_daemon_with(
     base_dir: &Path,
     spawn: &mut dyn FnMut() -> io::Result<()>,
     wait: Duration,
     poll: Duration,
 ) -> Result<EnsureOutcome, ClientError> {
-    let dirs = RuntimeDir::paths_at_base(base_dir)?;
-    match daemon_state(&dirs)? {
-        DaemonState::Ready => return Ok(EnsureOutcome::AlreadyRunning),
-        DaemonState::Booting => {
-            let budget = wait * SPAWN_ATTEMPTS;
-            let deadline = Instant::now() + budget;
-            while Instant::now() < deadline {
-                std::thread::sleep(poll);
-                match daemon_state(&dirs)? {
-                    DaemonState::Ready => return Ok(EnsureOutcome::AlreadyRunning),
-                    // The booting daemon died before binding: spawn below.
-                    DaemonState::Absent => break,
-                    DaemonState::Booting => {}
+    Ensure {
+        spawn,
+        signal: &mut signal_terminate,
+        client_version: env!("CARGO_PKG_VERSION"),
+        wait,
+        poll,
+        handover: HANDOVER_WAIT,
+        probe: HELLO_PROBE_TIMEOUT,
+    }
+    .run(base_dir)
+}
+
+/// One run of the ensure logic with everything it touches outside the
+/// runtime directory injected: how a daemon is spawned, how one is
+/// signalled, the version the hello states, and every wait.
+pub(crate) struct Ensure<'a> {
+    /// Starts `pam daemon` for the base.
+    pub(crate) spawn: &'a mut dyn FnMut() -> io::Result<()>,
+    /// Sends the stop signal to a pid (`SIGTERM` in production).
+    pub(crate) signal: &'a mut dyn FnMut(u32) -> Result<(), StopError>,
+    /// The version the readiness hello states.
+    pub(crate) client_version: &'a str,
+    /// Readiness wait per spawn attempt.
+    pub(crate) wait: Duration,
+    /// Pause between two looks at the daemon.
+    pub(crate) poll: Duration,
+    /// How long a stopping or restarting daemon may hold the lock.
+    pub(crate) handover: Duration,
+    /// How long one readiness hello may take.
+    pub(crate) probe: Duration,
+}
+
+impl Ensure<'_> {
+    /// The decision logic of [`ensure_daemon`].
+    ///
+    /// A daemon that is already on its way — **booting** (it holds the
+    /// instance lock but does not answer yet) or **restarting** (its binary
+    /// was replaced on disk and it is draining) — is waited for, never raced
+    /// with a second spawn: the extra process would only lose the lock and
+    /// exit. A **pre-migration** daemon is superseded once. A daemon of
+    /// another build counts as running and is left alone: the request that
+    /// follows gets its refusal.
+    pub(crate) fn run(&mut self, base_dir: &Path) -> Result<EnsureOutcome, ClientError> {
+        let dirs = RuntimeDir::paths_at_base(base_dir)?;
+        let mut state = self.settled(base_dir, &dirs)?;
+        if state == DaemonState::Legacy {
+            state = self.supersede(base_dir, &dirs)?;
+        }
+        match state {
+            DaemonState::Ready => return Ok(EnsureOutcome::AlreadyRunning),
+            // Greeting in the old protocol again after it was stopped: a
+            // service manager or an older client keeps starting it.
+            DaemonState::Legacy => {
+                return Err(ClientError::LegacyDaemon {
+                    pid: lock_holder(base_dir),
+                    detail: "it was stopped and a pre-migration daemon took the instance lock \
+                             again"
+                        .to_owned(),
+                });
+            }
+            DaemonState::Absent => {}
+            // `settled` returns neither; refuse rather than spawn over a
+            // lock holder.
+            DaemonState::Booting | DaemonState::Restarting => {
+                return Err(ClientError::NotReady {
+                    waited: self.wait * SPAWN_ATTEMPTS,
+                });
+            }
+        }
+        for _attempt in 0..SPAWN_ATTEMPTS {
+            (self.spawn)().map_err(|source| ClientError::Spawn { source })?;
+            let deadline = Instant::now() + self.wait;
+            loop {
+                if self.state(&dirs)? == DaemonState::Ready {
+                    return Ok(EnsureOutcome::Started);
                 }
-            }
-            if daemon_state(&dirs)? == DaemonState::Booting {
-                return Err(ClientError::NotReady { waited: budget });
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(self.poll);
             }
         }
-        DaemonState::Absent => {}
+        Err(ClientError::NotReady {
+            waited: self.wait * SPAWN_ATTEMPTS,
+        })
     }
-    for _attempt in 0..SPAWN_ATTEMPTS {
-        spawn().map_err(|source| ClientError::Spawn { source })?;
-        let deadline = Instant::now() + wait;
+
+    /// Where the daemon stands once it is no longer on its way: waits out
+    /// a booting daemon (for as long as a spawn would be given) and a
+    /// restarting one (for the handover), and returns the first state that
+    /// is neither.
+    fn settled(&self, base_dir: &Path, dirs: &RuntimeDir) -> Result<DaemonState, ClientError> {
+        let started = Instant::now();
         loop {
-            if daemon_ready(&dirs)? {
-                return Ok(EnsureOutcome::Started);
+            let state = self.state(dirs)?;
+            let budget = match state {
+                DaemonState::Booting => self.wait * SPAWN_ATTEMPTS,
+                DaemonState::Restarting => self.handover,
+                _ => return Ok(state),
+            };
+            if started.elapsed() >= budget {
+                return Err(never_ready(base_dir, dirs, budget));
             }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(poll);
+            std::thread::sleep(self.poll);
         }
     }
-    Err(ClientError::NotReady {
-        waited: wait * SPAWN_ATTEMPTS,
-    })
+
+    /// Stops a pre-migration daemon by the mechanism `pam daemon stop` uses
+    /// and reports where the base stands afterwards.
+    ///
+    /// The pid is read from the instance lock first and the daemon is
+    /// greeted once more after that: if it no longer answers in the old
+    /// protocol, another client already superseded it and nothing is
+    /// signalled; if it still does, the pid read before is its own.
+    fn supersede(
+        &mut self,
+        base_dir: &Path,
+        dirs: &RuntimeDir,
+    ) -> Result<DaemonState, ClientError> {
+        let pid = match probe_daemon(base_dir)? {
+            DaemonStatus::NotRunning => return self.settled(base_dir, dirs),
+            DaemonStatus::Running { pid } => pid,
+        };
+        let again = self.settled(base_dir, dirs)?;
+        if again != DaemonState::Legacy {
+            return Ok(again);
+        }
+        let Some(pid) = pid else {
+            return Err(ClientError::LegacyDaemon {
+                pid: None,
+                detail: "its lock file names no pid".to_owned(),
+            });
+        };
+        (self.signal)(pid).map_err(|error| ClientError::LegacyDaemon {
+            pid: Some(pid),
+            detail: match error {
+                StopError::Signal { detail, .. } => detail,
+                other => other.to_string(),
+            },
+        })?;
+        if !wait_for_daemon_exit(base_dir, self.handover)? {
+            return Err(ClientError::LegacyDraining {
+                pid,
+                waited: self.handover,
+            });
+        }
+        self.settled(base_dir, dirs)
+    }
+
+    /// Where a daemon stands behind one runtime directory right now: the
+    /// instance lock, then one hello.
+    fn state(&self, dirs: &RuntimeDir) -> Result<DaemonState, ClientError> {
+        if !lock_is_held(&dirs.run_dir().join(LOCK_FILE))? {
+            return Ok(DaemonState::Absent);
+        }
+        let hello = pam_proto::wire::Hello {
+            proto: pam_proto::wire::WIRE_PROTOCOL,
+            version: self.client_version.to_owned(),
+            via: Via::Direct,
+        };
+        Ok(match transport::probe(dirs, &hello, self.probe) {
+            Probe::Unreachable(_) => DaemonState::Booting,
+            Probe::Legacy => DaemonState::Legacy,
+            Probe::Refused(frame) if frame.cause == cause::DAEMON_OUTDATED => {
+                DaemonState::Restarting
+            }
+            // Acknowledged, or listening and too busy to greet, or answering
+            // with another refusal (a full listener, a slow handshake, a
+            // client of another build): a daemon of this protocol is there
+            // and stays, and the request's own exchange reports what it meets.
+            Probe::Ready(_) | Probe::Silent | Probe::Refused(_) => DaemonState::Ready,
+        })
+    }
+}
+
+/// The error for a lock holder that never answered a hello within `waited`.
+///
+/// On Windows a pre-migration daemon cannot be greeted at all: it listens on
+/// an `AF_UNIX` socket this build cannot open. A held lock, no public
+/// control file after the wait and the old socket file in the run directory
+/// is such a daemon, reported with the instruction to end it; there is no
+/// automatic stop on that platform.
+fn never_ready(base_dir: &Path, dirs: &RuntimeDir, waited: Duration) -> ClientError {
+    if cfg!(windows)
+        && dirs.run_dir().join(LEGACY_SOCKET_FILE).exists()
+        && !dirs.public_control().exists()
+    {
+        return ClientError::LegacyDaemon {
+            pid: lock_holder(base_dir),
+            detail: "it publishes no public endpoint this pam can dial".to_owned(),
+        };
+    }
+    ClientError::NotReady { waited }
 }
 
 /// Where a daemon stands behind one runtime directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonState {
-    /// The lock is held and the request socket accepts a connection.
+    /// The lock is held and a daemon of this protocol answers: it
+    /// acknowledged the hello, is too busy to greet, or refuses this
+    /// particular client (another build), which is the request's answer to
+    /// get, not a reason to start or stop anything.
     Ready,
-    /// The lock is held but the socket does not accept yet: a daemon in
-    /// crash recovery or warm-up (it binds after taking the lock).
+    /// The lock is held but nothing answers yet: a daemon in crash recovery
+    /// or warm-up (it binds after taking the lock).
     Booting,
+    /// The lock is held by a daemon whose binary was replaced on disk: it
+    /// answered `daemon_outdated` and is draining to hand over.
+    Restarting,
+    /// The lock is held by a daemon that greets in ZMTP: a pre-migration
+    /// build.
+    Legacy,
     /// Nobody holds the lock; any socket file is a stale leftover.
     Absent,
-}
-
-fn daemon_state(dirs: &RuntimeDir) -> Result<DaemonState, ClientError> {
-    if !lock_is_held(&dirs.run_dir().join(LOCK_FILE))? {
-        return Ok(DaemonState::Absent);
-    }
-    Ok(if socket_accepts(dirs.router_socket()) {
-        DaemonState::Ready
-    } else {
-        DaemonState::Booting
-    })
-}
-
-/// True when a daemon holds the instance lock **and** the request socket
-/// accepts a connection (see the module docs on the probe).
-fn daemon_ready(dirs: &RuntimeDir) -> Result<bool, ClientError> {
-    Ok(daemon_state(dirs)? == DaemonState::Ready)
-}
-
-/// How long the readiness probe waits for a connect to finish. A connect
-/// that is still pending means a listener exists with a full backlog — a
-/// live, busy daemon — so a timeout counts as accepting.
-#[cfg(unix)]
-const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Whether something accepts connections on the unix socket at `path`: an
-/// actual connect, so a stale socket file with no listener (a crashed
-/// daemon's leftover) is never mistaken for a ready daemon. The connect
-/// runs on a helper thread because a blocking unix connect to a full
-/// backlog would otherwise park the caller.
-#[cfg(unix)]
-fn socket_accepts(path: &Path) -> bool {
-    if !path.exists() {
-        return false;
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let target = path.to_path_buf();
-    std::thread::spawn(move || {
-        let outcome = std::os::unix::net::UnixStream::connect(&target)
-            .map(|_stream| ())
-            .map_err(|source| source.kind());
-        let _ = tx.send(outcome);
-    });
-    match rx.recv_timeout(CONNECT_PROBE_TIMEOUT) {
-        Ok(Ok(())) | Err(_) => true,
-        Ok(Err(kind)) => kind == io::ErrorKind::WouldBlock,
-    }
-}
-
-/// Without std unix sockets the probe falls back to the socket file's
-/// existence; [`connect_dealer`]'s bounded retry covers the stale case.
-#[cfg(not(unix))]
-fn socket_accepts(path: &Path) -> bool {
-    path.exists()
 }
 
 /// Probe the daemon's exclusive instance lock through a read-only handle.
@@ -556,20 +740,23 @@ const OUTDATED_RETRY_PAUSE: Duration = Duration::from_millis(750);
 /// [`Response::Refusal`], not an error).
 #[derive(Debug, Error)]
 pub enum RequestError {
-    /// The daemon could not be ensured.
+    /// No daemon this build can talk to could be ensured: none became
+    /// ready, or the one that runs is a pre-migration daemon this process
+    /// may not stop (see [`ClientError`]).
     #[error(transparent)]
     Ensure(#[from] ClientError),
     /// The runtime directory is unusable.
     #[error(transparent)]
     RuntimeDir(#[from] RuntimeDirError),
-    /// Connecting a socket failed.
+    /// Connecting the daemon's public endpoint failed.
     #[error("cannot connect to {endpoint}: {source}")]
     Connect {
-        /// The `ipc://` endpoint that failed.
+        /// The endpoint that failed: the socket path, or the control file on
+        /// Windows.
         endpoint: String,
-        /// The underlying zmq error.
+        /// The underlying connect error.
         #[source]
-        source: zeromq::ZmqError,
+        source: io::Error,
     },
     /// The session relay (`PAM_SOCKET_DIR`) is not answering. The client
     /// never spawns a daemon while the override is set — the relay is the
@@ -579,25 +766,24 @@ pub enum RequestError {
          outside the sandbox with `pam listen {dir}`"
     )]
     SessionUnreachable {
-        /// The override directory whose sockets did not answer.
+        /// The override directory whose socket did not answer.
         dir: PathBuf,
-        /// The underlying zmq error.
+        /// The underlying connect error.
         #[source]
-        source: zeromq::ZmqError,
+        source: io::Error,
     },
-    /// The zmq exchange itself failed.
+    /// The connection failed after it was made.
     #[error("transport failure talking to the daemon: {source}")]
     Transport {
-        /// The underlying zmq error.
+        /// The underlying I/O error.
         #[source]
-        source: zeromq::ZmqError,
+        source: io::Error,
     },
-    /// The daemon's bytes did not parse as a [`Response`] / [`Event`].
-    #[error("cannot parse the daemon's reply: {source}")]
+    /// The daemon's bytes were not a frame this protocol allows there.
+    #[error("cannot parse the daemon's reply: {detail}")]
     Parse {
-        /// The underlying JSON error.
-        #[source]
-        source: serde_json::Error,
+        /// What was wrong with it.
+        detail: String,
     },
     /// No reply within the client-side budget.
     #[error("no reply from the daemon within {waited:?} (deadline plus margin)")]
@@ -662,9 +848,9 @@ pub fn should_retry(response: &Response) -> bool {
 }
 
 /// Sends one request through the full client flow (module docs): ensure the daemon, build the
-/// envelope, exchange over `pam.sock`, retry exactly once after a `daemon_outdated` refusal. The
-/// daemon's answer (result, refusal, or ticket) is returned as-is; rendering and exit codes are the
-/// caller's job (the `pam` binary's `render` module).
+/// envelope, exchange it over one framed connection, retry exactly once after a `daemon_outdated`
+/// refusal. The daemon's answer (result, refusal, or ticket) is returned as-is; rendering and exit
+/// codes are the caller's job (the `pam` binary's `render` module).
 ///
 /// A capability under the reserved `admin.` prefix errors with [`RequestError::AdminOnly`] **before
 /// anything touches the socket** — every CLI subcommand funnels through here, so no subcommand,
@@ -709,14 +895,15 @@ pub async fn send_request_with_id(
         });
     }
     let envelope = build_envelope_with_id(id, capability, args, wait, deadline_ms, idempotency_key);
-    send_envelope(base_dir, &envelope, &RetryTimings::DEFAULT).await
+    send_envelope(base_dir, &envelope).await
 }
 
 /// [`send_request`] that keeps asking through the daemon's momentary
-/// conditions: a [`TRANSIENT_CAUSES`] refusal or a transient transport
-/// failure ([`RequestError::is_transient`]) is retried with bounded backoff
-/// for up to `patience`, then returned as it came. Meant for reads of a
-/// request that is already known good (a terminal ticket), where a busy
+/// conditions: a refusal the daemon marked `retryable` (or, from a daemon
+/// that does not mark them, one of the [`TRANSIENT_CAUSES`]) or a transient
+/// transport failure ([`RequestError::is_transient`]) is retried with bounded
+/// backoff for up to `patience`, then returned as it came. Meant for reads of
+/// a request that is already known good (a terminal ticket), where a busy
 /// daemon must not read as a policy refusal. Each attempt is a fresh
 /// request id.
 pub async fn send_request_patient(
@@ -753,9 +940,11 @@ pub async fn send_request_patient(
 /// authenticates peers independently of the envelope's caller fields, never falls back to the
 /// public socket, and is unavailable where that channel is unsupported.
 ///
-/// The exchange runs once: a transport error or version refusal is returned without replaying the
-/// operation, because a missing reply can follow an applied change — inspect the resulting state
-/// before manually retrying. A capability outside `admin.*` errors with [`RequestError::NotAdmin`].
+/// The daemon is ensured first through the public hello (so a pre-migration daemon is superseded
+/// before its admin listener is spoken to in frames it does not know). The exchange then runs
+/// once: a transport error or version refusal is returned without replaying the operation,
+/// because a missing reply can follow an applied change — inspect the resulting state before
+/// manually retrying. A capability outside `admin.*` errors with [`RequestError::NotAdmin`].
 /// Admin ops always wait (synchronous request/reply).
 pub async fn send_admin(
     base_dir: &Path,
@@ -783,54 +972,167 @@ pub async fn send_admin(
         deadline_ms,
         wait: true,
     };
+    exchange_admin(base_dir, &envelope).await
+}
+
+/// The two steps of [`send_admin`] for an envelope already built: ensure the
+/// daemon through the public hello, then one exchange on the private
+/// channel. A hello the admin plane refuses (`client_version_mismatch`,
+/// `daemon_outdated`, …) is that plane's answer: a refusal naming the
+/// operation, never replayed.
+pub(crate) async fn exchange_admin(
+    base_dir: &Path,
+    envelope: &Envelope,
+) -> Result<Response, RequestError> {
     ensure_daemon_async(base_dir).await?;
-    pam_daemon::admin_transport::exchange(base_dir, &envelope)
+    pam_daemon::admin_transport::exchange(base_dir, envelope)
         .await
         .map_err(|source| RequestError::AdminTransport { source })
 }
 
-/// The waits around the single `daemon_outdated` retry.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RetryTimings {
-    /// Pause before waiting on the replacement daemon.
+/// How one public exchange or follow reaches the daemon, and how patient
+/// it is: everything the request flow reads from the environment or from a
+/// constant, in one injectable place.
+#[derive(Debug, Clone)]
+pub(crate) struct DialOptions {
+    /// `$PAM_SOCKET_DIR`, when the session relay is the transport.
+    pub(crate) session_dir: Option<PathBuf>,
+    /// The version the hello states.
+    pub(crate) client_version: String,
+    /// Bound on one connect, retries of a restarting endpoint included.
+    pub(crate) connect_timeout: Duration,
+    /// Pause before waiting on the replacement of an outdated daemon.
     pub(crate) pause: Duration,
-    /// Longest wait for the old daemon's drain to hand over.
+    /// Longest wait for an outdated daemon's drain to hand over.
     pub(crate) replacement_wait: Duration,
+    /// First pause after a transient failure of a follow.
+    pub(crate) backoff_min: Duration,
+    /// Cap on that pause.
+    pub(crate) backoff_max: Duration,
 }
 
-impl RetryTimings {
-    /// The production waits: the old daemon drains for up to ten seconds
-    /// (`DEFAULT_DRAIN_TIMEOUT`) before the new binary takes over.
-    pub(crate) const DEFAULT: Self = Self {
-        pause: OUTDATED_RETRY_PAUSE,
-        replacement_wait: Duration::from_secs(20),
-    };
+impl DialOptions {
+    /// The production values, with the session override as given.
+    pub(crate) fn new(session_dir: Option<PathBuf>) -> Self {
+        Self {
+            session_dir,
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            connect_timeout: CONNECT_TIMEOUT,
+            pause: OUTDATED_RETRY_PAUSE,
+            replacement_wait: HANDOVER_WAIT,
+            backoff_min: TRANSIENT_MIN,
+            backoff_max: TRANSIENT_MAX,
+        }
+    }
+
+    /// The production values for this process's environment.
+    fn from_env() -> Self {
+        Self::new(session_socket_dir())
+    }
+
+    /// The runtime directories this dial uses.
+    fn dirs(&self, base_dir: &Path) -> Result<RuntimeDir, RuntimeDirError> {
+        dial_dirs_with(self.session_dir.as_deref(), base_dir)
+    }
+
+    /// The dial of `dirs`: the hello says `relay` when the session override
+    /// is in effect. Self-reported; attribution only.
+    fn dial<'a>(&self, dirs: &'a RuntimeDir) -> Dial<'a> {
+        let via = if self.session_dir.is_some() {
+            Via::Relay
+        } else {
+            Via::Direct
+        };
+        let mut dial = Dial::new(dirs, via, self.connect_timeout);
+        dial.hello.version.clone_from(&self.client_version);
+        dial
+    }
+
+    /// Maps a connect failure to its error: under the session override the
+    /// relay directory is the transport, so the error names `pam listen`
+    /// rather than an endpoint the sandboxed caller could not reach anyway.
+    fn connect_error(&self, dirs: &RuntimeDir, source: io::Error) -> RequestError {
+        match &self.session_dir {
+            Some(dir) => RequestError::SessionUnreachable {
+                dir: dir.clone(),
+                source,
+            },
+            None => RequestError::Connect {
+                endpoint: transport::endpoint_label(dirs),
+                source,
+            },
+        }
+    }
+
+    /// The error for a peer that greeted in ZMTP where no takeover is (or
+    /// is any longer) this client's to perform.
+    fn legacy_error(&self, base_dir: &Path) -> ClientError {
+        match &self.session_dir {
+            Some(dir) => ClientError::LegacyBehindRelay { dir: dir.clone() },
+            None => ClientError::LegacyDaemon {
+                pid: lock_holder(base_dir),
+                detail: "it still answers in the old protocol after this client tried to \
+                         supersede it"
+                    .to_owned(),
+            },
+        }
+    }
+
+    /// What a transport failure is to the caller of a request, apart from
+    /// the two cases the callers act on themselves (a ZMTP greeting, an
+    /// `error` frame).
+    fn request_error(&self, dirs: &RuntimeDir, error: TransportError) -> RequestError {
+        match error {
+            TransportError::Connect(source) => self.connect_error(dirs, source),
+            TransportError::Io(source) => RequestError::Transport { source },
+            TransportError::Timeout { waited } => RequestError::ReplyTimeout { waited },
+            TransportError::Protocol(detail) => RequestError::Parse { detail },
+            // Both callers turn an `error` frame into the refusal it is before
+            // they come here; kept total rather than assumed.
+            TransportError::Refused(frame) => RequestError::Parse {
+                detail: format!("{}: {}", frame.cause, frame.detail),
+            },
+            TransportError::LegacyDaemon => RequestError::Ensure(ClientError::LegacyDaemon {
+                pid: None,
+                detail: "it answers in the old protocol".to_owned(),
+            }),
+        }
+    }
 }
 
 /// The public exchange loop behind [`send_request`]:
-/// ensure the daemon, exchange over `pam.sock`, and after a
+/// ensure the daemon, exchange over the public endpoint, and after a
 /// `daemon_outdated` refusal wait for the replacement daemon to be ready
 /// and retry exactly once. With the session override active
-/// the daemon probe is skipped and both endpoints come from the relay
+/// the daemon probe is skipped and the endpoint comes from the relay
 /// directory instead of `<base>/run`.
 pub(crate) async fn send_envelope(
     base_dir: &Path,
     envelope: &Envelope,
-    timings: &RetryTimings,
 ) -> Result<Response, RequestError> {
-    send_envelope_with(base_dir, envelope, timings, || {
+    send_envelope_with(base_dir, envelope, &DialOptions::from_env(), || {
         ensure_daemon_for_dial(base_dir)
     })
     .await
 }
 
-/// [`send_envelope`] with the daemon-ensure step injected, so the
-/// wait-for-the-replacement behaviour is testable without spawning a real
-/// `pam` (a test binary cannot).
+/// [`send_envelope`] with the dial options and the daemon-ensure step
+/// injected, so the wait-for-the-replacement and the supersede behaviour are
+/// testable without spawning a real `pam` (a test binary cannot).
+///
+/// Two things are retried, each at most once per call. A `daemon_outdated`
+/// answer — a refusal in a reply, or an `error` frame at the hello, which is
+/// surfaced as the same refusal — waits for the replacement and sends the
+/// envelope again. A ZMTP greeting from a pre-migration daemon goes back to
+/// the ensure step, which supersedes it (never under the session override:
+/// that is an error for the human). Every other `error` frame is returned
+/// as the refusal it is, sent once: `client_version_mismatch` among them,
+/// whose detail names the running daemon's version and executable — the
+/// client never stops a daemon over it.
 pub(crate) async fn send_envelope_with<E, F>(
     base_dir: &Path,
     envelope: &Envelope,
-    timings: &RetryTimings,
+    options: &DialOptions,
     ensure: E,
 ) -> Result<Response, RequestError>
 where
@@ -838,22 +1140,50 @@ where
     F: std::future::Future<Output = Result<(), RequestError>>,
 {
     let mut retried = false;
+    let mut superseded = false;
     loop {
         ensure().await?;
-        let dirs = dial_dirs(base_dir)?;
+        let dirs = options.dirs(base_dir)?;
         let holder = lock_holder(base_dir);
-        let response = exchange(&dirs, envelope).await?;
+        let budget = Duration::from_millis(envelope.deadline_ms) + REPLY_MARGIN;
+        let response = match transport::call(&options.dial(&dirs), envelope, budget).await {
+            Ok(response) => response,
+            Err(TransportError::LegacyDaemon) => {
+                if superseded || options.session_dir.is_some() {
+                    return Err(options.legacy_error(base_dir).into());
+                }
+                // The loop head's ensure meets the same greeting and stops
+                // that daemon, or says why it may not.
+                superseded = true;
+                continue;
+            }
+            Err(TransportError::Refused(frame)) => refusal_of(&envelope.id, frame),
+            Err(error) => return Err(options.request_error(&dirs, error)),
+        };
         if should_retry(&response) && !retried {
             retried = true;
-            tokio::time::sleep(timings.pause).await;
-            if session_socket_dir().is_none() {
-                await_replacement(base_dir, holder, timings.replacement_wait).await;
+            tokio::time::sleep(options.pause).await;
+            if options.session_dir.is_none() {
+                await_replacement(base_dir, holder, options.replacement_wait).await;
             }
             // The loop head re-ensures: a daemon that did not respawn itself
-            // is started, and readiness is a real connect, not a stale file.
+            // is started, and readiness is a real hello, not a stale file.
             continue;
         }
         return Ok(response);
+    }
+}
+
+/// An `error` frame as the refusal of request `id`: the daemon said no
+/// before there was a request to answer, with the same three fields a
+/// refusal carries. `retryable` follows the cause.
+fn refusal_of(id: &str, frame: ErrorFrame) -> Response {
+    Response::Refusal {
+        retryable: is_transient_cause(&frame.cause),
+        id: id.to_owned(),
+        cause: frame.cause,
+        detail: frame.detail,
+        recovery: frame.recovery,
     }
 }
 
@@ -886,116 +1216,45 @@ async fn await_replacement(base_dir: &Path, old_pid: Option<u32>, wait: Duration
     }
 }
 
-/// Maps a socket connect failure to its error: under the session override
-/// the relay directory is the transport, so the error names `pam listen`
-/// rather than an endpoint the sandboxed caller could not reach anyway.
-fn connect_error(dirs: &RuntimeDir, source: zeromq::ZmqError) -> RequestError {
-    match session_socket_dir() {
-        Some(dir) => RequestError::SessionUnreachable { dir, source },
-        None => RequestError::Connect {
-            endpoint: dirs.router_endpoint(),
-            source,
-        },
-    }
-}
-
-/// How long one connect may take before it fails. zeromq itself keeps
-/// retrying a refused or missing `ipc` endpoint with backoff for its
-/// 30 s default, which would park every command on a dead socket for half a
-/// minute; a daemon that is merely restarting is back well inside this.
+/// How long one connect may take before it fails. A daemon that is merely
+/// restarting is back well inside this; a socket nobody binds must not park
+/// every command for longer.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Socket options with the bounded [`CONNECT_TIMEOUT`].
-fn bounded_options(timeout: Duration) -> SocketOptions {
-    let mut options = SocketOptions::default();
-    options.connect_timeout(timeout);
-    options
-}
-
-/// Connects a `DEALER` to the request endpoint. The connect retries a
-/// refused or missing endpoint internally (a daemon mid-restart is reached
-/// as soon as it binds) for up to `timeout`, then fails.
-pub(crate) async fn connect_dealer_within(
-    dirs: &RuntimeDir,
-    timeout: Duration,
-) -> Result<DealerSocket, RequestError> {
-    let mut dealer = DealerSocket::with_options(bounded_options(timeout));
-    dealer
-        .connect(&dirs.router_endpoint())
-        .await
-        .map_err(|source| connect_error(dirs, source))?;
-    Ok(dealer)
-}
-
-/// [`connect_dealer_within`] with the default [`CONNECT_TIMEOUT`].
-pub(crate) async fn connect_dealer(dirs: &RuntimeDir) -> Result<DealerSocket, RequestError> {
-    connect_dealer_within(dirs, CONNECT_TIMEOUT).await
-}
-
-/// One `DEALER` exchange: connect, send the envelope, await its single
-/// reply under `deadline_ms` plus [`REPLY_MARGIN`].
-async fn exchange(dirs: &RuntimeDir, envelope: &Envelope) -> Result<Response, RequestError> {
-    let mut dealer = connect_dealer(dirs).await?;
-    let payload = serde_json::to_vec(envelope).map_err(|source| RequestError::Parse { source })?;
-    dealer
-        .send(ZmqMessage::from(payload))
-        .await
-        .map_err(|source| RequestError::Transport { source })?;
-
-    let budget = Duration::from_millis(envelope.deadline_ms) + REPLY_MARGIN;
-    let reply = tokio::time::timeout(budget, dealer.recv())
-        .await
-        .map_err(|_elapsed| RequestError::ReplyTimeout { waited: budget })?
-        .map_err(|source| RequestError::Transport { source })?;
-    let frames = reply.into_vec();
-    let payload = frames
-        .first()
-        .map(|frame| frame.to_vec())
-        .unwrap_or_default();
-    serde_json::from_slice(&payload).map_err(|source| RequestError::Parse { source })
-}
-
-/// Deadline for each store reconciliation `query` request a follow
-/// makes (see [`follow_ticket`]). Small in the common case — the answer
-/// is a single indexed row read — but bounded generously: on a loaded
-/// runner the daemon can serialize the read behind an active flow's
-/// store work, and a too-tight deadline turned a healthy follow into a
-/// `deadline_exceeded` refusal (Windows CI, 2026-09-17). The follow's
-/// own timeout still bounds the whole wait.
+/// Deadline of the `query` that authorises a follow. Small in the common
+/// case — the answer is a single indexed row read — but bounded generously:
+/// on a loaded runner the daemon can serialize the read behind an active
+/// flow's store work, and a too-tight deadline turned a healthy follow into
+/// a `deadline_exceeded` refusal (Windows CI, 2026-09-17). The follow's own
+/// timeout still bounds the whole wait.
 const QUERY_DEADLINE_MS: u64 = 15_000;
 
-/// First pause before a follow re-reconciles against the store; each
-/// subsequent reconcile doubles it up to [`RECONCILE_MAX`], so a long
-/// quiet follow stays cheap while a lost terminal event is still
-/// noticed within seconds.
-const RECONCILE_MIN: Duration = Duration::from_secs(1);
-
-/// Cap on the reconcile back-off interval.
-const RECONCILE_MAX: Duration = Duration::from_secs(30);
-
-/// How long the follow's event-stream connect may take per attempt.
-const SUBSCRIBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// First pause after a transient failure of the authorizing query, before
-/// anything is subscribed; doubles up to [`TRANSIENT_MAX`].
+/// First pause after a transient failure of a follow or of a patient
+/// request; doubles up to [`TRANSIENT_MAX`].
 const TRANSIENT_MIN: Duration = Duration::from_millis(500);
 
 /// Cap on the transient-failure backoff: a busy or restarting daemon is
 /// asked again within this long, never hammered.
 const TRANSIENT_MAX: Duration = Duration::from_secs(8);
 
-/// Refusal causes that describe the daemon's momentary condition, not a
-/// decision about the caller: it is out of capacity or over its rate
-/// window, draining, restarting for a newer binary, or timed the read out.
-/// A follow retries these with backoff; every other refusal is a policy
-/// answer and stops it.
-pub const TRANSIENT_CAUSES: [&str; 6] = [
+/// Causes that describe the daemon's momentary condition, not a decision
+/// about the caller: it is out of capacity (request slots, follower slots,
+/// connections) or over its rate window, draining, restarting for a newer
+/// binary, or timed something out. A follow retries these with backoff;
+/// every other refusal is a policy answer and stops it. The daemon marks
+/// its own transient refusals `retryable`; this list is the fallback for an
+/// answer that carries no such mark (an `error` frame).
+pub const TRANSIENT_CAUSES: [&str; 10] = [
     "request_capacity_exhausted",
     "request_rate_exhausted",
     "daemon_shutting_down",
     CAUSE_DAEMON_OUTDATED,
     "deadline_exceeded",
     "internal_error",
+    cause::FOLLOWER_CAPACITY_EXHAUSTED,
+    cause::CONNECTION_CAPACITY_EXHAUSTED,
+    cause::HANDSHAKE_TIMEOUT,
+    cause::FOLLOW_EXPIRED,
 ];
 
 /// True when `cause` is one of the [`TRANSIENT_CAUSES`].
@@ -1007,8 +1266,8 @@ pub fn is_transient_cause(cause: &str) -> bool {
 impl RequestError {
     /// True when the failure says the daemon was briefly unavailable
     /// (connect or transport trouble, a missed reply, a daemon still
-    /// booting, or a [`TRANSIENT_CAUSES`] refusal) rather than that the
-    /// request is wrong or forbidden: worth asking again.
+    /// booting or still draining, or a [`TRANSIENT_CAUSES`] refusal) rather
+    /// than that the request is wrong or forbidden: worth asking again.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
@@ -1018,7 +1277,8 @@ impl RequestError {
             | Self::Ensure(
                 ClientError::NotReady { .. }
                 | ClientError::Probe { .. }
-                | ClientError::ProbeTask { .. },
+                | ClientError::ProbeTask { .. }
+                | ClientError::LegacyDraining { .. },
             ) => true,
             Self::FollowRefused { cause, .. } => is_transient_cause(cause),
             _ => false,
@@ -1026,214 +1286,248 @@ impl RequestError {
     }
 }
 
-/// Follows a ticket's event stream on `events.sock` to a terminal `done`/`refused` event, calling
-/// `on_event` for each one seen. Returns the terminal event; gives up with
-/// [`RequestError::FollowTimeout`] past `timeout`. Two races can silently drop the terminal event:
-/// zmq `PUB` has no replay, so an event published before this subscription registered is gone for
-/// good; and `SubSocket::subscribe` only queues the subscription frame, so an event published in
-/// the instant before `PUB` processes it is filtered out.
-///
-/// The store is therefore the authority on termination, never the event stream alone: authorize
-/// through the scoped `query` capability, then reconcile whether the ticket is already terminal —
-/// immediately after subscribing, and again on a backing-off interval while events are quiet —
-/// surfaced as the synthesized terminal event. Events before the subscription (`queued`, `started`)
-/// stay unreplayable, but the terminal event is now guaranteed to arrive.
-///
-/// Events are hints, and the daemon's momentary condition is not a verdict: a transient failure of
-/// the query (see [`RequestError::is_transient`] — capacity or rate refusals, a draining or
-/// restarting daemon, transport trouble) is retried with bounded backoff until `timeout`, a
-/// closed event stream is reconnected (the durable query keeps reconciling meanwhile), and an
-/// event this client does not know is skipped. Only a real refusal ([`RequestError::FollowRefused`]
-/// with a non-transient cause) or a client-side failure that retrying cannot fix ends the follow
-/// early.
+/// How a follow ended: the terminal event a subscriber sees and the durable
+/// answer that came with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FollowEnd {
+    /// `done` or `refused`.
+    pub event: Event,
+    /// The scoped `query` answer for the ticket, read from the daemon's
+    /// store when the stream ended: body `{ticket, state, outcome,
+    /// capability}`.
+    pub response: Response,
+}
+
+/// Follows a ticket to its terminal `done`/`refused` event, calling `on_event` for each event
+/// seen, the terminal one included, and returns that terminal event; gives up with
+/// [`RequestError::FollowTimeout`] past `timeout`. [`follow_ticket_to_end`] with the durable
+/// answer dropped.
 pub async fn follow_ticket(
     base_dir: &Path,
     ticket: &str,
     timeout: Duration,
-    mut on_event: impl FnMut(&Event),
+    on_event: impl FnMut(&Event),
 ) -> Result<Event, RequestError> {
+    follow_ticket_to_end(base_dir, ticket, timeout, on_event)
+        .await
+        .map(|end| end.event)
+}
+
+/// Follows a ticket on the daemon's follow stream to its end and returns the terminal event with
+/// the durable answer the daemon sent with it, so nothing has to be queried afterwards.
+///
+/// One connection is one follow: hello, `follow` (a waiting `query` for the ticket, which is the
+/// authorisation and the one request row a follow costs), then the ticket's events and `end`. The
+/// daemon attaches the follower before it reads the store again, so there is no moment in which
+/// an ending can be missed, and it replays what it still holds of the earlier events: a follow
+/// that joins late sees `queued` and `started`, and one that joins after the ending returns at
+/// once.
+///
+/// The daemon's momentary condition is not a verdict. A refusal it marks `retryable`, an `error`
+/// frame with a transient cause (see [`TRANSIENT_CAUSES`] — capacity, rate, a draining or
+/// restarting daemon, an expired stream), a dropped connection and a failed connect are retried
+/// with bounded backoff until `timeout`, each reconnect sending the last sequence number seen so
+/// only newer events come back; a daemon that restarted meanwhile has a new epoch and its replay
+/// is taken from the start. Only a real refusal ([`RequestError::FollowRefused`] with a
+/// non-transient cause) or a client-side failure that retrying cannot fix ends the follow early.
+pub async fn follow_ticket_to_end(
+    base_dir: &Path,
+    ticket: &str,
+    timeout: Duration,
+    mut on_event: impl FnMut(&Event),
+) -> Result<FollowEnd, RequestError> {
+    follow_with(
+        base_dir,
+        ticket,
+        timeout,
+        &DialOptions::from_env(),
+        || ensure_daemon_for_dial(base_dir),
+        &mut on_event,
+    )
+    .await
+}
+
+/// Why one follow connection did not reach the ticket's end, and whether
+/// another connection may.
+struct FollowFailure {
+    error: RequestError,
+    retry: bool,
+}
+
+impl FollowFailure {
+    /// A failure whose own kind says whether it is worth another try.
+    fn of(error: RequestError) -> Self {
+        Self {
+            retry: error.is_transient(),
+            error,
+        }
+    }
+}
+
+/// [`follow_ticket_to_end`] with the dial options and the daemon-ensure step
+/// injected: one loop of connect, follow, and — on anything transient —
+/// back off and resume.
+pub(crate) async fn follow_with<E, F>(
+    base_dir: &Path,
+    ticket: &str,
+    timeout: Duration,
+    options: &DialOptions,
+    ensure: E,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<FollowEnd, RequestError>
+where
+    E: Fn() -> F,
+    F: std::future::Future<Output = Result<(), RequestError>>,
+{
     let deadline = Instant::now() + timeout;
     let timed_out = || RequestError::FollowTimeout {
         ticket: ticket.to_owned(),
         waited: timeout,
     };
-    // Authorize before subscribing: unavailable tickets never consume PUB data.
-    let mut transient_pause = TRANSIENT_MIN;
+    let mut resume = Resume::default();
+    let mut superseded = false;
+    let mut pause = options.backoff_min;
     loop {
-        match reconcile_once(base_dir, ticket, deadline, &timed_out).await {
-            Ok(Some(event)) => {
-                on_event(&event);
-                return Ok(event);
-            }
-            Ok(None) => break,
-            Err(error) if error.is_transient() => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(timed_out());
-                }
-                tokio::time::sleep(transient_pause.min(remaining)).await;
-                transient_pause = (transient_pause * 2).min(TRANSIENT_MAX);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    let mut sub: Option<SubSocket> = None;
-    let mut sub_pause = RECONCILE_MIN;
-    let mut next_sub_attempt = Instant::now();
-    let mut reconcile_pause = RECONCILE_MIN;
-    let mut next_reconcile = Instant::now();
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(timed_out());
         }
-        if sub.is_none() && now >= next_sub_attempt {
-            match open_subscription(base_dir, ticket).await {
-                Ok(opened) => {
-                    sub = Some(opened);
-                    sub_pause = RECONCILE_MIN;
-                    // Reconcile right after (re)subscribing: closes the slow-joiner gap.
-                    next_reconcile = Instant::now();
-                }
-                Err(error) if error.is_transient() => {
-                    // The query keeps reconciling meanwhile; events are only hints.
-                    next_sub_attempt = Instant::now() + sub_pause;
-                    sub_pause = (sub_pause * 2).min(RECONCILE_MAX);
-                }
-                Err(error) => return Err(error),
-            }
+        let before = resume.clone();
+        let attempt = follow_once(
+            base_dir,
+            ticket,
+            options,
+            &ensure,
+            &mut resume,
+            &mut superseded,
+            on_event,
+        );
+        match tokio::time::timeout(remaining, attempt).await {
+            Err(_elapsed) => return Err(timed_out()),
+            Ok(Ok(end)) => return Ok(end),
+            Ok(Err(failure)) if !failure.retry => return Err(failure.error),
+            // A busy or restarting daemon is asked again, not abandoned.
+            Ok(Err(_transient)) => {}
         }
-        if Instant::now() >= next_reconcile {
-            match reconcile_once(base_dir, ticket, deadline, &timed_out).await {
-                Ok(Some(event)) => {
-                    on_event(&event);
-                    return Ok(event);
-                }
-                Ok(None) => {}
-                // A busy or restarting daemon is asked again later, not abandoned.
-                Err(error) if error.is_transient() => {}
-                Err(error) => return Err(error),
-            }
-            next_reconcile = Instant::now() + reconcile_pause;
-            reconcile_pause = (reconcile_pause * 2).min(RECONCILE_MAX);
+        // A connection that got somewhere (a hello acknowledged, an event
+        // delivered) starts the backoff over.
+        if resume != before {
+            pause = options.backoff_min;
         }
-        let mut wake = deadline.min(next_reconcile);
-        if sub.is_none() {
-            wake = wake.min(next_sub_attempt);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
         }
-        let wait = wake.saturating_duration_since(Instant::now());
-        let Some(stream) = sub.as_mut() else {
-            tokio::time::sleep(wait).await;
-            continue;
-        };
-        let Ok(received) = tokio::time::timeout(wait, stream.recv()).await else {
-            // Reconcile due or deadline reached; the loop head decides.
-            continue;
-        };
-        let message = match received {
-            Ok(message) => message,
-            Err(_closed) => {
-                // The daemon restarted or the relay dropped the stream:
-                // reconnect, and let the durable query settle what was missed.
-                sub = None;
-                next_sub_attempt = Instant::now();
-                continue;
-            }
-        };
-        let frames = message.into_vec();
-        // PUB frames are [topic, payload]; anything shorter is noise.
-        let Some(payload) = frames.get(1) else {
-            continue;
-        };
-        // An event kind this client does not know (a newer daemon) is skipped.
-        let Ok(event) = serde_json::from_slice::<Event>(payload) else {
-            continue;
-        };
-        if matches!(event, Event::Done | Event::Refused) {
-            // PUB is only a hint; recheck current scope and durable state before
-            // exposing a terminal event or deciding the follow has finished.
-            next_reconcile = Instant::now();
-        } else {
-            on_event(&event);
-        }
+        tokio::time::sleep(pause.min(remaining)).await;
+        pause = (pause * 2).min(options.backoff_max);
     }
 }
 
-/// One reconcile of [`follow_ticket`] under the follow's overall deadline.
-async fn reconcile_once(
+/// One follow connection, from the ensure step to the stream's `end`.
+async fn follow_once<E, F>(
     base_dir: &Path,
     ticket: &str,
-    deadline: Instant,
-    timed_out: &dyn Fn() -> RequestError,
-) -> Result<Option<Event>, RequestError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    tokio::time::timeout(remaining, query_terminal(base_dir, ticket))
-        .await
-        .map_err(|_elapsed| timed_out())?
-}
-
-/// Connects a `SUB` socket to the events endpoint and subscribes to
-/// `ticket`'s topic.
-async fn open_subscription(base_dir: &Path, ticket: &str) -> Result<SubSocket, RequestError> {
-    let dirs = dial_dirs(base_dir)?;
-    let endpoint = dirs.events_endpoint();
-    // Shorter than the request connect: the follow keeps reconciling through
-    // the durable query while this retries, so it must not park the loop.
-    let mut sub = SubSocket::with_options(bounded_options(SUBSCRIBE_CONNECT_TIMEOUT));
-    sub.connect(&endpoint)
-        .await
-        .map_err(|source| match session_socket_dir() {
-            Some(dir) => RequestError::SessionUnreachable { dir, source },
-            None => RequestError::Connect { endpoint, source },
-        })?;
-    sub.subscribe(ticket)
-        .await
-        .map_err(|source| RequestError::Transport { source })?;
-    Ok(sub)
-}
-
-/// One reconcile step of [`follow_ticket`]: asks the daemon (`query`
-/// capability, request/reply — reliable, unlike `PUB`) for the ticket's
-/// stored state. `Some(event)` maps a terminal state to the terminal
-/// event a subscriber would have seen (`done` → [`Event::Done`],
-/// `refused`/`failed` → [`Event::Refused`], matching what the daemon
-/// publishes). Only an explicitly pending state returns `None`; refusals and
-/// malformed responses fail closed instead of repeatedly querying or watching.
-/// A refusal is surfaced as [`RequestError::FollowRefused`]; its cause says
-/// whether it is transient ([`RequestError::is_transient`]).
-async fn query_terminal(base_dir: &Path, ticket: &str) -> Result<Option<Event>, RequestError> {
+    options: &DialOptions,
+    ensure: &E,
+    resume: &mut Resume,
+    superseded: &mut bool,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<FollowEnd, FollowFailure>
+where
+    E: Fn() -> F,
+    F: std::future::Future<Output = Result<(), RequestError>>,
+{
+    ensure().await.map_err(FollowFailure::of)?;
+    let dirs = options
+        .dirs(base_dir)
+        .map_err(|error| FollowFailure::of(error.into()))?;
+    // A fresh id per connection: each is its own `query` request.
     let args = serde_json::json!({ "ticket": ticket });
-    let response = send_request(base_dir, "query", args, true, QUERY_DEADLINE_MS, None).await?;
-    match response {
+    let envelope = build_envelope("query", args, true, QUERY_DEADLINE_MS, None);
+    let opening = Duration::from_millis(QUERY_DEADLINE_MS) + REPLY_MARGIN;
+    let followed = transport::follow(
+        &options.dial(&dirs),
+        &envelope,
+        resume,
+        &mut *on_event,
+        opening,
+    )
+    .await;
+    let failure = match followed {
+        Ok(end) => return follow_end(ticket, end, on_event),
+        Err(TransportError::LegacyDaemon) => {
+            let again = !*superseded && options.session_dir.is_none();
+            *superseded = true;
+            FollowFailure {
+                // The next connection's ensure supersedes that daemon, once.
+                retry: again,
+                error: options.legacy_error(base_dir).into(),
+            }
+        }
+        Err(TransportError::Refused(frame)) => FollowFailure::of(RequestError::FollowRefused {
+            ticket: ticket.to_owned(),
+            cause: frame.cause,
+            detail: frame.detail,
+            recovery: frame.recovery,
+        }),
+        Err(error) => FollowFailure::of(options.request_error(&dirs, error)),
+    };
+    Err(failure)
+}
+
+/// What an `end` frame means for the follow: the terminal event and the
+/// durable answer, a refusal (transient when the daemon marked it so, or by
+/// its cause), or — for an answer that is neither a refusal nor a terminal
+/// state — a refusal made here, because a follow fails closed.
+fn follow_end(
+    ticket: &str,
+    end: End,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<FollowEnd, FollowFailure> {
+    let event = match &end.response {
         Response::Refusal {
             cause,
             detail,
             recovery,
+            retryable,
             ..
-        } => Err(RequestError::FollowRefused {
-            ticket: ticket.to_owned(),
-            cause,
-            detail,
-            recovery,
-        }),
+        } => {
+            return Err(FollowFailure {
+                retry: *retryable || is_transient_cause(cause),
+                error: RequestError::FollowRefused {
+                    ticket: ticket.to_owned(),
+                    cause: cause.clone(),
+                    detail: detail.clone(),
+                    recovery: recovery.clone(),
+                },
+            });
+        }
+        // The state in the durable answer decides; the frame's own event is
+        // what the daemon derived from that same state.
         Response::Result { body, .. } => {
             match body.get("state").and_then(serde_json::Value::as_str) {
-                Some("done") => Ok(Some(Event::Done)),
-                Some("refused" | "failed") => Ok(Some(Event::Refused)),
-                Some("queued" | "running" | "waiting_approval") => Ok(None),
-                _ => Err(unavailable_follow(ticket)),
+                Some("done") => Some(Event::Done),
+                Some("refused" | "failed") => Some(Event::Refused),
+                _ => None,
             }
         }
-        Response::Ticket { .. } => Err(unavailable_follow(ticket)),
-    }
+        Response::Ticket { .. } => None,
+    };
+    let Some(event) = event else {
+        return Err(FollowFailure::of(unavailable_follow(ticket)));
+    };
+    on_event(&event);
+    Ok(FollowEnd {
+        event,
+        response: end.response,
+    })
 }
 
 fn unavailable_follow(ticket: &str) -> RequestError {
     RequestError::FollowRefused {
         ticket: ticket.to_owned(),
-        cause: "request_unavailable".to_owned(),
-        detail: "The daemon did not return an authorized request state.".to_owned(),
+        cause: "result_unavailable".to_owned(),
+        detail: "The daemon did not return an authorized terminal request state.".to_owned(),
         recovery: "Check the original ticket and current repository access in the PAM GUI."
             .to_owned(),
     }
@@ -1335,9 +1629,12 @@ pub fn stop_daemon(base_dir: &Path, wait: Duration) -> Result<StopOutcome, StopE
 const KILL_BINARIES: [&str; 2] = ["/bin/kill", "/usr/bin/kill"];
 
 /// SIGTERM through the system `kill` at its absolute path: the workspace
-/// denies `unsafe`, which a direct `libc::kill` call would need.
+/// denies `unsafe`, which a direct `libc::kill` call would need. What `kill`
+/// says when it refuses (`Operation not permitted` under a sandbox that
+/// denies signals) is carried in the error instead of leaking onto the
+/// caller's stderr.
 #[cfg(unix)]
-fn signal_terminate(pid: u32) -> Result<(), StopError> {
+pub(crate) fn signal_terminate(pid: u32) -> Result<(), StopError> {
     let kill = KILL_BINARIES
         .iter()
         .find(|path| Path::new(path).is_file())
@@ -1345,27 +1642,33 @@ fn signal_terminate(pid: u32) -> Result<(), StopError> {
             pid,
             detail: "no system kill binary at /bin/kill or /usr/bin/kill".to_owned(),
         })?;
-    let status = Command::new(kill)
+    let output = Command::new(kill)
         .arg("-TERM")
         .arg(pid.to_string())
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .map_err(|err| StopError::Signal {
             pid,
             detail: format!("cannot run {kill}: {err}"),
         })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(StopError::Signal {
-            pid,
-            detail: format!("{kill} -TERM exited with {status}"),
-        })
+    if output.status.success() {
+        return Ok(());
     }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let said = said.trim();
+    Err(StopError::Signal {
+        pid,
+        detail: if said.is_empty() {
+            format!("{kill} -TERM exited with {}", output.status)
+        } else {
+            format!("{kill} -TERM exited with {}: {said}", output.status)
+        },
+    })
 }
 
 /// No unix signals here; stopping is not supported yet.
 #[cfg(not(unix))]
-fn signal_terminate(_pid: u32) -> Result<(), StopError> {
+pub(crate) fn signal_terminate(_pid: u32) -> Result<(), StopError> {
     Err(StopError::Unsupported)
 }
 

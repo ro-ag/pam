@@ -250,6 +250,15 @@ async fn echo_solves_with_the_args_mirrored_back() {
     .expect("test within deadline");
 }
 
+/// How many `query` request rows the daemon has recorded.
+async fn query_rows(store: &Store) -> usize {
+    store
+        .list_requests_filtered(Some(200), None, None, None, Some("query"), false)
+        .await
+        .expect("request rows list")
+        .len()
+}
+
 #[tokio::test]
 async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
     timeout(DEADLINE, async {
@@ -260,9 +269,7 @@ async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
         )
         .await;
 
-        // Enough delay for the follow subscription to register before
-        // the terminal event fires (zmq PUB has no replay).
-        let args = serde_json::json!({ "delay_ms": 2_000 });
+        let args = serde_json::json!({ "delay_ms": 1_500 });
         let response = client::send_request(&daemon.base(), "echo", args, false, 10_000, None)
             .await
             .expect("request flows");
@@ -274,16 +281,35 @@ async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
         let hint = render::render_ticket(ticket, 0);
         assert!(hint.contains(&format!("pam wait {ticket}")), "{hint}");
 
+        // The request is running before anybody follows it: `queued` and
+        // `started` were published to nobody, and the follow still gets them,
+        // replayed, ahead of the ending.
+        let store = daemon.handle.store();
+        wait_for_row(&store, ticket, |row| row.state == RequestState::Running).await;
+
         // `pam wait` / `pam subscribe` share this one code path.
         let mut seen = Vec::new();
-        let terminal = client::follow_ticket(&daemon.base(), ticket, FOLLOW_TIMEOUT, |event| {
+        let end = client::follow_ticket_to_end(&daemon.base(), ticket, FOLLOW_TIMEOUT, |event| {
             seen.push(event.clone());
         })
         .await
         .expect("follow reaches a terminal event");
 
-        assert_eq!(terminal, Event::Done);
-        assert_eq!(seen.last(), Some(&Event::Done));
+        assert_eq!(end.event, Event::Done);
+        assert_eq!(
+            seen,
+            [Event::Queued, Event::Started, Event::Done],
+            "a late follow is shown the events it missed, once each"
+        );
+        // The stream ended with the durable answer, so nothing is asked
+        // afterwards: the whole follow is the one `query` it authorised with.
+        let Response::Result { body, .. } = &end.response else {
+            panic!("the end carries the durable answer: {:?}", end.response);
+        };
+        assert_eq!(body["ticket"], ticket.as_str());
+        assert_eq!(body["state"], "done");
+        assert_eq!(body["capability"], "echo");
+        assert_eq!(query_rows(&store).await, 1, "one follow, one query row");
 
         daemon.stop().await;
     })
@@ -292,7 +318,7 @@ async fn no_wait_returns_a_ticket_and_the_event_stream_ends_in_done() {
 }
 
 #[tokio::test]
-async fn a_follow_that_joins_after_the_terminal_event_still_terminates() {
+async fn a_follow_that_joins_after_the_terminal_event_returns_at_once() {
     timeout(DEADLINE, async {
         let daemon = TestDaemon::start().await;
         seed_repository_scope(
@@ -315,17 +341,225 @@ async fn a_follow_that_joins_after_the_terminal_event_still_terminates() {
             panic!("expected a ticket, got a different response");
         };
 
-        // Let the request finish before anybody subscribes: all its
-        // events — the terminal one included — are published to nobody,
-        // and zmq PUB has no replay (issue #1).
+        // Let the request finish before anybody follows it (issue #1).
         let store = daemon.handle.store();
         wait_for_row(&store, &ticket, |row| row.state == RequestState::Done).await;
 
-        // The follow still terminates, through the store reconcile.
-        let terminal = client::follow_ticket(&daemon.base(), &ticket, FOLLOW_TIMEOUT, |_| {})
-            .await
-            .expect("follow reaches a terminal event");
+        // The authorising query already sees the ending: the daemon answers
+        // `end` on the spot, with nothing to wait for and nothing to poll.
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        let terminal = client::follow_ticket(&daemon.base(), &ticket, FOLLOW_TIMEOUT, |event| {
+            seen.push(event.clone());
+        })
+        .await
+        .expect("follow reaches a terminal event");
         assert_eq!(terminal, Event::Done);
+        assert_eq!(seen, [Event::Done]);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a finished ticket is answered at once: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(query_rows(&store).await, 1, "one follow, one query row");
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The compiled binary: `pam subscribe` prints the replayed `queued` and
+/// `started` before the ending and then the durable result; `pam wait` on
+/// the finished ticket answers at once. Each is one connection and one
+/// `query` row, and nothing is queried after the stream ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_and_subscribe_cost_one_query_row_each_and_subscribe_prints_the_replay() {
+    warm_binary();
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+        let store = daemon.handle.store();
+        let started = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "echo",
+                r#"{"delay_ms": 1500, "n": 7}"#,
+                "--no-wait",
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(started.code, 0, "{} {}", started.stdout, started.stderr);
+        let started: serde_json::Value = serde_json::from_str(&started.stdout).unwrap();
+        let ticket = started["ticket"].as_str().unwrap();
+        wait_for_row(&store, ticket, |row| row.state == RequestState::Running).await;
+        assert_eq!(query_rows(&store).await, 0);
+
+        let subscribed = run_pam(&daemon.base(), repo.path(), &["subscribe", ticket]).await;
+        assert_eq!(
+            subscribed.code, 0,
+            "{} {}",
+            subscribed.stdout, subscribed.stderr
+        );
+        let lines: Vec<&str> = subscribed.stdout.lines().collect();
+        assert_eq!(
+            &lines[..3],
+            ["[queued]", "[started]", "[done]"],
+            "{}",
+            subscribed.stdout
+        );
+        assert!(
+            subscribed.stdout.contains(ticket),
+            "the durable result follows the events: {}",
+            subscribed.stdout
+        );
+        assert_eq!(query_rows(&store).await, 1, "subscribe: one query row");
+
+        let waited = run_pam(&daemon.base(), repo.path(), &["wait", ticket, "--json"]).await;
+        assert_eq!(waited.code, 0, "{} {}", waited.stdout, waited.stderr);
+        let object: serde_json::Value =
+            serde_json::from_str(&waited.stdout).expect("stdout is one JSON document");
+        assert_eq!(object["kind"], "result");
+        assert_eq!(object["body"]["ticket"], ticket);
+        assert_eq!(object["body"]["state"], "done");
+        assert!(waited.stderr.is_empty(), "{}", waited.stderr);
+        assert_eq!(query_rows(&store).await, 2, "wait: one more query row");
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A follow the daemon refuses is one line on stderr, or with `--json` one
+/// refusal object on stdout and nothing else anywhere; exit 3 either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_wait_is_one_json_refusal_on_stdout_and_exits_three() {
+    warm_binary();
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+        let store = daemon.handle.store();
+
+        for subcommand in ["wait", "subscribe"] {
+            let refused = run_pam(
+                &daemon.base(),
+                repo.path(),
+                &[subcommand, "req_nobody_ever_sent_this", "--json"],
+            )
+            .await;
+            assert_eq!(
+                refused.code,
+                i32::from(render::EXIT_REFUSED),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let object: serde_json::Value =
+                serde_json::from_str(&refused.stdout).expect("stdout is one JSON document");
+            assert_eq!(object["kind"], "refusal");
+            assert_eq!(object["id"], "req_nobody_ever_sent_this");
+            assert_eq!(object["cause"], "result_unavailable");
+            assert!(refused.stderr.is_empty(), "{}", refused.stderr);
+        }
+
+        let refused = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["wait", "req_nobody_ever_sent_this"],
+        )
+        .await;
+        assert_eq!(refused.code, i32::from(render::EXIT_REFUSED));
+        assert!(refused.stdout.is_empty(), "{}", refused.stdout);
+        assert!(
+            refused.stderr.starts_with("pam wait: "),
+            "{}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("result_unavailable"),
+            "{}",
+            refused.stderr
+        );
+        assert_eq!(
+            query_rows(&store).await,
+            3,
+            "a refused follow is asked once and never retried"
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A daemon of another build refuses the hello; the CLI turns that refusal
+/// into one plain sentence with both versions and the daemon's executable,
+/// keeps the daemon's cause and recovery, and maps it to the refusal exit
+/// code. The wording under test is the real daemon's.
+#[tokio::test]
+async fn a_daemon_of_another_build_is_reported_in_one_plain_sentence() {
+    use pam_client::transport::{self, Dial, TransportError};
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let dirs = pam_daemon::runtime_dir::RuntimeDir::paths_at_base(&daemon.base()).unwrap();
+        let mut dial = Dial::new(&dirs, pam_proto::wire::Via::Direct, Duration::from_secs(5));
+        dial.hello.version = "9.9.9".to_owned();
+        let envelope =
+            pam::request::build_envelope("status", serde_json::json!({}), true, 5_000, None);
+        let refused = transport::call(&dial, &envelope, Duration::from_secs(10)).await;
+        let Err(TransportError::Refused(frame)) = refused else {
+            panic!("another build is refused at the hello: {refused:?}");
+        };
+        assert_eq!(frame.cause, "client_version_mismatch");
+        let daemon_path = daemon
+            .handle
+            .boot_image_path()
+            .expect("the daemon recorded its executable");
+        let sentence = format!(
+            "this pam (v9.9.9) is not the build the running daemon (v{}, {}) was started from",
+            pam_daemon::daemon::DAEMON_VERSION,
+            daemon_path.display()
+        );
+        assert_eq!(
+            render::render_refusal(&frame.cause, &frame.detail, &frame.recovery),
+            format!(
+                "pam: refused (client_version_mismatch)\n  {sentence}\n  \u{2192} {}",
+                frame.recovery
+            )
+        );
+        let follow = client::RequestError::FollowRefused {
+            ticket: "req_t".to_owned(),
+            cause: frame.cause.clone(),
+            detail: frame.detail.clone(),
+            recovery: frame.recovery.clone(),
+        };
+        assert_eq!(
+            render::render_follow_error("wait", &follow),
+            format!("pam wait: {sentence}; {}", frame.recovery)
+        );
+        // `--json` keeps the daemon's refusal as it came.
+        let object: serde_json::Value =
+            serde_json::from_str(&render::render_follow_failure(&follow, true).unwrap()).unwrap();
+        assert_eq!(object["cause"], "client_version_mismatch");
+        assert_eq!(object["detail"], frame.detail.as_str());
+
+        // Refused, not restarted: the daemon still serves its own build.
+        let served = client::send_request(
+            &daemon.base(),
+            "status",
+            serde_json::json!({}),
+            true,
+            5_000,
+            None,
+        )
+        .await
+        .expect("the daemon's own build is served");
+        assert_eq!(render::exit_code(&served), 0);
 
         daemon.stop().await;
     })

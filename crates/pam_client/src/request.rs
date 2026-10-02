@@ -2,8 +2,9 @@
 //!
 //! Every subcommand funnels through [`build_envelope`]: a fresh
 //! `req_<ulid>` id, the advisory caller identity from
-//! [`crate::caller::detect_caller`], and this binary's build version for
-//! the daemon's version handshake. Capability arguments arrive as JSON
+//! [`crate::caller::detect_caller`], and this binary's build version (kept
+//! on the envelope for the stored row; the daemon's version rule reads the
+//! connection's hello). Capability arguments arrive as JSON
 //! text on the command line and are validated by [`parse_args_object`] —
 //! the wire `args` field is always a JSON object.
 

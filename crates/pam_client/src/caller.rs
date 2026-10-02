@@ -2,7 +2,7 @@
 //! client inspects its own parent-process chain and cwd to guess the invoking agent and repo; the
 //! daemon uses these only for attribution, filtering, and audit. A malicious local process can
 //! trivially forge them — the security wall is the filesystem: only processes that can reach the
-//! runtime directory (and its `pam.sock`) can talk to the daemon at all.
+//! runtime directory (and the public socket in it) can talk to the daemon at all.
 //!
 //! `agent`: parent-process chain walked upward (bounded, cycle-safe), each name matched lowercased
 //! by **prefix** against known agents (`claude`, `claude-code` → `claude`); nearest match wins,

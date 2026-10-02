@@ -132,6 +132,15 @@ it("lets an activity lane grow with its row share above a readable floor", () =>
     /\.activity-lane\s*\{[^}]*flex: var\(--lane-share, 1\) 1 0%;[^}]*min-width: min\(100%, 360px\)/,
   );
 });
+it("lets Home fill the workspace and split into two columns when wide", () => {
+  expect(styles).toMatch(/\.home-layout\s*\{[^}]*display: grid;/);
+  expect(styles).not.toMatch(/\.home-layout\s*\{[^}]*max-width/);
+  const wide = styles.slice(styles.indexOf("@container workspace (min-width: 1200px)"));
+  expect(wide).toMatch(
+    /\.home-layout\s*\{[^}]*grid-template-areas: "status status" "ask tasks" "recent tasks"/,
+  );
+  expect(styles).toMatch(/\.home-tasks\s*\{[^}]*container-type: inline-size/);
+});
 it("preserves measured connection anchors and a 24px screen target at every supported zoom", () => {
   expect(tokens).toMatch(/\.flow-connection-handle\s*\{[^}]*width: 10px;[^}]*height: 10px/);
   for (const dimension of ["width", "height"]) {

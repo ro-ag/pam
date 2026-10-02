@@ -23,11 +23,17 @@
 //! transfer or a digest mismatch deletes the part file — cancelling or failing keeps it so
 //! the next attempt resumes. A failure's `cause` is the launcher's own vocabulary
 //! ([`NetFailure::cause`]), the same words the Network settings' Test action uses.
+//!
+//! Weights can also arrive from a file on this machine ([`start_import`]): the file is
+//! copied — never moved — into the models directory through the same part file, lock,
+//! digest check and link-into-place as a download, hashed in the pass that copies it,
+//! with the same handle, states and cancel. No curl runs for an import.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use pam_net::{CurlChild, CurlRequest, MirrorBase, NetFailure, NetSettings, TrustedCurl, Url};
@@ -35,6 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use crate::registry::sha256_file;
+use crate::weights::{Control, FREE_SPACE_HEADROOM_BYTES, WeightsError, platform_free_bytes};
 
 /// Checkpoint format version. pam-old wrote `1`; nothing has changed.
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -92,6 +99,25 @@ impl DownloadRequest {
         }
         self
     }
+}
+
+/// A `.gguf` to copy in from a file on this machine, and what it should
+/// turn out to be.
+///
+/// `expected_size` and `expected_sha256` come from the catalog preset the
+/// file was matched to, or from a digest the human supplied; `None` means
+/// the copy is kept whatever it hashes to and the model is unverified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRequest {
+    /// The file to copy: absolute, a regular file (not a symbolic link),
+    /// named `*.gguf`. Never modified, moved or deleted.
+    pub source: PathBuf,
+    /// Where the copy lands. Must not already exist.
+    pub dest: PathBuf,
+    /// Exact size the file must have, when known.
+    pub expected_size: Option<u64>,
+    /// Lowercase hex SHA-256 the copy must have, when known.
+    pub expected_sha256: Option<String>,
 }
 
 /// Deadlines handed to curl, so a dead transfer ends instead of hanging.
@@ -221,6 +247,35 @@ pub enum DownloadError {
     /// A filesystem call failed while setting the transfer up.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// The file an import names does not exist or cannot be read.
+    #[error("{0:?} does not exist or cannot be read")]
+    ImportSourceMissing(PathBuf),
+
+    /// The file an import names is not one PAM copies: a symbolic link,
+    /// not a regular file, not a `.gguf`, or already inside the models
+    /// directory.
+    #[error("{path:?} was not imported: {reason}")]
+    ImportSourceRefused {
+        /// The path as given.
+        path: PathBuf,
+        /// Which rule refused it.
+        reason: String,
+    },
+
+    /// The volume holding the models directory cannot take the copy.
+    #[error(
+        "not enough disk space under {dir} for the copy: {needed} bytes needed, {} free",
+        free.map_or_else(|| "an unknown amount".to_owned(), |bytes| format!("{bytes} bytes"))
+    )]
+    NoSpace {
+        /// The directory the copy would land in.
+        dir: PathBuf,
+        /// Bytes the copy needs, headroom included.
+        needed: u64,
+        /// Bytes free there, when known.
+        free: Option<u64>,
+    },
 }
 
 /// The three sidecar paths for a destination file.
@@ -804,6 +859,212 @@ fn start_inner(
     })
 }
 
+/// Copies a `.gguf` in from a file on this machine and returns at once.
+///
+/// Everything that can be refused up front is refused here, synchronously:
+/// a source that is missing, a symbolic link, not a regular file, not a
+/// `.gguf`, or inside the models directory; an occupied destination; a
+/// transfer holding the destination's lock; a partial download beside it
+/// (an import never glues onto downloaded bytes: discard the partial
+/// first); a volume without room for the copy. The copy then runs off the
+/// async threads through the same part file and link-into-place as a
+/// download, hashed as it is written, with the same [`DownloadHandle`].
+/// A cancel or a failure deletes the partial copy: an import starts over,
+/// it does not resume. Needs a tokio runtime.
+pub fn start_import(request: ImportRequest) -> Result<DownloadHandle, DownloadError> {
+    let request = ImportRequest {
+        source: request.source,
+        dest: std::path::absolute(&request.dest)?,
+        expected_size: request.expected_size,
+        expected_sha256: request.expected_sha256,
+    };
+    let size = check_import_source(&request.source, &request.dest)?;
+    if request.dest.exists() {
+        return Err(DownloadError::AlreadyExists(request.dest.clone()));
+    }
+    let parent = request
+        .dest
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    std::fs::create_dir_all(&parent)?;
+    let paths = sidecar_paths(&request.dest);
+    let lock = acquire_lock(&paths.lock)?;
+    if paths.part.exists() || paths.checkpoint.exists() {
+        release_lock(lock);
+        return Err(DownloadError::CheckpointConflict(format!(
+            "a partial download of {} is on disk; discard it before importing a file over it",
+            request.dest.display()
+        )));
+    }
+    let needed = size.saturating_add(FREE_SPACE_HEADROOM_BYTES);
+    let free = platform_free_bytes(&parent);
+    if free.is_some_and(|free| free < needed) {
+        release_lock(lock);
+        return Err(DownloadError::NoSpace {
+            dir: parent,
+            needed,
+            free,
+        });
+    }
+    let total = request.expected_size.or(Some(size));
+    let (state, states) =
+        watch::channel(DownloadState::Running(DownloadProgress { bytes: 0, total }));
+    let (cancel, cancelled) = watch::channel(false);
+    tokio::spawn(run_import(request, paths, lock, total, state, cancelled));
+    Ok(DownloadHandle {
+        state: states,
+        cancel: Arc::new(cancel),
+    })
+}
+
+/// The import source's rules, and its size when it passes them.
+fn check_import_source(source: &Path, dest: &Path) -> Result<u64, DownloadError> {
+    let refuse = |reason: String| DownloadError::ImportSourceRefused {
+        path: source.to_path_buf(),
+        reason,
+    };
+    if !source.is_absolute() {
+        return Err(refuse("the path must be absolute".to_owned()));
+    }
+    let meta = std::fs::symlink_metadata(source)
+        .map_err(|_| DownloadError::ImportSourceMissing(source.to_path_buf()))?;
+    if meta.file_type().is_symlink() {
+        return Err(refuse(
+            "it is a symbolic link; give the path of the file itself".to_owned(),
+        ));
+    }
+    if !meta.is_file() {
+        return Err(refuse("it is not a regular file".to_owned()));
+    }
+    if !source
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(refuse("only .gguf files are imported".to_owned()));
+    }
+    // The models directory is where the copy lands; a file already there is
+    // a model already, and copying it onto itself would be absurd.
+    if let (Ok(real), Some(models_dir)) =
+        (source.canonicalize(), dest.parent().and_then(Path::parent))
+        && models_dir
+            .canonicalize()
+            .is_ok_and(|models_dir| real.starts_with(models_dir))
+    {
+        return Err(refuse(
+            "it is already inside the models directory".to_owned(),
+        ));
+    }
+    Ok(meta.len())
+}
+
+/// Runs an import to its terminal state and publishes it.
+async fn run_import(
+    request: ImportRequest,
+    paths: SidecarPaths,
+    lock: File,
+    total: Option<u64>,
+    state: watch::Sender<DownloadState>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let done = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let copy = {
+        let source = request.source.clone();
+        let part = paths.part.clone();
+        let done = Arc::clone(&done);
+        let stop = Arc::clone(&stop);
+        tokio::task::spawn_blocking(move || {
+            let control = Control {
+                progress: &|bytes| done.store(bytes, Ordering::Relaxed),
+                cancelled: &|| stop.load(Ordering::Acquire),
+            };
+            crate::weights::copy_hashing(&source, &part, &control)
+        })
+    };
+    tokio::pin!(copy);
+    let mut ticker = tokio::time::interval(PROGRESS_POLL);
+    let mut watching = true;
+    let copied = loop {
+        tokio::select! {
+            finished = &mut copy => break finished,
+            changed = cancelled.changed(), if watching => match changed {
+                Ok(()) if *cancelled.borrow() => stop.store(true, Ordering::Release),
+                Ok(()) => {}
+                // Every handle was dropped: nobody is left to cancel.
+                Err(_) => watching = false,
+            },
+            _ = ticker.tick() => {
+                let _ = state.send(DownloadState::Running(DownloadProgress {
+                    bytes: done.load(Ordering::Relaxed),
+                    total,
+                }));
+            }
+        }
+    };
+    let terminal = match copied {
+        Ok(Ok((sha256, size_bytes))) => finish_import(&request, &paths, sha256, size_bytes),
+        Ok(Err(WeightsError::Cancelled)) => DownloadState::Cancelled,
+        Ok(Err(WeightsError::NoSpace { needed, free, .. })) => DownloadState::failed(
+            "no_space",
+            format!(
+                "the copy needs {needed} bytes and the volume has {}",
+                free.map_or_else(|| "an unknown amount".to_owned(), |b| format!("{b} bytes"))
+            ),
+        ),
+        // Windows has no free-space probe, so a full volume shows up here
+        // rather than in the pre-check; it gets the same name either way.
+        Ok(Err(WeightsError::Io(error)))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ) =>
+        {
+            DownloadState::failed(
+                "no_space",
+                format!("the volume holding the models directory filled up: {error}"),
+            )
+        }
+        Ok(Err(WeightsError::Io(error))) => {
+            DownloadState::failed("io", format!("copying the file failed: {error}"))
+        }
+        Err(error) => DownloadState::failed("io", format!("the copy task panicked: {error}")),
+    };
+    // Whatever the verdict, no partial copy is left: an import is never
+    // resumed, and the sidecars would otherwise read as a partial download.
+    let _ = std::fs::remove_file(&paths.part);
+    let _ = std::fs::remove_file(&paths.lock);
+    publish_terminal(&state, lock, terminal);
+}
+
+/// Checks the finished copy against the request and links it into place.
+fn finish_import(
+    request: &ImportRequest,
+    paths: &SidecarPaths,
+    sha256: String,
+    size_bytes: u64,
+) -> DownloadState {
+    if let Some(expected) = request.expected_size
+        && size_bytes != expected
+    {
+        return DownloadState::failed(
+            "size_mismatch",
+            format!("expected {expected} bytes, the file holds {size_bytes}"),
+        );
+    }
+    if let Some(expected) = &request.expected_sha256
+        && expected != &sha256
+    {
+        return DownloadState::failed(
+            "digest_mismatch",
+            format!("expected sha256:{expected}, the file hashes to sha256:{sha256}"),
+        );
+    }
+    if let Err(state) = link_into_place(&paths.part, &request.dest) {
+        return state;
+    }
+    DownloadState::Done { sha256, size_bytes }
+}
+
 /// One transfer's owned state, moved into the spawned task.
 struct Job {
     request: DownloadRequest,
@@ -1044,35 +1305,8 @@ impl Job {
     }
 
     /// Moves the part file into place and clears the sidecars.
-    ///
-    /// The move is a hard link followed by an unlink of the part, not a
-    /// rename: `rename` replaces whatever is at the destination, so a file
-    /// that appeared between an existence check and the rename — another
-    /// PAM, a human copying weights in by hand — would be silently
-    /// overwritten. `hard_link` refuses an existing destination inside the
-    /// filesystem, atomically, with no check-then-act window. Both names
-    /// are in one directory, so the link cannot cross a device.
     fn install(&self) -> Result<(), DownloadState> {
-        if let Err(error) = std::fs::hard_link(&self.paths.part, &self.request.dest) {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(DownloadState::failed(
-                    "already_exists",
-                    format!(
-                        "{} appeared while the download ran",
-                        self.request.dest.display()
-                    ),
-                ));
-            }
-            return Err(DownloadState::failed(
-                "io",
-                format!("could not move the finished file into place: {error}"),
-            ));
-        }
-        // The weights are in place under their final name; a part file that
-        // would not go away costs a resume check next time, and reporting a
-        // failed download here would be a lie.
-        let _ = std::fs::remove_file(&self.paths.part);
-
+        link_into_place(&self.paths.part, &self.request.dest)?;
         // No verification is recorded here: the downloader runs where the models directory
         // is, and a record written there is forgeable by whoever can write that directory.
         // The caller records it in its private trust store (`Registry::record_verified`)
@@ -1110,6 +1344,35 @@ impl Job {
         checkpoint.etag = Some(etag.to_owned());
         let _ = write_checkpoint(&self.paths.checkpoint, &checkpoint);
     }
+}
+
+/// Moves a finished part file to its destination.
+///
+/// The move is a hard link followed by an unlink of the part, not a
+/// rename: `rename` replaces whatever is at the destination, so a file
+/// that appeared between an existence check and the rename — another
+/// PAM, a human copying weights in by hand — would be silently
+/// overwritten. `hard_link` refuses an existing destination inside the
+/// filesystem, atomically, with no check-then-act window. Both names
+/// are in one directory, so the link cannot cross a device.
+fn link_into_place(part: &Path, dest: &Path) -> Result<(), DownloadState> {
+    if let Err(error) = std::fs::hard_link(part, dest) {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(DownloadState::failed(
+                "already_exists",
+                format!("{} appeared while the transfer ran", dest.display()),
+            ));
+        }
+        return Err(DownloadState::failed(
+            "io",
+            format!("could not move the finished file into place: {error}"),
+        ));
+    }
+    // The weights are in place under their final name; a part file that
+    // would not go away costs a resume check next time, and reporting a
+    // failed transfer here would be a lie.
+    let _ = std::fs::remove_file(part);
+    Ok(())
 }
 
 /// Takes the advisory lock for a destination.

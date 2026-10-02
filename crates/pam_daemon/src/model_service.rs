@@ -41,7 +41,7 @@ use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pam_model::download::{
-    DownloadError, DownloadHandle, DownloadRequest, DownloadState, TransferLimits,
+    DownloadError, DownloadHandle, DownloadRequest, DownloadState, ImportRequest, TransferLimits,
 };
 use pam_model::engine;
 use pam_model::engine_server::{EngineContract, EngineServer, EngineServerError, ServerOptions};
@@ -83,6 +83,13 @@ pub const KIND_DOWNLOAD: &str = "download";
 
 /// `model_job.kind` for a verification.
 pub const KIND_VERIFY: &str = "verify";
+
+/// `model_job.kind` an import is recorded under. The store's `kind` column
+/// admits only `download` and `verify` (migration 3's CHECK), and an import
+/// is a transfer into the models directory with the same progress, verdict
+/// and cancel; its `source` is the absolute path of the file, where a
+/// download's is an `https://` address, which is how the two are told apart.
+pub const KIND_IMPORT: &str = KIND_DOWNLOAD;
 
 /// `model_job.state` for a job that finished cleanly.
 pub const JOB_DONE: &str = "done";
@@ -397,6 +404,11 @@ pub struct ModelService {
     /// production has no such switch.
     #[cfg(test)]
     plain_http_for_tests: AtomicBool,
+    /// The release the engine ops install, import and disclose instead of
+    /// the pinned one: a fake archive the in-crate tests built. Production
+    /// has no such switch; [`Self::engine_release`] is the only reader.
+    #[cfg(test)]
+    engine_release_for_tests: RwLock<Option<engine::EngineRelease>>,
     /// The llama.cpp supervisor, built the first time an installed engine
     /// is needed and rebuilt if the installed binary changes.
     engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
@@ -477,6 +489,8 @@ impl ModelService {
             mirrors: RwLock::new(None),
             #[cfg(test)]
             plain_http_for_tests: AtomicBool::new(false),
+            #[cfg(test)]
+            engine_release_for_tests: RwLock::new(None),
             engine: std::sync::Mutex::new(None),
             busy: AtomicBool::new(false),
             resident: RwLock::new(None),
@@ -944,6 +958,47 @@ impl ModelService {
         self.plain_http_for_tests.store(true, Ordering::Release);
     }
 
+    /// The release the engine ops work with: the pinned one for this
+    /// platform, `None` where the platform has no pinned asset. In test
+    /// builds a release pinned through `pin_engine_release_for_tests`
+    /// takes its place; production reads only the compiled-in constants.
+    #[must_use]
+    pub fn engine_release(&self) -> Option<engine::EngineRelease> {
+        #[cfg(test)]
+        if let Some(release) = self
+            .engine_release_for_tests
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Some(release);
+        }
+        engine::Target::current().map(engine::EngineRelease::pinned)
+    }
+
+    /// Makes the engine ops install, import and disclose `release` — a fake
+    /// archive the test built — in place of the pinned one. Keep its tag and
+    /// build the pinned ones: `engine::status` reads those constants, not
+    /// this. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn pin_engine_release_for_tests(&self, release: engine::EngineRelease) {
+        *self
+            .engine_release_for_tests
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
+    }
+
+    /// Forgets the supervisor built over the installed engine, so the next
+    /// use reads the manifest again. Called after the engine is removed;
+    /// the caller has made sure nothing is loaded.
+    pub fn forget_engine(&self) {
+        *self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.set_resident(None);
+    }
+
     /// Stops an engine a previous daemon left running (SIGKILL, crash), once per
     /// engine base. The supervisor's pid file names the process; it is killed only when
     /// the live process with that pid has the recorded executable, was started with the
@@ -1342,6 +1397,55 @@ impl ModelService {
             self.stopping.subscribe(),
         ));
         tracing::info!(job = %job_id, model = model_id, "download started");
+        Ok(job_id)
+    }
+
+    /// Copies weights in from a file on this machine behind a job row
+    /// (kind [`KIND_IMPORT`]) and returns its id: the copy runs with the
+    /// same handle, progress, cancel and verdict as a download, and lands
+    /// recorded as verified when the request carried an expected digest
+    /// that the copy matched. Refusals happen before any row exists; no
+    /// network profile is resolved, because no network is used.
+    pub async fn start_import(
+        &self,
+        request: ImportRequest,
+        model_id: &str,
+    ) -> Result<String, ModelServiceError> {
+        let dest = request.dest.clone();
+        let dest_for_record = request.dest.clone();
+        let expected_digest = request.expected_sha256.is_some();
+        let source = request.source.display().to_string();
+        let total = request
+            .expected_size
+            .and_then(|bytes| i64::try_from(bytes).ok());
+        self.sweep_private_copies_once().await;
+        if self.is_downloading(&dest).await {
+            return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
+        }
+        let handle = pam_model::download::start_import(request).map_err(|err| match err {
+            DownloadError::AlreadyExists(_) => {
+                ModelServiceError::AlreadyInstalled(model_id.to_owned())
+            }
+            DownloadError::Locked(_) => ModelServiceError::AlreadyDownloading(model_id.to_owned()),
+            other => ModelServiceError::Download(other),
+        })?;
+        let job_id = new_job_id();
+        self.store
+            .insert_model_job(&job_id, KIND_IMPORT, model_id, Some(&source), total)
+            .await?;
+        self.downloads
+            .lock()
+            .await
+            .insert(job_id.clone(), (dest, handle.clone()));
+        self.spawn_task(follow_download(
+            Arc::clone(&self.store),
+            Arc::clone(&self.downloads),
+            job_id.clone(),
+            handle,
+            expected_digest.then(|| (self.registry(), dest_for_record)),
+            self.stopping.subscribe(),
+        ));
+        tracing::info!(job = %job_id, model = model_id, "import started");
         Ok(job_id)
     }
 

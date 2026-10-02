@@ -93,12 +93,13 @@ fn only_the_working_ops_get_the_long_deadline() {
         pam_daemon::admin_models::OP_MODELS_TRY,
         pam_daemon::admin_logs::OP_LOG_COMPRESS,
         pam_daemon::admin_engine::OP_ENGINE_INSTALL,
+        pam_daemon::admin_engine::OP_ENGINE_IMPORT,
     ];
     for op in long {
         assert_eq!(
             deadline_for(op),
             120_000,
-            "{op} decodes tokens or fetches the engine; 30 s would time it out"
+            "{op} decodes tokens or fetches, copies and verifies the engine; 30 s would time it out"
         );
     }
     let test_op = pam_daemon::admin_connectors::OP_CONNECTORS_TEST;

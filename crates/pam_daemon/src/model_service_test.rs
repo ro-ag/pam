@@ -441,7 +441,7 @@ async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
 /// The fake llama-server `cargo test` builds for `pam_model`, found next to
 /// this test binary's directory; `None` when it was not built.
 #[cfg(unix)]
-fn fake_engine_binary() -> Option<std::path::PathBuf> {
+pub(crate) fn fake_engine_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.parent()?.join("pam-fake-llama-server");
     path.is_file().then_some(path)
@@ -465,6 +465,7 @@ fn install_fake_engine(service: &ModelService, fake: &std::path::Path) {
         bytes: target.asset().bytes,
         version_line: "version: fake".into(),
         installed_at_ms: 0,
+        source: None,
     };
     std::fs::write(
         layout.manifest_path(),

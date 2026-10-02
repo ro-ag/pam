@@ -35,7 +35,7 @@ use pam_daemon::admin::{
     OP_PROFILE_SET, OP_REQUESTS_CANCEL,
 };
 use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
-use pam_daemon::admin_engine::OP_ENGINE_INSTALL;
+use pam_daemon::admin_engine::{OP_ENGINE_IMPORT, OP_ENGINE_INSTALL};
 use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
@@ -56,10 +56,11 @@ const STATUS_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
 
-/// Deadline for the three admin ops that do real work rather than a read:
+/// Deadline for the admin ops that do real work rather than a read:
 /// `admin.models.try` runs a generation, `admin.log.compress` runs a
 /// 64 MiB compaction plus a generation, and `admin.models.engine.install`
-/// downloads and verifies the pinned inference engine. A cold prompt on a
+/// and `.import` download or copy, unpack and verify the pinned inference
+/// engine. A cold prompt on a
 /// large model decodes for minutes, not seconds, so the shared 30 s
 /// ceiling would time out a working model.
 const LONG_DEADLINE_MS: u64 = 120_000;
@@ -183,7 +184,7 @@ pub fn is_known_admin_op(op: &str) -> bool {
 #[must_use]
 pub fn deadline_for(op: &str) -> u64 {
     match op {
-        OP_MODELS_TRY | OP_LOG_COMPRESS | OP_ENGINE_INSTALL => LONG_DEADLINE_MS,
+        OP_MODELS_TRY | OP_LOG_COMPRESS | OP_ENGINE_INSTALL | OP_ENGINE_IMPORT => LONG_DEADLINE_MS,
         OP_CONNECTORS_TEST => CONNECTOR_TEST_DEADLINE_MS,
         OP_NETWORK_TEST => NETWORK_TEST_DEADLINE_MS,
         _ => ADMIN_DEADLINE_MS,

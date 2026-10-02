@@ -423,8 +423,8 @@ pub(crate) fn hash_file(path: &Path, control: &Control<'_>) -> Result<(String, u
 
 /// Copies `source` to a new owner-only file at `dest`, hashing exactly the bytes it
 /// writes. The digest therefore describes the private file whatever happens to `source`
-/// while it is read.
-fn copy_hashing(
+/// while it is read. The weights import copies with it too.
+pub(crate) fn copy_hashing(
     source: &Path,
     dest: &Path,
     control: &Control<'_>,

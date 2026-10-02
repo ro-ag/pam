@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::catalog::UPSTREAM_PREFIX;
 use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
-    TransferLimits, curl_path, curl_recovery_line, discard_partial, failure_recovery,
-    inspect_partial, sidecar_paths, start_over_plain_http_for_tests,
+    ImportRequest, TransferLimits, curl_path, curl_recovery_line, discard_partial,
+    failure_recovery, inspect_partial, sidecar_paths, start_import,
+    start_over_plain_http_for_tests,
 };
 use crate::registry::verified_sidecar_path;
 use crate::testing as origin;
@@ -1251,4 +1252,248 @@ fn server_address(server: &origin::TestServer) -> std::net::SocketAddr {
         .trim_end_matches('/')
         .parse()
         .unwrap()
+}
+
+// ---- importing weights from a file on this machine ----
+
+/// A `.gguf` source outside the models directory, holding `bytes`.
+fn import_source(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Qwen3.gguf");
+    std::fs::write(&path, bytes).unwrap();
+    (dir, path)
+}
+
+fn import_request(source: &Path, dest: &Path, bytes: &[u8]) -> ImportRequest {
+    ImportRequest {
+        source: source.to_path_buf(),
+        dest: dest.to_path_buf(),
+        expected_size: Some(size_of(bytes)),
+        expected_sha256: Some(sha256_of(bytes)),
+    }
+}
+
+/// An import copies the file in through the same part file and link as a
+/// download, reports the digest of the copy, leaves the source as it was
+/// and no sidecar behind; a second import of the same file is refused.
+#[tokio::test]
+async fn an_import_copies_hashes_and_lands_without_touching_the_source() {
+    let bytes = body(3 * 1024 * 1024 + 17);
+    let (_src, source) = import_source(&bytes);
+    let before = std::fs::metadata(&source).unwrap();
+    let fixture = fixture();
+    let handle = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    assert!(
+        matches!(handle.state(), DownloadState::Running(DownloadProgress { bytes: 0, total: Some(t) }) if t == size_of(&bytes))
+    );
+    let state = settled(&handle).await;
+    assert_eq!(
+        state,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes)
+        }
+    );
+    assert_eq!(std::fs::read(&fixture.dest).unwrap(), bytes);
+    assert_eq!(dir_entries(fixture.dest.parent().unwrap()), ["Qwen3.gguf"]);
+    let after = std::fs::metadata(&source).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        bytes,
+        "the original is untouched"
+    );
+    let again = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(again, Err(DownloadError::AlreadyExists(_))),
+        "{again:?}"
+    );
+}
+
+/// The expected digest is the trust anchor: a file that hashes to anything
+/// else is not imported, and no copy of it is left anywhere.
+#[tokio::test]
+async fn an_import_with_the_wrong_digest_removes_the_copy() {
+    let bytes = body(70_000);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let mut request = import_request(&source, &fixture.dest, &bytes);
+    request.expected_sha256 = Some("f".repeat(64));
+    let handle = start_import(request).unwrap();
+    let state = settled(&handle).await;
+    assert!(
+        matches!(state, DownloadState::Failed { ref cause, .. } if cause == "digest_mismatch"),
+        "{state:?}"
+    );
+    assert!(!fixture.dest.exists());
+    assert!(
+        dir_entries(fixture.dest.parent().unwrap()).is_empty(),
+        "no part, no lock"
+    );
+    assert!(source.is_file(), "the original is untouched");
+}
+
+/// Without an expected digest the file is still copied and its digest
+/// reported; the caller decides what that means (unverified).
+#[tokio::test]
+async fn an_import_without_a_digest_lands_and_reports_what_it_hashed_to() {
+    let bytes = body(1000);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let handle = start_import(ImportRequest {
+        source: source.clone(),
+        dest: fixture.dest.clone(),
+        expected_size: None,
+        expected_sha256: None,
+    })
+    .unwrap();
+    assert_eq!(
+        settled(&handle).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: 1000
+        }
+    );
+    assert!(fixture.dest.is_file());
+}
+
+/// A wrong size is named before any digest is talked about.
+#[tokio::test]
+async fn an_import_of_the_wrong_size_is_named_as_one() {
+    let bytes = body(500);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let mut request = import_request(&source, &fixture.dest, &bytes);
+    request.expected_size = Some(499);
+    let state = settled(&start_import(request).unwrap()).await;
+    assert!(
+        matches!(state, DownloadState::Failed { ref cause, .. } if cause == "size_mismatch"),
+        "{state:?}"
+    );
+    assert!(!fixture.dest.exists());
+}
+
+/// What is refused before a copy starts: a missing file, a symbolic link, a
+/// directory, a file that is not a `.gguf`, a relative path, and a file
+/// already inside the models directory.
+#[cfg(unix)]
+#[test]
+fn an_import_source_that_breaks_a_rule_is_refused_by_name() {
+    let bytes = body(10);
+    let (src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let request = |path: &Path| ImportRequest {
+        source: path.to_path_buf(),
+        dest: fixture.dest.clone(),
+        expected_size: None,
+        expected_sha256: None,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+
+    let missing = start_import(request(&src.path().join("absent.gguf")));
+    assert!(
+        matches!(missing, Err(DownloadError::ImportSourceMissing(_))),
+        "{missing:?}"
+    );
+
+    let link = src.path().join("link.gguf");
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let linked = start_import(request(&link));
+    assert!(
+        matches!(linked, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("symbolic link")),
+        "{linked:?}"
+    );
+
+    let dir = src.path().join("tree.gguf");
+    std::fs::create_dir(&dir).unwrap();
+    let directory = start_import(request(&dir));
+    assert!(
+        matches!(directory, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("regular file")),
+        "{directory:?}"
+    );
+
+    let text = src.path().join("notes.txt");
+    std::fs::write(&text, b"x").unwrap();
+    let not_gguf = start_import(request(&text));
+    assert!(
+        matches!(not_gguf, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains(".gguf")),
+        "{not_gguf:?}"
+    );
+
+    let relative = start_import(request(Path::new("relative/Qwen3.gguf")));
+    assert!(
+        matches!(relative, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("absolute")),
+        "{relative:?}"
+    );
+
+    let inside = fixture.dest.parent().unwrap().join("Already.gguf");
+    std::fs::write(&inside, b"x").unwrap();
+    let in_models = start_import(request(&inside));
+    assert!(
+        matches!(in_models, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("models directory")),
+        "{in_models:?}"
+    );
+    assert!(!fixture.dest.exists());
+    assert_eq!(
+        dir_entries(fixture.dest.parent().unwrap()),
+        ["Already.gguf"]
+    );
+}
+
+/// A download holding the destination's lock, or a partial download beside
+/// it, refuses the import: an import never writes under a transfer and
+/// never glues onto downloaded bytes.
+#[tokio::test]
+async fn an_import_over_a_running_or_partial_download_is_refused() {
+    require_curl!();
+    let bytes = body(256 * 1024);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let server = origin::serve_slowly(
+        bytes.clone(),
+        "\"etag\"",
+        4 * 1024,
+        Duration::from_millis(40),
+    )
+    .await;
+    let download = start(request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes)).unwrap();
+    let paths = sidecar_paths(&fixture.dest);
+    assert!(wait_for_path(&paths.part).await);
+    let locked = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(locked, Err(DownloadError::Locked(_))),
+        "{locked:?}"
+    );
+    download.cancel();
+    assert_eq!(settled(&download).await, DownloadState::Cancelled);
+    assert!(paths.part.exists(), "the cancelled download keeps its part");
+    let conflict = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(conflict, Err(DownloadError::CheckpointConflict(_))),
+        "{conflict:?}"
+    );
+    assert!(paths.part.exists(), "the partial download is not touched");
+    discard_partial(&fixture.dest).unwrap();
+    let ok = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    assert!(matches!(settled(&ok).await, DownloadState::Done { .. }));
+}
+
+/// Cancelling an import deletes the partial copy: there is nothing to
+/// resume, and a part file would read as a partial download.
+#[tokio::test]
+async fn cancelling_an_import_leaves_nothing_behind() {
+    let bytes = body(64 * 1024 * 1024);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let handle = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    handle.cancel();
+    assert_eq!(settled(&handle).await, DownloadState::Cancelled);
+    assert!(!fixture.dest.exists());
+    assert!(
+        dir_entries(fixture.dest.parent().unwrap()).is_empty(),
+        "no part, no lock"
+    );
+    assert!(source.is_file());
 }

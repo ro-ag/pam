@@ -46,8 +46,8 @@ pub use curator::{
     invoke_args, trusted_dirs,
 };
 pub use download::{
-    DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState, curl_path,
-    start,
+    DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState, ImportRequest,
+    curl_path, start, start_import,
 };
 pub use gguf::{GgufError, GgufInfo, read_info};
 pub use qualification::{BenchContract, PromptContract, QUALIFIED, Qualification};

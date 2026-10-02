@@ -306,7 +306,9 @@ async fn a_sandboxed_client_cannot_stop_a_pre_migration_daemon_and_says_what_to_
         );
         assert!(stderr.contains("this process may not stop it"), "{stderr}");
         assert!(
-            stderr.contains("run `pam daemon stop` outside the sandbox, then retry"),
+            stderr.contains(
+                "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
+            ),
             "{stderr}"
         );
 

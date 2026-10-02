@@ -465,7 +465,7 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             json,
         } => follow(base, "wait", &ticket, timeout_ms, json).await,
         #[cfg(unix)]
-        Cmd::Listen { dir } => listen_mode(base, &dir),
+        Cmd::Listen { dir } => listen_mode(base, &dir).await,
         Cmd::Subscribe {
             ticket,
             timeout_ms,
@@ -840,16 +840,12 @@ fn daemon_stop() -> ExitCode {
 /// `pam listen <dir>`: serves the session socket relay until ctrl-c.
 /// Exit codes: 0 on a clean shutdown, 1 when the relay could not start or
 /// failed. Unix only — the subcommand does not exist elsewhere.
+///
+/// It runs on the runtime [`client_mode`] already entered: a second runtime
+/// cannot be started from inside one (tokio panics on the nested `block_on`).
 #[cfg(unix)]
-fn listen_mode(base: &Path, dir: &Path) -> ExitCode {
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("pam listen: cannot start the async runtime: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match runtime.block_on(pam_client::relay::run(dir, base)) {
+async fn listen_mode(base: &Path, dir: &Path) -> ExitCode {
+    match pam_client::relay::run(dir, base).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("pam listen: {err}");

@@ -181,10 +181,17 @@ pub(crate) const HANDOVER_WAIT: Duration = Duration::from_secs(20);
 const LEGACY_SOCKET_FILE: &str = "pam.sock";
 
 /// What the human does about a pre-migration daemon this process may not stop.
+///
+/// Two commands on unix, because stopping is half of it: a client that may
+/// not signal the old daemon is confined, and a confined client usually may
+/// not start a daemon either (it cannot write the base, or it dials through
+/// a relay and never spawns). `pam status` run outside starts the current
+/// daemon; with only `pam daemon stop` the retry fails with "did not become
+/// ready" or a transport failure (upgrade rehearsal, 2026-10-02).
 const LEGACY_RECOVERY: &str = if cfg!(windows) {
     "end that pam daemon process, then retry"
 } else {
-    "run `pam daemon stop` outside the sandbox, then retry"
+    "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
 };
 
 /// Why no daemon this build can talk to could be ensured.
@@ -258,7 +265,8 @@ pub enum ClientError {
     /// A client that dials through a relay never signals anything.
     #[error(
         "the pam daemon behind the session relay in {} ($PAM_SOCKET_DIR) predates this pam's \
-         wire protocol; run `pam daemon stop` outside the sandbox and try again",
+         wire protocol; run `pam daemon stop` and then `pam status` outside the sandbox and try \
+         again",
         dir.display()
     )]
     LegacyBehindRelay {

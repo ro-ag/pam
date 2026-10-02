@@ -360,7 +360,9 @@ fn behind_a_session_directory_a_pre_migration_daemon_is_reported_and_never_signa
             "{stderr}"
         );
         assert!(
-            stderr.contains("run `pam daemon stop` outside the sandbox and try again"),
+            stderr.contains(
+                "run `pam daemon stop` and then `pam status` outside the sandbox and try again"
+            ),
             "{stderr}"
         );
     }
@@ -390,7 +392,9 @@ fn a_client_with_no_pid_to_signal_prints_the_instruction_and_exits_non_zero() {
     );
     assert!(stderr.contains("this process may not stop it"), "{stderr}");
     assert!(
-        stderr.contains("run `pam daemon stop` outside the sandbox, then retry"),
+        stderr.contains(
+            "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
+        ),
         "{stderr}"
     );
 
@@ -435,7 +439,9 @@ fn a_client_whose_signal_is_refused_names_the_pid_and_leaves_the_daemon_running(
         "{stderr}"
     );
     assert!(
-        stderr.contains("run `pam daemon stop` outside the sandbox, then retry"),
+        stderr.contains(
+            "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
+        ),
         "{stderr}"
     );
 
@@ -444,5 +450,160 @@ fn a_client_whose_signal_is_refused_names_the_pid_and_leaves_the_daemon_running(
     assert!(
         !base.join("state.sqlite3").exists(),
         "no daemon of this build was started"
+    );
+}
+
+/// A running `pam listen <dir>` of this build. Killed and reaped on the way out, panic included.
+struct Relay {
+    child: Child,
+    output: PathBuf,
+}
+
+impl Relay {
+    /// Starts the relay and returns once it has printed its last startup line: by then it has
+    /// bound its socket, dealt with the daemon behind it and is accepting. A relay that exits
+    /// instead fails the test with what it printed.
+    fn start(base: &Path, cwd: &Path, session: &Path, output: PathBuf) -> Self {
+        let log = std::fs::File::create(&output).expect("the relay's output file");
+        let mut command = pam(base, cwd, &["listen"]);
+        command
+            .arg(session)
+            .stdout(log.try_clone().expect("a second handle"))
+            .stderr(log);
+        let mut relay = Self {
+            child: command.spawn().expect("pam listen starts"),
+            output,
+        };
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let printed = relay.printed();
+            if printed.contains("stop with ctrl-c") {
+                return relay;
+            }
+            let ended = relay.child.try_wait().expect("the relay is waitable");
+            assert!(
+                ended.is_none(),
+                "pam listen ended at startup ({ended:?}): {printed}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "pam listen never finished starting: {printed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Everything the relay wrote to stdout and stderr so far.
+    fn printed(&self) -> String {
+        std::fs::read_to_string(&self.output).unwrap_or_default()
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Ctrl-c: sends `SIGINT` and waits (bounded) for the relay to end.
+    fn interrupt(&mut self) -> ExitStatus {
+        let sent = Command::new("/bin/kill")
+            .args(["-INT", &self.pid().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "the relay takes the interrupt");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("the relay is waitable") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "the relay never ended");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `pam listen` through the compiled binary, with a pre-migration daemon behind it: the relay
+/// starts (it runs on the command's own runtime), stops that daemon through the pid in the
+/// lock, starts this build's daemon and says so, and a client that dials through the session
+/// directory is served. The session directory holds one socket, the request row records the
+/// relay as the peer, and ctrl-c ends the relay cleanly without taking the daemon with it.
+#[test]
+fn the_relay_replaces_a_pre_migration_daemon_and_serves_a_relayed_client() {
+    let (tmp, base, repo) = fixture();
+    seed_relaxed(&base);
+    let _cleanup = Cleanup {
+        base: base.clone(),
+        cwd: repo.clone(),
+    };
+    let mut fake = Fake::start(&base, false);
+    let old = fake.pid();
+    let root = tmp.path().canonicalize().expect("the tempdir exists");
+    let session = root.join("session");
+
+    let mut relay = Relay::start(&base, &repo, &session, root.join("listen.out"));
+    let printed = relay.printed();
+    assert!(
+        printed.contains("a pre-migration daemon was replaced"),
+        "{printed}"
+    );
+    let ended = fake.ended();
+    assert_eq!(ended.signal(), Some(15), "ended by SIGTERM: {ended:?}");
+    let new = lock_holder(&base).expect("a daemon of this build holds the lock");
+    assert_ne!(new, old);
+
+    let through_relay = |args: &[&str]| {
+        let mut command = pam(&base, &repo, args);
+        command.env("PAM_SOCKET_DIR", &session);
+        run(command)
+    };
+    let (code, stdout, stderr) = through_relay(&["echo", r#"{"msg":"relayed"}"#, "--json"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    let echoed: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON result");
+    assert_eq!(echoed["body"]["echo"]["msg"], "relayed", "{echoed}");
+    let (code, stdout, stderr) = through_relay(&["status", "--json"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+
+    let entries: Vec<_> = std::fs::read_dir(&session)
+        .expect("the session directory")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert_eq!(entries, ["pam.sock"], "one socket and nothing else");
+
+    let relay_pid = relay.pid();
+    let status = relay.interrupt();
+    assert!(status.success(), "ctrl-c is a clean exit: {status:?}");
+    assert!(
+        !session.join("pam.sock").exists(),
+        "the relay removes its socket on the way out"
+    );
+    assert_eq!(
+        lock_holder(&base),
+        Some(new),
+        "the daemon the relay started outlives it"
+    );
+
+    let (code, _, stderr) = run(pam(&base, &repo, &["daemon", "stop"]));
+    assert_eq!(code, Some(0), "{stderr}");
+    let id = echoed["id"].as_str().expect("the request id");
+    let origin = tokio::runtime::Runtime::new()
+        .expect("a runtime")
+        .block_on(async {
+            let store = Store::open(&base.join("state.sqlite3"))
+                .await
+                .expect("the store opens");
+            store.get_request(id).await.expect("the request reads")
+        })
+        .expect("the request was recorded")
+        .origin;
+    assert!(origin.relayed, "the client said it came through a relay");
+    assert_eq!(
+        origin.peer_pid,
+        Some(relay_pid),
+        "the kernel's peer for a relayed request is the relay"
     );
 }

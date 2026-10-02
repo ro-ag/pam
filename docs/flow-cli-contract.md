@@ -140,7 +140,8 @@ does not cancel the original request. Keep the ticket to inspect it later.
 A daemon of version 0.4 or older that is still running after an upgrade is not
 a refusal: the first command outside a sandbox stops it and starts the current
 one, and a command that may not signal it (under a sandbox, or through
-`PAM_SOCKET_DIR`) exits 1 with the instruction to run `pam daemon stop`.
+`PAM_SOCKET_DIR`) exits 1 with the instruction to run `pam daemon stop` and
+then `pam status` outside the sandbox.
 
 Without `--json`, a refused or timed-out follow is one `pam wait:` (or
 `pam subscribe:`) line on stderr naming the ticket. With `--json` (`pam wait`

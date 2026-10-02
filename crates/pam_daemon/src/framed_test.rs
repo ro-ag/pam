@@ -1314,6 +1314,23 @@ async fn the_version_rule_refuses_by_the_image_and_reads_off_the_request_behind_
     assert_eq!(verdict, Ok(()));
 }
 
+/// The restart is asked for once. The first hello that finds the binary
+/// replaced moves a serving daemon, and that is the one the log reports; the
+/// hellos behind it (a client polling for the replacement while the drain
+/// lasts) find the phase already moved. A drain is never turned into a restart.
+#[test]
+fn a_restart_is_requested_once_and_never_overrides_a_drain() {
+    let (phase, _) = watch::channel(LifecyclePhase::Serving);
+    assert!(crate::daemon::request_restart(&phase));
+    assert_eq!(*phase.borrow(), LifecyclePhase::Restarting);
+    assert!(!crate::daemon::request_restart(&phase));
+    assert_eq!(*phase.borrow(), LifecyclePhase::Restarting);
+
+    let (draining, _) = watch::channel(LifecyclePhase::Draining);
+    assert!(!crate::daemon::request_restart(&draining));
+    assert_eq!(*draining.borrow(), LifecyclePhase::Draining);
+}
+
 /// A hello refused after it was read whole (wrong protocol, wrong type, not a
 /// frame) takes the request behind it with it; a first frame refused from its
 /// header alone is not waited on.

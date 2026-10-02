@@ -82,8 +82,9 @@ the socket with files or other channels: the socket is the audited path.
 If a command fails saying a pre-migration pam daemon is running and this process
 may not stop it, the machine was upgraded while an old daemon kept running and
 your sandbox does not let you signal it. That too is the human's: they run
-`pam daemon stop` outside the sandbox, and your next command starts the current
-daemon.
+`pam daemon stop` and then `pam status` outside the sandbox. The second command
+starts the current daemon, which your sandbox may not let you do either; then
+you retry.
 
 ## Drop-in for a project's AGENTS.md
 

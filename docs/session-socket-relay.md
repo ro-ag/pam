@@ -28,10 +28,12 @@ claude …   # or any agent harness; start it normally
 `pam wait` and `pam subscribe`: a follow is a long-lived connection through the
 same pipe, so there is no second socket and a sandbox policy needs to allow only
 `<dir>/pam.sock`. Stop the relay with ctrl-c; it removes its socket file on the
-way out. A stale socket file nobody answers is replaced on the next start; a
-socket that still answers belongs to a running relay and is refused, never taken
-over. An `events.sock` left in `<dir>` by a relay of version 0.4 or older is
-removed at start when it is a socket you own; nothing dials it any more.
+way out, and a daemon the relay started keeps running. A stale socket file
+nobody answers is replaced on the next start; a socket that still answers
+belongs to a running relay and is refused, never taken over. A stale
+`events.sock` in `<dir>` is removed at start when it is a socket you own;
+nothing dials it any more. (No released relay can have left one: `pam listen`
+of 0.4.0 to 0.4.3 panicked at startup before it bound anything.)
 
 ## What the relay checks before it starts
 
@@ -68,10 +70,13 @@ directory instead of `<base>/run`, and lazy daemon auto-start is off: the
 relay is the transport, so a missing relay is a clean error naming
 `pam listen` — never a spawned daemon. A client that dials through the relay
 never signals anything either: if what answers is a daemon of version 0.4 or
-older, it fails with the instruction to run `pam daemon stop` outside the
-sandbox. The override affects only the public dial path (`send_request`,
-`follow_ticket`); `pam daemon stop` and the login service still target the real
-base.
+older, it fails with the instruction to run `pam daemon stop` and then
+`pam status` outside the sandbox. The second command matters: with the old
+daemon stopped and nothing started, the relay has no daemon to forward to and
+the client gets a bare transport failure (`Broken pipe` or `early eof`), not a
+message naming the cause. The override affects only the public dial path
+(`send_request`, `follow_ticket`); `pam daemon stop` and the login service
+still target the real base.
 
 ## What the daemon records for a relayed request
 

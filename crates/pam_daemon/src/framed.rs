@@ -520,12 +520,21 @@ pub async fn version_rule<S: AsyncRead + AsyncWrite + Unpin>(
     let refusal = match image.verdict(&hello.version, daemon_version).await {
         VersionVerdict::Match => return Ok(()),
         VersionVerdict::Restart => {
-            tracing::info!(
-                client_version = %hello.version,
-                daemon_version,
-                "the daemon's binary was replaced on disk; restarting with it"
-            );
-            crate::daemon::request_restart(phase);
+            // Logged once: a client waiting for the replacement greets again
+            // every few tens of milliseconds for as long as the drain lasts.
+            if crate::daemon::request_restart(phase) {
+                tracing::info!(
+                    client_version = %hello.version,
+                    daemon_version,
+                    "the daemon's binary was replaced on disk; restarting with it"
+                );
+            } else {
+                tracing::debug!(
+                    client_version = %hello.version,
+                    daemon_version,
+                    "refused a hello while restarting with the replaced binary"
+                );
+            }
             crate::daemon::outdated_refusal("hello", &hello.version, image.boot_path())
         }
         VersionVerdict::Mismatch => {

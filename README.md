@@ -65,7 +65,8 @@ handed off), `1` transport/client failure or observation timeout, `2` usage
 error, `3` refused, `4` unresolved, `5` blocked. A daemon started from another
 build refuses the command (`client_version_mismatch`, exit `3`) and keeps
 running; a daemon of version 0.4 or older that this process may not stop is a
-client failure (exit `1`) with the instruction to run `pam daemon stop`.
+client failure (exit `1`) with the instruction to run `pam daemon stop` and
+then `pam status` outside the sandbox.
 
 | Subcommand | What it does |
 | --- | --- |

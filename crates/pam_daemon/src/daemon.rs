@@ -2785,16 +2785,18 @@ pub(crate) fn shutting_down_refusal(id: &str) -> Response {
 }
 
 /// Moves a serving daemon to [`LifecyclePhase::Restarting`]; a daemon that
-/// is already draining keeps its phase.
-pub(crate) fn request_restart(phase: &watch::Sender<LifecyclePhase>) {
-    let _ = phase.send_if_modified(|current| {
+/// is already draining keeps its phase. Returns whether this call moved it,
+/// so the caller can report the restart once: while the drain lasts, every
+/// client that polls for the replacement asks again.
+pub(crate) fn request_restart(phase: &watch::Sender<LifecyclePhase>) -> bool {
+    phase.send_if_modified(|current| {
         if *current == LifecyclePhase::Serving {
             *current = LifecyclePhase::Restarting;
             true
         } else {
             false
         }
-    });
+    })
 }
 
 /// What a refusal says about where the daemon runs from.

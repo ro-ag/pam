@@ -3,7 +3,9 @@
 Status: implemented 2026-10-02 on branch `feat/framed-public-transport` (ptrack
 plan 49), tasks T1 to T8; what was and was not verified is recorded under
 [Verification record](#verification-record). T9, the upgrade rehearsal with real
-0.4.3 binaries, is still open. Approved for implementation 2026-10-02; implements
+0.4.3 and 0.3.0 binaries, was run loose on macOS and is recorded under
+[Rehearsal 2026-10-02](#rehearsal-2026-10-02); the LaunchAgent, the GUI and
+Windows were not part of it. Approved for implementation 2026-10-02; implements
 the owner decision recorded on plan 49 (closes issue 39). Sequenced after plan
 48, the design-review fix round.
 Review record: [design review, 2026-10-02](../reviews/design-review-2026-10-02.md).
@@ -832,21 +834,28 @@ client connects.
    byte of `0xFF` is a ZMTP greeting: the peer is a pre-migration daemon. No
    ZMTP is spoken back.
 2. If `PAM_SOCKET_DIR` is set the client stops here with an error: the daemon
-   behind the relay predates this protocol; run `pam daemon stop` outside the
-   sandbox and try again.
+   behind the relay predates this protocol; run `pam daemon stop` and then
+   `pam status` outside the sandbox and try again.
 3. Otherwise the client supersedes the daemon by the mechanism `pam daemon
    stop` uses (`stop_daemon`, client.rs:771-787): read the pid from
    `<base>/run/daemon.lock` while the lock is held, dial once more (if a
    hello now succeeds, another client already did this; skip to 5), run
    `kill -TERM <pid>`, and wait up to 20 seconds for the lock to be released.
    The old daemon drains for up to ten seconds, cancels what is left and
-   exits 0.
+   exits 0. The client prints nothing while it waits.
 4. If the signal cannot be sent (no pid, `kill` not permitted, as under the
    macOS broker profile, which denies signal operations) the client fails
    with: a pre-migration pam daemon (pid N) is running and this process may
-   not stop it; run `pam daemon stop` outside the sandbox, then retry. If the
-   daemon is still draining after the wait the client says so and exits; the
-   error is transient.
+   not stop it; run `pam daemon stop` and then `pam status` outside the
+   sandbox, then retry. The second command is part of the instruction because
+   stopping is not enough: a client that may not signal is confined, and under
+   the broker profile it cannot start a daemon either (after `pam daemon stop`
+   alone its retry fails with "the pam daemon did not become ready within
+   6s"; through a relay it fails with a transport error). An unsandboxed
+   `pam status` of this build does both steps by itself. If the daemon is
+   still draining after the wait the client says so and exits; the error is
+   transient. With a real 0.4.3 daemon that outcome is not reachable: its
+   drain is bounded at ten seconds and the client waits twenty.
 5. The client lazy-starts its own binary (`ensure_daemon`) and retries the
    request once.
 
@@ -862,9 +871,14 @@ followed by any pam command produces today. At next login the manager starts
 the pinned executable. If the upgrade replaced that file in place, that is
 the new daemon; `pam daemon` exits 0 on "already running", so a manager and a
 loose daemon do not fight. If the unit pins a path that still holds the old
-binary, the next login starts an old daemon and the next new client
-supersedes it again; `pam service status` already reports the stale pin and
-`pam service install` fixes it.
+binary, the next login cannot bring the old daemon back: once the new daemon
+has opened the store it is at schema 13, and a 0.4.3 `pam daemon` exits 1
+there ("database schema version 13 is newer than this binary supports (max
+11)"; 0.3.0 says "max 5"). A unit that restarts on failure would then keep
+relaunching a daemon that cannot start, while clients lazily start a loose
+new daemon; `pam service status` already reports the stale pin and
+`pam service install` fixes it. None of this paragraph was run under a real
+service manager (see "Rehearsal 2026-10-02").
 
 Windows. A pre-migration daemon listens on an `AF_UNIX` socket the new client
 cannot open. The client sees the instance lock held, no
@@ -889,9 +903,13 @@ sandbox and its clients cannot.
 
 - Public socket: the old client's `DEALER` sends its greeting on connect. The
   daemon reads four bytes, sees `0xFF`, closes, and logs one line (at most
-  once a minute) with the peer's uid and pid so the stale binary can be
-  found. The old client reports a connect failure and exits 1. It cannot stop
-  or restart the daemon.
+  once a minute, with the number it suppressed since the last) with the
+  peer's uid and pid so the stale binary can be found. The old client reports
+  a connect failure and exits 1: `pam status: cannot connect to
+  ipc://<base>/run/pam.sock: Failed Greeting exchange`, which names the socket
+  but not the cause. It cannot stop or restart the daemon. With no daemon
+  running, an old client spawns its own build's daemon, which the migrated
+  store refuses, and reports "the pam daemon did not become ready within 6s".
 - `events.sock`: gone. An old GUI's subscriber retries with backoff forever
   and receives nothing.
 - Admin socket: an old GUI process sends a bare envelope as its first frame.
@@ -899,8 +917,12 @@ sandbox and its clients cannot.
   `Envelope` and answers it in the old shape, a bare
   `Response::Refusal { cause: "client_outdated" }` telling the human to quit
   and reopen PAM, then closes. The old GUI displays it like any refusal.
-- An old `pam listen` process keeps working for new clients: it is a byte
-  pipe to `pam.sock`. Its `events.sock` listener is simply never dialled.
+- An old `pam listen` process does not exist in practice. In 0.4.0 to 0.4.3
+  the compiled `pam listen` panicked at startup (a second tokio runtime
+  started from inside the client runtime) before it bound a socket, so no
+  relay of an earlier build can be running across an upgrade. The same defect
+  was in this branch until the rehearsal; `listen_mode` now runs on the
+  command's runtime.
 
 ### Version skew after the migration
 
@@ -912,6 +934,44 @@ daemon was started from, or to stop the daemon from the PAM GUI and start it
 with the intended build). It reaches a caller as a refusal, so the CLI exits 3
 and prints one sentence built from that detail. The client does not stop the
 daemon in this case; see Decisions, 1.
+
+### Rehearsal 2026-10-02
+
+The upgrade was run by hand with real binaries on macOS arm64 (T9). New: a
+debug build of this branch (reports version 0.4.3, protocol 2). Old: a debug
+build of the tag `v0.4.3` (protocol 1), and the installed 0.3.0 application
+binary. Skew: this branch built once with the workspace version set to
+`0.4.4-t9`. Every command ran against a scratch base under `/tmp` with a
+scratch `HOME`, all daemons loose (started lazily or by hand), never under a
+service manager. A scratch base approves no repository, so `pam wait` is
+refused `result_unavailable` there until one is seeded; that is policy, not
+transport, and the scratch stores were seeded directly.
+
+| # | Scenario | Result |
+| --- | --- | --- |
+| 1 | Idle 0.4.3 daemon, new `pam status` | As designed. Exit 0 in 0.13 s, nothing on stderr, old pid gone, a new daemon holds the lock and answers `protocol: 2`. `echo`, `echo --no-wait`, `wait`, `subscribe`, `flow list` then work. |
+| 2 | 0.4.3 daemon with an 8 s request in flight, new `pam status` | As designed. The new client waited 7.1 s in silence, exit 0. The request finished inside the drain and reads `done` through the new daemon. The old `pam wait` exited 3 with `daemon_shutting_down`. With a 30 s request the new client waited 10.2 s; the old daemon logged "drain bound hit; cancelling in-flight leases" and the ticket reads `failed` / `cancelled` (exit 5). |
+| 3 | New daemon, old `pam status` | As designed. Exit 1, `cannot connect to ipc://…/pam.sock: Failed Greeting exchange`. One daemon log line for eight attempts; the next line, two minutes later, carried `suppressed=7`. The daemon kept serving. |
+| 4 | Sandboxed new client (the repository's broker profile), 0.4.3 daemon | First half as designed: exit 1, the pid and the instruction, daemon untouched; a sandboxed `pam daemon stop` is refused too. **Second half contradicted the design**: after an unsandboxed `pam daemon stop` the sandboxed retry failed with "the pam daemon did not become ready within 6s (after 2 spawn attempts)", because the profile does not let the client start a daemon. The instruction now names `pam daemon stop` and then `pam status`; followed literally, the sandboxed retry works. |
+| 5 | `pam listen` with a 0.4.3 daemon behind it | **Defect**: `pam listen` panicked at startup, in this branch and in 0.4.3 alike, whatever was behind it. Fixed (see "New daemon, old client"). With the fix: the relay stopped the old daemon (5.1 s with a 5 s request in flight), started the new one, printed "a pre-migration daemon was replaced; reachable" and served `status`, `echo --no-wait`, `wait` and `subscribe`, also for a client under a sandbox profile that allows only `<dir>/pam.sock`. The session directory held exactly `pam.sock`; relayed request rows carry `relayed = 1` and the relay's pid, direct ones `relayed = 0` and the client's pid. Ctrl-c: exit 0, socket removed, the daemon the relay started kept running. A relayed client that met a 0.4.3 daemon started after the relay got the instruction; after `pam daemon stop` alone it got `transport failure … Broken pipe`. |
+| 6 | New daemon, client of another version, binary unchanged | As designed. `client_version_mismatch`, exit 3, one sentence naming both versions and the daemon's path, for `status`, `echo`, `wait` and `subscribe`; the daemon kept its pid and served its own build. |
+| 7 | The daemon's binary replaced on disk | As designed. Same bytes at a new inode and a client of another version: the daemon restarted from the recorded path (new pid, parent 1, its own process group), came back as the same version and refused the client once, with no restart loop. A different build renamed into place: the first command waited out the drain (2.9 s with a 4 s request in flight), was answered by the new version, and the in-flight request reads `done`. A missing file: refused, no restart. The daemon logged the restart once per polling hello (39 lines in 2.2 s); it now logs it once. |
+| 8 | Run directory after a takeover | `daemon.lock` and `pam.sock` only. A drained old daemon removes its own `pam.sock` and `events.sock`; after `SIGKILL` both stay, and the new daemon's bind removes them. |
+| 9 | 0.3.0 application binary as the old daemon | As designed. Its lock file holds its pid; the new client replaced it in 0.14 s and the store went from its schema to 13. |
+
+Not rehearsed, and still unverified:
+
+- A daemon under the LaunchAgent. `pam service install` was not run, so what
+  launchd does with a superseded daemon, with a self-restarted one, and with a
+  unit that pins an old binary is still read from the unit file, not observed.
+  Every daemon above, 0.4.3 and 0.3.0 included, exited 0 on `SIGTERM`, which is
+  what `KeepAlive { SuccessfulExit = false }` leaves down.
+- The GUI: the takeover from `pam gui`, an old GUI on the admin socket
+  (`client_outdated`), and the event stream across a restart.
+- Windows, entirely.
+- The keychain and the model directory: the scratch `HOME` kept every daemon
+  away from both.
+- `LegacyDraining` against a real daemon: not reachable (step 4).
 
 ## Relay
 
@@ -1469,7 +1529,9 @@ Risks:
   client's shared spawn helper (its own process group, a reduced environment),
   but launchd or systemd may still reap it with the unit, leaving the next
   client to lazy-start a loose daemon. Nothing in this design depends on
-  the answer, but T9 must observe it before documents describe it.
+  the answer. T9 observed the loose case only (the respawned daemon has
+  parent 1 and its own process group, and serves); under launchd or systemd
+  it is still unobserved, and no document may describe it as fact.
 - The image check can miss a replacement when the daemon's recorded path
   still holds the old file (a versioned install directory reached through a
   path the kernel had already resolved, as `/proc/self/exe` does on Linux).
@@ -1477,8 +1539,13 @@ Risks:
   restart loop, which is strictly better than today.
 - The first pam command after an upgrade, if it runs inside a sandbox, cannot
   stop the pre-migration daemon and fails with an instruction. Any
-  unsandboxed pam process (GUI, a terminal command, `pam listen`, the login
-  service) clears it.
+  unsandboxed pam client of the new build (GUI, a terminal command,
+  `pam listen`) clears it by replacing the daemon. `pam daemon stop` alone
+  does not: it leaves no daemon, and the sandboxed client cannot start one.
+- There is no way back on the same base: an older daemon refuses the migrated
+  store.
+- The takeover is silent. A human whose first command lands on an old daemon
+  with work in flight waits up to ten seconds with nothing on stderr.
 - A GUI left running across an upgrade is refused on the admin plane until it
   is reopened.
 - Peer pid is recorded at accept. It identifies a short-lived process and can
@@ -1555,16 +1622,13 @@ Not verified:
   file, nonce proof), the removal of a leftover `pam.sock` at bind, the
   pre-migration heuristic in the client, and every test that is not
   `cfg(unix)` wait for the Windows VM and the CI Windows job.
-- No real 0.4.3 daemon was met. The pre-migration daemon in the tests greets
-  with the 64 bytes a ZMTP peer sends and speaks nothing else, and it dies on
-  `SIGTERM` instead of draining for up to ten seconds; the "still draining"
-  outcome is covered against fakes in `pam_client` only. T9 rehearses the
-  upgrade with real binaries, loose and under the LaunchAgent, and records what
-  the service manager does.
-- An old `pam` binary against the new daemon was not run; the daemon's side of
-  it (a ZMTP greeting is closed and logged at most once a minute) is tested
-  with the greeting bytes.
-- A follow from the compiled CLI through a real `pam listen` (the relay test
-  dials through `pam_client` in process).
+- The pre-migration daemon in the automated tests greets with the 64 bytes a
+  ZMTP peer sends and speaks nothing else, and it dies on `SIGTERM` instead of
+  draining for up to ten seconds; the "still draining" outcome is covered
+  against fakes in `pam_client` only. Real 0.4.3 and 0.3.0 daemons, an old
+  `pam` binary against the new daemon, and a follow from the compiled CLI
+  through a real `pam listen` were run by hand afterwards, loose only: see
+  "Rehearsal 2026-10-02", which also lists what it left unverified (the
+  LaunchAgent, the GUI, Windows).
 - The same-user directory-swap race of the relay has no test; it cannot be
   provoked deterministically.

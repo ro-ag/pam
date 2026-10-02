@@ -1791,7 +1791,9 @@ async fn a_client_that_may_not_signal_reports_the_instruction_and_starts_nothing
             "{message}"
         );
         assert!(
-            message.contains("run `pam daemon stop` outside the sandbox, then retry"),
+            message.contains(
+                "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
+            ),
             "{message}"
         );
     }
@@ -1909,7 +1911,9 @@ async fn a_pre_migration_daemon_behind_the_relay_is_an_instruction_never_a_signa
     let message = failed.to_string();
     assert!(message.contains("$PAM_SOCKET_DIR"), "{message}");
     assert!(
-        message.contains("run `pam daemon stop` outside the sandbox and try again"),
+        message.contains(
+            "run `pam daemon stop` and then `pam status` outside the sandbox and try again"
+        ),
         "{message}"
     );
     assert_eq!(relay.connections(), 1, "one dial; nothing was retried");

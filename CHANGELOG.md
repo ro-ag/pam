@@ -203,25 +203,45 @@ All notable changes to pam are documented in this file. The format follows
   authority tag counts only for a substantive quote.
 - An unanswered keychain prompt no longer stalls every connector: reads give up
   after 20 seconds.
+- `pam listen` starts. In 0.4.0 to 0.4.3 the installed binary panicked at
+  startup ("Cannot start a runtime from within a runtime") before it bound
+  anything, so the relay had only ever run inside tests. It now runs on the
+  command's own runtime, and a test starts the compiled binary.
 
 ### Compatibility
 
 - Schema version 12 adds indexes for Activity and retention and makes audit
   rows append-only and evidence views immutable. Version 13 adds the origin
   columns to request rows. A store upgraded by this version is refused by
-  older binaries.
-- Upgrading from 0.4.x with a daemon still running: the old daemon speaks the
-  previous protocol on the same socket, and a new client recognises it by its
-  greeting. The first `pam` command run outside a sandbox, the GUI, or
-  `pam listen` stops it the way `pam daemon stop` does and starts the new one.
-  A first command that may not signal it (under an agent sandbox, or through
-  `PAM_SOCKET_DIR`) exits `1` with the instruction to run `pam daemon stop`
-  outside the sandbox. On Windows the old daemon is not stopped automatically;
-  the message names its process to end.
-- An old `pam` binary cannot talk to the new daemon: it fails to connect and
-  the daemon logs the stale client (at most once a minute) without answering.
-  A GUI left open across the upgrade is refused `client_outdated` and must be
-  quit and reopened.
+  older binaries: a 0.4.3 daemon started on it exits `1` with "database schema
+  version 13 is newer than this binary supports (max 11)", so there is no way
+  back to an older daemon on the same base, and a login unit that still pins
+  an old binary cannot start it.
+- Upgrading from 0.4.x or 0.3.0 with a daemon still running: the old daemon
+  speaks the previous protocol on the same socket, and a new client recognises
+  it by its greeting. The first `pam` command run outside a sandbox, the GUI,
+  or `pam listen` stops it the way `pam daemon stop` does and starts the new
+  one. It prints nothing while it does, and it takes as long as the old
+  daemon's drain: at once when that daemon is idle, up to ten seconds while
+  it has work in flight. Work that finishes inside the drain keeps its result,
+  readable through the new daemon; work still running after ten seconds is
+  cancelled by the old daemon and reads as `failed` / `cancelled`. An old
+  `pam wait` on such a ticket exits `3` with `daemon_shutting_down`.
+- A first command that may not signal the old daemon (under an agent sandbox,
+  or through `PAM_SOCKET_DIR`) exits `1` with the instruction to run
+  `pam daemon stop` and then `pam status` outside the sandbox. Both are
+  needed: a client that may not signal usually may not start a daemon either,
+  so after the stop alone its retry fails ("did not become ready", or a
+  transport failure through a relay). `pam status` alone, run outside the
+  sandbox with the new binary, does both. On Windows the old daemon is not
+  stopped automatically; the message names its process to end.
+- An old `pam` binary cannot talk to the new daemon: it exits `1` with
+  `cannot connect to ipc://<base>/run/pam.sock: Failed Greeting exchange`, and
+  the daemon logs the stale client with its pid (at most once a minute, with a
+  count of what it suppressed) without answering. With no daemon running, the
+  old binary tries to start its own daemon, which the upgraded store refuses,
+  and reports that the daemon did not become ready. A GUI left open across the
+  upgrade is refused `client_outdated` and must be quit and reopened.
 - Sandbox profiles need only `<base>/run/pam.sock` (or `<dir>/pam.sock` for a
   session relay). A rule that still allows `events.sock` is harmless and can
   be dropped.

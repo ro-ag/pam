@@ -26,10 +26,14 @@ A second case puts a fake daemon of version 0.4 or older behind the same
 profile: it holds the real instance lock, names a stand-in process in it and
 answers on `pam.sock` with that version's greeting. The sandboxed CLI must exit
 `1`, print nothing on stdout under `--json`, name the pid and the instruction
-(`pam daemon stop` outside the sandbox) on stderr, and leave the stand-in
-process alive and the lock unchanged: a sandboxed client cannot stop a daemon,
-and does not start one beside it. The unsandboxed takeover is proved separately
-by `cargo test -p pam --test legacy_takeover`.
+(`pam daemon stop` and then `pam status`, outside the sandbox) on stderr, and
+leave the stand-in process alive and the lock unchanged: a sandboxed client
+cannot stop a daemon, and does not start one beside it. Under this profile it
+cannot start one at all: with no daemon running, the sandboxed CLI exits `1`
+after six seconds with "the pam daemon did not become ready" (seen with the
+real binaries on 2026-10-02; no test pins it), which is why the instruction
+names the second command. The unsandboxed takeover is proved separately by
+`cargo test -p pam --test legacy_takeover`.
 
 The keychain probe asks only for a nonexistent service/account. It requires a
 keychain search initialization error, not merely exit 44 or item-not-found,

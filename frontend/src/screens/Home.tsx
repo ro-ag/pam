@@ -170,7 +170,7 @@ export function HomeScreen() {
         </p>
       </PageHeader>
       <div className="page-content" role="region" aria-label="Home content" tabIndex={0}>
-        <div className="max-w-content space-y-5">
+        <div className="home-layout">
           <aside
             className="home-status border-b border-line text-sm"
             aria-label="Workspace overview"
@@ -195,11 +195,11 @@ export function HomeScreen() {
               </Link>
             )}
           </aside>
-          <section aria-labelledby="start-task-heading" className="space-y-3">
+          <section aria-labelledby="start-task-heading" className="home-tasks space-y-3">
             <h2 id="start-task-heading" className="text-lg font-semibold">
               Start a task
             </h2>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="home-task-grid grid gap-3">
               {START_TASKS.map((task) => (
                 <Link
                   key={task.id}
@@ -215,7 +215,11 @@ export function HomeScreen() {
               ))}
             </div>
           </section>
-          <Panel ground="command" className="min-w-0 overflow-hidden" aria-busy={asking}>
+          <Panel
+            ground="command"
+            className="home-ask min-w-0 overflow-hidden"
+            aria-busy={asking}
+          >
             <div className="space-y-4 p-5">
               <div className="flex items-center gap-3">
                 <span className="flex size-10 shrink-0 items-center justify-center rounded-card bg-accent-soft text-accent">
@@ -304,7 +308,7 @@ export function HomeScreen() {
             )}
           </Panel>
 
-          <section aria-labelledby="recent-heading" className="space-y-4">
+          <section aria-labelledby="recent-heading" className="home-recent min-w-0 space-y-4">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
               <h2 id="recent-heading" className="text-lg font-semibold">
                 Recent exchanges

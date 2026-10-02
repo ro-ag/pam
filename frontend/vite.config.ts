@@ -19,6 +19,11 @@ export default defineConfig(({ mode }) => ({
   build: {
     target: ["es2021", "chrome105", "safari13"],
     outDir: "dist",
+    // Never inline assets as `data:` URIs: the release CSP allows only
+    // `img-src 'self'` / `font-src 'self'`, so an inlined image (the 3.8 KB
+    // sidebar logo sat under Vite's 4 KB default) renders blank in the
+    // shipped app while the looser devCsp hides the problem in dev.
+    assetsInlineLimit: 0,
     emptyOutDir: true,
   },
   test: {

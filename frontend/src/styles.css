@@ -599,6 +599,33 @@
   .home-answer-facts {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
   }
+  /* Home fills the workspace: one column when narrow, then Ask Pam and its
+     answers take the wide main column while the starters stack beside them.
+     DOM order (status, starters, ask, answers) is unchanged; only the
+     placement moves. */
+  .home-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "status" "tasks" "ask" "recent";
+    align-items: start;
+    gap: 20px;
+  }
+  .home-status {
+    grid-area: status;
+  }
+  .home-tasks {
+    grid-area: tasks;
+    container-type: inline-size;
+  }
+  .home-ask {
+    grid-area: ask;
+  }
+  .home-recent {
+    grid-area: recent;
+  }
+  .home-task-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .home-status {
     display: flex;
     flex-wrap: wrap;
@@ -789,6 +816,19 @@
   @container (min-width: 640px) {
     .home-prompts {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @container (min-width: 520px) {
+    .home-task-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @container workspace (min-width: 1200px) {
+    .home-layout {
+      grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
+      grid-template-areas: "status status" "ask tasks" "recent tasks";
+      grid-template-rows: auto auto 1fr;
+      column-gap: 28px;
     }
   }
   @container workspace (min-width: 960px) {

@@ -620,6 +620,7 @@ impl ProcessGroup {
     }
 
     /// Signals the group without blocking the runtime, then disarms.
+    #[cfg_attr(not(unix), allow(clippy::unused_async))]
     async fn kill(&mut self) {
         #[cfg(unix)]
         if let Some((program, args)) = self.id.and_then(Self::command) {

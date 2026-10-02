@@ -327,6 +327,7 @@ fn daemon_ready(dirs: &RuntimeDir) -> Result<bool, ClientError> {
 /// How long the readiness probe waits for a connect to finish. A connect
 /// that is still pending means a listener exists with a full backlog — a
 /// live, busy daemon — so a timeout counts as accepting.
+#[cfg(unix)]
 const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether something accepts connections on the unix socket at `path`: an

@@ -8,10 +8,12 @@ use pam_daemon::lifecycle::{InstanceLock, acquire_instance_lock};
 use pam_daemon::runtime_dir::RuntimeDir;
 use pam_proto::{Outcome, Response};
 
+#[cfg(unix)]
+use crate::client::daemon_command;
 use crate::client::{
     ClientError, DaemonStatus, EnsureOutcome, RequestError, RetryTimings, connect_dealer_within,
-    daemon_command, daemon_env, ensure_daemon_off_thread, ensure_daemon_with, is_transient_cause,
-    probe_daemon, send_envelope_with, should_retry, wait_for_daemon_exit,
+    daemon_env, ensure_daemon_off_thread, ensure_daemon_with, is_transient_cause, probe_daemon,
+    send_envelope_with, should_retry, wait_for_daemon_exit,
 };
 
 /// Short bounds so the not-ready path stays fast.

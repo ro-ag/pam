@@ -727,7 +727,7 @@ impl ModelService {
 
     /// Reads and overwrites the last-use stamp, so a test can tell a counted use from
     /// an uncounted one.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn last_used_for_tests(&self, set: Option<i64>) -> i64 {
         if let Some(value) = set {
             self.last_used_at.store(value, Ordering::Release);

@@ -1,10 +1,12 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::curator::{
-    AgentCli, AgentId, CuratorError, detect, invoke, invoke_args, trusted_dirs, untrusted_reason,
-};
+use crate::curator::{AgentCli, AgentId, CuratorError, detect, invoke, invoke_args};
+#[cfg(unix)]
+use crate::curator::{trusted_dirs, untrusted_reason};
 
 /// Long enough that a script which answers immediately always makes it,
 /// short enough that a hung one does not stall the suite.

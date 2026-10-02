@@ -119,7 +119,7 @@ async fn serve_unix(fake: &Fake, socket: &str) {
 }
 
 #[cfg(not(unix))]
-async fn serve_unix(_fake: &Fake, socket: &str) {
+fn serve_unix(_fake: &Fake, socket: &str) -> std::future::Ready<()> {
     eprintln!("the fake llama-server needs a --port on this platform, not the socket {socket}");
     std::process::exit(2);
 }

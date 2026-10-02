@@ -580,9 +580,9 @@ pub fn trusted_tar_path() -> Result<PathBuf, EngineError> {
         if path.is_file() {
             return Ok(path);
         }
-        return Err(EngineError::Unpack {
+        Err(EngineError::Unpack {
             detail: format!("{} is missing", path.display()),
-        });
+        })
     }
     #[cfg(not(windows))]
     {

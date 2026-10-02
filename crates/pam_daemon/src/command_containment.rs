@@ -366,6 +366,7 @@ fn read_git_pointer(path: &std::path::Path) -> Option<String> {
 // Only the macOS profile builder calls this; without the same gate it is dead
 // code on other targets and fails the lint gate there but never here.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn validate_artifact_owner(
     root: &std::path::Path,
     protected: &std::path::Path,

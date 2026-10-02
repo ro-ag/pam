@@ -1,0 +1,5 @@
+# Database files are compared byte for byte (expected.json records their
+# digests): never normalize, never merge.
+*.sqlite3 binary
+*.sqlite3-wal binary
+*.sqlite3-shm binary

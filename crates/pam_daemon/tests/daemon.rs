@@ -1,8 +1,7 @@
-//! End-to-end tests: a real daemon ([`run_daemon`]) on a temp base dir,
-//! real zmq DEALER/SUB clients, real `SQLite` store — asserting replies,
-//! request rows, audit rows, and PUB events.
+//! End-to-end tests: a real daemon on a temp base dir, the testkit's framed
+//! public-transport client and admin all-events stream, real `SQLite` store —
+//! asserting replies, request rows, audit rows, and lifecycle events.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use pam_daemon::admin::{ACTION_ADMIN_DENIED, CAUSE_ADMIN_DENIED};
@@ -11,7 +10,7 @@ use pam_daemon::approval::{ACTION_APPROVAL, Resolution};
 use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, ACTION_GATE_REFUSAL, CAUSE_APPROVAL_DENIED,
     CAUSE_APPROVAL_TIMEOUT, CAUSE_DAEMON_OUTDATED, CAUSE_DAEMON_SHUTTING_DOWN,
-    CAUSE_DEADLINE_EXCEEDED, DaemonConfig, DaemonError, DaemonHandle, run_daemon, run_daemon_with,
+    CAUSE_DEADLINE_EXCEEDED, DaemonError, run_daemon,
 };
 use pam_daemon::lifecycle::{
     ACTION_DAEMON_RESTART, CAUSE_DAEMON_RESTART, LifecycleError, LifecyclePhase,
@@ -21,205 +20,20 @@ use pam_daemon::queue::{
     ACTION_CANCEL, ACTION_LEASE_REAPED, ACTION_RECOVERY_REFUSAL, CAUSE_CANCELLED,
     CAUSE_LEASE_EXPIRED,
 };
-use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
-use pam_store::{Actor, ApprovalResolution, Decision, RequestRow, RequestState, Store};
+use pam_proto::{Event, Outcome, PROTOCOL_VERSION, Response};
+use pam_store::{Actor, ApprovalResolution, Decision, RequestIngress, RequestState, Store};
+use pam_testkit::{
+    TEST_REPO, TestDaemon, base_of, envelope, open_store, seed_relaxed, short_tempdir,
+    with_deadline,
+};
 use tokio::sync::watch;
-use tokio::time::timeout;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-const DEADLINE: Duration = Duration::from_secs(20);
-
-/// Settle time for a fresh SUB subscription before events matter
-/// (zmq PUB drops messages published before the subscription registers).
-const SUB_SETTLE: Duration = Duration::from_millis(300);
-
-const REPO: &str = "/repo/test";
-
-/// Temp dir with a short absolute path: macOS caps unix socket paths at
-/// 104 bytes and the default temp root can get close.
-fn short_tempdir() -> tempfile::TempDir {
-    #[cfg(unix)]
-    {
-        tempfile::Builder::new()
-            .prefix("pam")
-            .tempdir_in("/tmp")
-            .expect("tempdir under /tmp")
-    }
-    #[cfg(not(unix))]
-    {
-        tempfile::tempdir().expect("tempdir")
-    }
-}
-
-struct TestDaemon {
-    tmp: tempfile::TempDir,
-    handle: DaemonHandle,
-    shutdown: watch::Sender<bool>,
-}
-
-impl TestDaemon {
-    async fn start() -> Self {
-        let tmp = short_tempdir();
-        seed_relaxed(&tmp).await;
-        Self::start_at(tmp).await
-    }
-
-    /// Starts the daemon on `tmp`'s `pam` subdirectory (which a test may
-    /// have pre-seeded through [`base_of`]).
-    async fn start_at(tmp: tempfile::TempDir) -> Self {
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
-            .await
-            .expect("daemon starts");
-        Self {
-            tmp,
-            handle,
-            shutdown,
-        }
-    }
-
-    /// A relaxed daemon whose view of its own executable is `image`.
-    async fn start_with_image(image: std::sync::Arc<ScriptedImage>) -> Self {
-        let tmp = short_tempdir();
-        seed_relaxed(&tmp).await;
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let config = DaemonConfig {
-            base_dir: Some(base_of(&tmp)),
-            image_probe: Some(image),
-            ..DaemonConfig::default()
-        };
-        let handle = run_daemon_with(config, shutdown_rx)
-            .await
-            .expect("daemon starts");
-        Self {
-            tmp,
-            handle,
-            shutdown,
-        }
-    }
-
-    /// [`Self::start_at`] with a custom approval timeout.
-    async fn start_at_with_approval_timeout(tmp: tempfile::TempDir, timeout: Duration) -> Self {
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let config = DaemonConfig {
-            base_dir: Some(base_of(&tmp)),
-            approval_timeout: timeout,
-            ..DaemonConfig::default()
-        };
-        let handle = run_daemon_with(config, shutdown_rx)
-            .await
-            .expect("daemon starts");
-        Self {
-            tmp,
-            handle,
-            shutdown,
-        }
-    }
-
-    async fn dealer(&self) -> DealerSocket {
-        let mut dealer = DealerSocket::new();
-        dealer
-            .connect(&self.handle.runtime_dir().router_endpoint())
-            .await
-            .expect("dealer connects");
-        dealer
-    }
-
-    /// A SUB socket subscribed to `topic`, settled past the slow-joiner
-    /// window.
-    async fn subscriber(&self, topic: &str) -> SubSocket {
-        let mut sub = SubSocket::new();
-        sub.connect(&self.handle.runtime_dir().events_endpoint())
-            .await
-            .expect("sub connects");
-        sub.subscribe(topic).await.expect("subscribe");
-        tokio::time::sleep(SUB_SETTLE).await;
-        sub
-    }
-
-    async fn stop(self) -> tempfile::TempDir {
-        let _ = self.shutdown.send(true);
-        self.handle.shutdown().await;
-        self.tmp
-    }
-
-    /// Joins the daemon **without** signalling shutdown — for tests
-    /// where the daemon initiated its own drain (version handshake).
-    async fn join(self) -> tempfile::TempDir {
-        self.handle.shutdown().await;
-        self.tmp
-    }
-}
-
-/// The daemon base directory inside a test's temp dir.
-fn base_of(tmp: &tempfile::TempDir) -> PathBuf {
-    tmp.path().join("pam")
-}
-
-fn envelope(id: &str, capability: &str, args: serde_json::Value, wait: bool) -> Envelope {
-    Envelope {
-        v: PROTOCOL_VERSION,
-        id: id.to_owned(),
-        capability: capability.to_owned(),
-        client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        caller: Caller {
-            agent: "claude".to_owned(),
-            repo: REPO.to_owned(),
-            pid: 4242,
-        },
-        args,
-        idempotency_key: None,
-        deadline_ms: 10_000,
-        wait,
-    }
-}
-
-async fn send(dealer: &mut DealerSocket, envelope: &Envelope) {
-    let payload = serde_json::to_vec(envelope).expect("serialize envelope");
-    dealer
-        .send(ZmqMessage::from(payload))
-        .await
-        .expect("send ok");
-}
-
-async fn recv_response(dealer: &mut DealerSocket) -> Response {
-    let answer = dealer.recv().await.expect("recv ok");
-    let frames = answer.into_vec();
-    serde_json::from_slice(&frames[0]).expect("parse response")
-}
-
-/// Receives one event off the subscription.
-async fn recv_event(sub: &mut SubSocket) -> Event {
-    let message = sub.recv().await.expect("event recv ok");
-    let frames = message.into_vec();
-    serde_json::from_slice(&frames[1]).expect("parse event")
-}
-
-/// Persists the relaxed profile before the daemon (and thus the gate)
-/// opens the store.
-///
-/// [`pam_daemon::policy::Profile::platform_default`] is `Relaxed` only on
-/// macOS and `Standard` everywhere else, and only the relaxed profile
-/// auto-grants a non-destructive capability on first use. The tests that
-/// drive `echo` without granting it would otherwise pass on macOS and
-/// refuse with `not_granted` on Linux and Windows. Tests that want a
-/// different profile seed it themselves and use [`TestDaemon::start_at`].
-async fn seed_relaxed(tmp: &tempfile::TempDir) {
-    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
-        .await
-        .expect("store opens");
-    store
-        .set_setting(PROFILE_SETTING_KEY, "\"relaxed\"")
-        .await
-        .expect("relaxed profile persists");
-}
+const REPO: &str = TEST_REPO;
 
 /// Seeds `tmp`'s store with the strict profile and an active `echo`
 /// grant, so every echo request hits the per-operation approval pause.
 async fn seed_strict_with_echo_grant(tmp: &tempfile::TempDir) {
-    let store = Store::open(&base_of(tmp).join("state.sqlite3"))
-        .await
-        .expect("store opens");
+    let store = open_store(tmp).await;
     store
         .set_setting(PROFILE_SETTING_KEY, "\"strict\"")
         .await
@@ -227,49 +41,20 @@ async fn seed_strict_with_echo_grant(tmp: &tempfile::TempDir) {
     store.insert_grant("echo").await.expect("grant inserted");
 }
 
-/// Collects this topic's events until a terminal one (`done`/`refused`).
-async fn events_until_terminal(sub: &mut SubSocket) -> Vec<Event> {
-    let mut events = Vec::new();
-    loop {
-        let message = sub.recv().await.expect("event recv ok");
-        let frames = message.into_vec();
-        let event: Event = serde_json::from_slice(&frames[1]).expect("parse event");
-        let terminal = matches!(event, Event::Done | Event::Refused);
-        events.push(event);
-        if terminal {
-            return events;
-        }
-    }
-}
-
-/// Polls the store until the request row satisfies `pred`.
-async fn wait_for_row(store: &Store, id: &str, pred: impl Fn(&RequestRow) -> bool) -> RequestRow {
-    loop {
-        if let Some(row) = store.get_request(id).await.expect("get_request ok")
-            && pred(&row)
-        {
-            return row;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 #[tokio::test]
 async fn echo_runs_end_to_end_through_lane_audit_and_events() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut sub = daemon.subscriber("req_echo").await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut events = daemon.subscribe(&["req_echo"]).await;
+        let mut client = daemon.client().await;
 
         let args = serde_json::json!({ "msg": "hi", "delay_ms": 150 });
-        send(
-            &mut dealer,
-            &envelope("req_echo", "echo", args.clone(), true),
-        )
-        .await;
+        client
+            .send(&envelope("req_echo", "echo", args.clone(), true))
+            .await;
 
         // The reply is the capability's result.
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Result {
             id,
             outcome,
@@ -285,7 +70,7 @@ async fn echo_runs_end_to_end_through_lane_audit_and_events() {
         assert!(evidence.is_empty());
 
         // The row is terminal `done` with the outcome recorded.
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let row = store.get_request("req_echo").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Done);
         assert_eq!(row.outcome.as_deref(), Some("solved"));
@@ -302,30 +87,40 @@ async fn echo_runs_end_to_end_through_lane_audit_and_events() {
         assert_eq!(execute[0].actor, Actor::System);
         assert!(audit.iter().any(|row| row.action == "auto_grant"));
 
-        // Lifecycle on PUB: queued (laned capability), started, done.
-        let events = events_until_terminal(&mut sub).await;
-        assert_eq!(events, [Event::Queued, Event::Started, Event::Done]);
+        // The request row records the connection it arrived on: the public
+        // plane and, where the kernel reports it, this very process.
+        assert_eq!(row.origin.ingress, RequestIngress::Public);
+        #[cfg(unix)]
+        assert_eq!(row.origin.peer_pid, Some(std::process::id()));
+        assert!(!row.origin.relayed);
+
+        // Lifecycle on the event stream: queued (laned capability), started,
+        // done. The stream was opened before the request, so nothing is lost.
+        let seen = events.until_terminal("req_echo").await;
+        assert_eq!(seen, [Event::Queued, Event::Started, Event::Done]);
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn status_bypasses_the_lanes_and_verifies() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut sub = daemon.subscriber("req_status").await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut events = daemon.subscribe(&["req_status", "req_query"]).await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope("req_status", "status", serde_json::json!({}), true),
-        )
-        .await;
+        client
+            .send(&envelope(
+                "req_status",
+                "status",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Result { outcome, body, .. } = response else {
             panic!("expected a result, got {response:?}");
         };
@@ -360,7 +155,7 @@ async fn status_bypasses_the_lanes_and_verifies() {
         assert_eq!(body["model"]["readiness"]["heavy"]["stage"], "unconfigured");
 
         // A poll leaves nothing behind: no request row, no audit row...
-        let store = daemon.handle.store();
+        let store = daemon.store();
         assert!(store.get_request("req_status").await.unwrap().is_none());
         assert!(
             store
@@ -371,51 +166,47 @@ async fn status_bypasses_the_lanes_and_verifies() {
         );
 
         // ...and no lifecycle events. A control request that is audited
-        // (`query`) publishes none either: its row is terminal and the
-        // subscriber of its topic has heard nothing.
-        let mut query_sub = daemon.subscriber("req_query").await;
-        send(
-            &mut dealer,
-            &envelope(
+        // (`query`) publishes none either: its row is terminal and a
+        // subscriber of both ids has heard nothing.
+        client
+            .send(&envelope(
                 "req_query",
                 "query",
                 serde_json::json!({ "ticket": "no_such_ticket" }),
                 true,
-            ),
-        )
-        .await;
-        let _ = recv_response(&mut dealer).await;
+            ))
+            .await;
+        let _ = client.recv().await;
         let row = store.get_request("req_query").await.unwrap().unwrap();
         assert!(row.state.is_terminal(), "query stays an audited request");
         assert_eq!(store.audit_for_request("req_query").await.unwrap().len(), 1);
-        for (topic, quiet) in [("req_status", &mut sub), ("req_query", &mut query_sub)] {
-            assert!(
-                timeout(Duration::from_millis(400), quiet.recv())
-                    .await
-                    .is_err(),
-                "a control request published a lifecycle event on {topic}"
-            );
-        }
+        assert_eq!(
+            events.recv_within(Duration::from_millis(400)).await,
+            None,
+            "a control request published a lifecycle event"
+        );
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn unknown_capability_is_refused_and_audited() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope("req_bad", "frobnicate", serde_json::json!({}), true),
-        )
-        .await;
+        client
+            .send(&envelope(
+                "req_bad",
+                "frobnicate",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal {
             id,
             cause,
@@ -429,7 +220,7 @@ async fn unknown_capability_is_refused_and_audited() {
         assert_eq!(cause, "unknown_capability");
         assert!(recovery.contains("GUI"), "recovery: {recovery}");
 
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let row = store.get_request("req_bad").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Refused);
         assert_eq!(row.outcome.as_deref(), Some("unknown_capability"));
@@ -442,13 +233,12 @@ async fn unknown_capability_is_refused_and_audited() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn standard_profile_refuses_an_ungranted_capability() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         // Persist the standard profile before the daemon (and thus the
         // gate) starts; run_daemon reads the setting at construction.
         let tmp = short_tempdir();
@@ -461,16 +251,19 @@ async fn standard_profile_refuses_an_ungranted_capability() {
                 .await
                 .expect("profile set");
         }
-        let daemon = TestDaemon::start_at(tmp).await;
-        let mut dealer = daemon.dealer().await;
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope("req_echo", "echo", serde_json::json!({ "msg": "hi" }), true),
-        )
-        .await;
+        client
+            .send(&envelope(
+                "req_echo",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+                true,
+            ))
+            .await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal {
             cause, recovery, ..
         } = response
@@ -480,7 +273,7 @@ async fn standard_profile_refuses_an_ungranted_capability() {
         assert_eq!(cause, "not_granted");
         assert!(recovery.contains("GUI"), "recovery: {recovery}");
 
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let row = store.get_request("req_echo").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Refused);
         let audit = store.audit_for_request("req_echo").await.unwrap();
@@ -491,29 +284,26 @@ async fn standard_profile_refuses_an_ungranted_capability() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn wait_false_returns_a_ticket_and_completes_in_the_background() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut sub = daemon.subscriber("req_bg").await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut events = daemon.subscribe(&["req_bg"]).await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope(
+        client
+            .send(&envelope(
                 "req_bg",
                 "echo",
                 serde_json::json!({ "delay_ms": 150 }),
                 false,
-            ),
-        )
-        .await;
+            ))
+            .await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Ticket {
             id,
             ticket,
@@ -527,37 +317,35 @@ async fn wait_false_returns_a_ticket_and_completes_in_the_background() {
         assert_eq!(position, 0);
 
         // The request still runs to completion.
-        let store = daemon.handle.store();
-        let row = wait_for_row(&store, "req_bg", |row| row.state == RequestState::Done).await;
+        let row = daemon
+            .wait_for_row("req_bg", |row| row.state == RequestState::Done)
+            .await;
         assert_eq!(row.outcome.as_deref(), Some("solved"));
-        let events = events_until_terminal(&mut sub).await;
-        assert_eq!(events.last(), Some(&Event::Done));
+        let seen = events.until_terminal("req_bg").await;
+        assert_eq!(seen.last(), Some(&Event::Done));
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn duplicate_in_flight_request_attaches_and_shares_the_result() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut first = daemon.dealer().await;
-        let mut second = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut first = daemon.client().await;
+        let mut second = daemon.client().await;
 
         let args = serde_json::json!({ "delay_ms": 700, "tag": "dup" });
-        send(
-            &mut first,
-            &envelope("req_dup1", "echo", args.clone(), true),
-        )
-        .await;
+        first
+            .send(&envelope("req_dup1", "echo", args.clone(), true))
+            .await;
         // Let the first request get admitted before the duplicate lands.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        send(&mut second, &envelope("req_dup2", "echo", args, true)).await;
+        second.send(&envelope("req_dup2", "echo", args, true)).await;
 
-        let first_response = recv_response(&mut first).await;
-        let second_response = recv_response(&mut second).await;
+        let first_response = first.recv().await;
+        let second_response = second.recv().await;
 
         // Attach semantics: one execution, both callers get its result.
         assert_eq!(first_response, second_response);
@@ -567,54 +355,48 @@ async fn duplicate_in_flight_request_attaches_and_shares_the_result() {
         assert_eq!(id, "req_dup1", "the attached caller shares the original");
 
         // The duplicate never got a row of its own.
-        let store = daemon.handle.store();
+        let store = daemon.store();
         assert!(store.get_request("req_dup2").await.unwrap().is_none());
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn cancel_builtin_stops_a_running_request() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut sub = daemon.subscriber("req_victim").await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut events = daemon.subscribe(&["req_victim"]).await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope(
+        client
+            .send(&envelope(
                 "req_victim",
                 "echo",
                 serde_json::json!({ "delay_ms": 8000 }),
                 false,
-            ),
-        )
-        .await;
-        let ticket_reply = recv_response(&mut dealer).await;
+            ))
+            .await;
+        let ticket_reply = client.recv().await;
         assert!(matches!(ticket_reply, Response::Ticket { .. }));
 
         // Wait for the executor to lease it.
-        let store = daemon.handle.store();
-        wait_for_row(&store, "req_victim", |row| {
-            row.state == RequestState::Running
-        })
-        .await;
+        let store = daemon.store();
+        daemon
+            .wait_for_row("req_victim", |row| row.state == RequestState::Running)
+            .await;
 
-        let mut canceller = daemon.dealer().await;
-        send(
-            &mut canceller,
-            &envelope(
+        let mut canceller = daemon.client().await;
+        canceller
+            .send(&envelope(
                 "req_cancel",
                 "cancel",
                 serde_json::json!({ "ticket": "req_victim" }),
                 true,
-            ),
-        )
-        .await;
-        let response = recv_response(&mut canceller).await;
+            ))
+            .await;
+        let response = canceller.recv().await;
         let Response::Result { outcome, body, .. } = response else {
             panic!("expected a result, got {response:?}");
         };
@@ -622,10 +404,9 @@ async fn cancel_builtin_stops_a_running_request() {
         assert_eq!(body["result"], "signalled_running");
 
         // The victim reaches its terminal state through its executor.
-        let row = wait_for_row(&store, "req_victim", |row| {
-            row.state == RequestState::Failed
-        })
-        .await;
+        let row = daemon
+            .wait_for_row("req_victim", |row| row.state == RequestState::Failed)
+            .await;
         assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
         let audit = store.audit_for_request("req_victim").await.unwrap();
         let cancel: Vec<_> = audit
@@ -636,38 +417,38 @@ async fn cancel_builtin_stops_a_running_request() {
         assert_eq!(cancel[0].decision, Decision::Deny);
         assert_eq!(cancel[0].actor, Actor::System);
 
-        let events = events_until_terminal(&mut sub).await;
-        assert_eq!(events.last(), Some(&Event::Refused));
+        let seen = events.until_terminal("req_victim").await;
+        assert_eq!(seen.last(), Some(&Event::Refused));
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn approval_approve_resumes_execution_and_audits_the_resolution() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         let tmp = short_tempdir();
         seed_strict_with_echo_grant(&tmp).await;
-        let daemon = TestDaemon::start_at(tmp).await;
-        let mut sub = daemon.subscriber("req_appr").await;
-        let mut dealer = daemon.dealer().await;
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let mut events = daemon.subscribe(&["req_appr"]).await;
+        let mut client = daemon.client().await;
 
         let args = serde_json::json!({ "msg": "hi" });
-        send(
-            &mut dealer,
-            &envelope("req_appr", "echo", args.clone(), true),
-        )
-        .await;
+        client
+            .send(&envelope("req_appr", "echo", args.clone(), true))
+            .await;
 
         // The request parks: approval_pending on PUB, waiting_approval
         // in the store, and one entry on the GUI's pending list.
-        assert_eq!(recv_event(&mut sub).await, Event::ApprovalPending);
-        let store = daemon.handle.store();
+        assert_eq!(
+            events.recv().await,
+            ("req_appr".to_owned(), Event::ApprovalPending)
+        );
+        let store = daemon.store();
         let row = store.get_request("req_appr").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::WaitingApproval);
-        let pending = daemon.handle.approvals().pending().await.unwrap();
+        let pending = daemon.handle().approvals().pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request_id, "req_appr");
         assert_eq!(pending[0].capability, "echo");
@@ -675,13 +456,13 @@ async fn approval_approve_resumes_execution_and_audits_the_resolution() {
 
         // The human approves; the pipeline resumes into execution.
         daemon
-            .handle
+            .handle()
             .approvals()
             .resolve("req_appr", Resolution::Approve { remember: false })
             .await
             .expect("resolvable");
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Result {
             id, outcome, body, ..
         } = response
@@ -712,7 +493,7 @@ async fn approval_approve_resumes_execution_and_audits_the_resolution() {
         );
         assert!(
             daemon
-                .handle
+                .handle()
                 .approvals()
                 .pending()
                 .await
@@ -721,39 +502,44 @@ async fn approval_approve_resumes_execution_and_audits_the_resolution() {
         );
 
         // The rest of the lifecycle follows the approval.
-        let events = events_until_terminal(&mut sub).await;
-        assert_eq!(events, [Event::Queued, Event::Started, Event::Done]);
+        let seen = events.until_terminal("req_appr").await;
+        assert_eq!(seen, [Event::Queued, Event::Started, Event::Done]);
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn approval_deny_refuses_with_approval_denied() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         let tmp = short_tempdir();
         seed_strict_with_echo_grant(&tmp).await;
-        let daemon = TestDaemon::start_at(tmp).await;
-        let mut sub = daemon.subscriber("req_deny").await;
-        let mut dealer = daemon.dealer().await;
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let mut events = daemon.subscribe(&["req_deny"]).await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope("req_deny", "echo", serde_json::json!({ "msg": "no" }), true),
-        )
-        .await;
-        assert_eq!(recv_event(&mut sub).await, Event::ApprovalPending);
+        client
+            .send(&envelope(
+                "req_deny",
+                "echo",
+                serde_json::json!({ "msg": "no" }),
+                true,
+            ))
+            .await;
+        assert_eq!(
+            events.recv().await,
+            ("req_deny".to_owned(), Event::ApprovalPending)
+        );
 
         daemon
-            .handle
+            .handle()
             .approvals()
             .resolve("req_deny", Resolution::Deny)
             .await
             .expect("resolvable");
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal {
             cause, recovery, ..
         } = response
@@ -763,7 +549,7 @@ async fn approval_deny_refuses_with_approval_denied() {
         assert_eq!(cause, CAUSE_APPROVAL_DENIED);
         assert!(recovery.contains("GUI"), "recovery: {recovery}");
 
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let row = store.get_request("req_deny").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Refused);
         assert_eq!(row.outcome.as_deref(), Some(CAUSE_APPROVAL_DENIED));
@@ -783,37 +569,41 @@ async fn approval_deny_refuses_with_approval_denied() {
                 .any(|row| row.action == ACTION_GATE_REFUSAL && row.decision == Decision::Refuse)
         );
 
-        assert_eq!(recv_event(&mut sub).await, Event::Refused);
+        assert_eq!(events.recv().await, ("req_deny".to_owned(), Event::Refused));
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn unanswered_approval_times_out_into_a_refusal() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         let tmp = short_tempdir();
         seed_strict_with_echo_grant(&tmp).await;
-        let daemon =
-            TestDaemon::start_at_with_approval_timeout(tmp, Duration::from_millis(300)).await;
-        let mut dealer = daemon.dealer().await;
-
-        send(
-            &mut dealer,
-            &envelope("req_slow", "echo", serde_json::json!({ "msg": "??" }), true),
-        )
+        let daemon = TestDaemon::spawn_at_with(tmp, |config| {
+            config.approval_timeout = Duration::from_millis(300);
+        })
         .await;
+        let mut client = daemon.client().await;
+
+        client
+            .send(&envelope(
+                "req_slow",
+                "echo",
+                serde_json::json!({ "msg": "??" }),
+                true,
+            ))
+            .await;
 
         // Nobody answers within the daemon's (short) approval timeout.
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal { cause, .. } = response else {
             panic!("expected a refusal, got {response:?}");
         };
         assert_eq!(cause, CAUSE_APPROVAL_TIMEOUT);
 
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let row = store.get_request("req_slow").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Refused);
         assert_eq!(row.outcome.as_deref(), Some(CAUSE_APPROVAL_TIMEOUT));
@@ -830,15 +620,14 @@ async fn unanswered_approval_times_out_into_a_refusal() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
 
         let mut request = envelope(
             "req_late",
@@ -847,9 +636,9 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
             true,
         );
         request.deadline_ms = 200;
-        send(&mut dealer, &request).await;
+        client.send(&request).await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal { cause, .. } = response else {
             panic!("expected a refusal, got {response:?}");
         };
@@ -857,8 +646,10 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
 
         // The request itself is torn down (expired through the queue)
         // and both the deadline refusal and the teardown are audited.
-        let store = daemon.handle.store();
-        let row = wait_for_row(&store, "req_late", |row| row.state == RequestState::Failed).await;
+        let store = daemon.store();
+        let row = daemon
+            .wait_for_row("req_late", |row| row.state == RequestState::Failed)
+            .await;
         assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
         let audit = store.audit_for_request("req_late").await.unwrap();
         assert!(audit.iter().any(|row| row.action == ACTION_DEADLINE_REFUSAL
@@ -876,17 +667,16 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn second_daemon_on_the_same_base_is_refused_with_the_holder_pid() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
 
         let (_shutdown, shutdown_rx) = watch::channel(false);
-        let err = run_daemon(Some(base_of(&daemon.tmp)), shutdown_rx)
+        let err = run_daemon(Some(daemon.base_dir()), shutdown_rx)
             .await
             .expect_err("second daemon must not start");
         let DaemonError::Lifecycle(LifecycleError::AlreadyRunning { pid, .. }) = err else {
@@ -908,13 +698,12 @@ async fn second_daemon_on_the_same_base_is_refused_with_the_holder_pid() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
         {
@@ -971,8 +760,8 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
                 .unwrap();
         }
 
-        let daemon = TestDaemon::start_at(tmp).await;
-        let store = daemon.handle.store();
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let store = daemon.store();
 
         for id in ["req_dead_run", "req_dead_wait"] {
             let row = store.get_request(id).await.unwrap().unwrap();
@@ -1001,16 +790,14 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
             RequestState::Failed
         );
         // The authorized queued row was rebuilt into its lane and executes.
-        let row = wait_for_row(&store, "req_survivor", |row| {
-            row.state == RequestState::Done
-        })
-        .await;
+        let row = daemon
+            .wait_for_row("req_survivor", |row| row.state == RequestState::Done)
+            .await;
         assert_eq!(row.outcome.as_deref(), Some("solved"));
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 /// A probe over one scripted file: the daemon's own executable as a test
@@ -1040,23 +827,21 @@ impl pam_daemon::image::ImageProbe for ScriptedImage {
     }
 }
 
-/// Sends `status` under three claimed versions and asserts each is refused
-/// `client_version_mismatch` with the phase still `Serving` and no row.
-async fn assert_claims_are_refused(
-    daemon: &TestDaemon,
-    dealer: &mut DealerSocket,
-    boot_path: &std::path::Path,
-) {
-    let lifecycle = daemon.handle.lifecycle();
+/// Sends `status` under three claimed versions (in the hello: the envelope's
+/// own `client_version` decides nothing on this transport) and asserts each is
+/// refused `client_version_mismatch` with the phase still `Serving` and no row.
+async fn assert_claims_are_refused(daemon: &TestDaemon, boot_path: &std::path::Path) {
+    let lifecycle = daemon.handle().lifecycle();
     for (index, claimed) in ["999.0.0", "0.0.1", "not a version"]
         .into_iter()
         .enumerate()
     {
         let id = format!("req_claims_{index}");
-        let mut other = envelope(&id, "status", serde_json::json!({}), true);
-        other.client_version = claimed.to_owned();
-        send(dealer, &other).await;
-        let response = recv_response(dealer).await;
+        let mut claimant = daemon.client().await;
+        claimant.claim_version(claimed);
+        let response = claimant
+            .request(&envelope(&id, "status", serde_json::json!({}), true))
+            .await;
         let Response::Refusal {
             cause,
             detail,
@@ -1079,13 +864,7 @@ async fn assert_claims_are_refused(
         assert!(!retryable, "sending it again would only repeat");
         assert_eq!(*lifecycle.borrow(), LifecyclePhase::Serving);
         assert!(
-            daemon
-                .handle
-                .store()
-                .get_request(&id)
-                .await
-                .unwrap()
-                .is_none(),
+            daemon.store().get_request(&id).await.unwrap().is_none(),
             "a refused handshake records no request row"
         );
     }
@@ -1097,37 +876,35 @@ async fn assert_claims_are_refused(
 /// occasion to look at the binary on disk.
 #[tokio::test]
 async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does() {
-    timeout(DEADLINE, async {
+    with_deadline(async {
         let image = std::sync::Arc::new(ScriptedImage::default());
-        let daemon = TestDaemon::start_with_image(image.clone()).await;
-        let mut lifecycle = daemon.handle.lifecycle();
-        let mut dealer = daemon.dealer().await;
+        let daemon = TestDaemon::spawn_with(|config| {
+            config.image_probe = Some(image.clone());
+        })
+        .await;
+        let mut lifecycle = daemon.handle().lifecycle();
+        let mut client = daemon.client().await;
         let boot_path = daemon
-            .handle
+            .handle()
             .boot_image_path()
             .expect("the platform names the test binary");
 
         // An in-flight request that a restart would cancel.
-        send(
-            &mut dealer,
-            &envelope(
+        client
+            .send(&envelope(
                 "req_survivor",
                 "echo",
                 serde_json::json!({ "delay_ms": 1_500 }),
                 false,
-            ),
-        )
-        .await;
-        assert!(matches!(
-            recv_response(&mut dealer).await,
-            Response::Ticket { .. }
-        ));
+            ))
+            .await;
+        assert!(matches!(client.recv().await, Response::Ticket { .. }));
 
         // The binary on disk is the one that is running. Whatever a client
         // claims — newer, older, nonsense — it is refused and nothing moves.
-        assert_claims_are_refused(&daemon, &mut dealer, &boot_path).await;
+        assert_claims_are_refused(&daemon, &boot_path).await;
         // The daemon is still serving and the in-flight work finishes.
-        let store = daemon.handle.store();
+        let store = daemon.store();
         let survivor = loop {
             let row = store.get_request("req_survivor").await.unwrap().unwrap();
             if row.state.is_terminal() {
@@ -1142,16 +919,16 @@ async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does(
         image.replace_on_disk();
         tokio::time::sleep(pam_daemon::image::RECHECK_INTERVAL + Duration::from_millis(100)).await;
 
-        let mut newer = envelope(
-            "req_newer",
-            "echo",
-            serde_json::json!({ "msg": "hi" }),
-            true,
-        );
-        newer.client_version = "999.0.0".to_owned();
-        send(&mut dealer, &newer).await;
-
-        let response = recv_response(&mut dealer).await;
+        let mut newer = daemon.client().await;
+        newer.claim_version("999.0.0");
+        let response = newer
+            .request(&envelope(
+                "req_newer",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+                true,
+            ))
+            .await;
         let Response::Refusal {
             id,
             cause,
@@ -1173,7 +950,7 @@ async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does(
         assert!(retryable, "the retry lands on the replacement daemon");
 
         // No request row was recorded for the refused envelope.
-        let store = daemon.handle.store();
+        let store = daemon.store();
         assert!(store.get_request("req_newer").await.unwrap().is_none());
 
         // The daemon drains and stops on its own: the phase flips to
@@ -1185,19 +962,17 @@ async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does(
         let tmp = daemon.join().await;
 
         // A fresh daemon on the same base serves a matching client.
-        let daemon = TestDaemon::start_at(tmp).await;
-        let mut dealer = daemon.dealer().await;
-        send(
-            &mut dealer,
-            &envelope(
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let mut client = daemon.client().await;
+        client
+            .send(&envelope(
                 "req_fresh",
                 "echo",
                 serde_json::json!({ "msg": "hi" }),
                 true,
-            ),
-        )
-        .await;
-        let response = recv_response(&mut dealer).await;
+            ))
+            .await;
+        let response = client.recv().await;
         assert!(
             matches!(response, Response::Result { .. }),
             "expected a result, got {response:?}"
@@ -1205,48 +980,39 @@ async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does(
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn graceful_drain_finishes_inflight_work_and_refuses_newcomers() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
 
-        send(
-            &mut dealer,
-            &envelope(
+        client
+            .send(&envelope(
                 "req_drain",
                 "echo",
                 serde_json::json!({ "delay_ms": 800 }),
                 false,
-            ),
-        )
-        .await;
-        assert!(matches!(
-            recv_response(&mut dealer).await,
-            Response::Ticket { .. }
-        ));
-        let store = daemon.handle.store();
-        wait_for_row(&store, "req_drain", |row| {
-            row.state == RequestState::Running
-        })
-        .await;
+            ))
+            .await;
+        assert!(matches!(client.recv().await, Response::Ticket { .. }));
+        let store = daemon.store();
+        daemon
+            .wait_for_row("req_drain", |row| row.state == RequestState::Running)
+            .await;
 
         // Begin the drain and give the lifecycle task a beat to flip
         // the phase before probing it with a new request.
-        let _ = daemon.shutdown.send(true);
+        daemon.begin_shutdown();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let mut latecomer = daemon.dealer().await;
-        send(
-            &mut latecomer,
-            &envelope("req_late", "echo", serde_json::json!({}), true),
-        )
-        .await;
-        let response = recv_response(&mut latecomer).await;
+        let mut latecomer = daemon.client().await;
+        latecomer
+            .send(&envelope("req_late", "echo", serde_json::json!({}), true))
+            .await;
+        let response = latecomer.recv().await;
         let Response::Refusal { cause, .. } = response else {
             panic!("expected a refusal, got {response:?}");
         };
@@ -1259,31 +1025,54 @@ async fn graceful_drain_finishes_inflight_work_and_refuses_newcomers() {
         assert_eq!(row.state, RequestState::Done);
         assert_eq!(row.outcome.as_deref(), Some("solved"));
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn a_model_admin_op_from_an_agent_trips_the_wire() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let mut dealer = daemon.dealer().await;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let mut client = daemon.client().await;
+
+        // Forged on the public socket the op is refused before any row is
+        // written: the public listener never lets `admin.*` through.
+        client
+            .send_public(&envelope(
+                "req_models_forged",
+                OP_MODELS_LIST,
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let response = client.recv().await;
+        assert!(
+            matches!(&response, Response::Refusal { cause, detail, .. }
+                if cause == CAUSE_ADMIN_DENIED && detail.contains("private native channel")),
+            "expected the public refusal, got {response:?}"
+        );
+        let store = daemon.store();
+        assert!(
+            store
+                .get_request("req_models_forged")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // The default `envelope` helper speaks as `claude`, not as the
         // GUI: the model ops sit behind the same tripwire as every other
-        // admin op, so this must never reach the registry.
-        send(
-            &mut dealer,
-            &envelope(
+        // admin op, so this must never reach the registry even when an
+        // agent identity reaches the private channel.
+        client
+            .send(&envelope(
                 "req_models_denied",
                 OP_MODELS_LIST,
                 serde_json::json!({}),
                 true,
-            ),
-        )
-        .await;
+            ))
+            .await;
 
-        let response = recv_response(&mut dealer).await;
+        let response = client.recv().await;
         let Response::Refusal {
             cause,
             detail,
@@ -1294,15 +1083,11 @@ async fn a_model_admin_op_from_an_agent_trips_the_wire() {
             panic!("a model admin op from an agent must be refused");
         };
         assert_eq!(cause, CAUSE_ADMIN_DENIED);
-        assert!(
-            detail.contains("private native channel"),
-            "detail: {detail}"
-        );
+        assert!(detail.contains("GUI-only"), "detail: {detail}");
         assert!(!recovery.is_empty());
 
         // Audited as the tripwire, not as an ordinary admin refusal, so
         // the attempt stands out in the trail.
-        let store = daemon.handle.store();
         let row = store
             .get_request("req_models_denied")
             .await
@@ -1327,15 +1112,14 @@ async fn a_model_admin_op_from_an_agent_trips_the_wire() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }
 
 #[tokio::test]
 async fn the_model_surface_is_reachable_from_the_daemon_handle() {
-    timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
-        let models = daemon.handle.models();
+    with_deadline(async {
+        let daemon = TestDaemon::spawn().await;
+        let models = daemon.handle().models();
 
         // Defaults start unset, so a tier resolves to nothing and the
         // caller takes its deterministic path.
@@ -1346,6 +1130,5 @@ async fn the_model_surface_is_reachable_from_the_daemon_handle() {
 
         daemon.stop().await;
     })
-    .await
-    .expect("test within deadline");
+    .await;
 }

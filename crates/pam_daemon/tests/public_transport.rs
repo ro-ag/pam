@@ -219,16 +219,6 @@ async fn a_request_round_trips_and_its_row_records_the_public_peer() {
             Response::Result { .. }
         ));
 
-        // The legacy listener is still served, and cannot name a peer.
-        let mut legacy = fixture.daemon.client().await;
-        let via_zmq = fixture.envelope("req_zmq", "echo", serde_json::json!({}), true);
-        assert!(matches!(
-            legacy.request(&via_zmq).await,
-            Response::Result { .. }
-        ));
-        let row = store.get_request("req_zmq").await.unwrap().unwrap();
-        assert_eq!(row.origin, pam_store::RequestOrigin::PUBLIC);
-
         fixture.daemon.stop().await;
     })
     .await;

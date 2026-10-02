@@ -263,9 +263,9 @@ async fn public_socket_refuses_forged_gui_identity_before_version_handshake() {
             forged.caller.pid = std::process::id();
             client.send_public(&forged).await;
             assert!(matches!(client.recv().await, Response::Refusal { cause, .. } if cause == CAUSE_ADMIN_DENIED));
-            let row = daemon.store().get_request(&forged.id).await.unwrap().unwrap();
-            assert_eq!(row.args_json, "{}");
-            assert_eq!(row.state, RequestState::Refused);
+            // The public listener refuses `admin.*` before any row is
+            // written: nothing of the forged arguments is stored.
+            assert!(daemon.store().get_request(&forged.id).await.unwrap().is_none());
         }
         assert!(matches!(client.request(&envelope("still_serving", "echo", serde_json::json!({}), true)).await,
             Response::Result { .. }));

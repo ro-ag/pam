@@ -2,7 +2,8 @@
 //!
 //! Spins up a **real daemon** ([`pam_daemon::daemon::run_daemon_with`]) on a temp runtime
 //! dir with a short path (unix socket paths cap at 104 bytes on macOS), talks to it over
-//! **real zmq** (`DEALER` for requests, `SUB` for lifecycle events), and inspects the
+//! the **real framed public transport** (one connection per request; lifecycle events
+//! from the private admin plane's all-events stream), and inspects the
 //! **real `SQLite` store** through the daemon's own [`Store`] handle. Every await is
 //! bounded by [`with_deadline`] — a generous **wall** deadline ([`TEST_DEADLINE`]) that
 //! tolerates loaded runners but fails genuine hangs; classify CPU-bound work by wall
@@ -11,6 +12,7 @@
 //! missing-audit sweep with a per-request exactly-one-terminal-row check over every
 //! request id a [`TestClient`] of this daemon sent.
 
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,14 +22,17 @@ use pam_daemon::daemon::{
     ACTION_DEADLINE_REFUSAL, DAEMON_VERSION, DaemonConfig, DaemonHandle, TERMINAL_ACTIONS,
     run_daemon_with,
 };
+use pam_daemon::event_hub::{PUBLIC_PROGRESS_NOTE, Subscribed, Subscriber};
 use pam_daemon::flow_service::{SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH};
+use pam_daemon::framed::{self, DialError};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
-use pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES;
+use pam_daemon::runtime_dir::{MAX_SOCKET_PATH_BYTES, RuntimeDir};
 use pam_daemon::secrets::SecretBackend;
+use pam_proto::wire::{ErrorFrame, EventFrame, Frame, MAX_FRAME_BYTES, Via, cause};
 use pam_proto::{Caller, Envelope, Event, PROTOCOL_VERSION, Response};
 use pam_store::{AuditRow, RequestRow, RequestState, Store};
 use tokio::sync::watch;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use tokio::task::JoinSet;
 
 /// The scripted HTTP transport connector tests answer calls with.
 pub use pam_connectors::testing::FakeTransport;
@@ -42,11 +47,6 @@ pub const TEST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Poll interval for store-observing waits.
 const POLL: Duration = Duration::from_millis(25);
-
-/// Settle time for a fresh `SUB` subscription before events matter
-/// (zmq `PUB` drops messages published before the subscription
-/// registers with the publisher).
-const SUB_SETTLE: Duration = Duration::from_millis(300);
 
 /// The repo every [`envelope`] runs under, so same-lane tests need no
 /// coordination.
@@ -345,42 +345,66 @@ impl TestDaemon {
         self.handle.store()
     }
 
-    /// A connected `DEALER` client speaking [`pam_proto`] envelopes.
+    /// A client of the framed public transport speaking [`pam_proto`]
+    /// envelopes. It holds no connection: each request dials its own.
+    ///
+    /// `async` only to keep the call shape every suite already uses.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "the harness API is `daemon.client().await` in every suite"
+    )]
     pub async fn client(&self) -> TestClient {
-        let mut dealer = DealerSocket::new();
-        with_deadline(dealer.connect(&self.handle.runtime_dir().router_endpoint()))
-            .await
-            .expect("dealer connects");
+        let base = self.base_dir();
         TestClient {
-            base: self
-                .handle
-                .runtime_dir()
-                .run_dir()
-                .parent()
-                .expect("run parent")
-                .to_path_buf(),
+            dirs: RuntimeDir::paths_at_base(&base).expect("the runtime paths resolve"),
+            base,
             admin: self.handle.admin(),
-            pending_admin: std::collections::VecDeque::new(),
-            dealer,
+            ready: VecDeque::new(),
+            in_flight: JoinSet::new(),
+            hello_version: None,
             sent_ids: Arc::clone(&self.sent_ids),
         }
     }
 
-    /// A `SUB` socket subscribed to each topic (request id), settled
-    /// past the slow-joiner window. Subscribe **before** sending the
-    /// requests whose events matter.
+    /// A stream of the lifecycle events of the tickets named by `topics`
+    /// (request ids; an empty list means every ticket), in publish order.
+    ///
+    /// The stream is the private admin plane's all-events subscription, filtered
+    /// here to the requested ids. The daemon answers `subscribed` only once
+    /// the subscription is registered, so every event published after this
+    /// call returns is delivered: there is nothing to settle, and subscribing
+    /// before the ids exist works. A daemon admits four such streams at once;
+    /// drop one before opening a fifth. Where the platform has no admin
+    /// adapter the stream reads the daemon's event hub in process instead.
+    ///
+    /// # Panics
+    ///
+    /// When the daemon refuses the subscription.
     pub async fn subscribe(&self, topics: &[&str]) -> EventStream {
-        let mut sub = SubSocket::new();
-        with_deadline(sub.connect(&self.handle.runtime_dir().events_endpoint()))
-            .await
-            .expect("sub connects");
-        for topic in topics {
-            with_deadline(sub.subscribe(topic))
+        let source = if pam_daemon::admin_transport::supported() {
+            let events = with_deadline(pam_daemon::admin_transport::events(&self.base_dir(), true))
                 .await
-                .expect("subscribe");
+                .unwrap_or_else(|error| panic!("the all-events stream opens: {error}"));
+            Source::Admin(Box::new(events))
+        } else {
+            Source::Hub(
+                self.handle
+                    .event_hub()
+                    .subscribe_all(true)
+                    .expect("an in-process subscriber attaches"),
+            )
+        };
+        EventStream {
+            source,
+            topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
         }
-        tokio::time::sleep(SUB_SETTLE).await;
-        EventStream { sub }
+    }
+
+    /// Starts the daemon's drain without joining it, so a test can probe the
+    /// draining daemon. [`Self::stop`] still joins it afterwards.
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     /// Graceful shutdown; returns the temp dir so a follow-up daemon can
@@ -504,18 +528,37 @@ impl TestDaemon {
     }
 }
 
-/// A `DEALER` client that sends [`pam_proto`] envelopes and receives
-/// [`Response`]s, recording every sent request id for the daemon's
-/// invariant sweep.
+/// A client of the framed public transport that sends [`pam_proto`]
+/// envelopes and receives [`Response`]s, recording every sent request id for
+/// the daemon's invariant sweep.
+///
+/// The transport carries one request per connection, so the client keeps no
+/// connection: [`Self::send`] dials, says hello, writes the request and hands
+/// the connection to a reader task; [`Self::recv`] returns the next reply to
+/// complete, **in completion order, not send order**. Several requests can be
+/// in flight at once, as on the old single socket. Dropping the client closes
+/// every connection it still holds; that never cancels a request.
 pub struct TestClient {
-    base: std::path::PathBuf,
+    base: PathBuf,
+    dirs: RuntimeDir,
     admin: Arc<pam_daemon::admin::AdminService>,
-    pending_admin: std::collections::VecDeque<Response>,
-    dealer: DealerSocket,
+    /// Answers that exist already: admin operations (answered inline) and
+    /// hellos the daemon refused. Returned before any in-flight reply.
+    ready: VecDeque<Response>,
+    /// One reader per request on the public plane.
+    in_flight: JoinSet<Response>,
+    hello_version: Option<String>,
     sent_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestClient {
+    /// Makes every later request claim `version` in its hello instead of the
+    /// daemon's own, which is what a client of another build would say. The
+    /// envelope's `client_version` decides nothing on this transport.
+    pub fn claim_version(&mut self, version: &str) {
+        self.hello_version = Some(version.to_owned());
+    }
+
     /// Sends an agent envelope through public IPC or explicitly seeds trusted
     /// administration through the native channel. Unsupported platform fixtures
     /// use the in-process service, never an insecure production wire fallback.
@@ -532,32 +575,74 @@ impl TestClient {
             } else {
                 self.admin.handle(envelope).await
             };
-            self.pending_admin.push_back(response);
+            self.ready.push_back(response);
             return;
         }
         self.send_public(envelope).await;
     }
 
     /// Raw public ingress, including deliberately forged administration.
+    ///
+    /// Returns once the daemon has acknowledged the hello, so requests sent
+    /// one after another reach the daemon in that order (whatever it then
+    /// does with them concurrently). A hello the daemon refuses
+    /// (`client_version_mismatch`, `daemon_outdated`, ...) comes back from
+    /// [`Self::recv`] as a [`Response::Refusal`] carrying the `error` frame's
+    /// cause, detail and recovery; `retryable` is set for the transient ones.
     pub async fn send_public(&mut self, envelope: &Envelope) {
         self.sent_ids
             .lock()
             .expect("sent-ids lock")
             .push(envelope.id.clone());
-        let payload = serde_json::to_vec(envelope).expect("serialize envelope");
-        with_deadline(self.dealer.send(ZmqMessage::from(payload)))
+        let mut stream = with_deadline(framed::connect_public(&self.dirs))
             .await
-            .expect("send ok");
+            .expect("the public socket accepts a connection");
+        let mut hello = framed::client_hello(Via::Direct);
+        if let Some(version) = &self.hello_version {
+            version.clone_into(&mut hello.version);
+        }
+        let request = Frame::Request {
+            envelope: envelope.clone(),
+        };
+        match with_deadline(framed::open(&mut stream, &hello, &request)).await {
+            Ok(_) => {}
+            Err(DialError::Refused(error)) => {
+                self.ready.push_back(refusal_of(&envelope.id, &error));
+                return;
+            }
+            Err(error) => panic!("the hello for {} failed: {error}", envelope.id),
+        }
+        let id = envelope.id.clone();
+        self.in_flight.spawn(async move {
+            match framed::read_daemon_frame(&mut stream, MAX_FRAME_BYTES).await {
+                Ok(Frame::Reply { response }) => response,
+                Ok(other) => panic!("{id}: expected a reply, got {}", other.type_name()),
+                Err(DialError::Refused(error)) => refusal_of(&id, &error),
+                Err(error) => panic!("{id}: no reply: {error}"),
+            }
+        });
     }
 
-    /// Receives one response.
+    /// Receives the next response to complete: an answer that already
+    /// exists, else the first reply to arrive on any connection in flight.
+    ///
+    /// # Panics
+    ///
+    /// When nothing is in flight (there is nothing to wait for), when the
+    /// wall deadline passes, or when a connection ends without a reply, which
+    /// the daemon never does for a request it accepted.
     pub async fn recv(&mut self) -> Response {
-        if let Some(response) = self.pending_admin.pop_front() {
+        if let Some(response) = self.ready.pop_front() {
             return response;
         }
-        let answer = with_deadline(self.dealer.recv()).await.expect("recv ok");
-        let frames = answer.into_vec();
-        serde_json::from_slice(&frames[0]).expect("parse response")
+        let joined = with_deadline(self.in_flight.join_next())
+            .await
+            .expect("recv with no request in flight");
+        match joined {
+            Ok(response) => response,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("a reply reader ended: {error}"),
+        }
     }
 
     /// Sends `envelope` and awaits its response.
@@ -567,22 +652,98 @@ impl TestClient {
     }
 }
 
-/// A `SUB` stream of `(request id, event)` pairs in publish order. The
-/// daemon publishes every event through one loop over one connection,
-/// so arrival order **is** publish order — assert on it instead of on
-/// wall clocks.
+/// A hello the daemon refused, as the [`Response::Refusal`] a caller of the
+/// old envelope protocol would have seen.
+fn refusal_of(id: &str, error: &ErrorFrame) -> Response {
+    let transient = [
+        cause::DAEMON_OUTDATED,
+        cause::DAEMON_SHUTTING_DOWN,
+        cause::CONNECTION_CAPACITY_EXHAUSTED,
+    ]
+    .contains(&error.cause.as_str());
+    if transient {
+        Response::transient_refusal(id, &error.cause, &error.detail, &error.recovery)
+    } else {
+        Response::refusal(id, &error.cause, &error.detail, &error.recovery)
+    }
+}
+
+/// Where an [`EventStream`] reads from.
+enum Source {
+    /// The private admin plane's all-events stream.
+    Admin(Box<pam_daemon::admin_transport::AdminEvents>),
+    /// The daemon's own hub, where the platform has no admin adapter.
+    Hub(Subscriber),
+}
+
+/// `(request id, event)` pairs of the requested tickets in publish order,
+/// read from the admin all-events stream. The hub publishes every event
+/// through one queue per subscriber, so arrival order **is** publish order
+/// across tickets: assert on it instead of on wall clocks.
+///
+/// [`Self::recv`] and the collectors give the **public** view of an event
+/// (a progress note is the constant [`PUBLIC_PROGRESS_NOTE`], what a public
+/// follower is shown); [`Self::recv_admin`] gives the whole frame with the
+/// real note and the ticket's metadata. Control requests (`status`, `query`,
+/// `cancel`) publish no events, so a stream is silent for them.
 pub struct EventStream {
-    sub: SubSocket,
+    source: Source,
+    /// Request ids to deliver; empty delivers every ticket.
+    topics: HashSet<String>,
 }
 
 impl EventStream {
-    /// Receives the next event as `(request id, event)`.
+    /// The next event of a requested ticket, as the admin plane carries it.
+    async fn next_frame(&mut self) -> EventFrame {
+        loop {
+            let frame = match &mut self.source {
+                Source::Admin(events) => events
+                    .next()
+                    .await
+                    .unwrap_or_else(|error| panic!("the all-events stream ended: {error}")),
+                Source::Hub(subscriber) => match subscriber.next().await {
+                    Subscribed::Event(event) => match event.into_frame() {
+                        Frame::Event(frame) => frame,
+                        other => unreachable!("a hub event is an event frame, not {other:?}"),
+                    },
+                    Subscribed::Lagged => panic!("the in-process subscriber lagged"),
+                    Subscribed::Closed => panic!("the event hub closed"),
+                },
+            };
+            let wanted = frame
+                .ticket
+                .as_ref()
+                .is_some_and(|ticket| self.topics.is_empty() || self.topics.contains(ticket));
+            if wanted {
+                return frame;
+            }
+        }
+    }
+
+    /// Receives the next event as `(request id, event)`, in its public view.
     pub async fn recv(&mut self) -> (String, Event) {
-        let message = with_deadline(self.sub.recv()).await.expect("event recv ok");
-        let frames = message.into_vec();
-        let topic = String::from_utf8(frames[0].to_vec()).expect("utf-8 topic");
-        let event = serde_json::from_slice(&frames[1]).expect("parse event");
-        (topic, event)
+        let frame = with_deadline(self.next_frame()).await;
+        (
+            frame.ticket.expect("a filtered frame names its ticket"),
+            public_view(frame.event),
+        )
+    }
+
+    /// Like [`Self::recv`] but `None` when no event of a requested ticket
+    /// arrives within `quiet`: how a test shows a ticket stayed silent.
+    pub async fn recv_within(&mut self, quiet: Duration) -> Option<(String, Event)> {
+        let frame = tokio::time::timeout(quiet, self.next_frame()).await.ok()?;
+        Some((
+            frame.ticket.expect("a filtered frame names its ticket"),
+            public_view(frame.event),
+        ))
+    }
+
+    /// Receives the next event whole: ticket, the admission metadata
+    /// (capability, repository, agent label, ingress), the daemon-wide counter
+    /// `n` and the real, unsanitised event.
+    pub async fn recv_admin(&mut self) -> EventFrame {
+        with_deadline(self.next_frame()).await
     }
 
     /// Collects events (all subscribed topics, publish order) until
@@ -616,5 +777,16 @@ impl EventStream {
                 return events;
             }
         }
+    }
+}
+
+/// What a public follower is shown of `event`: progress without its prose.
+fn public_view(event: Event) -> Event {
+    match event {
+        Event::Progress { pct, note: _ } => Event::Progress {
+            pct,
+            note: PUBLIC_PROGRESS_NOTE.to_owned(),
+        },
+        other => other,
     }
 }

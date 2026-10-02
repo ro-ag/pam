@@ -3303,7 +3303,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "ulid",
- "zeromq",
 ]
 
 [[package]]
@@ -3389,7 +3388,6 @@ dependencies = [
  "tauri",
  "tempfile",
  "tokio",
- "zeromq",
 ]
 
 [[package]]
@@ -3438,7 +3436,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "zeromq",
 ]
 
 [[package]]

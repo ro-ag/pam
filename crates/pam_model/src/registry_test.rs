@@ -971,6 +971,10 @@ fn a_source_swapped_after_verification_does_not_change_what_the_engine_loads() {
     let mut evil = tiny_moe_gguf();
     let last = evil.len() - 1;
     evil[last] ^= 0xff;
+    // Off Unix the fingerprint is size and mtime only, and NTFS stamps a write with a
+    // coarse clock tick: without a pause the swap can land in the tick the original was
+    // written in and be indistinguishable by design (see `FileFingerprint`).
+    std::thread::sleep(std::time::Duration::from_millis(50));
     let staged = dir.path().join("qwen").join(".evil");
     std::fs::write(&staged, &evil).unwrap();
     std::fs::rename(&staged, &path).unwrap();

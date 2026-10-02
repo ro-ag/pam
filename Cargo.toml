@@ -1,5 +1,4 @@
 [workspace]
-exclude = ["vendor/turso_core", "vendor/aegis"]
 resolver = "3"
 members = [
     "crates/pam",
@@ -37,15 +36,12 @@ pam_testkit = { path = "crates/pam_testkit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Real SQLite: the amalgamation shipped inside libsqlite3-sys, compiled by `cc`
-# and linked statically. A named exception to the no-C rule (owner decision
-# 2026-10-02, issue 38), like the Tauri/objc2 shims. Never the system library,
-# so every target runs the same engine.
+# Real SQLite for the store: the amalgamation shipped inside libsqlite3-sys,
+# compiled by `cc` and linked statically. A named exception to the no-C rule
+# (owner decision 2026-10-02, issue 38: the audit and authorization spine runs
+# on SQLite proper), like the Tauri/objc2 shims. Never the system library, so
+# every target runs the same engine.
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "cache", "limits"] }
-# No workspace member depends on turso any more (pam_store runs on rusqlite).
-# The entry, the two patches at the bottom of this file and the vendor
-# directories they point at are removed together in a follow-up change.
-turso = { version = "0.7", default-features = false, features = ["pure-rust-crypto"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 thiserror = "2"
 tempfile = "3"
@@ -74,6 +70,7 @@ tracing-appender = "0.2"
 # scaffold; `wry` is the webview runtime.
 # Wry currently compiles an Objective-C exception helper on macOS. This
 # conflicts with the no-C-compiler constraint; see ptrack issue 16/task 142.
+# An accepted exception, as bundled SQLite is (see `rusqlite` above).
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-build = { version = "2", default-features = false, features = ["config-json"] }
 
@@ -99,7 +96,3 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-
-[patch.crates-io]
-turso_core = { path = "vendor/turso_core" }
-aegis = { path = "vendor/aegis" }

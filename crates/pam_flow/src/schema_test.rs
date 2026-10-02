@@ -122,7 +122,7 @@ fn connector_ids_round_trip_through_their_names() {
         assert_eq!(ConnectorId::parse(id.as_str()), Some(id));
         assert_eq!(id.to_string(), id.as_str());
     }
-    assert_eq!(ConnectorId::ALL.len(), 7);
+    assert_eq!(ConnectorId::ALL.len(), 6);
     assert_eq!(ConnectorId::parse("gitlab"), None);
     assert_eq!(ConnectorId::parse("GitHub"), None);
     assert_eq!(ConnectorId::Sonarqube.as_str(), "sonarqube");

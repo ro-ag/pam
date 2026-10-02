@@ -1,5 +1,5 @@
 //! The connector host: the Connectors screen's backend, and what a flow step calls through.
-//! [`ConnectorService::list`] merges the seven static descriptors, saved rows, and keychain state;
+//! [`ConnectorService::list`] merges the six static descriptors, saved rows, and keychain state;
 //! `configure` writes a row and credential; `test` proves it still works; `invoke` — the only one
 //! an agent can cause — never runs until the connector is configured, enabled, and credentialed.
 //!
@@ -9,8 +9,7 @@
 //! log; `configure`'s audit row records only *that* a credential was set or cleared. Neither the
 //! keychain nor `curl` is a boot requirement: a closed keychain still lists with `store_available:
 //! false` and refuses credentialed ops with its own cause; missing `curl` still lists and
-//! configures but refuses HTTP ops with `connector_cli_missing`. AWS CLI execution is refused
-//! separately until its credential helpers have qualified containment.
+//! configures but refuses HTTP ops with `connector_cli_missing`.
 
 use std::collections::BTreeMap;
 
@@ -83,8 +82,8 @@ pub struct ConnectorSummary {
     pub id: String,
     /// The name a human reads, in the vendor's own spelling.
     pub name: &'static str,
-    /// How pam authenticates: `bearer`, `basic_user_secret`,
-    /// `token_as_user`, or `aws_profile`.
+    /// How pam authenticates: `bearer`, `basic_user_secret`, or
+    /// `token_as_user`.
     pub auth: &'static str,
     /// What this connector's `username` means, when it means anything —
     /// the label the GUI puts on the field.
@@ -95,7 +94,7 @@ pub struct ConnectorSummary {
     pub enabled: bool,
     /// The saved base URL, normalized when it was saved.
     pub base_url: Option<String>,
-    /// The saved user name, account email, or AWS profile.
+    /// The saved user name or account email.
     pub username: Option<String>,
     /// What the OS credential store said about this connector. Flattened
     /// into the entry the GUI reads, as `credential_present` and
@@ -301,7 +300,7 @@ struct Recoveries {
 }
 
 /// The per-connector recovery lines, in [`ConnectorId::ALL`] order.
-static RECOVERIES: LazyLock<[Recoveries; 7]> = LazyLock::new(|| ConnectorId::ALL.map(build_lines));
+static RECOVERIES: LazyLock<[Recoveries; 6]> = LazyLock::new(|| ConnectorId::ALL.map(build_lines));
 
 /// This connector's recovery lines.
 fn recoveries(id: ConnectorId) -> &'static Recoveries {
@@ -342,7 +341,7 @@ pub struct ConnectorService {
     /// summary say so.
     store_available: bool,
     /// Whether `curl` is missing, which refuses every HTTP connector before
-    /// the transport is touched (AWS drives its own CLI and is exempt).
+    /// the transport is touched.
     curl_missing: bool,
 }
 
@@ -511,9 +510,8 @@ impl ConnectorService {
     pub async fn test(&self, id: ConnectorId) -> Result<(bool, String), InvokeError> {
         let _guard = self.configuration_locks[&id].lock().await;
         let row = self.store.get_connector(id.as_str()).await?;
-        refuse_uncontained_cli(id)?;
         let connection = self.connection(id, row.as_ref()).await?;
-        self.ensure_transport(id)?;
+        self.ensure_transport()?;
 
         let deadline = Instant::now() + CONNECTOR_TEST_DEADLINE;
         let verify = pam_connectors::verify(id, &connection, self.transport.as_ref(), deadline);
@@ -593,29 +591,8 @@ impl ConnectorService {
             })
         })?;
         let row = self.scoped_row(repo, id, call, args).await?;
-        refuse_uncontained_cli(id)?;
-        // The AWS adapter captures its own child pipes, outside HTTP. Keep the
-        // full reservation because it does not return an exact stderr byte count.
-        let _aws_capture = if id == ConnectorId::Aws {
-            Some(
-                budget
-                    .command_persisted(
-                        pam_connectors::aws::MAX_STDOUT_BYTES
-                            + pam_connectors::aws::MAX_STDERR_BYTES,
-                    )
-                    .await
-                    .map_err(|error| {
-                        InvokeError::Connector(pam_connectors::ConnectorError::Policy {
-                            cause: error.cause,
-                            detail: error.to_string(),
-                        })
-                    })?,
-            )
-        } else {
-            None
-        };
         let connection = self.connection(id, row.as_ref()).await?;
-        self.ensure_transport(id)?;
+        self.ensure_transport()?;
         let transport = ScopedTransport {
             service: self,
             repo,
@@ -674,16 +651,13 @@ impl ConnectorService {
         row: Option<&ConnectorRow>,
     ) -> Result<Connection, InvokeError> {
         let shape = descriptor(id);
-        let base_url = if shape.needs_base_url {
-            let raw = row
-                .and_then(|row| row.base_url.as_deref())
-                .map(str::trim)
-                .filter(|raw| !raw.is_empty())
-                .ok_or(InvokeError::BaseUrlMissing)?;
-            validate_base_url(id, raw).map_err(|error| InvokeError::BadUrl(error.detail()))?
-        } else {
-            validate_base_url(id, "").map_err(|error| InvokeError::BadUrl(error.detail()))?
-        };
+        let raw = row
+            .and_then(|row| row.base_url.as_deref())
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .ok_or(InvokeError::BaseUrlMissing)?;
+        let base_url =
+            validate_base_url(id, raw).map_err(|error| InvokeError::BadUrl(error.detail()))?;
 
         let username = row
             .and_then(|row| row.username.as_deref())
@@ -697,18 +671,14 @@ impl ConnectorService {
             )));
         }
 
-        let secret = if shape.auth == AuthKind::AwsProfile {
-            None
-        } else {
-            // The daemon's own `Secret` is held for exactly as long as the
-            // conversion takes, then dropped (and overwritten).
-            let stored = self
-                .secrets
-                .get(id.as_str())
-                .await?
-                .ok_or(InvokeError::CredentialMissing)?;
-            Some(CallSecret::new(stored.expose().to_owned()))
-        };
+        // The daemon's own `Secret` is held for exactly as long as the
+        // conversion takes, then dropped (and overwritten).
+        let stored = self
+            .secrets
+            .get(id.as_str())
+            .await?
+            .ok_or(InvokeError::CredentialMissing)?;
+        let secret = Some(CallSecret::new(stored.expose().to_owned()));
 
         Ok(Connection {
             base_url,
@@ -717,9 +687,9 @@ impl ConnectorService {
         })
     }
 
-    /// Refuses an HTTP connector when this daemon has no `curl`.
-    fn ensure_transport(&self, id: ConnectorId) -> Result<(), InvokeError> {
-        if self.curl_missing && descriptor(id).auth != AuthKind::AwsProfile {
+    /// Refuses a connector when this daemon has no `curl`.
+    fn ensure_transport(&self) -> Result<(), InvokeError> {
+        if self.curl_missing {
             return Err(InvokeError::CurlMissing);
         }
         Ok(())
@@ -728,29 +698,20 @@ impl ConnectorService {
     /// Merges one connector's static shape, its row, and its credential.
     async fn summarize(&self, id: ConnectorId, row: Option<&ConnectorRow>) -> ConnectorSummary {
         let shape = descriptor(id);
-        // AWS stores no credential, so the keychain is never asked about it
-        // — a needless prompt on macOS, and a false "missing" line.
-        let credential = if shape.auth == AuthKind::AwsProfile {
-            CredentialStatus {
-                present: false,
+        let credential = match self.secrets.present(id.as_str()).await {
+            Ok(present) => CredentialStatus {
+                present,
                 store_available: self.store_available,
-            }
-        } else {
-            match self.secrets.present(id.as_str()).await {
-                Ok(present) => CredentialStatus {
-                    present,
-                    store_available: self.store_available,
-                },
-                Err(error) => {
-                    tracing::warn!(
-                        connector = id.as_str(),
-                        cause = error.cause(),
-                        "could not read the connector's credential"
-                    );
-                    CredentialStatus {
-                        present: false,
-                        store_available: false,
-                    }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    connector = id.as_str(),
+                    cause = error.cause(),
+                    "could not read the connector's credential"
+                );
+                CredentialStatus {
+                    present: false,
+                    store_available: false,
                 }
             }
         };
@@ -772,16 +733,10 @@ impl ConnectorService {
 /// Checks one base-URL value on its way into the row, answering what to
 /// store — `None` when it trims to nothing, which clears the field.
 ///
-/// A connector with no base URL of its own (AWS resolves endpoints through
-/// the local CLI) is exempt from validation: whatever its row carries there
-/// is never dialed.
 fn normalize_base_url(id: ConnectorId, raw: &str) -> Result<Option<String>, InvokeError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
-    }
-    if !descriptor(id).needs_base_url {
-        return Ok(Some(trimmed.to_owned()));
     }
     let url =
         validate_base_url(id, trimmed).map_err(|error| InvokeError::BadUrl(error.detail()))?;
@@ -794,7 +749,6 @@ fn auth_str(kind: AuthKind) -> &'static str {
         AuthKind::Bearer => "bearer",
         AuthKind::BasicUserSecret => "basic_user_secret",
         AuthKind::TokenAsUser => "token_as_user",
-        AuthKind::AwsProfile => "aws_profile",
     }
 }
 
@@ -950,13 +904,10 @@ pub(crate) fn configured_url(
     id: ConnectorId,
     row: Option<&ConnectorRow>,
 ) -> Result<String, InvokeError> {
-    let raw = if descriptor(id).needs_base_url {
-        row.and_then(|row| row.base_url.as_deref())
-            .filter(|raw| !raw.trim().is_empty())
-            .ok_or(InvokeError::BaseUrlMissing)?
-    } else {
-        ""
-    };
+    let raw = row
+        .and_then(|row| row.base_url.as_deref())
+        .filter(|raw| !raw.trim().is_empty())
+        .ok_or(InvokeError::BaseUrlMissing)?;
     validate_base_url(id, raw)
         .map(|url| url.to_string())
         .map_err(|error| InvokeError::BadUrl(error.detail()))
@@ -1000,14 +951,4 @@ impl HttpTransport for MissingCurl {
             ))
         })
     }
-}
-
-fn refuse_uncontained_cli(id: ConnectorId) -> Result<(), InvokeError> {
-    if id == ConnectorId::Aws {
-        return Err(InvokeError::Connector(ConnectorError::Policy {
-            cause: "command_containment_unavailable",
-            detail: "AWS CLI execution is unavailable until its credential and helper processes have qualified containment; no credential was read or process started.".to_owned(),
-        }));
-    }
-    Ok(())
 }

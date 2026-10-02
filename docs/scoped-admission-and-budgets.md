@@ -30,9 +30,12 @@ Target values are exact:
 | Confluence Cloud | Numeric page ID |
 | SharePoint 365 | Exact Graph site identifier |
 
-Broad searches, unresolvable resource IDs, and AWS require an explicit
-connector-wide approval. The GUI currently edits the six HTTP products above;
-it does not invent an AWS target policy. Jenkins folder prefixes and filesystem
+Broad searches and unresolvable resource IDs require an explicit
+connector-wide approval. The GUI edits the six HTTP products above, which are
+all the connectors there are. A scope policy saved before the AWS adapter was
+removed may still carry an `aws` approval; it is ignored when the policy is read
+(removing an approval only narrows access) and disappears on the next save.
+Jenkins folder prefixes and filesystem
 string prefixes are not wildcard grants. A separately checked-out worktree must
 be approved as its own root. Connector URL changes invalidate the old scope.
 
@@ -128,7 +131,7 @@ maximum body size before sending; completed bounded bodies return unused bytes.
 Errors or cancelled futures without an exact byte count keep their reservation.
 This bounds accepted/captured data, not all bytes transmitted by an uncooperative
 remote peer. HTTP deadlines are enforced around the transport, not merely passed
-to curl. AWS reserves both of its bounded pipe captures conservatively.
+to curl.
 
 Failed attempt evidence is filed before retry/backoff. Budget and scope refusals
 are nonretryable and stop the run with an explicit cause. Successful flow replies

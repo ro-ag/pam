@@ -4,8 +4,8 @@ use pam_flow::{ArgValue, ConnectorId};
 use url::Url;
 
 use crate::transport::{
-    AWS_BASE_URL, Connection, HttpResponse, Secret, base64, check_status, endpoint, id_arg,
-    int_arg, opt_text_arg, parse_json, pick, request, string_field, text_arg, validate_base_url,
+    Connection, HttpResponse, Secret, base64, check_status, endpoint, id_arg, int_arg,
+    opt_text_arg, parse_json, pick, request, string_field, text_arg, validate_base_url,
 };
 use crate::{ConnectorError, MAX_JSON_BYTES};
 
@@ -45,10 +45,10 @@ fn private_and_loopback_hosts_are_fine() {
 }
 
 #[test]
-fn aws_keeps_no_base_url() {
-    let url = validate_base_url(ConnectorId::Aws, "").unwrap();
-    assert_eq!(url.as_str(), AWS_BASE_URL);
-    assert!(validate_base_url(ConnectorId::Github, "").is_err());
+fn every_connector_refuses_an_empty_base_url() {
+    for id in ConnectorId::ALL {
+        assert!(validate_base_url(id, "").is_err(), "{id}");
+    }
 }
 
 #[test]
@@ -157,17 +157,6 @@ fn a_missing_credential_is_an_auth_failure_before_any_request() {
     )
     .unwrap_err();
     assert_eq!(error, ConnectorError::Auth);
-}
-
-#[test]
-fn aws_makes_no_http_requests() {
-    let aws = Connection {
-        base_url: url(AWS_BASE_URL),
-        username: Some("default".to_owned()),
-        secret: None,
-    };
-    let error = request(ConnectorId::Aws, &aws, url(AWS_BASE_URL), 16).unwrap_err();
-    assert_eq!(error.cause(), "connector_bad_args");
 }
 
 #[test]

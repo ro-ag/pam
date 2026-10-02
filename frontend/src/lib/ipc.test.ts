@@ -545,17 +545,8 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
         { name: "build", required: true },
       ],
     });
-    expect(FLOW_CONNECTOR_CALLS.aws).toEqual([
-      { name: "commands", args: [] },
-      {
-        name: "cli",
-        args: [
-          { name: "service", required: true },
-          { name: "command", required: true },
-          { name: "args", required: false },
-        ],
-      },
-    ]);
+    expect(FLOW_CONNECTORS).not.toContain("aws");
+    expect(FLOW_CONNECTOR_CALLS).not.toHaveProperty("aws");
     expect(FLOW_CONNECTOR_CALLS.sharepoint[0].args.map((arg) => arg.name)).toEqual([
       "site",
       "query",

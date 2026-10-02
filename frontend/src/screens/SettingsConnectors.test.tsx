@@ -39,15 +39,6 @@ beforeEach(() => {
       base_url: undefined,
       credential_present: false,
     },
-    {
-      ...github,
-      id: "aws",
-      name: "AWS",
-      auth: "aws_profile",
-      username_label: "profile",
-      needs_base_url: false,
-      credential_present: false,
-    },
   ];
   mocks.connectorsKeyring.mockResolvedValue({
     state: "reachable" as const,
@@ -96,7 +87,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-it("explains URL, credentials, disabled and untested states without an AWS secret field", async () => {
+it("explains URL, credentials, disabled and untested states", async () => {
   await setup();
   expect(row("Confluence").getByText("Disabled")).toBeInTheDocument();
   expect(row("Confluence").getByText("Needs URL")).toBeInTheDocument();
@@ -109,8 +100,7 @@ it("explains URL, credentials, disabled and untested states without an AWS secre
   });
   expect(row("Confluence").getByText("Needs credentials")).toBeInTheDocument();
   expect(row().getByText("Untested")).toBeInTheDocument();
-  expect(row("AWS").queryByLabelText("AWS credential")).not.toBeInTheDocument();
-  expect(row("AWS").getByText(/named AWS profile/)).toBeInTheDocument();
+  expect(screen.queryByLabelText("connector AWS")).not.toBeInTheDocument();
 });
 it("saves current edits then tests without enabling or retaining a secret in mutation state", async () => {
   const client = await setup();

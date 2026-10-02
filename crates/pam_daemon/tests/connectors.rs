@@ -150,7 +150,7 @@ async fn configure_then_test_then_list_agree_over_the_real_socket() {
             .await;
         let body = body_of(response, Outcome::Verified);
         let connectors = body["connectors"].as_array().expect("connectors array");
-        assert_eq!(connectors.len(), 7);
+        assert_eq!(connectors.len(), 6);
         assert_eq!(connectors[0]["id"], "github");
         assert_eq!(connectors[0]["enabled"], true);
         assert_eq!(connectors[0]["base_url"], BASE_URL);

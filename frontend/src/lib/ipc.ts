@@ -1004,7 +1004,7 @@ export type FlowRole = "observe" | "verify" | "change";
 export type FlowOutput = "compact" | "summarize" | "discard";
 export type FlowApproval = "none" | "required";
 export type FlowConnectorId =
-  "github" | "jenkins" | "sonarqube" | "jira" | "confluence" | "sharepoint" | "aws";
+  "github" | "jenkins" | "sonarqube" | "jira" | "confluence" | "sharepoint";
 
 /** Every connector, in `ConnectorId::ALL` order (the order the GUI lists them). */
 export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
@@ -1014,7 +1014,6 @@ export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
   "jira",
   "confluence",
   "sharepoint",
-  "aws",
 ];
 
 /** A connector call argument: YAML scalars only, string or integer. */
@@ -1228,17 +1227,6 @@ export const FLOW_CONNECTOR_CALLS: Record<FlowConnectorId, FlowCallSpec[]> = {
       ],
     },
   ],
-  aws: [
-    { name: "commands", args: [] },
-    {
-      name: "cli",
-      args: [
-        { name: "service", required: true },
-        { name: "command", required: true },
-        { name: "args", required: false },
-      ],
-    },
-  ],
 };
 
 /** One flow with its text: what the YAML tab edits. */
@@ -1251,7 +1239,7 @@ export interface FlowDetail extends FlowListEntry {
 }
 
 export interface FlowConnectorScope {
-  connector: Exclude<FlowConnectorId, "aws">;
+  connector: FlowConnectorId;
   base_url: string;
   access: "targets" | "connector_wide";
   targets: string[];
@@ -1515,7 +1503,7 @@ export function retentionPrune(): Promise<PruneReport> {
  */
 
 /** How pam authenticates a connector. */
-export type ConnectorAuth = "bearer" | "basic_user_secret" | "token_as_user" | "aws_profile";
+export type ConnectorAuth = "bearer" | "basic_user_secret" | "token_as_user";
 
 /** One connector row in Settings › Connectors. */
 export interface ConnectorSummary {

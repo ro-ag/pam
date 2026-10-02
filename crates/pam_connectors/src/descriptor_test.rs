@@ -43,8 +43,7 @@ fn names_are_spelled_the_way_the_vendors_spell_them() {
             "SonarQube",
             "Jira",
             "Confluence",
-            "SharePoint",
-            "AWS"
+            "SharePoint"
         ]
     );
 }
@@ -66,17 +65,12 @@ fn auth_kinds_follow_the_spec_table() {
         descriptor(ConnectorId::Sonarqube).auth,
         AuthKind::TokenAsUser
     );
-    assert_eq!(descriptor(ConnectorId::Aws).auth, AuthKind::AwsProfile);
 }
 
 #[test]
-fn only_aws_needs_no_base_url() {
+fn every_connector_needs_a_base_url() {
     for id in ConnectorId::ALL {
-        assert_eq!(
-            descriptor(id).needs_base_url,
-            id != ConnectorId::Aws,
-            "{id}"
-        );
+        assert!(descriptor(id).needs_base_url, "{id}");
     }
 }
 
@@ -90,7 +84,6 @@ fn the_username_column_is_labelled_where_it_means_something() {
         descriptor(ConnectorId::Confluence).username_label,
         Some("email")
     );
-    assert_eq!(descriptor(ConnectorId::Aws).username_label, Some("profile"));
     for id in [
         ConnectorId::Github,
         ConnectorId::Sonarqube,

@@ -62,7 +62,7 @@ const TOPICS: Array<[RegExp, SettingsTopic, string, string]> = [
     "The models directory and tier defaults",
   ],
   [
-    /connector|jira|github|sonar|confluence|sharepoint|aws/i,
+    /connector|jira|github|sonar|confluence|sharepoint/i,
     "connectors",
     "Connectors",
     "Connectors",

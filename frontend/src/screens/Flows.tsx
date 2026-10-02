@@ -380,11 +380,10 @@ function ConnectorPrerequisites({ ids }: { ids: string[] }) {
                 ? "Disabled"
                 : row.needs_base_url && !row.base_url
                   ? "Needs URL"
-                  : row.auth !== "aws_profile" && !row.store_available
+                  : !row.store_available
                     ? "Store unavailable"
-                    : row.auth !== "aws_profile" &&
-                        (!row.credential_present ||
-                          (row.auth === "basic_user_secret" && !row.username?.trim()))
+                    : !row.credential_present ||
+                        (row.auth === "basic_user_secret" && !row.username?.trim())
                       ? "Needs credentials"
                       : row.last_test?.status === "passed"
                         ? "Ready"

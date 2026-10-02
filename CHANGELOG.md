@@ -107,6 +107,12 @@ All notable changes to pam are documented in this file. The format follows
   the relaxed profile, adding a grant or approving with Remember. Approval
   cards show each argument as its own token and escape hidden characters.
 
+### Removed
+
+- The AWS CLI adapter, which was always refused, is removed. A flow that still
+  names `connector: aws` fails validation as a removed connector; a stored `aws`
+  connector row is ignored, and a keychain item left behind for it is harmless.
+
 ### Fixed
 
 - The daemon no longer stops answering `status` and `cancel` when something
@@ -153,8 +159,6 @@ All notable changes to pam are documented in this file. The format follows
   authority tag counts only for a substantive quote.
 - An unanswered keychain prompt no longer stalls every connector: reads give up
   after 20 seconds.
-- The AWS adapter refuses to start a process by itself, not only behind the
-  daemon's check.
 
 ### Compatibility
 

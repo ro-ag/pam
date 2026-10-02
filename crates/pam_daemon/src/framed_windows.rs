@@ -31,6 +31,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,6 +53,16 @@ pub const ADMIN_LABEL: &str = "pam-admin-server";
 
 /// Connections allowed to sit in the public nonce handshake at once.
 pub const MAX_PUBLIC_PENDING: usize = 32;
+
+/// How long a loopback connect may take before the port counts as dead.
+///
+/// A connect to a live loopback listener completes in well under a
+/// millisecond. Windows, though, takes about two seconds to refuse a connect
+/// to a port nobody listens on (it retransmits the SYN twice first), which a
+/// control file left by a crashed daemon points at. Without this bound that
+/// wait would outlast every readiness probe and be mistaken for a daemon too
+/// busy to answer.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// The control file's `schema_version`.
 const CONTROL_SCHEMA: u32 = 1;
@@ -357,11 +368,22 @@ impl Drop for LoopbackAcceptor {
 ///
 /// # Errors
 ///
-/// [`read_control`]'s errors; the connect error; `PermissionDenied` when the
-/// port is not loopback or cannot prove it holds the nonce.
+/// [`read_control`]'s errors; the connect error, with `ConnectionRefused` for
+/// a port that did not accept within [`CONNECT_TIMEOUT`]; `PermissionDenied`
+/// when the port is not loopback or cannot prove it holds the nonce.
 pub async fn connect(control: &Path, label: &str) -> io::Result<TcpStream> {
     let (port, nonce) = read_control(control)?;
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+    let mut stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "nothing accepted the loopback connection in time",
+        )
+    })??;
     if !is_loopback(stream.peer_addr()?) {
         return Err(denied("the endpoint is not loopback"));
     }

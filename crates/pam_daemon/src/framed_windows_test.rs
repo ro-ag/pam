@@ -93,6 +93,29 @@ async fn a_client_never_sends_the_nonce_to_a_port_that_cannot_prove_it() {
     .expect("test within deadline");
 }
 
+/// A control file left by a daemon that is gone points at a dead port. The
+/// dial must say so promptly: Windows alone takes about two seconds to refuse
+/// a connect to a closed loopback port, longer than a readiness probe waits,
+/// so the wait would read as a daemon too busy to answer.
+#[tokio::test]
+async fn a_control_file_left_by_a_dead_daemon_is_refused_promptly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let control = tmp.path().join("public.json");
+    let port = {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    publish(&control, port, &PUBLIC_NONCE);
+    let started = std::time::Instant::now();
+    let error = connect(&control, PUBLIC_LABEL).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a dead port took {:?} to refuse",
+        started.elapsed()
+    );
+}
+
 /// Server side: a peer that read the proof but presents the wrong nonce is
 /// refused before any frame byte is read.
 #[tokio::test]

@@ -2337,6 +2337,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_net"
+version = "0.4.3"
+dependencies = [
+ "pam_net",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "pam_proto"
 version = "0.4.3"
 dependencies = [

@@ -158,6 +158,16 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Fixed
 
+- On Windows a daemon started lazily by a command no longer inherits that
+  command's output pipe, so a program capturing `pam`'s output (an agent
+  harness) gets its answer instead of waiting until the daemon exits. The
+  daemon is started through the system PowerShell's `Start-Process`; where
+  policy blocks PowerShell the command reports that, and `pam service install`
+  runs the daemon at login without a lazy start.
+- On Windows a crashed daemon's stale control file is refused in 0.3 s instead
+  of being mistaken for a busy daemon.
+- `pam listen` no longer panics at startup (it did in 0.4.0 to 0.4.3).
+
 - The daemon no longer stops answering `status` and `cancel` when something
   behind it is slow: handlers have a hard deadline, `status` is a snapshot
   read and cancel has reserved capacity. The GUI's status polls no longer feed

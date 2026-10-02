@@ -112,6 +112,10 @@ pam service status      # show whether the unit exists and is loaded, and whethe
 pam service uninstall   # unregister and remove the unit; the manager stops the managed daemon, the next pam command starts one lazily
 ```
 
+On Windows a lazy start goes through the system PowerShell so the daemon does
+not hold the calling program's output pipe. Where policy blocks PowerShell,
+install the login unit: a managed daemon needs no lazy start.
+
 Each platform gets one user-scope unit, never sudo or admin:
 
 | Platform | Unit |

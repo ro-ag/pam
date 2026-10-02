@@ -2,12 +2,15 @@
 //! never taken over, and a stale socket file is replaced. Unix only — the
 //! relay's transport is unix domain sockets.
 
+use std::collections::VecDeque;
+use std::io;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use crate::relay::{self, RelayError};
+use crate::relay::{self, Accept, RelayError};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -196,5 +199,121 @@ fn a_stale_socket_file_is_replaced() {
         let server = tokio::spawn(relay::serve(bindings, shutdown_rx));
         let _ = shutdown_tx.send(true);
         server.await.expect("serve joins").expect("serve ok");
+    });
+}
+
+/// A scripted source of client connections: yields its queue in order (an
+/// `Err` is an accept failure), then never yields again.
+struct Scripted {
+    queue: Mutex<VecDeque<io::Result<tokio::net::UnixStream>>>,
+}
+
+impl Accept for Scripted {
+    async fn accept_client(&self) -> io::Result<tokio::net::UnixStream> {
+        let next = self.queue.lock().expect("script lock").pop_front();
+        match next {
+            Some(item) => item,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// A connected pair: the first end is what the "client" holds, the second is
+/// what the relay "accepts".
+fn pair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
+    tokio::net::UnixStream::pair().expect("socket pair")
+}
+
+/// EMFILE or an aborted handshake says nothing about the listener: the relay
+/// backs off and keeps accepting instead of exiting and tearing down both
+/// sockets.
+#[test]
+fn a_transient_accept_error_does_not_end_the_relay() {
+    let tmp = tmp();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let echo = tmp.path().join("echo.sock");
+        let _keepalive = bind_echo_daemon(&echo);
+        let (mut client, accepted) = pair();
+        let script = Scripted {
+            queue: Mutex::new(VecDeque::from([
+                Err(io::Error::from_raw_os_error(24)), // EMFILE
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "handshake aborted",
+                )),
+                Ok(accepted),
+            ])),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(relay::forward_loop(script, echo, shutdown_rx, 8));
+
+        client.write_all(b"still here").await.expect("write");
+        let mut buffer = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buffer))
+            .await
+            .expect("the relay served the client after two accept errors")
+            .expect("echo read");
+        assert_eq!(&buffer, b"still here");
+        assert!(!server.is_finished(), "the accept loop is still running");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown still ends the loop")
+            .expect("loop joins");
+    });
+}
+
+/// One peer cannot exhaust the relay: past the cap, new connections are
+/// closed at once while the ones in service keep working.
+#[test]
+fn concurrent_relayed_connections_are_capped() {
+    let tmp = tmp();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let echo = tmp.path().join("echo.sock");
+        let _keepalive = bind_echo_daemon(&echo);
+        let (mut first, first_server) = pair();
+        let (mut second, second_server) = pair();
+        let (mut third, third_server) = pair();
+        let script = Scripted {
+            queue: Mutex::new(VecDeque::from([
+                Ok(first_server),
+                Ok(second_server),
+                Ok(third_server),
+            ])),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(relay::forward_loop(script, echo, shutdown_rx, 2));
+
+        for (index, client) in [&mut first, &mut second].into_iter().enumerate() {
+            client.write_all(b"ping").await.expect("write");
+            let mut buffer = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buffer))
+                .await
+                .expect("within the cap, served")
+                .expect("echo read");
+            assert_eq!(&buffer, b"ping", "client {index}");
+        }
+        let mut buffer = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), third.read(&mut buffer))
+            .await
+            .expect("the over-cap client is closed promptly, not left hanging");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the third connection is shed: {read:?}"
+        );
+        // The two in service are unaffected by the shed one.
+        first.write_all(b"pong").await.expect("write");
+        let mut buffer = [0u8; 4];
+        first.read_exact(&mut buffer).await.expect("echo read");
+        assert_eq!(&buffer, b"pong");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown ends the loop")
+            .expect("loop joins");
     });
 }

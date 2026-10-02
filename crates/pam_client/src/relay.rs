@@ -14,13 +14,39 @@
 //! same user could talk to the real daemon anyway). The directory is
 //! created `0700` and the sockets `0600` to keep other users out; see
 //! `docs/session-socket-relay.md` for the full boundary.
+//!
+//! A relay that a sandboxed agent can wedge would cut that agent off from the
+//! daemon with no way to restart it, so the accept loops are hardened: a
+//! transient accept error (out of file descriptors, an aborted handshake) is
+//! retried with backoff instead of ending the relay, concurrent relayed
+//! connections are capped ([`MAX_CONNECTIONS`] per socket; the excess is
+//! closed at once, an honest transport error for that client), and the
+//! daemon-side dial is bounded ([`DAEMON_CONNECT_TIMEOUT`]).
 
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use pam_daemon::runtime_dir::RuntimeDir;
+
+/// How many client connections one relay socket forwards at once. The daemon
+/// bounds its own intake; this keeps a single sandboxed peer from exhausting
+/// the relay's file descriptors.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How long the relay waits to reach the daemon's socket for one client.
+pub const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First pause after a failed `accept`; doubles up to [`ACCEPT_BACKOFF_MAX`].
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+
+/// Cap on the accept-error backoff.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Why the relay could not start or keep running.
 #[derive(Debug, Error)]
@@ -152,37 +178,72 @@ fn session_dir_fallback() -> &'static Path {
 }
 
 /// Forwards one accepted client connection to `target` for its whole life.
-/// A daemon that does not answer closes the client side immediately — the
-/// client's own transport error is the honest signal, and the relay holds
-/// nothing to retry with.
+/// A daemon that does not answer (within [`DAEMON_CONNECT_TIMEOUT`]) closes
+/// the client side immediately — the client's own transport error is the
+/// honest signal, and the relay holds nothing to retry with.
 #[cfg(unix)]
 async fn pipe(mut client: tokio::net::UnixStream, target: PathBuf) {
-    if let Ok(mut daemon) = tokio::net::UnixStream::connect(&target).await {
+    let dialed = tokio::time::timeout(
+        DAEMON_CONNECT_TIMEOUT,
+        tokio::net::UnixStream::connect(&target),
+    )
+    .await;
+    if let Ok(Ok(mut daemon)) = dialed {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon).await;
     }
 }
 
-/// Accepts clients on one relay socket until `shutdown` fires, piping each
-/// to its daemon-side target.
+/// Something that yields client connections: the real
+/// [`tokio::net::UnixListener`], or a scripted source in tests.
 #[cfg(unix)]
-async fn forward_loop(
-    listener: tokio::net::UnixListener,
-    session_socket: PathBuf,
+pub(crate) trait Accept {
+    /// Waits for the next client connection.
+    fn accept_client(&self) -> impl Future<Output = io::Result<tokio::net::UnixStream>> + Send;
+}
+
+#[cfg(unix)]
+impl Accept for tokio::net::UnixListener {
+    async fn accept_client(&self) -> io::Result<tokio::net::UnixStream> {
+        self.accept().await.map(|(stream, _)| stream)
+    }
+}
+
+/// Accepts clients on one relay socket until `shutdown` fires, piping each
+/// to its daemon-side target. An accept error never ends the relay — it is
+/// retried with exponential backoff, because EMFILE or an aborted
+/// connection says nothing about the listener itself — and at most
+/// `max_connections` clients are forwarded at once.
+#[cfg(unix)]
+pub(crate) async fn forward_loop(
+    listener: impl Accept,
     target: PathBuf,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), RelayError> {
+    max_connections: usize,
+) {
+    let slots = Arc::new(Semaphore::new(max_connections));
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
-            accepted = listener.accept() => match accepted {
-                Ok((client, _)) => {
-                    tokio::spawn(pipe(client, target.clone()));
-                }
-                Err(source) => {
-                    return Err(RelayError::Io {
-                        path: session_socket,
-                        source,
+            _ = shutdown.changed() => return,
+            accepted = listener.accept_client() => match accepted {
+                Ok(client) => {
+                    backoff = ACCEPT_BACKOFF_MIN;
+                    let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                        // Over the cap: dropping the stream closes it.
+                        continue;
+                    };
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        pipe(client, target).await;
+                        drop(slot);
                     });
+                }
+                Err(_transient) => {
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                 }
             },
         }
@@ -191,6 +252,12 @@ async fn forward_loop(
 
 /// Runs both forwarding loops until `shutdown`, then removes the socket
 /// files so the next `pam listen` in this directory starts clean.
+///
+/// # Errors
+///
+/// None today: the forwarding loops survive transient accept errors, so
+/// only `shutdown` ends them. The `Result` stays in the signature for the
+/// caller's `?`.
 #[cfg(unix)]
 pub async fn serve(
     bindings: RelayBindings,
@@ -198,24 +265,24 @@ pub async fn serve(
 ) -> Result<(), RelayError> {
     let router = forward_loop(
         bindings.router_listener,
-        bindings.paths.router_socket().to_path_buf(),
         bindings.daemon.router_socket().to_path_buf(),
         shutdown.clone(),
+        MAX_CONNECTIONS,
     );
     let events = forward_loop(
         bindings.events_listener,
-        bindings.paths.events_socket().to_path_buf(),
         bindings.daemon.events_socket().to_path_buf(),
         shutdown,
+        MAX_CONNECTIONS,
     );
-    let result = tokio::try_join!(router, events);
+    tokio::join!(router, events);
     for socket in [
         bindings.paths.router_socket(),
         bindings.paths.events_socket(),
     ] {
         let _ = std::fs::remove_file(socket);
     }
-    result.map(|_| ())
+    Ok(())
 }
 
 /// One `pam listen` run: binds the relay, prints what it forwards and how

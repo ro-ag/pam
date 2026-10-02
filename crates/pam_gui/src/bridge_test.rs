@@ -2,7 +2,10 @@ use pam_client::client::{ClientError, RequestError};
 use pam_proto::{Outcome, Response};
 use serde_json::json;
 
-use crate::bridge::{ADMIN_OPS, BridgeError, deadline_for, is_disconnect, is_known_admin_op};
+use crate::bridge::{
+    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_RELAXED, admin_call, check_confirmation,
+    deadline_for, is_disconnect, is_known_admin_op, required_confirmation,
+};
 
 #[test]
 fn every_daemon_admin_op_is_whitelisted() {
@@ -16,7 +19,8 @@ fn every_daemon_admin_op_is_whitelisted() {
     }
     assert_eq!(
         ADMIN_OPS.len(),
-        10 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
+        // The ten core ops plus `admin.requests.cancel`, which the bridge names itself.
+        11 + pam_daemon::admin_models::MODEL_ADMIN_OPS.len()
             + pam_daemon::admin_logs::LOG_ADMIN_OPS.len()
             + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
             + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len()
@@ -207,6 +211,7 @@ fn private_admin_transport_failure_warns_against_replaying_unknown_effects() {
 #[test]
 fn daemon_refusals_pass_through_verbatim() {
     let refusal = Response::Refusal {
+        retryable: false,
         id: "req_1".to_owned(),
         cause: "already_granted".to_owned(),
         detail: "capability \"echo\" already has an active grant".to_owned(),
@@ -241,4 +246,128 @@ fn results_unwrap_to_their_body_and_tickets_are_rejected() {
     };
     let err = crate::bridge::expect_result(ticket).expect_err("tickets are unexpected");
     assert_eq!(err.cause, "unexpected_ticket");
+}
+
+/// The frontend's `AdminOp` union is the bridge's allowlist, no more and no less: a Rust op the
+/// frontend never uses is surface the webview could still reach, and a frontend op missing here
+/// would be refused at runtime.
+#[test]
+fn the_allowlist_is_exactly_the_ops_the_frontend_names() {
+    let source = include_str!("../../../frontend/src/lib/ipc.ts");
+    let union = source
+        .split_once("export type AdminOp =")
+        .expect("ipc.ts declares the AdminOp union")
+        .1
+        .split_once(';')
+        .expect("the union ends")
+        .0;
+    let mut frontend: Vec<&str> = union
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|name| name.starts_with("admin."))
+        .collect();
+    frontend.sort_unstable();
+    let mut bridge: Vec<&str> = ADMIN_OPS.to_vec();
+    bridge.sort_unstable();
+    assert_eq!(bridge, frontend);
+}
+
+#[test]
+fn authority_expanding_ops_need_a_typed_confirmation() {
+    // Relaxing the profile, any grant, and approving with "remember".
+    assert_eq!(
+        required_confirmation("admin.profile.set", &json!({"profile": "relaxed"})),
+        Some(CONFIRM_RELAXED)
+    );
+    assert_eq!(
+        required_confirmation("admin.profile.set", &json!({})),
+        Some(CONFIRM_RELAXED),
+        "an unreadable target fails closed"
+    );
+    assert_eq!(
+        required_confirmation("admin.grants.add", &json!({"capability": "fs.write"})),
+        Some(CONFIRM_GRANT)
+    );
+    assert_eq!(
+        required_confirmation(
+            "admin.approvals.resolve",
+            &json!({"request_id": "r", "resolution": "approved", "remember": true})
+        ),
+        Some(CONFIRM_GRANT)
+    );
+    // Narrowing and one-time decisions are one click.
+    for (op, args) in [
+        ("admin.profile.set", json!({"profile": "standard"})),
+        ("admin.profile.set", json!({"profile": "strict"})),
+        ("admin.grants.revoke", json!({"capability": "fs.write"})),
+        (
+            "admin.approvals.resolve",
+            json!({"request_id": "r", "resolution": "approved"}),
+        ),
+        (
+            "admin.approvals.resolve",
+            json!({"request_id": "r", "resolution": "approved", "remember": false}),
+        ),
+        (
+            "admin.approvals.resolve",
+            json!({"request_id": "r", "resolution": "denied", "remember": true}),
+        ),
+        ("admin.connectors.configure", json!({"id": "sonar"})),
+    ] {
+        assert_eq!(required_confirmation(op, &args), None, "{op} {args}");
+    }
+}
+
+#[test]
+fn a_missing_or_wrong_confirmation_is_refused_before_the_socket() {
+    let args = json!({"profile": "relaxed"});
+    for given in [None, Some(""), Some("yes"), Some("grant")] {
+        let error = check_confirmation("admin.profile.set", &args, given)
+            .expect_err("the phrase is required");
+        assert_eq!(error.cause, "confirmation_required", "{given:?}");
+        assert!(
+            error.recovery.contains(CONFIRM_RELAXED),
+            "{}",
+            error.recovery
+        );
+    }
+    check_confirmation("admin.profile.set", &args, Some(" Relaxed "))
+        .expect("the phrase, trimmed and case-insensitive, authorises it");
+}
+
+/// The command itself, not only the helper: an unconfirmed relax never gets as far as resolving
+/// a base directory, let alone the admin socket.
+#[tokio::test]
+async fn admin_call_refuses_an_unconfirmed_relax_without_touching_the_socket() {
+    let error = admin_call(
+        "admin.profile.set".to_owned(),
+        json!({"profile": "relaxed"}),
+        None,
+    )
+    .await
+    .expect_err("one click must not relax the profile");
+    assert_eq!(error.cause, "confirmation_required");
+    let error = admin_call(
+        "admin.grants.add".to_owned(),
+        json!({"capability": "x"}),
+        None,
+    )
+    .await
+    .expect_err("a grant needs confirmation too");
+    assert_eq!(error.cause, "confirmation_required");
+}
+
+#[tokio::test]
+async fn cancel_goes_through_the_private_admin_op_and_nothing_goes_public() {
+    // The run card's Cancel is an admin op, forwarded like every other human act.
+    assert!(is_known_admin_op("admin.requests.cancel"));
+    assert_eq!(deadline_for("admin.requests.cancel"), 30_000);
+    // The public-socket capabilities are not reachable through admin_call.
+    for name in ["cancel", "echo", "flow.run", "status", "query", ""] {
+        let error = admin_call(name.to_owned(), json!({"ticket": "t"}), None)
+            .await
+            .expect_err("a public capability is not an admin op");
+        assert_eq!(error.cause, "unknown_admin_op", "{name}");
+    }
 }

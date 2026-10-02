@@ -3,6 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ArrowUpRight, MessageSquare } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
+import {
+  approvalsRefetchInterval,
+  statusRefetchInterval,
+} from "../components/shell/useDaemonStatus";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { PageHeader } from "../components/ui/PageHeader";
@@ -78,12 +82,13 @@ export function HomeScreen() {
   const status = useQuery({
     queryKey: ["daemon", "status"],
     queryFn: daemonStatus,
-    refetchInterval: 5_000,
+    // The beacon's shared cadence: one interval for every observer, backing off on refusals.
+    refetchInterval: statusRefetchInterval,
   });
   const pending = useQuery({
     queryKey: ["approvals", "pending"],
     queryFn: approvalsPending,
-    refetchInterval: 5_000,
+    refetchInterval: approvalsRefetchInterval,
   });
   const [rephrase] = useRephrasePref();
   // Only read when the switch is on: the model line is the only thing on

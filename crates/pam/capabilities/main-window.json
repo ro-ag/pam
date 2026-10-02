@@ -8,7 +8,6 @@
     "core:default",
     "allow-daemon-status",
     "allow-admin-call",
-    "allow-request-capability",
     "allow-daemon-stop",
     "allow-events-subscribe",
     "allow-read-daemon-log",

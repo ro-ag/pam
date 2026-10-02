@@ -1,8 +1,8 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronRight } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { Badge, type BadgeProps } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -12,7 +12,6 @@ import {
   activityList,
   auditRequest,
   callersList,
-  subscribeEvents,
   toBridgeFailure,
   type ActivityRow,
   type AuditRow,
@@ -20,6 +19,7 @@ import {
 import { outcomeLabel } from "../lib/outcome";
 import { repoTail } from "../lib/repo";
 import { exactTime, relativeTime, useNow } from "../lib/time";
+import { useEventRefresh } from "../lib/useEventRefresh";
 import { EvidenceStrip } from "./EvidenceStrip";
 import {
   STATE_FILTERS,
@@ -32,8 +32,9 @@ import {
  * Activity — the default screen: the tide, every request the daemon has seen as a compact row.
  * Rows run in lanes, one per agent, alphabetical so lanes never swap, newest on top within a lane.
  * Chips narrow to an agent or repo via the same `?agent=` / `?repo=` params a shared URL carries.
- * Live-ness: a ~300ms trailing debounce on the daemon event stream coalesces bursts into one
- * refetch; a new request is visible well under a second after its event.
+ * Live-ness: the daemon event stream is a hint, coalesced by the shared trailing throttle
+ * (`useEventRefresh`): a burst is one refetch, refetches are at least ~1.5 s apart, and one in
+ * flight is never cancelled; a new request is visible about a quarter second after its event.
  * Plain list, no virtualization: the daemon clamps replies to 100 rows (v0 volumes) and the panel
  * already scrolls.
  * An expanded row shows the request's audit trail (`admin.audit.request`) under its evidence.
@@ -42,8 +43,11 @@ import {
 /** Rows requested per fetch; the store clamps to the same bound. */
 const LIST_LIMIT = 100;
 
-/** Trailing debounce for event-driven refetches: bursts coalesce. */
-export const EVENT_REFRESH_MS = 300;
+/** How long an event burst settles before its single refetch (the shared throttle's window). */
+export { EVENT_SETTLE_MS as EVENT_REFRESH_MS } from "../lib/useEventRefresh";
+
+/** The queries an event refreshes: the tide and the caller chips. */
+const ACTIVITY_KEYS = [["activity"], ["callers"]] as const;
 
 /** How often the "3m ago" column re-renders. */
 const CLOCK_TICK_MS = 30_000;
@@ -459,7 +463,6 @@ function PamMoment({ children, aside }: { children: ReactNode; aside?: ReactNode
 export function ActivityScreen() {
   const search = useSearch({ from: "/activity" });
   const navigate = useNavigate({ from: "/activity" });
-  const queryClient = useQueryClient();
   const now = useNow(CLOCK_TICK_MS);
   // The settle: a row lands in 180ms, a lane (or a row a chip hides)
   // leaves in 120ms. Reduced motion keeps the arrivals but drops the
@@ -492,33 +495,9 @@ export function ActivityScreen() {
 
   const callers = useQuery({ queryKey: ["callers"], queryFn: callersList });
 
-  // The event stream nudges the queries: one trailing ~300ms window per
-  // burst, then a single refetch. No per-row surgery.
-  useEffect(() => {
-    let timer: number | undefined;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    subscribeEvents(() => {
-      if (timer !== undefined) return;
-      timer = window.setTimeout(() => {
-        timer = undefined;
-        void queryClient.invalidateQueries({ queryKey: ["activity"] });
-        void queryClient.invalidateQueries({ queryKey: ["callers"] });
-      }, EVENT_REFRESH_MS);
-    })
-      .then((stop) => {
-        if (cancelled) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {
-        // No bridge (browser dev) or no stream: nothing to keep live.
-      });
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      unlisten?.();
-    };
-  }, [queryClient]);
+  // The event stream is a hint: the shared trailing throttle coalesces a burst into one
+  // refetch of both queries and never cancels one in flight. No per-row surgery.
+  useEventRefresh(ACTIVITY_KEYS);
 
   const requests = activity.data?.requests;
   const rows = useMemo(

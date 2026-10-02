@@ -3,6 +3,7 @@ import { LoaderCircle } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { backoffRefetchInterval } from "../lib/polling";
 import { engineInstall, engineStatus, toBridgeFailure, type EngineStatus } from "../lib/ipc";
 
 /**
@@ -13,6 +14,9 @@ import { engineInstall, engineStatus, toBridgeFailure, type EngineStatus } from 
 
 /** How often the read-only status re-checks itself. */
 const POLL_MS = 10_000;
+
+/** The engine poll backs off while the daemon refuses or is unreachable. */
+const engineRefetchInterval = backoffRefetchInterval<unknown>({ baseMs: POLL_MS });
 
 /** Causes that mean the existing install needs replacing, not a first install. */
 const REINSTALL_CAUSES = new Set(["stale_release", "server_missing", "manifest_invalid"]);
@@ -51,7 +55,7 @@ export function EngineCard() {
   const status = useQuery({
     queryKey: ["engine", "status"],
     queryFn: engineStatus,
-    refetchInterval: POLL_MS,
+    refetchInterval: engineRefetchInterval,
   });
 
   const install = useMutation({

@@ -9,7 +9,10 @@
 //! free) tears the subscription down and retries with exponential backoff ([`next_backoff`],
 //! capped), reset after any successfully forwarded event. Payload: `PUB` frames are `[topic,
 //! payload]` with the ticket as topic, forwarded as `{ ticket, event }` ([`decode_event_frames`]);
-//! undecodable frames are dropped so wire noise cannot kill the stream.
+//! undecodable frames are dropped so wire noise cannot kill the stream. Events of the GUI's **own**
+//! control requests (`status`, `query`, `cancel`; see [`crate::own_requests`]) are dropped here too:
+//! the daemon publishes lifecycle events for them, and forwarding them would let every status poll
+//! trigger the next one.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +73,13 @@ pub fn decode_event_frames<T: AsRef<[u8]>>(frames: &[T]) -> Option<EventPayload>
     })
 }
 
+/// True for an event the frontend should never see: one belonging to a control request the GUI
+/// itself sent, which would otherwise feed back into its own refresh loop.
+#[must_use]
+pub fn is_own_event(payload: &EventPayload) -> bool {
+    crate::own_requests::is_own(&payload.ticket)
+}
+
 /// Starts the event-forwarding task on first call; later calls are
 /// no-ops. Returns whether this call started it.
 #[tauri::command]
@@ -116,7 +126,9 @@ async fn stream_events(app: &AppHandle, base: &Path) -> bool {
     loop {
         match tokio::time::timeout(IDLE_RECHECK, sub.recv()).await {
             Ok(Ok(message)) => {
-                if let Some(payload) = decode_event_frames(&message.into_vec()) {
+                if let Some(payload) = decode_event_frames(&message.into_vec())
+                    && !is_own_event(&payload)
+                {
                     if app.emit(EVENT_CHANNEL, &payload).is_err() {
                         return delivered;
                     }

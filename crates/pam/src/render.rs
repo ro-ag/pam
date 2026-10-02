@@ -73,12 +73,14 @@ pub fn render_follow_failure(err: &crate::client::RequestError, json: bool) -> O
             detail,
             recovery,
         } => Response::Refusal {
+            retryable: false,
             id: ticket.clone(),
             cause: cause.clone(),
             detail: detail.clone(),
             recovery: recovery.clone(),
         },
         RequestError::FollowTimeout { ticket, waited } => Response::Refusal {
+            retryable: false,
             id: ticket.clone(),
             cause: CAUSE_FOLLOW_TIMEOUT.to_owned(),
             detail: format!("no terminal event within {waited:?}; the request keeps running"),
@@ -89,6 +91,95 @@ pub fn render_follow_failure(err: &crate::client::RequestError, json: bool) -> O
         _ => return None,
     };
     Some(render_json(&response))
+}
+
+/// True when the request may have reached the daemon even though no reply
+/// came back (a missed reply or a broken transport after the send), so it
+/// could still be running: the failures a caller must answer by following
+/// the original request, not by sending it again.
+#[must_use]
+pub fn is_unanswered(err: &crate::client::RequestError) -> bool {
+    use crate::client::RequestError;
+    matches!(
+        err,
+        RequestError::ReplyTimeout { .. } | RequestError::Transport { .. }
+    )
+}
+
+/// The recovery lines for an unanswered stateful request: its id (the
+/// daemon's ticket), how to follow it, and when resubmitting is safe.
+#[must_use]
+pub fn render_unanswered_recovery(id: &str) -> String {
+    format!(
+        "  request id: {id} (the daemon may still be running it)\n  \u{2192} follow it with: pam wait {id}\n    do not submit it again; only if `pam wait {id}` says the request is unavailable did it never reach the daemon, and then it is safe to resubmit"
+    )
+}
+
+/// The `--json` rendering of an unanswered stateful request: the same
+/// `kind: refusal` shape every other `--json` refusal has, with the
+/// request id as `id` and the `pam wait` line as the recovery. `cause` is
+/// `reply_timeout` or `transport_failure`.
+#[must_use]
+pub fn render_unanswered_json(id: &str, err: &crate::client::RequestError) -> String {
+    let cause = match err {
+        crate::client::RequestError::ReplyTimeout { .. } => "reply_timeout",
+        _ => "transport_failure",
+    };
+    render_json(&Response::Refusal {
+        retryable: false,
+        id: id.to_owned(),
+        cause: cause.to_owned(),
+        detail: format!("{err}; the request may still be running in the daemon"),
+        recovery: format!(
+            "Follow it with `pam wait {id}`; do not submit it again. Only if `pam wait {id}` reports the request unavailable did it never reach the daemon."
+        ),
+    })
+}
+
+/// Where a failed request's report goes: a JSON document for stdout (only for
+/// an unanswered stateful request under `--json`), and the stderr text.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RequestFailureReport {
+    /// The `--json` refusal object, when the caller asked for JSON and the
+    /// request may still be running in the daemon.
+    pub stdout: Option<String>,
+    /// The stderr text; empty when the JSON object carries everything.
+    pub stderr: String,
+}
+
+/// How a request that failed client-side is reported.
+///
+/// A stateful request (`flow.run`) whose reply never arrived may still be
+/// running, so it names its `id` and the `pam wait` recovery — as stderr
+/// text, or as the `--json` refusal object ([`render_unanswered_json`], one
+/// document on stdout and nothing else). Every other failure is the plain
+/// `pam <capability>: <error>` line it always was.
+#[must_use]
+pub fn render_request_failure(
+    capability: &str,
+    id: &str,
+    err: &crate::client::RequestError,
+    json: bool,
+) -> RequestFailureReport {
+    if capability == "flow.run" && is_unanswered(err) {
+        if json {
+            return RequestFailureReport {
+                stdout: Some(render_unanswered_json(id, err)),
+                stderr: String::new(),
+            };
+        }
+        return RequestFailureReport {
+            stdout: None,
+            stderr: format!(
+                "pam {capability}: {err}\n{}",
+                render_unanswered_recovery(id)
+            ),
+        };
+    }
+    RequestFailureReport {
+        stdout: None,
+        stderr: format!("pam {capability}: {err}"),
+    }
 }
 
 /// The stderr block for a refusal: cause, detail, recovery — always all
@@ -320,6 +411,8 @@ pub fn render_flow_result(body: &Value) -> String {
         lines.push(summary.to_owned());
     }
 
+    lines.extend(render_effects(body));
+
     for step in steps {
         let text = field(step, "summary").trim_end();
         if text.is_empty() {
@@ -330,9 +423,121 @@ pub fn render_flow_result(body: &Value) -> String {
             "\u{2500}\u{2500} {} \u{2500}\u{2500}",
             field(step, "id")
         ));
-        lines.extend(text.lines().map(|line| format!("  {line}")));
+        if is_model_summary(step) {
+            // A local model wrote this paragraph from the step's output, so
+            // anything in it can be a hostile echo of that output: it is
+            // labelled, and its control characters never reach a terminal.
+            lines.push(format!("  {UNTRUSTED_SUMMARY_LABEL}"));
+            lines.extend(text.lines().map(|line| format!("  {}", printable(line))));
+        } else {
+            lines.extend(text.lines().map(|line| format!("  {line}")));
+        }
     }
     lines.join("\n")
+}
+
+/// The label printed above every step summary a local model wrote.
+pub const UNTRUSTED_SUMMARY_LABEL: &str = "[untrusted local-model summary]";
+
+/// Whether a step's `summary` text was written by a local model.
+///
+/// Today the daemon marks that with a `summary_model` object (the model id
+/// and its qualification record); a step whose summary was skipped, or
+/// composed by the host, has none. A boolean `model_summary`, `untrusted`
+/// or `summary_untrusted` set to true on the step says the same, so a
+/// daemon that marks it explicitly is honoured too. Any one marker is
+/// enough: the label fails towards showing.
+fn is_model_summary(step: &Value) -> bool {
+    step.get("summary_model").is_some_and(Value::is_object)
+        || ["model_summary", "untrusted", "summary_untrusted"]
+            .iter()
+            .any(|key| step.get(*key).and_then(Value::as_bool) == Some(true))
+}
+
+/// `text` with every control character other than a tab replaced by its
+/// `\u{..}` escape, so model-written text cannot drive the terminal.
+fn printable(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\t' {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(ch));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The run's `effects` list: what the flow changed, one line per step.
+///
+/// Absent or empty when no state-changing step ran. When the run stopped
+/// `unresolved` or `blocked` the heading says so: the run failed after it
+/// had already changed something.
+fn render_effects(body: &Value) -> Vec<String> {
+    let Some(effects) = body
+        .get("effects")
+        .and_then(Value::as_array)
+        .filter(|effects| !effects.is_empty())
+    else {
+        return Vec::new();
+    };
+    let stopped = matches!(field(body, "outcome"), "unresolved" | "blocked");
+    let mut lines = vec![
+        String::new(),
+        if stopped {
+            "the run stopped after changing state:".to_owned()
+        } else {
+            "state this run changed:".to_owned()
+        },
+    ];
+    for effect in effects {
+        let mut line = format!(
+            "  {}  {}  {}",
+            field(effect, "step"),
+            field(effect, "kind"),
+            field(effect, "state")
+        );
+        let landing = field(effect, "landing");
+        if !landing.is_empty() {
+            line.push_str("  ");
+            line.push_str(landing);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// The `pam flow inspect` output: the flow id and digest on one line, so a
+/// human can copy the digest into `pam flow run --digest`, then the
+/// inspection itself.
+#[must_use]
+pub fn render_flow_inspect(body: &Value) -> String {
+    let flow = body.get("flow").unwrap_or(&Value::Null);
+    let digest = field(flow, "digest");
+    if digest.is_empty() {
+        return render_body(body);
+    }
+    format!(
+        "flow {}  digest {}\n\n{}",
+        field(flow, "id"),
+        digest,
+        render_body(body)
+    )
+}
+
+/// The `flow.run` arguments: the flow, its inputs, and, only when the
+/// caller pinned one, the digest the flow must still have.
+#[must_use]
+pub fn flow_run_args(id: &str, inputs: &Value, digest: Option<&str>) -> Value {
+    let mut args = serde_json::json!({ "id": id, "inputs": inputs });
+    if let (Some(digest), Some(map)) = (digest, args.as_object_mut()) {
+        map.insert(
+            "expected_digest".to_owned(),
+            Value::String(digest.to_owned()),
+        );
+    }
+    args
 }
 
 /// Parses `pam flow run`'s positional `key=value` arguments into the
@@ -382,6 +587,12 @@ pub fn render_service_report(report: &pam_client::service::ServiceReport) -> Str
         }
     }
     let _ = writeln!(out, "exe       {}", report.exe.display());
+    if let Some(pinned) = &report.pinned_exe {
+        let _ = writeln!(out, "pinned    {}", pinned.display());
+    }
+    if let Some(stale) = &report.stale {
+        let _ = writeln!(out, "stale     {stale}");
+    }
     if let Some(note) = &report.note {
         let _ = writeln!(out, "note      {note}");
     }

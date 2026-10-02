@@ -11,16 +11,17 @@ import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { cn } from "../lib/cn";
 import {
+  adminCall,
   callersList,
   evidenceGet,
   evidenceList,
   flowsInspect,
   flowsRun,
-  requestCapability,
   subscribeEvents,
   toBridgeFailure,
   type BridgeFailure,
   type FlowInspectBlocker,
+  type FlowEffectRecord,
   type FlowInspection,
   type FlowListEntry,
   type FlowResult,
@@ -163,6 +164,40 @@ function StepTable({ steps }: { steps: FlowStepReport[] }) {
   );
 }
 
+/** What a stopped run changed first: `possibly_applied` is a step that started and then failed. */
+const EFFECT_STATE_LABELS: Record<FlowEffectRecord["state"], string> = {
+  applied: "applied",
+  possibly_applied: "possibly applied",
+};
+
+/**
+ * A run that ended `unresolved` or `blocked` after a state-changing step ran did not leave
+ * things as it found them. The sentence says that first; the list says which steps, and
+ * whether each one is known to have applied.
+ */
+function EffectsList({ effects }: { effects: FlowEffectRecord[] }) {
+  return (
+    <div aria-label="changes before the run stopped" className="space-y-2">
+      <p className="max-w-xl font-sans text-sm font-medium text-ink">
+        The run stopped after it changed something.
+      </p>
+      <ul className="space-y-1">
+        {effects.map((effect) => (
+          <li key={effect.step} className="flex flex-wrap items-center gap-2">
+            <span className="font-data text-xs text-ink">{effect.step}</span>
+            {effect.landing && (
+              <span className="font-data text-xs text-ink-faint">{effect.landing}</span>
+            )}
+            <Badge tone={effect.state === "applied" ? "neutral" : "warning"}>
+              {EFFECT_STATE_LABELS[effect.state] ?? effect.state}
+            </Badge>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** The verdict card: outcome chip, Pam's sentence, then the step table. */
 function FlowVerdict({ result }: { result: FlowResult }) {
   return (
@@ -176,6 +211,8 @@ function FlowVerdict({ result }: { result: FlowResult }) {
         </span>
       </div>
       <p className="max-w-xl select-text font-sans text-sm text-ink">{result.summary}</p>
+      {(result.outcome === "unresolved" || result.outcome === "blocked") &&
+        (result.effects?.length ?? 0) > 0 && <EffectsList effects={result.effects ?? []} />}
       <StepTable steps={result.steps} />
     </div>
   );
@@ -337,6 +374,13 @@ export interface FlowRunState {
   settled: string | null;
   refused: boolean;
 }
+
+/** The daemon's refusal for a run pinned to a flow digest the flow no longer has. */
+const CAUSE_FLOW_CHANGED = "flow_changed";
+
+/** The way out of `flow_changed` for a human in the GUI (the daemon's own line names the CLI). */
+const FLOW_CHANGED_RECOVERY =
+  "The flow was edited after you opened it, so it did not run. It has been reloaded: review it, check readiness, then run it again.";
 
 /** How many events the card keeps while its ticket is still unknown. */
 const EARLY_EVENT_CAP = 64;
@@ -501,7 +545,8 @@ export function FlowRunCard({
     setTicket(null);
     ticketRef.current = null;
     early.current = [];
-    flowsRun(flow.id, repo.trim(), values)
+    // Pinned to the flow the card is showing: an edit since then is refused, never run.
+    flowsRun(flow.id, repo.trim(), values, flow.digest || inspection?.flow.digest)
       .then((reply) => {
         ticketRef.current = reply.ticket;
         setTicket(reply.ticket);
@@ -509,17 +554,29 @@ export function FlowRunCard({
         early.current = [];
         for (const payload of waiting) apply(payload);
       })
-      .catch((error) => setFailure(toBridgeFailure(error)))
+      .catch((error) => {
+        const refusal = toBridgeFailure(error);
+        if (refusal.cause !== CAUSE_FLOW_CHANGED) {
+          setFailure(refusal);
+          return;
+        }
+        // The flow was edited after this card showed it: nothing ran. Say so, reload what the
+        // list and the editor show, and drop the readiness read of the old version.
+        setFailure({ ...refusal, recovery: FLOW_CHANGED_RECOVERY });
+        setInspection(null);
+        void queryClient.invalidateQueries({ queryKey: ["flows"] });
+        void queryClient.invalidateQueries({ queryKey: ["flow", flow.id] });
+      })
       .finally(() => setStarting(false));
   };
 
-  // `cancel` is an ordinary capability the daemon exposes to anyone who
-  // holds the ticket; the GUI asks as itself and the audit names a human.
+  // Cancelling is an admin op on the private channel, so the audit trail names the human who
+  // pressed the button, not an agent that happened to hold the ticket.
   const cancel = () => {
     if (ticket === null) return;
     setCancelling(true);
     setFailure(null);
-    requestCapability("cancel", { ticket })
+    adminCall("admin.requests.cancel", { ticket })
       .catch((error) => setFailure(toBridgeFailure(error)))
       .finally(() => setCancelling(false));
   };

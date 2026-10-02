@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BRIDGE_TIMEOUT_MS,
   BridgeUnavailable,
+  CONFIRM_GRANT,
+  CONFIRM_RELAXED,
+  STATUS_TIMEOUT_MS,
+  approvalsResolve,
+  grantsAdd,
+  profileSet,
   FLOW_CONNECTORS,
   FLOW_CONNECTOR_CALLS,
   activityList,
@@ -41,7 +48,9 @@ import {
   modelsTry,
   modelsUnload,
   modelsVerify,
-  requestCapability,
+  revokedStepCount,
+  snapshotDigest,
+  type PendingApproval,
   subscribeEvents,
   toBridgeFailure,
 } from "./ipc";
@@ -74,7 +83,6 @@ describe("ipc without the app shell", () => {
     ["activityList", () => activityList()],
     ["grantsList", () => grantsList()],
     ["evidenceStats", () => evidenceStats()],
-    ["requestCapability", () => requestCapability("echo", { hello: "pam" })],
     ["subscribeEvents", () => subscribeEvents(() => {})],
   ] as const)("%s rejects with BridgeUnavailable", async (_name, call) => {
     await expect(call()).rejects.toBeInstanceOf(BridgeUnavailable);
@@ -91,6 +99,117 @@ describe("ipc without the app shell", () => {
       detail: failure.detail,
       recovery: failure.recovery,
     });
+  });
+});
+
+/**
+ * An `invoke` cannot be aborted, so a bridge call that never answers would hold its caller (and
+ * the daemon-side permit behind it) forever. Every wrapper therefore rejects with the uniform
+ * `reply_timeout` failure once its bound passes.
+ */
+describe("bridge calls have a client-side timeout", () => {
+  beforeEach(() => {
+    bridge.inShell = true;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    bridge.inShell = false;
+    vi.useRealTimers();
+  });
+
+  it("gives up on a status poll the bridge never answers", async () => {
+    bridge.invoke.mockImplementation(() => new Promise(() => {}));
+    const outcome = daemonStatus().then(
+      () => "answered",
+      (error: unknown) => toBridgeFailure(error).cause,
+    );
+    await vi.advanceTimersByTimeAsync(STATUS_TIMEOUT_MS - 1);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(await outcome).toBe("reply_timeout");
+  });
+
+  it("gives an admin read the ordinary bound, and a model run far longer", async () => {
+    bridge.invoke.mockImplementation(() => new Promise(() => {}));
+    let listed = "pending";
+    void approvalsPending().catch(() => {
+      listed = "timed out";
+    });
+    let tried = "pending";
+    void modelsTry("m", "hi").catch(() => {
+      tried = "timed out";
+    });
+    await vi.advanceTimersByTimeAsync(BRIDGE_TIMEOUT_MS + 1);
+    expect(listed).toBe("timed out");
+    expect(tried).toBe("pending");
+    await vi.advanceTimersByTimeAsync(110_000);
+    expect(tried).toBe("timed out");
+  });
+
+  it("does not time out an answer that arrives in time", async () => {
+    bridge.invoke.mockResolvedValue({ connected: true, status: {} });
+    await expect(daemonStatus()).resolves.toEqual({ connected: true, status: {} });
+    await vi.advanceTimersByTimeAsync(BRIDGE_TIMEOUT_MS * 4);
+  });
+});
+
+describe("authority-expanding wrappers pass the typed confirmation to the bridge", () => {
+  beforeEach(() => {
+    bridge.inShell = true;
+    bridge.invoke.mockResolvedValue({});
+  });
+
+  afterEach(() => {
+    bridge.inShell = false;
+  });
+
+  it("sends the phrase beside the op, not inside its args", async () => {
+    await profileSet("relaxed", CONFIRM_RELAXED);
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.profile.set",
+      args: { profile: "relaxed" },
+      confirmation: "relaxed",
+    });
+    await grantsAdd("fs.write", CONFIRM_GRANT);
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.grants.add",
+      args: { capability: "fs.write" },
+      confirmation: "grant",
+    });
+    await approvalsResolve("req_1", "approved", {
+      remember: true,
+      note: "ok",
+      confirmation: CONFIRM_GRANT,
+    });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.approvals.resolve",
+      args: { request_id: "req_1", resolution: "approved", remember: true, note: "ok" },
+      confirmation: "grant",
+    });
+  });
+
+  it("pins an approval to the flow digest the card showed, only when it has one", async () => {
+    await approvalsResolve("req_1", "approved", { expectedDigest: "ab".repeat(32) });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.approvals.resolve",
+      args: { request_id: "req_1", resolution: "approved", expected_digest: "ab".repeat(32) },
+      confirmation: undefined,
+    });
+    await approvalsResolve("req_1", "denied");
+    const calls = bridge.invoke.mock.calls;
+    const [, payload] = calls[calls.length - 1] as [string, { args: object }];
+    expect(payload.args).not.toHaveProperty("expected_digest");
+  });
+
+  it("reads the digest from either name the daemon snapshot may use", () => {
+    const base = { request_id: "r" } as PendingApproval;
+    const resolved = { program: "git", argv: [] };
+    expect(snapshotDigest({ ...base, resolved: { ...resolved, digest: "d1" } })).toBe("d1");
+    expect(snapshotDigest({ ...base, resolved: { ...resolved, flow_digest: "d2" } })).toBe(
+      "d2",
+    );
+    expect(snapshotDigest({ ...base, resolved })).toBeNull();
+    expect(snapshotDigest({ ...base, resolved: null })).toBeNull();
   });
 });
 
@@ -334,6 +453,18 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       { id: "pr-readiness", repo: "/work/pam", inputs: { base: "main" } },
     ],
     [
+      "flowsRun (pinned to the shown digest)",
+      () => flowsRun("pr-readiness", "/work/pam", {}, "cd".repeat(32)),
+      "admin.flows.run",
+      { id: "pr-readiness", repo: "/work/pam", inputs: {}, expected_digest: "cd".repeat(32) },
+    ],
+    [
+      "cancel (private channel)",
+      () => adminCall("admin.requests.cancel", { ticket: "req_run" }),
+      "admin.requests.cancel",
+      { ticket: "req_run" },
+    ],
+    [
       "flowsRun (nothing declared)",
       () => flowsRun("pr-readiness", "/work/pam"),
       "admin.flows.run",
@@ -443,5 +574,16 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
   it("sends an untouched connector field as an absent key, not an empty string", async () => {
     await connectorsConfigure("github", { enabled: false });
     expect(sent().args).toEqual({ id: "github", enabled: false });
+  });
+
+  it("counts the steps a save or delete took the remembered approval from", () => {
+    expect(revokedStepCount({})).toBeNull();
+    expect(revokedStepCount(undefined)).toBeNull();
+    expect(revokedStepCount({ grants_revoked: [] })).toBeNull();
+    expect(
+      revokedStepCount({ grants_revoked: ["flow.step:a/build", "flow.step:a/push"] }),
+    ).toBe(2);
+    // The daemon said approval is needed again without listing which steps.
+    expect(revokedStepCount({ reapproval_required: true })).toBe(1);
   });
 });

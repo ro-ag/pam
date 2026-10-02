@@ -163,6 +163,132 @@ describe("useDaemonStatus", () => {
     await waitFor(() => expect(result.current).toBe("pending"));
   });
 
+  describe("the status feedback loop (issue 35)", () => {
+    const busy = {
+      cause: "request_capacity_exhausted",
+      detail: "the control pool is full",
+      recovery: "Retry shortly.",
+    };
+
+    /** Mounts with the event stream wired and returns the captured handler. */
+    async function mountWithEvents() {
+      let handler: ((payload: PamEventPayload) => void) | undefined;
+      mockSubscribe.mockImplementation((h) => {
+        handler = h;
+        return Promise.resolve(() => {});
+      });
+      mockStatus.mockResolvedValue(up);
+      const hook = mount();
+      await tick(0);
+      expect(handler).toBeDefined();
+      return { hook, emit: (payload: PamEventPayload) => act(() => handler?.(payload)) };
+    }
+
+    it("turns a burst of events into at most one approvals refetch and no status poll", async () => {
+      vi.useFakeTimers();
+      const { emit } = await mountWithEvents();
+      const statusCalls = mockStatus.mock.calls.length;
+      const pendingCalls = mockPending.mock.calls.length;
+
+      // Two hundred done/refused/approval events, the way a busy agent (or the daemon's own
+      // lifecycle events for our status polls) would deliver them.
+      for (let index = 0; index < 200; index += 1) {
+        emit({ ticket: `req_${index}`, event: { kind: index % 2 ? "done" : "refused" } });
+      }
+      await tick(2_000);
+      expect(mockPending.mock.calls.length).toBe(pendingCalls + 1);
+      // Events are hints for the approvals only: the status call (public socket) is never
+      // event-driven, so a status poll's own events cannot start the next status poll.
+      expect(mockStatus.mock.calls.length).toBe(statusCalls);
+    });
+
+    it("ignores queued, started and progress events altogether", async () => {
+      vi.useFakeTimers();
+      const { emit } = await mountWithEvents();
+      const pendingCalls = mockPending.mock.calls.length;
+      for (const event of [
+        { kind: "queued" },
+        { kind: "started" },
+        { kind: "progress", note: "x" },
+      ] as const) {
+        emit({ ticket: "req_1", event });
+      }
+      await tick(4_000);
+      expect(mockPending.mock.calls.length).toBe(pendingCalls);
+    });
+
+    it("never restarts a poll that is still in flight when events arrive", async () => {
+      vi.useFakeTimers();
+      let release: (value: typeof up) => void = () => {};
+      let signalAborted = false;
+      const { emit } = await mountWithEvents();
+      mockPending.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve({ pending: [] });
+            signalAborted = false;
+          }),
+      );
+      emit({ ticket: "req_1", event: { kind: "done" } });
+      await tick(400);
+      const started = mockPending.mock.calls.length;
+      for (let index = 0; index < 20; index += 1) {
+        emit({ ticket: "req_2", event: { kind: "done" } });
+        await tick(500);
+      }
+      // Still the one in-flight fetch: nothing was cancelled and restarted.
+      expect(mockPending.mock.calls.length).toBe(started);
+      expect(signalAborted).toBe(false);
+      release(up);
+    });
+
+    it("backs off exponentially while the daemon answers request_capacity_exhausted", async () => {
+      vi.useFakeTimers();
+      mockStatus.mockRejectedValue(busy);
+      mount();
+      await tick(0);
+      expect(mockStatus).toHaveBeenCalledTimes(1);
+
+      // Failure 1 -> asked again after the base 5 s; failure 2 -> 10 s; failure 3 -> 20 s.
+      await tick(STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(2);
+      await tick(STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(2);
+      await tick(STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(3);
+      await tick(3 * STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(3);
+      await tick(STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(4);
+    });
+
+    it("returns to the base cadence once the daemon answers again", async () => {
+      vi.useFakeTimers();
+      mockStatus.mockRejectedValueOnce(busy).mockRejectedValueOnce(busy);
+      mockStatus.mockResolvedValue(up);
+      mount();
+      await tick(0);
+      await tick(STATUS_POLL_MS);
+      await tick(2 * STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(3);
+      // Healthy again: the next poll is a plain 5 s away.
+      await tick(STATUS_POLL_MS);
+      expect(mockStatus).toHaveBeenCalledTimes(4);
+    });
+
+    it("does not read a busy refusal as the daemon being down", async () => {
+      vi.useFakeTimers();
+      mockStatus.mockResolvedValueOnce(up);
+      const { result } = mount();
+      await tick(0);
+      expect(result.current).toBe("connected");
+      mockStatus.mockRejectedValue(busy);
+      for (let poll = 0; poll < 4; poll += 1) await tick(STATUS_POLL_MS * 2 ** poll);
+      // Four refusals in a row: the daemon is saturated, not gone.
+      expect(result.current).toBe("connected");
+    });
+  });
+
   it("shares its queries with the screens under the documented keys", async () => {
     mockStatus.mockResolvedValue(up);
     const { result } = mount();

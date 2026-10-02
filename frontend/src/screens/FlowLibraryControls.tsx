@@ -8,11 +8,25 @@ import {
   flowsGet,
   flowsNormalize,
   flowsSave,
+  revokedStepCount,
   toBridgeFailure,
   type BridgeFailure,
   type FlowListEntry,
+  type GrantRevocation,
 } from "../lib/ipc";
 import { toRaw } from "./flow-canvas/graph";
+
+/**
+ * What a save or delete tells the human when it removed remembered approvals: the changed steps
+ * ask again. Runs that were waiting on those steps end, so no promise is made about them.
+ */
+export function revokedNotice(reply: GrantRevocation | null | undefined): string | null {
+  const count = revokedStepCount(reply);
+  if (count === null) return null;
+  return count === 1
+    ? "1 step changed. Its remembered approval was removed and it will ask again."
+    : `${count} steps changed. Their remembered approval was removed and they will ask again.`;
+}
 
 export type LibraryDraft = { id: string; yaml: string; dirty: boolean; saveDisabled?: boolean };
 type Mode = "new" | "duplicate" | "rename" | "delete";
@@ -83,6 +97,7 @@ export function useFlowLibraryControls({
   const [program, setProgram] = useState("");
   const [argumentsText, setArgumentsText] = useState("");
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
+  const [revoked, setRevoked] = useState<string | null>(null);
   const [pending, setPending] = useState<{ proceed: () => void; cancel?: () => void } | null>(
     null,
   );
@@ -108,6 +123,7 @@ export function useFlowLibraryControls({
     locked.current = true;
     setBusy(true);
     setFailure(null);
+    setRevoked(null);
     try {
       await action();
       return true;
@@ -118,6 +134,11 @@ export function useFlowLibraryControls({
       locked.current = false;
       setBusy(false);
     }
+  }
+  /** Tells the human a save or delete removed remembered approvals, when it did. */
+  function announce(reply: GrantRevocation | null | undefined) {
+    const notice = revokedNotice(reply);
+    if (notice) setRevoked(notice);
   }
   async function refresh(flowId: string | null) {
     await client.invalidateQueries({ queryKey: ["flows"] });
@@ -166,6 +187,7 @@ export function useFlowLibraryControls({
       if (mode === "delete" && subject) {
         const original = await flowsGet(subject.id);
         const result = await flowsDelete(subject.id);
+        announce(result);
         setDeleted({ id: subject.id, yaml: original.yaml, revealed: result.revealed_builtin });
         await refresh(result.revealed_builtin ? subject.id : null);
       } else {
@@ -208,7 +230,9 @@ export function useFlowLibraryControls({
             };
           yaml = normalized.yaml;
         }
-        await flowsSave(cleanId, yaml, mode === "rename" ? {} : { create_only: true });
+        announce(
+          await flowsSave(cleanId, yaml, mode === "rename" ? {} : { create_only: true }),
+        );
         await refresh(cleanId);
       }
       setMode(null);
@@ -219,7 +243,7 @@ export function useFlowLibraryControls({
   const saveDraft = (current: LibraryDraft) =>
     void perform(async () => {
       if (!current.dirty || current.id !== selected?.id || current.saveDisabled) return;
-      await flowsSave(current.id, current.yaml);
+      announce(await flowsSave(current.id, current.yaml));
       await refresh(current.id);
     });
   const cancelMode = () => {
@@ -274,6 +298,11 @@ export function useFlowLibraryControls({
   );
   const dialogs = (
     <>
+      {revoked && (
+        <p role="status" className="rounded-card border border-line p-3 text-sm text-ink-muted">
+          {revoked}
+        </p>
+      )}
       {deleted && (
         <div
           role="status"
@@ -292,10 +321,12 @@ export function useFlowLibraryControls({
               requestNavigation(
                 () =>
                   void perform(async () => {
-                    await flowsSave(deleted.id, deleted.yaml, {
-                      create_only: true,
-                      ...(deleted.revealed ? { allow_builtin_override: true } : {}),
-                    });
+                    announce(
+                      await flowsSave(deleted.id, deleted.yaml, {
+                        create_only: true,
+                        ...(deleted.revealed ? { allow_builtin_override: true } : {}),
+                      }),
+                    );
                     await refresh(deleted.id);
                     setDeleted(null);
                   }),
@@ -456,7 +487,7 @@ export function useFlowLibraryControls({
                 if (!draft || draft.saveDisabled) return;
                 const proceed = pending.proceed;
                 const saved = await perform(async () => {
-                  await flowsSave(draft.id, draft.yaml);
+                  announce(await flowsSave(draft.id, draft.yaml));
                   await refresh(draft.id);
                 });
                 if (saved) {

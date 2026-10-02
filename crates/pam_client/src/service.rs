@@ -4,8 +4,14 @@
 //! platforms on any host with a fake; platform managers are compiled everywhere and selected by
 //! [`ServiceEnv::platform`]. Never sudo, admin, or root — user scope only.
 //!
-//! Install semantics: stop a loose daemon first (bounded, through [`crate::client::stop_daemon`])
-//! so the managed instance takes over, write the unit, register and start it. Uninstall unregisters
+//! Install semantics: refuse to pin a binary that must not run at every login
+//! ([`unsafe_exe_reason`]: a temp dir, a cargo `target/` dir, a group- or world-writable file or
+//! directory), write the unit **first** (a failed write leaves the running daemon alone), then stop a
+//! loose daemon (bounded, through [`crate::client::stop_daemon`]) so the managed instance takes
+//! over, then register and start it. The unit carries a `PAM_BASE_DIR` only when the caller asked
+//! for one explicitly (`pam service install --base-dir`), never because the environment happened to
+//! hold one: an agent-set variable must not outlive the shell it was set in. `status` reports a
+//! pinned executable that is missing or is not the running binary. Uninstall unregisters
 //! and removes the unit; on macOS and Linux the manager also stops the managed daemon (`launchctl
 //! bootout`, `systemctl disable --now`), and the next pam command starts one lazily. `pam daemon`
 //! exits 0 on `already running`, so a manager never restart-loops against a loose instance.
@@ -105,8 +111,15 @@ pub enum ServiceState {
 pub struct ServiceReport {
     /// Lowercase platform name ([`Platform::as_str`]).
     pub platform: &'static str,
-    /// The `pam` binary the unit runs.
+    /// The `pam` binary this process is (what `install` pins).
     pub exe: PathBuf,
+    /// The executable the installed unit actually runs, read back from the
+    /// unit file; `None` when there is no unit or the platform's task
+    /// manager does not expose it.
+    pub pinned_exe: Option<PathBuf>,
+    /// Why the pinned executable is stale (missing, or not this binary);
+    /// `None` when it matches or cannot be read.
+    pub stale: Option<String>,
     /// Where the unit stands after the command.
     pub state: ServiceState,
     /// Something the human should know (a loose daemon was stopped, or
@@ -132,21 +145,29 @@ pub struct ServiceEnv {
 
 impl ServiceEnv {
     /// Resolves the current process: platform, `current_exe`, home, and
-    /// whether `base` is an override of `~/.pam`.
+    /// the base the managed daemon will use.
+    ///
+    /// `requested_base` is a base the **caller asked for** (the CLI's
+    /// `--base-dir`, or the GUI's own resolved base); `None` means the
+    /// default `~/.pam`. Only an explicit request that differs from the
+    /// default becomes a `PAM_BASE_DIR` in the unit — the process
+    /// environment is deliberately not consulted here.
     ///
     /// # Errors
     ///
     /// [`ServiceError::NoHome`] when the home directory is unknown,
     /// [`ServiceError::NoExe`] when `current_exe` fails.
-    pub fn detect(base: &Path) -> Result<Self, ServiceError> {
+    pub fn detect(requested_base: Option<&Path>) -> Result<Self, ServiceError> {
         let home = std::env::home_dir().ok_or(ServiceError::NoHome)?;
         let exe = std::env::current_exe().map_err(ServiceError::NoExe)?;
-        let base_override = (base != home.join(".pam")).then(|| base.to_path_buf());
+        let default = home.join(".pam");
+        let base = requested_base.map_or_else(|| default.clone(), Path::to_path_buf);
+        let base_override = (base != default).then(|| base.clone());
         Ok(Self {
             platform: Platform::current(),
             exe,
             home,
-            base: base.to_path_buf(),
+            base,
             base_override,
         })
     }
@@ -231,6 +252,15 @@ pub enum ServiceError {
     /// Stopping the loose daemon before the install failed.
     #[error("stopping the running daemon failed: {0}")]
     Stop(#[from] StopError),
+    /// The executable `install` would pin into the login unit is somewhere
+    /// a login-start binary must not live.
+    #[error("refusing to pin {} into the login unit: {reason}", path.display())]
+    UnsafeExe {
+        /// The executable that would have been pinned.
+        path: PathBuf,
+        /// Why it is not acceptable.
+        reason: String,
+    },
 }
 
 impl ServiceError {
@@ -247,6 +277,10 @@ impl ServiceError {
             Self::Command { .. } => "Read the manager's message above; fix it and retry.",
             Self::Unsupported { .. } => "Start the daemon lazily instead: any pam command does.",
             Self::Stop(_) => "Stop the daemon with `pam daemon stop`, then retry.",
+            Self::UnsafeExe { .. } => {
+                "Install pam in a stable, user-owned location (the app bundle, or a directory only \
+                 you can write) and run `pam service install` from that copy."
+            }
         }
     }
 }
@@ -314,7 +348,11 @@ pub fn render_systemd_unit(exe: &Path, base_override: Option<&Path>) -> String {
         "[Unit]\nDescription=pam daemon (local lifeguard for developers and AI agents)\n\n",
     );
     unit.push_str("[Service]\n");
-    let _ = writeln!(unit, "ExecStart=\"{}\" daemon", exe.display());
+    let _ = writeln!(
+        unit,
+        "ExecStart=\"{}\" daemon",
+        systemd_exec_quote(&exe.display().to_string())
+    );
     unit.push_str("Restart=on-failure\nRestartSec=2\n");
     if let Some(base) = base_override {
         let _ = writeln!(
@@ -330,15 +368,26 @@ pub fn render_systemd_unit(exe: &Path, base_override: Option<&Path>) -> String {
 /// Escapes `value` for the inside of a double-quoted systemd assignment
 /// (`Environment="KEY=value"`): a bare value splits on whitespace, and
 /// inside the quotes only backslash and the quote itself need escaping.
+/// `%` starts a unit specifier (`%h`, `%t`, …) in every setting, so a
+/// literal one is doubled.
 fn systemd_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len());
     for ch in value.chars() {
         if matches!(ch, '\\' | '"') {
             quoted.push('\\');
         }
+        if ch == '%' {
+            quoted.push('%');
+        }
         quoted.push(ch);
     }
     quoted
+}
+
+/// [`systemd_quote`] for an `ExecStart=` word, where `$` also starts a
+/// variable expansion and is doubled to stay literal.
+fn systemd_exec_quote(value: &str) -> String {
+    systemd_quote(value).replace('$', "$$")
 }
 
 /// Reads the `Status:` line of `schtasks /Query /FO LIST` output. A task
@@ -363,6 +412,161 @@ pub fn windows_task_loaded(query_output: &str) -> bool {
 #[must_use]
 pub fn windows_task_action(exe: &Path) -> String {
     format!("conhost.exe --headless \"{}\" daemon", exe.display())
+}
+
+// --- the pinned executable --------------------------------------------------
+
+/// Directories whose contents are scratch space by convention, in addition
+/// to the platform's [`std::env::temp_dir`].
+const SCRATCH_ROOTS: [&str; 6] = [
+    "/tmp",
+    "/var/tmp",
+    "/private/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+];
+
+/// Why `exe` must not be pinned into a login unit, or `None` when it may be.
+///
+/// A login unit launches its binary unsandboxed at every login, so the
+/// binary has to be one the human put there: not a build or scratch
+/// artifact an agent could have produced (a temp dir, a cargo `target/`
+/// directory) and not a file or directory that another account or group
+/// could swap. A path that does not exist is not judged by its
+/// permissions (there is nothing to stat); `status` reports a missing
+/// pinned binary as stale instead.
+#[must_use]
+pub fn unsafe_exe_reason(exe: &Path) -> Option<String> {
+    let temp = std::env::temp_dir();
+    let mut scratch: Vec<PathBuf> = SCRATCH_ROOTS.iter().map(PathBuf::from).collect();
+    scratch.push(temp.clone());
+    scratch.extend(std::fs::canonicalize(&temp).ok());
+    unsafe_exe_reason_with(exe, &scratch)
+}
+
+/// [`unsafe_exe_reason`] with the scratch roots injected.
+#[must_use]
+pub fn unsafe_exe_reason_with(exe: &Path, scratch_roots: &[PathBuf]) -> Option<String> {
+    let canonical = std::fs::canonicalize(exe).ok();
+    for candidate in std::iter::once(exe).chain(canonical.as_deref()) {
+        if scratch_roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty() && candidate.starts_with(root))
+        {
+            return Some("it lives in a temporary directory".to_owned());
+        }
+        if in_cargo_target(candidate) {
+            return Some("it is a cargo build artifact (a `target/` directory)".to_owned());
+        }
+    }
+    writable_reason(canonical.as_deref().unwrap_or(exe))
+}
+
+/// True for `…/target/…/debug|release/…`: a cargo build output path.
+fn in_cargo_target(path: &Path) -> bool {
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    names
+        .iter()
+        .position(|name| *name == "target")
+        .is_some_and(|at| {
+            names[at + 1..]
+                .iter()
+                .any(|name| matches!(*name, "debug" | "release"))
+        })
+}
+
+/// Group- or world-writable executable or containing directory (unix).
+#[cfg(unix)]
+fn writable_reason(exe: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let loose = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o022 != 0)
+    };
+    if loose(exe) {
+        return Some("the file is writable by its group or by everyone".to_owned());
+    }
+    match exe.parent() {
+        Some(dir) if loose(dir) => Some(format!(
+            "its directory {} is writable by its group or by everyone",
+            dir.display()
+        )),
+        _ => None,
+    }
+}
+
+/// Windows ACLs are not inspected here.
+#[cfg(not(unix))]
+fn writable_reason(_exe: &Path) -> Option<String> {
+    None
+}
+
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The executable a `LaunchAgent` plist runs: the first `<string>` after
+/// `ProgramArguments`.
+#[must_use]
+pub fn pinned_exe_from_plist(plist: &str) -> Option<PathBuf> {
+    let after = plist.split_once("<key>ProgramArguments</key>")?.1;
+    let start = after.split_once("<string>")?.1;
+    let value = start.split_once("</string>")?.0;
+    Some(PathBuf::from(xml_unescape(value)))
+}
+
+/// The executable a systemd unit runs: the first word of `ExecStart=`,
+/// undoing `systemd_quote`'s escaping.
+#[must_use]
+pub fn pinned_exe_from_systemd(unit: &str) -> Option<PathBuf> {
+    let line = unit
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ExecStart="))?;
+    let rest = line.trim().strip_prefix('"')?;
+    let mut word = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(PathBuf::from(word)),
+            '\\' => word.extend(chars.next()),
+            '%' | '$' if chars.peek() == Some(&ch) => {
+                chars.next();
+                word.push(ch);
+            }
+            other => word.push(other),
+        }
+    }
+    None
+}
+
+/// Whether the unit's pinned executable still matches this binary: `None`
+/// when it does, else why not.
+fn stale_reason(pinned: &Path, running: &Path) -> Option<String> {
+    if !pinned.exists() {
+        return Some(format!(
+            "the unit runs {}, which no longer exists; run `pam service install` from the current binary",
+            pinned.display()
+        ));
+    }
+    let same = match (
+        std::fs::canonicalize(pinned),
+        std::fs::canonicalize(running),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => pinned == running,
+    };
+    (!same).then(|| {
+        format!(
+            "the unit runs {}, not this binary ({}); run `pam service install` to repoint it",
+            pinned.display(),
+            running.display()
+        )
+    })
 }
 
 // --- managers ---------------------------------------------------------------
@@ -447,8 +651,32 @@ fn report(env: &ServiceEnv, state: ServiceState, note: Option<String>) -> Servic
     ServiceReport {
         platform: env.platform.as_str(),
         exe: env.exe.clone(),
+        pinned_exe: None,
+        stale: None,
         state,
         note,
+    }
+}
+
+/// [`report`] for an installed unit: reads the pinned executable back from
+/// the unit text and says when it is stale.
+fn installed_report(
+    env: &ServiceEnv,
+    state: ServiceState,
+    unit_text: Option<&str>,
+) -> ServiceReport {
+    let pinned_exe = unit_text.and_then(|text| match env.platform {
+        Platform::Macos => pinned_exe_from_plist(text),
+        Platform::Linux => pinned_exe_from_systemd(text),
+        Platform::Windows | Platform::Other => None,
+    });
+    let stale_why = pinned_exe
+        .as_deref()
+        .and_then(|pinned| stale_reason(pinned, &env.exe));
+    ServiceReport {
+        pinned_exe,
+        stale: stale_why,
+        ..report(env, state, None)
     }
 }
 
@@ -485,6 +713,7 @@ pub fn status(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport, Se
     }
     let unit = unit_path(env);
     let unit_name = unit.display().to_string();
+    let unit_text = std::fs::read_to_string(&unit).ok();
     let state = match env.platform {
         Platform::Macos => {
             if unit.is_file() {
@@ -540,7 +769,10 @@ pub fn status(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport, Se
         }
         Platform::Other => unreachable!("filtered by unsupported()"),
     };
-    Ok(report(env, state, None))
+    let text = matches!(state, ServiceState::Installed { .. })
+        .then_some(unit_text.as_deref())
+        .flatten();
+    Ok(installed_report(env, state, text))
 }
 
 /// Registers the login-start unit and starts it now, stopping a loose
@@ -572,14 +804,18 @@ fn stop_note(stop: StopFn<'_>, base: &Path) -> Result<Option<String>, ServiceErr
     }
 }
 
-/// Writes the `LaunchAgent` and hands it to launchd.
-fn install_macos(env: &ServiceEnv, runner: &dyn Runner, unit: &Path) -> Result<(), ServiceError> {
-    let uid = macos_uid(runner)?;
+/// Writes the `LaunchAgent` file (nothing is registered yet).
+fn write_macos_unit(env: &ServiceEnv, unit: &Path) -> Result<(), ServiceError> {
     let log_dir = env.base.join("log");
     write_unit(
         unit,
         &render_launch_agent(&env.exe, &log_dir, env.base_override.as_deref()),
-    )?;
+    )
+}
+
+/// Hands the written `LaunchAgent` to launchd.
+fn register_macos(runner: &dyn Runner, unit: &Path) -> Result<(), ServiceError> {
+    let uid = macos_uid(runner)?;
     // A previous registration must go before bootstrap accepts the file again.
     let _ = probe(
         runner,
@@ -598,12 +834,16 @@ fn install_macos(env: &ServiceEnv, runner: &dyn Runner, unit: &Path) -> Result<(
     Ok(())
 }
 
-/// Writes the systemd user unit and enables it now.
-fn install_linux(env: &ServiceEnv, runner: &dyn Runner, unit: &Path) -> Result<(), ServiceError> {
+/// Writes the systemd user unit file (nothing is enabled yet).
+fn write_linux_unit(env: &ServiceEnv, unit: &Path) -> Result<(), ServiceError> {
     write_unit(
         unit,
         &render_systemd_unit(&env.exe, env.base_override.as_deref()),
-    )?;
+    )
+}
+
+/// Enables the written systemd unit now.
+fn register_linux(runner: &dyn Runner) -> Result<(), ServiceError> {
     must(runner, "systemctl", &args(&["--user", "daemon-reload"]))?;
     must(
         runner,
@@ -638,6 +878,11 @@ fn install_windows(env: &ServiceEnv, runner: &dyn Runner) -> Result<(), ServiceE
 
 /// [`install`] with the stop step injected.
 ///
+/// The order is the safe one: validate the executable, **write** the unit,
+/// stop the loose daemon, then register. A refusal or a failed write leaves
+/// the running daemon untouched; only a unit that is already on disk
+/// replaces it.
+///
 /// # Errors
 ///
 /// See [`install`].
@@ -649,23 +894,38 @@ pub fn install_with(
     if let Some(reason) = unsupported(env) {
         return Ok(report(env, ServiceState::Unsupported { reason }, None));
     }
-    let note = stop_note(stop, &env.base)?;
+    if let Some(reason) = unsafe_exe_reason(&env.exe) {
+        return Err(ServiceError::UnsafeExe {
+            path: env.exe.clone(),
+            reason,
+        });
+    }
     let unit = unit_path(env);
     let unit_name = unit.display().to_string();
     match env.platform {
-        Platform::Macos => install_macos(env, runner, &unit)?,
-        Platform::Linux => install_linux(env, runner, &unit)?,
+        Platform::Macos => write_macos_unit(env, &unit)?,
+        Platform::Linux => write_linux_unit(env, &unit)?,
+        Platform::Windows | Platform::Other => {}
+    }
+    let note = stop_note(stop, &env.base)?;
+    match env.platform {
+        Platform::Macos => register_macos(runner, &unit)?,
+        Platform::Linux => register_linux(runner)?,
         Platform::Windows => install_windows(env, runner)?,
         Platform::Other => unreachable!("filtered by unsupported()"),
     }
-    Ok(report(
+    let mut done = report(
         env,
         ServiceState::Installed {
             unit: unit_name,
             loaded: true,
         },
         note,
-    ))
+    );
+    if matches!(env.platform, Platform::Macos | Platform::Linux) {
+        done.pinned_exe = Some(env.exe.clone());
+    }
+    Ok(done)
 }
 
 /// Unregisters and removes the unit. On macOS and Linux the manager

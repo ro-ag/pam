@@ -868,6 +868,95 @@ async fn a_key_value_input_reaches_the_daemon_and_comes_back_in_the_verdict() {
     .expect("test within deadline");
 }
 
+/// `pam flow run --digest` pins the run to the flow the human inspected:
+/// the digest `pam flow inspect` prints runs it, and one the flow no longer
+/// has is refused (exit 3) with its recovery line before any step starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_pinned_to_a_stale_digest_is_refused_with_its_recovery() {
+    warm_binary();
+    timeout(FLOW_DEADLINE, async {
+        let daemon = TestDaemon::start_with_allowed_programs(&["git"]).await;
+        seed_flow(&daemon.tmp, "input-echo", INPUT_ECHO_FLOW);
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+
+        // The human inspection puts the digest on the first line, beside the id.
+        let inspect = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "inspect", "input-echo"],
+        )
+        .await;
+        assert_eq!(inspect.code, 0, "{} {}", inspect.stdout, inspect.stderr);
+        let first = inspect.stdout.lines().next().expect("a first line");
+        let digest = first
+            .strip_prefix("flow input-echo  digest ")
+            .unwrap_or_else(|| panic!("digest line missing: {first}"))
+            .to_owned();
+        assert_eq!(digest.len(), 64, "{first}");
+
+        // A digest the flow does not have: refused, nothing runs.
+        let stale = "0".repeat(64);
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "input-echo", "--digest", &stale],
+        )
+        .await;
+        assert_eq!(
+            run.code,
+            i32::from(render::EXIT_REFUSED),
+            "{} {}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("refused (flow_changed)"),
+            "stderr: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("pam flow inspect"),
+            "stderr: {}",
+            run.stderr
+        );
+        assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
+
+        // The inspected digest runs it, and `--json` carries no digest of its own.
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "input-echo", "--digest", &digest, "--json"],
+        )
+        .await;
+        assert_eq!(run.code, command_exit(0), "stderr: {}", run.stderr);
+
+        // A value that is not a digest is refused by the daemon, not sent as nothing.
+        let run = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["flow", "run", "input-echo", "--digest", "nope"],
+        )
+        .await;
+        assert_eq!(
+            run.code,
+            i32::from(render::EXIT_REFUSED),
+            "{} {}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("input_invalid"),
+            "stderr: {}",
+            run.stderr
+        );
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("digest pin test within deadline");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_positional_input_without_an_equals_sign_never_reaches_the_daemon() {
     warm_binary();

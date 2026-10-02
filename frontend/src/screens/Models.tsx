@@ -17,6 +17,7 @@ import { PageHeader } from "../components/ui/PageHeader";
 import { Section } from "../components/ui/Section";
 import { formatBytes, percentOf } from "../lib/bytes";
 import { cn } from "../lib/cn";
+import { backoffRefetchInterval } from "../lib/polling";
 import {
   modelsCatalog,
   modelsDefaultsSet,
@@ -142,6 +143,9 @@ export function pollInterval(status: ModelsStatus | undefined): number {
     status.jobs.some((job) => job.state === "running");
   return working ? POLL_BUSY_MS : POLL_IDLE_MS;
 }
+
+/** `pollInterval`, backing off while the daemon refuses or is unreachable. */
+const modelsRefetchInterval = backoffRefetchInterval<ModelsStatus>({ baseMs: pollInterval });
 
 // --- shared row furniture --------------------------------------------------
 
@@ -997,7 +1001,7 @@ export function ModelsScreen() {
   const status = useQuery({
     queryKey: ["models", "status"],
     queryFn: modelsStatus,
-    refetchInterval: (query) => pollInterval(query.state.data),
+    refetchInterval: modelsRefetchInterval,
   });
   const library = useQuery({ queryKey: ["models", "list"], queryFn: modelsList });
   const queryClient = useQueryClient();

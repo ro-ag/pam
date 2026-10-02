@@ -51,7 +51,7 @@ const mocks = vi.hoisted(() => ({
   evidenceList: vi.fn(),
   evidenceGet: vi.fn(),
   subscribeEvents: vi.fn(),
-  requestCapability: vi.fn(),
+  adminCall: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -480,6 +480,40 @@ describe("the YAML tab", () => {
     );
   });
 
+  it("tells the human which steps lost their remembered approval after a save", async () => {
+    mocks.flowsSave.mockResolvedValue({
+      ...entry({ id: "mine", source: "library" }),
+      grants_revoked: ["flow.step:mine/build", "flow.step:mine/push"],
+      reapproval_required: true,
+    });
+    await renderFlows();
+    const editor = await pick("mine");
+    fireEvent.change(editor, { target: { value: editor.value + "# edited\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(
+        "2 steps changed. Their remembered approval was removed and they will ask again.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing about approvals when a save revoked none", async () => {
+    mocks.flowsSave.mockResolvedValue({
+      ...entry({ id: "mine", source: "library" }),
+      grants_revoked: [],
+      reapproval_required: false,
+    });
+    await renderFlows();
+    const editor = await pick("mine");
+    fireEvent.change(editor, { target: { value: editor.value + "# edited\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mocks.flowsSave).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeDisabled());
+    expect(screen.queryByText(/remembered approval/)).toBeNull();
+  });
+
   it("renders the daemon's validation refusal as a FailureNote naming the path", async () => {
     mocks.flowsSave.mockRejectedValue({
       cause: "flow_invalid",
@@ -560,7 +594,13 @@ describe("the run card", () => {
     });
     fireEvent.click(card.getByRole("button", { name: "Run" }));
     await waitFor(() =>
-      expect(mocks.flowsRun).toHaveBeenCalledWith("pr-readiness", "/Users/dev/work/pam", {}),
+      // Pinned to the digest of the flow the card is showing.
+      expect(mocks.flowsRun).toHaveBeenCalledWith(
+        "pr-readiness",
+        "/Users/dev/work/pam",
+        {},
+        "sha256:abcd",
+      ),
     );
 
     await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
@@ -632,14 +672,8 @@ describe("the run card", () => {
     expect(screen.getByText("still going")).toBeInTheDocument();
   });
 
-  it("offers Cancel while the run is live and asks the daemon through the cancel capability", async () => {
-    mocks.requestCapability.mockResolvedValue({
-      kind: "result",
-      id: "req_c",
-      outcome: "cancelled",
-      body: {},
-      evidence: [],
-    });
+  it("offers Cancel while the run is live and asks the daemon through the private cancel op", async () => {
+    mocks.adminCall.mockResolvedValue({ ticket: "req_run", cancelled: true });
     await renderFlows();
     fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
     const card = within(await screen.findByLabelText("run this flow"));
@@ -654,10 +688,12 @@ describe("the run card", () => {
       "This flow is already running",
     );
     fireEvent.click(cancel);
-    expect(mocks.requestCapability).not.toHaveBeenCalled();
+    expect(mocks.adminCall).not.toHaveBeenCalled();
     fireEvent.click(card.getByRole("button", { name: "cancel it?" }));
     await waitFor(() =>
-      expect(mocks.requestCapability).toHaveBeenCalledWith("cancel", { ticket: "req_run" }),
+      expect(mocks.adminCall).toHaveBeenCalledWith("admin.requests.cancel", {
+        ticket: "req_run",
+      }),
     );
     feed({ ticket: "req_run", event: { kind: "refused" } });
     expect(await screen.findByText(/run · refused/)).toBeInTheDocument();
@@ -676,6 +712,83 @@ describe("the run card", () => {
     fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
     fireEvent.click(card.getByRole("button", { name: "Run" }));
     expect(await screen.findByText(/run · capability_denied/)).toBeInTheDocument();
+  });
+
+  it("refuses to run a flow edited since it was shown, reloads it, and says nothing ran", async () => {
+    mocks.flowsRun.mockRejectedValue({
+      cause: "flow_changed",
+      detail: 'flow "pr-readiness" now has digest ef01, not the pinned sha256:abcd',
+      recovery: "run `pam flow inspect` again, review what the flow does now",
+    });
+    await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    const listed = mocks.flowsList.mock.calls.length;
+    const read = mocks.flowsGet.mock.calls.length;
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    expect(await screen.findByText(/run · flow_changed/)).toBeInTheDocument();
+    expect(screen.getByText(/did not run/)).toBeInTheDocument();
+    // The library and the open flow are read again, so the next Run pins what is there now.
+    await waitFor(() => expect(mocks.flowsList.mock.calls.length).toBeGreaterThan(listed));
+    await waitFor(() => expect(mocks.flowsGet.mock.calls.length).toBeGreaterThan(read));
+    expect(card.queryByText("req_run")).toBeNull();
+  });
+
+  it("lists what a stopped run changed, under the sentence that says it stopped", async () => {
+    const stopped: FlowResult = {
+      ...VERDICT,
+      outcome: "unresolved",
+      summary: "2 steps: 1 succeeded, 1 failed (push)",
+      effects: [
+        { step: "commit", kind: "command", state: "applied" },
+        { step: "push", kind: "landing", state: "possibly_applied", landing: "push" },
+      ],
+    };
+    mocks.evidenceGet.mockImplementation((id: string) =>
+      Promise.resolve({
+        ...evidenceMeta({ id }),
+        text: JSON.stringify(stopped),
+        text_bytes: 400,
+        truncated: false,
+      } satisfies EvidenceContent),
+    );
+    await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
+    feed({ ticket: "req_run", event: { kind: "done" } });
+    const effects = within(await screen.findByLabelText("changes before the run stopped"));
+    expect(
+      effects.getByText("The run stopped after it changed something."),
+    ).toBeInTheDocument();
+    const items = effects.getAllByRole("listitem").map((item) => item.textContent);
+    expect(items).toEqual(["commitapplied", "pushpushpossibly applied"]);
+  });
+
+  it("shows no effects list for a run that finished well", async () => {
+    mocks.evidenceGet.mockImplementation((id: string) =>
+      Promise.resolve({
+        ...evidenceMeta({ id }),
+        text: JSON.stringify({
+          ...VERDICT,
+          effects: [{ step: "commit", kind: "command", state: "applied" }],
+        }),
+        text_bytes: 400,
+        truncated: false,
+      } satisfies EvidenceContent),
+    );
+    await renderFlows();
+    fireEvent.click(await screen.findByRole("tab", { name: "Run flow" }));
+    const card = within(await screen.findByLabelText("run this flow"));
+    fireEvent.change(card.getByLabelText("repo path"), { target: { value: "/tmp/x" } });
+    fireEvent.click(card.getByRole("button", { name: "Run" }));
+    await waitFor(() => expect(mocks.subscribeEvents).toHaveBeenCalled());
+    feed({ ticket: "req_run", event: { kind: "done" } });
+    await screen.findByLabelText("run verdict");
+    expect(screen.queryByLabelText("changes before the run stopped")).toBeNull();
   });
 
   it("shows a mid-run refusal instead of pretending a verdict exists", async () => {

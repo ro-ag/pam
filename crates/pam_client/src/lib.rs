@@ -42,8 +42,11 @@ mod service_test;
 /// The environment override is a testing/dev knob (deliberately not a
 /// CLI flag): it lets a test or a scratch session point a real spawned
 /// `pam daemon` process *and* the clients (CLI and GUI alike) at an
-/// isolated base dir. The auto-spawned daemon inherits the client's
-/// environment, so both sides always resolve the same base.
+/// isolated base dir. The auto-spawned daemon does **not** inherit the
+/// client's environment (it gets an allowlist, see
+/// [`client::spawn_daemon_process`]); the client passes the base it resolved
+/// as an explicit absolute `PAM_BASE_DIR`, so both sides still resolve the
+/// same base.
 #[must_use]
 pub fn default_base_dir() -> Option<PathBuf> {
     base_dir_from(std::env::var_os("PAM_BASE_DIR"), std::env::home_dir())

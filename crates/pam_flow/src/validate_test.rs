@@ -4,8 +4,8 @@ use std::time::Duration;
 use super::duration::format_duration;
 use super::schema::{Action, Approval, ConnectorId, Effect, Flow, OutputPolicy, Role, When};
 use super::validate::{
-    AWS_BLOCKER, FlowError, MAX_FILE_BYTES, connector_blocker, connector_calls, is_sensitive_arg,
-    is_shell, looks_secret_like, parse, parse_value,
+    FlowError, MAX_FILE_BYTES, connector_calls, is_sensitive_arg, is_shell, looks_secret_like,
+    parse, parse_value,
 };
 
 /// Wraps step YAML in the smallest valid flow around it.
@@ -575,7 +575,6 @@ fn the_connector_call_table_matches_the_spec() {
         names(ConnectorId::Sharepoint),
         ["document", "documents", "lists"]
     );
-    assert_eq!(names(ConnectorId::Aws), ["commands", "cli"]);
 
     let spec = |id, call: &str| {
         connector_calls(id)
@@ -610,11 +609,6 @@ fn the_connector_call_table_matches_the_spec() {
         spec(ConnectorId::Sharepoint, "documents").args,
         [("site", true), ("query", true), ("limit", false)]
     );
-    assert_eq!(
-        spec(ConnectorId::Aws, "cli").args,
-        [("service", true), ("command", true), ("args", false)]
-    );
-    assert!(spec(ConnectorId::Aws, "commands").args.is_empty());
 
     // Only two calls stream a log rather than JSON.
     let logs: Vec<_> = ConnectorId::ALL
@@ -721,7 +715,9 @@ fn status_assertions_are_bounded_connector_literals() {
 }
 
 #[test]
-fn a_flow_naming_the_aws_connector_is_refused_with_the_named_blocker() {
+fn a_flow_naming_the_removed_aws_connector_is_refused_legibly() {
+    // A flow saved before the AWS adapter was removed still names it: the
+    // validator refuses the step with the removal named, never a panic.
     for step in [
         "  - id: a\n    connector: aws\n    call: commands\n",
         "  - id: a\n    connector: aws\n    call: cli\n    with: { service: sts, command: get-caller-identity }\n",
@@ -729,20 +725,16 @@ fn a_flow_naming_the_aws_connector_is_refused_with_the_named_blocker() {
     ] {
         let (path, message) = bad_step(step);
         assert_eq!(path, "steps[0].connector");
-        assert_eq!(message, AWS_BLOCKER);
-        assert!(
-            message.contains("unavailable until containment lands"),
-            "{message}"
-        );
+        assert!(message.contains("`aws` connector was removed"), "{message}");
+        assert!(message.contains("Delete this step"), "{message}");
+        assert!(!message.contains("unknown connector"), "{message}");
     }
-    assert_eq!(connector_blocker(ConnectorId::Aws), Some(AWS_BLOCKER));
-    for id in ConnectorId::ALL {
-        if id != ConnectorId::Aws {
-            assert_eq!(connector_blocker(id), None, "{id}");
-        }
-    }
-    // The table itself stays, so descriptors can still say what will exist.
-    assert!(!connector_calls(ConnectorId::Aws).is_empty());
+    assert_eq!(ConnectorId::parse("aws"), None);
+    assert!(ConnectorId::ALL.iter().all(|id| id.as_str() != "aws"));
+    // Any other unknown name keeps the plain refusal.
+    let (path, message) = bad_step("  - id: a\n    connector: gitlab\n    call: runs\n");
+    assert_eq!(path, "steps[0].connector");
+    assert!(message.contains("unknown connector `gitlab`"), "{message}");
 }
 
 #[test]

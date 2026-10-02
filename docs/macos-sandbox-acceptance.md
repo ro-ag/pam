@@ -7,7 +7,8 @@ harness escapes quoted SBPL path contents and substitutes canonical temporary an
 an enterprise agent's actual host policy.
 
 The default-deny profile allows executable/library reads, child execution,
-caller process metadata, and only PAM's public Unix endpoints. It does not allow
+caller process metadata, and only PAM's one public Unix endpoint,
+`<base>/run/pam.sock`. It does not allow
 Mach service lookup, signal operations, arbitrary network access, private admin
 access, SQLite state access, keychain files, or writes to trusted assets. Its
 broad filesystem-read allowance is deliberately a fixture convenience, not a
@@ -20,6 +21,19 @@ fixture assets and the PAM executable for writing. A harmless `kill -0` against
 the outside test process must fail with permission denied; no signal that kills
 or changes the target is sent. The parent verifies the socket and lock inodes and lock bytes remain unchanged, then repeats a successful public echo. The profile grants no runtime-directory writes. Dropping the acceptance deadline kills an outstanding direct child. Removing repository approval must make the same
 evidence request unavailable while its protected source remains in the store.
+
+A second case puts a fake daemon of version 0.4 or older behind the same
+profile: it holds the real instance lock, names a stand-in process in it and
+answers on `pam.sock` with that version's greeting. The sandboxed CLI must exit
+`1`, print nothing on stdout under `--json`, name the pid and the instruction
+(`pam daemon stop` and then `pam status`, outside the sandbox) on stderr, and
+leave the stand-in process alive and the lock unchanged: a sandboxed client
+cannot stop a daemon, and does not start one beside it. Under this profile it
+cannot start one at all: with no daemon running, the sandboxed CLI exits `1`
+after six seconds with "the pam daemon did not become ready" (seen with the
+real binaries on 2026-10-02; no test pins it), which is why the instruction
+names the second command. The unsandboxed takeover is proved separately by
+`cargo test -p pam --test legacy_takeover`.
 
 The keychain probe asks only for a nonexistent service/account. It requires a
 keychain search initialization error, not merely exit 44 or item-not-found,
@@ -39,6 +53,7 @@ production frontend.
 
 Repository/connector scopes are global daemon approvals, not authenticated
 per-agent identities. A caller-supplied repository name cannot establish tenant
-isolation. Public PUB subscriptions likewise require a separate confidentiality
-decision: client-side scoped lookup does not authorize arbitrary raw subscribers.
-The fixture must not be cited as proving either property.
+isolation. Events are no longer broadcast: a public client receives the events
+of one ticket, on a follow the daemon authorised by the same scoped rule as a
+result read, and they carry no detail. That is the same global approval, not a
+per-agent boundary. The fixture must not be cited as proving either property.

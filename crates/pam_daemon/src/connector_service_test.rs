@@ -26,8 +26,7 @@ async fn approve_connector_repo(store: &Store, repo: &std::path::Path) {
     store.set_setting("flows.scope_policy", &serde_json::json!({
         "version": 1, "repositories": [{"root": root, "connectors": [
             {"connector":"github", "base_url":BASE_URL, "access":"connector_wide", "targets":[]},
-            {"connector":"jenkins", "base_url":"https://ci.example.test/", "access":"connector_wide", "targets":[]},
-            {"connector":"aws", "base_url":"https://aws.invalid/", "access":"connector_wide", "targets":[]}
+            {"connector":"jenkins", "base_url":"https://ci.example.test/", "access":"connector_wide", "targets":[]}
         ]}]
     }).to_string()).await.expect("explicit test scope");
 }
@@ -152,12 +151,6 @@ async fn list_answers_every_descriptor_merged_with_its_row() {
     assert!(jenkins.base_url.is_none());
     assert!(!jenkins.credential.present);
     assert_eq!(jenkins.username_label, Some("user"));
-
-    // AWS keeps no credential at all, so the keychain is never asked.
-    let aws = Fixture::summary_of(&summaries, ConnectorId::Aws);
-    assert_eq!(aws.auth, "aws_profile");
-    assert!(!aws.needs_base_url);
-    assert!(!aws.credential.present);
 }
 
 #[tokio::test]
@@ -628,7 +621,7 @@ async fn missing_scope_setting_does_not_inherit_connector_permission() {
 }
 
 #[tokio::test]
-async fn a_daemon_without_curl_refuses_http_and_uncontained_aws() {
+async fn a_daemon_without_curl_refuses_http_connectors() {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
     let repo = tempfile::tempdir().expect("repo");
     approve_connector_repo(&store, repo.path()).await;
@@ -674,30 +667,6 @@ async fn a_daemon_without_curl_refuses_http_and_uncontained_aws() {
         .await
         .expect_err("no curl, no call");
     assert_eq!(error.cause(), CAUSE_CLI_MISSING);
-
-    // AWS's separate CLI bridge is refused until its descendants are contained,
-    // including the local allowlist call so discovery never implies readiness.
-    service
-        .configure(
-            ConnectorId::Aws,
-            ConfigurePatch {
-                enabled: Some(true),
-                ..ConfigurePatch::default()
-            },
-        )
-        .await
-        .expect("aws needs no base URL and no credential");
-    let error = service
-        .invoke(
-            repo.path(),
-            ConnectorId::Aws,
-            "commands",
-            &BTreeMap::new(),
-            deadline(),
-        )
-        .await
-        .expect_err("AWS CLI containment is unavailable");
-    assert_eq!(error.cause(), "command_containment_unavailable");
 }
 
 #[tokio::test]
@@ -872,7 +841,7 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
     tokio::time::timeout(
         Duration::from_secs(1),
         service.configure(
-            ConnectorId::Aws,
+            ConnectorId::Jenkins,
             ConfigurePatch {
                 enabled: Some(false),
                 ..ConfigurePatch::default()
@@ -915,67 +884,91 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
     );
 }
 
-#[derive(Default)]
-struct UntouchedSecrets(std::sync::atomic::AtomicUsize);
-
-impl SecretBackend for UntouchedSecrets {
-    fn get(&self, _account: &str) -> Result<Option<String>, SecretError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(SecretError::Unavailable)
-    }
-    fn set(&self, _account: &str, _secret: &str) -> Result<(), SecretError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(SecretError::Unavailable)
-    }
-    fn delete(&self, _account: &str) -> Result<bool, SecretError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(SecretError::Unavailable)
-    }
-}
-
+/// An install upgraded from a release that shipped the AWS adapter still has
+/// an `aws` connector row. Listing must ignore it (it is not a connector any
+/// more), leave it and any keychain item untouched, and never panic.
 #[tokio::test]
-async fn aws_containment_refusal_precedes_credentials_transport_and_cli_validation() {
+async fn a_legacy_aws_row_is_ignored_by_the_connector_host() {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let repo = tempfile::tempdir().unwrap();
-    approve_connector_repo(&store, repo.path()).await;
-    // Defense in depth for the fixture: even if the containment guard regresses,
-    // this invalid profile fails adapter validation before any real CLI spawn.
     store
         .upsert_connector(
             "aws",
             pam_store::ConnectorPatch {
                 enabled: Some(true),
-                username: Some(Some("--fixture-no-process")),
+                username: Some(Some("default")),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-    let secrets = Arc::new(UntouchedSecrets::default());
-    let transport = Arc::new(FakeTransport::new());
-    let service = ConnectorService::new(
-        store,
-        Arc::new(SecretStore::new(secrets.clone())),
-        transport.clone(),
+    let service = ConnectorService::from_parts(Arc::clone(&store), None, None);
+
+    let summaries = service.list().await.expect("list survives a legacy row");
+    assert_eq!(summaries.len(), ConnectorId::ALL.len());
+    assert!(summaries.iter().all(|entry| entry.id != "aws"));
+    assert!(ConnectorId::parse("aws").is_none());
+    // The row is left alone: removal never deletes user data.
+    assert!(store.get_connector("aws").await.unwrap().is_some());
+}
+
+/// A scope policy saved before the removal can still approve `aws` for a
+/// repository. That must not lock out the repository's other approvals.
+#[tokio::test]
+async fn a_legacy_aws_scope_approval_is_dropped_without_voiding_the_policy() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let repo = tempfile::tempdir().unwrap();
+    approve_connector_repo(&store, repo.path()).await;
+    let root = repo.path().canonicalize().unwrap();
+    store
+        .set_setting(
+            "flows.scope_policy",
+            &serde_json::json!({
+                "version": 1, "repositories": [{"root": root, "connectors": [
+                    {"connector":"github", "base_url":BASE_URL, "access":"connector_wide", "targets":[]},
+                    {"connector":"aws", "base_url":"https://aws.invalid/", "access":"connector_wide", "targets":[]}
+                ]}]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let policy = crate::scope_policy::ScopePolicy::load(&store)
+        .await
+        .expect("a policy naming the removed connector still loads");
+    assert_eq!(policy.repositories[0].connectors.len(), 1);
+    assert_eq!(
+        policy.repositories[0].connectors[0].connector,
+        ConnectorId::Github
     );
-    let args = BTreeMap::from([
-        ("service".to_owned(), ArgValue::Text("sts".to_owned())),
-        (
-            "command".to_owned(),
-            ArgValue::Text("get-caller-identity".to_owned()),
-        ),
-    ]);
-    for call in ["commands", "cli"] {
-        let error = service
-            .invoke(repo.path(), ConnectorId::Aws, call, &args, deadline())
+    policy
+        .authorize_connector(
+            repo.path(),
+            ConnectorId::Github,
+            BASE_URL,
+            "runs",
+            &BTreeMap::new(),
+        )
+        .expect("the surviving approval still grants");
+    // A truly malformed connector name is still invalid, not silently dropped.
+    store
+        .set_setting(
+            "flows.scope_policy",
+            &serde_json::json!({
+                "version": 1, "repositories": [{"root": root, "connectors": [
+                    {"connector":"gitlab", "base_url":BASE_URL, "access":"connector_wide", "targets":[]}
+                ]}]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::scope_policy::ScopePolicy::load(&store)
             .await
-            .unwrap_err();
-        assert_eq!(error.cause(), "command_containment_unavailable");
-    }
-    let error = service.test(ConnectorId::Aws).await.unwrap_err();
-    assert_eq!(error.cause(), "command_containment_unavailable");
-    assert_eq!(secrets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(transport.requests().is_empty());
+            .unwrap_err()
+            .cause(),
+        crate::scope_policy::CAUSE_SCOPE_INVALID
+    );
 }
 
 /// The one redirect hop of a job log goes to a signed storage URL, not wherever a

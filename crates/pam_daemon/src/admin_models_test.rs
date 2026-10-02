@@ -425,6 +425,34 @@ async fn a_verified_model_needs_a_qualification_record_to_be_a_tier_default() {
             fx.models.resolve(Tier::Heavy).await.unwrap().id,
             "qwen/tiny"
         );
+
+        // The same record, measured with an engine option this build does not use: the
+        // badge is gone from the listing, the reason is there, and the tier cannot be
+        // pointed at the model.
+        let recached = pam_model::engine_server::EngineContract {
+            cache_prompt: true,
+            ..fx.models.engine_contract_for_tests(&sha256)
+        };
+        fx.models.qualify_measured_with_for_tests(&sha256, recached);
+        let listed = expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        assert_eq!(listed["models"][0]["qualification"], Value::Null);
+        assert!(
+            listed["models"][0]["qualification_issue"]
+                .as_str()
+                .unwrap()
+                .contains("re-measurement"),
+            "{}",
+            listed["models"][0]
+        );
+        let detail = expect_refusal(
+            fx.run(
+                OP_MODELS_DEFAULTS_SET,
+                json!({ "tier": "light", "model_id": "qwen/tiny" }),
+            )
+            .await,
+            CAUSE_UNQUALIFIED,
+        );
+        assert!(detail.contains("needs re-measurement"), "detail: {detail}");
     })
     .await
     .expect("test within deadline");
@@ -601,6 +629,21 @@ async fn verify_starts_a_job_and_delete_clears_the_default_it_held() {
         };
         assert_eq!(job.state, "done");
         assert_eq!(job.kind, "verify");
+        // The verification made PAM's own copy of the weights, named by its digest.
+        let detail: Value = serde_json::from_str(job.detail.as_deref().unwrap()).unwrap();
+        let private = fx
+            .models
+            .weights_dir()
+            .join(format!("{}.gguf", detail["sha256"].as_str().unwrap()));
+        assert!(private.is_file(), "{detail}");
+        assert!(detail["private_copy"].is_string(), "{detail}");
+        // A finished verification is not cancellable, and the refusal names both kinds.
+        let refused = expect_refusal(
+            fx.run(OP_MODELS_DOWNLOAD_CANCEL, json!({ "job_id": job_id }))
+                .await,
+            CAUSE_INVALID_ADMIN_ARGS,
+        );
+        assert!(refused.contains("verification"), "{refused}");
 
         // A test-only model cannot be a default through the op, so seed
         // one directly: deleting it must still clear the setting.
@@ -616,6 +659,10 @@ async fn verify_starts_a_job_and_delete_clears_the_default_it_held() {
         assert_eq!(body["deleted"], true);
         assert_eq!(body["cleared_defaults"], json!(["light"]));
         assert!(!path.exists(), "the weights are gone");
+        assert!(
+            !private.exists(),
+            "and so is PAM's private copy of them: deleting a model frees its disk"
+        );
         assert_eq!(fx.models.defaults().await.unwrap(), (None, None));
 
         // And the second delete has nothing to remove.

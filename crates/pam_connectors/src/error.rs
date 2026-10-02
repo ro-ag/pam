@@ -80,12 +80,6 @@ pub enum ConnectorError {
     /// The service answered, but not with what the call needs.
     #[error("{0}")]
     BadResponse(String),
-    /// A local CLI ran and failed.
-    #[error("{0}")]
-    Cli(String),
-    /// The local CLI this connector drives is not installed.
-    #[error("the aws CLI is not installed, or not on the daemon's PATH")]
-    CliMissing,
 }
 
 /// The `RateLimited` sentence, with the wait when the service named one.
@@ -120,8 +114,6 @@ impl ConnectorError {
             Self::TooLarge { .. } => "connector_response_too_large",
             Self::BadArgs(_) => "connector_bad_args",
             Self::BadResponse(_) => "connector_bad_response",
-            Self::Cli(_) => "connector_cli",
-            Self::CliMissing => "connector_cli_missing",
         }
     }
 
@@ -169,12 +161,6 @@ impl ConnectorError {
                     .to_owned()
             }
             Self::BadArgs(_) => "fix the step's `with:` arguments in the flow file".to_owned(),
-            Self::Cli(_) => {
-                "fix the step's `with:` arguments, or check the local AWS credentials".to_owned()
-            }
-            Self::CliMissing => {
-                "install the aws CLI and make sure it is on the daemon's PATH".to_owned()
-            }
         }
     }
 

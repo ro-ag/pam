@@ -35,20 +35,17 @@ pub enum ConnectorId {
     Confluence,
     /// `SharePoint` through Microsoft Graph.
     Sharepoint,
-    /// Allowlisted read-only AWS CLI passthrough.
-    Aws,
 }
 
 impl ConnectorId {
     /// Every connector, in the order the GUI lists them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Github,
         Self::Jenkins,
         Self::Sonarqube,
         Self::Jira,
         Self::Confluence,
         Self::Sharepoint,
-        Self::Aws,
     ];
 
     /// The wire name, as it appears in YAML and in the store.
@@ -61,7 +58,6 @@ impl ConnectorId {
             Self::Jira => "jira",
             Self::Confluence => "confluence",
             Self::Sharepoint => "sharepoint",
-            Self::Aws => "aws",
         }
     }
 

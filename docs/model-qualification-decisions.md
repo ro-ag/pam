@@ -31,6 +31,15 @@ enforced on the admission path, not only by the table's unit test:
 `pam_model::qualification::find_in` ignores a record whose engine tag is not the pinned
 one or whose figures no longer clear the gates.
 
+"Verified" is tied to the file as it was when its digest was checked: the registry
+compares a fingerprint of the file with the one recorded at verification, at every scan
+and again before a load. On macOS that fingerprint includes the file's device and inode
+and its change time. On Windows it is the file's size and modification time only, so a
+same-size replacement whose timestamp was restored is not detected there and the
+listing keeps saying verified. What runs is unaffected on either platform: the engine
+loads only PAM's private copy of the verified bytes, never the file in the models
+directory.
+
 ## The gates, and what they do not cover
 
 The gates applied to every screen are the ones the roadmap fixed on 2026-09-12:

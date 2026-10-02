@@ -211,3 +211,127 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
         daemon.shutdown().await;
     }).await.expect("sandbox acceptance fixture completes within deadline");
 }
+
+/// The 64-byte greeting a pre-migration (ZMTP) daemon sends on connect.
+fn zmtp_greeting() -> Vec<u8> {
+    let mut greeting = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F, 3, 0];
+    greeting.extend_from_slice(b"NULL");
+    greeting.resize(64, 0);
+    greeting
+}
+
+/// Kills and reaps the stand-in process on the way out, panic included.
+struct StandIn(std::process::Child);
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A sandboxed client that meets a pre-migration daemon may not stop it: the
+/// profile denies signals. It fails with the instruction for the human, names
+/// the pid, starts nothing, and the daemon's process is still alive.
+///
+/// The fake daemon holds the real instance lock, names a stand-in process it
+/// owns in it (so a client that did manage to signal would not take the test
+/// down with it), and greets in ZMTP on the socket the client dials.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sandboxed_client_cannot_stop_a_pre_migration_daemon_and_says_what_to_do() {
+    use std::io::Write as _;
+    let mut warm = Command::new(env!("CARGO_BIN_EXE_pam"));
+    warm.arg("--version");
+    assert!(execute(warm).await.status.success());
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let temp = tempfile::Builder::new()
+            .prefix("pamsb")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(root.join("trusted-asset"), b"trusted fixture asset").unwrap();
+        let base = root.join("pam");
+
+        let dirs = pam_daemon::runtime_dir::RuntimeDir::at_base(&base).unwrap();
+        let lock = pam_daemon::lifecycle::acquire_instance_lock(dirs.run_dir()).unwrap();
+        let stand_in = StandIn(
+            Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = stand_in.0.id();
+        std::fs::write(lock.path(), pid.to_string()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dirs.public_socket()).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = stream.write_all(&zmtp_greeting());
+                // Keep the connection until the client lets go of it.
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut stream, &mut std::io::sink());
+                });
+            }
+        });
+
+        let profile = root.join("agent.sb");
+        let home = std::env::home_dir().unwrap().canonicalize().unwrap();
+        let text = include_str!("support/broker-macos.sb")
+            .replace("@BASE@", &sbpl_path(&base))
+            .replace("@ASSET@", &sbpl_path(&root.join("trusted-asset")))
+            .replace("@HOME@", &sbpl_path(&home));
+        std::fs::write(&profile, text).unwrap();
+
+        let refused = pam(&profile, &root, &repo, &["status", "--json"]).await;
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "--json prints nothing it cannot stand behind: {stdout}"
+        );
+        assert!(stderr.starts_with("pam status: "), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "a pre-migration pam daemon (pid {pid}) is running"
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("this process may not stop it"), "{stderr}");
+        assert!(
+            stderr.contains(
+                "run `pam daemon stop` and then `pam status` outside the sandbox, then retry"
+            ),
+            "{stderr}"
+        );
+
+        // Not signalled, not replaced: the stand-in lives and the lock is the fake's.
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(
+            alive.success(),
+            "the pre-migration daemon's process is still alive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lock.path()).unwrap(),
+            pid.to_string()
+        );
+        assert!(matches!(
+            pam::client::probe_daemon(&base).unwrap(),
+            pam::client::DaemonStatus::Running { pid: Some(holder) } if holder == pid
+        ));
+        drop(stand_in);
+        drop(lock);
+    })
+    .await
+    .expect("sandbox takeover fixture completes within deadline");
+}

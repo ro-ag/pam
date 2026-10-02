@@ -21,9 +21,6 @@ pub enum AuthKind {
     /// `Authorization: Basic base64(secret:)` — `SonarQube` puts the token
     /// where the user name goes and leaves the password empty.
     TokenAsUser,
-    /// No credential at all: the local `aws` CLI resolves `~/.aws` itself,
-    /// and the row's user name is the optional profile.
-    AwsProfile,
 }
 
 /// One connector, described for the GUI and for the call dispatcher.
@@ -43,13 +40,13 @@ pub struct Descriptor {
     pub calls: &'static [CallSpec],
 }
 
-/// The seven descriptors, in [`ConnectorId::ALL`] order.
+/// The six descriptors, in [`ConnectorId::ALL`] order.
 ///
 /// Lazy rather than `static`, only because [`connector_calls`] is a plain
 /// function: the table it returns is itself `'static`, so nothing is copied.
 /// Callers that want them all iterate [`ConnectorId::ALL`] through
 /// [`descriptor`]; the daemon lists connectors from its own rows.
-static DESCRIPTORS: LazyLock<[Descriptor; 7]> = LazyLock::new(|| ConnectorId::ALL.map(build));
+static DESCRIPTORS: LazyLock<[Descriptor; 6]> = LazyLock::new(|| ConnectorId::ALL.map(build));
 
 /// Everything pam knows about one connector.
 #[must_use]
@@ -66,7 +63,6 @@ fn index_of(id: ConnectorId) -> usize {
         ConnectorId::Jira => 3,
         ConnectorId::Confluence => 4,
         ConnectorId::Sharepoint => 5,
-        ConnectorId::Aws => 6,
     }
 }
 
@@ -79,7 +75,6 @@ fn build(id: ConnectorId) -> Descriptor {
         ConnectorId::Jira => ("Jira", AuthKind::Bearer, true, None),
         ConnectorId::Confluence => ("Confluence", AuthKind::BasicUserSecret, true, Some("email")),
         ConnectorId::Sharepoint => ("SharePoint", AuthKind::Bearer, true, None),
-        ConnectorId::Aws => ("AWS", AuthKind::AwsProfile, false, Some("profile")),
     };
     Descriptor {
         id,

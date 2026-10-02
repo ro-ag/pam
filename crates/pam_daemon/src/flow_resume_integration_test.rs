@@ -130,7 +130,7 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         store.insert_admitted_request("resume","flow.run",root.to_str().unwrap(),"fixture","{\"id\":\"resumable\"}",None,expiry).await.unwrap();
         let original_deadline=Instant::now()+Duration::from_secs(25);
         let budget=crate::request_budget::RequestBudget::load_persistent(store.clone(),"resume",original_deadline).await.unwrap();
-        let mut ctx=ExecContext{origin:crate::ingress::Origin::Public,status:crate::status_cache::StatusCache::new(models.clone(),secrets.clone()),budget,request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
+        let mut ctx=ExecContext{origin:crate::ingress::Origin::Public,peer:pam_store::RequestOrigin::PUBLIC,status:crate::status_cache::StatusCache::new(models.clone(),secrets.clone()),budget,request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
         assert!(store.authorize_queued_request("resume",root.to_str().unwrap(),now()).await.unwrap());
         assert!(store.start_queued_request("resume",now()).await.unwrap());
         {
@@ -248,6 +248,7 @@ impl Gated {
                 .unwrap();
         let ctx = ExecContext {
             origin: crate::ingress::Origin::Public,
+            peer: pam_store::RequestOrigin::PUBLIC,
             status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
             budget,
             request_id: "gated".to_owned(),

@@ -113,7 +113,10 @@ impl ScopePolicy {
         if raw.len() > MAX_POLICY_BYTES {
             return Err(invalid("scope policy exceeds 64 KiB"));
         }
-        let policy: Self = serde_json::from_str(&raw)
+        let mut value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| invalid("scope policy is not valid versioned JSON"))?;
+        drop_removed_connector_scopes(&mut value);
+        let policy: Self = serde_json::from_value(value)
             .map_err(|_| invalid("scope policy is not valid versioned JSON"))?;
         policy.validate()?;
         Ok(policy)
@@ -381,7 +384,41 @@ fn valid_target(connector: ConnectorId, value: &str) -> bool {
         ConnectorId::Sharepoint => value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b',' | b'-' | b'_')),
-        ConnectorId::Aws => false,
+    }
+}
+
+/// Removes approvals for the connector that no longer exists.
+///
+/// A policy saved before the AWS adapter was removed can still carry an `aws`
+/// approval. Treating it as malformed would lock every other approval out, so
+/// it is dropped on read: removing an approval only narrows what is allowed,
+/// never widens it. The stored value is left alone until the next save writes
+/// the cleaned policy back.
+fn drop_removed_connector_scopes(policy: &mut serde_json::Value) {
+    let Some(repositories) = policy
+        .get_mut("repositories")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for repository in repositories {
+        let Some(connectors) = repository
+            .get_mut("connectors")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let before = connectors.len();
+        connectors.retain(|scope| {
+            scope.get("connector").and_then(serde_json::Value::as_str) != Some("aws")
+        });
+        if connectors.len() != before {
+            tracing::warn!(
+                connector = "aws",
+                recovery = "the AWS CLI adapter was removed; its stored scope approval is ignored and disappears on the next save of the approved-repositories settings",
+                "ignoring the scope approval of a removed connector"
+            );
+        }
     }
 }
 

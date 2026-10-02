@@ -2,7 +2,7 @@
 //!
 //! macOS/Linux exercise the private Unix socket. Unsupported platforms use
 //! an explicit in-process fixture; GUI tests separately assert unsupported
-//! production administration. Forgery tests always use raw public `ZeroMQ`.
+//! production administration. Forgery tests always use the raw public socket.
 
 use pam_daemon::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, CAUSE_ADMIN_DENIED, OP_ACTIVITY_LIST, OP_APPROVALS_PENDING,
@@ -263,9 +263,9 @@ async fn public_socket_refuses_forged_gui_identity_before_version_handshake() {
             forged.caller.pid = std::process::id();
             client.send_public(&forged).await;
             assert!(matches!(client.recv().await, Response::Refusal { cause, .. } if cause == CAUSE_ADMIN_DENIED));
-            let row = daemon.store().get_request(&forged.id).await.unwrap().unwrap();
-            assert_eq!(row.args_json, "{}");
-            assert_eq!(row.state, RequestState::Refused);
+            // The public listener refuses `admin.*` before any row is
+            // written: nothing of the forged arguments is stored.
+            assert!(daemon.store().get_request(&forged.id).await.unwrap().is_none());
         }
         assert!(matches!(client.request(&envelope("still_serving", "echo", serde_json::json!({}), true)).await,
             Response::Result { .. }));
@@ -323,8 +323,15 @@ async fn oversized_native_frame_is_closed_without_recording_or_stopping_daemon()
             .await
             .unwrap();
         raw.write_u32(1024 * 1024 + 1).await.unwrap();
-        let mut byte = [0];
-        assert_eq!(raw.read(&mut byte).await.unwrap(), 0);
+        // The length is refused from its header alone: the daemon names the
+        // bad frame and closes, without waiting for a body.
+        let mut answer = Vec::new();
+        raw.read_to_end(&mut answer).await.unwrap();
+        let refusal = pam_proto::wire::Frame::decode(&answer[4..]).unwrap();
+        assert!(
+            matches!(&refusal, pam_proto::wire::Frame::Error(error) if error.cause == "bad_frame"),
+            "{refusal:?}"
+        );
         let mut gui = daemon.client().await;
         body_of(
             gui.request(&admin_envelope(

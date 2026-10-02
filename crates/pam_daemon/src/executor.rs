@@ -11,9 +11,9 @@
 //!   the model and keyring blocks, served from [`crate::status_cache::StatusCache`] so a poll never
 //!   waits behind a slow lane. Outcome `verified`.
 //! - `query` (control): the lifecycle state of `args.ticket`'s request, straight from the store —
-//!   the authoritative answer `pam wait`/`pam subscribe` reconcile against, since zmq `PUB` has no
-//!   replay and a late subscriber would otherwise wait forever on an already-finished ticket.
-//!   Outcome `verified`.
+//!   the authoritative answer, and the authorisation a follow (`pam wait`/`pam subscribe`) opens
+//!   with: a follower of an already-finished ticket gets this answer at once instead of waiting
+//!   for an event that will not come again. Outcome `verified`.
 //! - `echo` (non-destructive): mirrors its args back; optional `delay_ms` sleeps first, honoring
 //!   the cancel signal (used by integration tests as a controllable long-running capability);
 //!   optional `fail: true` fails (after any delay) with [`CapabilityFailure::Failed`], a documented
@@ -69,6 +69,15 @@ pub struct ExecContext {
     /// its audit actor and its ownership check from this, never from
     /// [`Caller::agent`](pam_proto::Caller::agent).
     pub origin: Origin,
+    /// The plane and the connection the request arrived on, exactly as its
+    /// request row records them at admission (`ingress`, `peer_uid`,
+    /// `peer_pid`, `relayed`): the kernel's view of the peer for a request
+    /// from the framed public listener, no peer for one the administration
+    /// plane submitted or the legacy listener carried. Read back from the
+    /// row, so a bypass and a leased execution see the same thing.
+    /// Attribution only: a pid names a short-lived process and can be
+    /// reused, and nothing may be authorized by it.
+    pub peer: pam_store::RequestOrigin,
     /// The cached slow half of the `status` body (see [`StatusCache`]).
     pub status: Arc<StatusCache>,
     /// Shared absolute deadline and cumulative work allowance.
@@ -299,11 +308,11 @@ async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
 /// `query`: the lifecycle state of the request named by `args.ticket`,
 /// as `{ ticket, state, outcome }` straight from the store.
 ///
-/// This is the replay mechanism zmq `PUB` lacks: `pam wait` /
-/// `pam subscribe` reconcile their event subscription against this
-/// answer, so a follower that subscribed after the ticket's terminal
-/// event was published still terminates instead of waiting for an
-/// event that will never be re-sent.
+/// Events are notifications, this is the record: a follow (`pam wait` /
+/// `pam subscribe`) opens with this query and ends with its answer, so a
+/// follower that attached after the ticket's terminal event was published
+/// still terminates instead of waiting for an event that will never be
+/// re-sent.
 async fn query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     crate::flow_result_service::scoped_query(ctx).await
 }

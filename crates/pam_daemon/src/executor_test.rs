@@ -76,6 +76,7 @@ impl Fixture {
     ) -> ExecContext {
         ExecContext {
             origin: crate::ingress::Origin::Public,
+            peer: pam_store::RequestOrigin::PUBLIC,
             status: crate::status_cache::StatusCache::new(
                 Arc::clone(&self.models),
                 Arc::clone(&self.secrets),

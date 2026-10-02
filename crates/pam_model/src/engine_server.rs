@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use crate::engine_http::{self, Endpoint, HttpError, HttpReply};
-use crate::runtime::GenerateRequest;
+use crate::runtime::{CONTEXT_TOKENS, GenerateRequest};
 
 /// The longest a Unix socket path may be on macOS (`sun_path`).
 pub const MAX_SOCKET_PATH_BYTES: usize = 104;
@@ -71,10 +71,90 @@ pub struct ServerOptions {
     pub extra_env: Vec<(String, String)>,
 }
 
+impl ServerOptions {
+    /// The options a model whose header reports `context_length` is started with: the
+    /// defaults, with the context lowered to what the model was trained on
+    /// ([`context_tokens_for`]). One constructor for the load and for the qualification
+    /// fingerprint, so the two cannot disagree.
+    #[must_use]
+    pub fn for_model(context_length: Option<u64>) -> Self {
+        Self {
+            context_tokens: context_tokens_for(context_length),
+            ..Self::default()
+        }
+    }
+}
+
+/// The context the server is started with: [`CONTEXT_TOKENS`] as the admission
+/// envelope, lowered to `<arch>.context_length` when the GGUF header reports a smaller
+/// figure — a server asked for more context than its model was trained on fails to load
+/// or answers garbage past the limit. An absent or zero header value keeps the envelope.
+#[must_use]
+pub fn context_tokens_for(reported: Option<u64>) -> usize {
+    match reported.and_then(|tokens| usize::try_from(tokens).ok()) {
+        Some(tokens) if tokens > 0 => tokens.min(CONTEXT_TOKENS),
+        _ => CONTEXT_TOKENS,
+    }
+}
+
+/// `-np`: the server decodes one request at a time.
+const PARALLEL_SLOTS: u32 = 1;
+
+/// The fixed seed every completion is sent with.
+const COMPLETION_SEED: u64 = 7;
+
+/// Whether the server may reuse its prompt cache between completions.
+const CACHE_PROMPT: bool = false;
+
+/// The engine-side half of what a model's answers depend on: every launch argument and
+/// completion field that changes output. Part of a qualification's fingerprint
+/// ([`crate::qualification::BenchContract::fingerprint`]); the launch and the
+/// completion read the same constants, so changing one of them changes the fingerprint
+/// and a record measured before the change stops qualifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EngineContract {
+    /// `-c`.
+    pub context_tokens: usize,
+    /// `--reasoning-budget`.
+    pub reasoning_budget: i64,
+    /// `chat_template_kwargs.enable_thinking`.
+    pub enable_thinking: bool,
+    /// `-ngl`; `None` is the server default for the build (full offload on Metal).
+    pub gpu_layers: Option<u32>,
+    /// `-np`.
+    pub parallel_slots: u32,
+    /// Who frames the turns: the GGUF's own template (`--jinja`).
+    pub chat_template: &'static str,
+    /// `cache_prompt`.
+    pub cache_prompt: bool,
+    /// `seed`.
+    pub seed: u64,
+    /// The floor a positive output budget is raised to ([`MIN_OUTPUT_TOKENS`]).
+    pub min_output_tokens: usize,
+}
+
+impl EngineContract {
+    /// The contract a server started with `options` answers under.
+    #[must_use]
+    pub fn of(options: &ServerOptions) -> Self {
+        Self {
+            context_tokens: options.context_tokens,
+            reasoning_budget: options.reasoning_budget,
+            enable_thinking: options.reasoning_budget != 0,
+            gpu_layers: options.gpu_layers,
+            parallel_slots: PARALLEL_SLOTS,
+            chat_template: "gguf-jinja",
+            cache_prompt: CACHE_PROMPT,
+            seed: COMPLETION_SEED,
+            min_output_tokens: MIN_OUTPUT_TOKENS,
+        }
+    }
+}
+
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
-            context_tokens: 8192,
+            context_tokens: CONTEXT_TOKENS,
             threads: None,
             gpu_layers: None,
             reasoning_budget: 0,
@@ -444,7 +524,7 @@ impl EngineServer {
             "--no-webui".to_owned(),
             "--jinja".to_owned(),
             "-np".to_owned(),
-            "1".to_owned(),
+            PARALLEL_SLOTS.to_string(),
             "-c".to_owned(),
             options.context_tokens.to_string(),
             "--reasoning-budget".to_owned(),
@@ -879,8 +959,8 @@ impl EngineServer {
                     // Bounded tasks are scored on reproducibility: no
                     // prompt-cache reuse and a fixed seed keep two runs
                     // of one request on one server identical.
-                    "cache_prompt": false,
-                    "seed": 7,
+                    "cache_prompt": CACHE_PROMPT,
+                    "seed": COMPLETION_SEED,
                     // Qwen-style templates gate thinking here; a budget
                     // of 0 alone leaves them emitting an empty answer.
                     "chat_template_kwargs": {"enable_thinking": !thinking_off},

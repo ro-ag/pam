@@ -242,10 +242,21 @@ fn connector_arg(args: &Value, op: &str) -> Result<ConnectorId, AdminRefusal> {
         AdminRefusal {
             cause: CAUSE_INVALID_ADMIN_ARGS,
             detail: format!("{raw:?} is not a connector; pam has {}", known.join(", ")),
-            recovery: RECOVERY_FIX_ARGS,
+            recovery: if raw == REMOVED_AWS_CONNECTOR {
+                RECOVERY_REMOVED_AWS
+            } else {
+                RECOVERY_FIX_ARGS
+            },
         }
     })
 }
+
+/// The id of the connector that was removed. A stored row, flow or saved
+/// request that still names it is refused as an unknown connector.
+const REMOVED_AWS_CONNECTOR: &str = "aws";
+
+/// Recovery for a request that names the removed AWS connector.
+const RECOVERY_REMOVED_AWS: &str = "The AWS CLI adapter was removed; there is nothing to configure. Delete the step or row that names it. A keychain item left behind for it is harmless and can be deleted in the OS keychain.";
 
 /// Reads an optional boolean argument.
 fn optional_bool(args: &Value, key: &str, op: &str) -> Result<Option<bool>, AdminRefusal> {

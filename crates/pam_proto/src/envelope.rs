@@ -1,4 +1,5 @@
-//! Request envelope sent by the client over the `pam.sock` `ROUTER` socket.
+//! Request envelope a client sends to the daemon, inside a `request` or
+//! `follow` frame ([`crate::wire`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +22,12 @@ pub struct Caller {
 pub struct Envelope {
     /// Protocol version, currently [`crate::PROTOCOL_VERSION`].
     pub v: u32,
-    /// Request id, `req_<ulid>`; also the `PUB` topic for its events.
+    /// Request id, `req_<ulid>`; also the ticket its events are followed by.
     pub id: String,
     /// Capability being invoked, e.g. `log.summarize`.
     pub capability: String,
-    /// Build version of the client binary, for the version handshake.
+    /// Build version of the client binary. Recorded; the version handshake
+    /// is decided on the connection's `hello`, not on this field.
     pub client_version: String,
     /// Who is calling.
     pub caller: Caller,

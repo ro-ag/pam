@@ -4,7 +4,9 @@
 //! by a chain of facts that can each fail independently: configured → installed →
 //! verified → qualified → engine installed → ready. [`TierReadiness`] reports the first
 //! rung that fails ([`Stage`]) with the same cause the job would be refused with, plus a
-//! recovery line, so the GUI never invents readiness and never has to earn a refusal to
+//! recovery line (a model whose qualification record was measured with other engine
+//! options than this build starts it with stops at `unqualified` with cause
+//! [`CAUSE_CONTRACT_CHANGED`]: it needs re-measurement), so the GUI never invents readiness and never has to earn a refusal to
 //! learn the rule. Residency (the engine currently holding the weights) is transient and
 //! reported beside the stage, never as a stage: an unloaded ready model loads on its first
 //! job. The daemon computes this ([`crate::model_service::ModelService::readiness`]) so
@@ -12,13 +14,16 @@
 
 use pam_model::Qualification;
 use pam_model::engine::EngineStatus;
+use pam_model::engine_server::{EngineContract, ServerOptions};
 use pam_model::registry::ModelEntry;
 use serde::Serialize;
 
 use crate::log_service::{
     CAUSE_MODEL_MISSING, CAUSE_MODEL_UNQUALIFIED, CAUSE_MODEL_UNVERIFIED, CAUSE_NO_DEFAULT,
 };
-use crate::model_service::{ModelService, ModelUnavailable, Tier};
+use crate::model_service::{
+    ModelService, ModelUnavailable, SummaryDisclosure, Tier, summary_disclosure,
+};
 
 /// [`Blocker::cause`] when the pinned engine is not installed.
 pub const CAUSE_ENGINE_NOT_INSTALLED: &str = "engine_not_installed";
@@ -39,6 +44,31 @@ pub const RECOVERY_UNVERIFIED: &str = "Tier defaults need a verified model: run 
 pub const RECOVERY_UNQUALIFIED: &str = "Tier defaults need a qualified model: one whose exact digest met the capability gates \
      on this engine and platform (see docs/benchmarks). Unqualified models still answer Try on \
      the PAM GUI Models screen.";
+
+/// [`Blocker::cause`] when a record names the model's digest but was measured with
+/// other engine options than this build starts the model with: the stage is still
+/// `unqualified`.
+pub const CAUSE_CONTRACT_CHANGED: &str = "contract_changed";
+
+/// Recovery line for a model whose qualification no longer describes how it is run.
+pub const RECOVERY_CONTRACT_CHANGED: &str = "This model needs re-measurement: run the capability bench with the engine options PAM \
+     starts it with now and record the result (docs/benchmarks, \
+     docs/model-qualification-decisions.md). Until then every job takes the deterministic path; \
+     the model still answers Try on the PAM GUI Models screen.";
+
+/// What a tier's qualification means and what it does not, for the record `contract`
+/// (e.g. `answer-contract-v2`): the sentence shown beside a qualified model.
+#[must_use]
+pub fn qualification_note(contract: &str) -> String {
+    let version = contract.strip_prefix("answer-contract-").map_or_else(
+        || contract.to_owned(),
+        |version| format!("contract {version}"),
+    );
+    format!(
+        "Qualified on the capability bench ({version}). Summaries are advisory and not separately \
+         measured."
+    )
+}
 
 /// Recovery line for a ready model with no engine to run it.
 pub const RECOVERY_ENGINE_NOT_INSTALLED: &str =
@@ -92,6 +122,12 @@ pub struct TierReadiness {
     pub resident: bool,
     /// The record that qualifies `model_id`, when one does.
     pub qualification: Option<Qualification>,
+    /// What that qualification covers, in one sentence ([`qualification_note`]): the
+    /// capability bench, not the summary prompt. Present exactly when `qualification` is.
+    pub note: Option<String>,
+    /// The summary this tier's model would write: the fingerprint of its prompt and
+    /// that it was not measured. A disclosure; it never changes `stage`.
+    pub summary_contract: SummaryDisclosure,
     /// Present exactly when `stage` is not `Ready`.
     pub blocker: Option<Blocker>,
 }
@@ -141,6 +177,8 @@ impl ModelService {
             stage: Stage::Unconfigured,
             resident: false,
             qualification: None,
+            note: None,
+            summary_contract: summary_disclosure(&EngineContract::of(&ServerOptions::default())),
             blocker: None,
         };
         let Some(id) = model_id else {
@@ -163,6 +201,14 @@ impl ModelService {
             return Ok(readiness);
         };
         readiness.qualification = entry.qualification;
+        readiness.note = entry
+            .qualification
+            .as_ref()
+            .map(|record| qualification_note(record.contract));
+        // The summary's fingerprint for the options this very model is started with.
+        readiness.summary_contract = summary_disclosure(&EngineContract::of(
+            &ServerOptions::for_model(entry.info.as_ref().and_then(|info| info.context_length)),
+        ));
         if let Some((stage, blocker)) = admission_blocker(&entry) {
             readiness.stage = stage;
             readiness.blocker = Some(blocker);
@@ -214,6 +260,20 @@ pub fn admission_blocker(entry: &ModelEntry) -> Option<(Stage, Blocker)> {
                         .unwrap_or_default()
                 ),
                 recovery: RECOVERY_UNVERIFIED,
+            },
+        )),
+        // A record exists for this digest, but its figures were taken with other engine
+        // options: the badge is not carried, and the reason is not "nobody measured it".
+        Err(_) if entry.qualification_issue.is_some() => Some((
+            Stage::Unqualified,
+            Blocker {
+                cause: CAUSE_CONTRACT_CHANGED,
+                detail: format!(
+                    "{} is verified, but {}",
+                    entry.id,
+                    entry.qualification_issue.as_deref().unwrap_or_default()
+                ),
+                recovery: RECOVERY_CONTRACT_CHANGED,
             },
         )),
         Err(_) => Some((

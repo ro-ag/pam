@@ -106,19 +106,42 @@ revocation still applies to retained result metadata.
 
 ## Waiting and exit status
 
-Waiting authorizes through the durable status query before subscribing. A refusal
-ends the follow immediately with the original ticket and cause. A terminal event
-triggers a durable recheck rather than being treated as proof of success.
+`pam wait` and `pam subscribe` follow one ticket on one connection. The follow
+opens with the durable status query, which is its authorization and the one
+`query` request it costs: a refusal ends the follow immediately with the
+original ticket and cause, and a ticket that already finished is answered at
+once. Otherwise the daemon attaches the follower, replays the events of that
+ticket it still holds (so a late `pam subscribe` shows `queued` and `started`),
+streams the rest, and ends the stream with the durable result read from the
+store at that moment. The CLI prints that result; for a `flow.run` ticket it
+then reads the full verdict once through `flow.result`. An event is a
+notification, never proof of success: the ending is the store's answer, and the
+daemon re-checks the ticket and the caller's authorization on a terminal event
+and every 15 seconds, so an ending whose event was lost still ends the follow.
+Events carry no detail (a progress note is fixed generic text), and a gap in
+their sequence numbers needs no action.
 
 The CLI uses the same outcome mapping for synchronous execution and a completed
 wait: success 0, usage error 2, refusal 3, unresolved verification 4 and blocked
-work 5. Client/internal errors and observation timeout use 1. Refusal 3 means a
-policy refusal: transient daemon conditions (capacity, rate, shutdown, restart,
-deadline, internal error) are retried with backoff until the observation timeout,
-a lost event stream is reconnected while the durable query keeps reconciling, and
-the follow then ends with exit 1 and `follow_timeout`. Cancellation and
-request expiry remain explicit terminal causes in JSON; observation timeout does
-not cancel the original request. Keep the ticket to inspect it later.
+work 5. Client/internal errors and observation timeout use 1. Transient daemon
+conditions (capacity, rate, a full follower table, shutdown, restart, deadline,
+internal error, a follow that reached its one-hour lifetime) and a dropped
+connection are retried with backoff until the observation timeout: the client
+reconnects and resumes after the last event it saw, and a restarted daemon is
+followed from the start. The follow then ends with exit 1 and `follow_timeout`.
+Refusal 3 is what the daemon decided and a retry will not change: a policy
+refusal, or `client_version_mismatch` (also `protocol_mismatch`) when this `pam`
+is not the build the running daemon was started from. That refusal names the
+daemon's version and executable; the daemon is neither restarted nor stopped by
+it, and the fix is to use the matching binary or stop the daemon. Cancellation
+and request expiry remain explicit terminal causes in JSON; observation timeout
+does not cancel the original request. Keep the ticket to inspect it later.
+
+A daemon of version 0.4 or older that is still running after an upgrade is not
+a refusal: the first command outside a sandbox stops it and starts the current
+one, and a command that may not signal it (under a sandbox, or through
+`PAM_SOCKET_DIR`) exits 1 with the instruction to run `pam daemon stop` and
+then `pam status` outside the sandbox.
 
 Without `--json`, a refused or timed-out follow is one `pam wait:` (or
 `pam subscribe:`) line on stderr naming the ticket. With `--json` (`pam wait`

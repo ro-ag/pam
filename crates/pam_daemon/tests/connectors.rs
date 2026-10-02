@@ -1,5 +1,5 @@
 //! The connector admin surface, end to end: a real daemon on a temp base
-//! dir, real zmq, a real `SQLite` store — with the OS keychain and the
+//! dir, real sockets, a real `SQLite` store — with the OS keychain and the
 //! network replaced by the harness's fakes ([`FakeSecretBackend`],
 //! [`FakeTransport`]), which is the only thing about this that is not
 //! production.
@@ -150,7 +150,7 @@ async fn configure_then_test_then_list_agree_over_the_real_socket() {
             .await;
         let body = body_of(response, Outcome::Verified);
         let connectors = body["connectors"].as_array().expect("connectors array");
-        assert_eq!(connectors.len(), 7);
+        assert_eq!(connectors.len(), 6);
         assert_eq!(connectors[0]["id"], "github");
         assert_eq!(connectors[0]["enabled"], true);
         assert_eq!(connectors[0]["base_url"], BASE_URL);

@@ -297,7 +297,7 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
             }
         })
         .collect();
-    assert_eq!(required.len(), 7);
+    assert_eq!(required.len(), 6);
     assert_eq!(actual, required);
     assert!(flow.steps[0].expect_empty_output);
     for pair in flow.steps.windows(2) {

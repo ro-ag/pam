@@ -53,9 +53,6 @@ const GUIDANCE: Record<string, { url?: string; help: string }> = {
     url: "https://graph.microsoft.com/v1.0",
     help: "Use a Microsoft Graph bearer access token authorized to read the required SharePoint sites and files. This form does not sign in or renew expiring tokens.",
   },
-  aws: {
-    help: "Use a named AWS profile already configured on this machine. Leave the profile blank for the default credential chain. The profile needs only the read permissions for your flow; there is no secret for PAM to store.",
-  },
 };
 
 type Action = { kind: "save-test" } | { kind: "enable"; enabled: boolean } | { kind: "clear" };
@@ -78,7 +75,6 @@ function ConnectorRow({
   const [dirty, setDirty] = useState(false);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
   const [verdict, setVerdict] = useState(connector.last_test);
-  const profile = connector.auth === "aws_profile";
   const guidance = GUIDANCE[connector.id];
 
   useEffect(() => {
@@ -103,7 +99,7 @@ function ConnectorRow({
             : {
                 ...(connector.needs_base_url ? { base_url: baseUrl.trim() || null } : {}),
                 ...(connector.username_label ? { username: username.trim() || null } : {}),
-                ...(!profile && secret ? { credential: { set: secret } } : {}),
+                ...(secret ? { credential: { set: secret } } : {}),
               },
       );
       if (action.kind !== "enable") {
@@ -162,13 +158,11 @@ function ConnectorRow({
     setFailure(null);
   }
   const denied = failure?.cause === CAUSE_STORE_DENIED;
-  const unavailable =
-    !profile && (!connector.store_available || failure?.cause === "store_unavailable");
+  const unavailable = !connector.store_available || failure?.cause === "store_unavailable";
   const needsUrl = connector.needs_base_url && !baseUrl.trim();
   const needsCredentials =
-    !profile &&
-    ((!connector.credential_present && !secret) ||
-      (connector.auth === "basic_user_secret" && !username.trim()));
+    (!connector.credential_present && !secret) ||
+    (connector.auth === "basic_user_secret" && !username.trim());
   const state = blocked
     ? "Readiness unavailable"
     : unavailable
@@ -251,23 +245,21 @@ function ConnectorRow({
           </label>
         )}
       </div>
-      {!profile && (
-        <label className="block space-y-1">
-          <span className={fieldLabelClasses}>Credential</span>
-          <TextField
-            className={fieldClasses}
-            type="password"
-            autoComplete="new-password"
-            aria-label={`${connector.name} credential`}
-            value={secret}
-            disabled={busy}
-            onChange={(event) => edit(() => setSecret(event.target.value))}
-            placeholder={
-              connector.credential_present ? "Stored; type to replace it" : "Paste the token"
-            }
-          />
-        </label>
-      )}
+      <label className="block space-y-1">
+        <span className={fieldLabelClasses}>Credential</span>
+        <TextField
+          className={fieldClasses}
+          type="password"
+          autoComplete="new-password"
+          aria-label={`${connector.name} credential`}
+          value={secret}
+          disabled={busy}
+          onChange={(event) => edit(() => setSecret(event.target.value))}
+          placeholder={
+            connector.credential_present ? "Stored; type to replace it" : "Paste the token"
+          }
+        />
+      </label>
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
@@ -286,16 +278,14 @@ function ConnectorRow({
           )}
           Save and test
         </Button>
-        {!profile && (
-          <ConfirmButton
-            label="Clear"
-            confirmLabel="clear it?"
-            busy={busy}
-            disabled={!connector.credential_present}
-            title={!connector.credential_present ? "No credential is stored" : undefined}
-            onConfirm={() => act({ kind: "clear" })}
-          />
-        )}
+        <ConfirmButton
+          label="Clear"
+          confirmLabel="clear it?"
+          busy={busy}
+          disabled={!connector.credential_present}
+          title={!connector.credential_present ? "No credential is stored" : undefined}
+          onConfirm={() => act({ kind: "clear" })}
+        />
         {verdict && !dirty && (
           <span className="font-data text-xs text-ink-muted">
             {verdict.detail}{" "}

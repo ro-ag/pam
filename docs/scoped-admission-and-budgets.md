@@ -30,9 +30,12 @@ Target values are exact:
 | Confluence Cloud | Numeric page ID |
 | SharePoint 365 | Exact Graph site identifier |
 
-Broad searches, unresolvable resource IDs, and AWS require an explicit
-connector-wide approval. The GUI currently edits the six HTTP products above;
-it does not invent an AWS target policy. Jenkins folder prefixes and filesystem
+Broad searches and unresolvable resource IDs require an explicit
+connector-wide approval. The GUI edits the six HTTP products above, which are
+all the connectors there are. A scope policy saved before the AWS adapter was
+removed may still carry an `aws` approval; it is ignored when the policy is read
+(removing an approval only narrows access) and disappears on the next save.
+Jenkins folder prefixes and filesystem
 string prefixes are not wildcard grants. A separately checked-out worktree must
 be approved as its own root. Connector URL changes invalidate the old scope.
 
@@ -94,10 +97,11 @@ admission capacity.
 
 | Resource | Ceiling |
 | --- | --- |
-| Public JSON request or response frame | 1 MiB |
-| ZMTP multipart message | Four frames; 2 MiB including data-frame headers |
-| Inbound ZMTP connections, including handshakes | 256 process-wide |
-| Inbound handshake | Five seconds |
+| Public JSON request, reply or event frame | 1 MiB; the declared length is checked before any buffer is allocated |
+| `hello` frame | 4 KiB; the version it carries, 64 bytes |
+| Inbound public connections, including handshakes and follows | 256 process-wide; one over the cap is told `connection_capacity_exhausted` |
+| Inbound handshake (the `hello` and the one request frame) | Five seconds |
+| Frame write to a peer | Five seconds; a peer that does not read is disconnected |
 | Request ID, capability, caller label, idempotency key | 128 bytes each |
 | Caller repository spelling | 4,096 bytes |
 | Active admitted requests | 128; a row past its deadline stops counting |
@@ -105,6 +109,13 @@ admission capacity.
 | Public dispatcher slots | 128 work; 16 `status`; 16 `query`; 8 `cancel` (falls back to a control slot); 32 for requests the private admin plane submits. The transport holds none |
 | Aggregate admission rate | 256 work/second; 64 `status`/second; 64 `query`/second; 16 `cancel`/second |
 | Request handler | Request deadline plus 30 seconds; control class: the smaller of deadline and 10 seconds, plus 2 seconds |
+| Public followers (`pam wait`, `pam subscribe`) | 96 in total; 16 per ticket; refusal `follower_capacity_exhausted` (retried by the client) |
+| Follower queue | 64 events; the oldest `progress` event is dropped first, the ending never |
+| Replay kept per live ticket | The last 32 events, for a late or resumed follower |
+| Tickets the event hub tracks | 512; the oldest one nobody follows is dropped, which only loses replay |
+| Follow lifetime | One hour (`follow_expired`), after which the client reconnects; the daemon re-checks the ticket and the follower's authorization every 15 seconds |
+| All-events subscribers (private admin plane, the GUI) | 4; 1,024 queued events each, then `subscriber_lagged` |
+| Private admin plane | 1 MiB requests, 16 MiB replies, 32 connections, five-second handshake |
 | Finished replies kept for attached duplicates | 256 entries, 8 MiB, 60 seconds; the oldest is evicted first |
 | `echo` diagnostic | Delay at most 60 seconds; arguments at most 64 KiB |
 | Request wall time | One hour, including admission and queue wait |
@@ -115,12 +126,15 @@ admission capacity.
 | Accounted blocking jobs | Eight executing; 128 outstanding including waiting lanes |
 
 Individual adapter and step ceilings can be smaller. Identity and payload checks
-happen before retaining a decoded request for execution. The patched existing
-ZeroMQ dependency checks declared frame sizes before allocating, including on
-clients. An oversized public reply becomes a small explicit refusal; callers
-must use bounded evidence retrieval rather than request a complete large blob.
-See [the dependency patch record](../vendor/zeromq/PAM-PATCH.md) for wire limits
-and its separate regression command.
+happen before retaining a decoded request for execution. Both the daemon and
+the client check a frame's declared length against the direction's limit before
+allocating or reading its body. An oversized public reply becomes a small
+explicit refusal (`response_budget_exhausted`); callers must use bounded
+evidence retrieval rather than request a complete large blob. A connection
+carries exactly one request, so a pending reply and an active handler are the
+same thing: the transport holds no permits of its own beyond the connection
+cap. The wire protocol and the reasons for each follow limit are in the
+[transport specification](specs/2026-10-02-framed-public-transport.md).
 
 Every flow step and retry shares the same request budget. Preliminary git reads
 consume an attempt and capture allowance. Each physical HTTP hop reserves its
@@ -128,7 +142,7 @@ maximum body size before sending; completed bounded bodies return unused bytes.
 Errors or cancelled futures without an exact byte count keep their reservation.
 This bounds accepted/captured data, not all bytes transmitted by an uncooperative
 remote peer. HTTP deadlines are enforced around the transport, not merely passed
-to curl. AWS reserves both of its bounded pipe captures conservatively.
+to curl.
 
 Failed attempt evidence is filed before retry/backoff. Budget and scope refusals
 are nonretryable and stop the run with an explicit cause. Successful flow replies

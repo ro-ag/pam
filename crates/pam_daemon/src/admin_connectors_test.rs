@@ -166,7 +166,7 @@ async fn list_answers_every_connector_and_finishes_the_request() {
     let body = body_of(response, Outcome::Verified);
 
     let connectors = body["connectors"].as_array().expect("connectors array");
-    assert_eq!(connectors.len(), 7);
+    assert_eq!(connectors.len(), 6);
     assert_eq!(connectors[0]["id"], "github");
     assert_eq!(connectors[0]["name"], "GitHub");
     assert_eq!(connectors[0]["auth"], "bearer");
@@ -326,6 +326,62 @@ async fn configure_refuses_an_unknown_connector_id() {
         RequestState::Refused
     );
     assert_eq!(fixture.terminal_actions(&id).await, [ACTION_ADMIN]);
+}
+
+/// An install upgraded from a release that shipped the AWS adapter still has
+/// an `aws` row (and perhaps a keychain item). The row must neither crash nor
+/// resurface the connector, and any op naming it must refuse with a recovery
+/// line, never panic.
+#[tokio::test]
+async fn a_legacy_aws_row_is_ignored_and_ops_naming_it_refuse_legibly() {
+    let fixture = fixture().await;
+    fixture
+        .store
+        .upsert_connector(
+            "aws",
+            pam_store::ConnectorPatch {
+                enabled: Some(true),
+                username: Some(Some("default")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a legacy row can exist in the store");
+
+    let (_, response) = fixture.run(OP_CONNECTORS_LIST, json!({})).await;
+    let body = body_of(response, Outcome::Verified);
+    let connectors = body["connectors"].as_array().expect("connectors array");
+    assert_eq!(connectors.len(), 6);
+    assert!(
+        connectors.iter().all(|entry| entry["id"] != "aws"),
+        "the removed connector must not be listed: {connectors:?}"
+    );
+
+    for op in [OP_CONNECTORS_CONFIGURE, OP_CONNECTORS_TEST] {
+        let (id, response) = fixture.run(op, json!({ "id": "aws" })).await;
+        let (cause, detail, recovery) = refusal_of(response);
+        assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS, "{op}");
+        assert!(detail.contains("is not a connector"), "{op}: {detail}");
+        assert!(
+            recovery.contains("AWS CLI adapter was removed"),
+            "{recovery}"
+        );
+        assert!(recovery.contains("keychain item"), "{recovery}");
+        assert_eq!(
+            fixture.terminal_actions(&id).await,
+            [ACTION_ADMIN],
+            "{op} still finishes its request"
+        );
+    }
+    // Refusing never touched the row or the keychain.
+    assert!(
+        fixture
+            .store
+            .get_connector("aws")
+            .await
+            .expect("row query")
+            .is_some_and(|row| row.enabled)
+    );
 }
 
 #[tokio::test]

@@ -33,6 +33,19 @@ not intercept build scripts that invoke a compiler directly. The selected databa
 graph contains no `cc`, `cmake`, or `simsimd`. Turso SDK build metadata still selects
 `bindgen`; its current build script does not invoke it for this host.
 
+## Transport (plan 49)
+
+The public transport uses no third-party socket library. The `zeromq` crate, its
+same-version `vendor/zeromq` patch (declared frame sizes checked before
+allocation) and that patch's separate gate step were removed when both daemon
+planes moved to PAM's own length-prefixed frame protocol on tokio stream
+sockets; the frame-size checks now live in `pam_daemon::framed` and run in the
+ordinary test suite. Eight packages left the lockfile with it: `zeromq`,
+`win_uds` (the FFI crate that gave Windows its `AF_UNIX` sockets),
+`asynchronous-codec`, `crossbeam-queue`, `futures`, `scc`, `sdd` and `saa`.
+`cargo tree -i zeromq` and `cargo tree -i win_uds` match no package. Two vendor
+patches remain, both described above.
+
 ## Unresolved GUI conflict (issue #16)
 
 Wry 0.55.1 unconditionally enables `objc2/exception` on Apple targets. The

@@ -22,7 +22,7 @@ for access, evidence, polling, validation, or landing decisions.
 
 ## Boundaries that do not change
 
-- Reuse the single binary, CLI, daemon, internal ZeroMQ/Unix IPC, flows, GUI,
+- Reuse the single binary, CLI, daemon, internal Unix-socket IPC, flows, GUI,
   audit/evidence store, Candle runtime, and existing adapters. No MCP interface.
 - Enterprise policy must allow executable and IPC access. A Unix socket does
   not make activity invisible to the sandbox or establish caller identity.

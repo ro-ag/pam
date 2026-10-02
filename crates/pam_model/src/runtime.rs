@@ -11,8 +11,7 @@
 /// The context window PAM runs models in, in tokens.
 ///
 /// Capped at 8192 and lowered to the header's `<arch>.context_length` when
-/// the header reports less (`pam_daemon::model_service::context_tokens_for`
-/// does this now). The cap exists because the KV cache for a 30B `MoE` at
+/// the header reports less ([`crate::engine_server::context_tokens_for`]). The cap exists because the KV cache for a 30B `MoE` at
 /// its advertised context does not fit in the machines PAM targets, and a
 /// number that is true on paper but fails at token 40 000 is a lie the human
 /// pays for. 8192 is the figure pam-old ran on.
@@ -92,12 +91,9 @@ pub struct LoadedModel {
     pub quant: String,
     /// `general.architecture`.
     pub architecture: String,
-    /// The context the engine was started with. Today that is always
-    /// [`CONTEXT_TOKENS`] (the daemon loads every model with
-    /// `ServerOptions::default()`); the header's own
-    /// `<arch>.context_length` is reported by the registry but not
-    /// consulted at load, so a model advertising less than 8192 is started
-    /// above its window rather than clamped.
+    /// The context the engine was started with: [`CONTEXT_TOKENS`], lowered to
+    /// the header's own `<arch>.context_length` when that is smaller
+    /// ([`crate::engine_server::context_tokens_for`]).
     pub context_length: usize,
     /// Artifact file size. Not a working-set measurement.
     pub weight_bytes: u64,

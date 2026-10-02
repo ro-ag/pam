@@ -294,7 +294,7 @@ async fn boot_fails_the_jobs_a_dead_daemon_left_running() {
 /// keep the envelope.
 #[test]
 fn context_tokens_follow_the_header_only_downwards() {
-    use crate::model_service::context_tokens_for;
+    use pam_model::engine_server::context_tokens_for;
     let envelope = pam_model::runtime::CONTEXT_TOKENS;
     assert_eq!(context_tokens_for(None), envelope);
     assert_eq!(context_tokens_for(Some(0)), envelope);
@@ -771,6 +771,17 @@ async fn a_checked_download_is_recorded_in_the_private_base_not_beside_the_file(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    let status = service.status().await.unwrap();
+    let row = status["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == job.as_str())
+        .unwrap();
+    let detail: serde_json::Value = serde_json::from_str(row["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(detail["verified"], true, "{detail}");
+    assert!(detail.get("verify_error").is_none(), "{detail}");
+
     assert!(!pam_model::registry::verified_sidecar_path(&dest).exists());
     let entry = service.find("qwen/pinned").await.unwrap().unwrap();
     assert_eq!(
@@ -778,6 +789,519 @@ async fn a_checked_download_is_recorded_in_the_private_base_not_beside_the_file(
         Some(sha256.as_str())
     );
     assert!(std::fs::read_dir(service.trust_dir()).unwrap().count() >= 1);
+    // The record is not curl's word for it: PAM's own copy of the file was made and
+    // hashed, and it is what the engine would be started on.
+    let private = service.weights_dir().join(format!("{sha256}.gguf"));
+    assert_eq!(entry.engine_path(), private);
+    assert_eq!(std::fs::read(&private).unwrap(), body);
+}
+
+// ---- a verified model is loaded from PAM's private copy, never from the models directory ----
+
+/// The window the fingerprint re-check could only narrow: the models directory's file
+/// is replaced after the scan a load is based on and before the engine opens it. The
+/// engine is started on the private copy, so it gets the verified bytes regardless.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_source_swapped_between_the_scan_and_the_load_does_not_reach_the_engine() {
+    let Some(fake) = fake_engine_binary() else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("pam-sw-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "tiny.gguf");
+    let verified_bytes = std::fs::read(&path).unwrap();
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Light, Some("qwen/tiny"))
+        .await
+        .unwrap();
+    install_fake_engine(&service, &fake);
+    let entry = service.resolve(Tier::Light).await.unwrap();
+    let digest = entry.verified.as_ref().unwrap().sha256.clone();
+
+    // After the resolve: other bytes renamed over the verified name (same length).
+    let staged = dir.path().join("qwen").join(".evil");
+    std::fs::write(&staged, b"NOT a real gguf").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+
+    let operation = service.operation.lock().await;
+    service.ensure_loaded_inner(&entry).await.unwrap();
+    let loaded = service
+        .engine_server()
+        .unwrap()
+        .model()
+        .expect("the engine holds the model");
+    assert_eq!(
+        loaded.path,
+        service.weights_dir().join(format!("{digest}.gguf")),
+        "the engine was started on the private copy"
+    );
+    assert!(
+        loaded.path.starts_with(dir.path().join("base")),
+        "which lives under the daemon's base, not in the models directory"
+    );
+    assert_eq!(std::fs::read(&loaded.path).unwrap(), verified_bytes);
+    assert_eq!(
+        pam_model::registry::sha256_file(&loaded.path).unwrap().0,
+        digest,
+        "what the engine opened has the verified digest"
+    );
+    drop(operation);
+
+    // The next resolve sees the swap and refuses the tier; nothing unverified serves.
+    assert!(matches!(
+        service.resolve(Tier::Light).await.unwrap_err(),
+        ModelUnavailable::Unverified(_)
+    ));
+    service.unload_all().await.unwrap();
+    assert!(
+        std::fs::read_dir(service.weights_dir())
+            .unwrap()
+            .next()
+            .is_none(),
+        "once unloaded, the copy of a file that is no longer verified is swept"
+    );
+}
+
+/// An unverified model is still loadable for Try, from the file itself: there is no
+/// claim about its bytes to protect, and it never serves a job.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unverified_model_loads_from_the_models_directory() {
+    let Some(fake) = fake_engine_binary() else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("pam-un-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "tiny.gguf");
+    install_fake_engine(&service, &fake);
+    let entry = service.find("qwen/tiny").await.unwrap().unwrap();
+
+    service.ensure_loaded(&entry).await.unwrap();
+    let engine = service.engine_server().unwrap();
+    assert_eq!(engine.model().unwrap().path, path);
+
+    // Verified afterwards: the same id is now another file to the engine, so a job
+    // does not reuse the unverified load.
+    verify_and_qualify(&service, &path);
+    let verified = service.find("qwen/tiny").await.unwrap().unwrap();
+    service.ensure_loaded(&verified).await.unwrap();
+    assert_eq!(
+        engine.model().unwrap().path,
+        verified.engine_path(),
+        "reloaded from the private copy"
+    );
+    assert_ne!(verified.engine_path(), path);
+    service.unload_all().await.unwrap();
+}
+
+/// A verification is a job: it reports what it did with the private copy, and a cancel
+/// leaves no copy and no record.
+#[tokio::test]
+async fn a_verify_job_makes_the_private_copy_and_a_cancelled_one_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    let entry = service.find("qwen/small").await.unwrap().unwrap();
+
+    let job = service.start_verify(entry).await.unwrap();
+    let row = finished_job(&service, &job).await;
+    assert_eq!(row["state"], "done", "{row}");
+    let detail: serde_json::Value = serde_json::from_str(row["detail"].as_str().unwrap()).unwrap();
+    let digest = detail["sha256"].as_str().unwrap().to_owned();
+    assert!(
+        ["cloned", "copied"].contains(&detail["private_copy"].as_str().unwrap()),
+        "{detail}"
+    );
+    assert_eq!(
+        row["bytes_done"],
+        std::fs::metadata(&path).unwrap().len(),
+        "progress reached the whole file"
+    );
+    assert!(
+        service
+            .weights_dir()
+            .join(format!("{digest}.gguf"))
+            .is_file()
+    );
+    assert!(
+        !service.cancel_verify(&job),
+        "a finished job has nothing to cancel"
+    );
+
+    // A file large enough that the hash is still running when the cancel lands (sparse:
+    // it costs no disk, and its clone costs none either).
+    let big = dir.path().join("qwen").join("big.gguf");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(768 * 1024 * 1024)
+        .unwrap();
+    let entry = service.find("qwen/big").await.unwrap().unwrap();
+    let job = service.start_verify(entry).await.unwrap();
+    assert!(service.cancel_verify(&job));
+    let row = finished_job(&service, &job).await;
+    assert_eq!(row["state"], "cancelled", "{row}");
+    assert_eq!(
+        std::fs::read_dir(service.weights_dir()).unwrap().count(),
+        1,
+        "only the first model's copy is there"
+    );
+    assert_eq!(
+        service.find("qwen/big").await.unwrap().unwrap().verified,
+        None
+    );
+}
+
+/// Polls `admin.models.status` until job `id` leaves `running`, and returns its row.
+async fn finished_job(service: &ModelService, id: &str) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        let status = service.status().await.unwrap();
+        let row = status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .expect("the job has a row")
+            .clone();
+        if row["state"] != JOB_RUNNING {
+            return row;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{row}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn a_verification_that_cannot_keep_its_copy_fails_with_its_own_cause_and_recovery() {
+    use pam_model::RegistryError;
+    use pam_model::weights::WeightsError;
+    let no_space = RegistryError::Weights(WeightsError::NoSpace {
+        dir: "/base/engine/weights".into(),
+        needed: 12_109_566_624,
+        free: Some(1_000_000),
+    });
+    let cause = crate::model_service::verify_cause(&no_space);
+    assert_eq!(cause, crate::model_service::CAUSE_NO_SPACE);
+    let body = crate::model_service::job_failure_value(cause, &no_space.to_string());
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("12109566624 bytes needed") && detail.contains("1000000 bytes free"),
+        "{detail}"
+    );
+    assert!(
+        body["recovery"].as_str().unwrap().contains("verify again"),
+        "{body}"
+    );
+    let changed = RegistryError::Changed {
+        id: "qwen/tiny".into(),
+        what: "it was modified while being verified".into(),
+    };
+    assert_eq!(
+        crate::model_service::verify_cause(&changed),
+        "model_changed"
+    );
+    assert_eq!(
+        crate::model_service::verify_cause(&RegistryError::NotFound("x".into())),
+        crate::model_service::CAUSE_VERIFY_FAILED
+    );
+}
+
+/// What a killed daemon left half-made in the private weights store is removed by the
+/// first status of the next one; finished copies of live verifications stay.
+#[tokio::test]
+async fn the_first_status_sweeps_what_a_dead_daemon_left_in_the_weights_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    service.set_engine_base(dir.path().join("base"));
+    verify_and_qualify(&service, &path);
+    let leftover = service
+        .weights_dir()
+        .join(".incoming-1-00000000deadbeef.part");
+    std::fs::write(&leftover, b"half a model").unwrap();
+    // A fresh base flag, as at daemon start.
+    service.set_engine_base(dir.path().join("base"));
+
+    let status = service.status().await.unwrap();
+    assert_eq!(
+        status["weights_dir"],
+        service.weights_dir().display().to_string()
+    );
+    assert_eq!(status["summary_contract"]["task"], "log.summary");
+    assert!(!leftover.exists());
+    assert_eq!(
+        std::fs::read_dir(service.weights_dir()).unwrap().count(),
+        1,
+        "the verified model keeps its copy"
+    );
+}
+
+// ---- qualification is a capability-bench claim; the summary's contract is disclosed ----
+
+/// The disclosed fingerprint is of the request the summary really sends, and the
+/// disclosure says in plain words that nothing was measured under it.
+#[tokio::test]
+async fn the_summary_contract_is_disclosed_as_the_request_the_summary_sends() {
+    use pam_model::engine_server::{EngineContract, ServerOptions};
+    let contract = crate::model_service::summary_contract().expect("the request builds");
+    assert_eq!(contract.task, "log.summary");
+    let system = contract.system.as_deref().unwrap();
+    assert!(
+        system.starts_with(crate::log_service::SUMMARY_SYSTEM),
+        "{system}"
+    );
+    assert!(
+        system.contains("- exit status: unknown") && system.contains("<<<EVIDENCE <fence>>>>"),
+        "host facts and the fence are part of what is fingerprinted: {system}"
+    );
+    assert!(
+        contract.prompt.contains("<evidence>"),
+        "{}",
+        contract.prompt
+    );
+    assert_eq!(contract.max_tokens, crate::log_service::SUMMARY_MAX_TOKENS);
+    assert!((contract.temperature - crate::log_service::SUMMARY_TEMPERATURE).abs() < f64::EPSILON);
+    assert_eq!(
+        contract.input_limit,
+        crate::model_service::SUMMARY_INPUT_LIMIT_TOKENS
+    );
+    // The limit lives as a literal in `log_service` until that call names the constant.
+    let log_service = include_str!("log_service.rs");
+    assert!(
+        log_service.contains("SUMMARY_INPUT_LIMIT_TOKENS")
+            || log_service.contains("(Tier::Heavy, request, 2048, cancel)"),
+        "the summary's input limit moved; SUMMARY_INPUT_LIMIT_TOKENS must move with it"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let status = service.status().await.unwrap();
+    let disclosed = &status["summary_contract"];
+    assert_eq!(
+        disclosed["fingerprint"],
+        contract.fingerprint(&EngineContract::of(&ServerOptions::default()))
+    );
+    assert_eq!(
+        disclosed["measured"], false,
+        "nothing was measured under it"
+    );
+    let note = disclosed["note"].as_str().unwrap();
+    assert!(
+        note.contains("advisory")
+            && note.contains("untrusted")
+            && note.contains("not been measured"),
+        "{note}"
+    );
+}
+
+/// The summary request framed another way: what an edit to `frame_evidence` or to the
+/// summary instructions would produce.
+fn reworded(
+    instructions: &str,
+    host_facts: &[(&str, &str)],
+    evidence: &str,
+) -> Option<pam_model::runtime::FramedEvidence> {
+    let mut framed =
+        pam_model::runtime::frame_evidence_with(instructions, host_facts, evidence, "<fence>")?;
+    framed.system.push_str(" Answer in one line.");
+    Some(framed)
+}
+
+/// The summary's framing is not what a record was measured under, so editing it must
+/// not drop the badge: it changes the disclosed fingerprint and nothing else.
+#[tokio::test]
+async fn a_summary_framing_change_moves_the_disclosure_and_not_the_qualification() {
+    use pam_model::PromptContract;
+    use pam_model::engine_server::{EngineContract, ServerOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Heavy, Some("qwen/small"))
+        .await
+        .unwrap();
+    let engine = EngineContract::of(&ServerOptions::default());
+    let shipped = crate::model_service::summary_disclosure(&engine)
+        .fingerprint
+        .expect("a fingerprint");
+
+    let request = crate::log_service::summary_request_with("<evidence>", None, reworded).unwrap();
+    let edited = PromptContract::of(
+        "log.summary",
+        &request,
+        crate::model_service::SUMMARY_INPUT_LIMIT_TOKENS,
+    )
+    .fingerprint(&engine);
+    assert_ne!(
+        edited, shipped,
+        "the disclosed fingerprint follows the prompt"
+    );
+
+    // Nothing about the gate reads that fingerprint: the record still qualifies the model.
+    let entry = service.resolve(Tier::Heavy).await.unwrap();
+    assert!(entry.qualification.is_some());
+    let readiness = service.readiness_now(Tier::Heavy).await.unwrap();
+    assert_eq!(
+        readiness.qualification.map(|record| record.artifact),
+        Some("fixture")
+    );
+    assert_eq!(
+        readiness.summary_contract.fingerprint.as_deref(),
+        Some(shipped.as_str())
+    );
+    assert!(!readiness.summary_contract.measured);
+}
+
+#[tokio::test]
+async fn a_record_measured_with_other_engine_options_refuses_the_tier_and_says_re_measure() {
+    use pam_model::engine_server::EngineContract;
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Light, Some("qwen/small"))
+        .await
+        .unwrap();
+    assert_eq!(service.resolve(Tier::Light).await.unwrap().id, "qwen/small");
+
+    // The same record, measured when the supervisor sent another seed: a bench-affecting
+    // option this build no longer uses.
+    let sha256 = pam_model::registry::sha256_file(&path).unwrap().0;
+    let reseeded = EngineContract {
+        seed: 9,
+        ..service.engine_contract_for_tests(&sha256)
+    };
+    service.qualify_measured_with_for_tests(&sha256, reseeded);
+    let refused = service.resolve(Tier::Light).await.unwrap_err();
+    let ModelUnavailable::Unqualified(detail) = &refused else {
+        panic!("expected an unqualified refusal, got {refused:?}");
+    };
+    assert!(
+        detail.starts_with("qwen/small (")
+            && detail.contains("seed: measured 9, now 7")
+            && detail.contains("needs re-measurement"),
+        "{detail}"
+    );
+    let entry = service.find("qwen/small").await.unwrap().unwrap();
+    assert_eq!(entry.qualification, None, "the badge is not carried");
+    assert_eq!(
+        entry.class,
+        pam_model::ModelClass::Engine,
+        "it is still verified, and still answers Try"
+    );
+    let listed = serde_json::to_value(&entry).unwrap();
+    assert!(
+        listed["qualification_issue"]
+            .as_str()
+            .unwrap()
+            .contains("re-measurement"),
+        "the listing carries the reason: {listed}"
+    );
+}
+
+/// The gate a summary passes is unchanged: a model that is not verified, or verified but
+/// not bench-qualified (no record, or a record that no longer describes how it is run),
+/// writes no summary; the compact evidence stands and the skip says why.
+#[tokio::test]
+async fn a_summary_is_skipped_for_a_model_that_is_unverified_or_unqualified() {
+    use crate::log_service::{CompressInput, LogService};
+    use pam_model::engine_server::EngineContract;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    models.set_models_dir(dir.path()).await.unwrap();
+    models.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    models
+        .set_default(Tier::Heavy, Some("qwen/small"))
+        .await
+        .unwrap();
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let skipped = |request: &'static str| {
+        let logs = &logs;
+        let store = &store;
+        async move {
+            store
+                .insert_request(request, "admin.log.compress", "gui", "pam-gui", "{}", None)
+                .await
+                .unwrap();
+            let report = logs
+                .compress(
+                    request,
+                    CompressInput {
+                        name: "build.log".to_owned(),
+                        bytes: b"step one\nerror: link failed\n".to_vec(),
+                        exit_status: Some(1),
+                        use_model: true,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.summary.is_none() && report.model.is_none());
+            report.model_skipped.expect("the skip is explained")
+        }
+    };
+
+    let unverified = skipped("req_unverified").await;
+    assert_eq!(unverified.cause, crate::log_service::CAUSE_MODEL_UNVERIFIED);
+
+    let (sha256, size_bytes) = pam_model::registry::sha256_file(&path).unwrap();
+    models
+        .registry()
+        .record_verified(
+            &path,
+            &pam_model::VerifiedRecord {
+                sha256: sha256.clone(),
+                size_bytes,
+                verified_ts: 0,
+                matches_catalog: None,
+            },
+        )
+        .unwrap();
+    let unqualified = skipped("req_unqualified").await;
+    assert_eq!(
+        unqualified.cause,
+        crate::log_service::CAUSE_MODEL_UNQUALIFIED
+    );
+
+    let reseeded = EngineContract {
+        seed: 9,
+        ..models.engine_contract_for_tests(&sha256)
+    };
+    models.qualify_measured_with_for_tests(&sha256, reseeded);
+    let changed = skipped("req_changed").await;
+    assert_eq!(changed.cause, crate::log_service::CAUSE_MODEL_UNQUALIFIED);
+    assert!(
+        changed.detail.contains("needs re-measurement"),
+        "{}",
+        changed.detail
+    );
+
+    // Qualified with the options this build uses: the gate opens, and the only thing
+    // between the log and a summary is the engine, which this fixture does not install.
+    models.qualify_for_tests(&sha256);
+    let admitted = skipped("req_admitted").await;
+    assert_eq!(admitted.cause, "load_failed", "{}", admitted.detail);
 }
 
 // ---- a dead engine is noticed, a failing one is not "in use", a wedged one is bounded ----

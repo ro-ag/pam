@@ -58,6 +58,28 @@ export function toBridgeFailure(err: unknown): BridgeFailure {
   };
 }
 
+/** The cause of a refusal to a window whose build is not the running daemon's. */
+export const CLIENT_VERSION_MISMATCH = "client_version_mismatch";
+
+/**
+ * Rewrites a `client_version_mismatch` refusal into the plain notice Settings › Daemon shows, or
+ * returns `null` for any other failure. The daemon's detail names its version and the path it is
+ * running from ("… does not match daemon version 0.5.0 running from /path/pam; that binary has
+ * not changed on disk …"); both are lifted into the sentence, and the daemon's own recovery line
+ * is kept as is. A detail that does not parse still gets the notice, without the facts.
+ */
+export function versionMismatchNote(failure: BridgeFailure): BridgeFailure | null {
+  if (failure.cause !== CLIENT_VERSION_MISMATCH) return null;
+  const facts = /daemon version (\S+) running from (.+?); /.exec(failure.detail);
+  // The note renders as a sentence and adds its own full stop.
+  const where = facts ? `; the daemon is version ${facts[1]}, running from ${facts[2]}` : "";
+  return {
+    cause: failure.cause,
+    detail: `This window is not the build the running daemon was started from${where}`,
+    recovery: failure.recovery,
+  };
+}
+
 /**
  * Longest an ordinary bridge call may take before the webview stops waiting. The Rust side
  * bounds every admin request at 30 s, so this only fires for a call that is truly stuck. The
@@ -667,6 +689,18 @@ export interface ModelsEngineSummary {
 export type ReadinessStage =
   "unconfigured" | "missing" | "unverified" | "unqualified" | "engine_missing" | "ready";
 
+/**
+ * The summary disclosure of one tier (`pam_daemon::model_service::SummaryDisclosure`): the
+ * fingerprint of the prompt the summary is written under, and that no qualification record was
+ * measured under it. A disclosure, never a gate.
+ */
+export interface SummaryContract {
+  task: string;
+  fingerprint: string | null;
+  measured: boolean;
+  note: string;
+}
+
 /** One tier's verdict, computed by the daemon with the job's own refusal cause. */
 export interface TierReadiness {
   tier: "light" | "heavy";
@@ -679,6 +713,13 @@ export interface TierReadiness {
   /** Whether the engine holds `model_id` right now — transient, independent of `stage`. */
   resident: boolean;
   qualification: Qualification | null;
+  /**
+   * What the qualification covers, in one sentence: the capability bench, not the summary
+   * prompt. Present exactly when `qualification` is; absent on an older daemon.
+   */
+  note?: string | null;
+  /** What PAM discloses about the summary this tier's model writes; absent on an older daemon. */
+  summary_contract?: SummaryContract;
   /** Present exactly when `stage` is not `ready`. */
   blocker: { cause: string; detail: string; recovery: string } | null;
 }
@@ -1004,7 +1045,7 @@ export type FlowRole = "observe" | "verify" | "change";
 export type FlowOutput = "compact" | "summarize" | "discard";
 export type FlowApproval = "none" | "required";
 export type FlowConnectorId =
-  "github" | "jenkins" | "sonarqube" | "jira" | "confluence" | "sharepoint" | "aws";
+  "github" | "jenkins" | "sonarqube" | "jira" | "confluence" | "sharepoint";
 
 /** Every connector, in `ConnectorId::ALL` order (the order the GUI lists them). */
 export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
@@ -1014,7 +1055,6 @@ export const FLOW_CONNECTORS: readonly FlowConnectorId[] = [
   "jira",
   "confluence",
   "sharepoint",
-  "aws",
 ];
 
 /** A connector call argument: YAML scalars only, string or integer. */
@@ -1228,17 +1268,6 @@ export const FLOW_CONNECTOR_CALLS: Record<FlowConnectorId, FlowCallSpec[]> = {
       ],
     },
   ],
-  aws: [
-    { name: "commands", args: [] },
-    {
-      name: "cli",
-      args: [
-        { name: "service", required: true },
-        { name: "command", required: true },
-        { name: "args", required: false },
-      ],
-    },
-  ],
 };
 
 /** One flow with its text: what the YAML tab edits. */
@@ -1251,7 +1280,7 @@ export interface FlowDetail extends FlowListEntry {
 }
 
 export interface FlowConnectorScope {
-  connector: Exclude<FlowConnectorId, "aws">;
+  connector: FlowConnectorId;
   base_url: string;
   access: "targets" | "connector_wide";
   targets: string[];
@@ -1515,7 +1544,7 @@ export function retentionPrune(): Promise<PruneReport> {
  */
 
 /** How pam authenticates a connector. */
-export type ConnectorAuth = "bearer" | "basic_user_secret" | "token_as_user" | "aws_profile";
+export type ConnectorAuth = "bearer" | "basic_user_secret" | "token_as_user";
 
 /** One connector row in Settings › Connectors. */
 export interface ConnectorSummary {
@@ -1599,19 +1628,39 @@ export function readDaemonLog(lines: number): Promise<DaemonLogTail> {
 
 // --- event stream ----------------------------------------------------------
 
-/** A daemon lifecycle event, tagged like the Rust `Event` enum. */
+/**
+ * A daemon lifecycle event, tagged like the Rust `Event` enum, or the pump's own `resync`
+ * marker: "events may have been missed, refetch your lists once". `resync` is sent after every
+ * (re)connect of the stream and when the daemon's counter `n` skips; it is not a daemon event
+ * and carries an empty ticket.
+ */
 export type PamEvent =
   | { kind: "queued" }
   | { kind: "started" }
   | { kind: "progress"; pct?: number; note: string }
   | { kind: "approval_pending" }
   | { kind: "done" }
-  | { kind: "refused" };
+  | { kind: "refused" }
+  | { kind: "resync" };
 
-/** What arrives on the `pam://event` channel: `{ ticket, event }`. */
+/**
+ * What arrives on the `pam://event` channel: `{ ticket, event }` plus what the daemon knows
+ * about the ticket. The stream is the private admin socket's, so progress notes are the real
+ * ones. The members after `event` are absent when the daemon holds no admission record for the
+ * ticket and on a `resync`.
+ */
 export interface PamEventPayload {
   ticket: string;
   event: PamEvent;
+  /** The daemon-wide event counter; a skip means events were missed. */
+  n?: number;
+  capability?: string;
+  /** The caller's repository as admitted. */
+  repo?: string;
+  /** The caller's self-reported agent label: attribution, not authority. */
+  agent?: string;
+  /** Which plane admitted the ticket. */
+  ingress?: "public" | "admin";
 }
 
 /** The Tauri event channel the Rust bridge forwards daemon events on. */
@@ -1619,8 +1668,8 @@ export const EVENT_CHANNEL = "pam://event";
 
 /**
  * Subscribes `handler` to every daemon event. The first call also asks
- * the Rust side to start its (singleton, reconnecting) events.sock
- * subscriber. Resolves to an unlisten function.
+ * the Rust side to start its (singleton, reconnecting) all-events stream on the
+ * private admin socket. Resolves to an unlisten function.
  */
 export async function subscribeEvents(
   handler: (payload: PamEventPayload) => void,

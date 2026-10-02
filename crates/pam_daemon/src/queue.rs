@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::Envelope;
-use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
+use pam_store::{Actor, AuditEntry, Decision, RequestOrigin, RequestState, Store, StoreError};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
@@ -299,6 +299,20 @@ impl QueueManager {
         envelope: &Envelope,
         class: crate::policy::CapabilityClass,
     ) -> Result<AdmitOutcome, QueueError> {
+        self.admit_from(envelope, class, &RequestOrigin::PUBLIC)
+            .await
+    }
+
+    /// [`Self::admit`] recording where the request entered the daemon: the
+    /// plane and the kernel's view of the connection go onto the row in the
+    /// same INSERT that admits it. Attribution only — admission, dedupe and
+    /// the caps are the same whoever asked.
+    pub async fn admit_from(
+        &self,
+        envelope: &Envelope,
+        class: crate::policy::CapabilityClass,
+        origin: &RequestOrigin,
+    ) -> Result<AdmitOutcome, QueueError> {
         let args_json = envelope.args.to_string();
         let _inner = self.inner.lock().await;
         let now = wall_clock_ms();
@@ -357,7 +371,7 @@ impl QueueManager {
             });
         }
         self.store
-            .insert_admitted_request(
+            .insert_admitted_request_from(
                 &envelope.id,
                 &envelope.capability,
                 &envelope.caller.repo,
@@ -365,6 +379,7 @@ impl QueueManager {
                 &args_json,
                 envelope.idempotency_key.as_deref(),
                 expires_at_ms,
+                origin,
             )
             .await?;
         Ok(if class.bypasses_lanes() {

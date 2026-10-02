@@ -62,7 +62,11 @@ Every subcommand the binary has; there is no raw-protocol escape hatch and no
 security command. `--json` prints the daemon's response unchanged, and every
 subcommand maps its outcome to the same exit codes: `0` success (or a ticket
 handed off), `1` transport/client failure or observation timeout, `2` usage
-error, `3` refused, `4` unresolved, `5` blocked.
+error, `3` refused, `4` unresolved, `5` blocked. A daemon started from another
+build refuses the command (`client_version_mismatch`, exit `3`) and keeps
+running; a daemon of version 0.4 or older that this process may not stop is a
+client failure (exit `1`) with the instruction to run `pam daemon stop` and
+then `pam status` outside the sandbox.
 
 | Subcommand | What it does |
 | --- | --- |
@@ -70,8 +74,8 @@ error, `3` refused, `4` unresolved, `5` blocked.
 | `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). It is served from a snapshot refreshed in the background: `snapshot.stale` says when a part is out of date, `active_requests` does not count the poll itself, and a poll leaves no request or audit row. |
 | `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. A delay over 60 s or arguments over 64 KiB are refused. |
 | `pam cancel <ticket> [--json]` | Cancels a queued or running request. Run it from the repository the ticket was submitted from: another repository's ticket answers `not_found`. |
-| `pam wait <ticket> [--timeout-ms N] [--json]` | Blocks quietly until the ticket's terminal event, then prints its durable result. Transient daemon refusals are retried and a lost event stream is reconnected until the timeout (default 10 minutes), when it exits `1` and keeps the request running; exit `3` means a policy refusal only. With `--json` the refusal or timeout is a `kind: refusal` object on stdout. |
-| `pam subscribe <ticket> [--timeout-ms N] [--json]` | Like `wait`, but prints each event as it streams. |
+| `pam wait <ticket> [--timeout-ms N] [--json]` | Follows the ticket on one connection and blocks quietly until it ends, then prints the durable result the stream ended with; a ticket that already finished is answered at once. Transient daemon refusals are retried and a dropped connection is resumed after the last event seen, until the timeout (default 10 minutes), when it exits `1` and keeps the request running; exit `3` means the daemon refused (policy, or a daemon of another build). With `--json` the refusal or timeout is a `kind: refusal` object on stdout. Run it from the repository the ticket was submitted from. |
+| `pam subscribe <ticket> [--timeout-ms N] [--json]` | Like `wait`, but prints each event as it arrives. A late subscriber is shown the earlier events of a running ticket the daemon still holds (`queued`, `started`). Events carry no detail: a progress note is fixed generic text. |
 | `pam evidence read <evidence-id> --request <ticket> [--offset N] [--length N] [--view ID --digest SHA] [--json]` | Reads one byte range of retained evidence; continue with the returned view, digest and `next_offset`. |
 | `pam flow list [--offset N] [--limit 1..=50] [--json]` | The flows this machine has: id, source, steps, name. |
 | `pam flow show <id>` | One flow's canonical YAML. |
@@ -79,7 +83,7 @@ error, `3` refused, `4` unresolved, `5` blocked.
 | `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--digest <sha256>] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. `--digest` runs it only if the flow still has the digest `pam flow inspect` printed; otherwise it refuses as `flow_changed`. If the reply is lost, the request id and the `pam wait` recovery are printed. |
 | `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket, including the state-changing steps that ran (`effects`). Local-model summaries are labelled `[untrusted local-model summary]`. |
 | `pam service install [--base-dir DIR]\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
-| `pam listen <dir>` (unix) | Serves a session socket relay: binds `pam.sock`/`events.sock` in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). |
+| `pam listen <dir>` (unix) | Serves a session socket relay: binds one socket, `pam.sock`, in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). It refuses a `<dir>` that is a link or is shared, and replaces a daemon of version 0.4 or older when it starts. |
 | `pam daemon` | Runs the daemon in the foreground. |
 | `pam daemon stop` | Signals the running daemon to drain and exit. |
 | `pam gui` | Opens the desktop control center. |
@@ -107,6 +111,10 @@ pam service install     # register the unit and start the managed daemon now
 pam service status      # show whether the unit exists and is loaded, and whether it pins this binary
 pam service uninstall   # unregister and remove the unit; the manager stops the managed daemon, the next pam command starts one lazily
 ```
+
+On Windows a lazy start goes through the system PowerShell so the daemon does
+not hold the calling program's output pipe. Where policy blocks PowerShell,
+install the login unit: a managed daemon needs no lazy start.
 
 Each platform gets one user-scope unit, never sudo or admin:
 
@@ -138,6 +146,11 @@ tools/check.sh                       # the whole local gate: fmt, clippy, rustdo
 npm --prefix frontend run gui:build  # embedded-frontend binary
 npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb, NSIS)
 ```
+
+A binary built without the embedded frontend (any plain `cargo build`) opens
+its window on the Vite development server and therefore refuses to start
+`pam gui` unless `PAM_GUI_DEV=1` is set; `npm --prefix frontend run dev:desktop`
+sets it and starts both, on macOS and Windows alike.
 
 The frontend builds with TypeScript 7 (`tsc`). Its `@typescript/native` npm alias
 provides the native compiler; the `typescript` alias provides Microsoft's

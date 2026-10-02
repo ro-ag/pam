@@ -1,10 +1,10 @@
-//! Runtime directory setup: `<base>/run` and the socket paths inside it.
+//! Runtime directory setup: `<base>/run` and the endpoint paths inside it.
 //!
 //! The default base is `~/.pam`; tests point it at a temporary directory.
-//! Unix domain socket paths are capped at 104 bytes on macOS (the size of
-//! `sun_path` in `sockaddr_un`), so both socket paths are validated here,
-//! at boot, before anything binds — a violation is a legible error naming
-//! the limit and the offending path instead of a cryptic bind failure.
+//! A unix domain socket path must fit `sun_path` in `sockaddr_un` with its
+//! terminator (104 bytes on macOS), so the public socket path is validated
+//! here, at boot, before anything binds — a violation is a legible error
+//! naming the limit and the offending path instead of a cryptic bind failure.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Maximum unix socket path length in bytes (`sun_path` on macOS).
+/// Size of `sun_path` on macOS in bytes. A socket path must be shorter: the
+/// terminator has to fit as well.
 pub const MAX_SOCKET_PATH_BYTES: usize = 104;
 
 /// Attempts before a persistent `PermissionDenied` is reported.
@@ -27,10 +28,10 @@ pub enum RuntimeDirError {
     /// The home directory could not be resolved.
     #[error("cannot resolve the home directory to place ~/.pam; set $HOME")]
     HomeNotFound,
-    /// A socket path exceeds the unix socket path limit.
+    /// A socket path does not fit the unix socket path limit.
     #[error(
-        "socket path {} is {len} bytes, over the 104-byte unix socket path \
-         limit (`sun_path` on macOS); use a shorter pam base directory",
+        "socket path {} is {len} bytes; a unix socket path must be shorter \
+         than 104 bytes (`sun_path` on macOS); use a shorter pam base directory",
         path.display()
     )]
     SocketPathTooLong {
@@ -50,18 +51,24 @@ pub enum RuntimeDirError {
     },
 }
 
-/// Resolved runtime directory: `<base>/run` plus the two socket paths.
+/// File name of the public socket (unix).
+const PUBLIC_SOCKET: &str = "pam.sock";
+
+/// File name of the Windows public adapter's control file (port and nonce).
+const PUBLIC_CONTROL: &str = "public.json";
+
+/// Resolved runtime directory: `<base>/run` plus the endpoint paths in it.
 #[derive(Debug, Clone)]
 pub struct RuntimeDir {
     run: PathBuf,
-    router: PathBuf,
-    events: PathBuf,
+    public: PathBuf,
+    public_control: PathBuf,
 }
 
 impl RuntimeDir {
     /// Prepares `<base>/run` (created with mode `0700` on unix) and computes
-    /// the socket paths, validating both against the 104-byte limit before
-    /// creating anything.
+    /// the endpoint paths, validating the socket path against the unix limit
+    /// before creating anything.
     pub fn at_base(base: &Path) -> Result<Self, RuntimeDirError> {
         let dirs = Self::paths_at_base(base)?;
         create_private_dir(&dirs.run).map_err(|source| RuntimeDirError::Create {
@@ -75,65 +82,46 @@ impl RuntimeDir {
     /// Clients use this while the daemon alone creates and protects its runtime
     /// directory. Connecting to a running daemon requires no directory writes.
     pub fn paths_at_base(base: &Path) -> Result<Self, RuntimeDirError> {
-        let run = base.join("run");
-        let router = run.join("pam.sock");
-        let events = run.join("events.sock");
-        validate_socket_path(&router)?;
-        validate_socket_path(&events)?;
-        Ok(Self {
-            run,
-            router,
-            events,
-        })
+        Self::paths_at_dir(&base.join("run"))
     }
 
     /// Resolve and validate endpoint paths for an explicit socket directory
-    /// with the same flat layout (`pam.sock` and `events.sock` directly
-    /// inside it). This is the session relay's (`pam listen`) view of its
-    /// own directory and the client's `PAM_SOCKET_DIR` view of it: the
-    /// `run` field is the directory itself, so lock-based probes under it
-    /// answer "no daemon" — callers that hold the override must skip the
-    /// daemon probe, which the client's dial path does.
+    /// with the same flat layout (`pam.sock` directly inside it). This is
+    /// the session relay's (`pam listen`) view of its own directory and the
+    /// client's `PAM_SOCKET_DIR` view of it: the `run` field is the directory
+    /// itself, so lock-based probes under it answer "no daemon" — callers
+    /// that hold the override must skip the daemon probe, which the client's
+    /// dial path does.
     pub fn paths_at_dir(dir: &Path) -> Result<Self, RuntimeDirError> {
-        let router = dir.join("pam.sock");
-        let events = dir.join("events.sock");
-        validate_socket_path(&router)?;
-        validate_socket_path(&events)?;
+        let public = dir.join(PUBLIC_SOCKET);
+        validate_socket_path(&public)?;
         Ok(Self {
+            public,
+            public_control: dir.join(PUBLIC_CONTROL),
             run: dir.to_path_buf(),
-            router,
-            events,
         })
     }
 
-    /// The `<base>/run` directory holding the sockets.
+    /// The `<base>/run` directory holding the public endpoint.
     #[must_use]
     pub fn run_dir(&self) -> &Path {
         &self.run
     }
 
-    /// Filesystem path of the `ROUTER` socket (`pam.sock`).
+    /// Filesystem path of the public socket (unix): the stream socket
+    /// `pam.sock` the framed public listener serves. On Windows nothing is
+    /// bound here (see [`Self::public_control`]); a file of this name there
+    /// is what a pre-migration daemon left behind.
     #[must_use]
-    pub fn router_socket(&self) -> &Path {
-        &self.router
+    pub fn public_socket(&self) -> &Path {
+        &self.public
     }
 
-    /// Filesystem path of the `PUB` socket (`events.sock`).
+    /// Filesystem path of the Windows public adapter's control file
+    /// (`public.json`: loopback port and owner nonce).
     #[must_use]
-    pub fn events_socket(&self) -> &Path {
-        &self.events
-    }
-
-    /// `ipc://` endpoint of the `ROUTER` socket.
-    #[must_use]
-    pub fn router_endpoint(&self) -> String {
-        format!("ipc://{}", self.router.display())
-    }
-
-    /// `ipc://` endpoint of the `PUB` socket.
-    #[must_use]
-    pub fn events_endpoint(&self) -> String {
-        format!("ipc://{}", self.events.display())
+    pub fn public_control(&self) -> &Path {
+        &self.public_control
     }
 }
 
@@ -197,7 +185,9 @@ pub fn remove_stale_with(
 
 fn validate_socket_path(path: &Path) -> Result<(), RuntimeDirError> {
     let len = os_str_bytes(path);
-    if len > MAX_SOCKET_PATH_BYTES {
+    // `sun_path` holds the path and its terminator, so the limit itself is
+    // already too long: the same bound the listener applies when it binds.
+    if len >= MAX_SOCKET_PATH_BYTES {
         return Err(RuntimeDirError::SocketPathTooLong {
             path: path.to_path_buf(),
             len,
@@ -214,8 +204,9 @@ fn os_str_bytes(path: &Path) -> usize {
 
 #[cfg(not(unix))]
 fn os_str_bytes(path: &Path) -> usize {
-    // Windows named `AF_UNIX` sockets have a similar (108-byte) cap; the
-    // encoded length is a close proxy and keeps the check uniform.
+    // Nothing binds a unix socket here on Windows (the public endpoint is a
+    // control file); the check is kept uniform so a base directory that is
+    // accepted on one platform is accepted on the other.
     path.as_os_str().len()
 }
 

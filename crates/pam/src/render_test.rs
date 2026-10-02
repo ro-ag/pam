@@ -835,3 +835,62 @@ fn the_digest_is_sent_only_when_one_was_given() {
     let bare = flow_run_args("f", &inputs, None);
     assert!(bare.get("expected_digest").is_none(), "{bare}");
 }
+
+/// The refusal of a daemon that is another build is reworded into one plain
+/// sentence; its cause and recovery stay the daemon's, and every other
+/// refusal is printed as it came.
+#[test]
+fn a_version_mismatch_refusal_is_one_plain_sentence_with_the_daemons_recovery() {
+    use crate::render::{render_follow_error, version_mismatch_line};
+    let detail = "client version 0.5.1 does not match daemon version 0.5.0 running from \
+                  /Users/Jo Doe/My Apps/pam; that binary has not changed on disk, so the daemon \
+                  keeps running";
+    let recovery = "Use the pam binary this daemon was started from.";
+    assert_eq!(
+        render_refusal("client_version_mismatch", detail, recovery),
+        "pam: refused (client_version_mismatch)\n  this pam (v0.5.1) is not the build the \
+         running daemon (v0.5.0, /Users/Jo Doe/My Apps/pam) was started from\n  \u{2192} Use the \
+         pam binary this daemon was started from."
+    );
+
+    // A wording this build does not recognise is shown, not guessed at.
+    let opaque = version_mismatch_line("client_version_mismatch", "different builds").unwrap();
+    assert_eq!(
+        opaque,
+        format!(
+            "this pam (v{}) is not the build the running daemon was started from (different \
+             builds)",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+
+    // Only that cause is reworded.
+    assert_eq!(version_mismatch_line("daemon_outdated", detail), None);
+    assert_eq!(
+        render_refusal("not_granted", "no grant", "Open the GUI."),
+        "pam: refused (not_granted)\n  no grant\n  \u{2192} Open the GUI."
+    );
+
+    let follow = RequestError::FollowRefused {
+        ticket: "req_t".to_owned(),
+        cause: "client_version_mismatch".to_owned(),
+        detail: detail.to_owned(),
+        recovery: recovery.to_owned(),
+    };
+    assert_eq!(
+        render_follow_error("subscribe", &follow),
+        "pam subscribe: this pam (v0.5.1) is not the build the running daemon (v0.5.0, \
+         /Users/Jo Doe/My Apps/pam) was started from; Use the pam binary this daemon was started \
+         from."
+    );
+    let other = RequestError::FollowRefused {
+        ticket: "req_t".to_owned(),
+        cause: "result_unavailable".to_owned(),
+        detail: "not yours".to_owned(),
+        recovery: "Check the GUI.".to_owned(),
+    };
+    assert_eq!(
+        render_follow_error("wait", &other),
+        format!("pam wait: {other}")
+    );
+}

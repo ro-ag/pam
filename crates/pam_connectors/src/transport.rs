@@ -26,13 +26,6 @@ pub const MAX_JSON_BYTES: u64 = 1024 * 1024;
 /// The most a log body may weigh before the call is refused.
 pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The base URL an AWS connection carries.
-///
-/// AWS has no base URL: the local `aws` CLI resolves endpoints itself. The
-/// field still exists on [`Connection`] so every connector is built the same
-/// way, so it is filled with a reserved name that can never resolve.
-pub const AWS_BASE_URL: &str = "https://aws.invalid/";
-
 /// HTTP verbs for read-only connectors and separately authorized typed mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
@@ -205,13 +198,12 @@ impl Drop for Secret {
 
 /// One configured connector: where it lives and how to authenticate to it.
 pub struct Connection {
-    /// The service root, always with a trailing slash. For AWS this is
-    /// [`AWS_BASE_URL`] and is never dialed.
+    /// The service root, always with a trailing slash.
     pub base_url: Url,
-    /// The row's `username`: a Jenkins user, a Confluence account email, an
-    /// AWS profile. `None` where the connector has no use for one.
+    /// The row's `username`: a Jenkins user or a Confluence account email.
+    /// `None` where the connector has no use for one.
     pub username: Option<String>,
-    /// The stored credential. `None` for AWS, which has none.
+    /// The stored credential.
     pub secret: Option<Secret>,
 }
 
@@ -229,13 +221,9 @@ impl fmt::Debug for Connection {
 ///
 /// `https` only, no userinfo, no query, no fragment, and a trailing slash so
 /// path joining is unsurprising. Private and loopback hosts are fine — a
-/// self-hosted Jenkins usually lives on one. AWS keeps no base URL at all, so
-/// it accepts an empty string and answers with [`AWS_BASE_URL`].
-pub fn validate_base_url(id: ConnectorId, raw: &str) -> Result<Url, ConnectorError> {
+/// self-hosted Jenkins usually lives on one.
+pub fn validate_base_url(_id: ConnectorId, raw: &str) -> Result<Url, ConnectorError> {
     let trimmed = raw.trim();
-    if id == ConnectorId::Aws && trimmed.is_empty() {
-        return Ok(Url::parse(AWS_BASE_URL).expect("the AWS placeholder URL parses"));
-    }
     if trimmed.is_empty() {
         return Err(ConnectorError::BadArgs(
             "the base URL is empty; type the service's root URL".to_owned(),
@@ -365,11 +353,6 @@ fn authorization(id: ConnectorId, conn: &Connection) -> Result<(String, String),
         }
         AuthKind::TokenAsUser => {
             format!("Basic {}", base64(format!("{}:", secret()?).as_bytes()))
-        }
-        AuthKind::AwsProfile => {
-            return Err(ConnectorError::BadArgs(
-                "the AWS connector makes no HTTP requests".to_owned(),
-            ));
         }
     };
     Ok((name, value))

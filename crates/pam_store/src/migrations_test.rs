@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
 }
 
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 12
+            supported: 13
         }
     ));
     let message = err.to_string();
@@ -105,7 +105,7 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -137,7 +137,7 @@ async fn v3_database_gains_meta_json() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
     assert!(
         evidence_columns(&store)
             .await
@@ -177,7 +177,7 @@ async fn v4_database_upgrades_to_v5() {
     drop((conn, db));
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
 
     let mut rows = store
         .lock()
@@ -335,7 +335,7 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     build_v11_database(&path).await;
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
 
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
@@ -423,4 +423,121 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
             .await
             .unwrap()
     );
+}
+
+/// A genuine v12 database (the version before the origin columns): every
+/// migration up to 12, stamped 12, holding rows a daemon of that version
+/// left behind in each lifecycle state.
+async fn build_v12_database(path: &std::path::Path) {
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 12) {
+        conn.execute_batch(migration.sql).await.unwrap();
+    }
+    conn.execute("PRAGMA user_version = 12", ()).await.unwrap();
+    for (id, capability, state) in [
+        ("old_queued", "echo", "queued"),
+        ("old_done", "flow.run", "done"),
+        ("old_admin", "admin.grants.list", "done"),
+    ] {
+        conn.execute(
+            "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
+                 created_ts, updated_ts, expires_at_ms, authorization_revision, queue_authorized)
+             VALUES (?1, ?2, '/repo', 'agent', '{}', ?3, 1, 1, 9000000000000, 0, 1)",
+            turso::params![id, capability, state],
+        )
+        .await
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+         VALUES ('old_done', 'execute', 'allow', 'system', 'kept', 5)",
+        (),
+    )
+    .await
+    .unwrap();
+    drop((conn, db));
+}
+
+/// The upgrade from the previous version: existing rows survive, read back
+/// as public with no recorded peer (nothing is claimed about a connection
+/// nobody recorded), and the recovery page — which selects the same columns
+/// through its own guarded list — still reads them.
+#[tokio::test]
+async fn v12_database_gains_the_request_origin_columns() {
+    use crate::{RequestIngress, RequestOrigin, RequestState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    build_v12_database(&path).await;
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 13);
+
+    for id in ["old_queued", "old_done", "old_admin"] {
+        let row = store.get_request(id).await.unwrap().unwrap();
+        assert_eq!(row.origin, RequestOrigin::PUBLIC, "{id}");
+    }
+    // The rows kept everything else they had.
+    let done = store.get_request("old_done").await.unwrap().unwrap();
+    assert_eq!(done.state, RequestState::Done);
+    assert_eq!(done.expires_at_ms, Some(9_000_000_000_000));
+    assert!(done.queue_authorized);
+    assert_eq!(
+        store.audit_for_request("old_done").await.unwrap()[0]
+            .detail
+            .as_deref(),
+        Some("kept")
+    );
+    let page = store
+        .queued_recovery_page(None, 1024 * 1024)
+        .await
+        .unwrap()
+        .expect("no oversized row");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "old_queued");
+    assert_eq!(page[0].origin, RequestOrigin::PUBLIC);
+
+    // A row written after the upgrade carries its origin.
+    let origin = RequestOrigin {
+        ingress: RequestIngress::Public,
+        peer_uid: Some(501),
+        peer_pid: Some(4242),
+        relayed: true,
+    };
+    store
+        .insert_admitted_request_from(
+            "new_public",
+            "echo",
+            "/repo",
+            "agent",
+            "{}",
+            None,
+            9_000_000_000_000,
+            &origin,
+        )
+        .await
+        .unwrap();
+    let row = store.get_request("new_public").await.unwrap().unwrap();
+    assert_eq!(row.origin, origin);
+
+    // The column constraints came with the upgrade: an ingress outside the
+    // two planes, or a relayed flag that is not a flag, is refused.
+    let conn = store.lock().await.unwrap();
+    for (ingress, relayed) in [("gui", 0), ("public", 2)] {
+        assert!(
+            conn.execute(
+                "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
+                     created_ts, updated_ts, ingress, relayed)
+                 VALUES ('bad', 'echo', '/repo', 'agent', '{}', 'done', 1, 1, ?1, ?2)",
+                turso::params![ingress, relayed],
+            )
+            .await
+            .is_err(),
+            "ingress {ingress:?} relayed {relayed} was accepted"
+        );
+    }
 }

@@ -6,9 +6,8 @@
 //! # Timing sensitivity
 //!
 //! Ordering assertions use **logical event order** off the daemon's
-//! `PUB` stream (one publisher loop, one connection — arrival order is
-//! publish order), never wall durations, so runner load cannot flip
-//! them. The only wall bound is the harness's generous
+//! all-events stream (one hub, one connection — arrival order is publish
+//! order), never wall durations, so runner load cannot flip them. The only wall bound is the harness's generous
 //! [`pam_testkit::TEST_DEADLINE`], which catches hangs.
 
 use std::collections::HashSet;

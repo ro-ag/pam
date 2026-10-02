@@ -1,11 +1,14 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
+use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 
 use crate::retention::{
-    MAX_DAYS, PruneReport, RetentionPatch, RetentionRefusal, RetentionService, RetentionSettings,
-    SETTING_AUDIT_DAYS, SETTING_EVIDENCE_DAYS, validate,
+    CAUSE_CLOCK_JUMP, CensusSource, GuardPolicy, KEEP_KIND, MAX_DAYS, PassCensus, PassOutcome,
+    PruneReport, RECOVERY_CLOCK_JUMP, RetentionPatch, RetentionRefusal, RetentionService,
+    RetentionSettings, SETTING_AUDIT_DAYS, SETTING_CLOCK_GUARD, SETTING_EVIDENCE_DAYS,
+    SETTING_LAST_RUN, SETTING_WATERMARK, Trigger, validate,
 };
 
 const DAY: i64 = 86_400;
@@ -337,4 +340,492 @@ async fn a_save_writes_both_windows_as_one_validated_pair() {
         Some("null")
     );
     assert_eq!(service.settings().await.unwrap(), saved);
+}
+
+// ---- the forward-clock-jump guard -------------------------------------
+
+/// A census whose answer a test sets: what a pass "would remove".
+#[derive(Debug)]
+struct FakeCensus(Option<PassCensus>);
+
+impl CensusSource for FakeCensus {
+    fn census(
+        &self,
+        _settings: RetentionSettings,
+        _now_ts: i64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<PassCensus>, StoreError>> + Send + '_>,
+    > {
+        let answer = self.0;
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// `eligible` of `total` rows, as the census reports them.
+fn census(eligible: u64, total: u64) -> Arc<FakeCensus> {
+    Arc::new(FakeCensus(Some(PassCensus {
+        eligible_rows: eligible,
+        total_rows: total,
+    })))
+}
+
+/// A service on a clock the test moves, over a store holding one finished
+/// request that a 30-day window deletes as soon as the clock is 31 days on.
+struct Guarded {
+    store: Arc<Store>,
+    service: RetentionService,
+    clock: Arc<AtomicI64>,
+    start: i64,
+}
+
+async fn guarded(census_source: Arc<FakeCensus>) -> Guarded {
+    let (store, service) = service().await;
+    finished_request(&store, "old").await;
+    service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(30)),
+            audit_days: Some(Some(30)),
+        })
+        .await
+        .unwrap();
+    let start = crate::retention::now_ts();
+    let clock = Arc::new(AtomicI64::new(start));
+    let reader = Arc::clone(&clock);
+    let service = service
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+        .with_census(census_source);
+    Guarded {
+        store,
+        service,
+        clock,
+        start,
+    }
+}
+
+impl Guarded {
+    fn set_clock(&self, ts: i64) {
+        self.clock.store(ts, Ordering::SeqCst);
+    }
+
+    async fn watermark(&self) -> Option<String> {
+        self.store.get_setting(SETTING_WATERMARK).await.unwrap()
+    }
+
+    async fn kept(&self) -> bool {
+        self.store.get_request("old").await.unwrap().is_some()
+    }
+
+    /// A scheduled hourly pass.
+    async fn scheduled(&self) -> PassOutcome {
+        self.service
+            .run_pass(Trigger::Scheduled(Duration::from_hours(1)))
+            .await
+            .unwrap()
+    }
+}
+
+fn skipped(outcome: PassOutcome) -> crate::retention::ClockGuardNotice {
+    match outcome {
+        PassOutcome::Skipped(notice) => notice,
+        other @ PassOutcome::Ran { .. } => {
+            panic!("expected the guard to hold the pass back, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_normal_pass_runs_and_moves_the_watermark() {
+    let guarded = guarded(census(100, 100)).await;
+    // The first pass has no watermark, so the guard has nothing to compare.
+    assert!(matches!(
+        guarded.scheduled().await,
+        PassOutcome::Ran {
+            overrode_guard: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        guarded.watermark().await.as_deref(),
+        Some(guarded.start.to_string().as_str())
+    );
+    // An hour later is an ordinary tick, even though a census would say
+    // every row is old.
+    guarded.set_clock(guarded.start + 3600);
+    assert!(matches!(
+        guarded.scheduled().await,
+        PassOutcome::Ran {
+            overrode_guard: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        guarded.watermark().await.as_deref(),
+        Some((guarded.start + 3600).to_string().as_str())
+    );
+    assert_eq!(guarded.service.clock_guard().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_first_run_without_a_watermark_behaves_as_before_the_guard() {
+    // No watermark and no recorded pass: the clock is 100 days on, the
+    // census says everything is old, and the pass still runs.
+    let guarded = guarded(census(100, 100)).await;
+    assert_eq!(guarded.watermark().await, None);
+    guarded.set_clock(guarded.start + 100 * DAY);
+    assert!(matches!(guarded.scheduled().await, PassOutcome::Ran { .. }));
+    assert!(!guarded.kept().await);
+}
+
+#[tokio::test]
+async fn a_forward_jump_that_would_remove_most_rows_is_held_back() {
+    let guarded = guarded(census(80, 100)).await;
+    guarded.scheduled().await;
+    let before = guarded.store.get_setting(SETTING_LAST_RUN).await.unwrap();
+
+    // A VM resume (or a bad NTP answer) puts the clock 100 days on.
+    guarded.set_clock(guarded.start + 100 * DAY);
+    let notice = skipped(guarded.scheduled().await);
+    assert_eq!(notice.ts, guarded.start + 100 * DAY);
+    assert_eq!(notice.watermark_ts, guarded.start);
+    assert_eq!(notice.jump_secs, 100 * DAY);
+    assert_eq!(notice.threshold_secs, 24 * 3600);
+    assert_eq!(
+        (notice.eligible_rows, notice.total_rows),
+        (Some(80), Some(100))
+    );
+    assert!(
+        notice.detail().contains("80 of 100 rows"),
+        "{}",
+        notice.detail()
+    );
+    assert!(notice.detail().contains("nothing was deleted"));
+
+    // Nothing was deleted, the watermark and the last run did not move, and
+    // the notice is stored for the status reply.
+    assert!(guarded.kept().await);
+    assert_eq!(
+        guarded.watermark().await.as_deref(),
+        Some(guarded.start.to_string().as_str())
+    );
+    assert_eq!(
+        guarded.store.get_setting(SETTING_LAST_RUN).await.unwrap(),
+        before
+    );
+    assert_eq!(guarded.service.clock_guard().await.unwrap(), Some(notice));
+    assert_eq!(CAUSE_CLOCK_JUMP, "retention_clock_jump");
+    assert!(RECOVERY_CLOCK_JUMP.contains("Check the system clock"));
+
+    // The next hourly tick is held back the same way: skipping never advances
+    // the watermark, so the jump does not "age out".
+    guarded.set_clock(guarded.start + 100 * DAY + 3600);
+    skipped(guarded.scheduled().await);
+    assert!(guarded.kept().await);
+    // A settings save runs a pass too, and is held back like the scheduler.
+    skipped(guarded.service.run_pass(Trigger::Settings).await.unwrap());
+    assert!(guarded.kept().await);
+}
+
+#[tokio::test]
+async fn a_late_pass_that_removes_little_is_not_held_back() {
+    // The daemon was off for three days: past the threshold, but the pass
+    // only takes 5 of 1000 rows, so nobody is asked to confirm anything.
+    let guarded = guarded(census(5, 1000)).await;
+    guarded.scheduled().await;
+    guarded.set_clock(guarded.start + 3 * DAY);
+    assert!(matches!(guarded.scheduled().await, PassOutcome::Ran { .. }));
+    // Even a large share of a tiny store is not held back.
+    let tiny = guarded_tiny().await;
+    assert!(matches!(tiny.scheduled().await, PassOutcome::Ran { .. }));
+}
+
+async fn guarded_tiny() -> Guarded {
+    let guarded = guarded(census(3, 4)).await;
+    guarded.scheduled().await;
+    guarded.set_clock(guarded.start + 100 * DAY);
+    guarded
+}
+
+#[tokio::test]
+async fn a_source_that_cannot_count_fails_closed() {
+    let guarded = guarded(Arc::new(FakeCensus(None))).await;
+    guarded.scheduled().await;
+    guarded.set_clock(guarded.start + 100 * DAY);
+    let notice = skipped(guarded.scheduled().await);
+    assert_eq!((notice.eligible_rows, notice.total_rows), (None, None));
+    assert!(notice.detail().contains("could not be counted"));
+    assert!(guarded.kept().await);
+}
+
+/// The production source counts the store's own rows: a jump that would
+/// take most of them is held back with the real figures in the notice, and
+/// the human's confirmation then removes exactly what was counted.
+#[tokio::test]
+async fn the_store_census_holds_back_a_jump_that_would_remove_most_rows() {
+    // Sixty finished requests under a 30-day audit window: 100 days on,
+    // every one of them, and nothing else, would go.
+    let (store, service) = service().await;
+    for index in 0..60 {
+        finished_request(&store, &format!("old_{index}")).await;
+    }
+    service
+        .set_settings(RetentionPatch {
+            evidence_days: None,
+            audit_days: Some(Some(30)),
+        })
+        .await
+        .unwrap();
+    let start = crate::retention::now_ts();
+    let clock = Arc::new(AtomicI64::new(start));
+    let reader = Arc::clone(&clock);
+    // No `with_census`: this is the source the daemon runs with.
+    let service = service.with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    service.run_pass(Trigger::Manual).await.unwrap();
+    clock.store(start + 3600, Ordering::SeqCst);
+    assert!(matches!(
+        service.run_pass(Trigger::Settings).await.unwrap(),
+        PassOutcome::Ran { .. }
+    ));
+    clock.store(start + 100 * DAY, Ordering::SeqCst);
+    let notice = skipped(service.run_pass(Trigger::Settings).await.unwrap());
+    assert_eq!(
+        (notice.eligible_rows, notice.total_rows),
+        (Some(60), Some(60)),
+        "the notice carries the store's own count"
+    );
+    assert!(
+        notice.detail().contains("60 of 60 rows"),
+        "{}",
+        notice.detail()
+    );
+    for index in 0..60 {
+        let id = format!("old_{index}");
+        assert!(store.get_request(&id).await.unwrap().is_some(), "{id}");
+    }
+    // Counting is not pruning: the pass is still held back on the next tick.
+    skipped(
+        service
+            .run_pass(Trigger::Scheduled(Duration::from_hours(1)))
+            .await
+            .unwrap(),
+    );
+    // The human confirms; the pass removes exactly what was counted.
+    let PassOutcome::Ran {
+        report,
+        overrode_guard,
+    } = service.run_pass(Trigger::Manual).await.unwrap()
+    else {
+        panic!("a manual pass always runs");
+    };
+    assert!(overrode_guard);
+    assert_eq!(report.requests, 60);
+}
+
+/// The same jump over a store it would barely touch runs without asking,
+/// because the production source can now tell: sixty records with their
+/// verdicts are kept by a forever audit window, and only five old source
+/// blobs fall under the 30-day evidence window. Five rows is under the
+/// guard's floor.
+#[tokio::test]
+async fn the_store_census_lets_a_late_pass_that_removes_little_run() {
+    let (store, service) = service().await;
+    for index in 0..60 {
+        let id = format!("kept_{index}");
+        finished_request(&store, &id).await;
+        store
+            .insert_evidence(&format!("verdict_{index}"), &id, KEEP_KIND, b"{}", None)
+            .await
+            .unwrap();
+    }
+    for index in 0..5 {
+        store
+            .insert_evidence(
+                &format!("blob_{index}"),
+                &format!("kept_{index}"),
+                "log.source",
+                b"source",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(30)),
+            audit_days: None,
+        })
+        .await
+        .unwrap();
+    let start = crate::retention::now_ts();
+    let clock = Arc::new(AtomicI64::new(start));
+    let reader = Arc::clone(&clock);
+    let service = service.with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    service.run_pass(Trigger::Manual).await.unwrap();
+    clock.store(start + 100 * DAY, Ordering::SeqCst);
+    let PassOutcome::Ran {
+        report,
+        overrode_guard,
+    } = service.run_pass(Trigger::Settings).await.unwrap()
+    else {
+        panic!("a late pass that removes five rows of 125 is not held back");
+    };
+    assert!(!overrode_guard);
+    assert_eq!((report.evidence_rows, report.requests), (5, 0));
+    assert!(store.get_evidence("verdict_0").await.unwrap().is_some());
+    assert!(store.get_evidence("blob_0").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_threshold_is_the_larger_of_a_day_and_two_intervals() {
+    let policy = GuardPolicy::default();
+    assert_eq!(policy.threshold_secs(Duration::from_hours(1)), 24 * 3600);
+    assert_eq!(policy.threshold_secs(Duration::from_hours(30)), 60 * 3600);
+
+    let guarded = guarded(census(100, 100)).await;
+    guarded.scheduled().await;
+    // 23 hours on: under the day, no matter what the census says.
+    guarded.set_clock(guarded.start + 23 * 3600);
+    assert!(matches!(guarded.scheduled().await, PassOutcome::Ran { .. }));
+    let mark = guarded.start + 23 * 3600;
+    // 25 hours after that: over it.
+    guarded.set_clock(mark + 25 * 3600);
+    skipped(guarded.scheduled().await);
+    // The same gap is ordinary for a scheduler that ticks every 30 hours.
+    assert!(matches!(
+        guarded
+            .service
+            .run_pass(Trigger::Scheduled(Duration::from_hours(30)))
+            .await
+            .unwrap(),
+        PassOutcome::Ran { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_manual_run_overrides_the_guard_and_clears_the_notice() {
+    let guarded = guarded(census(80, 100)).await;
+    guarded.scheduled().await;
+    guarded.set_clock(guarded.start + 100 * DAY);
+    skipped(guarded.scheduled().await);
+    assert!(guarded.service.clock_guard().await.unwrap().is_some());
+
+    let outcome = guarded.service.run_pass(Trigger::Manual).await.unwrap();
+    let PassOutcome::Ran {
+        report,
+        overrode_guard,
+    } = outcome
+    else {
+        panic!("a manual pass is never held back: {outcome:?}");
+    };
+    assert!(overrode_guard);
+    assert_eq!(report.requests, 1);
+    assert!(!guarded.kept().await);
+    assert_eq!(guarded.service.clock_guard().await.unwrap(), None);
+    assert_eq!(
+        guarded
+            .store
+            .get_setting(SETTING_CLOCK_GUARD)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("null")
+    );
+    // The human vouched for this clock, so it is the new watermark and the
+    // next ordinary tick is ordinary.
+    assert_eq!(
+        guarded.watermark().await.as_deref(),
+        Some((guarded.start + 100 * DAY).to_string().as_str())
+    );
+    guarded.set_clock(guarded.start + 100 * DAY + 3600);
+    assert!(matches!(
+        guarded.scheduled().await,
+        PassOutcome::Ran {
+            overrode_guard: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_backward_jump_deletes_nothing_it_would_not_have_before() {
+    let guarded = guarded(census(100, 100)).await;
+    guarded.scheduled().await;
+
+    // The clock falls 200 days behind. A pass still runs (it is harmless:
+    // the cutoff only moved back), deletes nothing, and the watermark keeps
+    // its high-water value.
+    guarded.set_clock(guarded.start - 200 * DAY);
+    let outcome = guarded.scheduled().await;
+    let PassOutcome::Ran { report, .. } = outcome else {
+        panic!("a backward jump is not held back: {outcome:?}");
+    };
+    assert_eq!((report.requests, report.evidence_rows), (0, 0));
+    assert!(guarded.kept().await);
+    assert_eq!(
+        guarded.watermark().await.as_deref(),
+        Some(guarded.start.to_string().as_str())
+    );
+
+    // Returning to the true time is not a forward jump from the watermark.
+    guarded.set_clock(guarded.start + 3600);
+    assert!(matches!(
+        guarded.scheduled().await,
+        PassOutcome::Ran {
+            overrode_guard: false,
+            ..
+        }
+    ));
+    assert!(guarded.kept().await);
+}
+
+#[tokio::test]
+async fn a_store_from_before_the_guard_uses_its_last_recorded_pass() {
+    let guarded = guarded(census(100, 100)).await;
+    // An install that predates the watermark only has `retention.last_run`.
+    let old_pass = PruneReport {
+        ts: guarded.start,
+        evidence_rows: 0,
+        evidence_bytes: 0,
+        requests: 0,
+        audit_rows: 0,
+    };
+    guarded
+        .store
+        .set_setting(SETTING_LAST_RUN, &serde_json::to_string(&old_pass).unwrap())
+        .await
+        .unwrap();
+    guarded.set_clock(guarded.start + 100 * DAY);
+    skipped(guarded.scheduled().await);
+    assert!(guarded.kept().await);
+
+    // An unreadable watermark falls back to it too, rather than to "no guard".
+    guarded
+        .store
+        .set_setting(SETTING_WATERMARK, "not a number")
+        .await
+        .unwrap();
+    skipped(guarded.scheduled().await);
+    assert!(guarded.kept().await);
+}
+
+#[tokio::test]
+async fn forever_windows_are_never_held_back() {
+    let (store, service) = service().await;
+    let start = crate::retention::now_ts();
+    let clock = Arc::new(AtomicI64::new(start));
+    let reader = Arc::clone(&clock);
+    let service = service
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+        .with_census(census(100, 100));
+    service.run_pass(Trigger::Manual).await.unwrap();
+    clock.store(start + 100 * DAY, Ordering::SeqCst);
+    // Nothing can be removed with both windows forever, so there is nothing
+    // to hold back, and the watermark follows the clock.
+    assert!(matches!(
+        service.run_pass(Trigger::Settings).await.unwrap(),
+        PassOutcome::Ran { .. }
+    ));
+    assert_eq!(
+        store.get_setting(SETTING_WATERMARK).await.unwrap(),
+        Some((start + 100 * DAY).to_string())
+    );
 }

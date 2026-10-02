@@ -937,9 +937,6 @@ impl FlowService {
                     with,
                 } => {
                     item["product"] = json!(connector.as_str());
-                    if *connector == pam_connectors::ConnectorId::Aws {
-                        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "AWS CLI helper containment is not qualified"}));
-                    }
                     item["operation"] = json!(call);
                     // Named to stay off the redactor's sensitive-key list: a
                     // `credential`-shaped key would mask the sentinel itself,

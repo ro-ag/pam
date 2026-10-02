@@ -30,8 +30,9 @@ pub use store::{
     FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantChange, GrantChangeOutcome,
     GrantRow, LandingSession, MAX_EVIDENCE_MAP_BYTES, MAX_EVIDENCE_MAP_SEGMENTS, MAX_EXPIRY_BATCH,
     MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_LIST_LIMIT, ModelJobRow,
-    OUTCOME_ADMIN_DENIED, PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestPrune,
-    RequestRow, RequestState, RequestStatusMeta, Store,
+    OUTCOME_ADMIN_DENIED, PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestIngress,
+    RequestOrigin, RequestPrune, RequestRow, RequestState, RequestStatusMeta, RetentionCensus,
+    Store,
 };
 
 #[cfg(test)]

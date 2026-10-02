@@ -196,6 +196,66 @@ fn disconnects_are_classified_for_the_status_command() {
     }
 }
 
+/// A pre-migration daemon this process could not stop is a daemon that is
+/// there: the status command must say so with the instruction, not report
+/// "offline" (which would read as "starting one will help").
+#[test]
+fn a_pre_migration_daemon_is_a_named_error_not_a_disconnect() {
+    let stuck = [
+        RequestError::Ensure(ClientError::LegacyDaemon {
+            pid: Some(4242),
+            detail: "kill: Operation not permitted".to_owned(),
+        }),
+        RequestError::Ensure(ClientError::LegacyDaemon {
+            pid: None,
+            detail: "its lock file names no pid".to_owned(),
+        }),
+        RequestError::Ensure(ClientError::LegacyBehindRelay {
+            dir: std::path::PathBuf::from("/agent/relay"),
+        }),
+    ];
+    for err in stuck {
+        assert!(!is_disconnect(&err), "{err} must surface as an error");
+        let said = err.to_string();
+        let mapped = BridgeError::from(err);
+        assert_eq!(mapped.cause, "legacy_daemon");
+        // The client's sentence (the pid, why it could not be stopped) is kept.
+        assert_eq!(mapped.detail, said);
+        assert!(
+            mapped.recovery.contains("then try again"),
+            "{}",
+            mapped.recovery
+        );
+        assert_eq!(
+            mapped.recovery.contains("`pam daemon stop`"),
+            cfg!(unix),
+            "the recovery names a command only where it exists: {}",
+            mapped.recovery
+        );
+    }
+
+    // Told to stop and still draining: momentary, so the beacon reads
+    // offline and retries, and a command that surfaces it names the wait.
+    let draining = || {
+        RequestError::Ensure(ClientError::LegacyDraining {
+            pid: 4242,
+            waited: std::time::Duration::from_secs(20),
+        })
+    };
+    assert!(is_disconnect(&draining()));
+    let mapped = BridgeError::from(draining());
+    assert_eq!(mapped.cause, "daemon_restarting");
+    assert!(mapped.detail.contains("4242"), "{}", mapped.detail);
+    assert!(mapped.recovery.contains("Retry"), "{}", mapped.recovery);
+
+    // Every other ensure failure is still "no daemon is answering".
+    let absent = RequestError::Ensure(ClientError::NotReady {
+        waited: std::time::Duration::from_secs(6),
+    });
+    assert!(is_disconnect(&absent));
+    assert_eq!(BridgeError::from(absent).cause, "daemon_unreachable");
+}
+
 #[test]
 fn private_admin_transport_failure_warns_against_replaying_unknown_effects() {
     let error = RequestError::AdminTransport {

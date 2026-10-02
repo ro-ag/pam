@@ -263,46 +263,6 @@ const SHAREPOINT_CALLS: &[CallSpec] = &[
     },
 ];
 
-/// The AWS call table, kept so the descriptor and the GUI can show what the
-/// connector will offer; [`connector_blocker`] refuses every flow that names
-/// it until then.
-const AWS_CALLS: &[CallSpec] = &[
-    CallSpec {
-        name: "commands",
-        args: &[],
-        yields_log: false,
-    },
-    CallSpec {
-        name: "cli",
-        args: &[("service", true), ("command", true), ("args", false)],
-        yields_log: false,
-    },
-];
-
-/// Why the AWS connector cannot be named by a flow yet: the daemon refuses it
-/// before any credential or process is touched, and a flow file that depends
-/// on it would validate today and fail at run time. Lifted when containment
-/// for the CLI lands.
-pub const AWS_BLOCKER: &str = "the aws connector is unavailable until containment lands; the daemon refuses it before any credential or process is touched";
-
-/// The reason a connector may not be named by a flow, when there is one.
-///
-/// A blocked connector keeps its call table — [`connector_calls`] still
-/// answers, so descriptors and the GUI can describe it — but [`parse`]
-/// refuses any step that names it, with this text at `steps[n].connector`.
-#[must_use]
-pub fn connector_blocker(id: ConnectorId) -> Option<&'static str> {
-    match id {
-        ConnectorId::Aws => Some(AWS_BLOCKER),
-        ConnectorId::Github
-        | ConnectorId::Jenkins
-        | ConnectorId::Sonarqube
-        | ConnectorId::Jira
-        | ConnectorId::Confluence
-        | ConnectorId::Sharepoint => None,
-    }
-}
-
 /// The read-only calls a connector offers.
 #[must_use]
 pub fn connector_calls(id: ConnectorId) -> &'static [CallSpec] {
@@ -313,7 +273,6 @@ pub fn connector_calls(id: ConnectorId) -> &'static [CallSpec] {
         ConnectorId::Jira => JIRA_CALLS,
         ConnectorId::Confluence => CONFLUENCE_CALLS,
         ConnectorId::Sharepoint => SHAREPOINT_CALLS,
-        ConnectorId::Aws => AWS_CALLS,
     }
 }
 
@@ -865,6 +824,10 @@ fn validate_command(argv: &[String], at: &str, scope: &Scope) -> Result<(), Flow
     Ok(())
 }
 
+/// The wire name of the connector that was removed. A flow file saved before
+/// the removal still names it, and deserves a legible refusal.
+const REMOVED_AWS_CONNECTOR: &str = "aws";
+
 fn validate_connector(
     connector: &str,
     call: Option<&str>,
@@ -873,17 +836,16 @@ fn validate_connector(
     scope: &Scope,
 ) -> Result<Action, FlowError> {
     let Some(id) = ConnectorId::parse(connector) else {
-        return Err(FlowError::invalid(
-            format!("{at}.connector"),
+        let known = names(&ConnectorId::ALL.map(ConnectorId::as_str));
+        let detail = if connector == REMOVED_AWS_CONNECTOR {
             format!(
-                "unknown connector `{connector}`; pam knows {}",
-                names(&ConnectorId::ALL.map(ConnectorId::as_str))
-            ),
-        ));
+                "the `aws` connector was removed (its CLI adapter was never runnable); pam knows {known}. Delete this step or replace it with a step over a connector pam still has"
+            )
+        } else {
+            format!("unknown connector `{connector}`; pam knows {known}")
+        };
+        return Err(FlowError::invalid(format!("{at}.connector"), detail));
     };
-    if let Some(blocker) = connector_blocker(id) {
-        return Err(FlowError::invalid(format!("{at}.connector"), blocker));
-    }
     let calls = connector_calls(id);
     let call_path = format!("{at}.call");
     let Some(call) = call else {

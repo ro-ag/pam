@@ -1,10 +1,12 @@
-//! Cross-process PUB/SUB regression test: spawns a REAL `pam daemon` process
-//! (`CARGO_BIN_EXE_pam`, isolated `PAM_BASE_DIR`) and follows it over real ipc sockets.
+//! Cross-process follow regression test: spawns a REAL `pam daemon` process
+//! (`CARGO_BIN_EXE_pam`, isolated `PAM_BASE_DIR`) and follows it over its real public socket.
 //!
-//! In-process suites run daemon and subscriber in one process, but the failure this guards
-//! against only reproduces across two OS processes: zmq `PUB` has no replay, so a terminal event
-//! published before a later `pam subscribe` joins is lost. Covers both subscribing while the
-//! request runs and after it finished.
+//! In-process suites run daemon and follower in one process; the failure this file was written
+//! for only reproduced across two OS processes: a terminal event published before a later
+//! `pam subscribe` joined was lost for good. A follow is now one connection that the daemon
+//! attaches before it reads the store again and ends with the durable answer, so both joining
+//! while the request runs and joining after it finished terminate, and each follow costs exactly
+//! one `query` request row.
 //!
 //! Every await is bounded; the spawned daemon receives `SIGTERM` (same as `pam daemon stop`) and
 //! is reaped on the way out, panic included, so no stray daemon outlives the test.
@@ -14,7 +16,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pam::client::{self, DaemonStatus};
+use pam_client::transport::{self, Probe};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
+use pam_daemon::runtime_dir::RuntimeDir;
+use pam_proto::wire::Via;
 use pam_proto::{Event, Response};
 use pam_store::Store;
 use tokio::time::timeout;
@@ -75,11 +80,13 @@ impl LiveDaemon {
         daemon
     }
 
-    /// Polls (bounded) until the daemon is probe-ready: lock held and
-    /// `pam.sock` bound. A child that exits early fails legibly.
+    /// Polls (bounded) until the daemon is ready the way a client means it:
+    /// lock held and a hello acknowledged on the public endpoint. A child
+    /// that exits early fails legibly.
     fn wait_ready(&mut self) {
         let deadline = Instant::now() + LIFECYCLE_WAIT;
-        let socket = self.base.join("run").join("pam.sock");
+        let dirs = RuntimeDir::paths_at_base(&self.base).expect("runtime paths resolve");
+        let hello = pam_daemon::framed::client_hello(Via::Direct);
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait ok") {
                 panic!("pam daemon exited during startup: {status}");
@@ -88,7 +95,12 @@ impl LiveDaemon {
                 client::probe_daemon(&self.base),
                 Ok(DaemonStatus::Running { .. })
             );
-            if running && socket.exists() {
+            if running
+                && matches!(
+                    transport::probe(&dirs, &hello, Duration::from_secs(1)),
+                    Probe::Ready(_)
+                )
+            {
                 return;
             }
             assert!(
@@ -267,8 +279,8 @@ async fn a_separate_daemon_process_streams_events_to_a_live_follow() {
         seed_relaxed(&base).await;
         let daemon = LiveDaemon::spawn(&base);
 
-        // Scenario 1 — follow while the request runs: the terminal
-        // event travels PUB → SUB across the process boundary.
+        // Scenario 1 — follow while the request runs: its events and its
+        // ending cross the process boundary on the one follow connection.
         let ticket = ticket_for_delayed_echo(&base, 1_500).await;
         let mut seen = Vec::new();
         let terminal = client::follow_ticket(&base, &ticket, FOLLOW_TIMEOUT, |event| {
@@ -278,19 +290,41 @@ async fn a_separate_daemon_process_streams_events_to_a_live_follow() {
         .expect("live follow reaches a terminal event");
         assert_eq!(terminal, Event::Done);
         assert_eq!(seen.last(), Some(&Event::Done));
+        assert_eq!(
+            seen.iter().filter(|event| **event == Event::Done).count(),
+            1,
+            "the ending is delivered once: {seen:?}"
+        );
 
-        // Scenario 2 — the recorded live failure: subscribe only after
-        // the request finished. Its events were published to nobody and
-        // PUB has no replay; the follow must terminate through the
-        // store reconcile all the same.
+        // Scenario 2 — the recorded live failure: follow only after the
+        // request finished. Its events were published to nobody; the
+        // authorising query sees the durable ending and the daemon answers
+        // `end` at once.
         let ticket = ticket_for_delayed_echo(&base, 100).await;
         tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let asked = Instant::now();
         let terminal = client::follow_ticket(&base, &ticket, FOLLOW_TIMEOUT, |_| {})
             .await
             .expect("late follow reaches a terminal event");
         assert_eq!(terminal, Event::Done);
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "a finished ticket is answered at once: {:?}",
+            asked.elapsed()
+        );
 
         daemon.stop();
+
+        // The daemon process is gone, so its store can be read: two follows,
+        // two `query` rows. Nothing was queried to reconcile either of them.
+        let store = Store::open(&base.join("state.sqlite3"))
+            .await
+            .expect("store opens after the daemon exited");
+        let queries = store
+            .list_requests_filtered(Some(200), None, None, None, Some("query"), false)
+            .await
+            .expect("request rows list");
+        assert_eq!(queries.len(), 2, "one query row per follow: {queries:?}");
     })
     .await
     .expect("test within deadline");

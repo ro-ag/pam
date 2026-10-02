@@ -7,16 +7,18 @@
 //!
 //! Which frontend loads is fixed at compile time by `tauri`'s `custom-protocol` feature; this
 //! crate's `embed` feature is the manual switch. Off (default, dev): `npm --prefix frontend run
-//! dev` then `cargo run -p pam -- gui` — loads the Vite dev server, shows a white window if it
-//! isn't running. On (production): `npm --prefix frontend run build` then `cargo build --release -p
+//! dev` then `PAM_GUI_DEV=1 cargo run -p pam -- gui` — loads the Vite dev server (shows a white
+//! window if it isn't running), and only because that variable says so: the window holds the full
+//! admin bridge, so a build without the embedded frontend refuses to start without it
+//! ([`frontend`]). On (production): `npm --prefix frontend run build` then `cargo build --release -p
 //! pam --features gui-embed` (or `npm --prefix frontend run gui:build` for both). No feature gate
 //! exists otherwise: the owner ships one binary, so CLI-only builds pay the Tauri/wry compile cost
 //! too — accepted trade-off, revisit only if build times become a real problem.
 
 pub mod bridge;
 pub mod events;
+pub mod frontend;
 pub mod logs;
-pub mod own_requests;
 pub mod service;
 
 #[cfg(test)]
@@ -24,9 +26,9 @@ mod bridge_test;
 #[cfg(test)]
 mod events_test;
 #[cfg(test)]
-mod logs_test;
+mod frontend_test;
 #[cfg(test)]
-mod own_requests_test;
+mod logs_test;
 #[cfg(test)]
 mod service_test;
 
@@ -39,8 +41,21 @@ mod service_test;
 ///
 /// # Errors
 ///
-/// Returns an error when the platform webview runtime cannot start.
+/// Returns an error when the platform webview runtime cannot start, and
+/// refuses to start (before any window exists) a build without the embedded
+/// frontend unless `PAM_GUI_DEV=1` asks for the development server
+/// ([`frontend::choose`]).
 pub fn run(context: tauri::Context) -> tauri::Result<()> {
+    frontend::choose(
+        tauri::is_dev(),
+        std::env::var_os(frontend::DEV_SWITCH).as_deref(),
+    )
+    .map_err(|refused| {
+        tauri::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            refused,
+        ))
+    })?;
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             bridge::daemon_status,

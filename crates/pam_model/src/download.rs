@@ -600,6 +600,16 @@ pub fn failure_recovery(cause: &str) -> &'static str {
             "The digest run could not finish; check the file is readable and still there, then \
              verify again."
         }
+        "no_space" => {
+            "Verifying keeps PAM's own copy of the weights under its base directory, and that \
+             volume has no room for one. Free the bytes named in the detail there, or keep the \
+             models directory on the same APFS volume as PAM's base so the copy shares its \
+             blocks, then verify again."
+        }
+        "model_changed" => {
+            "The file changed while it was being verified; wait for whatever is writing it, \
+             then verify again."
+        }
         "daemon_restart" => {
             "The daemon restarted while this transfer ran; the partial file is kept, so download \
              again to resume."

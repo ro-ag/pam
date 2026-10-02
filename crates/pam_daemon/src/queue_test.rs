@@ -1543,3 +1543,93 @@ async fn abandoning_a_lease_frees_the_lane_without_a_terminal_write() {
     .await
     .expect("test within deadline");
 }
+
+/// Admission writes the origin in the INSERT that creates the row: it
+/// survives placement and the lease, and it changes nothing about dedupe —
+/// a duplicate from another connection attaches to the original, whose row
+/// keeps the original's origin.
+#[tokio::test]
+async fn admit_from_records_the_origin_and_changes_nothing_else() {
+    use pam_store::{RequestIngress, RequestOrigin};
+
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let peer = RequestOrigin {
+            ingress: RequestIngress::Public,
+            peer_uid: Some(501),
+            peer_pid: Some(4_100),
+            relayed: true,
+        };
+        let first = envelope("req_origin", REPO_A, serde_json::json!({ "n": 1 }), None);
+        assert_eq!(
+            queue
+                .admit_from(&first, CapabilityClass::NonDestructive, &peer)
+                .await
+                .unwrap(),
+            AdmitOutcome::Admitted
+        );
+        queue.place_in_lane("req_origin", REPO_A).await.unwrap();
+        let row = store.get_request("req_origin").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert_eq!(row.origin, peer);
+
+        // The same work from the private plane attaches: who asks is not
+        // part of what was asked.
+        let duplicate = envelope(
+            "req_origin_dup",
+            REPO_A,
+            serde_json::json!({ "n": 1 }),
+            None,
+        );
+        assert_eq!(
+            queue
+                .admit_from(
+                    &duplicate,
+                    CapabilityClass::NonDestructive,
+                    &RequestOrigin::ADMIN
+                )
+                .await
+                .unwrap(),
+            AdmitOutcome::Attached {
+                existing_request_id: "req_origin".to_owned()
+            }
+        );
+        assert!(store.get_request("req_origin_dup").await.unwrap().is_none());
+
+        // A bypass row and an administration submission.
+        let read = envelope("req_origin_read", REPO_B, serde_json::json!({}), None);
+        assert_eq!(
+            queue
+                .admit_from(&read, CapabilityClass::ReadOnly, &RequestOrigin::ADMIN)
+                .await
+                .unwrap(),
+            AdmitOutcome::Bypass
+        );
+        let row = store.get_request("req_origin_read").await.unwrap().unwrap();
+        assert_eq!(row.origin, RequestOrigin::ADMIN);
+
+        // `admit` is `admit_from` for a caller with no peer to report.
+        let plain = envelope(
+            "req_origin_plain",
+            REPO_B,
+            serde_json::json!({ "n": 2 }),
+            None,
+        );
+        admit(&queue, &plain).await;
+        let row = store
+            .get_request("req_origin_plain")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.origin, RequestOrigin::PUBLIC);
+
+        // The lease moves the row's state and leaves its origin alone.
+        let leased = queue.take_next(REPO_A).await.unwrap().expect("a lease");
+        assert_eq!(leased.request_id, "req_origin");
+        let row = store.get_request("req_origin").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Running);
+        assert_eq!(row.origin, peer);
+    })
+    .await
+    .expect("test within deadline");
+}

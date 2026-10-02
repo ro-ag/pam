@@ -53,8 +53,6 @@ fn causes_are_the_names_the_spec_fixes() {
         ConnectorError::BadResponse(String::new()).cause(),
         "connector_bad_response"
     );
-    assert_eq!(ConnectorError::Cli(String::new()).cause(), "connector_cli");
-    assert_eq!(ConnectorError::CliMissing.cause(), "connector_cli_missing");
 }
 
 #[test]
@@ -117,14 +115,6 @@ fn rate_limit_recovery_names_the_wait_it_was_given() {
 }
 
 #[test]
-fn cli_missing_recovery_names_the_install() {
-    assert_eq!(
-        ConnectorError::CliMissing.recovery(ConnectorId::Aws),
-        "install the aws CLI and make sure it is on the daemon's PATH"
-    );
-}
-
-#[test]
 fn only_transient_failures_are_retryable() {
     assert!(ConnectorError::Timeout.retryable());
     assert!(ConnectorError::RateLimited { retry_after: None }.retryable());
@@ -138,8 +128,6 @@ fn only_transient_failures_are_retryable() {
     assert!(!ConnectorError::Certificate.retryable());
     assert!(!ConnectorError::BadArgs("no".to_owned()).retryable());
     assert!(!ConnectorError::BadResponse("no".to_owned()).retryable());
-    assert!(!ConnectorError::Cli("no".to_owned()).retryable());
-    assert!(!ConnectorError::CliMissing.retryable());
     assert!(
         !ConnectorError::TooLarge {
             bytes: 2,
@@ -193,8 +181,6 @@ fn variants() -> Vec<ConnectorError> {
         },
         ConnectorError::BadArgs("`repo` is required".to_owned()),
         ConnectorError::BadResponse("not JSON".to_owned()),
-        ConnectorError::Cli("exited 255".to_owned()),
-        ConnectorError::CliMissing,
     ]
 }
 

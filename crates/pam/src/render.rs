@@ -11,6 +11,11 @@
 //!   → Open the PAM GUI to grant it, then retry.
 //! ```
 //!
+//! One refusal is reworded for the human: `client_version_mismatch`, the answer of a running
+//! daemon that is another build than this binary. Its detail becomes one plain sentence naming
+//! both versions and the daemon's executable ([`version_mismatch_line`]); cause and recovery stay
+//! the daemon's.
+//!
 //! With `--json` the raw [`Response`] JSON goes to stdout instead; the exit code is mapped the
 //! same way either way. `pam flow` gets three renderers — [`render_flow_list`],
 //! [`render_flow_show`], [`render_flow_result`] — plus [`parse_flow_inputs`], which turns
@@ -186,7 +191,62 @@ pub fn render_request_failure(
 /// three (see the module docs).
 #[must_use]
 pub fn render_refusal(cause: &str, detail: &str, recovery: &str) -> String {
+    let detail = version_mismatch_line(cause, detail).unwrap_or_else(|| detail.to_owned());
     format!("pam: refused ({cause})\n  {detail}\n  \u{2192} {recovery}")
+}
+
+/// The plain sentence for a `client_version_mismatch` refusal — this binary
+/// is not the build the running daemon was started from — or `None` for any
+/// other cause.
+///
+/// The daemon's detail names the client's version, its own, and the
+/// executable it runs from ("client version 0.5.1 does not match daemon
+/// version 0.5.0 running from /path/pam; that binary has not changed on
+/// disk, …"); all three are lifted into the sentence. A detail in a wording
+/// this build does not recognise is kept verbatim behind the sentence, never
+/// guessed at.
+#[must_use]
+pub fn version_mismatch_line(cause: &str, detail: &str) -> Option<String> {
+    if cause != pam_proto::wire::cause::CLIENT_VERSION_MISMATCH {
+        return None;
+    }
+    let facts = || {
+        let (client, rest) = detail
+            .strip_prefix("client version ")?
+            .split_once(" does not match daemon version ")?;
+        let (daemon, rest) = rest.split_once(" running from ")?;
+        let (path, _) = rest.rsplit_once("; ")?;
+        (!client.is_empty() && !daemon.is_empty() && !path.is_empty())
+            .then_some((client, daemon, path))
+    };
+    Some(match facts() {
+        Some((client, daemon, path)) => format!(
+            "this pam (v{client}) is not the build the running daemon (v{daemon}, {path}) was \
+             started from"
+        ),
+        None => format!(
+            "this pam (v{}) is not the build the running daemon was started from ({detail})",
+            env!("CARGO_PKG_VERSION")
+        ),
+    })
+}
+
+/// The stderr line for a follow that ended without a terminal event:
+/// `pam <subcommand>: <error>`, with a `client_version_mismatch` refusal
+/// reworded as in [`render_refusal`].
+#[must_use]
+pub fn render_follow_error(subcommand: &str, err: &crate::client::RequestError) -> String {
+    if let crate::client::RequestError::FollowRefused {
+        cause,
+        detail,
+        recovery,
+        ..
+    } = err
+        && let Some(line) = version_mismatch_line(cause, detail)
+    {
+        return format!("pam {subcommand}: {line}; {recovery}");
+    }
+    format!("pam {subcommand}: {err}")
 }
 
 /// The stdout block for a ticket: the id to follow, plus the hint.

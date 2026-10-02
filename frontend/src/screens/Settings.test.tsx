@@ -720,6 +720,51 @@ describe("daemon", () => {
     expect(restart).toHaveAttribute("title", "The daemon is not running");
   });
 
+  describe("a window that is not the daemon's build", () => {
+    const mismatch = {
+      cause: "client_version_mismatch",
+      detail:
+        "client version 0.4.3 does not match daemon version 0.5.0 running from " +
+        "/Applications/pam.app/Contents/MacOS/pam; that binary has not changed on disk, so the " +
+        "daemon keeps running",
+      recovery:
+        "Use the pam binary this daemon was started from, or stop the daemon from the PAM GUI " +
+        "and start it with the build you intend to use.",
+    };
+
+    it("says so plainly, with the daemon's version and path and the way out", async () => {
+      mocks.daemonStatus.mockRejectedValue(mismatch);
+      renderSettings("daemon");
+      const card = within(await screen.findByRole("region", { name: "Daemon" }));
+      expect(await card.findByText(/daemon · client_version_mismatch/)).toBeInTheDocument();
+      expect(
+        card.getByText(
+          "This window is not the build the running daemon was started from; the daemon is " +
+            "version 0.5.0, running from /Applications/pam.app/Contents/MacOS/pam.",
+        ),
+      ).toBeInTheDocument();
+      expect(card.getByText(mismatch.recovery)).toBeInTheDocument();
+      // The recovery names stopping from here, so stopping stays possible: it is a signal, not
+      // a request the daemon would refuse.
+      expect(card.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
+      expect(card.getByRole("button", { name: "Restart" })).toBeEnabled();
+    });
+
+    it("leaves every other bridge failure as it was, with Stop closed", async () => {
+      mocks.daemonStatus.mockRejectedValue({
+        cause: "daemon_outdated",
+        detail: "the daemon is restarting on a newer build",
+        recovery: "Wait a moment and retry.",
+      });
+      renderSettings("daemon");
+      const card = within(await screen.findByRole("region", { name: "Daemon" }));
+      expect(await card.findByText(/daemon · daemon_outdated/)).toBeInTheDocument();
+      expect(card.getByText(/the daemon is restarting on a newer build/)).toBeInTheDocument();
+      expect(card.queryByText(/not the build the running daemon/)).not.toBeInTheDocument();
+      expect(card.getByRole("button", { name: "Stop daemon" })).toBeDisabled();
+    });
+  });
+
   it.each([
     ["not_running", null, /was not running/],
     ["still_draining", 42, /still draining · pid 42 · finishing in-flight work/],

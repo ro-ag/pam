@@ -202,7 +202,7 @@ mod live {
         CAUSE_INTERNAL_ERROR, CAUSE_REQUEST_CAPACITY, CONTROL_SLOTS, DaemonConfig, DaemonHandle,
         Registration, STATUS_SLOTS, WORK_SLOTS, run_daemon_with,
     };
-    use crate::ingress::Origin;
+    use crate::ingress::{Origin, PeerIdentity, PublicPeer};
     use crate::secrets::FakeSecretBackend;
     use crate::transport::IncomingRequest;
 
@@ -254,19 +254,43 @@ mod live {
 
         /// Sends one public request straight into the dispatcher.
         async fn submit(&self, envelope: Envelope) -> oneshot::Receiver<Response> {
+            self.submit_from(envelope, Origin::Public, None).await
+        }
+
+        /// Sends one request into the dispatcher as the given plane's
+        /// listener would, with the peer that listener saw.
+        async fn submit_from(
+            &self,
+            envelope: Envelope,
+            origin: Origin,
+            peer: Option<PublicPeer>,
+        ) -> oneshot::Receiver<Response> {
             let (reply, answer) = oneshot::channel();
             self.handle
                 .admin()
                 .submit
                 .send(IncomingRequest {
-                    identity: Vec::new(),
-                    origin: Origin::Public,
+                    origin,
+                    peer,
                     envelope,
                     reply,
                 })
                 .await
                 .expect("the dispatcher is running");
             answer
+        }
+
+        async fn ask_from(
+            &self,
+            envelope: Envelope,
+            origin: Origin,
+            peer: Option<PublicPeer>,
+        ) -> Response {
+            let answer = self.submit_from(envelope, origin, peer).await;
+            tokio::time::timeout(PATIENCE, answer)
+                .await
+                .expect("an answer within the test's patience")
+                .expect("the daemon answers every admitted request")
         }
 
         async fn ask(&self, envelope: Envelope) -> Response {
@@ -428,6 +452,245 @@ mod live {
             .queue()
             .cancel("gone_original", pam_store::Actor::System)
             .await;
+        live.stop().await;
+    }
+
+    /// The peer the framed listener saw, as a test passes it.
+    fn kernel_peer(pid: u32, relayed: bool) -> PublicPeer {
+        PublicPeer {
+            identity: PeerIdentity::Unix {
+                uid: 501,
+                gid: 20,
+                pid: Some(pid),
+            },
+            relayed,
+        }
+    }
+
+    /// Admission writes where a request entered the daemon onto its row:
+    /// the plane, and for a framed public connection the kernel's uid and
+    /// pid and the relay marker — whatever the envelope says about itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_records_the_plane_and_the_peer_on_the_request_row() {
+        use pam_store::{RequestIngress, RequestOrigin};
+
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+
+        // A laned request from a framed connection.
+        let mut laned = request("origin_laned", "echo", serde_json::json!({ "n": 1 }), true);
+        laned.caller.agent = "pam-gui".to_owned();
+        laned.caller.pid = 1;
+        let response = live
+            .ask_from(laned, Origin::Public, Some(kernel_peer(7_001, false)))
+            .await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let row = store.get_request("origin_laned").await.unwrap().unwrap();
+        assert_eq!(
+            row.origin,
+            RequestOrigin {
+                ingress: RequestIngress::Public,
+                peer_uid: Some(501),
+                peer_pid: Some(7_001),
+                relayed: false,
+            }
+        );
+        // The label is stored as what it is: a label.
+        assert_eq!(row.caller_agent, "pam-gui");
+
+        // A control request through a relay: a bypass row, same columns.
+        let query = request(
+            "origin_query",
+            "query",
+            serde_json::json!({ "ticket": "origin_laned" }),
+            true,
+        );
+        let _ = live
+            .ask_from(query, Origin::Public, Some(kernel_peer(7_002, true)))
+            .await;
+        let row = store.get_request("origin_query").await.unwrap().unwrap();
+        assert_eq!(row.origin.peer_pid, Some(7_002));
+        assert!(row.origin.relayed);
+
+        // A request refused before admission (unknown capability) is
+        // recorded with its origin too.
+        let unknown = request("origin_unknown", "frobnicate", serde_json::json!({}), true);
+        let response = live
+            .ask_from(unknown, Origin::Public, Some(kernel_peer(7_003, false)))
+            .await;
+        assert!(matches!(response, Response::Refusal { .. }), "{response:?}");
+        let row = store.get_request("origin_unknown").await.unwrap().unwrap();
+        assert_eq!(row.origin.peer_pid, Some(7_003));
+
+        // A public request submitted with no peer records none.
+        let _ = live
+            .ask(request(
+                "origin_legacy",
+                "echo",
+                serde_json::json!({ "n": 2 }),
+                true,
+            ))
+            .await;
+        let row = store.get_request("origin_legacy").await.unwrap().unwrap();
+        assert_eq!(row.origin, RequestOrigin::PUBLIC);
+
+        // What the private plane submits is recorded as such, with no peer
+        // claimed for an in-process submission.
+        let admin = request("origin_admin", "echo", serde_json::json!({ "n": 3 }), true);
+        let response = live.ask_from(admin, Origin::Admin, None).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let row = store.get_request("origin_admin").await.unwrap().unwrap();
+        assert_eq!(row.origin, RequestOrigin::ADMIN);
+
+        live.stop().await;
+    }
+
+    /// The pipeline never judges a request by its envelope's version: the
+    /// hello of the connection it came on went through the version rule on
+    /// its listener, and what the administration plane submits in process
+    /// came from a connection that did. The field is recorded, nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_is_never_judged_by_its_envelope_version() {
+        let live = Live::start("relaxed", |_| {}).await;
+
+        let mut public = request("ver_public", "echo", serde_json::json!({ "n": 1 }), true);
+        public.client_version = "0.0.1".to_owned();
+        let response = live
+            .ask_from(public, Origin::Public, Some(kernel_peer(7_010, false)))
+            .await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+
+        let mut admin = request("ver_admin", "echo", serde_json::json!({ "n": 2 }), true);
+        admin.client_version = "0.0.1".to_owned();
+        let response = live.ask_from(admin, Origin::Admin, None).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+
+        // Neither moved the phase: a claimed version restarts nothing.
+        assert_eq!(
+            *live.handle.lifecycle().borrow(),
+            crate::lifecycle::LifecyclePhase::Serving
+        );
+        live.stop().await;
+    }
+
+    /// A ticket whose lifecycle events are published is registered with the
+    /// hub at admission, so the administration plane's stream can name it,
+    /// and is gone from the hub once it ends. Control requests publish
+    /// nothing and are never registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tickets_are_registered_with_the_hub_at_admission_and_forgotten_at_the_end() {
+        use pam_proto::Event;
+        use pam_proto::wire::Ingress as WireIngress;
+
+        use crate::event_hub::Subscribed;
+
+        let live = Live::start("relaxed", |_| {}).await;
+        let hub = live.handle.event_hub();
+        let mut all = hub.subscribe_all().expect("a subscriber slot");
+        let mut next = async || match tokio::time::timeout(PATIENCE, all.next()).await {
+            Ok(Subscribed::Event(event)) => event,
+            other => panic!("expected an event, got {other:?}"),
+        };
+
+        // A laned request: every event carries what admission knew.
+        let response = live
+            .ask(request(
+                "hub_laned",
+                "echo",
+                serde_json::json!({ "n": 1 }),
+                true,
+            ))
+            .await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        for expected in [Event::Queued, Event::Started, Event::Done] {
+            let event = next().await;
+            assert_eq!(
+                (event.ticket.as_str(), &event.event),
+                ("hub_laned", &expected)
+            );
+            let meta = event.meta.expect("registered at admission");
+            assert_eq!(meta.capability, "echo");
+            assert_eq!(meta.repo, REPO);
+            assert_eq!(meta.agent, "claude");
+            assert_eq!(meta.ingress, WireIngress::Public);
+        }
+
+        // The same request from the private plane is named as such.
+        let admin = request("hub_admin", "echo", serde_json::json!({ "n": 2 }), true);
+        let _ = live.ask_from(admin, Origin::Admin, None).await;
+        for _ in 0..3 {
+            let event = next().await;
+            assert_eq!(event.ticket, "hub_admin");
+            assert_eq!(
+                event.meta.expect("registered at admission").ingress,
+                WireIngress::Admin
+            );
+        }
+
+        // A request refused before admission still names itself.
+        let _ = live
+            .ask(request(
+                "hub_unknown",
+                "frobnicate",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let event = next().await;
+        assert_eq!(
+            (event.ticket.as_str(), &event.event),
+            ("hub_unknown", &Event::Refused)
+        );
+        assert_eq!(
+            event
+                .meta
+                .expect("registered before the refusal")
+                .capability,
+            "frobnicate"
+        );
+
+        // A read-only bypass is registered and ends in its handler.
+        let _ = live
+            .ask(request(
+                "hub_bypass",
+                "flow.list",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let event = next().await;
+        assert_eq!(
+            (event.ticket.as_str(), &event.event),
+            ("hub_bypass", &Event::Started)
+        );
+        assert_eq!(
+            event.meta.expect("registered at admission").capability,
+            "flow.list"
+        );
+        let event = next().await;
+        assert_eq!(event.ticket, "hub_bypass");
+
+        // Control requests publish nothing, so there is nothing to name.
+        let _ = live
+            .ask(request(
+                "hub_query",
+                "query",
+                serde_json::json!({ "ticket": "hub_laned" }),
+                true,
+            ))
+            .await;
+        let _ = live
+            .ask(request("hub_status", "status", serde_json::json!({}), true))
+            .await;
+        assert_eq!(all.queued(), 0, "a control request published an event");
+
+        // Everything that ended is gone from the hub's table.
+        eventually("the hub forgot every finished ticket", || async {
+            hub.usage().entries == 0
+        })
+        .await;
+
+        drop(all);
         live.stop().await;
     }
 
@@ -634,6 +897,37 @@ mod live {
         live.stop().await;
     }
 
+    /// The hub removes a ticket when its terminal event is published. A
+    /// bypass whose verdict is parked for retry publishes none, and must not
+    /// hold a slot of the hub's table until the table is full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bypass_that_ends_without_a_terminal_event_is_forgotten_by_the_hub() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let terminals = Arc::clone(&live.handle.admin().terminals);
+        let hub = live.handle.event_hub();
+
+        terminals.fail_next(3);
+        let response = live
+            .ask(request(
+                "hub_parked",
+                "flow.list",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        assert_eq!(refusal(&response), (CAUSE_INTERNAL_ERROR, true));
+        assert_eq!(terminals.parked_count(), 1);
+        // `started` was published, `done` was not.
+        assert_eq!(hub.usage().entries, 0);
+
+        eventually("the parked verdict is recorded", || async {
+            state_of(&store, "hub_parked").await == Some(RequestState::Done)
+        })
+        .await;
+        live.stop().await;
+    }
+
     /// A failed terminal write after a successful execution used to strand
     /// the lane until the lease deadline and turn the real result into
     /// `deadline_exceeded`.
@@ -706,8 +1000,8 @@ mod cancel_plane {
             .admin()
             .submit
             .send(IncomingRequest {
-                identity: Vec::new(),
                 origin: Origin::Public,
+                peer: None,
                 envelope,
                 reply,
             })

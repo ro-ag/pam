@@ -1,14 +1,12 @@
 //! Connectors over an injected HTTP transport (system `curl` in production). One module
 //! per connector; secrets never reach argv, logs, or evidence. See
-//! `docs/specs/2026-09-02-flows-connectors-design.md`. Seven services are described —
-//! GitHub Actions, Jenkins, `SonarQube`, Jira Data Center, Confluence Cloud, `SharePoint`
-//! (via Microsoft Graph), and an allowlisted passthrough to the local `aws` CLI. Every
+//! `docs/specs/2026-09-02-flows-connectors-design.md`. Six services are described —
+//! GitHub Actions, Jenkins, `SonarQube`, Jira Data Center, Confluence Cloud, and
+//! `SharePoint` (via Microsoft Graph). Every
 //! flow-step call ([`call`]) is read-only: nothing reachable from a flow creates, updates,
 //! or deletes anything. The one writing surface is [`github_landing`] — typed pull-request
 //! creation and merge for guarded landing, under its own policy and never reachable from
-//! a flow step. The AWS descriptor exists, but the daemon refuses that connector before any
-//! credential or process is touched and `pam_flow` refuses a flow that names it, until
-//! containment lands. Two entry points cover the read path: [`call`] runs one flow step's
+//! a flow step. Two entry points cover the read path: [`call`] runs one flow step's
 //! connector action (JSON or a log); [`verify`] proves a stored credential works (the
 //! GUI's **Test** button). Both take a `&dyn HttpTransport`, so the daemon injects
 //! [`CurlTransport`] and tests inject `testing::FakeTransport` (behind the `testing`
@@ -28,7 +26,6 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-pub mod aws;
 mod confluence;
 mod curl;
 mod descriptor;
@@ -56,13 +53,11 @@ pub use descriptor::{AuthKind, Descriptor, descriptor};
 pub use error::ConnectorError;
 pub use pam_flow::{ArgValue, ConnectorId};
 pub use transport::{
-    AWS_BASE_URL, Connection, HttpRequest, HttpResponse, HttpTransport, MAX_JSON_BYTES,
-    MAX_LOG_BYTES, Method, Secret, TransportError, validate_base_url,
+    Connection, HttpRequest, HttpResponse, HttpTransport, MAX_JSON_BYTES, MAX_LOG_BYTES, Method,
+    Secret, TransportError, validate_base_url,
 };
 pub use url::Url;
 
-#[cfg(test)]
-mod aws_test;
 #[cfg(test)]
 mod confluence_test;
 #[cfg(test)]
@@ -109,7 +104,7 @@ pub enum CallResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     /// One line naming who pam is over there — "authenticated as octocat",
-    /// "account 123456789012 arn …" — shown next to the connector in the GUI.
+    /// "signed in as jdoe on example.atlassian.net" — shown next to the connector in the GUI.
     pub detail: String,
 }
 
@@ -134,7 +129,6 @@ pub async fn call(
         ConnectorId::Jira => jira::call(conn, call, args, transport, deadline).await,
         ConnectorId::Confluence => confluence::call(conn, call, args, transport, deadline).await,
         ConnectorId::Sharepoint => sharepoint::call(conn, call, args, transport, deadline).await,
-        ConnectorId::Aws => aws::call(conn, call, args, deadline).await,
     }
 }
 
@@ -156,7 +150,6 @@ pub async fn verify(
         ConnectorId::Jira => jira::verify(conn, transport, deadline).await,
         ConnectorId::Confluence => confluence::verify(conn, transport, deadline).await,
         ConnectorId::Sharepoint => sharepoint::verify(conn, transport, deadline).await,
-        ConnectorId::Aws => aws::verify(conn, deadline).await,
     }
 }
 

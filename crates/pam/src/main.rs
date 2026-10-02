@@ -97,17 +97,21 @@ enum Cmd {
     },
     /// Serve a session socket relay for sandboxed clients (unix only).
     ///
-    /// Binds `pam.sock` and `events.sock` directly inside `<dir>` and
-    /// forwards bytes to the daemon's runtime sockets, so a client running
-    /// under an agent sandbox that blocks the daemon's own socket can dial
-    /// a path the sandbox permits. Point sandboxed clients at it with
-    /// `PAM_SOCKET_DIR=<dir>` — while that is set they never start a
-    /// daemon themselves, so a dead relay is a clean error, not a spawn.
-    /// The relay is a dumb byte pipe: all admission and authority stays
-    /// with the daemon. See docs/session-socket-relay.md.
+    /// Binds one socket, `pam.sock`, directly inside `<dir>` and forwards
+    /// bytes to the daemon's public socket, so a client running under an
+    /// agent sandbox that blocks the daemon's own socket can dial a path
+    /// the sandbox permits (the directory is created 0700 and must be
+    /// yours, not a link, and not writable by others). Requests and
+    /// `pam wait` / `pam subscribe` streams travel over that one socket.
+    /// Point sandboxed clients at it with `PAM_SOCKET_DIR=<dir>` — while
+    /// that is set they never start a daemon themselves, so a dead relay
+    /// is a clean error, not a spawn. If the daemon behind it is a
+    /// pre-migration build, the relay replaces it first. The relay is a
+    /// dumb byte pipe: all admission and authority stays with the daemon.
+    /// See docs/session-socket-relay.md.
     #[cfg(unix)]
     Listen {
-        /// Directory to bind the session sockets in (created private).
+        /// Directory to bind the session socket in (created private).
         #[arg(default_value = ".pam-session")]
         dir: PathBuf,
     },
@@ -461,7 +465,7 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             json,
         } => follow(base, "wait", &ticket, timeout_ms, json).await,
         #[cfg(unix)]
-        Cmd::Listen { dir } => listen_mode(base, &dir),
+        Cmd::Listen { dir } => listen_mode(base, &dir).await,
         Cmd::Subscribe {
             ticket,
             timeout_ms,
@@ -734,15 +738,19 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
     code
 }
 
-/// Follow events, then resolve the durable response so workflow failure and
-/// advisory diagnosis cannot be mistaken for successful stream completion.
+/// Follow a ticket to its end and print the durable response that ended the
+/// stream, so workflow failure and advisory diagnosis cannot be mistaken for
+/// successful stream completion.
 ///
 /// `subcommand` is `wait` (quiet) or `subscribe` (prints each event); it
 /// also prefixes every error line. A follow that ends without a terminal
 /// event — refused, or past `timeout_ms` — is a stderr line, or with
 /// `--json` a refusal object on stdout ([`render::render_follow_failure`])
 /// so a machine reader never has to parse prose; the exit code is the
-/// same either way (refusal 3, timeout 1).
+/// same either way (refusal 3, timeout 1). Any other client-side failure
+/// (no daemon, a daemon of another build, a pre-migration daemon this
+/// process may not stop) is a stderr line and exit 1, with nothing on
+/// stdout.
 async fn follow(
     base: &Path,
     subcommand: &str,
@@ -757,8 +765,8 @@ async fn follow(
             println!("{}", render::render_event(event));
         }
     };
-    match client::follow_ticket(base, ticket, timeout, on_event).await {
-        Ok(_) => terminal_result(base, subcommand, ticket, json).await,
+    match client::follow_ticket_to_end(base, ticket, timeout, on_event).await {
+        Ok(end) => terminal_result(base, ticket, &end.response, json).await,
         Err(err) => {
             let code = if matches!(err, client::RequestError::FollowRefused { .. }) {
                 ExitCode::from(render::EXIT_REFUSED)
@@ -767,49 +775,35 @@ async fn follow(
             };
             match render::render_follow_failure(&err, json) {
                 Some(object) => println!("{object}"),
-                None => eprintln!("pam {subcommand}: {err}"),
+                None => eprintln!("{}", render::render_follow_error(subcommand, &err)),
             }
             code
         }
     }
 }
 
-async fn terminal_result(base: &Path, subcommand: &str, ticket: &str, json: bool) -> ExitCode {
+/// Prints what a finished follow resolved to. `response` is the durable
+/// `query` answer the follow stream ended with, so the ticket is not queried
+/// again; only a flow run is read once more, through `flow.result`, for its
+/// report.
+async fn terminal_result(base: &Path, ticket: &str, response: &Response, json: bool) -> ExitCode {
+    let is_flow_run = matches!(response, Response::Result { body, .. }
+        if body.get("capability").and_then(serde_json::Value::as_str) == Some("flow.run"));
+    if !is_flow_run {
+        return print_response("query", response, json);
+    }
     // The ticket is already terminal here: a daemon that is momentarily busy
     // (capacity, rate, restarting) must not turn that into a "refused".
-    let args = serde_json::json!({"ticket": ticket});
-    match client::send_request_patient(
+    request_patiently(
         base,
-        "query",
-        args.clone(),
+        "flow.result",
+        serde_json::json!({"ticket": ticket}),
         true,
-        DEFAULT_DEADLINE_MS,
-        RESULT_PATIENCE,
+        None,
+        json,
+        Some(RESULT_PATIENCE),
     )
     .await
-    {
-        Ok(response) => {
-            if matches!(&response, Response::Result { body, .. } if body.get("capability").and_then(serde_json::Value::as_str) == Some("flow.run"))
-            {
-                request_patiently(
-                    base,
-                    "flow.result",
-                    args,
-                    true,
-                    None,
-                    json,
-                    Some(RESULT_PATIENCE),
-                )
-                .await
-            } else {
-                print_response("query", &response, json)
-            }
-        }
-        Err(error) => {
-            eprintln!("pam {subcommand}: {error}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 /// `pam daemon stop`: name the lock holder, send it SIGTERM (unix), and
@@ -846,16 +840,12 @@ fn daemon_stop() -> ExitCode {
 /// `pam listen <dir>`: serves the session socket relay until ctrl-c.
 /// Exit codes: 0 on a clean shutdown, 1 when the relay could not start or
 /// failed. Unix only — the subcommand does not exist elsewhere.
+///
+/// It runs on the runtime [`client_mode`] already entered: a second runtime
+/// cannot be started from inside one (tokio panics on the nested `block_on`).
 #[cfg(unix)]
-fn listen_mode(base: &Path, dir: &Path) -> ExitCode {
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("pam listen: cannot start the async runtime: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match runtime.block_on(pam_client::relay::run(dir, base)) {
+async fn listen_mode(base: &Path, dir: &Path) -> ExitCode {
+    match pam_client::relay::run(dir, base).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("pam listen: {err}");

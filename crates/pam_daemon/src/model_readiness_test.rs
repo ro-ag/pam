@@ -6,7 +6,7 @@ use pam_store::Store;
 use crate::log_service::{
     CAUSE_MODEL_MISSING, CAUSE_MODEL_UNQUALIFIED, CAUSE_MODEL_UNVERIFIED, CAUSE_NO_DEFAULT,
 };
-use crate::model_readiness::{CAUSE_ENGINE_NOT_INSTALLED, Stage};
+use crate::model_readiness::{CAUSE_CONTRACT_CHANGED, CAUSE_ENGINE_NOT_INSTALLED, Stage};
 use crate::model_service::{ModelService, Tier};
 
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
@@ -203,4 +203,121 @@ fn stages_serialize_as_snake_case_causes_the_gui_can_switch_on() {
         serde_json::to_value(Stage::Ready).unwrap(),
         serde_json::json!("ready")
     );
+}
+
+/// A model whose record was measured with other engine options than this build starts
+/// it with is reported unqualified with its own cause and a recovery that says what to
+/// do, and its record is not shown as if it still vouched for it.
+#[tokio::test]
+async fn changed_engine_options_read_as_unqualified_needing_re_measurement() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    let sha256 = verify(&service, &path);
+    service
+        .set_default(Tier::Heavy, Some("qwen/small"))
+        .await
+        .unwrap();
+    service.qualify_for_tests(&sha256);
+    let ready = service
+        .readiness(Tier::Heavy, &engine(true), None)
+        .await
+        .unwrap();
+    assert_eq!(ready.stage, Stage::Ready);
+    assert!(ready.qualification.is_some());
+
+    let rethought = pam_model::engine_server::EngineContract {
+        reasoning_budget: 512,
+        enable_thinking: true,
+        ..service.engine_contract_for_tests(&sha256)
+    };
+    service.qualify_measured_with_for_tests(&sha256, rethought);
+    let changed = service
+        .readiness(Tier::Heavy, &engine(true), None)
+        .await
+        .unwrap();
+    assert_eq!(changed.stage, Stage::Unqualified);
+    assert_eq!(changed.qualification, None);
+    assert_eq!(
+        changed.note, None,
+        "no qualified sentence without a qualification"
+    );
+    let blocker = changed.blocker.expect("a blocker");
+    assert_eq!(blocker.cause, CAUSE_CONTRACT_CHANGED);
+    assert!(
+        blocker.detail.starts_with("qwen/small is verified, but")
+            && blocker
+                .detail
+                .contains("reasoning_budget: measured 512, now 0")
+            && blocker
+                .detail
+                .contains("enable_thinking: measured true, now false")
+            && blocker.detail.contains("needs re-measurement"),
+        "{}",
+        blocker.detail
+    );
+    assert!(
+        blocker.recovery.contains("re-measurement") && blocker.recovery.contains("Try"),
+        "{}",
+        blocker.recovery
+    );
+
+    // No record at all keeps the plain cause.
+    service.qualify_for_tests("not-this-digest");
+    let plain = service
+        .readiness(Tier::Heavy, &engine(true), None)
+        .await
+        .unwrap();
+    assert_eq!(plain.blocker.unwrap().cause, CAUSE_MODEL_UNQUALIFIED);
+}
+
+/// A qualified tier says what the qualification is and what it is not, and discloses
+/// the summary's own contract as unmeasured: neither of which is a blocker.
+#[tokio::test]
+async fn a_ready_tier_says_what_was_measured_and_discloses_the_summary_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let path = touch_model(dir.path(), "qwen", "small.gguf");
+    let sha256 = verify(&service, &path);
+    service
+        .set_default(Tier::Heavy, Some("qwen/small"))
+        .await
+        .unwrap();
+    service.qualify_for_tests(&sha256);
+
+    let ready = service
+        .readiness(Tier::Heavy, &engine(true), None)
+        .await
+        .unwrap();
+    assert_eq!(ready.stage, Stage::Ready);
+    assert!(ready.blocker.is_none());
+    assert_eq!(
+        ready.note.as_deref(),
+        Some(
+            "Qualified on the capability bench (contract v2). Summaries are advisory and not \
+             separately measured."
+        )
+    );
+    let body = serde_json::to_value(&ready).unwrap();
+    assert_eq!(body["summary_contract"]["task"], "log.summary");
+    assert_eq!(body["summary_contract"]["measured"], false);
+    assert_eq!(
+        body["summary_contract"]["fingerprint"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        crate::model_readiness::qualification_note("some-other-contract"),
+        "Qualified on the capability bench (some-other-contract). Summaries are advisory and \
+         not separately measured."
+    );
+
+    // An unconfigured tier still discloses it, and says nothing about a qualification.
+    let light = service
+        .readiness(Tier::Light, &engine(true), None)
+        .await
+        .unwrap();
+    assert_eq!(light.note, None);
+    assert!(!light.summary_contract.measured);
 }

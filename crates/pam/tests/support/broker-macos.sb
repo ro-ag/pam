@@ -10,7 +10,6 @@
 (allow process-info*)
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote unix-socket (literal "@BASE@/run/pam.sock")))
-(allow network-outbound (remote unix-socket (literal "@BASE@/run/events.sock")))
 (deny file-read-data file-write* (subpath "@BASE@/admin"))
 (deny file-read-data file-write* (literal "@BASE@/state.sqlite3"))
 (deny file-read-data file-write* (literal "@BASE@/state.sqlite3-wal"))

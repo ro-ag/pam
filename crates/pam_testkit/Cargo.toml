@@ -1,6 +1,6 @@
 [package]
 name = "pam_testkit"
-description = "Shared integration-test harness: real daemon on a temp runtime dir, real zmq clients, store assertions."
+description = "Shared integration-test harness: real daemon on a temp runtime dir, a framed public-transport client, store assertions."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,6 @@ pam_store.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-zeromq.workspace = true
 
 [lints]
 workspace = true

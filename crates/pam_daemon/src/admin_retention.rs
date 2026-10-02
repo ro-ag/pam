@@ -10,6 +10,11 @@
 //! answer already carries the figures for what the new window removed instead of leaving the screen
 //! and the database disagreeing for up to an hour. The windows, validation rule, and schedule live
 //! in [`crate::retention`]; this module is only the door.
+//!
+//! Every reply carries `clock_guard`: `null`, or the notice of a pass the forward-clock-jump guard
+//! held back (cause `retention_clock_jump`, with its recovery line). [`OP_RETENTION_PRUNE`] is the
+//! human's confirmation and always runs; its audit row says when it overrode the guard.
+//! [`OP_RETENTION_SET`] is not: it can be held back like a scheduled pass.
 
 use pam_proto::Outcome;
 use serde_json::{Value, json};
@@ -20,11 +25,12 @@ use crate::admin::{
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
 use crate::retention::{
-    CAUSE_RETENTION_INVALID, PruneReport, RECOVERY_RETENTION_INVALID, RetentionPatch,
-    RetentionRefusal, RetentionService, RetentionSettings, now_ts,
+    CAUSE_CLOCK_JUMP, CAUSE_RETENTION_INVALID, ClockGuardNotice, PassOutcome, PruneReport,
+    RECOVERY_CLOCK_JUMP, RECOVERY_RETENTION_INVALID, RetentionPatch, RetentionRefusal,
+    RetentionService, RetentionSettings, Trigger,
 };
 
-/// `admin.retention.get` → `{ evidence_days, audit_days, last_run }`.
+/// `admin.retention.get` → `{ evidence_days, audit_days, last_run, clock_guard }`.
 pub const OP_RETENTION_GET: &str = "admin.retention.get";
 
 /// `admin.retention.set { evidence_days?, audit_days? }` → the same
@@ -32,7 +38,8 @@ pub const OP_RETENTION_GET: &str = "admin.retention.get";
 /// `null` for forever; an absent field leaves that window alone.
 pub const OP_RETENTION_SET: &str = "admin.retention.set";
 
-/// `admin.retention.prune` → the [`PruneReport`] of a pass run now.
+/// `admin.retention.prune` → the [`PruneReport`] of a pass run now, plus
+/// `clock_guard_overridden`. Always runs: it is the human's confirmation.
 pub const OP_RETENTION_PRUNE: &str = "admin.retention.prune";
 
 /// Every op this module answers — the GUI bridge's whitelist reads it so
@@ -58,7 +65,18 @@ impl AdminService {
     /// The retention service for this call. Building one is an
     /// `Arc` clone, so the daemon carries no field for it.
     fn retention(&self) -> RetentionService {
-        RetentionService::new(std::sync::Arc::clone(&self.store))
+        let service = RetentionService::new(std::sync::Arc::clone(&self.store));
+        // Tests move the clock these ops read; production reads the system's.
+        #[cfg(test)]
+        let service = {
+            let ahead = self
+                .retention_clock_ahead
+                .load(std::sync::atomic::Ordering::SeqCst);
+            service.with_clock(std::sync::Arc::new(move || {
+                crate::retention::now_ts().saturating_add(ahead)
+            }))
+        };
+        service
     }
 
     /// Both windows and the last pass's figures, as the panel opens.
@@ -66,9 +84,10 @@ impl AdminService {
         let retention = self.retention();
         let settings = retention.settings().await?;
         let last_run = retention.last_run().await?;
+        let guard = retention.clock_guard().await?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: state_body(settings, last_run)?,
+            body: state_body(settings, last_run, guard)?,
             audit: audit_detail(OP_RETENTION_GET, settings),
         })
     }
@@ -89,11 +108,18 @@ impl AdminService {
         };
         let retention = self.retention();
         let settings = retention.set_settings(patch).await.map_err(refuse)?;
-        let last_run = retention.prune(now_ts()).await?;
+        // The save itself is a human act, but not a decision about the
+        // clock, so the pass it triggers can still be held back.
+        let (last_run, guard) = match retention.run_pass(Trigger::Settings).await? {
+            PassOutcome::Ran { report, .. } => (Some(report), None),
+            PassOutcome::Skipped(notice) => (retention.last_run().await?, Some(notice)),
+        };
+        let mut audit = audit_detail(OP_RETENTION_SET, settings);
+        audit["clock_guard_held_back"] = json!(guard.is_some());
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: state_body(settings, Some(last_run))?,
-            audit: audit_detail(OP_RETENTION_SET, settings),
+            body: state_body(settings, last_run, guard)?,
+            audit,
         })
     }
 
@@ -103,7 +129,17 @@ impl AdminService {
     /// [`Outcome::Changed`] — the store is exactly as it was, and the
     /// outcome should not claim otherwise.
     async fn retention_prune(&self) -> Result<AdminOk, AdminRefusal> {
-        let report = self.retention().prune(now_ts()).await?;
+        let PassOutcome::Ran {
+            report,
+            overrode_guard,
+        } = self.retention().run_pass(Trigger::Manual).await?
+        else {
+            return Err(AdminRefusal {
+                cause: CAUSE_INTERNAL_ERROR,
+                detail: "a manual retention pass was held back, which it never is".to_owned(),
+                recovery: RECOVERY_INTERNAL,
+            });
+        };
         let changed = report.evidence_rows > 0 || report.requests > 0;
         Ok(AdminOk {
             outcome: if changed {
@@ -111,13 +147,18 @@ impl AdminService {
             } else {
                 Outcome::Verified
             },
-            body: report_body(report)?,
+            body: {
+                let mut body = report_body(report)?;
+                body["clock_guard_overridden"] = json!(overrode_guard);
+                body
+            },
             audit: json!({
                 "op": OP_RETENTION_PRUNE,
                 "evidence_rows": report.evidence_rows,
                 "evidence_bytes": report.evidence_bytes,
                 "requests": report.requests,
                 "audit_rows": report.audit_rows,
+                "clock_guard_overridden": overrode_guard,
             }),
         })
     }
@@ -155,6 +196,7 @@ fn optional_window(args: &Value, key: &str) -> Result<WindowChange, AdminRefusal
 fn state_body(
     settings: RetentionSettings,
     last_run: Option<PruneReport>,
+    guard: Option<ClockGuardNotice>,
 ) -> Result<Value, AdminRefusal> {
     let last_run = match last_run {
         Some(report) => report_body(report)?,
@@ -164,7 +206,24 @@ fn state_body(
         "evidence_days": settings.evidence_days,
         "audit_days": settings.audit_days,
         "last_run": last_run,
+        "clock_guard": guard.map(guard_body),
     }))
+}
+
+/// A held-back pass as the panel reads it: the cause and recovery line the
+/// refusal style uses, the plain-language detail, and the figures behind it.
+fn guard_body(notice: ClockGuardNotice) -> Value {
+    json!({
+        "cause": CAUSE_CLOCK_JUMP,
+        "detail": notice.detail(),
+        "recovery": RECOVERY_CLOCK_JUMP,
+        "ts": notice.ts,
+        "watermark_ts": notice.watermark_ts,
+        "jump_secs": notice.jump_secs,
+        "threshold_secs": notice.threshold_secs,
+        "eligible_rows": notice.eligible_rows,
+        "total_rows": notice.total_rows,
+    })
 }
 
 /// One prune report as JSON.

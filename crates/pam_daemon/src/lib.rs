@@ -31,6 +31,9 @@ pub mod daemon;
 pub mod diagnosis_service;
 #[cfg(test)]
 mod diagnosis_service_test;
+pub mod event_hub;
+#[cfg(test)]
+mod event_hub_test;
 mod evidence_service;
 mod evidence_view;
 #[cfg(test)]
@@ -44,15 +47,32 @@ mod flow_result_service;
 #[cfg(test)]
 mod flow_result_service_test;
 pub mod flow_service;
+pub mod framed;
+#[cfg(test)]
+mod framed_test;
+#[cfg(unix)]
+pub mod framed_unix;
+#[cfg(all(test, unix))]
+mod framed_unix_test;
+// Built for its tests on every platform: the handshake is plain loopback TCP.
+#[cfg(any(windows, test))]
+pub mod framed_windows;
+#[cfg(test)]
+mod framed_windows_test;
 pub mod image;
 #[cfg(test)]
 mod image_test;
 pub mod ingress;
+#[cfg(test)]
+mod ingress_test;
 pub mod lifecycle;
 pub mod log_service;
 pub mod model_readiness;
 pub mod model_service;
 pub mod policy;
+pub mod public_transport;
+#[cfg(test)]
+mod public_transport_test;
 pub mod queue;
 pub mod retention;
 pub mod runtime_dir;

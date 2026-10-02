@@ -15,7 +15,18 @@
 //! deterministically. `last_used_at` (which drives idle unload) is updated after every load and
 //! every *successful* generation: a caller retrying against a failing engine must not keep it
 //! "in use". Verification records live under the daemon's private base (`<base>/model-trust`),
-//! never beside the weights: the models directory is not a trust boundary. A generation is
+//! never beside the weights: the models directory is not a trust boundary. For the same reason
+//! the engine never opens a verified model by its path there: verifying makes PAM's own copy
+//! under `<base>/engine/weights/<sha256>.gguf` (a block-sharing clone on APFS, a hashed full copy
+//! elsewhere), the digest is the digest of that copy, and that copy is what is loaded. The copy
+//! lives as long as the verification behind it (it is swept on delete, on a new digest, when the
+//! source file changed or went away; an unload only triggers the sweep). A verification is a job
+//! with progress and a cancel, like a download. Qualification is a claim about the capability
+//! bench and is bound to what the bench measured: a record counts only while this build starts the
+//! model with the engine options the record was measured with ([`pam_model::qualification`]);
+//! otherwise the model is unqualified, cause `contract_changed`. The summary's own prompt was never
+//! measured separately; its fingerprint ([`summary_disclosure`]) is disclosed in status and
+//! readiness and gates nothing. A generation is
 //! bounded end to end ([`GENERATE_TOTAL_DEADLINE`], lock wait and load included) and takes a
 //! cancel receiver; an engine process found dead surfaces as `engine_exited` and the next
 //! request reloads; an engine a `SIGKILL`ed daemon left running is found through its pid file and
@@ -24,17 +35,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pam_model::download::{DownloadError, DownloadHandle, DownloadRequest, DownloadState};
 use pam_model::engine;
-use pam_model::engine_server::{EngineServer, EngineServerError, ServerOptions};
-use pam_model::qualification::{QUALIFIED, Qualification};
-use pam_model::registry::{ModelClass, ModelEntry, Registry, RegistryError, default_models_dir};
-use pam_model::runtime::{
-    GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot, RuntimeState,
+use pam_model::engine_server::{EngineContract, EngineServer, EngineServerError, ServerOptions};
+use pam_model::qualification::{PromptContract, QUALIFIED, Qualification};
+use pam_model::registry::{
+    ModelClass, ModelEntry, Registry, RegistryError, VerifyOutcome, default_models_dir,
 };
+use pam_model::runtime::{
+    FramedEvidence, GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot,
+    RuntimeState, frame_evidence_with,
+};
+use pam_model::weights::{Control, WeightsError};
 use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
@@ -81,6 +96,87 @@ pub const CAUSE_DAEMON_RESTART: &str = "daemon_restart";
 
 /// Cause written when a verification could not finish.
 pub const CAUSE_VERIFY_FAILED: &str = "verify_failed";
+
+/// Cause written when the volume holding PAM's base has no room for the private copy of
+/// the weights a verification makes. The detail names the bytes needed.
+pub const CAUSE_NO_SPACE: &str = "no_space";
+
+/// `task` of the disclosed prompt contract: the log summary, the one job a qualified
+/// model serves today.
+pub const SUMMARY_CONTRACT_TASK: &str = "log.summary";
+
+/// The framed-prompt token limit a summary is admitted under. It mirrors the limit
+/// `log_service` passes to [`ModelService::generate_bounded_cancellable`]; a unit test
+/// holds the two together until that call names this constant.
+pub const SUMMARY_INPUT_LIMIT_TOKENS: usize = 2048;
+
+/// The plain statement that travels with every disclosure of the summary's contract.
+pub const SUMMARY_DISCLOSURE_NOTE: &str = "Summaries are advisory and labelled untrusted. The summary prompt has not been measured \
+     separately: qualification is a capability-bench result.";
+
+/// What PAM discloses about the summary a model writes: the fingerprint of the prompt
+/// it is sent, and that no qualification record was measured under that prompt. A
+/// disclosure, never a gate: a verified, bench-qualified model summarises whatever this
+/// says, and an edit to the summary prompt changes the fingerprint and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SummaryDisclosure {
+    /// [`SUMMARY_CONTRACT_TASK`].
+    pub task: &'static str,
+    /// Fingerprint of the summary's prompt contract under the engine options given;
+    /// `None` only if the summary request cannot be built at all.
+    pub fingerprint: Option<String>,
+    /// Whether a qualification record was measured under this fingerprint. `false`:
+    /// none has been.
+    pub measured: bool,
+    /// [`SUMMARY_DISCLOSURE_NOTE`].
+    pub note: &'static str,
+}
+
+/// The [`SummaryDisclosure`] for a model started with `engine`.
+#[must_use]
+pub fn summary_disclosure(engine: &EngineContract) -> SummaryDisclosure {
+    SummaryDisclosure {
+        task: SUMMARY_CONTRACT_TASK,
+        fingerprint: summary_contract().map(|contract| contract.fingerprint(engine)),
+        measured: false,
+        note: SUMMARY_DISCLOSURE_NOTE,
+    }
+}
+
+/// Stands in for the log text when the summary request is built for its fingerprint.
+const CONTRACT_PROBE_EVIDENCE: &str = "<evidence>";
+
+/// Stands in for the per-call fence token when the summary request is built for its
+/// fingerprint.
+const CONTRACT_PROBE_TOKEN: &str = "<fence>";
+
+/// The prompt contract of a log summary: the request `log_service` really builds, over
+/// placeholder evidence, an unknown exit status and a fixed fence token, with the token
+/// limit it is admitted under. Editing the summary instructions, the framing in
+/// [`pam_model::runtime::frame_evidence`], the output cap or the temperature changes its
+/// fingerprint. That fingerprint is disclosed ([`summary_disclosure`]) and gates nothing:
+/// qualification is a capability-bench claim, and no record was measured under this
+/// prompt.
+///
+/// `None` if the request cannot be built at all.
+#[must_use]
+pub fn summary_contract() -> Option<&'static PromptContract> {
+    static CONTRACT: LazyLock<Option<PromptContract>> = LazyLock::new(|| {
+        fn probe_frame(
+            instructions: &str,
+            host_facts: &[(&str, &str)],
+            evidence: &str,
+        ) -> Option<FramedEvidence> {
+            frame_evidence_with(instructions, host_facts, evidence, CONTRACT_PROBE_TOKEN)
+        }
+        crate::log_service::summary_request_with(CONTRACT_PROBE_EVIDENCE, None, probe_frame)
+            .ok()
+            .map(|request| {
+                PromptContract::of(SUMMARY_CONTRACT_TASK, &request, SUMMARY_INPUT_LIMIT_TOKENS)
+            })
+    });
+    CONTRACT.as_ref()
+}
 
 /// How often a download's follower reads its handle and writes progress.
 pub const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
@@ -257,6 +353,9 @@ type Resident = Option<(PathBuf, LoadedModel)>;
 /// is writing to.
 type Downloads = Arc<Mutex<HashMap<String, (PathBuf, DownloadHandle)>>>;
 
+/// The cancel flag of every verification in flight, keyed by job id.
+type Verifies = Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
 /// The daemon's model layer (see the module docs).
 pub struct ModelService {
     store: Arc<Store>,
@@ -288,6 +387,11 @@ pub struct ModelService {
     last_used_at: AtomicI64,
     pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
+    verifies: Verifies,
+    /// Whether the private weights store has been swept since the engine base was set
+    /// (`true` once done). Held across the sweep, so a verification started meanwhile
+    /// waits instead of having its unfinished copy taken for a dead daemon's.
+    weights_swept: Mutex<bool>,
     host_ram_bytes: u64,
     /// Whether the pid file of a previous daemon's engine has been looked at since the
     /// engine base was set.
@@ -339,6 +443,8 @@ impl ModelService {
             last_used_at: AtomicI64::new(0),
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
+            verifies: Verifies::default(),
+            weights_swept: Mutex::new(false),
             host_ram_bytes: host_ram_bytes(),
             orphans_checked: AtomicBool::new(false),
             generate_total_ms: AtomicU64::new(duration_ms(GENERATE_TOTAL_DEADLINE)),
@@ -376,13 +482,49 @@ impl ModelService {
         Some(built)
     }
 
-    /// Unloads whatever holds weights: the engine process.
+    /// Unloads whatever holds weights: the engine process. The private copies stay (a
+    /// reload must not cost a copy of the weights); only the ones no live verification
+    /// references any more are swept, now that nothing maps them.
     pub async fn unload_all(&self) -> Result<(), RuntimeError> {
         if let Some(engine) = self.engine_server() {
             engine.unload().await;
         }
         self.set_resident(None);
+        self.sweep_private_copies(false).await;
         Ok(())
+    }
+
+    /// [`Registry::sweep_private_copies`] on the model lane; what it removed is logged.
+    /// `false` when the lane had no room and nothing ran.
+    async fn sweep_private_copies(&self, include_unfinished: bool) -> bool {
+        let registry = self.registry();
+        let swept =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                registry.sweep_private_copies(include_unfinished)
+            })
+            .await;
+        let Ok(report) = swept else {
+            return false;
+        };
+        if !report.removed.is_empty() || report.records_removed > 0 {
+            tracing::info!(
+                copies = report.removed.len(),
+                records = report.records_removed,
+                "removed private weight copies no verification references"
+            );
+        }
+        true
+    }
+
+    /// The first sweep after the engine base is known, which also removes the copies a
+    /// killed daemon left half-made. It runs before any verification of this process can
+    /// start one of its own (a verification and a download both wait here first).
+    async fn sweep_private_copies_once(&self) {
+        let mut swept = self.weights_swept.lock().await;
+        if *swept {
+            return;
+        }
+        *swept = self.sweep_private_copies(true).await;
     }
 
     /// The current state, read without touching the engine process or the
@@ -498,11 +640,21 @@ impl ModelService {
     }
 
     /// A registry over the configured models directory, keeping its verification
-    /// records in the daemon's private base ([`Self::trust_dir`]).
+    /// records ([`Self::trust_dir`]) and its copies of verified weights
+    /// ([`Self::weights_dir`]) in the daemon's private base.
     #[must_use]
     pub fn registry(&self) -> Registry {
         Registry::with_qualifications(self.models_dir(), *self.qualifications())
             .with_trust_dir(self.trust_dir())
+            .with_weights_dir(self.weights_dir())
+    }
+
+    /// Where PAM's own copies of verified weights live:
+    /// `<daemon base>/engine/weights/<sha256>.gguf`. The engine is started on these
+    /// files, never on a path in the models directory.
+    #[must_use]
+    pub fn weights_dir(&self) -> PathBuf {
+        self.engine_base().join("engine").join("weights")
     }
 
     /// Where verification records live: `<daemon base>/model-trust`, inside the `0700`
@@ -521,25 +673,66 @@ impl ModelService {
     }
 
     /// Qualifies `sha256` on the current target with a leaked one-record table,
-    /// so a test can drive the production gate with a fixture it just hashed.
+    /// so a test can drive the production gate with a fixture it just hashed. The
+    /// record is "measured" with the engine options this build starts the verified file
+    /// with that digest with (verify it first), so the fixture passes the bench-contract
+    /// check the way a real record must.
     #[cfg(test)]
     pub(crate) fn qualify_for_tests(&self, sha256: &str) {
+        self.qualify_measured_with_for_tests(sha256, self.engine_contract_for_tests(sha256));
+    }
+
+    /// The engine options this build starts the verified file with digest `sha256` with
+    /// (the defaults when no such file is verified yet).
+    #[cfg(test)]
+    pub(crate) fn engine_contract_for_tests(&self, sha256: &str) -> EngineContract {
+        let context = self
+            .registry()
+            .scan()
+            .ok()
+            .and_then(|entries| {
+                entries.into_iter().find(|entry| {
+                    entry
+                        .verified
+                        .as_ref()
+                        .is_some_and(|record| record.sha256 == sha256)
+                })
+            })
+            .and_then(|entry| entry.info.and_then(|info| info.context_length));
+        EngineContract::of(&ServerOptions::for_model(context))
+    }
+
+    /// [`Self::qualify_for_tests`] with the engine options the record was measured with
+    /// supplied: options other than the ones this build uses are a record that no longer
+    /// describes how the model is run.
+    #[cfg(test)]
+    pub(crate) fn qualify_measured_with_for_tests(&self, sha256: &str, measured: EngineContract) {
+        let record = Qualification {
+            artifact: "fixture",
+            sha256: Box::leak(sha256.to_owned().into_boxed_str()),
+            engine_tag: engine::ENGINE_TAG,
+            targets: Box::leak(
+                vec![engine::Target::current().expect("a supported target")].into_boxed_slice(),
+            ),
+            contract: "answer-contract-v2",
+            case_set_sha256: "",
+            record: "docs/benchmarks/none",
+            host: "test",
+            accuracy: 1.0,
+            false_passes: 0,
+            warm_p95_ms: 1,
+            decided: "2026-01-01",
+            system_sha256: "",
+            output_cap: 160,
+            input_limit: 640,
+            engine: measured,
+            bench_contract: "",
+        };
+        let fingerprint = record.bench().fingerprint(&record.engine);
         let table: &'static [Qualification] = Box::leak(
             vec![Qualification {
-                artifact: "fixture",
-                sha256: Box::leak(sha256.to_owned().into_boxed_str()),
-                engine_tag: engine::ENGINE_TAG,
-                targets: Box::leak(
-                    vec![engine::Target::current().expect("a supported target")].into_boxed_slice(),
-                ),
-                contract: "test",
-                case_set_sha256: "",
-                record: "docs/benchmarks/none",
-                host: "test",
-                accuracy: 1.0,
-                false_passes: 0,
-                warm_p95_ms: 1,
-                decided: "2026-01-01",
+                bench_contract: Box::leak(fingerprint.into_boxed_str()),
+                ..record
             }]
             .into_boxed_slice(),
         );
@@ -563,6 +756,11 @@ impl ModelService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base);
         self.orphans_checked.store(false, Ordering::Release);
+        // Another base, another private weights store to sweep. Uncontended outside a
+        // sweep in flight, which belongs to the previous base anyway.
+        if let Ok(mut swept) = self.weights_swept.try_lock() {
+            *swept = false;
+        }
     }
 
     /// Stops an engine a previous daemon left running (SIGKILL, crash), once per
@@ -649,15 +847,23 @@ impl ModelService {
         Ok(entry)
     }
 
-    /// The job gate: verified digest and a qualification on this target. Applied
-    /// where a tier is pointed at a model and where a tier resolves, so a default
-    /// seeded past the admin op is refused at the same line.
+    /// The job gate: verified digest and a qualification on this target whose bench
+    /// contract this build's engine options reproduce. Applied where a tier is pointed
+    /// at a model and where a tier resolves, so a default seeded past the admin op is
+    /// refused at the same line. A record measured with other options refuses like no
+    /// record at all, and the refusal says what differs and that the model needs
+    /// re-measurement.
     pub fn admit(entry: &ModelEntry) -> Result<(), ModelUnavailable> {
         if entry.class == ModelClass::TestOnly {
             return Err(ModelUnavailable::Unverified(entry.id.clone()));
         }
         if entry.qualification.is_none() {
-            return Err(ModelUnavailable::Unqualified(entry.id.clone()));
+            return Err(ModelUnavailable::Unqualified(
+                match &entry.qualification_issue {
+                    Some(issue) => format!("{} ({issue})", entry.id),
+                    None => entry.id.clone(),
+                },
+            ));
         }
         Ok(())
     }
@@ -761,11 +967,26 @@ impl ModelService {
             .ok_or_else(|| ModelServiceError::UnknownModel(model_id.to_owned()))?;
         let engine = self.engine_server().ok_or_else(engine_not_installed)?;
         let current = match engine.model() {
-            Some(current) if current.id == entry.id && current.path == entry.path => current,
+            Some(current) if current.id == entry.id && current.path == entry.engine_path() => {
+                current
+            }
             other => {
+                // The same id over another file: it was loaded before it was verified
+                // (or before its verification changed), so the engine does not hold
+                // the bytes this entry now stands for.
+                let resident = other.map(|current| {
+                    if current.id == entry.id {
+                        format!(
+                            "{} is loaded from a file it no longer stands for; load it again",
+                            current.id
+                        )
+                    } else {
+                        current.id
+                    }
+                });
                 return Err(ModelUnavailable::NotResident {
                     requested: entry.id,
-                    resident: other.map(|current| current.id),
+                    resident,
                 });
             }
         };
@@ -793,7 +1014,9 @@ impl ModelService {
             .await
             .map_err(|error| RuntimeError::LoadFailed(error.to_string()))?;
         if current.as_ref().is_none_or(|current| {
-            current.path != entry.path || current.fingerprint != entry.fingerprint
+            current.path != entry.path
+                || current.fingerprint != entry.fingerprint
+                || current.private_copy != entry.private_copy
         }) {
             return Err(RuntimeError::LoadFailed(
                 "The installed model entry changed before loading; select it again.".to_owned(),
@@ -804,19 +1027,31 @@ impl ModelService {
         Ok(loaded)
     }
 
-    async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
+    /// Loads `entry` as given, without scanning again. The caller holds the operation
+    /// lock and vouches that `entry` is what it wants loaded; what protects the load
+    /// from a models directory that changed since that scan is that a verified entry is
+    /// loaded from PAM's private copy.
+    pub(crate) async fn ensure_loaded_inner(
+        &self,
+        entry: &ModelEntry,
+    ) -> Result<LoadedModel, RuntimeError> {
         let engine = self.engine_server().ok_or_else(engine_not_installed)?;
         // An engine left by a SIGKILLed daemon holds the weights' memory and may hold the
         // socket path: stop it before starting another.
         if let OrphanReap::Killed { pid } = self.reap_orphan_engine().await {
             tracing::warn!(pid, "stopped an engine a previous daemon left running");
         }
+        // A verified entry is loaded from PAM's private copy of the verified bytes, never
+        // from the models directory: whatever is renamed or rewritten there between the
+        // scan and the engine's open cannot change what loads. An unverified entry (Try
+        // only, never a job) has no such copy and loads the file itself.
+        let engine_path = entry.engine_path().to_path_buf();
         if let Some(current) = engine.model()
             && current.id == entry.id
-            && current.path == entry.path
+            && current.path == engine_path
         {
             let loaded = engine_loaded_model(entry, &current);
-            self.set_resident(Some((entry.path.clone(), loaded.clone())));
+            self.set_resident(Some((engine_path, loaded.clone())));
             // Reusing what is already loaded is not a use: the generation that asked
             // counts itself once it succeeds.
             return Ok(loaded);
@@ -825,19 +1060,15 @@ impl ModelService {
         // weights go, so a snapshot taken mid-load never pairs the new
         // engine model with the old registry entry.
         self.set_resident(None);
-        let options = ServerOptions {
-            context_tokens: context_tokens_for(
-                entry.info.as_ref().and_then(|info| info.context_length),
-            ),
-            ..ServerOptions::default()
-        };
-        // The verification is a claim about the bytes the scan saw: refuse if the file
-        // is not the one it described, both before the engine opens it and once it is up
-        // (a swap or in-place edit during the load must not leave unverified weights
-        // serving under a verified name).
+        // The same constructor the qualification fingerprint uses, so the options a
+        // record was measured under are the options the model is started with.
+        let options =
+            ServerOptions::for_model(entry.info.as_ref().and_then(|info| info.context_length));
+        // The verification is a claim about the private copy: refuse if it is not the
+        // file that was hashed, both before the engine opens it and once it is up.
         self.recheck(entry).await?;
         let current = engine
-            .load(&entry.id, &entry.path, &options)
+            .load(&entry.id, &engine_path, &options)
             .await
             .map_err(engine_error)?;
         if let Err(error) = self.recheck(entry).await {
@@ -845,7 +1076,7 @@ impl ModelService {
             return Err(error);
         }
         let loaded = engine_loaded_model(entry, &current);
-        self.set_resident(Some((entry.path.clone(), loaded.clone())));
+        self.set_resident(Some((engine_path, loaded.clone())));
         self.touch_last_used();
         Ok(loaded)
     }
@@ -876,6 +1107,7 @@ impl ModelService {
         let dest = request.dest.clone();
         let dest_for_record = request.dest.clone();
         let expected_digest = request.expected_sha256.is_some();
+        self.sweep_private_copies_once().await;
         if self.is_downloading(&dest).await {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
@@ -954,54 +1186,59 @@ impl ModelService {
         }
     }
 
-    /// Streams `entry`'s SHA-256 behind a job row and returns its id.
+    /// Stops a running verification: its private copy in progress is removed and
+    /// nothing is recorded. `false` means no such job is in flight.
+    pub fn cancel_verify(&self, job_id: &str) -> bool {
+        let flag = self
+            .verifies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned();
+        flag.is_some_and(|flag| {
+            flag.store(true, Ordering::Release);
+            true
+        })
+    }
+
+    /// Verifies `entry` behind a job row and returns its id.
+    ///
+    /// The job makes PAM's private copy of the weights and hashes it
+    /// ([`Registry::verify_with`]) on the hash lane, never on a request thread: on a
+    /// volume that cannot share blocks that is a full copy of the file. The row carries
+    /// the bytes done every [`DOWNLOAD_POLL`], the job stops on
+    /// [`Self::cancel_verify`], and a volume without room fails it with
+    /// [`CAUSE_NO_SPACE`] and the bytes needed.
     pub async fn start_verify(&self, entry: ModelEntry) -> Result<String, ModelServiceError> {
+        self.sweep_private_copies_once().await;
         let job_id = new_job_id();
         let total = i64::try_from(entry.size_bytes).ok();
         self.store
             .insert_model_job(&job_id, KIND_VERIFY, &entry.id, None, total)
             .await?;
-        let store = Arc::clone(&self.store);
-        let registry = self.registry();
-        let id = job_id.clone();
-        tokio::spawn(async move {
-            let outcome =
-                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelHash, move || {
-                    registry.verify(&entry)
-                })
-                .await;
-            let (state, detail) = match outcome {
-                Ok(Ok(verified)) => {
-                    if let Ok(done) = i64::try_from(verified.size_bytes) {
-                        let _ = store.update_model_job_progress(&id, done, total).await;
-                    }
-                    (
-                        JOB_DONE,
-                        json!({
-                            "sha256": verified.sha256,
-                            "size_bytes": verified.size_bytes,
-                            "matches_catalog": verified.matches_catalog,
-                        }),
-                    )
-                }
-                Ok(Err(err)) => (
-                    JOB_FAILED,
-                    job_failure_value(CAUSE_VERIFY_FAILED, &err.to_string()),
-                ),
-                Err(err) => (JOB_FAILED, job_failure_value(err.cause(), &err.to_string())),
-            };
-            let _ = store
-                .finish_model_job(&id, state, Some(&detail.to_string()))
-                .await;
-        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.verifies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(job_id.clone(), Arc::clone(&cancel));
+        tokio::spawn(follow_verify(
+            Arc::clone(&self.store),
+            Arc::clone(&self.verifies),
+            job_id.clone(),
+            self.registry(),
+            entry,
+            cancel,
+        ));
         Ok(job_id)
     }
 
     /// The `admin.models.status` body: the runtime, the jobs worth
     /// showing, the tier defaults, their readiness, and the settings behind them.
     pub async fn status(&self) -> Result<serde_json::Value, ModelUnavailable> {
-        // First status after a daemon start: stop an engine the last daemon left behind.
+        // First status after a daemon start: stop an engine the last daemon left behind,
+        // and clear the private weight copies nothing references any more.
         let _ = self.reap_orphan_engine().await;
+        self.sweep_private_copies_once().await;
         let (light, heavy) = self.defaults().await?;
         let rows = self.store.list_model_jobs(JOB_QUERY_LIMIT).await?;
         let (running, settled): (Vec<ModelJobRow>, Vec<ModelJobRow>) =
@@ -1054,6 +1291,12 @@ impl ModelService {
             "readiness": readiness,
             "idle_unload_min": self.idle_unload_min().await?,
             "models_dir": self.models_dir().display().to_string(),
+            // Where PAM keeps its own copy of every verified model (what the engine loads).
+            "weights_dir": self.weights_dir().display().to_string(),
+            // A disclosure, not a gate: the fingerprint of the prompt a summary is sent
+            // (at the engine's default options; each tier's readiness carries its own
+            // model's), and that nothing was measured under it.
+            "summary_contract": summary_disclosure(&EngineContract::of(&ServerOptions::default())),
             "host_ram_bytes": self.host_ram_bytes,
         }))
     }
@@ -1154,6 +1397,7 @@ impl ModelService {
         }
         engine.unload().await;
         self.set_resident(None);
+        self.sweep_private_copies(false).await;
         tracing::info!(model = %loaded.id, idle_min, "idle unload");
     }
 }
@@ -1224,27 +1468,44 @@ async fn follow_download(
     };
     let (state, detail) = match verdict {
         DownloadState::Done { sha256, size_bytes } => {
+            // `Some(None)`: recorded as verified. `Some(Some(why))`: the file landed but
+            // could not be recorded, and the row says why so "unverified" is not a riddle.
+            let mut recorded_verified: Option<Option<String>> = None;
             if let Some((registry, dest)) = record_as_verified {
                 let digest = sha256.clone();
-                let recorded = crate::blocking_jobs::run(
-                    crate::blocking_jobs::Kind::ModelFilesystem,
-                    move || registry.record_download(&dest, &digest, size_bytes),
-                )
-                .await;
-                // The file is good either way; a failed record costs one Verify.
-                if !matches!(recorded, Ok(Ok(()))) {
-                    tracing::warn!(job = %job_id, "download verified but its record was not written");
+                // Recording makes and hashes PAM's private copy of the file (the digest
+                // curl's pass computed was of a file in the models directory): the hash
+                // lane, not the one registry scans wait on.
+                let recorded =
+                    crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelHash, move || {
+                        registry.record_download(&dest, &digest, size_bytes)
+                    })
+                    .await;
+                // The file is there either way; a failed record costs one Verify, and
+                // the model stays unverified until then.
+                let failure = match recorded {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(error) = &failure {
+                    tracing::warn!(job = %job_id, %error, "download finished but was not recorded as verified");
                 }
+                recorded_verified = Some(failure);
             }
             if let Ok(done) = i64::try_from(size_bytes) {
                 let _ = store
                     .update_model_job_progress(&job_id, done, Some(done))
                     .await;
             }
-            (
-                JOB_DONE,
-                Some(json!({ "sha256": sha256, "size_bytes": size_bytes })),
-            )
+            let mut detail = json!({ "sha256": sha256, "size_bytes": size_bytes });
+            if let Some(failure) = recorded_verified {
+                detail["verified"] = json!(failure.is_none());
+                if let Some(why) = failure {
+                    detail["verify_error"] = json!(format!("{why}. Run Verify on the model."));
+                }
+            }
+            (JOB_DONE, Some(detail))
         }
         DownloadState::Failed { cause, detail } => {
             // The cause and curl's own complaint go to the log as well as
@@ -1267,6 +1528,87 @@ async fn follow_download(
         tracing::info!(job = %job_id, state, "download finished");
     }
     downloads.lock().await.remove(&job_id);
+}
+
+/// Runs one verification on the hash lane, writing its progress and then its verdict
+/// onto the job row, and forgets its cancel flag when it is over.
+async fn follow_verify(
+    store: Arc<Store>,
+    verifies: Verifies,
+    job_id: String,
+    registry: Registry,
+    entry: ModelEntry,
+    cancel: Arc<AtomicBool>,
+) {
+    let total = i64::try_from(entry.size_bytes).ok();
+    let done = Arc::new(AtomicU64::new(0));
+    let work = {
+        let done = Arc::clone(&done);
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelHash, move || {
+            let control = Control {
+                progress: &|bytes| done.store(bytes, Ordering::Relaxed),
+                cancelled: &|| cancel.load(Ordering::Acquire),
+            };
+            registry.verify_with(&entry, &control)
+        })
+    };
+    tokio::pin!(work);
+    let mut ticker = tokio::time::interval(DOWNLOAD_POLL);
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut work => break outcome,
+            _ = ticker.tick() => {
+                let bytes = i64::try_from(done.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
+                let _ = store.update_model_job_progress(&job_id, bytes, total).await;
+            }
+        }
+    };
+    let (state, detail) = match outcome {
+        Ok(Ok(outcome)) => {
+            if let Ok(bytes) = i64::try_from(outcome.size_bytes) {
+                let _ = store.update_model_job_progress(&job_id, bytes, total).await;
+            }
+            (JOB_DONE, Some(verify_detail(&outcome)))
+        }
+        Ok(Err(RegistryError::Weights(WeightsError::Cancelled))) => (JOB_CANCELLED, None),
+        Ok(Err(error)) => (
+            JOB_FAILED,
+            Some(job_failure_value(verify_cause(&error), &error.to_string())),
+        ),
+        Err(error) => (
+            JOB_FAILED,
+            Some(job_failure_value(error.cause(), &error.to_string())),
+        ),
+    };
+    let encoded = detail.map(|value| value.to_string());
+    let _ = store
+        .finish_model_job(&job_id, state, encoded.as_deref())
+        .await;
+    verifies
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&job_id);
+}
+
+/// What a finished verification's job row says.
+fn verify_detail(verified: &VerifyOutcome) -> serde_json::Value {
+    json!({
+        "sha256": verified.sha256,
+        "size_bytes": verified.size_bytes,
+        "matches_catalog": verified.matches_catalog,
+        // `cloned` shares the file's blocks, `copied` took its size again on the
+        // volume of PAM's base, `reused` found the copy already there.
+        "private_copy": verified.private_copy,
+    })
+}
+
+/// The cause a failed verification's job row carries.
+pub(crate) fn verify_cause(error: &RegistryError) -> &'static str {
+    match error {
+        RegistryError::Weights(WeightsError::NoSpace { .. }) => CAUSE_NO_SPACE,
+        RegistryError::Changed { .. } => crate::admin_models::CAUSE_MODEL_CHANGED,
+        _ => CAUSE_VERIFY_FAILED,
+    }
 }
 
 /// Ticks until the service is dropped, unloading an idle model.
@@ -1463,21 +1805,6 @@ fn reap_recorded_engine(engine: &EngineServer) -> OrphanReap {
         OrphanReap::Killed { pid: record.pid }
     } else {
         OrphanReap::NotOurs { pid: record.pid }
-    }
-}
-
-/// The context the server is started with: [`CONTEXT_TOKENS`] as the
-/// admission envelope, lowered to `<arch>.context_length` when the GGUF
-/// header reports a smaller figure — a server asked for more context than
-/// its model was trained on fails to load or answers garbage past the
-/// limit. An absent or zero header value keeps the envelope.
-///
-/// [`CONTEXT_TOKENS`]: pam_model::runtime::CONTEXT_TOKENS
-pub(crate) fn context_tokens_for(reported: Option<u64>) -> usize {
-    let envelope = pam_model::runtime::CONTEXT_TOKENS;
-    match reported.and_then(|tokens| usize::try_from(tokens).ok()) {
-        Some(tokens) if tokens > 0 => tokens.min(envelope),
-        _ => envelope,
     }
 }
 

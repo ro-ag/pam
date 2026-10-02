@@ -167,6 +167,10 @@ export function TierRow({
               false passes · {record.engine_tag} · {record.decided}
             </p>
           )}
+          {/* What the record covers: the bench, not the summary prompt. The daemon's own words. */}
+          {record && readiness.note && (
+            <p className="font-sans text-xs text-ink-muted">{readiness.note}</p>
+          )}
         </div>
         {repair && onRepair && (
           <Button size="sm" variant="secondary" onClick={() => onRepair(repair.target)}>

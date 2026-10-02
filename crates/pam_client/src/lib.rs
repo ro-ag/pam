@@ -4,7 +4,8 @@
 //! `crates/pam` depends on `pam_gui` (single-binary law: `pam gui` hands
 //! the process to the Tauri event loop), so the GUI cannot depend on the
 //! `pam` crate without a cycle. Everything both sides need — daemon
-//! lifecycle ([`client`]), envelope building ([`request`]), advisory
+//! lifecycle and the request flow ([`client`]), the framed exchange with
+//! the daemon ([`transport`]), envelope building ([`request`]), advisory
 //! caller identity ([`caller`]), and the base-dir resolution below —
 //! lives here instead; `pam` re-exports these modules so its public
 //! surface (`pam::client`, …) is unchanged.
@@ -12,6 +13,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+mod broker_windows;
 pub mod caller;
 pub mod client;
 // The session relay's transport is unix domain sockets; on Windows a
@@ -20,7 +23,10 @@ pub mod client;
 pub mod relay;
 pub mod request;
 pub mod service;
+pub mod transport;
 
+#[cfg(all(windows, test))]
+mod broker_windows_test;
 #[cfg(test)]
 mod caller_test;
 #[cfg(test)]
@@ -34,6 +40,8 @@ mod relay_test;
 mod request_test;
 #[cfg(test)]
 mod service_test;
+#[cfg(test)]
+mod transport_test;
 
 /// The base directory every pam mode works under: `$PAM_BASE_DIR` when
 /// set and non-empty, otherwise `~/.pam`. `None` only when neither the

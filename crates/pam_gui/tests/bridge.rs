@@ -1,9 +1,9 @@
 //! Bridge integration tests: the seams `pam_gui`'s Tauri commands are thin over, driven against a
 //! **real daemon** (`pam_testkit`). The Tauri runtime itself never starts here; instead each test
 //! replicates exactly what the command bodies do — the same `pam_client` calls with the same
-//! parameters, unwrapped through the same [`pam_gui::bridge`] helpers — plus the event subscriber's
-//! decode path: a `SubSocket` connected the way `events.rs` connects, decoding `PUB` frames through
-//! the very [`decode_event_frames`] the forwarding task uses.
+//! parameters, unwrapped through the same [`pam_gui::bridge`] helpers — plus the event pump: the
+//! very [`pump`] the Tauri command spawns, dialling the daemon's private all-events stream
+//! ([`AdminConnect`]) and delivering to a channel where the webview would be.
 //!
 //! The commands resolve their base dir from the process environment (`$PAM_BASE_DIR`), which the
 //! workspace's `unsafe` denial forbids mutating in-process — so the tests pass the harness base dir
@@ -11,27 +11,22 @@
 
 use std::time::Duration;
 
-use pam_client::client::{self, DaemonStatus};
+use pam_client::client;
 use pam_daemon::policy::CAUSE_UNKNOWN_CAPABILITY;
-use pam_daemon::runtime_dir::RuntimeDir;
 use pam_gui::bridge::{expect_result, is_disconnect, is_known_admin_op};
-use pam_gui::events::decode_event_frames;
+use pam_gui::events::{AdminConnect, EventPayload, EventSink, PayloadEvent, pump};
+use pam_proto::wire::Ingress;
 use pam_proto::{Event, Response};
 use pam_testkit::{TestDaemon, with_deadline};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use serde_json::Value;
 use serde_json::json;
-use zeromq::{Socket, SocketRecv, SubSocket};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// The deadlines the bridge commands use (`bridge.rs` constants are
 /// private; the values are part of the replicated call).
 const STATUS_DEADLINE_MS: u64 = 5_000;
 const ADMIN_DEADLINE_MS: u64 = 30_000;
-
-/// Settle time for a fresh `SUB` subscription (zmq `PUB` drops frames
-/// published before the subscription registers — same reason
-/// `pam_testkit` settles its own subscribers).
-const SUB_SETTLE: Duration = Duration::from_millis(300);
 
 /// `daemon_status`'s happy path: the ordinary read-only `status`
 /// request against a live daemon answers a result whose body carries
@@ -164,26 +159,51 @@ async fn a_real_daemon_refusal_passes_through_verbatim() {
     daemon.stop().await;
 }
 
-/// The event subscriber's decode path against real `PUB` traffic: a
-/// `SubSocket` connected exactly as `events.rs::stream_events` connects
-/// (all topics, empty prefix) decodes a real request's lifecycle into
-/// `(ticket, Event)` pairs via [`decode_event_frames`], ending in the
-/// terminal `done` for the ticket the daemon answered with.
+/// Where the pump delivers in these tests: a channel in place of the webview.
+struct Webview(UnboundedSender<EventPayload>);
+
+impl EventSink for Webview {
+    fn emit(&self, payload: &EventPayload) -> bool {
+        self.0.send(payload.clone()).is_ok()
+    }
+}
+
+/// The pump the Tauri command spawns, against the daemon at `base`, and what it delivers.
+fn start_pump(
+    base: &std::path::Path,
+) -> (tokio::task::JoinHandle<()>, UnboundedReceiver<EventPayload>) {
+    let (tx, rx) = unbounded_channel();
+    let task = tokio::spawn(pump(AdminConnect::new(base.to_path_buf()), Webview(tx)));
+    (task, rx)
+}
+
+fn is_resync(payload: &EventPayload) -> bool {
+    matches!(payload.event, PayloadEvent::Resync { .. })
+}
+
+/// The next payload, within the test deadline.
+async fn next(rx: &mut UnboundedReceiver<EventPayload>) -> EventPayload {
+    with_deadline(rx.recv())
+        .await
+        .expect("the pump keeps delivering")
+}
+
+/// Event frames from a real daemon decode to the payload the webview receives: after the
+/// connect's one resync, a real request's lifecycle arrives in order under its ticket, carrying
+/// what the daemon knows about it, and ends in the terminal `done`.
 #[tokio::test]
-async fn event_frames_from_a_real_daemon_decode_like_the_subscriber() {
+async fn event_frames_from_a_real_daemon_decode_to_the_payload() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
+    let (pump_task, mut rx) = start_pump(&base);
 
-    // Connect the way events.rs does: SubSocket on events.sock, every topic.
-    let dirs = RuntimeDir::at_base(&base).expect("runtime dir resolves");
-    let mut sub = SubSocket::new();
-    with_deadline(sub.connect(&dirs.events_endpoint()))
-        .await
-        .expect("sub connects");
-    with_deadline(sub.subscribe(""))
-        .await
-        .expect("subscribes to every topic");
-    tokio::time::sleep(SUB_SETTLE).await;
+    // The stream is subscribed once the connect's refresh arrives: from here nothing is missed.
+    let first = next(&mut rx).await;
+    assert!(
+        is_resync(&first),
+        "the first payload is the refresh: {first:?}"
+    );
+    assert_eq!(first.ticket, "", "a resync names no ticket");
 
     let args = json!({ "msg": "over the bridge" });
     let response = with_deadline(client::send_request(
@@ -195,50 +215,151 @@ async fn event_frames_from_a_real_daemon_decode_like_the_subscriber() {
         panic!("echo with wait=true answers a result, got {response:?}");
     };
 
-    // Drain PUB frames through the subscriber's own decoder until the
-    // ticket's terminal event; undecodable frames drop, as in events.rs.
     let mut events = Vec::new();
+    let mut counters = Vec::new();
     while events.last() != Some(&Event::Done) {
-        let message = with_deadline(sub.recv())
-            .await
-            .expect("event frames arrive");
-        let Some(payload) = decode_event_frames(&message.into_vec()) else {
-            continue;
+        let payload = next(&mut rx).await;
+        assert!(
+            !is_resync(&payload),
+            "no gap on an idle stream: {payload:?}"
+        );
+        assert_eq!(payload.ticket, id, "one request, one ticket");
+        assert_eq!(payload.capability.as_deref(), Some("echo"));
+        assert_eq!(payload.ingress, Some(Ingress::Public));
+        assert!(
+            payload.agent.is_some(),
+            "the agent label travels: {payload:?}"
+        );
+        assert!(
+            payload.repo.is_some(),
+            "the repository travels: {payload:?}"
+        );
+        counters.push(payload.n.expect("the daemon-wide counter travels"));
+        let PayloadEvent::Lifecycle(event) = payload.event else {
+            unreachable!("resync was excluded above");
         };
-        assert_eq!(payload.ticket, id, "one request, one topic");
-        events.push(payload.event);
+        events.push(event);
     }
     assert!(
         events.contains(&Event::Started),
         "the lifecycle reports the worker start before done: {events:?}"
     );
+    assert!(
+        counters.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "no events were dropped for this subscriber: {counters:?}"
+    );
+
+    pump_task.abort();
     daemon.stop().await;
 }
 
-/// The reconnect loop's staleness probe (`events.rs` idle path): a live
-/// daemon reads as running; once stopped, the same probe reports it
-/// gone so the stream tears down instead of trusting a silent socket.
+/// The acceptance statement for the feedback loop: the GUI's own status polls (and queries) never
+/// come back as events, because the daemon publishes none for control requests. The old design
+/// filtered them in the webview; there is nothing left to filter.
 #[tokio::test]
-async fn the_idle_probe_sees_the_daemon_come_and_go() {
+async fn a_status_poll_does_not_come_back_as_an_event() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
+    let (pump_task, mut rx) = start_pump(&base);
+    assert!(is_resync(&next(&mut rx).await));
 
+    for _ in 0..5 {
+        let response = with_deadline(client::send_request(
+            &base,
+            "status",
+            json!({}),
+            true,
+            STATUS_DEADLINE_MS,
+            None,
+        ))
+        .await
+        .expect("a live daemon answers the status poll");
+        expect_result(response).expect("status answers a result");
+    }
+    // Real work after the polls, so the stream demonstrably carries traffic and the absence of
+    // the polls is not just an idle socket.
+    let Response::Result { id: work, .. } = with_deadline(client::send_request(
+        &base,
+        "echo",
+        json!({ "msg": "after the polls" }),
+        true,
+        10_000,
+        None,
+    ))
+    .await
+    .expect("echo answers") else {
+        panic!("echo answers a result");
+    };
+    let mut seen = Vec::new();
+    loop {
+        let payload = next(&mut rx).await;
+        let done = payload.event == PayloadEvent::Lifecycle(Event::Done);
+        seen.push(payload);
+        if done {
+            break;
+        }
+    }
     assert!(
-        matches!(
-            client::probe_daemon(&base),
-            Ok(DaemonStatus::Running { .. })
-        ),
-        "a live daemon holds the instance lock"
+        seen.iter().all(|payload| payload.ticket == work),
+        "only the echo's ticket is on the stream, no status poll: {seen:?}"
+    );
+    // Nothing trails behind it either.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no late event for a poll arrived after the work"
     );
 
-    // Keep the temp dir alive past the daemon so the probe sees an
-    // existing-but-empty runtime dir, exactly what a crashed daemon leaves.
+    pump_task.abort();
+    daemon.stop().await;
+}
+
+/// The reconnect loop against a daemon that goes away and comes back at the same base: the
+/// stream ends with the daemon, the pump retries on its own, and the next connect asks for one
+/// refresh and carries the new daemon's events.
+#[tokio::test]
+async fn the_stream_reconnects_when_the_daemon_comes_and_goes() {
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+    let (pump_task, mut rx) = start_pump(&base);
+    assert!(
+        is_resync(&next(&mut rx).await),
+        "connected to the first daemon"
+    );
+
+    // Keep the temp dir alive past the daemon: the second one starts on the same base.
     let tmp = daemon.stop().await;
+    let daemon = TestDaemon::spawn_at(tmp).await;
+
+    let refreshed = next(&mut rx).await;
     assert!(
-        matches!(client::probe_daemon(&base), Ok(DaemonStatus::NotRunning)),
-        "a stopped daemon releases the lock"
+        is_resync(&refreshed),
+        "the reconnect to the new daemon asks for exactly one refresh: {refreshed:?}"
     );
-    drop(tmp);
+
+    let Response::Result { id, .. } = with_deadline(client::send_request(
+        &base,
+        "echo",
+        json!({ "msg": "second daemon" }),
+        true,
+        10_000,
+        None,
+    ))
+    .await
+    .expect("the new daemon answers") else {
+        panic!("echo answers a result");
+    };
+    loop {
+        let payload = next(&mut rx).await;
+        assert!(!is_resync(&payload), "one refresh per connect: {payload:?}");
+        assert_eq!(payload.ticket, id);
+        if payload.event == PayloadEvent::Lifecycle(Event::Done) {
+            break;
+        }
+    }
+
+    pump_task.abort();
+    daemon.stop().await;
 }
 
 /// The classification `daemon_status` uses to answer

@@ -316,7 +316,7 @@ impl ConnectorService {
             })
         })?;
         check_live(cancel, deadline, &budget)?;
-        self.ensure_transport(ConnectorId::Github)?;
+        self.ensure_transport()?;
         let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
         let secret = connection.secret.ok_or(InvokeError::CredentialMissing)?;
         let url = upload_pack_url(&target.request.remote_url)?;

@@ -173,6 +173,26 @@ describe("useEventRefresh", () => {
     expect(signals[1]?.aborted).toBe(false);
   });
 
+  it("treats a resync, a lagged stream's reconnect, as one refresh however many arrive", async () => {
+    const queryFn = vi.fn().mockResolvedValue("ok");
+    render(mount(queryFn));
+    await settle(0);
+    expect(queryFn).toHaveBeenCalledTimes(1);
+
+    // The pump says "events may have been missed" after a reconnect and again at a counter skip;
+    // together with the events around them they are still a single refetch.
+    const resync: PamEventPayload = { ticket: "", event: { kind: "resync" } };
+    act(() => {
+      handler?.(resync);
+      handler?.(resync);
+      handler?.({ ticket: "t", event: { kind: "started" }, n: 41, ingress: "public" });
+    });
+    await settle(EVENT_SETTLE_MS + 1);
+    expect(queryFn).toHaveBeenCalledTimes(2);
+    await settle(30_000);
+    expect(queryFn).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores progress notes, which stream by the dozen during a run", async () => {
     const queryFn = vi.fn().mockResolvedValue("ok");
     render(mount(queryFn));

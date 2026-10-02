@@ -3,7 +3,8 @@
 //! Knows nothing about the daemon — reads files, inspects GGUF headers, describes a
 //! curated catalog, owns the inference runtime; `ModelService` (daemon) turns that into
 //! admin ops, keeping this layer testable without a socket, store, or request. Modules:
-//! [`gguf`], [`catalog`], [`registry`], [`download`], [`runtime`], [`engine`] /
+//! [`gguf`], [`catalog`], [`registry`], [`weights`] (PAM's private copy of verified
+//! weights, the only file the engine opens), [`download`], [`runtime`], [`engine`] /
 //! [`engine_server`] (out-of-process `llama.cpp`), [`curator`], [`error`].
 //! [`registry::classify`] admits a model only once its digest is verified
 //! ([`ModelClass::Engine`]); unverified is [`ModelClass::TestOnly`] — loadable/promptable to
@@ -29,6 +30,7 @@ pub mod qualification;
 mod qualification_test;
 pub mod registry;
 pub mod runtime;
+pub mod weights;
 
 /// A range-serving HTTP origin for download tests.
 ///
@@ -48,9 +50,9 @@ pub use download::{
     start,
 };
 pub use gguf::{GgufError, GgufInfo, read_info};
-pub use qualification::{QUALIFIED, Qualification};
+pub use qualification::{BenchContract, PromptContract, QUALIFIED, Qualification};
 pub use registry::{
-    FileFingerprint, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord,
+    FileFingerprint, ModelClass, ModelEntry, Registry, RegistryError, SweepReport, VerifiedRecord,
     VerifyOutcome, classify, default_models_dir,
 };
 pub use runtime::{
@@ -70,3 +72,5 @@ mod gguf_test;
 mod registry_test;
 #[cfg(test)]
 mod runtime_test;
+#[cfg(test)]
+mod weights_test;

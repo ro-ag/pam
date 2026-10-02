@@ -466,10 +466,10 @@ impl AdminService {
         let (reply, answer) = oneshot::channel();
         self.submit
             .send(IncomingRequest {
-                // No zmq peer: this envelope never came off a socket, and
-                // the reply goes back through the channel, not the router.
-                identity: Vec::new(),
+                // No peer: this envelope never came off a socket, and the
+                // reply comes back through the channel.
                 origin: crate::ingress::Origin::Admin,
+                peer: None,
                 envelope,
                 reply,
             })
@@ -536,8 +536,8 @@ impl AdminService {
         let (reply, answer) = oneshot::channel();
         self.submit
             .send(IncomingRequest {
-                identity: Vec::new(),
                 origin: crate::ingress::Origin::Admin,
+                peer: None,
                 envelope,
                 reply,
             })

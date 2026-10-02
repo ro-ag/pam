@@ -153,7 +153,7 @@ async fn get_on_a_fresh_store_is_forever_and_never_pruned() {
     let body = body_of(f.admin.handle(&envelope).await, Outcome::Verified);
     assert_eq!(
         body,
-        json!({ "evidence_days": null, "audit_days": null, "last_run": null })
+        json!({ "evidence_days": null, "audit_days": null, "last_run": null, "clock_guard": null })
     );
     f.assert_audited(&envelope.id).await;
 }
@@ -191,7 +191,12 @@ async fn set_persists_prunes_at_once_and_round_trips() {
     );
     assert_eq!(
         body,
-        json!({ "evidence_days": null, "audit_days": 365, "last_run": body["last_run"] })
+        json!({
+            "evidence_days": null,
+            "audit_days": 365,
+            "last_run": body["last_run"],
+            "clock_guard": null
+        })
     );
 }
 
@@ -234,6 +239,7 @@ async fn prune_answers_a_report_and_every_op_leaves_one_audit_row() {
     let body = body_of(f.admin.handle(&envelope).await, Outcome::Verified);
     assert_eq!(body["requests"], 0);
     assert_eq!(body["evidence_rows"], 0);
+    assert_eq!(body["clock_guard_overridden"], false);
     assert!(body["ts"].is_i64());
     f.assert_audited(&envelope.id).await;
     assert!(
@@ -243,4 +249,145 @@ async fn prune_answers_a_report_and_every_op_leaves_one_audit_row() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A finished request for the pass to look at.
+async fn old_finished_request(f: &Fixture, id: &str) {
+    f.store
+        .insert_request(id, "release", "ro-ag/pam", "claude", "{}", None)
+        .await
+        .unwrap();
+    f.store
+        .finish_request(
+            id,
+            pam_store::RequestState::Done,
+            None,
+            pam_store::AuditEntry {
+                action: "execute",
+                decision: pam_store::Decision::Allow,
+                actor: pam_store::Actor::System,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// How far the staged clock jumps.
+const JUMP_SECS: i64 = 100 * 86_400;
+
+#[tokio::test]
+async fn a_forward_jump_surfaces_in_the_status_and_manual_prune_confirms_it() {
+    let f = fixture().await;
+    // Sixty finished requests and a 30-day audit window, saved on time: the
+    // save's own pass runs, removes nothing and sets the watermark.
+    for index in 0..60 {
+        old_finished_request(&f, &format!("victim_{index}")).await;
+    }
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_SET, json!({ "audit_days": 30 })))
+            .await,
+        Outcome::Changed,
+    );
+    assert!(body["clock_guard"].is_null(), "{body}");
+    assert_eq!(body["last_run"]["requests"], 0, "{body}");
+    let on_time = body["last_run"].clone();
+
+    // The clock jumps 100 days: every record now looks older than the
+    // window. A settings save prunes at once but is not a decision about
+    // the clock: the pass is held back, and the reply says why, how much
+    // it would have removed (the store's own count), and how to recover.
+    f.admin
+        .retention_clock_ahead
+        .store(JUMP_SECS, std::sync::atomic::Ordering::SeqCst);
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_SET, json!({ "audit_days": 30 })))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(body["clock_guard"]["cause"], "retention_clock_jump");
+    assert!(
+        body["clock_guard"]["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("run retention manually from Settings"),
+        "{body}"
+    );
+    let eligible = body["clock_guard"]["eligible_rows"]
+        .as_u64()
+        .expect("counted");
+    let total = body["clock_guard"]["total_rows"].as_u64().expect("counted");
+    assert!(
+        (60..=total).contains(&eligible),
+        "the sixty records and the earlier admin rows: {body}"
+    );
+    assert_eq!(body["last_run"], on_time, "no pass completed: {body}");
+    assert!(f.store.get_request("victim_0").await.unwrap().is_some());
+
+    // The status reply keeps saying so until a pass completes.
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["clock_guard"]["cause"], "retention_clock_jump");
+    assert!(body["clock_guard"]["jump_secs"].as_i64().unwrap() >= 99 * 86_400);
+
+    // Prune now is the human's confirmation: it proceeds, says it overrode
+    // the guard (in the reply and in its one audit row), removes what was
+    // held back, and the notice goes.
+    let envelope = f.envelope(OP_RETENTION_PRUNE, json!({}));
+    let body = body_of(f.admin.handle(&envelope).await, Outcome::Changed);
+    assert_eq!(body["clock_guard_overridden"], true);
+    assert!(body["ts"].is_i64());
+    assert!(body["requests"].as_u64().unwrap() >= 60, "{body}");
+    assert!(f.store.get_request("victim_0").await.unwrap().is_none());
+    f.assert_audited(&envelope.id).await;
+    let audit = f.store.audit_for_request(&envelope.id).await.unwrap();
+    assert!(
+        audit.iter().any(|row| row
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("\"clock_guard_overridden\":true"))),
+        "{audit:?}"
+    );
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    assert!(body["clock_guard"].is_null());
+}
+
+/// A forward jump over a store the pass would barely touch asks nobody: the
+/// daemon counts, finds one old record, and runs.
+#[tokio::test]
+async fn a_forward_jump_that_would_remove_little_is_not_held_back() {
+    let f = fixture().await;
+    old_finished_request(&f, "lonely").await;
+    body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_SET, json!({ "audit_days": 30 })))
+            .await,
+        Outcome::Changed,
+    );
+    f.admin
+        .retention_clock_ahead
+        .store(JUMP_SECS, std::sync::atomic::Ordering::SeqCst);
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_SET, json!({ "audit_days": 30 })))
+            .await,
+        Outcome::Changed,
+    );
+    assert!(body["clock_guard"].is_null(), "{body}");
+    assert!(
+        body["last_run"]["requests"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+    assert!(f.store.get_request("lonely").await.unwrap().is_none());
 }

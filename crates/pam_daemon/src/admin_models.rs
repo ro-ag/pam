@@ -40,7 +40,8 @@ pub const OP_MODELS_CATALOG: &str = "admin.models.catalog";
 /// `admin.models.download { preset_id } | { url, vendor }` → `{ job_id }`.
 pub const OP_MODELS_DOWNLOAD: &str = "admin.models.download";
 
-/// `admin.models.download.cancel { job_id }` → stops the transfer.
+/// `admin.models.download.cancel { job_id }` → stops the transfer, or the
+/// verification, with that job id.
 pub const OP_MODELS_DOWNLOAD_CANCEL: &str = "admin.models.download.cancel";
 
 /// `admin.models.download.discard { preset_id } | { url, vendor }` →
@@ -445,13 +446,14 @@ impl AdminService {
         Ok((request, model_id))
     }
 
-    /// Stops a running transfer; the part file stays for a resume.
+    /// Stops a running transfer (the part file stays for a resume) or a running
+    /// verification (its private copy in progress is removed, nothing is recorded).
     async fn models_download_cancel(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let job_id = required_str(args, "job_id", OP_MODELS_DOWNLOAD_CANCEL)?;
-        if !self.models.cancel_download(job_id).await {
+        if !self.models.cancel_download(job_id).await && !self.models.cancel_verify(job_id) {
             return Err(AdminRefusal {
                 cause: CAUSE_INVALID_ADMIN_ARGS,
-                detail: format!("no download job {job_id:?} is in flight"),
+                detail: format!("no download or verification job {job_id:?} is in flight"),
                 recovery: RECOVERY_FIX_ARGS,
             });
         }

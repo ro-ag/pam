@@ -65,7 +65,32 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 12,
         sql: SCHEMA_V12,
     },
+    Migration {
+        version: 13,
+        sql: SCHEMA_V13,
+    },
 ];
+
+/// Migration 13: where a request entered the daemon, on its row.
+///
+/// - `ingress` is the plane the request arrived on: `public` (the public
+///   listener) or `admin` (submitted by the private administration plane on a
+///   human's behalf). Rows written before this migration, and rows of a
+///   writer that does not say, are `public`: `admin` is only ever recorded
+///   for a request that provably entered on the private plane.
+/// - `peer_uid` and `peer_pid` are the kernel's view of the connection the
+///   request arrived on, where the platform reports one; NULL otherwise (the
+///   legacy listener, Windows, an administration submission).
+/// - `relayed` is the client's own statement that it came through a session
+///   relay, in which case the peer is the relay process.
+///
+/// All of it is attribution. Nothing is authorized by these columns.
+const SCHEMA_V13: &str = "
+ALTER TABLE request ADD COLUMN ingress TEXT NOT NULL DEFAULT 'public' CHECK (ingress IN ('public', 'admin'));
+ALTER TABLE request ADD COLUMN peer_uid INTEGER;
+ALTER TABLE request ADD COLUMN peer_pid INTEGER;
+ALTER TABLE request ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0 CHECK (relayed IN (0, 1));
+";
 
 /// Migration 12: indexes for the hot scans, scoped revocation, immutability.
 ///

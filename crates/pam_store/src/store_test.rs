@@ -3,8 +3,8 @@ use turso::params;
 
 use crate::{
     Actor, ApprovalResolution, AuditEntry, CompressionStats, ConnectorPatch, Decision,
-    EVIDENCE_KIND_LOG_COMPACT, EvidencePrune, ModelJobRow, RequestPrune, RequestState, Store,
-    StoreError,
+    EVIDENCE_KIND_LOG_COMPACT, EvidencePrune, ModelJobRow, RequestPrune, RequestState,
+    RetentionCensus, Store, StoreError,
 };
 
 /// The one model job row with `id`, read back through the bounded list.
@@ -46,7 +46,7 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 12);
+    assert_eq!(store.schema_version().await.unwrap(), 13);
 
     // WAL is the engine's native journal mode.
     let mut rows = store
@@ -1694,6 +1694,133 @@ async fn prune_requests_removes_the_whole_terminal_record_only() {
     );
 }
 
+/// The census counts exactly what a pass would remove, removes nothing, and
+/// a pass run right after it removes exactly that many rows.
+#[tokio::test]
+async fn the_retention_census_counts_what_a_pass_would_remove_without_removing_it() {
+    let store = Store::open_in_memory().await.unwrap();
+    let finish = |id: &'static str| {
+        let store = &store;
+        async move {
+            store
+                .finish_request(id, RequestState::Done, None, entry("execute"))
+                .await
+                .unwrap();
+        }
+    };
+    // Older than both cutoffs and terminal: the record leaves whole. One of
+    // its evidence rows is also old enough for the evidence window (counted
+    // once), the verdict is only reached through the record.
+    insert_demo_request(&store, "ancient").await;
+    finish("ancient").await;
+    store
+        .insert_evidence("ev_ancient_log", "ancient", "log.source", b"0123", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_ancient_verdict", "ancient", "flow.result", b"{}", None)
+        .await
+        .unwrap();
+    age_request(&store, "ancient", 1_000).await;
+    // Between the cutoffs and terminal: the record stays, its old evidence
+    // goes, its verdict stays.
+    insert_demo_request(&store, "middle").await;
+    finish("middle").await;
+    store
+        .insert_evidence("ev_middle_log", "middle", "log.source", b"45", None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_middle_verdict", "middle", "flow.result", b"{}", None)
+        .await
+        .unwrap();
+    age_request(&store, "middle", 3_000).await;
+    // Newer than both cutoffs and terminal: untouched.
+    insert_demo_request(&store, "recent").await;
+    finish("recent").await;
+    store
+        .insert_evidence("ev_recent_log", "recent", "log.source", b"6", None)
+        .await
+        .unwrap();
+    age_request(&store, "recent", 9_000).await;
+    // Ancient but in flight: never eligible, and its request is not a row
+    // the audit window could ever remove.
+    insert_demo_request(&store, "stuck").await;
+    store
+        .update_request_state("stuck", RequestState::Running, None)
+        .await
+        .unwrap();
+    store
+        .insert_evidence("ev_stuck_log", "stuck", "log.source", b"789", None)
+        .await
+        .unwrap();
+    age_request(&store, "stuck", 1_000).await;
+
+    // Six evidence rows and three terminal requests exist.
+    let total_rows = 9;
+    let census = |evidence: Option<i64>, request: Option<i64>| {
+        let store = &store;
+        async move {
+            store
+                .retention_census(evidence, "flow.result", request)
+                .await
+                .unwrap()
+        }
+    };
+    // Both windows forever: nothing is eligible.
+    assert_eq!(
+        census(None, None).await,
+        RetentionCensus {
+            eligible_rows: 0,
+            total_rows
+        }
+    );
+    // The evidence window alone, on either side of the middle record.
+    assert_eq!(census(Some(2_000), None).await.eligible_rows, 1);
+    assert_eq!(census(Some(5_000), None).await.eligible_rows, 2);
+    // A row exactly at the cutoff stays, as in the prune.
+    assert_eq!(census(Some(3_000), None).await.eligible_rows, 1);
+    assert_eq!(census(Some(3_001), None).await.eligible_rows, 2);
+    // The audit window alone: the ancient record and both its evidence rows.
+    assert_eq!(census(None, Some(2_000)).await.eligible_rows, 3);
+    assert_eq!(census(None, Some(1_000)).await.eligible_rows, 0);
+    // Both: the ancient record whole (its old log row counted once) and the
+    // middle record's old log row.
+    let both = census(Some(5_000), Some(2_000)).await;
+    assert_eq!(
+        both,
+        RetentionCensus {
+            eligible_rows: 4,
+            total_rows
+        }
+    );
+
+    // Counting removed nothing.
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM evidence").await, 6);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM request").await, 4);
+
+    // The pass itself, in the order retention runs it, removes exactly the
+    // census: the count is the prune's own filter, not an estimate.
+    let evidence = store
+        .prune_evidence_before(5_000, "flow.result")
+        .await
+        .unwrap();
+    let requests = store.prune_requests_before(2_000).await.unwrap();
+    assert_eq!(
+        evidence.rows + requests.evidence_rows + requests.requests,
+        both.eligible_rows
+    );
+    assert_eq!(
+        census(Some(5_000), Some(2_000)).await,
+        RetentionCensus {
+            eligible_rows: 0,
+            total_rows: total_rows - both.eligible_rows
+        }
+    );
+    assert!(store.get_request("stuck").await.unwrap().is_some());
+    assert!(store.get_evidence("ev_stuck_log").await.unwrap().is_some());
+}
+
 #[tokio::test]
 async fn connector_identity_changes_invalidate_all_test_fields() {
     let store = Store::open_in_memory().await.unwrap();
@@ -1966,4 +2093,96 @@ async fn bounded_setting_cas_preserves_concurrent_changes() {
             .await
             .is_err()
     );
+}
+
+/// The origin is written by the INSERT that creates the row, for every way
+/// a row is born, and every row reader hands it back: the single read, the
+/// activity list, the dedupe lookup and the boot recovery page.
+#[tokio::test]
+async fn a_request_row_records_where_it_entered_the_daemon() {
+    use crate::{RequestIngress, RequestOrigin};
+
+    let store = Store::open_in_memory().await.unwrap();
+    let peer = RequestOrigin {
+        ingress: RequestIngress::Public,
+        peer_uid: Some(501),
+        peer_pid: Some(77_001),
+        relayed: false,
+    };
+    let relayed = RequestOrigin {
+        relayed: true,
+        peer_pid: None,
+        ..peer
+    };
+    let far = wall_ms_far();
+    store
+        .insert_admitted_request_from("r_peer", "echo", "/r", "claude", "{}", None, far, &peer)
+        .await
+        .unwrap();
+    store
+        .insert_request_from(
+            "r_relayed",
+            "frobnicate",
+            "/r",
+            "claude",
+            "{}",
+            None,
+            &relayed,
+        )
+        .await
+        .unwrap();
+    store
+        .insert_running_request_from(
+            "r_admin",
+            "admin.grants.list",
+            "/admin",
+            "pam-gui",
+            "{}",
+            None,
+            &RequestOrigin::ADMIN,
+        )
+        .await
+        .unwrap();
+    // The writers that do not say record a public request with no peer.
+    store
+        .insert_admitted_request("r_plain", "echo", "/other", "claude", "{}", None, far)
+        .await
+        .unwrap();
+
+    for (id, expected) in [
+        ("r_peer", peer),
+        ("r_relayed", relayed),
+        ("r_admin", RequestOrigin::ADMIN),
+        ("r_plain", RequestOrigin::PUBLIC),
+    ] {
+        let row = store.get_request(id).await.unwrap().unwrap();
+        assert_eq!(row.origin, expected, "{id}");
+    }
+
+    let listed = store
+        .list_requests_filtered(None, None, None, None, None, false)
+        .await
+        .unwrap();
+    let admin = listed.iter().find(|row| row.id == "r_admin").unwrap();
+    assert_eq!(admin.origin.ingress, RequestIngress::Admin);
+
+    let found = store
+        .find_admitted_by_shape("echo", "/r", "{}", None, 0)
+        .await
+        .unwrap()
+        .expect("the admitted echo is in flight");
+    assert_eq!(found.origin, peer);
+
+    let page = store
+        .queued_recovery_page(None, 1024 * 1024)
+        .await
+        .unwrap()
+        .expect("no oversized row");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].origin, relayed);
+}
+
+/// An admission expiry far enough ahead that no test outlives it.
+fn wall_ms_far() -> i64 {
+    9_000_000_000_000
 }

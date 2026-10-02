@@ -2,8 +2,8 @@
 # tools/check.sh — the single local quality gate.
 #
 # Run this before every PR: it is the whole gate, in the order that fails
-# fastest. CI does not duplicate it (Actions cost money; quality gates run
-# locally before merge — see CLAUDE.md "Working agreements").
+# fastest. The `gate` job in .github/workflows/ci.yml runs this same script
+# on macos-15 (arm64), so local and CI results come from one definition.
 #
 #   1. cargo fmt --check          formatting, no writes
 #   2. cargo clippy -D warnings   pedantic lints across every target

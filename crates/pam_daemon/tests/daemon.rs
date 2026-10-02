@@ -17,7 +17,9 @@ use pam_daemon::lifecycle::{
     ACTION_DAEMON_RESTART, CAUSE_DAEMON_RESTART, LifecycleError, LifecyclePhase,
 };
 use pam_daemon::policy::PROFILE_SETTING_KEY;
-use pam_daemon::queue::{ACTION_CANCEL, ACTION_LEASE_REAPED, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED};
+use pam_daemon::queue::{
+    ACTION_CANCEL, ACTION_LEASE_REAPED, ACTION_RECOVERY_REFUSAL, CAUSE_CANCELLED, CAUSE_LEASE_EXPIRED,
+};
 use pam_proto::{Caller, Envelope, Event, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{Actor, ApprovalResolution, Decision, RequestRow, RequestState, Store};
 use tokio::sync::watch;
@@ -861,7 +863,12 @@ async fn elapsed_deadline_refuses_the_waiting_caller_and_ends_the_request() {
         assert!(audit.iter().any(|row| row.action == ACTION_DEADLINE_REFUSAL
             && row.decision == Decision::Timeout
             && row.actor == Actor::System));
-        assert!(audit.iter().any(|row| row.action == ACTION_LEASE_REAPED));
+        // Which path tears it down is a scheduler race: the reaper ends a
+        // running lease, `take_next` refuses a row that expired before it
+        // was leased. Either is the one teardown row.
+        assert!(audit.iter().any(
+            |row| row.action == ACTION_LEASE_REAPED || row.action == ACTION_RECOVERY_REFUSAL
+        ));
 
         daemon.stop().await;
     })

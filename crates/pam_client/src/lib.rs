@@ -13,6 +13,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+mod broker_windows;
 pub mod caller;
 pub mod client;
 // The session relay's transport is unix domain sockets; on Windows a
@@ -23,6 +25,8 @@ pub mod request;
 pub mod service;
 pub mod transport;
 
+#[cfg(all(windows, test))]
+mod broker_windows_test;
 #[cfg(test)]
 mod caller_test;
 #[cfg(test)]

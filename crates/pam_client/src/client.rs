@@ -47,6 +47,7 @@ use std::ffi::OsString;
 use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -673,7 +674,7 @@ pub fn daemon_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsSt
 
 /// The fixed working directory of a spawned daemon: never the caller's
 /// (an agent's repository), which flows must not see as the daemon's home.
-fn daemon_cwd() -> PathBuf {
+pub(crate) fn daemon_cwd() -> PathBuf {
     if cfg!(unix) {
         PathBuf::from("/")
     } else {
@@ -687,11 +688,13 @@ fn daemon_cwd() -> PathBuf {
 /// [`daemon_env`] allowlist over `vars` plus an explicit absolute
 /// `PAM_BASE_DIR`, so a relative override still names the same directory
 /// from the new working directory.
+#[cfg(unix)]
 pub(crate) fn daemon_command(
     exe: &Path,
     base_dir: &Path,
     vars: impl Iterator<Item = (OsString, OsString)>,
 ) -> Command {
+    use std::os::unix::process::CommandExt as _;
     let base = std::path::absolute(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
     let mut command = Command::new(exe);
     command
@@ -702,18 +705,8 @@ pub(crate) fn daemon_command(
         .env_clear()
         .envs(daemon_env(vars))
         .env("PAM_BASE_DIR", base)
-        .current_dir(daemon_cwd());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW.
-        command.creation_flags(0x0000_0200 | 0x0800_0000);
-    }
+        .current_dir(daemon_cwd())
+        .process_group(0);
     command
 }
 
@@ -722,15 +715,26 @@ pub(crate) fn daemon_command(
 /// a long-lived caller (the GUI) accumulates no zombies. The daemon
 /// self-logs to `<base>/log/`.
 ///
+/// On Windows the daemon is started through a PowerShell broker instead (see
+/// `broker_windows`): a daemon spawned directly would inherit the caller's
+/// stdout pipe and keep a harness that captures it waiting for end-of-file.
+///
 /// # Errors
 ///
 /// Whatever spawning the process produced.
 pub fn spawn_daemon_process(exe: &Path, base_dir: &Path) -> io::Result<()> {
-    let mut child = daemon_command(exe, base_dir, std::env::vars_os()).spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    #[cfg(unix)]
+    {
+        let mut child = daemon_command(exe, base_dir, std::env::vars_os()).spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        crate::broker_windows::spawn_daemon(exe, base_dir, std::env::vars_os())
+    }
 }
 
 /// Default bound on `pam wait` / `pam subscribe`, in milliseconds

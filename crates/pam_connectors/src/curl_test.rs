@@ -419,3 +419,32 @@ fn upload_pack_packet_stays_exact_in_curl_stdin_config() {
         .push(("content-type".into(), "application/json".into()));
     assert!(crate::curl::validate_request_body(&req).is_err());
 }
+
+#[tokio::test]
+async fn a_header_with_a_line_break_is_refused_before_curl_is_started() {
+    use crate::HttpTransport as _;
+    // Not the trusted curl: if the request got as far as choosing an executable the
+    // refusal would be `trusted_curl_unavailable`, so the cause proves nothing ran.
+    let transport = CurlTransport::new("/agent-controlled/curl".into());
+    for value in ["Bearer abc\n", "Bearer abc\r\nX-Injected: 1", "Bearer a\0b"] {
+        let mut request = request();
+        request.headers = vec![("Authorization".to_owned(), value.to_owned())];
+        let error = transport
+            .send(
+                request,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::TransportError::Policy {
+                    cause: "header_invalid",
+                    ..
+                }
+            ),
+            "{value:?}: {error:?}"
+        );
+    }
+}

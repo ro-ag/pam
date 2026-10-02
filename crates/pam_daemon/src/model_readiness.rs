@@ -204,7 +204,14 @@ pub fn admission_blocker(entry: &ModelEntry) -> Option<(Stage, Blocker)> {
                 cause: CAUSE_MODEL_UNVERIFIED,
                 detail: format!(
                     "{id} has no verified digest; unverified models prove the wiring and never \
-                     serve a job"
+                     serve a job{}",
+                    // A once-verified file that changed, or an old sidecar the registry no
+                    // longer trusts, says so: "unverified" alone reads like a lost setting.
+                    entry
+                        .verification_issue
+                        .as_deref()
+                        .map(|issue| format!(" ({issue})"))
+                        .unwrap_or_default()
                 ),
                 recovery: RECOVERY_UNVERIFIED,
             },

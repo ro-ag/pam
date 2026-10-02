@@ -121,6 +121,25 @@ pub fn clear_binary_for_tests() {
     BINARY_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
 }
 
+/// The adapter's own refusal to run the CLI.
+///
+/// The daemon refuses the AWS connector before any credential or process is touched
+/// (`command_containment_unavailable`), but that is one `if` in another crate; this is the
+/// same refusal where the process would actually start, so moving or losing the daemon's
+/// check does not hand an agent-chosen command line to a `PATH`-resolved `aws`. Every spawn
+/// goes through [`run`], which calls it. Only a test that named a stand-in binary
+/// ([`set_binary_for_tests`]) gets past it; there is no production way to.
+fn execution_gate() -> Result<(), ConnectorError> {
+    #[cfg(any(test, feature = "testing"))]
+    if BINARY_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        return Ok(());
+    }
+    Err(ConnectorError::Policy {
+        cause: "command_containment_unavailable",
+        detail: "AWS CLI execution is unavailable until its credential and helper processes have qualified containment; no process was started.".to_owned(),
+    })
+}
+
 /// The `aws` executable on `PATH`, if there is one.
 #[must_use]
 pub fn aws_binary() -> Option<PathBuf> {
@@ -277,6 +296,7 @@ struct Output {
 
 /// Spawns the CLI, bounds it, and waits for it.
 async fn run(line: &[String], deadline: Instant) -> Result<Output, ConnectorError> {
+    execution_gate()?;
     let binary = aws_binary().ok_or(ConnectorError::CliMissing)?;
     let mut command = Command::new(&binary);
     command

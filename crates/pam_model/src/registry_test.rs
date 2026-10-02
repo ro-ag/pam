@@ -14,8 +14,35 @@ fn models_dir_with(name: &str, bytes: &[u8]) -> (tempfile::TempDir, Registry) {
     let vendor = dir.path().join("qwen");
     std::fs::create_dir_all(&vendor).unwrap();
     std::fs::write(vendor.join(name), bytes).unwrap();
-    let registry = Registry::new(dir.path());
+    let registry = Registry::new(dir.path()).with_trust_dir(trust_dir(&dir));
     (dir, registry)
+}
+
+/// The private trust directory a test registry keeps its records in: a dot
+/// directory beside the vendors, which a scan skips.
+fn trust_dir(models: &tempfile::TempDir) -> PathBuf {
+    models.path().join(".private-trust")
+}
+
+/// How many verification records the trust directory holds.
+fn trust_record_count(registry: &Registry) -> usize {
+    std::fs::read_dir(registry.trust_dir().unwrap()).map_or(0, Iterator::count)
+}
+
+/// A legacy sidecar claiming `sha256` for a file of `size`, written the way pam
+/// used to (newer than the file, correct size).
+fn forge_sidecar(path: &Path, sha256: &str, size: u64) {
+    let record = VerifiedRecord {
+        sha256: sha256.to_owned(),
+        size_bytes: size,
+        verified_ts: 1,
+        matches_catalog: None,
+    };
+    std::fs::write(
+        verified_sidecar_path(path),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -163,7 +190,7 @@ fn dest_for_follows_the_vendor_layout() {
 }
 
 #[test]
-fn verify_writes_a_sidecar_that_the_next_scan_reads_back() {
+fn verify_records_in_the_private_store_and_the_next_scan_reads_it_back() {
     let (_dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
     let entry = registry.find("qwen/tiny").unwrap().unwrap();
 
@@ -171,10 +198,16 @@ fn verify_writes_a_sidecar_that_the_next_scan_reads_back() {
     assert_eq!(outcome.size_bytes, entry.size_bytes);
     assert_eq!(outcome.sha256.len(), 64);
     assert_eq!(outcome.matches_catalog, None);
-    assert!(verified_sidecar_path(&entry.path).exists());
+    assert!(
+        !verified_sidecar_path(&entry.path).exists(),
+        "nothing is written beside the file, where the models directory's writers could forge it"
+    );
+    assert_eq!(trust_record_count(&registry), 1);
 
     let rescanned = registry.find("qwen/tiny").unwrap().unwrap();
-    let record = rescanned.verified.expect("the sidecar is read back");
+    assert_eq!(rescanned.class, ModelClass::Engine);
+    assert_eq!(rescanned.verification_issue, None);
+    let record = rescanned.verified.expect("the record is read back");
     assert_eq!(record.sha256, outcome.sha256);
     assert_eq!(record.size_bytes, entry.size_bytes);
     assert_eq!(record.matches_catalog, None);
@@ -205,7 +238,7 @@ fn verify_of_a_catalog_file_name_with_the_wrong_bytes_says_so() {
     assert_eq!(
         rescanned.verified.unwrap().matches_catalog,
         Some(false),
-        "and the verdict survives the sidecar round trip"
+        "and the verdict survives the record round trip"
     );
 }
 
@@ -239,26 +272,38 @@ fn record_verified_is_what_a_finished_download_calls() {
 }
 
 #[test]
-fn an_unreadable_sidecar_is_ignored_rather_than_fatal() {
-    let (_dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
-    let entry = registry.find("qwen/tiny").unwrap().unwrap();
-    std::fs::write(verified_sidecar_path(&entry.path), b"{ not json").unwrap();
-
-    let rescanned = registry.find("qwen/tiny").unwrap().unwrap();
-    assert_eq!(rescanned.verified, None);
-}
-
-#[test]
-fn delete_removes_the_model_and_its_sidecar() {
+fn an_unreadable_trust_record_is_ignored_rather_than_fatal() {
     let (_dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
     let entry = registry.find("qwen/tiny").unwrap().unwrap();
     registry.verify(&entry).unwrap();
+    for record in std::fs::read_dir(registry.trust_dir().unwrap()).unwrap() {
+        std::fs::write(record.unwrap().path(), b"{ not json").unwrap();
+    }
+
+    let rescanned = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(rescanned.verified, None);
+    assert!(
+        rescanned
+            .verification_issue
+            .unwrap()
+            .contains("verify again")
+    );
+}
+
+#[test]
+fn delete_removes_the_model_its_trust_record_and_a_legacy_sidecar() {
+    let (_dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let entry = registry.find("qwen/tiny").unwrap().unwrap();
+    registry.verify(&entry).unwrap();
+    forge_sidecar(&entry.path, &"a".repeat(64), entry.size_bytes);
     let sidecar = verified_sidecar_path(&entry.path);
     assert!(sidecar.exists());
+    assert_eq!(trust_record_count(&registry), 1);
 
     registry.delete(&entry).unwrap();
     assert!(!entry.path.exists());
     assert!(!sidecar.exists());
+    assert_eq!(trust_record_count(&registry), 0);
     assert!(registry.scan().unwrap().is_empty());
 }
 
@@ -321,6 +366,8 @@ fn entry_at(path: &Path) -> ModelEntry {
         info_error: None,
         class: ModelClass::TestOnly,
         verified: None,
+        verification_issue: None,
+        fingerprint: crate::registry::FileFingerprint::default(),
         qualification: None,
         catalog_id: None,
     }
@@ -354,7 +401,8 @@ fn a_verified_digest_is_qualified_only_when_a_record_names_it_on_this_target() {
     let path = dir.path().join("qwen").join("tiny.gguf");
     let (sha256, size) = sha256_file(&path).unwrap();
 
-    let unqualified = Registry::with_qualifications(dir.path(), table_for("not-this-digest"));
+    let unqualified = Registry::with_qualifications(dir.path(), table_for("not-this-digest"))
+        .with_trust_dir(trust_dir(&dir));
     unqualified
         .record_verified(
             &path,
@@ -373,7 +421,8 @@ fn a_verified_digest_is_qualified_only_when_a_record_names_it_on_this_target() {
         "but nothing measured this digest"
     );
 
-    let qualified = Registry::with_qualifications(dir.path(), table_for(&sha256));
+    let qualified = Registry::with_qualifications(dir.path(), table_for(&sha256))
+        .with_trust_dir(trust_dir(&dir));
     let entry = qualified.find("qwen/tiny").unwrap().unwrap();
     assert_eq!(
         entry.qualification.map(|record| record.artifact),
@@ -494,7 +543,8 @@ fn a_rewritten_model_file_loses_its_verification_and_qualification() {
     let (dir, _) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
     let path = dir.path().join("qwen").join("tiny.gguf");
     let (sha256, size) = sha256_file(&path).unwrap();
-    let registry = Registry::with_qualifications(dir.path(), table_for(&sha256));
+    let registry = Registry::with_qualifications(dir.path(), table_for(&sha256))
+        .with_trust_dir(trust_dir(&dir));
     registry
         .record_verified(
             &path,
@@ -514,7 +564,7 @@ fn a_rewritten_model_file_loses_its_verification_and_qualification() {
     );
 
     // Another file lands under the verified name: one more tensor, so the
-    // size differs and the old sidecar no longer describes these bytes.
+    // size differs and the old record no longer describes these bytes.
     let rewritten = synth_gguf(
         3,
         "qwen3",
@@ -526,48 +576,179 @@ fn a_rewritten_model_file_loses_its_verification_and_qualification() {
     std::fs::write(&path, &rewritten).unwrap();
 
     let entry = registry.find("qwen/tiny").unwrap().unwrap();
-    assert_eq!(entry.verified, None, "a sidecar for other bytes is absent");
+    assert_eq!(entry.verified, None, "a record for other bytes is absent");
     assert_eq!(entry.class, ModelClass::TestOnly);
     assert_eq!(entry.qualification, None);
     assert!(
-        verified_sidecar_path(&path).exists(),
+        entry.verification_issue.unwrap().contains("changed"),
+        "the human is told the file changed, not just that it is unverified"
+    );
+    assert_eq!(
+        trust_record_count(&registry),
+        1,
         "nothing is deleted, only distrusted"
     );
 }
 
+/// An in-place edit that keeps the size and puts the modification time back is
+/// what a sidecar's mtime comparison could not see; the change time cannot be set
+/// back by a writer.
+#[cfg(unix)]
 #[test]
-fn a_sidecar_older_than_the_file_it_describes_is_stale() {
+fn a_same_size_edit_with_the_old_mtime_restored_still_loses_verification() {
     let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
     let path = dir.path().join("qwen").join("tiny.gguf");
     let entry = registry.find("qwen/tiny").unwrap().unwrap();
     registry.verify(&entry).unwrap();
-    assert!(
-        registry
-            .find("qwen/tiny")
-            .unwrap()
-            .unwrap()
-            .verified
-            .is_some()
-    );
+    let verified = registry.find("qwen/tiny").unwrap().unwrap();
+    assert!(verified.verified.is_some());
 
-    // Same size, newer bytes: the digest changed but the length did not, and
-    // the file's modification time is what gives it away.
-    let sidecar = verified_sidecar_path(&path);
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-    std::fs::File::options()
-        .write(true)
-        .open(&sidecar)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    let old_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
     let mut bytes = tiny_moe_gguf();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
+    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&path, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
 
-    assert_eq!(
-        registry.find("qwen/tiny").unwrap().unwrap().verified,
-        None,
-        "a sidecar written before the file's last change describes other bytes"
+    let after = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(after.verified, None, "the digest describes other bytes");
+    assert_eq!(after.class, ModelClass::TestOnly);
+    assert!(
+        matches!(
+            registry.recheck(&verified),
+            Err(RegistryError::Changed { .. })
+        ),
+        "a load that began from the verified scan refuses too"
     );
+}
+
+#[test]
+fn a_forged_sidecar_in_the_models_directory_confers_nothing() {
+    let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let (sha256, size) = sha256_file(&path).unwrap();
+    // The attacker names the qualified digest and gets the size and the mtime right.
+    forge_sidecar(&path, &sha256, size);
+    let qualified = Registry::with_qualifications(dir.path(), table_for(&sha256))
+        .with_trust_dir(trust_dir(&dir));
+
+    let entry = qualified.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(entry.verified, None);
+    assert_eq!(entry.class, ModelClass::TestOnly);
+    assert_eq!(
+        entry.qualification, None,
+        "no qualification without a verification"
+    );
+    let issue = entry.verification_issue.expect("the human is told why");
+    assert!(
+        issue.contains("sidecar") && issue.contains("verify again"),
+        "{issue}"
+    );
+    assert_eq!(trust_record_count(&registry), 0);
+    // And with no trust directory at all, nothing is verified either.
+    let bare = Registry::with_qualifications(dir.path(), table_for(&sha256));
+    assert_eq!(
+        bare.find("qwen/tiny").unwrap().unwrap().class,
+        ModelClass::TestOnly
+    );
+}
+
+#[test]
+fn an_install_with_only_old_sidecars_degrades_to_verify_again_and_recovers() {
+    let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let (sha256, size) = sha256_file(&path).unwrap();
+    forge_sidecar(&path, &sha256, size);
+
+    let before = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(before.class, ModelClass::TestOnly);
+    assert!(before.verification_issue.is_some());
+
+    registry.verify(&before).unwrap();
+    let after = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(after.class, ModelClass::Engine);
+    assert_eq!(after.verified.as_ref().unwrap().sha256, sha256);
+    assert_eq!(
+        after.verification_issue, None,
+        "the hint goes away once verified"
+    );
+    registry
+        .recheck(&after)
+        .expect("an unchanged file passes the load check");
+}
+
+#[test]
+fn a_registry_without_a_trust_directory_refuses_to_record() {
+    let (dir, _) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let bare = Registry::new(dir.path());
+    let entry = bare.find("qwen/tiny").unwrap().unwrap();
+
+    assert!(matches!(bare.verify(&entry), Err(RegistryError::Io(_))));
+    assert!(
+        !verified_sidecar_path(&entry.path).exists(),
+        "it never falls back to writing beside the file"
+    );
+}
+
+#[test]
+fn a_trust_record_copied_under_another_files_name_verifies_nothing() {
+    let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let other = dir.path().join("qwen").join("other.gguf");
+    std::fs::copy(dir.path().join("qwen").join("tiny.gguf"), &other).unwrap();
+    let tiny = registry.find("qwen/tiny").unwrap().unwrap();
+    registry.verify(&tiny).unwrap();
+
+    // The record for `tiny` is moved to the file name `other` would look up.
+    let canonical_other = other.canonicalize().unwrap();
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        canonical_other.to_string_lossy().as_bytes(),
+    ));
+    let source = std::fs::read_dir(registry.trust_dir().unwrap())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::copy(
+        &source,
+        registry.trust_dir().unwrap().join(format!("{digest}.json")),
+    )
+    .unwrap();
+
+    let entry = registry.find("qwen/other").unwrap().unwrap();
+    assert_eq!(entry.verified, None);
+    assert!(
+        entry
+            .verification_issue
+            .unwrap()
+            .contains("does not describe")
+    );
+}
+
+#[test]
+fn an_unchanged_file_is_not_reparsed_on_every_scan_and_an_edited_one_is() {
+    let (dir, registry) = models_dir_with("tiny.gguf", &tiny_moe_gguf());
+    let path = dir.path().join("qwen").join("tiny.gguf");
+    let parses = || crate::registry::HEADER_PARSES.with(std::cell::Cell::get);
+    let before = parses();
+
+    let first = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(parses(), before + 1, "the first scan parses the header");
+    for _ in 0..3 {
+        let again = registry.find("qwen/tiny").unwrap().unwrap();
+        assert_eq!(again.info, first.info);
+    }
+    assert_eq!(parses(), before + 1, "later scans reuse it");
+
+    // A file that stops being a model is parsed afresh, not served from the cache.
+    std::fs::write(&path, b"not a gguf any more").unwrap();
+    let broken = registry.find("qwen/tiny").unwrap().unwrap();
+    assert_eq!(parses(), before + 2);
+    assert!(broken.info.is_none() && broken.info_error.is_some());
 }

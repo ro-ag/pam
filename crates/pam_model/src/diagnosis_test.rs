@@ -519,3 +519,20 @@ fn resolution_never_invents_or_repairs_anything_else() {
     assert_eq!(resolve_citation_offsets("[1,2]", &task()).text, "[1,2]");
     assert_eq!(validate(truncated, &task()).unwrap_err().cause, "not_json");
 }
+
+#[test]
+fn only_a_substantive_quote_carries_authority_tags() {
+    use crate::diagnosis::{MIN_AUTHORITY_QUOTE_BYTES, is_substantive_quote};
+    assert!(!is_substantive_quote("e", 4096));
+    assert!(!is_substantive_quote("", 0));
+    assert!(!is_substantive_quote(
+        &"x".repeat(MIN_AUTHORITY_QUOTE_BYTES - 1),
+        4096
+    ));
+    assert!(is_substantive_quote(
+        &"x".repeat(MIN_AUTHORITY_QUOTE_BYTES),
+        4096
+    ));
+    // A short item quoted whole is as substantive as it can be.
+    assert!(is_substantive_quote("OOM", 3));
+}

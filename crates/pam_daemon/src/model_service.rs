@@ -13,11 +13,17 @@
 //! [`SETTING_IDLE_UNLOAD_MIN`] (`0` = never), via the pure `should_unload`.
 //! The model layer never becomes a hard dependency: with nothing configured every caller falls back
 //! deterministically. `last_used_at` (which drives idle unload) is updated after every load and
-//! every generation.
+//! every *successful* generation: a caller retrying against a failing engine must not keep it
+//! "in use". Verification records live under the daemon's private base (`<base>/model-trust`),
+//! never beside the weights: the models directory is not a trust boundary. A generation is
+//! bounded end to end ([`GENERATE_TOTAL_DEADLINE`], lock wait and load included) and takes a
+//! cancel receiver; an engine process found dead surfaces as `engine_exited` and the next
+//! request reloads; an engine a `SIGKILL`ed daemon left running is found through its pid file and
+//! stopped, after its executable, arguments and start time prove it is ours.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -283,6 +289,13 @@ pub struct ModelService {
     pub(crate) operation: Arc<Mutex<()>>,
     downloads: Downloads,
     host_ram_bytes: u64,
+    /// Whether the pid file of a previous daemon's engine has been looked at since the
+    /// engine base was set.
+    orphans_checked: AtomicBool,
+    /// Milliseconds one `generate_bounded` may take in total; tests shorten it.
+    generate_total_ms: AtomicU64,
+    /// Milliseconds the engine itself may take over one completion; tests shorten it.
+    generate_step_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for ModelService {
@@ -327,6 +340,9 @@ impl ModelService {
             operation: Arc::new(Mutex::new(())),
             downloads: Downloads::default(),
             host_ram_bytes: host_ram_bytes(),
+            orphans_checked: AtomicBool::new(false),
+            generate_total_ms: AtomicU64::new(duration_ms(GENERATE_TOTAL_DEADLINE)),
+            generate_step_ms: AtomicU64::new(duration_ms(ENGINE_GENERATE_DEADLINE)),
         });
         tokio::spawn(idle_unload_loop(Arc::downgrade(&service)));
         Ok(service)
@@ -442,11 +458,18 @@ impl ModelService {
         let outcome = {
             let _busy = BusyGuard::engage(&self.busy);
             engine
-                .generate(request, cancel, input_limit, ENGINE_GENERATE_DEADLINE)
+                .generate(
+                    request,
+                    cancel,
+                    input_limit,
+                    Duration::from_millis(self.generate_step_ms.load(Ordering::Relaxed)),
+                )
                 .await
         };
-        self.touch_last_used();
+        // Only a completed generation counts as use: callers that keep retrying a
+        // failing engine must not hold it loaded past the idle window.
         let result = outcome.map_err(engine_error)?;
+        self.touch_last_used();
         let decode_ms = result.predicted_ms.max(0.0);
         #[allow(
             clippy::cast_precision_loss,
@@ -474,10 +497,21 @@ impl ModelService {
         })
     }
 
-    /// A registry over the configured models directory.
+    /// A registry over the configured models directory, keeping its verification
+    /// records in the daemon's private base ([`Self::trust_dir`]).
     #[must_use]
     pub fn registry(&self) -> Registry {
         Registry::with_qualifications(self.models_dir(), *self.qualifications())
+            .with_trust_dir(self.trust_dir())
+    }
+
+    /// Where verification records live: `<daemon base>/model-trust`, inside the `0700`
+    /// base the agent sandbox is assumed to exclude. The models directory is not
+    /// assumed protected, so nothing there can vouch for weights. (Before the daemon
+    /// sets its base — tests — it falls back to a directory beside the models.)
+    #[must_use]
+    pub fn trust_dir(&self) -> PathBuf {
+        self.engine_base().join("model-trust")
     }
 
     fn qualifications(&self) -> std::sync::RwLockReadGuard<'_, &'static [Qualification]> {
@@ -528,6 +562,32 @@ impl ModelService {
             .engine_base
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base);
+        self.orphans_checked.store(false, Ordering::Release);
+    }
+
+    /// Stops an engine a previous daemon left running (SIGKILL, crash), once per
+    /// engine base. The supervisor's pid file names the process; it is killed only when
+    /// the live process with that pid has the recorded executable, was started with the
+    /// recorded model and key-file arguments, and started when the record says. Anything
+    /// else with that pid is somebody else's: the stale record is removed and nothing is
+    /// killed. Returns what happened, for logs and tests.
+    pub async fn reap_orphan_engine(&self) -> OrphanReap {
+        if self.orphans_checked.swap(true, Ordering::AcqRel) {
+            return OrphanReap::NothingToDo;
+        }
+        let Some(engine) = self.engine_server() else {
+            // No engine installed yet: look again once there is one.
+            self.orphans_checked.store(false, Ordering::Release);
+            return OrphanReap::NothingToDo;
+        };
+        if engine.model().is_some() {
+            return OrphanReap::NothingToDo;
+        }
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            reap_recorded_engine(&engine)
+        })
+        .await
+        .unwrap_or(OrphanReap::NothingToDo)
     }
 
     /// The daemon's base directory as set by [`Self::set_engine_base`], or
@@ -615,16 +675,73 @@ impl ModelService {
         request: GenerateRequest,
         input_limit: usize,
     ) -> Result<GenerateResult, ModelUnavailable> {
-        let _operation = self.operation.lock().await;
-        let entry = self.resolve(tier).await?;
-        let loaded = self.ensure_loaded_inner(&entry).await?;
-        // The daemon-internal path has no cancel surface yet: the sender
-        // lives as long as the call and never fires.
+        // The caller has no cancel surface: the sender lives as long as the call and
+        // never fires. The call is still bounded by the total deadline.
         let (_never, cancel) = watch::channel(false);
-        let engine = self.engine_server().ok_or_else(engine_not_installed)?;
-        Ok(self
-            .engine_generate(&engine, &loaded, &request, cancel, input_limit)
-            .await?)
+        self.generate_bounded_cancellable(tier, request, input_limit, cancel)
+            .await
+    }
+
+    /// [`Self::generate_bounded`] that stops when `cancel` flips to `true`, and in any
+    /// case after [`GENERATE_TOTAL_DEADLINE`] counted from this call: waiting for the
+    /// service-wide operation lock behind another generation, loading the model and the
+    /// completion all spend the same budget. A flow step that was cancelled, or whose
+    /// deadline passed, therefore stops holding the lock (and the GPU) instead of
+    /// queueing up to fifteen minutes behind a wedged engine.
+    ///
+    /// Dropping the future on the deadline or the cancel is safe: the engine child is
+    /// `kill_on_drop` while loading and a generation in flight is abandoned by closing
+    /// its connection.
+    pub async fn generate_bounded_cancellable(
+        &self,
+        tier: Tier,
+        request: GenerateRequest,
+        input_limit: usize,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<GenerateResult, ModelUnavailable> {
+        let total = Duration::from_millis(self.generate_total_ms.load(Ordering::Relaxed));
+        let engine_cancel = cancel.clone();
+        let work = async {
+            let _operation = self.operation.lock().await;
+            let entry = self.resolve(tier).await?;
+            let loaded = self.ensure_loaded_inner(&entry).await?;
+            let engine = self.engine_server().ok_or_else(engine_not_installed)?;
+            // The cancel is also handed to the engine so an in-flight completion is
+            // abandoned by closing its connection, not merely dropped here.
+            Ok(self
+                .engine_generate(&engine, &loaded, &request, engine_cancel, input_limit)
+                .await?)
+        };
+        tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => Err(RuntimeError::Cancelled.into()),
+            outcome = tokio::time::timeout(total, work) => outcome.unwrap_or_else(|_| {
+                Err(RuntimeError::GenerationFailed(format!(
+                    "no result within {} s; the engine is busy or stuck",
+                    total.as_secs()
+                ))
+                .into())
+            }),
+        }
+    }
+
+    /// Reads and overwrites the last-use stamp, so a test can tell a counted use from
+    /// an uncounted one.
+    #[cfg(test)]
+    pub(crate) fn last_used_for_tests(&self, set: Option<i64>) -> i64 {
+        if let Some(value) = set {
+            self.last_used_at.store(value, Ordering::Release);
+        }
+        self.last_used_at.load(Ordering::Acquire)
+    }
+
+    /// Shortens the generation deadlines so a test can watch them fire.
+    #[cfg(test)]
+    pub(crate) fn set_generate_deadlines_for_tests(&self, total: Duration, step: Duration) {
+        self.generate_total_ms
+            .store(duration_ms(total), Ordering::Relaxed);
+        self.generate_step_ms
+            .store(duration_ms(step), Ordering::Relaxed);
     }
 
     /// Diagnose on one explicitly requested installed model without loading or swapping:
@@ -675,26 +792,33 @@ impl ModelService {
             .find(&entry.id)
             .await
             .map_err(|error| RuntimeError::LoadFailed(error.to_string()))?;
-        if current
-            .as_ref()
-            .is_none_or(|current| current.path != entry.path)
-        {
+        if current.as_ref().is_none_or(|current| {
+            current.path != entry.path || current.fingerprint != entry.fingerprint
+        }) {
             return Err(RuntimeError::LoadFailed(
                 "The installed model entry changed before loading; select it again.".to_owned(),
             ));
         }
-        self.ensure_loaded_inner(entry).await
+        let loaded = self.ensure_loaded_inner(entry).await?;
+        self.touch_last_used();
+        Ok(loaded)
     }
 
     async fn ensure_loaded_inner(&self, entry: &ModelEntry) -> Result<LoadedModel, RuntimeError> {
         let engine = self.engine_server().ok_or_else(engine_not_installed)?;
+        // An engine left by a SIGKILLed daemon holds the weights' memory and may hold the
+        // socket path: stop it before starting another.
+        if let OrphanReap::Killed { pid } = self.reap_orphan_engine().await {
+            tracing::warn!(pid, "stopped an engine a previous daemon left running");
+        }
         if let Some(current) = engine.model()
             && current.id == entry.id
             && current.path == entry.path
         {
             let loaded = engine_loaded_model(entry, &current);
             self.set_resident(Some((entry.path.clone(), loaded.clone())));
-            self.touch_last_used();
+            // Reusing what is already loaded is not a use: the generation that asked
+            // counts itself once it succeeds.
             return Ok(loaded);
         }
         // The swap is about to happen: forget the old view before the old
@@ -707,14 +831,35 @@ impl ModelService {
             ),
             ..ServerOptions::default()
         };
+        // The verification is a claim about the bytes the scan saw: refuse if the file
+        // is not the one it described, both before the engine opens it and once it is up
+        // (a swap or in-place edit during the load must not leave unverified weights
+        // serving under a verified name).
+        self.recheck(entry).await?;
         let current = engine
             .load(&entry.id, &entry.path, &options)
             .await
             .map_err(engine_error)?;
+        if let Err(error) = self.recheck(entry).await {
+            engine.unload().await;
+            return Err(error);
+        }
         let loaded = engine_loaded_model(entry, &current);
         self.set_resident(Some((entry.path.clone(), loaded.clone())));
         self.touch_last_used();
         Ok(loaded)
+    }
+
+    /// [`Registry::recheck`] on the blocking lane, as a load refusal.
+    async fn recheck(&self, entry: &ModelEntry) -> Result<(), RuntimeError> {
+        let registry = self.registry();
+        let checked = entry.clone();
+        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+            registry.recheck(&checked)
+        })
+        .await
+        .map_err(|error| RuntimeError::LoadFailed(error.to_string()))?
+        .map_err(|error| RuntimeError::LoadFailed(error.to_string()))
     }
 
     /// Starts a transfer and returns its job id.
@@ -729,6 +874,8 @@ impl ModelService {
         model_id: &str,
     ) -> Result<String, ModelServiceError> {
         let dest = request.dest.clone();
+        let dest_for_record = request.dest.clone();
+        let expected_digest = request.expected_sha256.is_some();
         if self.is_downloading(&dest).await {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
@@ -757,6 +904,9 @@ impl ModelService {
             Arc::clone(&self.downloads),
             job_id.clone(),
             handle,
+            // A download that carried an expected digest and finished has been checked
+            // against it; only then is it recorded as verified, in the private store.
+            expected_digest.then(|| (self.registry(), dest_for_record)),
         ));
         tracing::info!(job = %job_id, model = model_id, "download started");
         Ok(job_id)
@@ -816,7 +966,7 @@ impl ModelService {
         let id = job_id.clone();
         tokio::spawn(async move {
             let outcome =
-                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelHash, move || {
                     registry.verify(&entry)
                 })
                 .await;
@@ -850,6 +1000,8 @@ impl ModelService {
     /// The `admin.models.status` body: the runtime, the jobs worth
     /// showing, the tier defaults, their readiness, and the settings behind them.
     pub async fn status(&self) -> Result<serde_json::Value, ModelUnavailable> {
+        // First status after a daemon start: stop an engine the last daemon left behind.
+        let _ = self.reap_orphan_engine().await;
         let (light, heavy) = self.defaults().await?;
         let rows = self.store.list_model_jobs(JOB_QUERY_LIMIT).await?;
         let (running, settled): (Vec<ModelJobRow>, Vec<ModelJobRow>) =
@@ -871,6 +1023,12 @@ impl ModelService {
         let engine_loaded = self
             .engine_server_for(&engine_status)
             .and_then(|engine| engine.model());
+        let engine_exited = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|engine| engine.last_exit());
         let resident = engine_loaded.as_ref().map(|loaded| loaded.id.clone());
         let readiness = json!({
             "light": self
@@ -887,6 +1045,9 @@ impl ModelService {
                 "expected_tag": engine_status.expected_tag,
                 "cause": engine_status.cause,
                 "loaded": engine_loaded,
+                // Set when the engine process died on its own (killed for memory, a
+                // crash): why, until the model is loaded again.
+                "exited": engine_exited,
             },
             "jobs": jobs,
             "defaults": { "light": light, "heavy": heavy },
@@ -1019,6 +1180,7 @@ async fn follow_download(
     downloads: Downloads,
     job_id: String,
     handle: DownloadHandle,
+    record_as_verified: Option<(Registry, PathBuf)>,
 ) {
     let mut ticker = tokio::time::interval(DOWNLOAD_POLL);
     // A store that refuses every progress write would otherwise warn twice
@@ -1062,6 +1224,18 @@ async fn follow_download(
     };
     let (state, detail) = match verdict {
         DownloadState::Done { sha256, size_bytes } => {
+            if let Some((registry, dest)) = record_as_verified {
+                let digest = sha256.clone();
+                let recorded = crate::blocking_jobs::run(
+                    crate::blocking_jobs::Kind::ModelFilesystem,
+                    move || registry.record_download(&dest, &digest, size_bytes),
+                )
+                .await;
+                // The file is good either way; a failed record costs one Verify.
+                if !matches!(recorded, Ok(Ok(()))) {
+                    tracing::warn!(job = %job_id, "download verified but its record was not written");
+                }
+            }
             if let Ok(done) = i64::try_from(size_bytes) {
                 let _ = store
                     .update_model_job_progress(&job_id, done, Some(done))
@@ -1193,8 +1367,104 @@ impl From<crate::blocking_jobs::Error> for ModelServiceError {
     }
 }
 
-/// How long one engine completion may take end to end.
-const ENGINE_GENERATE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(15);
+/// How long the engine itself may take over one completion. The qualification gate is a
+/// ten-second warm p95, so two minutes is generous and no longer a quarter hour.
+const ENGINE_GENERATE_DEADLINE: Duration = Duration::from_mins(2);
+
+/// How long one `generate_bounded` call may take in all: the wait for the service-wide
+/// operation lock behind another generation, a cold model load (180 s allowed), and the
+/// completion.
+pub const GENERATE_TOTAL_DEADLINE: Duration = Duration::from_mins(5);
+
+/// `d` in whole milliseconds, saturating.
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Resolves when `cancel` is (or becomes) `true`; pends forever once every sender is gone.
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// What [`ModelService::reap_orphan_engine`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanReap {
+    /// No pid file, no engine installed, or already checked.
+    NothingToDo,
+    /// The pid file named a process that is gone; the record was removed.
+    Stale,
+    /// The pid file named a live process that is not the recorded engine (the pid was
+    /// reused); nothing was killed and the record was removed.
+    NotOurs {
+        /// The pid that was left alone.
+        pid: u32,
+    },
+    /// A leftover engine proven ours was stopped.
+    Killed {
+        /// The pid that was stopped.
+        pid: u32,
+    },
+}
+
+/// Reads the supervisor's pid file and stops the process it names — only when that
+/// process is provably the engine this daemon family spawned: same executable path, the
+/// recorded `-m <model>` and a `--api-key-file` argument on its command line, and a start
+/// time not before the recorded spawn. A reused pid fails these and is left alone.
+fn reap_recorded_engine(engine: &EngineServer) -> OrphanReap {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Some(record) = engine.pid_record() else {
+        return OrphanReap::NothingToDo;
+    };
+    let pid = Pid::from_u32(record.pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always),
+    );
+    let Some(process) = system.process(pid) else {
+        engine.forget_pid_record();
+        return OrphanReap::Stale;
+    };
+    let same_exe = process.exe().is_some_and(|exe| {
+        exe == record.exe
+            || matches!(
+                (exe.canonicalize(), record.exe.canonicalize()),
+                (Ok(live), Ok(recorded)) if live == recorded
+            )
+    });
+    let args: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let same_model = args
+        .windows(2)
+        .any(|pair| pair[0] == "-m" && Path::new(&pair[1]) == record.model_path);
+    let supervised = args.iter().any(|arg| arg == "--api-key-file");
+    let spawned_s = u64::try_from(record.spawned_ms / 1000).unwrap_or(0);
+    let started_after_spawn = process.start_time().saturating_add(2) >= spawned_s;
+    if !(same_exe && same_model && supervised && started_after_spawn) {
+        engine.forget_pid_record();
+        return OrphanReap::NotOurs { pid: record.pid };
+    }
+    let killed = process.kill_and_wait().is_ok();
+    engine.forget_pid_record();
+    if killed {
+        OrphanReap::Killed { pid: record.pid }
+    } else {
+        OrphanReap::NotOurs { pid: record.pid }
+    }
+}
 
 /// The context the server is started with: [`CONTEXT_TOKENS`] as the
 /// admission envelope, lowered to `<arch>.context_length` when the GGUF
@@ -1242,6 +1512,7 @@ fn engine_error(error: EngineServerError) -> RuntimeError {
             RuntimeError::PromptTooLong { tokens, limit }
         }
         EngineServerError::Cancelled => RuntimeError::Cancelled,
+        exited @ EngineServerError::Exited { .. } => RuntimeError::EngineExited(exited.to_string()),
         other => RuntimeError::LoadFailed(other.to_string()),
     }
 }

@@ -306,8 +306,25 @@ fn credential_arg(args: &Value, op: &str) -> Result<Option<CredentialAction>, Ad
     }
     if let Some(secret) = object.get("set") {
         let secret = secret.as_str().ok_or_else(malformed)?;
+        // A pasted token nearly always carries a trailing newline or space; stored
+        // as is it would be sent inside the Authorization header (or hidden in the
+        // Basic base64) and surface later as a mysterious "credential rejected".
+        let secret = secret.trim();
         if secret.is_empty() {
             return Err(malformed());
+        }
+        // Whatever is left inside must be one plain line: a control character in
+        // the middle is a corrupt paste, and refusing it here beats corrupting a
+        // header later.
+        if secret.chars().any(char::is_control) {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!(
+                    "{op}: the credential contains a control character or line break; \
+                     nothing was stored"
+                ),
+                recovery: "Paste the token again as a single line, then save.",
+            });
         }
         return Ok(Some(CredentialAction::Set(crate::secrets::Secret::new(
             secret.to_owned(),

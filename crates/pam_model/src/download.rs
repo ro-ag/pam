@@ -23,15 +23,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
-use crate::catalog::CATALOG;
-use crate::registry::{Registry, VerifiedRecord, sha256_file};
+use crate::registry::sha256_file;
 
 /// Checkpoint format version. pam-old wrote `1`; nothing has changed.
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -816,6 +815,9 @@ impl Job {
         let stall_secs = self.limits.stall_window.as_secs().max(1);
         let connect_secs = self.limits.connect_timeout.as_secs().max(1);
         let mut command = Command::new(&self.curl);
+        // Same hardening as the connector transport: the daemon's environment may have been
+        // set by whatever started it, so none of it is inherited beyond [`curl_env`].
+        command.env_clear().envs(curl_env(std::env::vars_os()));
         command
             .arg("-q")
             .arg("--fail")
@@ -927,7 +929,7 @@ impl Job {
             );
         }
 
-        if let Err(state) = self.install(&sha256, size_bytes) {
+        if let Err(state) = self.install() {
             return state;
         }
         DownloadState::Done { sha256, size_bytes }
@@ -942,7 +944,7 @@ impl Job {
     /// overwritten. `hard_link` refuses an existing destination inside the
     /// filesystem, atomically, with no check-then-act window. Both names
     /// are in one directory, so the link cannot cross a device.
-    fn install(&self, sha256: &str, size_bytes: u64) -> Result<(), DownloadState> {
+    fn install(&self) -> Result<(), DownloadState> {
         if let Err(error) = std::fs::hard_link(&self.paths.part, &self.request.dest) {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 return Err(DownloadState::failed(
@@ -963,50 +965,15 @@ impl Job {
         // failed download here would be a lie.
         let _ = std::fs::remove_file(&self.paths.part);
 
-        if self.request.expected_sha256.is_some() {
-            self.record_verification(sha256, size_bytes);
-        }
+        // No verification is recorded here: the downloader runs where the models directory
+        // is, and a record written there is forgeable by whoever can write that directory.
+        // The caller records it in its private trust store (`Registry::record_verified`)
+        // once it sees `DownloadState::Done` for a request that carried an expected digest.
 
         let _ = std::fs::remove_file(&self.paths.checkpoint);
         let _ = std::fs::remove_file(&self.etag_file);
         let _ = std::fs::remove_file(&self.paths.lock);
         Ok(())
-    }
-
-    /// Writes the verification sidecar with the digest just computed.
-    ///
-    /// The download hashed the bytes on the way in; making the registry
-    /// re-read gigabytes to learn what is already known would be absurd. A
-    /// failure to write it is not a failure of the download — the file is
-    /// good, and the worst it costs is one re-verification.
-    fn record_verification(&self, sha256: &str, size_bytes: u64) {
-        let Some(models_dir) = self
-            .request
-            .dest
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-        else {
-            return;
-        };
-        let file_name = self
-            .request
-            .dest
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let matches_catalog = CATALOG
-            .iter()
-            .find(|preset| preset.file_name == file_name)
-            .map(|preset| preset.sha256 == sha256 && preset.size_bytes == size_bytes);
-
-        let record = VerifiedRecord {
-            sha256: sha256.to_owned(),
-            size_bytes,
-            verified_ts: now_unix_seconds(),
-            matches_catalog,
-        };
-        let _ = Registry::new(models_dir).record_verified(&self.request.dest, &record);
     }
 
     /// Publishes the part file's current size.
@@ -1117,12 +1084,40 @@ async fn read_stderr_tail(stderr: &mut Option<tokio::process::ChildStderr>) -> S
     }
 }
 
-fn now_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        })
+/// The only variables a download's curl keeps from the daemon's environment: what a
+/// Windows child needs to initialise its network and crypto stack, and the proxy and
+/// CA-bundle variables an enterprise network needs for model downloads to work at all.
+///
+/// Everything else is dropped — notably `SSLKEYLOGFILE` (curl would write TLS secrets
+/// there), `CURL_HOME` and `HOME` (curlrc is disabled with `-q` regardless). The proxy
+/// and CA variables are an explicit, temporary allowlist: the connector transport clears
+/// them too, and the end state is daemon-owned proxy/CA settings written by the human
+/// (owner decision); a download is digest-checked, so a redirected transfer cannot
+/// substitute bytes.
+pub(crate) fn curl_env(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const KEPT: [&str; 17] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+    ];
+    vars.filter(|(name, _)| name.to_str().is_some_and(|name| KEPT.contains(&name)))
+        .collect()
 }
 
 /// The fixed operating-system curl, or `None` when it is absent or its

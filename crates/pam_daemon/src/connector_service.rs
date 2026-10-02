@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use pam_connectors::{
     ArgValue, AuthKind, CallResult, Connection, ConnectorError, ConnectorId, HttpRequest,
-    HttpResponse, HttpTransport, Secret as CallSecret, TransportError, descriptor,
+    HttpResponse, HttpTransport, Secret as CallSecret, TransportError, Url, descriptor,
     validate_base_url,
 };
 use pam_store::{ConnectorPatch, ConnectorRow, Store, StoreError};
@@ -892,6 +892,12 @@ impl HttpTransport for ScopedTransport<'_> {
                     "log redirect requires HTTPS without user information or a fragment".to_owned(),
                 ));
             }
+            if let Some(refusal) = redirect_target_refusal(&target) {
+                return Err(TransportError::Network(format!(
+                    "log redirect to {refusal} is not followed; the one hop must go to a public \
+                     storage host on port 443"
+                )));
+            }
             let mut next = request;
             next.url = target;
             next.headers.retain(|(name, _)| {
@@ -902,6 +908,42 @@ impl HttpTransport for ScopedTransport<'_> {
             self.send_once(next, deadline).await
         })
     }
+}
+
+/// Why a log redirect target must not be fetched, or `None` when it may be.
+///
+/// The one hop a job-log redirect is allowed to take goes to a signed storage URL
+/// (GitHub answers with a public cloud-storage host). A response from a compromised or
+/// hostile service must not be able to aim the daemon at the machine's own network: an
+/// IP literal (loopback, link-local metadata, private ranges), a single-label or
+/// local-looking name, or any port but 443 is refused. The suffixes a strict allowlist
+/// would pin (`.githubusercontent.com`, `.blob.core.windows.net`) are not enforced
+/// because GitHub Enterprise Server stores logs wherever the administrator configured.
+pub(crate) fn redirect_target_refusal(target: &Url) -> Option<String> {
+    let host = target.host_str()?;
+    let Some(domain) = target.domain() else {
+        // `domain()` is `None` for an IPv4 or IPv6 literal.
+        return Some(format!("the address {host}"));
+    };
+    let domain = domain.to_ascii_lowercase();
+    if target.port_or_known_default() != Some(443) {
+        return Some(format!("{domain} on a non-standard port"));
+    }
+    let domain = domain.trim_end_matches('.');
+    let local_suffixes = [
+        ".local",
+        ".localhost",
+        ".internal",
+        ".lan",
+        ".home",
+        ".corp",
+        ".intranet",
+        ".localdomain",
+    ];
+    if !domain.contains('.') || local_suffixes.iter().any(|suffix| domain.ends_with(suffix)) {
+        return Some(format!("the local-looking name {domain}"));
+    }
+    None
 }
 
 pub(crate) fn configured_url(

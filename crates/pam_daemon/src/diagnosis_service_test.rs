@@ -691,3 +691,78 @@ fn diagnosis_use_accumulates_across_calls() {
     assert_eq!(use_.prompt_tokens, 200);
     assert_eq!(use_.completion_tokens, 48);
 }
+
+/// Two offered reads can share an operation name (one per node); the pair's target
+/// selects which one runs. Selecting by name alone ran `target_0`'s read for a
+/// `target_1` request.
+#[tokio::test]
+async fn a_read_is_dispatched_by_its_full_pair_not_its_operation_name() {
+    let recipe = DiagnosisRecipe::jenkins_build_failure();
+    let mut two = inputs();
+    let mut second = bound_read("read_failed_stage");
+    second.dispatch.args.insert("node_id".into(), "7".into());
+    two.reads.push(second);
+    let model = ScriptedModel::text(vec![
+        &read_request_verdict("read_failed_stage", "target_1", "the second node"),
+        &finish_verdict("code", "high", "ev_followup_1"),
+    ]);
+    let reader = ScriptedReader::scripted(vec![Ok(node_evidence_outcome())]);
+
+    let outcome = diagnose(
+        &recipe,
+        two,
+        Budgets::default(),
+        |request| model.generate(request),
+        |dispatch| reader.read(dispatch),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, DiagnosisOutcome::Diagnosed { .. }),
+        "{outcome:?}"
+    );
+    let dispatches = reader.dispatched();
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(
+        dispatches[0].args["node_id"], "7",
+        "target_1 ran, not target_0"
+    );
+}
+
+/// A one-byte quote of a tagged item must not satisfy an authority bar: the span is
+/// derived from the quote, so any substring of the item is "byte-honest".
+#[tokio::test]
+async fn a_one_byte_quote_does_not_earn_the_items_authority_tag() {
+    let recipe = DiagnosisRecipe::jenkins_build_failure();
+    let tiny = r#"{"hypothesis":"code","confidence":"high","summary":"The publish stage asserts.","citations":[{"evidence":"ev_stage","start":0,"end":1,"quote":"e"}],"next":"finish"}"#;
+    let model = ScriptedModel::text(vec![tiny]);
+    let reader = ScriptedReader::scripted(vec![]);
+
+    let (cause, detail, _) = unresolved(
+        diagnose(
+            &recipe,
+            inputs(),
+            Budgets::default(),
+            |request| model.generate(request),
+            |dispatch| reader.read(dispatch),
+        )
+        .await,
+    );
+    assert_eq!(cause, "unsupported_hypothesis");
+    assert!(detail.contains("program_failure"), "{detail}");
+
+    // The same item quoted substantively does support the verdict.
+    let model = ScriptedModel::text(vec![&finish_verdict("code", "high", "ev_stage")]);
+    let outcome = diagnose(
+        &recipe,
+        inputs(),
+        Budgets::default(),
+        |request| model.generate(request),
+        |dispatch| reader.read(dispatch),
+    )
+    .await;
+    assert!(
+        matches!(outcome, DiagnosisOutcome::Diagnosed { .. }),
+        "{outcome:?}"
+    );
+}

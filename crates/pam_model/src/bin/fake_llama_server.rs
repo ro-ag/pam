@@ -1,7 +1,7 @@
 //! A stand-in for `llama-server` used by the engine supervisor tests.
 //!
 //! Accepts the supervisor's argument vector (`-m`, `--host`, `--port`,
-//! `--api-key`, `-c`, …) and answers the handful of routes the supervisor
+//! `--api-key-file`, `-c`, …; `--api-key` too, for tests that spawn it by hand) and answers the handful of routes the supervisor
 //! uses with deterministic JSON: `/health`, `/props`, `/apply-template`,
 //! `/tokenize`, `/v1/chat/completions`.
 //!
@@ -44,7 +44,18 @@ async fn main() {
     };
     let host = value("--host").expect("--host <socket or address>");
     let fake = Fake {
-        api_key: value("--api-key").unwrap_or_default(),
+        // Like llama-server: the key comes from `--api-key-file` (the first
+        // non-empty line) or `--api-key`; with neither, every route is open.
+        api_key: value("--api-key-file")
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| value("--api-key"))
+            .unwrap_or_default(),
         model: std::env::var("PAM_FAKE_MODEL_PATH")
             .ok()
             .or_else(|| value("-m"))

@@ -314,3 +314,39 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.clone())
 }
+
+#[test]
+fn dot_segments_are_refused_not_silently_dropped() {
+    // The `url` crate drops `.` and `..` on extend, so `team/../secret` would be fetched
+    // as `/job/team/job/secret` while the step reports the path it was given.
+    let base = Url::parse("https://ci.example.com/jenkins/").unwrap();
+    for bad in [".", "..", "a\nb", "a\0b"] {
+        let error = endpoint(&base, &["job", "team", "job", bad]).unwrap_err();
+        assert_eq!(error.cause(), "connector_bad_args", "{bad:?} was accepted");
+    }
+    // Percent-encoded dots are an ordinary (encoded) name, not a traversal.
+    let url = endpoint(&base, &["job", "%2e%2e"]).unwrap();
+    assert_eq!(
+        url.as_str(),
+        "https://ci.example.com/jenkins/job/%252e%252e"
+    );
+}
+
+#[test]
+fn a_stored_credential_with_a_line_break_is_refused_with_a_plain_cause() {
+    for secret in ["ghp_abc\n", " ghp_abc", "ghp_a\nX-Injected: 1"] {
+        let conn = Connection {
+            base_url: url("https://api.github.com/"),
+            username: None,
+            secret: Some(Secret::new(secret.to_owned())),
+        };
+        let error = request(
+            ConnectorId::Github,
+            &conn,
+            url("https://api.github.com/user"),
+            16,
+        )
+        .unwrap_err();
+        assert_eq!(error.cause(), "connector_bad_args", "{secret:?}");
+    }
+}

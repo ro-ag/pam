@@ -619,3 +619,408 @@ async fn a_diagnostic_on_a_model_the_engine_does_not_hold_is_refused() {
     assert_eq!(ok.model.id, "qwen/tiny");
     service.unload_all().await.unwrap();
 }
+
+// ---- the trust anchor for weights lives under the daemon's private base ----
+
+/// The legacy sidecar an older pam (or anything that can write the models directory)
+/// leaves beside a file, claiming `sha256`.
+fn plant_sidecar(path: &std::path::Path, sha256: &str, size_bytes: u64) {
+    let record = pam_model::VerifiedRecord {
+        sha256: sha256.to_owned(),
+        size_bytes,
+        verified_ts: 1,
+        matches_catalog: None,
+    };
+    std::fs::write(
+        pam_model::registry::verified_sidecar_path(path),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A planted sidecar naming the qualified digest (the shape of the attack: right
+/// size, written after the file) must not admit the file to a tier. Only a record
+/// in the private base does.
+#[tokio::test]
+async fn a_sidecar_planted_in_the_models_directory_does_not_admit_a_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "forged.gguf");
+    let (sha256, size_bytes) = pam_model::registry::sha256_file(&path).unwrap();
+    service.qualify_for_tests(&sha256);
+    service
+        .set_default(Tier::Light, Some("qwen/forged"))
+        .await
+        .unwrap();
+    plant_sidecar(&path, &sha256, size_bytes);
+
+    let refused = service.resolve(Tier::Light).await.unwrap_err();
+    assert!(
+        matches!(refused, ModelUnavailable::Unverified(ref id) if id == "qwen/forged"),
+        "{refused:?}"
+    );
+    let entry = service.find("qwen/forged").await.unwrap().unwrap();
+    let blocker = crate::model_readiness::admission_blocker(&entry)
+        .expect("not admitted")
+        .1;
+    assert!(
+        blocker.detail.contains("sidecar") && blocker.detail.contains("verify again"),
+        "an install upgraded from sidecars says why it needs a Verify: {}",
+        blocker.detail
+    );
+
+    // The recovery works: Verify records in the private base, and the file serves.
+    service.registry().verify(&entry).unwrap();
+    assert!(
+        service.trust_dir().starts_with(dir.path().join("base")),
+        "the record lives under the daemon's base, not the models directory"
+    );
+    assert_eq!(
+        service.resolve(Tier::Light).await.unwrap().id,
+        "qwen/forged"
+    );
+}
+
+/// Weights rewritten under a verified name stop serving: the verification was a claim
+/// about other bytes, whatever the sidecar-style evidence beside the file says.
+#[tokio::test]
+async fn a_model_rewritten_after_verification_is_refused_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "swapped.gguf");
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Light, Some("qwen/swapped"))
+        .await
+        .unwrap();
+    let before = service.resolve(Tier::Light).await.unwrap();
+
+    // Same size, different bytes.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, b"NOT a real gguf").unwrap();
+
+    let refused = service.resolve(Tier::Light).await.unwrap_err();
+    assert!(
+        matches!(refused, ModelUnavailable::Unverified(ref id) if id == "qwen/swapped"),
+        "{refused:?}"
+    );
+    let entry = service.find("qwen/swapped").await.unwrap().unwrap();
+    assert!(
+        entry
+            .verification_issue
+            .as_deref()
+            .is_some_and(|issue| issue.contains("changed")),
+        "{entry:?}"
+    );
+    // An entry resolved before the rewrite cannot be loaded either.
+    let error = service.ensure_loaded(&before).await.unwrap_err();
+    assert!(
+        matches!(&error, pam_model::RuntimeError::LoadFailed(detail) if detail.contains("changed")),
+        "{error:?}"
+    );
+}
+
+/// A finished download that carried an expected digest is recorded as verified in the
+/// private base; nothing is written beside the weights.
+#[tokio::test]
+async fn a_checked_download_is_recorded_in_the_private_base_not_beside_the_file() {
+    if pam_model::download::curl_path().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let body: Vec<u8> = (0..=255_u8).cycle().take(64 * 1024).collect();
+    let origin = pam_model::testing::serve(body.clone(), "\"etag-1\"").await;
+    let (sha256, size) = {
+        use sha2::{Digest, Sha256};
+        (hex::encode(Sha256::digest(&body)), body.len() as u64)
+    };
+    let dest = dir.path().join("qwen").join("pinned.gguf");
+
+    let job = service
+        .start_download(
+            DownloadRequest {
+                url: origin.url("pinned.gguf"),
+                dest: dest.clone(),
+                expected_size: Some(size),
+                expected_sha256: Some(sha256.clone()),
+                license_id: None,
+            },
+            "qwen/pinned",
+        )
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let status = service.status().await.unwrap();
+        let row = status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == job.as_str())
+            .unwrap()
+            .clone();
+        if row["state"] != JOB_RUNNING {
+            assert_eq!(row["state"], "done", "{row}");
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(!pam_model::registry::verified_sidecar_path(&dest).exists());
+    let entry = service.find("qwen/pinned").await.unwrap().unwrap();
+    assert_eq!(
+        entry.verified.as_ref().map(|record| record.sha256.as_str()),
+        Some(sha256.as_str())
+    );
+    assert!(std::fs::read_dir(service.trust_dir()).unwrap().count() >= 1);
+}
+
+// ---- a dead engine is noticed, a failing one is not "in use", a wedged one is bounded ----
+
+#[cfg(unix)]
+async fn loaded_fake_service(prefix: &str) -> Option<(Arc<ModelService>, tempfile::TempDir)> {
+    let fake = fake_engine_binary()?;
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in("/tmp")
+        .unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let path = touch_model(dir.path(), "qwen", "tiny.gguf");
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Light, Some("qwen/tiny"))
+        .await
+        .unwrap();
+    install_fake_engine(&service, &fake);
+    Some((service, dir))
+}
+
+#[cfg(unix)]
+fn echo_request(prompt: &str) -> pam_model::runtime::GenerateRequest {
+    pam_model::runtime::GenerateRequest {
+        system: None,
+        prompt: prompt.into(),
+        max_tokens: 16,
+        temperature: 0.0,
+        stop: Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_engine_killed_from_outside_is_reported_and_the_next_request_reloads() {
+    let Some((service, _dir)) = loaded_fake_service("pam-mx-").await else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    service
+        .generate_bounded(Tier::Light, echo_request("one"), 4096)
+        .await
+        .unwrap();
+    let pid = service.engine_server().unwrap().model().unwrap().pid;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    while service.snapshot().state != pam_model::RuntimeState::Idle {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "still 'loaded'"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let status = service.status().await.unwrap();
+    assert!(status["engine"]["loaded"].is_null());
+    assert_eq!(
+        status["engine"]["exited"]["model_id"], "qwen/tiny",
+        "the human sees that the engine died, and which model it held: {status}"
+    );
+
+    // No manual Unload needed: the next request starts a fresh engine.
+    let again = service
+        .generate_bounded(Tier::Light, echo_request("two"), 4096)
+        .await
+        .unwrap();
+    assert_eq!(again.text, "echo: two");
+    let status = service.status().await.unwrap();
+    assert!(
+        status["engine"]["exited"].is_null(),
+        "a fresh load clears it"
+    );
+    service.unload_all().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_generation_does_not_count_as_use() {
+    let Some((service, _dir)) = loaded_fake_service("pam-mu-").await else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    service
+        .generate_bounded(Tier::Light, echo_request("one"), 4096)
+        .await
+        .unwrap();
+    service.last_used_for_tests(Some(1_000));
+
+    // A prompt over the limit fails on the engine's own count.
+    let refused = service
+        .generate_bounded(Tier::Light, echo_request("a b c d e f g h"), 2)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, ModelUnavailable::Runtime(_)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        service.last_used_for_tests(None),
+        1_000,
+        "a refusal must not keep the weights resident past the idle window"
+    );
+
+    service
+        .generate_bounded(Tier::Light, echo_request("two"), 4096)
+        .await
+        .unwrap();
+    assert!(service.last_used_for_tests(None) > 1_000);
+    service.unload_all().await.unwrap();
+}
+
+/// A daemon killed with SIGKILL leaves its engine running. The next daemon finds it
+/// through the pid file and stops it — and only it: a pid file naming some other
+/// process is cleared and that process is left alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_engine_a_dead_daemon_left_behind_is_stopped_but_a_stranger_is_not() {
+    use crate::model_service::OrphanReap;
+    let Some((first, dir)) = loaded_fake_service("pam-mo-").await else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    first
+        .generate_bounded(Tier::Light, echo_request("one"), 4096)
+        .await
+        .unwrap();
+    let orphan = first.engine_server().unwrap().model().unwrap().pid;
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(orphan));
+
+    // "The daemon restarted": a second service over the same base, which never loaded
+    // anything itself. (The first one is leaked, as a SIGKILLed process would be.)
+    let second = service(dir.path()).await;
+    second.set_engine_base(dir.path().join("base"));
+    let leaked = Arc::clone(&first);
+    std::mem::forget(leaked);
+    let reaped = second.reap_orphan_engine().await;
+    assert_eq!(reaped, OrphanReap::Killed { pid: orphan });
+    let started = std::time::Instant::now();
+    while alive(orphan) && started.elapsed() < std::time::Duration::from_secs(10) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!alive(orphan), "the leftover engine is gone");
+    assert!(second.engine_server().unwrap().pid_record().is_none());
+
+    // A pid file that names an unrelated live process (pid reuse): nothing is killed.
+    let mut stranger = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let server = second.engine_server().unwrap();
+    std::fs::write(
+        server.pid_file(),
+        serde_json::to_vec(&pam_model::engine_server::EnginePidRecord {
+            pid: stranger.id(),
+            exe: server.binary().to_path_buf(),
+            model_path: dir.path().join("qwen").join("tiny.gguf"),
+            spawned_ms: 0,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let third = service(dir.path()).await;
+    third.set_engine_base(dir.path().join("base"));
+    let outcome = third.reap_orphan_engine().await;
+    assert_eq!(outcome, OrphanReap::NotOurs { pid: stranger.id() });
+    assert!(alive(stranger.id()), "an unrelated process must survive");
+    assert!(server.pid_record().is_none(), "the stale record is cleared");
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+}
+
+/// The cancel receiver and the total deadline stop a generation that is stuck behind
+/// the service-wide lock, instead of queueing for a quarter hour.
+#[tokio::test]
+async fn a_generation_waiting_behind_a_stuck_one_is_cancelled_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let request = || pam_model::runtime::GenerateRequest {
+        system: None,
+        prompt: "x".into(),
+        max_tokens: 1,
+        temperature: 0.0,
+        stop: Vec::new(),
+    };
+    // Something else holds the operation lock for the whole test.
+    let _stuck = service.operation.lock().await;
+
+    // Cancel: returns promptly with `Cancelled`.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let waiting = service.generate_bounded_cancellable(Tier::Light, request(), 16, cancel_rx);
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => result,
+            () = async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancel_tx.send(true).unwrap();
+                std::future::pending::<()>().await;
+            } => unreachable!(),
+        }
+    })
+    .await
+    .expect("the cancel took effect");
+    assert!(
+        matches!(
+            cancelled,
+            Err(ModelUnavailable::Runtime(
+                pam_model::RuntimeError::Cancelled
+            ))
+        ),
+        "{cancelled:?}"
+    );
+
+    // Deadline: with nobody cancelling, the total deadline ends the wait.
+    service.set_generate_deadlines_for_tests(
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_millis(300),
+    );
+    let (_keep, never) = tokio::sync::watch::channel(false);
+    let started = std::time::Instant::now();
+    let error = service
+        .generate_bounded_cancellable(Tier::Light, request(), 16, never)
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(
+        matches!(&error, ModelUnavailable::Runtime(pam_model::RuntimeError::GenerationFailed(detail)) if detail.contains("no result within")),
+        "{error:?}"
+    );
+}

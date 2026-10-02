@@ -23,6 +23,7 @@ pub mod engine_http;
 pub mod engine_server;
 pub mod error;
 pub mod gguf;
+pub(crate) mod private;
 pub mod qualification;
 #[cfg(test)]
 mod qualification_test;
@@ -39,7 +40,8 @@ pub mod testing;
 
 pub use catalog::{CATALOG, Preset, find_preset};
 pub use curator::{
-    AgentCli, AgentId, CuratorError, INVOKE_MAX_OUTPUT, detect, invoke, invoke_args,
+    AgentCli, AgentId, CuratorError, Detection, INVOKE_MAX_OUTPUT, UntrustedCli, detect, invoke,
+    invoke_args, trusted_dirs,
 };
 pub use download::{
     DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState, curl_path,
@@ -48,8 +50,8 @@ pub use download::{
 pub use gguf::{GgufError, GgufInfo, read_info};
 pub use qualification::{QUALIFIED, Qualification};
 pub use registry::{
-    ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord, VerifyOutcome, classify,
-    default_models_dir,
+    FileFingerprint, ModelClass, ModelEntry, Registry, RegistryError, VerifiedRecord,
+    VerifyOutcome, classify, default_models_dir,
 };
 pub use runtime::{
     CONTEXT_TOKENS, GenerateRequest, GenerateResult, LoadedModel, RuntimeError, RuntimeSnapshot,
@@ -66,3 +68,5 @@ mod download_test;
 mod gguf_test;
 #[cfg(test)]
 mod registry_test;
+#[cfg(test)]
+mod runtime_test;

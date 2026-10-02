@@ -2,12 +2,25 @@
 //! loaded model, a private Unix socket, and bounded generation over it.
 //!
 //! The server is spawned with a scrubbed environment, an API key only PAM
-//! knows, no web UI, the GGUF's own chat template (`--jinja`), thinking
-//! disabled by budget, and the context size from the admission envelope.
-//! PAM talks to it with [`crate::engine_http`]; a cancel drops the
-//! connection, which stops decoding on the server side. Unloading kills
-//! the process. Nothing here downloads or verifies the engine — that is
-//! [`crate::engine`].
+//! knows (handed over as a `0600` key file, `--api-key-file`, never on the
+//! argument vector where `ps` would show it), no web UI, the GGUF's own chat
+//! template (`--jinja`), thinking disabled by budget, and the context size
+//! from the admission envelope. PAM talks to it with [`crate::engine_http`];
+//! a cancel drops the connection, which stops decoding on the server side.
+//! Unloading kills the process. Nothing here downloads or verifies the
+//! engine — that is [`crate::engine`].
+//!
+//! The supervisor does not trust its endpoint or its child blindly. A free
+//! loopback port is probed and released before the spawn, so another process
+//! can take it first: every health poll re-checks that the child is still
+//! alive, a healthy reply is accepted only after the child has survived a
+//! short bind grace, the peer must refuse a wrong key and name our model, and
+//! a child that exits early on a loopback port is retried on a fresh one. A
+//! child that dies later is noticed ([`EngineServer::model`] goes `None`,
+//! [`EngineServer::last_exit`] says why, generation reports
+//! [`EngineServerError::Exited`]) and the next load starts a new one. A pid
+//! file in the private runtime directory lets the next daemon find an engine
+//! its predecessor left behind.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,6 +36,21 @@ use crate::runtime::GenerateRequest;
 
 /// The longest a Unix socket path may be on macOS (`sun_path`).
 pub const MAX_SOCKET_PATH_BYTES: usize = 104;
+
+/// How long a freshly spawned server must have stayed alive before a healthy
+/// answer on its endpoint is believed. A server that cannot bind (another
+/// process took the port or the socket path first) exits within moments of the
+/// spawn; until it has survived this long, the answer may be that other
+/// process's.
+const BIND_GRACE: Duration = Duration::from_millis(500);
+
+/// How many times a load tries a fresh loopback port after the child died or
+/// its endpoint turned out to be someone else's.
+const MAX_LOAD_ATTEMPTS: usize = 3;
+
+/// A key that is certainly not the server's, sent once to prove the peer
+/// enforces `--api-key-file` before the real key goes anywhere.
+const WRONG_KEY_PROBE: &str = "pam-engine-identity-probe-not-the-key";
 
 /// How the server is started for one model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +141,16 @@ pub enum EngineServerError {
     /// The server did not report healthy within the load timeout.
     #[error("engine did not become healthy within {0:?}")]
     LoadTimeout(Duration),
+    /// The server process died after it had loaded (killed for memory, crashed,
+    /// stopped by hand). Nothing is loaded now; loading the model again starts a
+    /// new one.
+    #[error("engine exited ({status}); load the model again: {log_tail}")]
+    Exited {
+        /// The exit status text.
+        status: String,
+        /// The end of the server log.
+        log_tail: String,
+    },
     /// No model is loaded.
     #[error("no model is loaded in the engine")]
     NoModelLoaded,
@@ -143,6 +181,39 @@ pub enum EngineServerError {
     Malformed(String),
 }
 
+/// Why a server that had loaded is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineExit {
+    /// Registry id of the model it held.
+    pub model_id: String,
+    /// The exit status text.
+    pub status: String,
+    /// The end of the server log.
+    pub log_tail: String,
+    /// Unix milliseconds when the exit was noticed.
+    pub noticed_at_ms: i64,
+}
+
+/// What the supervisor writes to `engine.pid` after spawning a server, so a later
+/// daemon can recognise a server its predecessor left running. The reader must
+/// verify the live process against `exe` and `started_ms`/the arguments before
+/// treating it as ours: a pid alone is reused by the operating system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnginePidRecord {
+    /// Operating-system process id of the server.
+    pub pid: u32,
+    /// The engine binary that was spawned.
+    pub exe: PathBuf,
+    /// The GGUF it was asked to load (`-m`).
+    pub model_path: PathBuf,
+    /// Unix milliseconds just before the spawn; a live process that started before
+    /// this cannot be the one that was spawned.
+    pub spawned_ms: i64,
+}
+
+/// Source of loopback ports, for tests that need to know the port in advance.
+type PortSource = Arc<dyn Fn() -> Option<u16> + Send + Sync>;
+
 struct Live {
     child: tokio::process::Child,
     api_key: String,
@@ -156,10 +227,16 @@ struct Live {
 pub struct EngineServer {
     binary: PathBuf,
     socket: PathBuf,
+    /// Private directory for the key file and the pid file (`<run dir>/engine`).
+    runtime: PathBuf,
     log: PathBuf,
     live: Arc<Mutex<Option<Live>>>,
     /// The endpoint the running server was started on.
     endpoint: Mutex<Option<Endpoint>>,
+    /// Why the last server that had loaded is gone, until the next load or unload.
+    exited: Mutex<Option<EngineExit>>,
+    /// Forces loopback endpoints with ports from this source; tests only.
+    port_source: Mutex<Option<PortSource>>,
 }
 
 #[allow(
@@ -191,10 +268,64 @@ impl EngineServer {
         Ok(Self {
             binary,
             socket,
+            runtime: run_dir.join("engine"),
             log: log_dir.join("llama-server.log"),
             live: Arc::new(Mutex::new(None)),
             endpoint: Mutex::new(None),
+            exited: Mutex::new(None),
+            port_source: Mutex::new(None),
         })
+    }
+
+    /// Makes every load use a loopback endpoint on the port `source` returns instead
+    /// of the private socket. Exists so a test can occupy the port the supervisor is
+    /// about to pick; production never calls it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_loopback_ports(
+        self,
+        source: impl Fn() -> Option<u16> + Send + Sync + 'static,
+    ) -> Self {
+        *self
+            .port_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(source));
+        self
+    }
+
+    /// Where the per-load API key file is written (removed once the server is
+    /// healthy, and on every exit path).
+    #[must_use]
+    pub fn key_file(&self) -> PathBuf {
+        self.runtime.join("api.key")
+    }
+
+    /// Where the pid record of the running server is kept.
+    #[must_use]
+    pub fn pid_file(&self) -> PathBuf {
+        self.runtime.join("engine.pid")
+    }
+
+    /// The pid record a previous supervisor left, if one is there and parses.
+    #[must_use]
+    pub fn pid_record(&self) -> Option<EnginePidRecord> {
+        let bytes = std::fs::read(self.pid_file()).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Removes the pid record (the process it named is gone or was never ours).
+    pub fn forget_pid_record(&self) {
+        let _ = std::fs::remove_file(self.pid_file());
+    }
+
+    /// Why the last server that had loaded is gone, when it died on its own.
+    /// Cleared by the next load or unload.
+    #[must_use]
+    pub fn last_exit(&self) -> Option<EngineExit> {
+        self.exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The socket the server listens on (Unix hosts).
@@ -221,6 +352,16 @@ impl EngineServer {
     /// Picks the endpoint for a new server: the private Unix socket where
     /// the platform has them, otherwise a free loopback port.
     fn choose_endpoint(&self) -> Result<Endpoint, EngineServerError> {
+        let source = self
+            .port_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(source) = source {
+            return source().map(Endpoint::Loopback).ok_or_else(|| {
+                EngineServerError::SocketPath("no loopback port to try".to_owned())
+            });
+        }
         if cfg!(unix) {
             return Ok(Endpoint::Unix(self.socket.clone()));
         }
@@ -234,9 +375,46 @@ impl EngineServer {
         Ok(Endpoint::Loopback(port))
     }
 
-    /// The loaded model, if any.
+    /// Notices a server that died on its own: takes it out of service, records why
+    /// ([`Self::last_exit`]), and removes its socket and pid file. `None` when the
+    /// server is alive, or none runs.
+    fn poll_exit(&self) -> Option<EngineExit> {
+        let exit = {
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let status = match live.as_mut()?.child.try_wait() {
+                Ok(Some(status)) => status.to_string(),
+                Ok(None) => return None,
+                Err(error) => format!("status unreadable: {error}"),
+            };
+            let gone = live.take()?;
+            EngineExit {
+                model_id: gone.model.id,
+                status,
+                log_tail: log_tail(&self.log),
+                noticed_at_ms: now_ms(),
+            }
+        };
+        *self
+            .endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_file(&self.socket);
+        self.forget_pid_record();
+        *self
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(exit.clone());
+        Some(exit)
+    }
+
+    /// The loaded model, if any. A server found dead is noticed here and reported
+    /// as nothing loaded ([`Self::last_exit`] says why).
     #[must_use]
     pub fn model(&self) -> Option<EngineModel> {
+        self.poll_exit();
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -287,6 +465,11 @@ impl EngineServer {
 
     /// Starts the server on `model_path` and waits for it to report
     /// healthy. An already loaded model is unloaded first.
+    ///
+    /// On a loopback endpoint a child that exits early, or an endpoint whose answer
+    /// is not ours, is retried on a fresh port (up to `MAX_LOAD_ATTEMPTS`): the
+    /// port was probed and released before the spawn, and another process may have
+    /// taken it in between.
     pub async fn load(
         &self,
         model_id: &str,
@@ -301,83 +484,58 @@ impl EngineServer {
             std::fs::create_dir_all(dir)
                 .map_err(|e| EngineServerError::SocketPath(format!("{}: {e}", dir.display())))?;
         }
+        crate::private::create_private_dir(&self.runtime).map_err(|e| {
+            EngineServerError::SocketPath(format!("{}: {e}", self.runtime.display()))
+        })?;
+        let mut last = None;
+        for _ in 0..MAX_LOAD_ATTEMPTS {
+            match self.load_once(model_id, model_path, options).await {
+                Ok(model) => return Ok(model),
+                Err(attempt) if attempt.retry => last = Some(attempt.error),
+                Err(attempt) => return Err(attempt.error),
+            }
+        }
+        Err(last.unwrap_or_else(|| EngineServerError::Spawn("no load attempt ran".to_owned())))
+    }
+
+    /// One spawn-and-wait. `retry` says whether a fresh endpoint could change the
+    /// outcome (the child died early, or the peer was a stranger).
+    async fn load_once(
+        &self,
+        model_id: &str,
+        model_path: &Path,
+        options: &ServerOptions,
+    ) -> Result<EngineModel, LoadAttempt> {
         let _ = std::fs::remove_file(&self.socket);
         let endpoint = self.choose_endpoint()?;
+        let retryable = matches!(endpoint, Endpoint::Loopback(_));
         let api_key = fresh_api_key(model_path)?;
-        let mut child = self.spawn(model_path, &endpoint, options, &api_key)?;
+        let key_file = self.key_file();
+        crate::private::write_private_file(&key_file, format!("{api_key}\n").as_bytes())
+            .map_err(|e| EngineServerError::Spawn(format!("write the API key file: {e}")))?;
+        // The key file goes away on every path out of here, success included
+        // (the server read it at startup; generation uses the key in memory).
+        let _key_file = RemoveOnDrop(key_file.clone());
+        let spawned_ms = now_ms();
+        let mut child = self.spawn(model_path, &endpoint, options, &key_file)?;
         let pid = child.id().unwrap_or_default();
-        let deadline = Instant::now() + options.load_timeout;
-        loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(EngineServerError::Crashed {
-                    status: status.to_string(),
-                    log_tail: log_tail(&self.log),
-                });
-            }
-            if Instant::now() >= deadline {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = std::fs::remove_file(&self.socket);
-                return Err(EngineServerError::LoadTimeout(options.load_timeout));
-            }
-            if matches!(endpoint, Endpoint::Loopback(_)) || self.socket.exists() {
-                let health = engine_http::request(
-                    &endpoint,
-                    "GET",
-                    "/health",
-                    &api_key,
-                    None,
-                    Duration::from_secs(2),
-                )
-                .await;
-                if let Ok(reply) = health
-                    && reply.status == 200
-                    && serde_json::from_slice::<serde_json::Value>(&reply.body)
-                        .is_ok_and(|v| v["status"] == "ok")
-                {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        let props = engine_http::request(
-            &endpoint,
-            "GET",
-            "/props",
-            &api_key,
-            None,
-            Duration::from_secs(10),
-        )
-        .await
-        .ok()
-        .and_then(|reply| serde_json::from_slice::<serde_json::Value>(&reply.body).ok());
-        // Health alone does not prove the peer is our child: on a loopback
-        // port the number was probed and released before the spawn, and
-        // another local process could have taken it in between — in which
-        // case it now holds the bearer key. The server's own `/props`
-        // names the model it loaded; anything but our path is a stranger,
-        // and the child is stopped rather than trusted.
-        let served_path = props.as_ref().and_then(|p| p["model_path"].as_str());
-        if served_path != Some(model_path.to_string_lossy().as_ref()) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            let _ = std::fs::remove_file(&self.socket);
-            return Err(EngineServerError::Spawn(format!(
-                "the server at {} reports model {:?}, not {}; refusing to trust it",
-                endpoint.host_arg(),
-                served_path.unwrap_or("<none>"),
-                model_path.display()
-            )));
-        }
+        self.write_pid_record(&EnginePidRecord {
+            pid,
+            exe: self.binary.clone(),
+            model_path: model_path.to_path_buf(),
+            spawned_ms,
+        });
+        let started = Instant::now();
+        self.wait_healthy(&mut child, &endpoint, &api_key, options, started, retryable)
+            .await?;
+        let props = self
+            .prove_peer(&mut child, &endpoint, &api_key, model_path, retryable)
+            .await?;
         let model = EngineModel {
             id: model_id.to_owned(),
             path: model_path.to_path_buf(),
             context_length: options.context_tokens,
-            build_info: props
-                .as_ref()
-                .and_then(|p| p["build_info"].as_str())
-                .unwrap_or("unknown")
-                .to_owned(),
+            build_info: props["build_info"].as_str().unwrap_or("unknown").to_owned(),
             loaded_at_ms: now_ms(),
             pid,
         };
@@ -394,7 +552,158 @@ impl EngineServer {
             .endpoint
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint);
+        *self
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(model)
+    }
+
+    /// The attempt a child's early exit is.
+    fn crashed(&self, status: std::process::ExitStatus, retry: bool) -> LoadAttempt {
+        self.abandon_files();
+        LoadAttempt {
+            error: EngineServerError::Crashed {
+                status: status.to_string(),
+                log_tail: log_tail(&self.log),
+            },
+            retry,
+        }
+    }
+
+    /// Polls until the server reports healthy, the child dies, or the load times out.
+    async fn wait_healthy(
+        &self,
+        child: &mut tokio::process::Child,
+        endpoint: &Endpoint,
+        api_key: &str,
+        options: &ServerOptions,
+        started: Instant,
+        retryable: bool,
+    ) -> Result<(), LoadAttempt> {
+        let deadline = started + options.load_timeout;
+        loop {
+            // Checked on every poll, before the health request: another process
+            // answering on the endpoint must never mask a child that has died.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(self.crashed(status, retryable));
+            }
+            if Instant::now() >= deadline {
+                self.abandon(child).await;
+                return Err(EngineServerError::LoadTimeout(options.load_timeout).into());
+            }
+            if (matches!(endpoint, Endpoint::Loopback(_)) || self.socket.exists())
+                && self.healthy(endpoint, api_key, started, deadline).await
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Health alone does not prove the peer is our child. The peer must refuse a key it
+    /// was not started with (a real server enforces `--api-key-file`; a stranger that
+    /// answers everything is caught before the real key goes to it), must name the model
+    /// we asked for, and the child must still be alive afterwards: a child that lost the
+    /// race for its endpoint is dead by now and the answers were someone else's.
+    /// Answers the server's `/props`.
+    async fn prove_peer(
+        &self,
+        child: &mut tokio::process::Child,
+        endpoint: &Endpoint,
+        api_key: &str,
+        model_path: &Path,
+        retryable: bool,
+    ) -> Result<serde_json::Value, LoadAttempt> {
+        let wrong = engine_http::request(
+            endpoint,
+            "GET",
+            "/props",
+            WRONG_KEY_PROBE,
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+        if wrong.as_ref().is_ok_and(|reply| reply.status < 400) {
+            self.abandon(child).await;
+            return Err(LoadAttempt {
+                error: EngineServerError::Spawn(format!(
+                    "the server at {} answered without the API key; refusing to trust it",
+                    endpoint.host_arg()
+                )),
+                retry: retryable,
+            });
+        }
+        let props = engine_http::request(
+            endpoint,
+            "GET",
+            "/props",
+            api_key,
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .ok()
+        .and_then(|reply| (reply.status == 200).then_some(reply))
+        .and_then(|reply| serde_json::from_slice::<serde_json::Value>(&reply.body).ok());
+        // The server's own `/props` names the model it loaded; anything but our
+        // path is a stranger, and the child is stopped rather than trusted.
+        let served_path = props.as_ref().and_then(|p| p["model_path"].as_str());
+        if served_path != Some(model_path.to_string_lossy().as_ref()) {
+            self.abandon(child).await;
+            return Err(LoadAttempt {
+                error: EngineServerError::Spawn(format!(
+                    "the server at {} reports model {:?}, not {}; refusing to trust it",
+                    endpoint.host_arg(),
+                    served_path.unwrap_or("<none>"),
+                    model_path.display()
+                )),
+                retry: retryable,
+            });
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(self.crashed(status, retryable));
+        }
+        Ok(props.unwrap_or_default())
+    }
+
+    /// One health poll: `true` only for an `ok` answer from a server that has been
+    /// alive for the bind grace.
+    async fn healthy(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        started: Instant,
+        deadline: Instant,
+    ) -> bool {
+        let patience =
+            Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
+        let health =
+            engine_http::request(endpoint, "GET", "/health", api_key, None, patience).await;
+        let ok = health.is_ok_and(|reply| {
+            reply.status == 200
+                && serde_json::from_slice::<serde_json::Value>(&reply.body)
+                    .is_ok_and(|v| v["status"] == "ok")
+        });
+        ok && started.elapsed() >= BIND_GRACE
+    }
+
+    fn write_pid_record(&self, record: &EnginePidRecord) {
+        if let Ok(json) = serde_json::to_vec(record) {
+            let _ = crate::private::write_private_file(&self.pid_file(), &json);
+        }
+    }
+
+    /// Stops a child that is not being trusted and removes what it left.
+    async fn abandon(&self, child: &mut tokio::process::Child) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        self.abandon_files();
+    }
+
+    fn abandon_files(&self) {
+        let _ = std::fs::remove_file(&self.socket);
+        self.forget_pid_record();
     }
 
     fn spawn(
@@ -402,11 +711,13 @@ impl EngineServer {
         model_path: &Path,
         endpoint: &Endpoint,
         options: &ServerOptions,
-        api_key: &str,
+        key_file: &Path,
     ) -> Result<tokio::process::Child, EngineServerError> {
         let mut args = self.launch_args(model_path, endpoint, options);
-        args.push("--api-key".to_owned());
-        args.push(api_key.to_owned());
+        // The key travels as a file only the daemon's user can read; an argument
+        // would show it to every process that can list this one's arguments.
+        args.push("--api-key-file".to_owned());
+        args.push(key_file.to_string_lossy().into_owned());
         let mut command = tokio::process::Command::new(&self.binary);
         command
             .args(&args)
@@ -431,7 +742,7 @@ impl EngineServer {
             .map_err(|e| EngineServerError::Spawn(e.to_string()))
     }
 
-    /// Stops the server, if one runs, and removes its socket.
+    /// Stops the server, if one runs, and removes its socket and pid file.
     pub async fn unload(&self) {
         let live = self
             .live
@@ -446,7 +757,11 @@ impl EngineServer {
             .endpoint
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let _ = std::fs::remove_file(&self.socket);
+        *self
+            .exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.abandon_files();
     }
 
     /// One bounded chat completion. The framed prompt is counted first and
@@ -459,105 +774,149 @@ impl EngineServer {
         input_limit: usize,
         deadline: Duration,
     ) -> Result<EngineResult, EngineServerError> {
-        let (api_key, thinking_off) = self
+        // A server that died since the last call is reported as exited, not as a
+        // transport failure to a socket nobody listens on.
+        self.poll_exit();
+        let Some((api_key, thinking_off)) = self
             .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|live| (live.api_key.clone(), live.reasoning_budget == 0))
-            .ok_or(EngineServerError::NoModelLoaded)?;
+        else {
+            return Err(self
+                .exited_error()
+                .unwrap_or(EngineServerError::NoModelLoaded));
+        };
         let endpoint = self.endpoint().ok_or(EngineServerError::NoModelLoaded)?;
+        let work = self.complete(
+            &endpoint,
+            &api_key,
+            thinking_off,
+            request,
+            input_limit,
+            deadline,
+        );
+        let outcome = tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => return Err(EngineServerError::Cancelled),
+            result = Box::pin(work) => result,
+        };
+        if matches!(outcome, Err(EngineServerError::Http(_))) {
+            // A dead server and a broken connection look the same from here; the
+            // process knows which. The exit lands a moment after the socket closes.
+            for _ in 0..3 {
+                if self.poll_exit().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if let Some(error) = self.exited_error() {
+                return Err(error);
+            }
+        }
+        outcome
+    }
+
+    /// The three requests of one completion: frame, count, generate.
+    async fn complete(
+        &self,
+        endpoint: &Endpoint,
+        api_key: &str,
+        thinking_off: bool,
+        request: &GenerateRequest,
+        input_limit: usize,
+        deadline: Duration,
+    ) -> Result<EngineResult, EngineServerError> {
         let mut messages = Vec::new();
         if let Some(system) = &request.system {
             messages.push(serde_json::json!({"role": "system", "content": system}));
         }
         messages.push(serde_json::json!({"role": "user", "content": request.prompt}));
-
-        let work = async {
-            let framed = self
-                .post(
-                    &endpoint,
-                    &api_key,
-                    "/apply-template",
-                    &serde_json::json!({"messages": messages}),
-                    Duration::from_secs(30),
-                )
-                .await?;
-            let prompt = framed["prompt"]
-                .as_str()
-                .ok_or_else(|| EngineServerError::Malformed("apply-template has no prompt".into()))?
-                .to_owned();
-            let counted = self
-                .post(
-                    &endpoint,
-                    &api_key,
-                    "/tokenize",
-                    &serde_json::json!({"content": prompt, "add_special": true}),
-                    Duration::from_secs(30),
-                )
-                .await?;
-            let tokens = counted["tokens"]
-                .as_array()
-                .map(Vec::len)
-                .ok_or_else(|| EngineServerError::Malformed("tokenize has no tokens".into()))?;
-            if tokens > input_limit {
-                return Err(EngineServerError::InputTooLong {
-                    tokens,
-                    limit: input_limit,
-                });
-            }
-            let reply = self
-                .post(
-                    &endpoint,
-                    &api_key,
-                    "/v1/chat/completions",
-                    &serde_json::json!({
-                        "messages": messages,
-                        "max_tokens": output_budget(request.max_tokens),
-                        "temperature": request.temperature,
-                        "stop": request.stop,
-                        "stream": false,
-                        // Bounded tasks are scored on reproducibility: no
-                        // prompt-cache reuse and a fixed seed keep two runs
-                        // of one request on one server identical.
-                        "cache_prompt": false,
-                        "seed": 7,
-                        // Qwen-style templates gate thinking here; a budget
-                        // of 0 alone leaves them emitting an empty answer.
-                        "chat_template_kwargs": {"enable_thinking": !thinking_off},
-                    }),
-                    deadline,
-                )
-                .await?;
-            let choice = reply["choices"]
-                .get(0)
-                .ok_or_else(|| EngineServerError::Malformed("no choices".into()))?;
-            Ok(EngineResult {
-                text: choice["message"]["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                prompt_tokens: usize::try_from(
-                    reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                )
-                .unwrap_or(usize::MAX),
-                completion_tokens: usize::try_from(
-                    reply["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                )
-                .unwrap_or(usize::MAX),
-                prompt_ms: reply["timings"]["prompt_ms"].as_f64().unwrap_or(0.0),
-                predicted_ms: reply["timings"]["predicted_ms"].as_f64().unwrap_or(0.0),
-                finish_reason: choice["finish_reason"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_owned(),
-            })
-        };
-        tokio::select! {
-            biased;
-            () = cancelled(&mut cancel) => Err(EngineServerError::Cancelled),
-            result = Box::pin(work) => result,
+        let framed = self
+            .post(
+                endpoint,
+                api_key,
+                "/apply-template",
+                &serde_json::json!({"messages": messages}),
+                Duration::from_secs(30),
+            )
+            .await?;
+        let prompt = framed["prompt"]
+            .as_str()
+            .ok_or_else(|| EngineServerError::Malformed("apply-template has no prompt".into()))?
+            .to_owned();
+        let counted = self
+            .post(
+                endpoint,
+                api_key,
+                "/tokenize",
+                &serde_json::json!({"content": prompt, "add_special": true}),
+                Duration::from_secs(30),
+            )
+            .await?;
+        let tokens = counted["tokens"]
+            .as_array()
+            .map(Vec::len)
+            .ok_or_else(|| EngineServerError::Malformed("tokenize has no tokens".into()))?;
+        if tokens > input_limit {
+            return Err(EngineServerError::InputTooLong {
+                tokens,
+                limit: input_limit,
+            });
         }
+        let reply = self
+            .post(
+                endpoint,
+                api_key,
+                "/v1/chat/completions",
+                &serde_json::json!({
+                    "messages": messages,
+                    "max_tokens": output_budget(request.max_tokens),
+                    "temperature": request.temperature,
+                    "stop": request.stop,
+                    "stream": false,
+                    // Bounded tasks are scored on reproducibility: no
+                    // prompt-cache reuse and a fixed seed keep two runs
+                    // of one request on one server identical.
+                    "cache_prompt": false,
+                    "seed": 7,
+                    // Qwen-style templates gate thinking here; a budget
+                    // of 0 alone leaves them emitting an empty answer.
+                    "chat_template_kwargs": {"enable_thinking": !thinking_off},
+                }),
+                deadline,
+            )
+            .await?;
+        let choice = reply["choices"]
+            .get(0)
+            .ok_or_else(|| EngineServerError::Malformed("no choices".into()))?;
+        Ok(EngineResult {
+            text: choice["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            prompt_tokens: usize::try_from(reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0))
+                .unwrap_or(usize::MAX),
+            completion_tokens: usize::try_from(
+                reply["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            )
+            .unwrap_or(usize::MAX),
+            prompt_ms: reply["timings"]["prompt_ms"].as_f64().unwrap_or(0.0),
+            predicted_ms: reply["timings"]["predicted_ms"].as_f64().unwrap_or(0.0),
+            finish_reason: choice["finish_reason"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned(),
+        })
+    }
+
+    /// [`EngineServerError::Exited`] for the last server that died, if one did.
+    fn exited_error(&self) -> Option<EngineServerError> {
+        self.last_exit().map(|exit| EngineServerError::Exited {
+            status: exit.status,
+            log_tail: exit.log_tail,
+        })
     }
 
     async fn post(
@@ -583,6 +942,30 @@ impl EngineServer {
     }
 }
 
+/// A failed load attempt and whether a fresh endpoint could change the outcome.
+struct LoadAttempt {
+    error: EngineServerError,
+    retry: bool,
+}
+
+impl From<EngineServerError> for LoadAttempt {
+    fn from(error: EngineServerError) -> Self {
+        Self {
+            error,
+            retry: false,
+        }
+    }
+}
+
+/// Removes a file when dropped: the API key file, on every path out of a load.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 impl Drop for EngineServer {
     fn drop(&mut self) {
         if let Some(mut live) = self
@@ -592,8 +975,12 @@ impl Drop for EngineServer {
             .take()
         {
             let _ = live.child.start_kill();
+            // Only a server this supervisor started owns the pid file: one that
+            // never loaded must leave a predecessor's record for the reaper.
+            self.forget_pid_record();
         }
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(self.key_file());
     }
 }
 
@@ -610,7 +997,9 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
 
 /// A per-load bearer token. The socket is already private to PAM's user;
 /// the key stops any other local process that can reach the path from
-/// driving the server, and it never leaves this process.
+/// driving the server. It reaches the server through a `0600` key file
+/// (`--api-key-file`), never the argument vector, and is held in memory by
+/// the supervisor for the requests it makes.
 ///
 /// Entropy, on every platform without a new dependency: the standard
 /// library's `RandomState` keys are seeded per thread from the operating

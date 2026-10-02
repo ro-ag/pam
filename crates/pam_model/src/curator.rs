@@ -3,10 +3,20 @@
 //! PAM holds no API keys; it borrows the human's own `claude`, `codex`,
 //! `copilot`, or `gemini` CLI for one turn, no tools, no session left
 //! behind. [`detect`] finds what's installed; [`invoke`] asks one question,
-//! run in a fresh empty temp dir with `PATH` narrowed to the agent's own
-//! directory plus the daemon's. Flags disabling tools/session persistence
+//! run in a fresh empty temp dir. Flags disabling tools/session persistence
 //! are mandatory, kept in [`invoke_args`]. Output is capped at
 //! [`INVOKE_MAX_OUTPUT`] for bounded memory; `gemini`'s form is unverified.
+//!
+//! The daemon may have been started lazily by an agent, so its `PATH` and
+//! environment are agent-influenced and neither is trusted here, the same
+//! policy the connector transport applies to `curl`. A CLI is looked up only in
+//! [`trusted_dirs`] (system directories, Homebrew prefixes and the user's
+//! well-known install directories), and a candidate counts only when it and
+//! every directory above it are owned by root or the daemon's user and are not
+//! group- or world-writable (sticky shared directories are fine as ancestors).
+//! The check runs at detection and again at every [`invoke`]. A CLI that exists only
+//! somewhere else on `PATH` is reported as [`UntrustedCli`] and never run. Children
+//! get an explicit minimal environment ([`child_env`]) and nothing inherited.
 //! On Windows a deleted CLI fails through `cmd.exe` as
 //! [`CuratorError::Failed`] with its exit 1, not a spawn error.
 //! [`detect`] is synchronous (`spawn_blocking`); [`invoke`] is async via
@@ -113,7 +123,7 @@ impl std::fmt::Display for AgentId {
     }
 }
 
-/// An agent CLI found on `PATH`.
+/// An agent CLI found in a trusted directory.
 ///
 /// `path` is canonicalized, so the record survives a `PATH` change and
 /// names the binary that will actually run. `version` is `None` when the
@@ -146,37 +156,142 @@ pub enum CuratorError {
     /// killed.
     #[error("{0} produced no output within {1:?}")]
     Timeout(AgentId, Duration),
+    /// The executable is no longer in a trusted place (replaced, moved under a
+    /// writable directory) since it was detected.
+    #[error("{0} is not trusted to run: {1}")]
+    Untrusted(AgentId, String),
     /// The child could not be spawned, or its pipes could not be read.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
-/// Find the vendor agent CLIs on the given `PATH`.
+/// A CLI that is on the daemon's `PATH` (or in a known directory) but not somewhere
+/// PAM will run it from. Reported so the human learns why it was not offered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UntrustedCli {
+    /// Which agent this is.
+    pub id: AgentId,
+    /// Where it was found.
+    pub path: PathBuf,
+    /// Why it is not run, with how to fix it.
+    pub reason: String,
+}
+
+/// What [`detect`] found: CLIs it will run, and CLIs it refused with the reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Detection {
+    /// CLIs in a trusted directory, verified and version-probed.
+    pub found: Vec<AgentCli>,
+    /// Candidates seen but not trusted; never executed.
+    pub untrusted: Vec<UntrustedCli>,
+}
+
+/// The directories a vendor CLI may be run from: the operating system's and the
+/// package managers' fixed locations, plus the user's well-known install directories
+/// under `home` when it is known. The daemon's `PATH` never adds to this list.
+#[must_use]
+pub fn trusted_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = if cfg!(windows) {
+        ["ProgramFiles", "ProgramFiles(x86)"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        [
+            "/usr/bin",
+            "/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    };
+    if let Some(home) = home.filter(|home| home.is_absolute()) {
+        if cfg!(windows) {
+            dirs.push(home.join("AppData").join("Roaming").join("npm"));
+        }
+        for relative in [
+            ".local/bin",
+            ".cargo/bin",
+            ".claude/local",
+            ".npm-global/bin",
+            ".bun/bin",
+        ] {
+            dirs.push(home.join(relative));
+        }
+    }
+    dirs
+}
+
+/// Find the vendor agent CLIs in `trusted` directories.
 ///
-/// `path_env` is passed in (not read from the environment) so the
-/// daemon decides what agents see, and tests can point detection at a
-/// directory they control. A candidate must be a regular file (a
-/// directory named `codex` is not a CLI) and executable (Unix: any `x`
-/// bit; Windows: a recognized executable extension); the first match
-/// per agent wins, the way a shell would resolve it. Each survivor is
-/// asked `--version` under `version_deadline` — one that misses it is
-/// killed and reported with `version: None`, not dropped.
+/// `trusted` is passed in (see [`trusted_dirs`]) so the daemon decides what is
+/// trusted and tests can point detection at a directory they control. A candidate
+/// must be a regular file (a directory named `codex` is not a CLI), executable
+/// (Unix: any `x` bit; Windows: a recognized executable extension), and trusted
+/// ([`untrusted_reason`]); the first trusted match per agent wins. Each survivor is
+/// asked `--version` under `version_deadline` with the minimal [`child_env`] — one
+/// that misses it is killed and reported with `version: None`, not dropped.
+///
+/// `path_env` (the daemon's `PATH`) is only *looked at*, never executed from: an agent
+/// with no trusted match whose name is found there, or found in a trusted directory
+/// that fails the ownership check, is reported in [`Detection::untrusted`] with the
+/// reason, so a refusal can say why instead of "not installed".
 ///
 /// Blocking: stats the filesystem and waits on child processes.
 #[must_use]
-pub fn detect(path_env: &OsStr, version_deadline: Duration) -> Vec<AgentCli> {
-    let dirs: Vec<PathBuf> = std::env::split_paths(path_env)
+pub fn detect(trusted: &[PathBuf], path_env: &OsStr, version_deadline: Duration) -> Detection {
+    let mut detection = Detection::default();
+    let on_path: Vec<PathBuf> = std::env::split_paths(path_env)
         .filter(|dir| !dir.as_os_str().is_empty())
         .collect();
-
-    let mut found = Vec::new();
     for id in AgentId::ALL {
-        if let Some(path) = locate(&dirs, id) {
-            let version = probe_version(&path, version_deadline);
-            found.push(AgentCli { id, path, version });
+        let mut refused: Option<UntrustedCli> = None;
+        let mut accepted = None;
+        for dir in trusted {
+            let Some(candidate) = first_candidate(dir, id) else {
+                continue;
+            };
+            match untrusted_reason(&candidate) {
+                None => {
+                    accepted = candidate.canonicalize().ok();
+                    break;
+                }
+                Some(reason) => {
+                    refused.get_or_insert(UntrustedCli {
+                        id,
+                        path: candidate,
+                        reason,
+                    });
+                }
+            }
         }
+        if let Some(path) = accepted {
+            let version = probe_version(&path, version_deadline);
+            detection.found.push(AgentCli { id, path, version });
+            continue;
+        }
+        if refused.is_none() {
+            // Not in any trusted directory: say so if the daemon's PATH has one.
+            refused = on_path
+                .iter()
+                .filter(|dir| !trusted.contains(dir))
+                .find_map(|dir| first_candidate(dir, id))
+                .map(|path| UntrustedCli {
+                    id,
+                    path,
+                    reason: format!(
+                        "it is outside the directories PAM runs CLIs from; install {id} under \
+                         /usr/local/bin, a Homebrew prefix or your own ~/.local/bin and try again"
+                    ),
+                });
+        }
+        detection.untrusted.extend(refused);
     }
-    found
+    detection
 }
 
 /// The argument vector for one non-interactive, tool-free, single-turn
@@ -243,9 +358,9 @@ pub fn invoke_args(id: AgentId, prompt: &str) -> (Vec<String>, bool) {
 /// Ask an agent one question and return what it said.
 ///
 /// The child runs in a fresh empty temp directory that is removed when the
-/// call ends, with `PATH` pinned to the agent's own directory followed by
-/// the daemon's — enough for the CLI to find its own helpers, not enough
-/// for it to inherit a surprise. stdout and stderr are drained
+/// call ends, with only the minimal [`child_env`] — nothing of the daemon's
+/// environment is inherited, and the executable is re-checked as trusted
+/// right before it is spawned. stdout and stderr are drained
 /// concurrently with the stdin write, so neither a large prompt nor a
 /// chatty agent can deadlock the call.
 ///
@@ -261,12 +376,18 @@ pub async fn invoke(
 ) -> Result<String, CuratorError> {
     let workdir = tempfile::Builder::new().prefix("pam-curator-").tempdir()?;
     let (args, prompt_on_stdin) = invoke_args(cli.id, prompt);
+    // Checked at use, not just at detection: the listing may be minutes old.
+    let canonical = cli.path.canonicalize()?;
+    if let Some(reason) = untrusted_reason(&canonical) {
+        return Err(CuratorError::Untrusted(cli.id, reason));
+    }
 
-    let mut command = tokio::process::Command::new(&cli.path);
+    let mut command = tokio::process::Command::new(&canonical);
     command
         .args(&args)
         .current_dir(workdir.path())
-        .env("PATH", pinned_path(&cli.path))
+        .env_clear()
+        .envs(child_env(&canonical, workdir.path()))
         .stdin(if prompt_on_stdin {
             Stdio::piped()
         } else {
@@ -323,18 +444,13 @@ pub async fn invoke(
     ))
 }
 
-/// First candidate for `id` on `dirs`, canonicalized — shell resolution
-/// order, minus the shell.
-fn locate(dirs: &[PathBuf], id: AgentId) -> Option<PathBuf> {
-    for dir in dirs {
-        for name in candidate_names(id) {
-            let candidate = dir.join(name);
-            if is_executable_file(&candidate) {
-                return candidate.canonicalize().ok();
-            }
-        }
-    }
-    None
+/// The first file in `dir` that would run as `id` (a regular, executable file),
+/// not yet canonicalized or trust-checked.
+fn first_candidate(dir: &Path, id: AgentId) -> Option<PathBuf> {
+    candidate_names(id)
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 /// File names that would run `id` on this platform, in the order the
@@ -380,8 +496,15 @@ fn is_executable_file(path: &Path) -> bool {
 /// the version is decoration, and a CLI that will not report one is still
 /// a CLI PAM can call.
 fn probe_version(path: &Path, deadline: Duration) -> Option<String> {
+    let workdir = tempfile::Builder::new()
+        .prefix("pam-curator-")
+        .tempdir()
+        .ok()?;
     let mut child = std::process::Command::new(path)
         .arg("--version")
+        .current_dir(workdir.path())
+        .env_clear()
+        .envs(child_env(path, workdir.path()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -421,27 +544,143 @@ fn probe_version(path: &Path, deadline: Duration) -> Option<String> {
     }
 }
 
-/// `PATH` for a curator child: the agent's own directory first, then
-/// whatever the daemon inherited.
+/// The whole environment a curator child gets: the user's identity (`HOME`, `USER`,
+/// `LOGNAME`, so the CLI finds its own login), a fixed `PATH` (the CLI's own directory,
+/// then the system directories), `TMPDIR` pointing at the call's private directory and
+/// a fixed `LANG`. Nothing else is inherited: the daemon's variables may have been set
+/// by whatever started it.
+#[must_use]
+pub fn child_env(binary: &Path, workdir: &Path) -> Vec<(String, std::ffi::OsString)> {
+    let mut env: Vec<(String, std::ffi::OsString)> = Vec::new();
+    for name in ["HOME", "USER", "LOGNAME"] {
+        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            env.push((name.to_owned(), value));
+        }
+    }
+    let mut dirs: Vec<PathBuf> = binary.parent().map(Path::to_path_buf).into_iter().collect();
+    if cfg!(windows) {
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            dirs.push(root.join("System32"));
+            dirs.push(root);
+        }
+        for name in ["SystemRoot", "ComSpec", "PATHEXT", "USERPROFILE", "APPDATA"] {
+            if let Some(value) = std::env::var_os(name) {
+                env.push((name.to_owned(), value));
+            }
+        }
+    } else {
+        dirs.extend(
+            [
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+            ]
+            .iter()
+            .map(PathBuf::from),
+        );
+    }
+    env.push((
+        "PATH".to_owned(),
+        std::env::join_paths(&dirs).unwrap_or_default(),
+    ));
+    env.push(("TMPDIR".to_owned(), workdir.as_os_str().to_owned()));
+    if cfg!(windows) {
+        env.push(("TEMP".to_owned(), workdir.as_os_str().to_owned()));
+    }
+    env.push(("LANG".to_owned(), "en_US.UTF-8".into()));
+    env
+}
+
+/// Why `candidate` must not be run, or `None` when it may be.
 ///
-/// The agent's directory has to be there — several of these CLIs shell out
-/// to siblings installed next to them — and the daemon's `PATH` has to be
-/// there because that is where `git`, `node` and the platform's own tools
-/// live. Nothing beyond those two is added.
-fn pinned_path(binary: &Path) -> std::ffi::OsString {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(parent) = binary.parent() {
-        dirs.push(parent.to_path_buf());
+/// Unix: the canonical file must be a regular file owned by root or the daemon's
+/// user and not group- or world-writable, and every directory above it must be a
+/// directory owned by root or that user, not group- or world-writable (a sticky shared
+/// directory such as `/tmp` is allowed above the file's own directory, since entries
+/// in it are protected from other users). Windows has no ownership model readable
+/// without a platform crate, so the fixed directory list is the whole policy there.
+#[cfg(unix)]
+#[must_use]
+pub fn untrusted_reason(candidate: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(owner) = current_uid() else {
+        return Some("cannot establish which user the daemon runs as".to_owned());
+    };
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(error) => return Some(format!("cannot resolve {}: {error}", candidate.display())),
+    };
+    let Ok(file) = canonical.symlink_metadata() else {
+        return Some(format!("cannot stat {}", canonical.display()));
+    };
+    if !file.is_file() {
+        return Some(format!("{} is not a regular file", canonical.display()));
     }
-    if let Some(inherited) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&inherited));
+    let owned_by_us_or_root = |uid: u32| uid == 0 || uid == owner;
+    if !owned_by_us_or_root(file.uid()) {
+        return Some(format!(
+            "{} is owned by uid {}, not root or you",
+            canonical.display(),
+            file.uid()
+        ));
     }
-    std::env::join_paths(dirs).unwrap_or_else(|_| {
-        binary
-            .parent()
-            .map(Path::as_os_str)
-            .unwrap_or_default()
-            .to_os_string()
+    if file.mode() & 0o022 != 0 {
+        return Some(format!(
+            "{} is writable by group or others; run chmod go-w on it",
+            canonical.display()
+        ));
+    }
+    for (depth, dir) in canonical.ancestors().skip(1).enumerate() {
+        let Ok(meta) = dir.symlink_metadata() else {
+            return Some(format!("cannot stat {}", dir.display()));
+        };
+        if !meta.is_dir() {
+            return Some(format!("{} is not a directory", dir.display()));
+        }
+        if !owned_by_us_or_root(meta.uid()) {
+            return Some(format!(
+                "{} is owned by uid {}, not root or you",
+                dir.display(),
+                meta.uid()
+            ));
+        }
+        let sticky = meta.mode() & 0o1000 != 0;
+        if meta.mode() & 0o022 != 0 && !(sticky && depth > 0) {
+            return Some(format!(
+                "{} is writable by group or others; run chmod go-w on it",
+                dir.display()
+            ));
+        }
+    }
+    None
+}
+
+/// See the Unix version; here the fixed directory list is the policy.
+#[cfg(not(unix))]
+#[must_use]
+pub fn untrusted_reason(candidate: &Path) -> Option<String> {
+    candidate
+        .canonicalize()
+        .err()
+        .map(|error| format!("cannot resolve {}: {error}", candidate.display()))
+}
+
+/// The user id the daemon runs as: the owner of a file it just created, which needs
+/// neither `unsafe` nor the process environment.
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        tempfile::tempfile()
+            .ok()?
+            .metadata()
+            .ok()
+            .map(|meta| meta.uid())
     })
 }
 

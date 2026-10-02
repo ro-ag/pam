@@ -515,7 +515,7 @@ fn every_ggml_type_id_llama_cpp_writes_is_accepted_and_the_gaps_are_not() {
 
 #[test]
 fn a_huge_declared_string_on_a_tiny_file_fails_fast_without_the_allocation() {
-    // One metadata pair whose key claims just under the 256 MiB cap (the
+    // One metadata pair whose *value* string claims just under the 256 MiB cap (the
     // magic and counts already used a few bytes of the header budget); the
     // file is a hundred bytes. The parser must fail on the shortfall, not
     // reserve the declared length first.
@@ -524,6 +524,9 @@ fn a_huge_declared_string_on_a_tiny_file_fails_fast_without_the_allocation() {
     bytes.extend_from_slice(&3u32.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
     bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.push(b'k');
+    bytes.extend_from_slice(&8u32.to_le_bytes());
     bytes.extend_from_slice(&(GGUF_MAX_STRING_BYTES - 4096).to_le_bytes());
     bytes.resize(100, b'k');
     let started = std::time::Instant::now();
@@ -544,10 +547,32 @@ fn a_huge_declared_string_on_a_tiny_file_fails_fast_without_the_allocation() {
     over.extend_from_slice(&3u32.to_le_bytes());
     over.extend_from_slice(&0u64.to_le_bytes());
     over.extend_from_slice(&1u64.to_le_bytes());
+    over.extend_from_slice(&1u64.to_le_bytes());
+    over.push(b'k');
+    over.extend_from_slice(&8u32.to_le_bytes());
     over.extend_from_slice(&(GGUF_MAX_STRING_BYTES + 1).to_le_bytes());
     over.resize(100, b'k');
     assert!(matches!(
         parse_info(Cursor::new(over)),
         Err(GgufError::Malformed(_))
     ));
+}
+
+#[test]
+fn a_metadata_key_far_longer_than_any_real_key_is_refused_before_it_is_read() {
+    // A planted file with a ~250 MiB key would otherwise cost that much I/O and memory
+    // on every scan, for a name nobody uses.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&(GGUF_MAX_STRING_BYTES - 4096).to_le_bytes());
+    bytes.resize(100, b'k');
+
+    let error = parse_info(Cursor::new(bytes)).unwrap_err();
+    assert!(
+        matches!(&error, GgufError::Malformed(detail) if detail.contains("metadata key")),
+        "{error:?}"
+    );
 }

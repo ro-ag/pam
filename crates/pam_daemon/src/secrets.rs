@@ -34,6 +34,11 @@ pub fn account_for(connector_id: &str) -> String {
     format!("pam.connector.v1.{connector_id}")
 }
 
+/// How long a credential read waits for the keychain before reporting it unavailable.
+/// Long enough for a healthy keychain's cold first access, short of the 30-second
+/// step deadlines of the callers.
+pub const READ_DEADLINE: Duration = Duration::from_secs(20);
+
 /// The connector id a reachability probe reads under.
 ///
 /// Nothing is ever stored here: the probe asks for an account that does
@@ -481,6 +486,9 @@ pub struct SecretStore {
     /// `Mutex` rather than an async one: it is held for a field read,
     /// never across the blocking call that produces the value.
     probe: Mutex<Option<(Instant, KeyringHealth)>>,
+    /// How long a credential *read* may wait on the keychain lane before it reports
+    /// [`SecretError::Unavailable`] (see [`READ_DEADLINE`]).
+    read_deadline: Duration,
 }
 
 impl fmt::Debug for SecretStore {
@@ -501,7 +509,16 @@ impl SecretStore {
         Self {
             backend,
             probe: Mutex::new(None),
+            read_deadline: READ_DEADLINE,
         }
+    }
+
+    /// [`Self::new`] with a different read deadline, so a test can watch it fire.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_read_deadline(mut self, deadline: Duration) -> Self {
+        self.read_deadline = deadline;
+        self
     }
 
     /// Whether the credential store answers, from the cache when it is
@@ -562,9 +579,28 @@ impl SecretStore {
     pub async fn get(&self, connector_id: &str) -> Result<Option<Secret>, SecretError> {
         let backend = Arc::clone(&self.backend);
         let account = account_for(connector_id);
-        run_blocking(move || backend.get(&account))
-            .await
-            .map(|value| value.map(Secret::new))
+        // Every connector call reads its credential here, through one serialized
+        // keychain lane. A locked keychain's modal prompt nobody answers holds that
+        // lane for as long as the prompt lives; without a bound every later read
+        // (all connectors, the GUI list) would queue behind it for the step's whole
+        // deadline. The abandoned call keeps the lane until it returns, so later
+        // reads fail fast instead of stacking up, and succeed again once the prompt
+        // is answered.
+        match tokio::time::timeout(
+            self.read_deadline,
+            run_blocking(move || backend.get(&account)),
+        )
+        .await
+        {
+            Ok(read) => read.map(|value| value.map(Secret::new)),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    deadline_s = self.read_deadline.as_secs(),
+                    "the credential store did not answer in time; a keychain prompt may be waiting"
+                );
+                Err(SecretError::Unavailable)
+            }
+        }
     }
 
     /// Creates or replaces the secret stored for `connector_id`. Takes the

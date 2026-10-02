@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pam_model::catalog::{CATALOG, find_preset};
-use pam_model::curator::{AgentCli, AgentId};
+use pam_model::curator::{AgentId, Detection};
 use pam_model::download::{DownloadError, DownloadRequest, curl_recovery_line};
 use pam_model::registry::{ModelEntry, RegistryError};
 use pam_model::runtime::{GenerateRequest, RuntimeState};
@@ -143,7 +143,10 @@ pub const CAUSE_MODELS_DIR_OVERLAPS_BASE: &str = "models_dir_overlaps_base";
 /// Refusal cause: a transfer is writing to that file right now.
 pub const CAUSE_DOWNLOAD_IN_PROGRESS: &str = "download_in_progress";
 
-/// Refusal cause: the chosen agent CLI is not on `PATH`.
+/// Refusal cause: a model file changed after it was verified.
+pub const CAUSE_MODEL_CHANGED: &str = "model_changed";
+
+/// Refusal cause: the chosen agent CLI is not in a directory PAM runs CLIs from.
 pub const CAUSE_NOT_DETECTED: &str = "not_detected";
 
 /// Refusal cause: no curator CLI is picked.
@@ -212,6 +215,13 @@ const RECOVERY_RETRY_LATER: &str = "Another generation is running; retry when it
 
 /// Recovery line for a load the engine refused.
 const RECOVERY_VERIFY_FILE: &str = "Read the load error detail. For an unsupported quantization/backend, choose a supported model/backend and retain the model file and error when reporting it. For a truncated or unreadable GGUF, verify the file on the PAM GUI Models screen.";
+
+/// Recovery line for an engine process that died on its own.
+const RECOVERY_ENGINE_EXITED: &str = "The engine process stopped (it may have been killed for memory). The next job loads the model again; to retry now, load the model on the PAM GUI Models screen.";
+
+/// Recovery line for a model file that changed after it was verified.
+const RECOVERY_VERIFY_AGAIN: &str =
+    "Run Verify on the PAM GUI Models screen; the model serves again once its digest is checked.";
 
 /// Recovery line for a curator that is not there.
 const RECOVERY_CURATOR_PICK: &str =
@@ -758,17 +768,23 @@ impl AdminService {
         })
     }
 
-    /// The vendor agent CLIs on `PATH`, and which one is picked.
+    /// The vendor agent CLIs in trusted directories, those seen elsewhere and refused
+    /// (never run), and which one is picked.
     async fn curator_list(&self) -> Result<AdminOk, AdminRefusal> {
-        let detected = detect_agents().await?;
+        let detection = detect_agents().await?;
         let selected = self.selected_agent().await?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body: json!({
-                "detected": detected,
+                "detected": detection.found,
+                "untrusted": detection.untrusted,
                 "selected": selected.map(AgentId::as_str),
             }),
-            audit: json!({ "op": OP_CURATOR_LIST, "count": detected.len() }),
+            audit: json!({
+                "op": OP_CURATOR_LIST,
+                "count": detection.found.len(),
+                "untrusted": detection.untrusted.len(),
+            }),
         })
     }
 
@@ -787,11 +803,11 @@ impl AdminService {
             detail: format!("{raw:?} is not an agent; expected claude, codex, copilot or gemini"),
             recovery: RECOVERY_FIX_ARGS,
         })?;
-        let detected = detect_agents().await?;
-        if !detected.iter().any(|cli| cli.id == agent) {
+        let detection = detect_agents().await?;
+        if !detection.found.iter().any(|cli| cli.id == agent) {
             return Err(AdminRefusal {
                 cause: CAUSE_NOT_DETECTED,
-                detail: format!("no {raw} executable on the daemon's PATH"),
+                detail: not_detected_detail(&detection, agent),
                 recovery: RECOVERY_CURATOR_PICK,
             });
         }
@@ -812,13 +828,18 @@ impl AdminService {
             detail: "no curator agent is selected".to_owned(),
             recovery: RECOVERY_CURATOR_PICK,
         })?;
-        let detected = detect_agents().await?;
-        let cli = detected
-            .into_iter()
+        let detection = detect_agents().await?;
+        let cli = detection
+            .found
+            .iter()
             .find(|cli| cli.id == selected)
+            .cloned()
             .ok_or_else(|| AdminRefusal {
                 cause: CAUSE_NO_CURATOR,
-                detail: format!("{selected} is selected but no longer on the daemon's PATH"),
+                detail: format!(
+                    "{selected} is selected but no longer where PAM runs it from: {}",
+                    not_detected_detail(&detection, selected)
+                ),
                 recovery: RECOVERY_CURATOR_PICK,
             })?;
 
@@ -871,15 +892,31 @@ impl AdminService {
     }
 }
 
-/// The vendor CLIs on the daemon's own `PATH`, probed off the async
-/// threads (detection stats the filesystem and waits on children).
-async fn detect_agents() -> Result<Vec<AgentCli>, AdminRefusal> {
+/// The vendor CLIs in trusted directories (never the daemon's inherited `PATH`, which
+/// may have been shaped by whatever started the daemon), probed off the async threads
+/// (detection stats the filesystem and waits on children). The `PATH` is only looked
+/// at, to explain a CLI that was refused.
+async fn detect_agents() -> Result<Detection, AdminRefusal> {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     crate::blocking_jobs::run(crate::blocking_jobs::Kind::AgentDetection, move || {
-        pam_model::curator::detect(&path, DETECT_DEADLINE)
+        let trusted = pam_model::curator::trusted_dirs(home.as_deref());
+        pam_model::curator::detect(&trusted, &path, DETECT_DEADLINE)
     })
     .await
     .map_err(blocking_refusal)
+}
+
+/// Why `agent` is not offered: the untrusted candidate that was seen, or simply absent.
+fn not_detected_detail(detection: &Detection, agent: AgentId) -> String {
+    match detection.untrusted.iter().find(|cli| cli.id == agent) {
+        Some(cli) => format!(
+            "{agent} was found at {} but PAM will not run it: {}",
+            cli.path.display(),
+            cli.reason
+        ),
+        None => format!("no {agent} executable in the directories PAM runs CLIs from"),
+    }
 }
 
 /// The `.gguf` file name a pasted URL ends in.
@@ -973,6 +1010,7 @@ pub(crate) fn runtime_refusal(err: &pam_model::RuntimeError) -> AdminRefusal {
         pam_model::RuntimeError::PromptTooLong { .. } => RECOVERY_SHORTEN_PROMPT,
         pam_model::RuntimeError::Busy => RECOVERY_RETRY_LATER,
         pam_model::RuntimeError::Cancelled => "The generation was cancelled. Try again when ready.",
+        pam_model::RuntimeError::EngineExited(_) => RECOVERY_ENGINE_EXITED,
         pam_model::RuntimeError::GenerationFailed(_) => {
             "Keep the error detail and report it with the model file, architecture, quantization and backend from model status. Try a supported model/backend; restarting does not repair incompatible inference kernels."
         }
@@ -1005,6 +1043,11 @@ fn registry_refusal(err: RegistryError) -> AdminRefusal {
             cause: CAUSE_INVALID_ADMIN_ARGS,
             detail: err.to_string(),
             recovery: RECOVERY_FIX_ARGS,
+        },
+        RegistryError::Changed { .. } => AdminRefusal {
+            cause: CAUSE_MODEL_CHANGED,
+            detail: err.to_string(),
+            recovery: RECOVERY_VERIFY_AGAIN,
         },
         other => AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,

@@ -460,6 +460,7 @@ fn copy_hashing(
 
 /// Sets a Unix permission mode; a no-op where modes do not exist (the private
 /// directory's access control is what applies there).
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {

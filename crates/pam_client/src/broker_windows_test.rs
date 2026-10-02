@@ -241,12 +241,14 @@ fn the_started_daemon_gets_the_allowlist_and_the_explicit_base_only() {
         !env.to_ascii_uppercase().contains("PSMODULEPATH"),
         "what the broker needed for itself stays with the broker: {env}"
     );
-    assert!(
-        cwd.trim().trim_end_matches('\\').eq_ignore_ascii_case(
-            std::env::temp_dir()
-                .to_string_lossy()
-                .trim_end_matches('\\')
-        ),
+    // Compared after canonicalization: the temp directory can be spelled in
+    // its 8.3 short form (`RUNNER~1`) in the environment while the child
+    // reports the long form.
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    assert_eq!(
+        canonical(std::path::Path::new(cwd.trim())),
+        canonical(&std::env::temp_dir()),
         "the daemon's fixed working directory: {cwd}"
     );
 }

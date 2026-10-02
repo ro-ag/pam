@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::admin::AdminService;
+use crate::event_hub::EventHub;
 use crate::image::ImageWatch;
 use crate::lifecycle::LifecyclePhase;
 
@@ -67,7 +68,11 @@ impl AdminTransport {
         admin: Arc<AdminService>,
         phase: watch::Sender<LifecyclePhase>,
         image: Arc<ImageWatch>,
+        hub: Arc<EventHub>,
     ) -> io::Result<Self> {
+        // The all-events stream is served from the hub; until it is, the
+        // listener only takes it.
+        drop(hub);
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
             let lifecycle = frame::AdminLifecycle { phase, image };

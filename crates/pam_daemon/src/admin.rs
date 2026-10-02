@@ -610,6 +610,7 @@ impl AdminService {
                 // No zmq peer: the reply comes back through the channel.
                 identity: Vec::new(),
                 origin: Origin::Admin,
+                peer: None,
                 envelope,
                 reply,
             })

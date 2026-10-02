@@ -109,6 +109,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::connector_service::ConnectorService;
+use crate::event_hub::EventHub;
 use crate::executor::{
     BuiltinCapability, CapabilityFailure, CapabilityOutput, ExecContext, outcome_str,
 };
@@ -604,7 +605,19 @@ pub async fn run_daemon_with(
     crate::landing_sweep::sweep_orphaned_workspaces(&store).await;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CAPACITY);
-    let transport = Transport::bind(&dirs, incoming_tx.clone()).await?;
+    // Built before either transport: both planes publish into and read from
+    // the one hub, and both move the one lifecycle phase.
+    let hub = EventHub::new();
+    let (phase, _) = watch::channel(LifecyclePhase::Serving);
+    let transport = Transport::bind_with(
+        &dirs,
+        incoming_tx.clone(),
+        Arc::clone(&store),
+        phase.clone(),
+        Arc::clone(&hub),
+        Arc::clone(&image),
+    )
+    .await?;
 
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
@@ -619,7 +632,6 @@ pub async fn run_daemon_with(
         Arc::clone(&logs),
         Arc::clone(&gate),
     ));
-    let (phase, _) = watch::channel(LifecyclePhase::Serving);
     // Drain stops the lease-granting side (executor loop, reaper);
     // dispatch keeps answering (with refusals) until the drain is done.
     let (drain_tx, drain_rx) = watch::channel(false);
@@ -638,6 +650,7 @@ pub async fn run_daemon_with(
         Arc::clone(&admin),
         phase.clone(),
         Arc::clone(&image),
+        hub,
     ) {
         Ok(listener) => listener,
         Err(error) => {

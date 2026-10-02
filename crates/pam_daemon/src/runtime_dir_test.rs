@@ -253,3 +253,39 @@ fn a_flat_socket_directory_resolves_the_relay_layout() {
         "{err:?}"
     );
 }
+
+#[test]
+fn the_framed_public_endpoints_sit_beside_the_legacy_sockets() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dirs = RuntimeDir::at_base(tmp.path()).expect("runtime dir");
+    // Transitional: the framed socket is served next to the ZeroMQ one, so
+    // it cannot share its name until the cut-over.
+    assert_eq!(dirs.public_socket(), dirs.run_dir().join("pam.next.sock"));
+    assert_ne!(dirs.public_socket(), dirs.router_socket());
+    assert_eq!(dirs.public_control(), dirs.run_dir().join("public.json"));
+    let resolved = RuntimeDir::paths_at_base(tmp.path()).expect("paths resolve");
+    assert_eq!(resolved.public_socket(), dirs.public_socket());
+    assert_eq!(resolved.public_control(), dirs.public_control());
+
+    let dir = PathBuf::from("/tmp/pam-relay-fixture");
+    let flat = RuntimeDir::paths_at_dir(&dir).expect("flat layout resolves");
+    assert_eq!(flat.public_socket(), dir.join("pam.next.sock"));
+    assert_eq!(flat.public_control(), dir.join("public.json"));
+}
+
+#[test]
+fn the_transitional_public_socket_does_not_tighten_the_boot_length_check() {
+    // A base whose `events.sock` path is exactly at the limit worked before
+    // the framed socket existed and still resolves.
+    let fixed = "/tmp//run/events.sock".len();
+    let base = PathBuf::from(format!(
+        "/tmp/{}",
+        "z".repeat(MAX_SOCKET_PATH_BYTES - fixed)
+    ));
+    let dirs = RuntimeDir::paths_at_base(&base).expect("a base at the limit resolves");
+    assert_eq!(
+        dirs.events_socket().as_os_str().len(),
+        MAX_SOCKET_PATH_BYTES
+    );
+    assert!(dirs.public_socket().as_os_str().len() > MAX_SOCKET_PATH_BYTES);
+}

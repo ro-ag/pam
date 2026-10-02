@@ -470,6 +470,7 @@ impl AdminService {
                 // the reply goes back through the channel, not the router.
                 identity: Vec::new(),
                 origin: crate::ingress::Origin::Admin,
+                peer: None,
                 envelope,
                 reply,
             })
@@ -538,6 +539,7 @@ impl AdminService {
             .send(IncomingRequest {
                 identity: Vec::new(),
                 origin: crate::ingress::Origin::Admin,
+                peer: None,
                 envelope,
                 reply,
             })

@@ -261,6 +261,7 @@ mod live {
                 .send(IncomingRequest {
                     identity: Vec::new(),
                     origin: Origin::Public,
+                    peer: None,
                     envelope,
                     reply,
                 })
@@ -708,6 +709,7 @@ mod cancel_plane {
             .send(IncomingRequest {
                 identity: Vec::new(),
                 origin: Origin::Public,
+                peer: None,
                 envelope,
                 reply,
             })

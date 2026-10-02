@@ -50,12 +50,21 @@ pub enum RuntimeDirError {
     },
 }
 
-/// Resolved runtime directory: `<base>/run` plus the two socket paths.
+/// File name of the framed public socket while it is served next to the
+/// `ZeroMQ` one. The cut-over makes it `pam.sock`; this name must not ship.
+const TRANSITIONAL_PUBLIC_SOCKET: &str = "pam.next.sock";
+
+/// File name of the Windows public adapter's control file (port and nonce).
+const PUBLIC_CONTROL: &str = "public.json";
+
+/// Resolved runtime directory: `<base>/run` plus the endpoint paths in it.
 #[derive(Debug, Clone)]
 pub struct RuntimeDir {
     run: PathBuf,
     router: PathBuf,
     events: PathBuf,
+    public: PathBuf,
+    public_control: PathBuf,
 }
 
 impl RuntimeDir {
@@ -81,6 +90,8 @@ impl RuntimeDir {
         validate_socket_path(&router)?;
         validate_socket_path(&events)?;
         Ok(Self {
+            public: run.join(TRANSITIONAL_PUBLIC_SOCKET),
+            public_control: run.join(PUBLIC_CONTROL),
             run,
             router,
             events,
@@ -100,6 +111,8 @@ impl RuntimeDir {
         validate_socket_path(&router)?;
         validate_socket_path(&events)?;
         Ok(Self {
+            public: dir.join(TRANSITIONAL_PUBLIC_SOCKET),
+            public_control: dir.join(PUBLIC_CONTROL),
             run: dir.to_path_buf(),
             router,
             events,
@@ -122,6 +135,26 @@ impl RuntimeDir {
     #[must_use]
     pub fn events_socket(&self) -> &Path {
         &self.events
+    }
+
+    /// Filesystem path of the framed public socket (unix): the stream socket
+    /// that supersedes [`Self::router_socket`].
+    ///
+    /// Transitional value: `pam.next.sock`, served next to the `ZeroMQ`
+    /// `pam.sock` until the cut-over makes this `pam.sock`. The transitional
+    /// name is two bytes longer than `events.sock` and is not part of the
+    /// boot-time length validation, so a base that works today keeps working;
+    /// the framed listener checks the limit when it binds.
+    #[must_use]
+    pub fn public_socket(&self) -> &Path {
+        &self.public
+    }
+
+    /// Filesystem path of the Windows public adapter's control file
+    /// (`public.json`: loopback port and owner nonce).
+    #[must_use]
+    pub fn public_control(&self) -> &Path {
+        &self.public_control
     }
 
     /// `ipc://` endpoint of the `ROUTER` socket.

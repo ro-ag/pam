@@ -8,6 +8,7 @@
 mod envelope;
 mod event;
 mod response;
+pub mod wire;
 
 pub use envelope::{Caller, Envelope};
 pub use event::Event;
@@ -24,3 +25,5 @@ mod event_test;
 mod lib_test;
 #[cfg(test)]
 mod response_test;
+#[cfg(test)]
+mod wire_test;

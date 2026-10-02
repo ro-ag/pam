@@ -16,11 +16,20 @@
 //! [`crate::policy::admission_pool`]. A per-request forwarder lives exactly as long as that
 //! request's `oneshot`, which the dispatcher's reply guard always resolves, so forwarders are
 //! bounded by the dispatcher's own pools plus the ingress channel.
+//!
+//! [`EventPublisher`] itself lives in [`crate::event_hub`] and is re-exported here: services
+//! publish into the daemon's one event hub, and the `PUB` loop is one of the hub's sinks, fed the
+//! same sanitised `(request id, event)` pairs it always carried. [`Transport::bind_with`] is the
+//! daemon's entry point and takes what the framed public listener needs (store, lifecycle phase,
+//! hub, boot image); that listener is served next to this one until the `ZeroMQ` sockets are
+//! removed. [`Transport::bind`] keeps the old signature over a hub of its own.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use pam_proto::{Envelope, Event, Response};
+use pam_store::Store;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -29,14 +38,15 @@ use zeromq::{
     ZmqMessage,
 };
 
-use crate::ingress::Origin;
+use crate::event_hub::{EventHub, LEGACY_SINK_CAPACITY};
+pub use crate::event_hub::{EventPublisher, PUBLIC_PROGRESS_NOTE, PublishError};
+use crate::image::ImageWatch;
+use crate::ingress::{Origin, PublicPeer};
+use crate::lifecycle::LifecyclePhase;
 use crate::runtime_dir::{RuntimeDir, remove_stale};
 
-/// Capacity of the internal reply and event channels.
+/// Capacity of the internal reply channel.
 const CHANNEL_CAPACITY: usize = 256;
-
-/// Public progress carries no task-specific prose; details require scoped reads.
-pub const PUBLIC_PROGRESS_NOTE: &str = "Task progress updated";
 
 /// Why the transport could not start.
 #[derive(Debug, Error)]
@@ -61,11 +71,6 @@ pub enum TransportError {
     },
 }
 
-/// The transport was shut down; the event was dropped.
-#[derive(Debug, Error)]
-#[error("transport is shut down; event dropped")]
-pub struct PublishError;
-
 /// A validated request received from a client.
 ///
 /// The daemon core answers by sending exactly one [`Response`] into
@@ -76,63 +81,20 @@ pub struct IncomingRequest {
     pub identity: Vec<u8>,
     /// Which plane the request arrived on (see [`crate::ingress`]).
     pub origin: Origin,
+    /// The connection the request arrived on, as the framed public listener
+    /// saw it; `None` for the `ZeroMQ` listener and for requests the
+    /// administration plane submits.
+    pub peer: Option<PublicPeer>,
     /// The parsed request envelope.
     pub envelope: Envelope,
     /// Channel for this request's single response.
     pub reply: oneshot::Sender<Response>,
 }
 
-/// Clone-able handle daemon services use to broadcast lifecycle events.
-#[derive(Debug, Clone)]
-pub struct EventPublisher {
-    tx: mpsc::Sender<(String, Event)>,
-}
-
-impl EventPublisher {
-    /// A publisher over a bare channel, for in-crate unit tests that
-    /// need to observe published events without binding real sockets.
-    #[cfg(test)]
-    pub(crate) fn for_tests() -> (Self, mpsc::Receiver<(String, Event)>) {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        (Self { tx }, rx)
-    }
-
-    /// Best-effort notification: queue the event or drop it when slow peers
-    /// have filled the bounded queue. Authoritative results remain in Store;
-    /// subscribers reconcile missed terminal events through `query`.
-    ///
-    /// The ready future preserves callers' awaitable API without letting a
-    /// notification delay request completion, cancellation or administration.
-    pub fn publish(
-        &self,
-        request_id: &str,
-        event: Event,
-    ) -> std::future::Ready<Result<(), PublishError>> {
-        // Sanitize at the shared publication boundary, including test publishers.
-        // Enumerate lifecycle variants so a future payload-bearing event needs review.
-        let event = match event {
-            Event::Progress { pct, note: _ } => Event::Progress {
-                pct,
-                note: PUBLIC_PROGRESS_NOTE.to_owned(),
-            },
-            Event::Queued
-            | Event::Started
-            | Event::ApprovalPending
-            | Event::Done
-            | Event::Refused => event,
-        };
-        let result = match self.tx.try_send((request_id.to_owned(), event)) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(PublishError),
-        };
-        std::future::ready(result)
-    }
-}
-
 /// Running transport service: both sockets bound, tasks pumping.
 #[derive(Debug)]
 pub struct Transport {
-    events: EventPublisher,
+    hub: Arc<EventHub>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -140,9 +102,36 @@ pub struct Transport {
 impl Transport {
     /// Removes stale socket files, binds `ROUTER` and `PUB` under `dirs`,
     /// and starts the socket tasks. Valid requests arrive on `incoming`.
+    /// Events go through an event hub of the transport's own.
     pub async fn bind(
         dirs: &RuntimeDir,
         incoming: mpsc::Sender<IncomingRequest>,
+    ) -> Result<Self, TransportError> {
+        Self::bind_legacy(dirs, incoming, EventHub::new()).await
+    }
+
+    /// [`Self::bind`] for the daemon: events go through the daemon's `hub`,
+    /// and `store`, `phase` and `image` are what the framed public listener
+    /// on [`RuntimeDir::public_socket`] serves from.
+    pub async fn bind_with(
+        dirs: &RuntimeDir,
+        incoming: mpsc::Sender<IncomingRequest>,
+        store: Arc<Store>,
+        phase: watch::Sender<LifecyclePhase>,
+        hub: Arc<EventHub>,
+        image: Arc<ImageWatch>,
+    ) -> Result<Self, TransportError> {
+        // The framed public listener starts here from these; until it does
+        // the daemon serves the legacy sockets only.
+        let _ = (store, phase, image);
+        Self::bind_legacy(dirs, incoming, hub).await
+    }
+
+    /// Binds the `ZeroMQ` sockets and makes the `PUB` loop a sink of `hub`.
+    async fn bind_legacy(
+        dirs: &RuntimeDir,
+        incoming: mpsc::Sender<IncomingRequest>,
+        hub: Arc<EventHub>,
     ) -> Result<Self, TransportError> {
         for path in [dirs.router_socket(), dirs.events_socket()] {
             remove_stale(path).map_err(|source| TransportError::RemoveStale {
@@ -158,7 +147,8 @@ impl Transport {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (reply_tx, reply_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(LEGACY_SINK_CAPACITY);
+        hub.set_legacy_sink(event_tx);
 
         let (send_half, recv_half) = router.split();
         let tasks = vec![
@@ -173,7 +163,7 @@ impl Transport {
         ];
 
         Ok(Self {
-            events: EventPublisher { tx: event_tx },
+            hub,
             shutdown: shutdown_tx,
             tasks,
         })
@@ -182,16 +172,17 @@ impl Transport {
     /// A new handle for publishing events.
     #[must_use]
     pub fn event_publisher(&self) -> EventPublisher {
-        self.events.clone()
+        self.hub.publisher()
     }
 
-    /// Signals the socket tasks to stop and waits for them to finish.
+    /// Signals the socket tasks to stop, waits for them to finish and closes
+    /// the event hub: a publish after this errors.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
-        drop(self.events);
         for task in self.tasks {
             let _ = task.await;
         }
+        self.hub.close();
     }
 }
 
@@ -266,17 +257,7 @@ async fn handle_frames(
     }
     match serde_json::from_slice::<Envelope>(payload) {
         Ok(envelope) => {
-            if envelope.id.is_empty()
-                || envelope.id.len() > 128
-                || envelope.capability.len() > 128
-                || envelope.client_version.len() > 128
-                || envelope.caller.agent.len() > 128
-                || envelope.caller.repo.len() > 4096
-                || envelope
-                    .idempotency_key
-                    .as_ref()
-                    .is_some_and(|key| key.len() > 128)
-            {
+            if !envelope_within_limits(&envelope) {
                 let _ = reply_tx
                     .send((
                         identity,
@@ -292,6 +273,7 @@ async fn handle_frames(
             let request = IncomingRequest {
                 identity: identity.clone(),
                 origin: Origin::Public,
+                peer: None,
                 envelope,
                 reply: tx,
             };
@@ -318,8 +300,25 @@ async fn handle_frames(
     }
 }
 
+/// Whether the envelope's identity and scope fields fit their ceilings: a
+/// non-empty id of at most 128 bytes; capability, client version, agent label
+/// and idempotency key of at most 128 bytes each; a repository spelling of at
+/// most 4,096 bytes. Checked before anything is retained.
+pub(crate) fn envelope_within_limits(envelope: &Envelope) -> bool {
+    !envelope.id.is_empty()
+        && envelope.id.len() <= 128
+        && envelope.capability.len() <= 128
+        && envelope.client_version.len() <= 128
+        && envelope.caller.agent.len() <= 128
+        && envelope.caller.repo.len() <= 4096
+        && envelope
+            .idempotency_key
+            .as_ref()
+            .is_none_or(|key| key.len() <= 128)
+}
+
 /// Builds the immediate refusal for a payload the transport cannot parse.
-fn bad_request(id: String, detail: &str) -> Response {
+pub(crate) fn bad_request(id: String, detail: &str) -> Response {
     Response::Refusal {
         retryable: false,
         id,
@@ -332,7 +331,7 @@ fn bad_request(id: String, detail: &str) -> Response {
 
 /// Best-effort extraction of the request id from an unparseable envelope,
 /// so the refusal can still name the request it answers.
-fn salvage_request_id(payload: &[u8]) -> String {
+pub(crate) fn salvage_request_id(payload: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(payload)
         .ok()
         .as_ref()

@@ -58,6 +58,8 @@ const mocks = vi.hoisted(() => ({
   // drown out the copy this file is here to assert.
   flowsSettingsGet: vi.fn(),
   connectorsList: vi.fn(),
+  // The Network section mounts between Connectors and Daemon.
+  networkGet: vi.fn(),
   retentionGet: vi.fn(),
   retentionSet: vi.fn(),
   retentionPrune: vi.fn(),
@@ -157,6 +159,16 @@ beforeEach(() => {
   mocks.curatorList.mockResolvedValue({ detected: [], selected: null });
   mocks.flowsSettingsGet.mockResolvedValue({ allowed_programs: ["git"], extra_path: [] });
   mocks.connectorsList.mockResolvedValue({ connectors: [] });
+  mocks.networkGet.mockResolvedValue({
+    settings: {
+      proxy: null,
+      no_proxy: [],
+      ca_bundle: null,
+      engine_mirror: null,
+      models_mirror: null,
+      credential: { present: false, store_available: true },
+    },
+  });
   mocks.retentionGet.mockResolvedValue({
     evidence_days: 90,
     audit_days: 365,
@@ -211,6 +223,7 @@ const categoryNames = [
   "Models",
   "Flows",
   "Connectors",
+  "Network",
   "Daemon",
   "Retention",
   "Logs",
@@ -234,7 +247,7 @@ describe("settings navigation", () => {
         .map((tab) => tab.textContent),
     ).toEqual(categoryNames);
     expectActiveCategory("Appearance");
-    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(8);
+    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(9);
     for (const name of categoryNames) {
       const id = name.toLowerCase();
       const tab = within(categories).getByRole("tab", { name });
@@ -345,6 +358,7 @@ describe("settings navigation", () => {
       mocks.curatorList,
       mocks.flowsSettingsGet,
       mocks.connectorsList,
+      mocks.networkGet,
       mocks.serviceStatus,
       mocks.retentionGet,
       mocks.readDaemonLog,

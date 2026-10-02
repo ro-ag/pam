@@ -3,6 +3,7 @@ import {
   BRIDGE_TIMEOUT_MS,
   BridgeUnavailable,
   CONFIRM_GRANT,
+  CONFIRM_NETWORK,
   CONFIRM_RELAXED,
   STATUS_TIMEOUT_MS,
   approvalsResolve,
@@ -36,6 +37,9 @@ import {
   flowsSettingsSet,
   grantsList,
   logCompress,
+  networkGet,
+  networkSet,
+  networkTest,
   modelsCatalog,
   modelsDefaultsSet,
   modelsDelete,
@@ -186,6 +190,30 @@ describe("authority-expanding wrappers pass the typed confirmation to the bridge
       op: "admin.approvals.resolve",
       args: { request_id: "req_1", resolution: "approved", remember: true, note: "ok" },
       confirmation: "grant",
+    });
+  });
+
+  it("sends the network phrase beside the op, and the password only inside the patch", async () => {
+    await networkSet(
+      {
+        proxy: { url: "http://proxy.corp.example:3128", auth: "basic", username: "svc" },
+        credential: { set: "hunter2" },
+      },
+      CONFIRM_NETWORK,
+    );
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.network.set",
+      args: {
+        proxy: { url: "http://proxy.corp.example:3128", auth: "basic", username: "svc" },
+        credential: { set: "hunter2" },
+      },
+      confirmation: "network",
+    });
+    await networkSet({ ca_bundle: null });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.network.set",
+      args: { ca_bundle: null },
+      confirmation: undefined,
     });
   });
 
@@ -563,6 +591,20 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "admin.connectors.configure",
       { id: "jira", username: null },
     ],
+    ["networkGet", () => networkGet(), "admin.network.get", {}],
+    [
+      "networkSet (a patch: absent keeps, null clears)",
+      () => networkSet({ proxy: null, no_proxy: ["corp.example"], engine_mirror: null }),
+      "admin.network.set",
+      { proxy: null, no_proxy: ["corp.example"], engine_mirror: null },
+    ],
+    [
+      "networkTest (one connector)",
+      () => networkTest("jenkins"),
+      "admin.network.test",
+      { target: "jenkins" },
+    ],
+    ["networkTest (everything configured)", () => networkTest(), "admin.network.test", {}],
     [
       "connectorsTest",
       () => connectorsTest("github"),

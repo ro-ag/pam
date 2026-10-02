@@ -270,6 +270,9 @@ export type AdminOp =
   | "admin.connectors.keyring"
   | "admin.connectors.sonar_mappings.get"
   | "admin.connectors.sonar_mappings.set"
+  | "admin.network.get"
+  | "admin.network.set"
+  | "admin.network.test"
   | "admin.retention.get"
   | "admin.retention.set"
   | "admin.retention.prune";
@@ -294,6 +297,8 @@ export function adminCall<T>(
  */
 export const CONFIRM_RELAXED = "relaxed";
 export const CONFIRM_GRANT = "grant";
+/** Setting or changing the network proxy, its password or the CA bundle (`CONFIRM_NETWORK`). */
+export const CONFIRM_NETWORK = "network";
 
 export type Profile = "relaxed" | "standard" | "strict";
 
@@ -1605,6 +1610,118 @@ export function connectorsTest(
  */
 export function connectorsKeyring(fresh = false): Promise<KeyringHealth> {
   return adminCall("admin.connectors.keyring", { fresh });
+}
+
+// --- network ---------------------------------------------------------------
+
+/**
+ * The network settings surface (`pam_daemon::admin_network`, spec
+ * docs/specs/2026-10-02-enterprise-network-and-engine-delivery.md). The proxy password is
+ * write-only: it goes to the keychain through `credential: { set }` and no reply ever carries it,
+ * only `credential.present`.
+ */
+
+export type ProxyAuth = "none" | "basic" | "anyauth";
+
+export interface NetworkProxy {
+  url: string;
+  auth: ProxyAuth;
+  username?: string | null;
+}
+
+/** The private, digest-checked copy PAM made of an imported CA bundle. */
+export interface NetworkCaBundle {
+  sha256: string;
+  certificates: number;
+  /** Where it was imported from; display only. */
+  source_path?: string;
+  imported_ts?: number;
+  /** True when the source file's digest no longer equals the import (display only). */
+  source_changed?: boolean;
+}
+
+export interface NetworkSettings {
+  proxy: NetworkProxy | null;
+  no_proxy: string[];
+  ca_bundle: NetworkCaBundle | null;
+  engine_mirror: string | null;
+  models_mirror: string | null;
+  credential: { present: boolean; store_available: boolean };
+  /** Managed-policy only; absent or empty when no policy sets it. */
+  mirror_allowed_hosts?: string[] | null;
+}
+
+/** Where a field's effective value comes from, and whether policy owns it. */
+export interface NetworkEffective {
+  source: "default" | "user" | "policy";
+  locked: boolean;
+}
+
+export interface NetworkGetReply {
+  settings: NetworkSettings;
+  effective?: Partial<
+    Record<
+      "proxy" | "credential" | "no_proxy" | "ca_bundle" | "engine_mirror" | "models_mirror",
+      NetworkEffective
+    >
+  >;
+  curl?: {
+    version: string;
+    backend: string;
+    supports_proxy: boolean;
+    supports_cidr_no_proxy: boolean;
+  };
+  /** Names (never values) of proxy and CA variables in the daemon's own environment. */
+  ignored_env?: string[];
+}
+
+/**
+ * A patch: an absent key keeps the stored value, `null` clears it, a value sets it. The daemon
+ * validates the whole patch before applying any of it.
+ */
+export interface NetworkPatch {
+  proxy?: { url: string; auth: ProxyAuth; username: string | null } | null;
+  credential?: { set: string } | { clear: true };
+  no_proxy?: string[];
+  ca_bundle?: { path: string } | null;
+  engine_mirror?: string | null;
+  models_mirror?: string | null;
+}
+
+export type NetworkRoute = "direct" | "bypass" | "proxy";
+
+/** One probed target; a failed probe is an answer (`ok: false`), not a refusal. */
+export interface NetworkTestResult {
+  target: string;
+  host: string;
+  route: NetworkRoute;
+  /** The furthest point reached. */
+  stage: "proxy" | "tunnel" | "tls" | "http";
+  ok: boolean;
+  http_status: number | null;
+  cause?: string | null;
+  detail?: string | null;
+  recovery?: string | null;
+}
+
+export function networkGet(): Promise<NetworkGetReply> {
+  return adminCall("admin.network.get");
+}
+
+/**
+ * Saves a patch. A proxy URL, password or CA bundle that is set or changed needs the typed
+ * phrase (`CONFIRM_NETWORK`); the bridge checks it in Rust before the op reaches the daemon.
+ */
+export function networkSet(patch: NetworkPatch, confirmation?: string): Promise<unknown> {
+  return adminCall("admin.network.set", { ...patch }, confirmation);
+}
+
+/**
+ * Probes a configured target with the saved settings: no credentials, no free-form URL. The
+ * bridge gives this op 25 s.
+ */
+export function networkTest(target?: string): Promise<{ results: NetworkTestResult[] }> {
+  return adminCall("admin.network.test", target === undefined ? {} : { target });
 }
 
 // --- daemon log ------------------------------------------------------------

@@ -356,12 +356,13 @@ Client to daemon: `hello`, then one of `request`, `follow` (public) or
 `request`, `events` (admin).
 
 Daemon to client: `hello_ack`, then `reply`; or `following`, `event`*, `end`;
-or `event`* (admin all-events); or `error` at any point, after which the
-daemon closes.
+or `subscribed`, `event`* (admin all-events); or `error` at any point, after
+which the daemon closes.
 
 A client may write `hello` and its request frame back to back without
 waiting. The daemon always answers the hello first. If the hello is refused
-the request frame is never read.
+the request frame is never parsed or acted on; it is read off without
+allocating, so the client can read the refusal before the connection closes.
 
 ### Hello
 
@@ -471,7 +472,7 @@ moment. `event` is `done` or `refused`, the terminal event a subscriber sees
 today; it is absent when the follow itself was refused:
 
 ```json
-{"t":"end","response":{"kind":"refusal","id":"req_01JB2M7F","cause":"request_unavailable",
+{"t":"end","response":{"kind":"refusal","id":"req_01JB2M7F","cause":"result_unavailable",
  "detail":"…","recovery":"…"}}
 ```
 
@@ -486,7 +487,10 @@ Admin connections only (see "Events"):
 {"t":"events","include_probes":false}
 ```
 
-answered by a stream of
+answered first by `{"t":"subscribed"}`, written once the subscription is
+registered in the hub: every event published from then on is delivered or
+shows as a gap in `n`, and nothing published before it is replayed. Then a
+stream of
 
 ```json
 {"t":"event","n":1042,"ticket":"req_01JB2M6A","capability":"flow.run",
@@ -516,6 +520,7 @@ after which the daemon closes:
 | `daemon_shutting_down` | a follow stream is cut by the drain |
 | `follow_expired` | a follow reached its maximum lifetime |
 | `subscriber_lagged` | an admin all-events subscriber overflowed its queue |
+| `subscriber_capacity_exhausted` | an `events` request when four all-events subscribers are already attached (transient) |
 
 Everything that concerns a parsed request keeps today's shape: a `reply` (or
 `end`) carrying `Response::Refusal` with the existing causes (`bad_request`,
@@ -679,7 +684,7 @@ handler re-runs the scoped authorisation against the store
 (`flow_result_service::authorized_metadata`) without creating a request row.
 Terminal state gives `end` with the durable answer. Authorisation that no
 longer holds (repository scope changed, grant revision moved) gives `end`
-with `request_unavailable`. The backstop covers terminal transitions whose
+with `result_unavailable`. The backstop covers terminal transitions whose
 event was never published, which is what the client's reconcile query covers
 today.
 
@@ -702,7 +707,7 @@ caller's repository must be an approved root, equal to the ticket's stored
 canonical repository, the stored path must still canonicalise to itself, and
 the ticket's authorisation revision must equal the current grant-revocation
 revision (flow_result_service.rs:179-212). A ticket that does not exist is
-`request_unavailable`, indistinguishable from one the caller may not see.
+`result_unavailable`, indistinguishable from one the caller may not see.
 
 Drain. When the daemon leaves `Serving`, followers get
 `error daemon_shutting_down` and are closed. The client reconnects with
@@ -716,9 +721,11 @@ its ticket, capability, repository, agent label and ingress, and the real
 progress note. `n` is a daemon-wide counter; a gap tells the GUI it missed
 events and should refresh its lists from `admin.activity.list`.
 
-`status` and `query` traffic is left out unless `include_probes` is true.
-That removes the loop in which the GUI's own status polls come back as
-events, at the source rather than by filtering in the webview.
+Control requests (`status`, `query`, `cancel`) publish no lifecycle events at
+all, so the stream never carries them and the GUI's own polls cannot come back
+as events. `include_probes` is accepted and the hub's filter honours it, but
+there is no probe traffic for it to select: both settings deliver the same
+stream.
 
 At most four subscribers. A subscriber whose 1,024-event queue overflows
 loses the oldest progress events first and, if that is not enough, is closed
@@ -745,8 +752,9 @@ What is recorded: the `request` row gains `ingress` (`public` or `admin`),
 migration. Audit rows join to the request by id, so every audited decision
 has the kernel's view of the connection that asked for it. Transport-level
 refusals that create no row (hello errors, capacity, bad frames) log the peer
-with the refusal. `admin.activity.list` and `admin.audit.request` can expose
-the new columns; changing the GUI views is out of scope here.
+with the refusal. `admin.activity.list` returns `ingress`, `peer_uid`,
+`peer_pid` and `relayed` per request; `admin.audit.request` returns audit rows
+only; changing the GUI views is out of scope here.
 
 What is not changed: `caller.agent`, `caller.repo` and `caller.pid` are still
 self-reported, still stored, still attribution. The peer pid is attribution
@@ -986,7 +994,11 @@ One accept loop per listener:
 
 1. Under the five-second handshake timeout: read four bytes. `0xFF`: log and
    close. Otherwise read the hello (4 KiB), check `proto`, apply the version
-   rule, write `hello_ack` or `error`. Read the request frame (1 MiB).
+   rule, write `hello_ack` or `error`. Read the request frame (1 MiB). A hello
+   that is refused after it was read whole (wrong protocol, wrong type, the
+   version rule) is followed by reading off, without allocating, the one
+   request frame the client wrote behind it, on both planes; a first frame
+   refused from its length alone is closed at once.
 2. `request`: validate the envelope's limits; refuse `admin.*`; if the phase
    is `Restarting` answer `daemon_outdated`, if `Draining` answer
    `daemon_shutting_down`; otherwise send `IncomingRequest { origin,
@@ -1021,7 +1033,9 @@ One accept loop per listener:
   frees its slot; the laned work continues under its lease. Bypass execution
   and all bookkeeping are never interrupted by a disconnect.
 - The origin travels into `ExecContext` and into admission, where the peer is
-  written to the request row.
+  written to the request row. `ExecContext::peer` is that recorded row value
+  (`pam_store::RequestOrigin`), read back from the row, so a bypass and a
+  leased execution see the same thing.
 
 ### Reply routing and the completion router
 
@@ -1116,11 +1130,11 @@ files; every await in a test is bounded.
 | tests/transport_stress.rs: GUI polling and abandoned subscribers | same scenario with abandoned followers (connected, never reading) and status polling; control requests keep being answered; follower count and file descriptors stay bounded |
 | tests/session_relay.rs | request and follow through the relay; the session directory holds only `pam.sock` |
 | pam_testkit `TestClient` (one DEALER, pipelined) | per-request connections; `send` starts a reader task, `recv` returns the next completed reply; API unchanged, so spine, admin, flows and the other suites do not change |
-| pam_testkit `EventStream` (SUB, `SUB_SETTLE` sleep) | the admin all-events stream (`include_probes: true`) filtered to the requested ids, in the hub's publish order; subscribing before the ids exist keeps working; no settle sleep. Where no admin adapter exists the harness reads the hub in process |
+| pam_testkit `EventStream` (SUB, `SUB_SETTLE` sleep) | the admin all-events stream filtered to the requested ids (control requests have no events on it, with or without `include_probes`), in the hub's publish order; subscribing before the ids exist keeps working; no settle sleep. Where no admin adapter exists the harness reads the hub in process |
 | client_test.rs fake ROUTER daemon (268-326) | a fake framed daemon (unix listener, lock, scripted frames) and a fake ZMTP daemon (writes the 64-byte greeting) |
 | client_test.rs: refused follow queries once, never subscribes | one connection, one `end` refusal, no retry |
 | client_test.rs: no reply within deadline plus margin; two outdated refusals stop after one retry | same over frames |
-| pam_gui/tests/bridge.rs: event frames decode like the subscriber | admin all-events from a real daemon decode to the payload; status polls are absent by default |
+| pam_gui/tests/bridge.rs: event frames decode like the subscriber | admin all-events from a real daemon decode to the payload; status polls never appear |
 | pam_gui/tests/bridge.rs: idle probe sees the daemon come and go | end of file on daemon stop, reconnect on start |
 | pam/tests/cli.rs:264, 320 | the workarounds go: a follow after terminal returns at once; `subscribe` prints the replayed `queued` and `started` |
 | pam/tests/live_subscribe.rs | kept; additionally asserts one `query` row for the whole follow |
@@ -1320,7 +1334,7 @@ T4. Admin plane on the framed module, and the all-events stream.
 - Acceptance: existing admin tests green (`crates/pam_testkit/tests/admin.rs`,
   `admin_test.rs`, frame and Windows tests); `EMFILE` no longer ends the
   admin listener; all-events stream delivers rich events in publish order,
-  omits probes by default, enforces the subscriber cap and lag rule; a bare
+  never carries control requests, enforces the subscriber cap and lag rule; a bare
   envelope gets `client_outdated`; `bash tools/check.sh`.
 
 ### Phase C (three agents in parallel)

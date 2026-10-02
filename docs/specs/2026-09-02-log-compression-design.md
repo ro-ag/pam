@@ -132,7 +132,7 @@ impl Store {
 ```
 
 Evidence ids are `ev_<ulid>`, minted by the daemon. Every statement runs
-behind the store's connection lock (turso concurrency rule; since 2026-10-02 the mutex owns the connection, `pam_store/src/conn_gate.rs`).
+through the store's connection gate (`ConnGate::run` in `pam_store/src/conn_gate.rs`: one job at a time on the one connection; written under the turso concurrency rule, which the SQLite store of 2026-10-02 replaced).
 
 ## Daemon (`pam_daemon`)
 

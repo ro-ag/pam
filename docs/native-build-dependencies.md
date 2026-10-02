@@ -1,37 +1,53 @@
 # Native build dependency status
 
-PAM requires Rust dependencies that do not compile C/C++ sources. Calling the
-platform linker and binding to installed OS frameworks are separate from
-compiling bundled native source. This requirement is not yet satisfied by the
-whole application: the existing macOS GUI has a confirmed conflict.
+PAM's own dependency choices are pure Rust, with two named exceptions that do
+compile C or Objective-C sources: the platform shims Tauri and objc2 on macOS
+(the Objective-C exception helper; see "Unresolved GUI conflict" below), and
+SQLite, compiled from the amalgamation bundled in `libsqlite3-sys` (owner
+decision 2026-10-02, ptrack issue 38: the audit and authorization spine runs on
+SQLite proper, through `rusqlite`). Calling the platform linker and binding to
+installed OS frameworks are separate from compiling bundled native source.
 
-## Database repair (task #142)
+## Toolchain required to build
 
-The pinned Turso 0.7.2 release selected SimSIMD unconditionally. The same-version
-`vendor/turso_core` patch removes it and uses Rust dense vector distance
-implementations. Zero-vector cosine semantics are retained; SIMD rounding and
-performance equivalence are not promised. SQL regression tests cover ordinary,
-empty, zero, mismatched, extreme, and nonfinite vectors.
+A C compiler is required on every supported target, because `cc` compiles the
+bundled SQLite during `cargo build`. Nothing is downloaded at build time and no
+`bindgen` or `clang-sys` is involved: the bindings are pre-generated. This also
+applies to `cargo install` from source.
 
-The same-version `vendor/aegis` patch removes an unconditional `cc` build
-dependency and requires `pure-rust`. Its cryptographic runtime sources are
-unchanged. Both vendor directories retain licenses and record archive checksums
-and upstream revisions in `PATCH.md`. These are maintenance obligations: review
-and remove the patches when upstream offers suitable feature controls.
+| Target | Compiler | Notes |
+| --- | --- | --- |
+| macOS arm64 | Xcode command line tools (`xcode-select --install`) | Already needed for the Objective-C helper that Wry builds. |
+| Windows amd64 (`x86_64-pc-windows-msvc`) | MSVC build tools (Visual Studio Build Tools, "Desktop development with C++") | Rust's MSVC target already needs them to link; `cc` uses the same `cl.exe`. |
+| Windows arm64 (`aarch64-pc-windows-msvc`) | The same build tools with the ARM64 toolset (MSVC ARM64 build tools) | `cl.exe` for the ARM64 target; native on an ARM64 host. |
 
-Verify the database separately from the GUI, from the repository root:
+Linux and Intel Macs are not supported targets.
 
-```sh
-cargo tree -p pam_store --locked --edges normal,build
-CC=/usr/bin/false CXX=/usr/bin/false CARGO_TARGET_DIR=target/no-c-store cargo test -p pam_store --locked
-```
+## Database (SQLite, bundled)
 
-Use a fresh repository-local target directory when proving compiler independence;
-a cached build alone is insufficient. Do not run Cargo concurrently with another
-worktree. Inspect the dependency graph as well: compiler environment variables do
-not intercept build scripts that invoke a compiler directly. The selected database
-graph contains no `cc`, `cmake`, or `simsimd`. Turso SDK build metadata still selects
-`bindgen`; its current build script does not invoke it for this host.
+`pam_store` links SQLite statically through `rusqlite` with the `bundled`,
+`cache` and `limits` features. The engine is the amalgamation shipped inside
+`libsqlite3-sys`, never the system library, so every target runs the same
+version. The committed `Cargo.lock` pins `rusqlite` 0.40.1 and
+`libsqlite3-sys` 0.38.1, which bundles SQLite 3.53.2. Do not run `cargo update`
+for these without reading which SQLite the new `libsqlite3-sys` bundles.
+
+No compile flags are set (`LIBSQLITE3_FLAGS` is not used): every setting that
+matters for security (double-quoted string literals off, foreign keys on, WAL,
+`synchronous = FULL`, `secure_delete`, no `ATTACH`) is applied per connection at
+open and read back by a test. See [the SQLite store design](specs/2026-10-02-sqlite-store.md).
+
+Read back what a build contains, from a SQL session over a store opened by that
+build or through the store's tests: `SELECT sqlite_version();` and
+`PRAGMA compile_options;`. `sqlite_version()` equals the bundled version
+(`crates/pam_store/src/open_test.rs` asserts it).
+
+The earlier engine, Turso, and the same-version `vendor/turso_core` and
+`vendor/aegis` patches that kept it free of C (task #142) were removed on
+2026-10-02. The compiler-denied proof that used to cover `pam_store`
+(`CC=/usr/bin/false cargo test -p pam_store`) no longer applies to it. Verify
+that nothing of the old engine remains with `cargo tree -i turso`,
+`cargo tree -i turso_core` and `cargo tree -i aegis`, which match no package.
 
 ## Transport (plan 49)
 
@@ -43,8 +59,8 @@ sockets; the frame-size checks now live in `pam_daemon::framed` and run in the
 ordinary test suite. Eight packages left the lockfile with it: `zeromq`,
 `win_uds` (the FFI crate that gave Windows its `AF_UNIX` sockets),
 `asynchronous-codec`, `crossbeam-queue`, `futures`, `scc`, `sdd` and `saa`.
-`cargo tree -i zeromq` and `cargo tree -i win_uds` match no package. Two vendor
-patches remain, both described above.
+`cargo tree -i zeromq` and `cargo tree -i win_uds` match no package. No vendor
+patches remain; the repository has no `vendor/` directory.
 
 ## Unresolved GUI conflict (issue #16)
 
@@ -59,7 +75,8 @@ Additionally, Tauri's build chain selects `embed-resource`, whose library depend
 on `cc` for Windows resource cross-compilation. This dependency can appear on a
 macOS host even if its resource compilation path is not executed.
 
-A GUI runtime replacement or an explicitly accepted exception requires a product
-decision. Until that decision and its validation are complete, do not describe
-PAM's entire dependency graph as compiler-free. Database validation on this
-macOS host is not evidence of all-platform or whole-application compliance.
+The product decision was made on 2026-09-12 (issue #16): the shims Tauri and
+objc2 compile on macOS are an accepted exception, not PAM code. Do not describe
+PAM's entire dependency graph as compiler-free: the platform shims and bundled
+SQLite are compiled. Validation on one host is not evidence of all-platform
+compliance.

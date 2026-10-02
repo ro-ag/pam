@@ -62,10 +62,12 @@ impl Store {
 }
 ```
 
-Both hold the connection lock across `BEGIN..COMMIT` (memento law: one turso
-connection, one statement at a time). Since 2026-10-02 the lock is the store's
-`ConnGate` (the mutex owns the connection; an abandoned transaction is rolled
-back before the next call), and each prune runs oldest first in bounded batches
+Both hold the connection across `BEGIN..COMMIT` (written under the memento law
+of the time: one connection, one statement at a time). Since 2026-10-02 the
+store runs on SQLite and the gate is `ConnGate::run`: one job at a time on the
+one connection, off the async threads, run to completion once started even if
+its caller is dropped, so a transaction is never left open by an abandoned
+caller (see [the SQLite store design](2026-10-02-sqlite-store.md)). And each prune runs oldest first in bounded batches
 (64 evidence rows, 256 request records), one transaction per batch with the lock
 released in between, instead of one transaction per pass; totals are unchanged.
 A stored window outside 1 to 3650 days reads as forever (a stored `0` no longer

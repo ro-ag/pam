@@ -88,7 +88,9 @@ smaller of the deadline and 10 seconds plus 2 seconds. When it elapses the calle
 is answered `deadline_exceeded` at once, the slot is released and the terminal
 row is written in a detached task. A handler that is only parked on the
 completion router lets go when its caller disconnects; the laned work continues.
-A terminal write that fails is retried and then parked for the maintenance loop,
+A terminal write that fails is retried and then parked for the maintenance loop
+(one that finds the store already closed, at the very end of a shutdown, is
+neither: nothing can record it any more, and boot recovery closes its row),
 and a reconciler fails any in-flight row whose deadline passed (plus the handler
 grace and 15 seconds) and drops it from the lanes, so a stranded row cannot hold
 admission capacity.
@@ -124,6 +126,7 @@ admission capacity.
 | Accepted HTTP bodies per request | 128 MiB cumulative |
 | Command capture per request | 128 MiB cumulative |
 | Accounted blocking jobs | Eight executing; 128 outstanding including waiting lanes |
+| Store calls queued per connection | 1,024, waiting plus running, on the writing connection and on the read-only one. The next call is refused before it runs and writes nothing; a public request that meets it is refused `store_overloaded`, marked retryable (a follow and a patient read retry it with backoff), and the admin plane shows the store's sentence |
 
 Individual adapter and step ceilings can be smaller. Identity and payload checks
 happen before retaining a decoded request for execution. Both the daemon and

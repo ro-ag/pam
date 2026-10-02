@@ -142,6 +142,13 @@ directories for flows through the flow settings, not the shell.
 
 ## Build from source
 
+Building needs a C compiler on every target, because the store links SQLite
+compiled from the amalgamation bundled in the `libsqlite3-sys` crate: the Xcode
+command line tools on macOS (`xcode-select --install`), the MSVC build tools
+("Desktop development with C++", with the ARM64 toolset on Windows arm64) on
+Windows. Nothing else is downloaded at build time. See
+[native build dependencies](docs/native-build-dependencies.md).
+
 ```sh
 rustup show                          # picks up rust-toolchain.toml
 npm --prefix frontend ci             # Node 22.22.2+, 24.15+, or 26+

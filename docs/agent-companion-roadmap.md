@@ -28,7 +28,8 @@ for access, evidence, polling, validation, or landing decisions.
   not make activity invisible to the sandbox or establish caller identity.
 - Administration stays GUI-only, with verified enforcement rather than a
   self-reported GUI label. The daemon owns authority and enforces every call.
-- Pure-Rust dependency constraint remains. No inference API keys, hosted core
+- Pure-Rust dependency constraint remains, with bundled SQLite (2026-10-02) and
+  the macOS platform shims as named exceptions. No inference API keys, hosted core
   inference, Python inference service, or silent vendor-CLI fallback. Connector
   secrets remain in the OS keychain and never enter agent/model context.
 - Workflow state is durable; inference is stateless. Models make advisory

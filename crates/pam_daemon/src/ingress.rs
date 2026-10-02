@@ -18,8 +18,16 @@
 //! listener, which has no way to ask. They are recorded, never used to
 //! authorize. [`Ingress`] is the seam itself: the one call a transport adapter
 //! makes to run a request, whatever carried the bytes.
+//!
+//! What is recorded is [`recorded`]: the plane and the peer as the columns
+//! of the request row ([`pam_store::RequestOrigin`]), written by the INSERT
+//! that admits the request. A leased execution reads its origin back from
+//! that row ([`Origin::of_row`]), so a request the administration plane
+//! submitted is still an administration request when its lane reaches it.
 
+use pam_proto::wire;
 use pam_proto::{Envelope, Response};
+use pam_store::{RequestIngress, RequestOrigin};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -35,6 +43,47 @@ pub enum Origin {
     /// arrived on the private admin listener (the GUI: a run, an inspect, a
     /// cancel).
     Admin,
+}
+
+impl Origin {
+    /// The origin recorded on a request row.
+    #[must_use]
+    pub const fn of_row(recorded: &RequestOrigin) -> Self {
+        match recorded.ingress {
+            RequestIngress::Public => Self::Public,
+            RequestIngress::Admin => Self::Admin,
+        }
+    }
+
+    /// The plane as the wire protocol names it (the all-events stream's
+    /// `ingress` member).
+    #[must_use]
+    pub const fn wire(self) -> wire::Ingress {
+        match self {
+            Self::Public => wire::Ingress::Public,
+            Self::Admin => wire::Ingress::Admin,
+        }
+    }
+}
+
+/// What the request row records about where a request entered the daemon.
+///
+/// The peer is recorded for a public request only: a request of
+/// [`Origin::Admin`] was submitted in process, and whatever connection the
+/// human's surface arrived on was already admitted by the administration
+/// plane's own check. A public request with no peer came through a listener
+/// that cannot ask the kernel (the legacy `ZeroMQ` socket).
+#[must_use]
+pub fn recorded(origin: Origin, peer: Option<PublicPeer>) -> RequestOrigin {
+    match origin {
+        Origin::Admin => RequestOrigin::ADMIN,
+        Origin::Public => RequestOrigin {
+            ingress: RequestIngress::Public,
+            peer_uid: peer.and_then(|peer| peer.identity.uid()),
+            peer_pid: peer.and_then(|peer| peer.identity.pid()),
+            relayed: peer.is_some_and(|peer| peer.relayed),
+        },
+    }
 }
 
 /// What the operating system says about the other end of a connection.

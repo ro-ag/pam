@@ -11,8 +11,8 @@
 //! - client to daemon: `hello`, then one of `request`, `follow` (public plane)
 //!   or `request`, `events` (administration plane);
 //! - daemon to client: `hello_ack`, then `reply`; or `following`, `event`*,
-//!   `end`; or `event`* (all events); or `error` at any point, after which the
-//!   daemon closes.
+//!   `end`; or `subscribed`, `event`* (all events); or `error` at any point,
+//!   after which the daemon closes.
 //!
 //! Unknown members are ignored. A frame whose `"t"` the receiver does not know
 //! is [`FrameError::UnknownType`]: a protocol error for the daemon, skipped by
@@ -67,6 +67,9 @@ pub mod cause {
     pub const FOLLOW_EXPIRED: &str = "follow_expired";
     /// An all-events subscriber overflowed its queue.
     pub const SUBSCRIBER_LAGGED: &str = "subscriber_lagged";
+    /// Every all-events subscriber slot is taken. Transient: a slot frees when
+    /// another subscriber's connection ends.
+    pub const SUBSCRIBER_CAPACITY_EXHAUSTED: &str = "subscriber_capacity_exhausted";
     /// Every follower slot (in total, or for one ticket) is taken. Carried by
     /// a refusal in an `end` frame; transient.
     pub const FOLLOWER_CAPACITY_EXHAUSTED: &str = "follower_capacity_exhausted";
@@ -244,15 +247,23 @@ pub enum Frame {
     /// Client (administration plane): stream every event.
     Events {
         /// Include `status` and `query` traffic, which is left out by default.
+        /// The daemon publishes no lifecycle events for control requests
+        /// (`status`, `query`, `cancel`) at all, so today the two settings
+        /// deliver the same stream; the member is kept so that a daemon
+        /// which does publish them leaves them out unless asked.
         #[serde(default)]
         include_probes: bool,
     },
+    /// Daemon (administration plane): the `events` subscription is in place.
+    /// Every event published from here on is delivered or shows as a gap in
+    /// `n`; nothing published before it is replayed.
+    Subscribed,
     /// Daemon: a transport-level failure; the connection closes.
     Error(ErrorFrame),
 }
 
 /// Every frame type name this build understands.
-pub const FRAME_TYPES: [&str; 10] = [
+pub const FRAME_TYPES: [&str; 11] = [
     "hello",
     "hello_ack",
     "request",
@@ -262,6 +273,7 @@ pub const FRAME_TYPES: [&str; 10] = [
     "event",
     "end",
     "events",
+    "subscribed",
     "error",
 ];
 
@@ -312,6 +324,7 @@ impl Frame {
             Self::Event(_) => "event",
             Self::End(_) => "end",
             Self::Events { .. } => "events",
+            Self::Subscribed => "subscribed",
             Self::Error(_) => "error",
         }
     }

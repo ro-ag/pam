@@ -138,7 +138,7 @@ impl ConnectorService {
         if Instant::now() >= deadline.min(budget.deadline()) {
             return Err(ConnectorError::Timeout.into());
         }
-        self.ensure_transport(ConnectorId::Github)?;
+        self.ensure_transport()?;
         let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
         let transport = LandingTransport {
             service: self,

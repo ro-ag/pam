@@ -283,6 +283,12 @@ pub struct AdminService {
     /// paths. Created here and shared with the pipeline, whose maintenance
     /// loop retries whatever either of them parked.
     pub(crate) terminals: Arc<TerminalWriter>,
+    /// Seconds the retention ops' wall clock runs ahead of the real one.
+    /// Tests stage a forward clock jump over real rows with it (see
+    /// [`crate::admin_retention`]); production has no such field and reads
+    /// the system clock.
+    #[cfg(test)]
+    pub(crate) retention_clock_ahead: std::sync::atomic::AtomicI64,
 }
 
 impl AdminService {
@@ -308,6 +314,8 @@ impl AdminService {
             connectors,
             flows,
             submit,
+            #[cfg(test)]
+            retention_clock_ahead: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -328,9 +336,18 @@ impl AdminService {
     ) -> Response {
         let deadline = Instant::now() + Duration::from_millis(envelope.deadline_ms.min(300_000));
         let id = &envelope.id;
+        // The plane is recorded from where the envelope arrived, never from
+        // what it says: only the private listener writes `admin`. An
+        // `admin.*` envelope that reached the public plane keeps `public` on
+        // the row its tripwire refusal is audited against.
+        let origin = if private_ingress {
+            pam_store::RequestOrigin::ADMIN
+        } else {
+            pam_store::RequestOrigin::PUBLIC
+        };
         let inserted = self
             .store
-            .insert_running_request(
+            .insert_running_request_from(
                 id,
                 &envelope.capability,
                 ADMIN_REPO,
@@ -339,6 +356,7 @@ impl AdminService {
                 // even before caller validation; each operation owns safe audit fields.
                 "{}",
                 envelope.idempotency_key.as_deref(),
+                &origin,
             )
             .await;
         if inserted.is_err() {
@@ -892,6 +910,12 @@ impl AdminService {
                     "outcome": row.outcome,
                     "created_ts": row.created_ts,
                     "updated_ts": row.updated_ts,
+                    // Where the request entered the daemon and what the
+                    // kernel said about the connection. Attribution only.
+                    "ingress": row.origin.ingress.as_str(),
+                    "peer_uid": row.origin.peer_uid,
+                    "peer_pid": row.origin.peer_pid,
+                    "relayed": row.origin.relayed,
                 })
             })
             .collect();

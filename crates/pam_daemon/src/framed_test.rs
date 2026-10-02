@@ -17,12 +17,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::framed::{
-    Accept, AcceptBackoff, DialError, First, FirstByte, HANDSHAKE_TIMEOUT, HandshakeError, Limits,
-    Listener, Policy, accept_hello, call, client_hello, follow, handshake_deadline, open,
-    read_daemon_frame, read_first_frame, read_frame, read_hello, refuse, send, sniff, stopped,
+    Accept, AcceptBackoff, DialError, First, FirstByte, FrameReader, HANDSHAKE_TIMEOUT,
+    HandshakeError, Limits, Listener, Policy, accept_hello, call, client_hello, discard_frame,
+    follow, handshake_deadline, open, open_encoded, read_daemon_frame, read_first_frame,
+    read_frame, read_hello, read_hello_within, refuse, send, sniff, stopped, version_rule,
     write_frame, write_once,
 };
+use crate::image::{BootImage, FileFacts, ImageProbe, ImageWatch};
 use crate::ingress::PeerIdentity;
+use crate::lifecycle::LifecyclePhase;
 
 pub(crate) const PATIENCE: Duration = Duration::from_secs(60);
 
@@ -629,9 +632,10 @@ async fn a_follow_carries_its_resume_position_and_skips_frames_it_does_not_know(
     );
 }
 
-/// A source of in-memory connections and scripted accept errors.
-struct Scripted {
-    script: mpsc::UnboundedReceiver<io::Result<DuplexStream>>,
+/// A source of in-memory connections and scripted accept errors. Every
+/// connection is reported with the peer its dialer names.
+pub(crate) struct Scripted {
+    script: mpsc::UnboundedReceiver<io::Result<(DuplexStream, PeerIdentity)>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -640,7 +644,7 @@ impl Accept for Scripted {
 
     async fn accept(&mut self) -> io::Result<(DuplexStream, PeerIdentity)> {
         match self.script.recv().await {
-            Some(next) => next.map(|stream| (stream, PeerIdentity::OwnerNonce)),
+            Some(next) => next,
             None => std::future::pending().await,
         }
     }
@@ -655,24 +659,34 @@ impl Accept for Scripted {
 }
 
 /// The far end of a [`Scripted`] acceptor.
-struct Dialer {
-    script: mpsc::UnboundedSender<io::Result<DuplexStream>>,
+pub(crate) struct Dialer {
+    script: mpsc::UnboundedSender<io::Result<(DuplexStream, PeerIdentity)>>,
     closed: Arc<AtomicBool>,
 }
 
 impl Dialer {
-    fn connect(&self) -> DuplexStream {
+    pub(crate) fn connect(&self) -> DuplexStream {
+        self.connect_as(PeerIdentity::OwnerNonce)
+    }
+
+    /// A connection the acceptor reports as coming from `peer`.
+    pub(crate) fn connect_as(&self, peer: PeerIdentity) -> DuplexStream {
         let (client, server) = tokio::io::duplex(64 * 1024);
-        self.script.send(Ok(server)).unwrap();
+        self.script.send(Ok((server, peer))).unwrap();
         client
     }
 
-    fn fail(&self, error: io::Error) {
+    pub(crate) fn fail(&self, error: io::Error) {
         self.script.send(Err(error)).unwrap();
+    }
+
+    /// Whether the listener closed the acceptor.
+    pub(crate) fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
-fn scripted() -> (Scripted, Dialer) {
+pub(crate) fn scripted() -> (Scripted, Dialer) {
     let (tx, rx) = mpsc::unbounded_channel();
     let closed = Arc::new(AtomicBool::new(false));
     (
@@ -751,7 +765,7 @@ async fn ask(dialer: &Dialer, id: &str) -> Response {
 }
 
 /// EMFILE on unix; an uncategorised error everywhere.
-fn too_many_open_files() -> io::Error {
+pub(crate) fn too_many_open_files() -> io::Error {
     io::Error::from_raw_os_error(24)
 }
 
@@ -1015,4 +1029,434 @@ fn the_two_planes_keep_their_documented_limits() {
         assert_eq!(limits.drain, Duration::from_secs(5));
     }
     assert_eq!(client_hello(Via::Direct).proto, 2);
+}
+
+/// The administration plane's hello: an untyped first frame larger than a
+/// hello comes back whole for the policy to answer, with nothing written; a
+/// typed frame is still held to the hello limit, and the plain `read_hello`
+/// still refuses the long frame by its length.
+#[tokio::test]
+async fn a_raised_first_frame_limit_only_admits_an_untyped_frame() {
+    let deadline = || handshake_deadline(&Limits::ADMIN);
+    let limit = Limits::ADMIN.request_bytes;
+    let bare = serde_json::to_vec(&Envelope {
+        args: serde_json::json!({ "pad": "x".repeat(16 * MAX_HELLO_BYTES) }),
+        ..envelope("req_bare")
+    })
+    .unwrap();
+    let mut framed_bare = Vec::new();
+    write_frame(&mut framed_bare, &bare, limit).await.unwrap();
+
+    let verdict_within = |first: Vec<u8>| async move {
+        let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+        client.write_all(&first).await.unwrap();
+        client.shutdown().await.unwrap();
+        let verdict = read_hello_within(&mut server, deadline(), limit).await;
+        drop(server);
+        let mut sent = Vec::new();
+        client.read_to_end(&mut sent).await.unwrap();
+        (verdict, sent)
+    };
+
+    let (verdict, sent) = verdict_within(framed_bare).await;
+    assert!(
+        matches!(&verdict, Err(HandshakeError::Untyped(body)) if body == &bare),
+        "{verdict:?}"
+    );
+    assert!(sent.is_empty(), "the policy answers, not the handshake");
+
+    // A hello padded past the hello limit is refused although it fits the
+    // raised one.
+    let mut fat = serde_json::to_value(Frame::Hello(client_hello(Via::Direct))).unwrap();
+    fat["pad"] = serde_json::json!("x".repeat(MAX_HELLO_BYTES));
+    let mut framed_fat = Vec::new();
+    write_frame(&mut framed_fat, &serde_json::to_vec(&fat).unwrap(), limit)
+        .await
+        .unwrap();
+    let (verdict, sent) = verdict_within(framed_fat).await;
+    assert!(
+        matches!(verdict, Err(HandshakeError::BadFrame(_))),
+        "{verdict:?}"
+    );
+    assert_eq!(sent_cause(&sent), cause::BAD_FRAME);
+
+    // A hello inside the limit is a hello under either reader.
+    let (verdict, sent) =
+        verdict_within(wire_bytes(&Frame::Hello(client_hello(Via::Direct))).await).await;
+    assert!(verdict.is_ok(), "{verdict:?}");
+    assert!(sent.is_empty());
+
+    // Without the raised limit a bare frame longer than a hello is a bad
+    // frame (one small enough for the helper's 64 KiB stream).
+    let shorter = serde_json::to_vec(&Envelope {
+        args: serde_json::json!({ "pad": "x".repeat(2 * MAX_HELLO_BYTES) }),
+        ..envelope("req_bare")
+    })
+    .unwrap();
+    let mut framed_shorter = Vec::new();
+    write_frame(&mut framed_shorter, &shorter, limit)
+        .await
+        .unwrap();
+    let (verdict, sent) = hello_verdict(framed_shorter).await;
+    assert!(
+        matches!(verdict, Err(HandshakeError::BadFrame(_))),
+        "{verdict:?}"
+    );
+    assert_eq!(sent_cause(&sent), cause::BAD_FRAME);
+}
+
+/// A request the caller encoded itself is sized before anything is written:
+/// an over-limit one never reaches the daemon.
+#[tokio::test]
+async fn an_encoded_request_over_the_limit_is_refused_before_any_write() {
+    let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+    let hello = client_hello(Via::Direct);
+    for request in [vec![b'x'; MAX_FRAME_BYTES + 1], Vec::new()] {
+        let outcome = open_encoded(&mut client, &hello, &request).await;
+        assert!(
+            matches!(&outcome, Err(DialError::Io(error)) if error.kind() == io::ErrorKind::InvalidData),
+            "{outcome:?}"
+        );
+    }
+    drop(client);
+    let mut seen = Vec::new();
+    server.read_to_end(&mut seen).await.unwrap();
+    assert!(seen.is_empty(), "nothing was written: {} bytes", seen.len());
+}
+
+/// A read that is dropped mid-frame, in the header or in the body, resumes
+/// where it stopped: a stream read under a timeout never loses its place.
+#[tokio::test(start_paused = true)]
+async fn a_frame_reader_resumes_a_read_that_was_dropped_mid_frame() {
+    let tick = Duration::from_millis(5);
+    let (mut near, mut far) = tokio::io::duplex(1024);
+    let mut reader = FrameReader::new(64);
+    let first = br#"{"t":"one"}"#;
+    let second = br#"{"t":"two","pad":"xxxxxxxx"}"#;
+    let header = |body: &[u8]| u32::try_from(body.len()).unwrap().to_be_bytes();
+
+    // Two header bytes, then nothing: the read is dropped by the timeout.
+    far.write_all(&header(first)[..2]).await.unwrap();
+    assert!(
+        tokio::time::timeout(tick, reader.read(&mut near))
+            .await
+            .is_err()
+    );
+    // The rest of the header and half the body: dropped again.
+    far.write_all(&header(first)[2..]).await.unwrap();
+    far.write_all(&first[..5]).await.unwrap();
+    assert!(
+        tokio::time::timeout(tick, reader.read(&mut near))
+            .await
+            .is_err()
+    );
+    // The remainder, with the whole next frame right behind it.
+    far.write_all(&first[5..]).await.unwrap();
+    far.write_all(&header(second)).await.unwrap();
+    far.write_all(second).await.unwrap();
+    assert_eq!(reader.read(&mut near).await.unwrap(), first);
+    assert_eq!(reader.read(&mut near).await.unwrap(), second);
+
+    // The peer closing between frames, or inside one, is an end of file.
+    far.write_all(&header(first)).await.unwrap();
+    drop(far);
+    let error = reader.read(&mut near).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    let (mut near, far) = tokio::io::duplex(1024);
+    drop(far);
+    let error = FrameReader::new(64).read(&mut near).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+    // A bad length is refused from the header alone, body unread.
+    for announced in [0u32, 65, u32::MAX] {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let mut source = HeaderOnly {
+            header: announced.to_be_bytes(),
+            given: 0,
+            body_polls: Arc::clone(&body_polls),
+        };
+        let error = tokio::time::timeout(tick, FrameReader::new(64).read(&mut source))
+            .await
+            .expect("refused without waiting for a body")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{announced}");
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0, "{announced}");
+    }
+}
+
+/// The image probe a test flips to "the binary on disk was replaced".
+struct Flip {
+    replaced: AtomicBool,
+}
+
+impl ImageProbe for Flip {
+    fn facts(&self, path: &std::path::Path) -> Option<FileFacts> {
+        Some(FileFacts {
+            canonical: path.to_path_buf(),
+            len: 100,
+            modified: None,
+            identity: Some((1, u64::from(self.replaced.load(Ordering::SeqCst)))),
+        })
+    }
+}
+
+fn image_over(probe: &Arc<Flip>) -> Arc<ImageWatch> {
+    let boot = BootImage::from_paths(
+        vec![std::path::PathBuf::from("/opt/pam/bin/pam")],
+        probe.as_ref(),
+    );
+    ImageWatch::with_boot(boot, Arc::clone(probe) as Arc<dyn ImageProbe>)
+}
+
+fn hello_claiming(version: &str) -> Hello {
+    Hello {
+        version: version.to_owned(),
+        ..client_hello(Via::Direct)
+    }
+}
+
+/// What the version rule did with a hello claiming `version`, with a request
+/// frame and three more bytes already written behind that hello: its verdict,
+/// the frames the peer was sent, and what was left unread after it.
+async fn version_verdict(
+    version: &str,
+    image: &ImageWatch,
+    phase: &watch::Sender<LifecyclePhase>,
+) -> (Result<(), pam_proto::wire::ErrorFrame>, Vec<u8>, Vec<u8>) {
+    let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+    let request = wire_bytes(&Frame::Request {
+        envelope: envelope("req_behind"),
+    })
+    .await;
+    client.write_all(&request).await.unwrap();
+    client.write_all(b"xyz").await.unwrap();
+    client.shutdown().await.unwrap();
+    let verdict = version_rule(
+        &mut server,
+        &hello_claiming(version),
+        image,
+        phase,
+        handshake_deadline(&Limits::PUBLIC),
+    )
+    .await;
+    let mut unread = Vec::new();
+    server.read_to_end(&mut unread).await.unwrap();
+    drop(server);
+    let mut sent = Vec::new();
+    client.read_to_end(&mut sent).await.unwrap();
+    (verdict, sent, unread)
+}
+
+/// The version rule both planes call: an equal version passes untouched; any
+/// other is refused by what the daemon's own binary on disk says, never by
+/// what the client claims; only a replaced binary moves the phase, and only
+/// from `Serving`; and a refusal reads off exactly the one request frame the
+/// client wrote behind its hello.
+#[tokio::test]
+async fn the_version_rule_refuses_by_the_image_and_reads_off_the_request_behind_the_hello() {
+    let probe = Arc::new(Flip {
+        replaced: AtomicBool::new(false),
+    });
+    let (phase, _) = watch::channel(LifecyclePhase::Serving);
+    let whole_request = wire_bytes(&Frame::Request {
+        envelope: envelope("req_behind"),
+    })
+    .await;
+
+    // This build: nothing is written, nothing is read, the request stays.
+    let image = image_over(&probe);
+    let (verdict, sent, unread) = version_verdict(env!("CARGO_PKG_VERSION"), &image, &phase).await;
+    assert_eq!(verdict, Ok(()));
+    assert!(
+        sent.is_empty(),
+        "an accepted hello is acked by accept_hello"
+    );
+    assert_eq!(unread, [whole_request.as_slice(), b"xyz"].concat());
+
+    // Another build, the binary on disk unchanged: refused, nothing moves.
+    for claimed in ["9.9.9", "0.0.1", "not a version"] {
+        let (verdict, sent, unread) = version_verdict(claimed, &image, &phase).await;
+        let error = verdict.unwrap_err();
+        assert_eq!(error.cause, cause::CLIENT_VERSION_MISMATCH);
+        assert!(error.detail.contains(claimed), "{}", error.detail);
+        assert!(
+            error.detail.contains(env!("CARGO_PKG_VERSION"))
+                && error.detail.contains("/opt/pam/bin/pam"),
+            "the refusal names the daemon's version and executable: {}",
+            error.detail
+        );
+        // What was returned is what was written, as one `error` frame.
+        assert_eq!(Frame::decode(&sent[4..]).unwrap(), Frame::Error(error));
+        // Exactly the request frame was read off: the close is not held up
+        // waiting for more, and nothing past the frame is consumed.
+        assert_eq!(unread, b"xyz");
+        assert_eq!(*phase.borrow(), LifecyclePhase::Serving);
+    }
+
+    // The binary was replaced: the daemon hands over. (A fresh watch: the
+    // one above has just cached "unchanged" for its re-check interval.)
+    let replaced = Arc::new(Flip {
+        replaced: AtomicBool::new(false),
+    });
+    let image_replaced = image_over(&replaced);
+    replaced.replaced.store(true, Ordering::SeqCst);
+    let (verdict, sent, unread) = version_verdict("9.9.9", &image_replaced, &phase).await;
+    let error = verdict.unwrap_err();
+    assert_eq!(error.cause, cause::DAEMON_OUTDATED);
+    assert_eq!(Frame::decode(&sent[4..]).unwrap(), Frame::Error(error));
+    assert_eq!(unread, b"xyz");
+    assert_eq!(*phase.borrow(), LifecyclePhase::Restarting);
+
+    // A daemon that is already draining keeps its phase, and an equal
+    // version is never a reason to look at the image at all.
+    let (draining, _) = watch::channel(LifecyclePhase::Draining);
+    let (verdict, _, _) = version_verdict("9.9.9", &image_replaced, &draining).await;
+    assert_eq!(verdict.unwrap_err().cause, cause::DAEMON_OUTDATED);
+    assert_eq!(*draining.borrow(), LifecyclePhase::Draining);
+    let (verdict, _, _) = version_verdict(env!("CARGO_PKG_VERSION"), &image, &draining).await;
+    assert_eq!(verdict, Ok(()));
+}
+
+/// A hello refused after it was read whole (wrong protocol, wrong type, not a
+/// frame) takes the request behind it with it; a first frame refused from its
+/// header alone is not waited on.
+#[tokio::test(start_paused = true)]
+async fn a_refused_hello_takes_the_request_behind_it_and_a_bad_length_does_not_wait() {
+    let request = wire_bytes(&Frame::Request {
+        envelope: envelope("req_behind"),
+    })
+    .await;
+    let future = wire_bytes(&Frame::Hello(Hello {
+        proto: 3,
+        ..client_hello(Via::Direct)
+    }))
+    .await;
+    let wrong_type = wire_bytes(&Frame::Subscribed).await;
+    let mut not_json = Vec::new();
+    write_frame(&mut not_json, b"not json", MAX_HELLO_BYTES)
+        .await
+        .unwrap();
+    for (first, expected) in [
+        (future, cause::PROTOCOL_MISMATCH),
+        (wrong_type, cause::BAD_FRAME),
+        (not_json, cause::BAD_FRAME),
+    ] {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client.write_all(&first).await.unwrap();
+        client.write_all(&request).await.unwrap();
+        client.write_all(b"xyz").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let verdict = read_hello(&mut server, handshake_deadline(&Limits::PUBLIC)).await;
+        assert!(verdict.is_err(), "{verdict:?}");
+        // The client is still connected and silent, yet nothing was waited
+        // for: the request was already there.
+        assert_eq!(started.elapsed(), Duration::ZERO, "{expected}");
+        assert_eq!(error_cause(&mut client).await, expected);
+        let mut left = [0u8; 3];
+        server.read_exact(&mut left).await.unwrap();
+        assert_eq!(&left, b"xyz", "{expected}: exactly one frame was read off");
+    }
+
+    // An over-limit length: refused from the header, no body awaited.
+    let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+    let oversized = u32::try_from(MAX_HELLO_BYTES + 1).unwrap().to_be_bytes();
+    client.write_all(&oversized).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let verdict = read_hello(&mut server, handshake_deadline(&Limits::PUBLIC)).await;
+    assert!(
+        matches!(verdict, Err(HandshakeError::BadFrame(_))),
+        "{verdict:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(error_cause(&mut client).await, cause::BAD_FRAME);
+}
+
+/// `discard_frame` drops one frame without trusting its length and gives up
+/// at the deadline when the peer sends nothing.
+#[tokio::test(start_paused = true)]
+async fn discarding_a_frame_is_bounded_in_bytes_and_in_time() {
+    // A length far over the limit: at most one frame's worth is dropped.
+    let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+    let feeding = tokio::spawn(async move {
+        client.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        let chunk = vec![7u8; 64 * 1024];
+        let mut written = 0usize;
+        while written < MAX_FRAME_BYTES + 64 * 1024 {
+            if client.write_all(&chunk).await.is_err() {
+                break;
+            }
+            written += chunk.len();
+        }
+        client
+    });
+    discard_frame(&mut server, tokio::time::Instant::now() + HANDSHAKE_TIMEOUT).await;
+    let mut rest = Vec::new();
+    let mut client = feeding.await.unwrap();
+    client.shutdown().await.unwrap();
+    server.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(
+        rest.len(),
+        64 * 1024,
+        "one frame's worth was dropped, no more"
+    );
+
+    // A silent peer: the wait ends at the deadline.
+    let (_client, mut server) = tokio::io::duplex(1024);
+    let started = tokio::time::Instant::now();
+    discard_frame(&mut server, started + HANDSHAKE_TIMEOUT).await;
+    assert_elapsed(started, HANDSHAKE_TIMEOUT);
+}
+
+/// The cancel-safe reader decodes like `read_daemon_frame`: an `error` frame
+/// is the refusal, an unknown type is skipped, and a read dropped mid-frame
+/// loses nothing.
+#[tokio::test(start_paused = true)]
+async fn a_frame_reader_reads_daemon_frames_and_keeps_its_place() {
+    let tick = Duration::from_millis(5);
+    let (mut near, mut far) = tokio::io::duplex(64 * 1024);
+    let mut reader = FrameReader::new(MAX_FRAME_BYTES);
+    let event = wire_bytes(&Frame::follow_event(1, Event::Started)).await;
+
+    // Half an event, a dropped read, the other half behind an unknown frame.
+    far.write_all(b"\x00\x00\x00\x0b{\"t\":\"new\"}")
+        .await
+        .unwrap();
+    far.write_all(&event[..9]).await.unwrap();
+    assert!(
+        tokio::time::timeout(tick, reader.daemon_frame(&mut near))
+            .await
+            .is_err()
+    );
+    far.write_all(&event[9..]).await.unwrap();
+    assert_eq!(
+        reader.daemon_frame(&mut near).await.unwrap(),
+        Frame::follow_event(1, Event::Started)
+    );
+
+    far.write_all(&wire_bytes(&Frame::Subscribed).await)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.daemon_frame(&mut near).await.unwrap(),
+        Frame::Subscribed
+    );
+
+    let refusal = Frame::error(cause::DAEMON_SHUTTING_DOWN, "draining", "Reconnect.");
+    far.write_all(&wire_bytes(&refusal).await).await.unwrap();
+    let refused = reader.daemon_frame(&mut near).await;
+    assert!(
+        matches!(&refused, Err(DialError::Refused(error)) if error.cause == cause::DAEMON_SHUTTING_DOWN),
+        "{refused:?}"
+    );
+
+    far.write_all(b"\x00\x00\x00\x08not json").await.unwrap();
+    assert!(matches!(
+        reader.daemon_frame(&mut near).await,
+        Err(DialError::Protocol(_))
+    ));
+    drop(far);
+    assert!(matches!(
+        reader.daemon_frame(&mut near).await,
+        Err(DialError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
 }

@@ -1,37 +1,28 @@
-//! Kernel-owner admission for macOS/Linux administration over a Unix socket.
+//! Kernel-owner admission for administration over a Unix socket.
+//!
+//! The endpoint is `<base>/admin/control.sock`, mode `0600` in a `0700`
+//! directory, under a base whose ownership and ancestors are validated here
+//! before anything is created or opened. Connections come from
+//! [`crate::framed_unix::UnixAcceptor`] with the kernel's view of each peer and
+//! are served by the shared administration policy, which admits only the
+//! daemon's own uid. The client half checks the same thing in the other
+//! direction before it writes a byte.
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use pam_proto::{Envelope, Response};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::net::UnixStream;
 
-use super::frame::{
-    AcceptBackoff, AdminLifecycle, DRAIN_TIMEOUT, MAX_CONNECTIONS, denied, encode_request,
-    exchange_on, invalid, serve, timed_out,
-};
+use super::frame::{AdminLifecycle, AdminPolicy, Admission, denied, invalid};
 use crate::admin::AdminService;
-
-/// Where connections come from. The production acceptor is the bound
-/// [`UnixListener`]; a test wraps one to script accept errors.
-pub(super) trait Accept: Send + 'static {
-    /// The next connection, or the error the kernel reported.
-    fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send;
-}
-
-impl Accept for UnixListener {
-    async fn accept(&mut self) -> io::Result<UnixStream> {
-        UnixListener::accept(self).await.map(|(stream, _)| stream)
-    }
-}
+use crate::event_hub::EventHub;
+use crate::framed::{self, Accept};
+use crate::framed_unix::{self, UnixAcceptor};
+use crate::ingress::PeerIdentity;
 
 pub(super) struct Listener {
-    stop: watch::Sender<bool>,
-    task: Option<JoinHandle<()>>,
+    inner: framed::Listener,
 }
 
 impl Listener {
@@ -39,62 +30,57 @@ impl Listener {
         base: &Path,
         admin: Arc<AdminService>,
         lifecycle: AdminLifecycle,
+        hub: Arc<EventHub>,
     ) -> io::Result<Self> {
-        Self::bind_with(base, admin, lifecycle, |listener| listener)
+        Self::bind_with(base, admin, lifecycle, hub, |acceptor| acceptor)
     }
 
-    /// [`Self::bind`] with the bound listener handed through `wrap` first,
+    /// [`Self::bind`] with the bound acceptor handed through `wrap` first,
     /// so a test can put a scripted acceptor in front of the real socket.
     pub(super) fn bind_with<A: Accept>(
         base: &Path,
         admin: Arc<AdminService>,
         lifecycle: AdminLifecycle,
-        wrap: impl FnOnce(UnixListener) -> A,
+        hub: Arc<EventHub>,
+        wrap: impl FnOnce(UnixAcceptor) -> A,
     ) -> io::Result<Self> {
         let uid = owner()?;
         let path = endpoint(base, uid, true)?;
+        // Only a socket this owner left behind is replaced; anything else at
+        // the path is refused rather than removed.
         if let Ok(metadata) = path.symlink_metadata() {
             validate_socket(&metadata, uid)?;
             std::fs::remove_file(&path)?;
         }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(accept(wrap(listener), admin, lifecycle, receiver, uid));
+        let acceptor = UnixAcceptor::bind(&path)?;
+        let policy = AdminPolicy::new(admin, lifecycle, hub, Admission::UnixOwner(uid));
         Ok(Self {
-            stop,
-            task: Some(task),
+            inner: framed::Listener::spawn(wrap(acceptor), policy),
         })
     }
 
-    pub(super) async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
+    /// Stops accepting, unlinks the socket, and gives in-flight connections
+    /// the drain before aborting them.
+    pub(super) async fn shutdown(self) {
+        self.inner.shutdown().await;
     }
 }
 
 fn owner() -> io::Result<u32> {
     // A local pair asks the kernel for our credentials without unsafe FFI or
     // trusting an environment variable, PID in JSON or filesystem owner alone.
-    let (stream, _other) = UnixStream::pair()?;
-    let credentials = stream.peer_cred()?;
-    if credentials.pid().is_none() {
-        return Err(denied("kernel peer PID is unavailable"));
+    match framed_unix::own_identity()? {
+        PeerIdentity::Unix {
+            uid, pid: Some(_), ..
+        } => Ok(uid),
+        _ => Err(denied("kernel peer PID is unavailable")),
     }
-    Ok(credentials.uid())
 }
 
+/// The client's check of the server: whoever answers on the socket must be
+/// this owner, by the kernel's word, before anything is sent to it.
 fn verify_peer(stream: &UnixStream, uid: u32) -> io::Result<()> {
-    let credentials = stream.peer_cred()?;
-    if credentials.uid() != uid || credentials.pid().is_none() {
+    if !Admission::UnixOwner(uid).admits(&framed_unix::peer_identity(stream)?) {
         return Err(denied(
             "private administration requires the daemon's OS owner and kernel peer PID",
         ));
@@ -190,93 +176,14 @@ fn validate_socket(metadata: &std::fs::Metadata, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-async fn accept<A: Accept>(
-    mut listener: A,
-    admin: Arc<AdminService>,
-    lifecycle: AdminLifecycle,
-    mut stop: watch::Receiver<bool>,
-    uid: u32,
-) {
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let mut tasks = JoinSet::new();
-    let mut phase = lifecycle.phase.subscribe();
-    let mut backoff = AcceptBackoff::new();
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.changed() => break,
-            _ = phase.changed() => break,
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            accepted = listener.accept() => {
-                let stream = match accepted {
-                    Ok(stream) => {
-                        backoff.reset();
-                        stream
-                    }
-                    // An accept error never ends the listener (see
-                    // `AcceptBackoff`): log it, pause, accept again.
-                    Err(error) => {
-                        let pause = backoff.after(&error);
-                        tracing::warn!(
-                            kind = ?error.kind(),
-                            %error,
-                            pause_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
-                            "private admin accept failed; retrying"
-                        );
-                        tokio::select! {
-                            _ = stop.changed() => break,
-                            _ = phase.changed() => break,
-                            () = tokio::time::sleep(pause) => {}
-                        }
-                        continue;
-                    }
-                };
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
-                if let Err(error) = verify_peer(&stream, uid) {
-                    // Who knocked is worth a line: a wrong uid on the
-                    // owner-only socket is either a misconfiguration or
-                    // someone probing it.
-                    let credentials = stream.peer_cred().ok();
-                    tracing::warn!(
-                        expected_uid = uid,
-                        peer_uid = credentials.as_ref().map(tokio::net::unix::UCred::uid),
-                        peer_pid = credentials.as_ref().and_then(tokio::net::unix::UCred::pid),
-                        kind = ?error.kind(),
-                        "private admin connection refused at peer verification"
-                    );
-                    continue;
-                }
-                let admin = Arc::clone(&admin);
-                let lifecycle = lifecycle.clone();
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    let mut stream = stream;
-                    if let Err(error) = serve(&mut stream, &admin, &lifecycle).await {
-                        tracing::debug!(kind = ?error.kind(), "private admin connection ended");
-                    }
-                });
-            }
-        }
-    }
-    drop(listener);
-    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await;
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-}
-
-pub(super) async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> {
-    let encoded = encode_request(envelope)?;
+/// Connects the private endpoint under `base` as its owner: the directory,
+/// the socket file and the answering process are all checked before the
+/// stream is handed back. The caller bounds it with its own timeout.
+pub(super) async fn connect(base: &Path) -> io::Result<UnixStream> {
     let uid = owner()?;
     let path = endpoint(base, uid, false)?;
     validate_socket(&path.symlink_metadata()?, uid)?;
-    tokio::time::timeout(Duration::from_millis(envelope.deadline_ms), async {
-        let mut stream = UnixStream::connect(path).await?;
-        verify_peer(&stream, uid)?;
-        exchange_on(&mut stream, envelope, &encoded).await
-    })
-    .await
-    .map_err(|_| timed_out())?
+    let stream = framed_unix::connect(&path).await?;
+    verify_peer(&stream, uid)?;
+    Ok(stream)
 }

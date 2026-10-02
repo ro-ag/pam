@@ -20,9 +20,13 @@
 //! [`EventPublisher`] itself lives in [`crate::event_hub`] and is re-exported here: services
 //! publish into the daemon's one event hub, and the `PUB` loop is one of the hub's sinks, fed the
 //! same sanitised `(request id, event)` pairs it always carried. [`Transport::bind_with`] is the
-//! daemon's entry point and takes what the framed public listener needs (store, lifecycle phase,
-//! hub, boot image); that listener is served next to this one until the `ZeroMQ` sockets are
-//! removed. [`Transport::bind`] keeps the old signature over a hub of its own.
+//! daemon's entry point: besides the `ZeroMQ` sockets it starts the framed public listener
+//! ([`crate::public_transport`]) on [`RuntimeDir::public_socket`] (the published control file on
+//! Windows), served next to this one until the `ZeroMQ` sockets are removed. Both feed the same
+//! request channel and the same hub. [`Transport::shutdown`] stops the framed listener too: it
+//! stops accepting and removes its socket file, connection tasks write their final frame, and
+//! only then is the hub closed. [`Transport::bind`] keeps the old signature over a hub of its
+//! own and serves the `ZeroMQ` sockets only.
 
 use std::io;
 use std::path::PathBuf;
@@ -40,9 +44,11 @@ use zeromq::{
 
 use crate::event_hub::{EventHub, LEGACY_SINK_CAPACITY};
 pub use crate::event_hub::{EventPublisher, PUBLIC_PROGRESS_NOTE, PublishError};
+use crate::framed::Listener;
 use crate::image::ImageWatch;
-use crate::ingress::{Origin, PublicPeer};
+use crate::ingress::{Ingress, Origin, PublicPeer};
 use crate::lifecycle::LifecyclePhase;
+use crate::public_transport::PublicPolicy;
 use crate::runtime_dir::{RuntimeDir, remove_stale};
 
 /// Capacity of the internal reply channel.
@@ -68,6 +74,15 @@ pub enum TransportError {
         /// The underlying zmq error.
         #[source]
         source: zeromq::ZmqError,
+    },
+    /// The framed public listener could not be started.
+    #[error("cannot listen on {}: {source}", endpoint.display())]
+    Listen {
+        /// The socket path (unix) or control file (Windows) of the listener.
+        endpoint: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -97,6 +112,8 @@ pub struct Transport {
     hub: Arc<EventHub>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    /// The framed public listener; `None` for [`Transport::bind`].
+    public: Option<Listener>,
 }
 
 impl Transport {
@@ -107,12 +124,15 @@ impl Transport {
         dirs: &RuntimeDir,
         incoming: mpsc::Sender<IncomingRequest>,
     ) -> Result<Self, TransportError> {
-        Self::bind_legacy(dirs, incoming, EventHub::new()).await
+        Self::bind_legacy(dirs, incoming, EventHub::new(), None).await
     }
 
     /// [`Self::bind`] for the daemon: events go through the daemon's `hub`,
-    /// and `store`, `phase` and `image` are what the framed public listener
-    /// on [`RuntimeDir::public_socket`] serves from.
+    /// and the framed public listener is started on
+    /// [`RuntimeDir::public_socket`] (unix) or behind
+    /// [`RuntimeDir::public_control`] (Windows), serving from `store`,
+    /// `phase` and `image`. Must be called while holding the daemon's
+    /// instance lock: a stale socket file is removed.
     pub async fn bind_with(
         dirs: &RuntimeDir,
         incoming: mpsc::Sender<IncomingRequest>,
@@ -121,17 +141,36 @@ impl Transport {
         hub: Arc<EventHub>,
         image: Arc<ImageWatch>,
     ) -> Result<Self, TransportError> {
-        // The framed public listener starts here from these; until it does
-        // the daemon serves the legacy sockets only.
-        let _ = (store, phase, image);
-        Self::bind_legacy(dirs, incoming, hub).await
+        // The endpoint first: a bind that fails leaves nothing to undo, and
+        // if the legacy bind fails after it the acceptor's drop removes the
+        // socket file again.
+        let acceptor = bind_public(dirs)?;
+        let policy = PublicPolicy::new(
+            Ingress::new(incoming.clone()),
+            store,
+            phase,
+            Arc::clone(&hub),
+            image,
+        );
+        Self::bind_legacy(dirs, incoming, hub, Some((acceptor, policy))).await
     }
 
-    /// Binds the `ZeroMQ` sockets and makes the `PUB` loop a sink of `hub`.
+    /// Free connection permits of the framed public listener; zero when it
+    /// is not running ([`Self::bind`]).
+    #[must_use]
+    pub fn public_connections_available(&self) -> usize {
+        self.public
+            .as_ref()
+            .map_or(0, Listener::available_connections)
+    }
+
+    /// Binds the `ZeroMQ` sockets and makes the `PUB` loop a sink of `hub`;
+    /// then starts the framed listener when one was bound.
     async fn bind_legacy(
         dirs: &RuntimeDir,
         incoming: mpsc::Sender<IncomingRequest>,
         hub: Arc<EventHub>,
+        public: Option<(PublicAcceptor, Arc<PublicPolicy>)>,
     ) -> Result<Self, TransportError> {
         for path in [dirs.router_socket(), dirs.events_socket()] {
             remove_stale(path).map_err(|source| TransportError::RemoveStale {
@@ -166,6 +205,7 @@ impl Transport {
             hub,
             shutdown: shutdown_tx,
             tasks,
+            public: public.map(|(acceptor, policy)| Listener::spawn(acceptor, policy)),
         })
     }
 
@@ -175,15 +215,55 @@ impl Transport {
         self.hub.publisher()
     }
 
-    /// Signals the socket tasks to stop, waits for them to finish and closes
-    /// the event hub: a publish after this errors.
+    /// Signals the socket tasks to stop, waits for them to finish, stops the
+    /// framed public listener (its socket file is removed, a connection with
+    /// an answer in hand writes it, a follower is told the daemon is
+    /// shutting down) and closes the event hub: a publish after this errors.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         for task in self.tasks {
             let _ = task.await;
         }
+        if let Some(public) = self.public {
+            public.shutdown().await;
+        }
         self.hub.close();
     }
+}
+
+/// Where the framed public listener's connections come from.
+#[cfg(unix)]
+type PublicAcceptor = crate::framed_unix::UnixAcceptor;
+
+/// Where the framed public listener's connections come from.
+#[cfg(windows)]
+type PublicAcceptor = crate::framed_windows::LoopbackAcceptor;
+
+/// Binds the framed public endpoint: a `0600` stream socket at
+/// [`RuntimeDir::public_socket`], after removing a stale one.
+#[cfg(unix)]
+fn bind_public(dirs: &RuntimeDir) -> Result<PublicAcceptor, TransportError> {
+    let path = dirs.public_socket();
+    PublicAcceptor::bind(path).map_err(|source| TransportError::Listen {
+        endpoint: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Binds the framed public endpoint: a loopback port behind a fresh owner
+/// nonce, published at [`RuntimeDir::public_control`].
+#[cfg(windows)]
+fn bind_public(dirs: &RuntimeDir) -> Result<PublicAcceptor, TransportError> {
+    let control = dirs.public_control();
+    PublicAcceptor::bind(
+        control,
+        crate::framed_windows::PUBLIC_LABEL,
+        crate::framed_windows::MAX_PUBLIC_PENDING,
+    )
+    .map_err(|source| TransportError::Listen {
+        endpoint: control.to_path_buf(),
+        source,
+    })
 }
 
 async fn bind_socket<S: Socket>(socket: &mut S, endpoint: &str) -> Result<(), TransportError> {

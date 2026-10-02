@@ -201,7 +201,9 @@ pub fn seed_flow(tmp: &tempfile::TempDir, id: &str, yaml: &str) -> PathBuf {
 /// to bind — a failure here means the temp root is too deep, not a
 /// daemon bug.
 fn assert_socket_paths_fit(base: &std::path::Path) {
-    for socket in ["pam.sock", "events.sock"] {
+    // `pam.next.sock` is the framed public listener's transitional path, the
+    // longest of the three: the daemon refuses to start when it does not fit.
+    for socket in ["pam.sock", "events.sock", "pam.next.sock"] {
         let path = base.join("run").join(socket);
         let len = path.as_os_str().len();
         assert!(

@@ -104,3 +104,59 @@ async fn the_seam_hands_the_core_one_request_with_its_origin_and_peer_and_return
         .await;
     assert_eq!(closed.unwrap_err(), IngressError::Closed);
 }
+
+/// What goes onto the request row: the plane, and the kernel's view of the
+/// peer for a public request only.
+#[test]
+fn the_recorded_origin_is_the_plane_and_the_public_peer() {
+    use pam_store::{RequestIngress, RequestOrigin};
+
+    use crate::ingress::recorded;
+
+    let unix = PublicPeer {
+        identity: PeerIdentity::Unix {
+            uid: 501,
+            gid: 20,
+            pid: Some(4242),
+        },
+        relayed: true,
+    };
+    assert_eq!(
+        recorded(Origin::Public, Some(unix)),
+        RequestOrigin {
+            ingress: RequestIngress::Public,
+            peer_uid: Some(501),
+            peer_pid: Some(4242),
+            relayed: true,
+        }
+    );
+    // A platform that reports no pid records none, never a guess.
+    let no_pid = PublicPeer {
+        identity: PeerIdentity::Unix {
+            uid: 501,
+            gid: 20,
+            pid: None,
+        },
+        relayed: false,
+    };
+    assert_eq!(recorded(Origin::Public, Some(no_pid)).peer_pid, None);
+    // Windows proves ownership of the control file, not a process.
+    let nonce = PublicPeer {
+        identity: PeerIdentity::OwnerNonce,
+        relayed: false,
+    };
+    assert_eq!(recorded(Origin::Public, Some(nonce)), RequestOrigin::PUBLIC);
+    // The legacy listener cannot ask the kernel.
+    assert_eq!(recorded(Origin::Public, None), RequestOrigin::PUBLIC);
+    // An administration submission is in process: no peer is claimed for it.
+    assert_eq!(recorded(Origin::Admin, Some(unix)), RequestOrigin::ADMIN);
+
+    // And back: a leased execution reads its origin from the row.
+    assert_eq!(Origin::of_row(&RequestOrigin::ADMIN), Origin::Admin);
+    assert_eq!(
+        Origin::of_row(&recorded(Origin::Public, Some(unix))),
+        Origin::Public
+    );
+    assert_eq!(Origin::Admin.wire(), pam_proto::wire::Ingress::Admin);
+    assert_eq!(Origin::Public.wire(), pam_proto::wire::Ingress::Public);
+}

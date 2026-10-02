@@ -323,8 +323,15 @@ async fn oversized_native_frame_is_closed_without_recording_or_stopping_daemon()
             .await
             .unwrap();
         raw.write_u32(1024 * 1024 + 1).await.unwrap();
-        let mut byte = [0];
-        assert_eq!(raw.read(&mut byte).await.unwrap(), 0);
+        // The length is refused from its header alone: the daemon names the
+        // bad frame and closes, without waiting for a body.
+        let mut answer = Vec::new();
+        raw.read_to_end(&mut answer).await.unwrap();
+        let refusal = pam_proto::wire::Frame::decode(&answer[4..]).unwrap();
+        assert!(
+            matches!(&refusal, pam_proto::wire::Frame::Error(error) if error.cause == "bad_frame"),
+            "{refusal:?}"
+        );
         let mut gui = daemon.client().await;
         body_of(
             gui.request(&admin_envelope(

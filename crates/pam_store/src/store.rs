@@ -163,6 +163,78 @@ impl RequestState {
     }
 }
 
+/// The plane a request entered the daemon on, as recorded in
+/// `request.ingress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestIngress {
+    /// The public listener: an agent, the CLI, anything that can reach the
+    /// public socket. Also what a row written before the column existed
+    /// reads as.
+    Public,
+    /// Submitted by the private administration plane on a human's behalf.
+    Admin,
+}
+
+impl RequestIngress {
+    /// The value stored in the `request.ingress` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// Parses a `request.ingress` column value back into the enum.
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "public" => Ok(Self::Public),
+            "admin" => Ok(Self::Admin),
+            other => Err(StoreError::UnexpectedValue {
+                column: "request.ingress",
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Where a request entered the daemon and what the operating system said
+/// about the connection it arrived on. Written once, by the INSERT that
+/// creates the row. Attribution only: nothing is authorized by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestOrigin {
+    /// The plane the request arrived on.
+    pub ingress: RequestIngress,
+    /// The peer's user id as the kernel reported it at accept; `None` where
+    /// the platform or the listener has none to report.
+    pub peer_uid: Option<u32>,
+    /// The peer's process id as the kernel reported it at accept. It names
+    /// a short-lived process and can be reused.
+    pub peer_pid: Option<u32>,
+    /// The client said it came through a session relay, in which case the
+    /// peer is the relay process. Self-reported.
+    pub relayed: bool,
+}
+
+impl RequestOrigin {
+    /// A public request with no recorded peer: the legacy listener, and what
+    /// a row written before the columns existed reads as.
+    pub const PUBLIC: Self = Self {
+        ingress: RequestIngress::Public,
+        peer_uid: None,
+        peer_pid: None,
+        relayed: false,
+    };
+
+    /// A request the private administration plane submitted.
+    pub const ADMIN: Self = Self {
+        ingress: RequestIngress::Admin,
+        peer_uid: None,
+        peer_pid: None,
+        relayed: false,
+    };
+}
+
 /// Outcome recorded on an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -272,6 +344,8 @@ pub struct RequestRow {
     pub authorization_revision: Option<i64>,
     /// Earliest next watch poll in Unix milliseconds; never extends admission expiry.
     pub resume_at_ms: Option<i64>,
+    /// Where the request entered the daemon, and the peer it arrived from.
+    pub origin: RequestOrigin,
 }
 
 /// How a pending approval was resolved.
@@ -558,6 +632,18 @@ pub struct RequestPrune {
     pub evidence_bytes: u64,
 }
 
+/// What a retention pass would remove, counted without removing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionCensus {
+    /// Rows the pass would remove at these cutoffs (evidence rows, then
+    /// request records; an evidence row that goes with its request is
+    /// counted once).
+    pub eligible_rows: u64,
+    /// Rows the windows could ever remove: all evidence rows plus all
+    /// terminal requests.
+    pub total_rows: u64,
+}
+
 /// One row of the `connector` table: a connector's configuration and its
 /// last self-test verdict.
 ///
@@ -709,6 +795,32 @@ impl Store {
         args_json: &str,
         idempotency_key: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.insert_request_from(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            &RequestOrigin::PUBLIC,
+        )
+        .await
+    }
+
+    /// [`Self::insert_request`] recording where the request entered the
+    /// daemon, in the same INSERT.
+    // One request row = one INSERT: every column the row needs at birth is an argument.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_request_from(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+        origin: &RequestOrigin,
+    ) -> Result<(), StoreError> {
         self.insert_request_in_state(
             id,
             capability,
@@ -718,6 +830,7 @@ impl Store {
             idempotency_key,
             RequestState::Queued,
             None,
+            origin,
         )
         .await
     }
@@ -736,6 +849,32 @@ impl Store {
         args_json: &str,
         idempotency_key: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.insert_running_request_from(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            &RequestOrigin::PUBLIC,
+        )
+        .await
+    }
+
+    /// [`Self::insert_running_request`] recording where the request entered
+    /// the daemon, in the same INSERT.
+    // One request row = one INSERT: every column the row needs at birth is an argument.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_running_request_from(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+        origin: &RequestOrigin,
+    ) -> Result<(), StoreError> {
         self.insert_request_in_state(
             id,
             capability,
@@ -745,6 +884,7 @@ impl Store {
             idempotency_key,
             RequestState::Running,
             None,
+            origin,
         )
         .await
     }
@@ -763,6 +903,35 @@ impl Store {
         idempotency_key: Option<&str>,
         expires_at_ms: i64,
     ) -> Result<(), StoreError> {
+        self.insert_admitted_request_from(
+            id,
+            capability,
+            repo,
+            caller_agent,
+            args_json,
+            idempotency_key,
+            expires_at_ms,
+            &RequestOrigin::PUBLIC,
+        )
+        .await
+    }
+
+    /// [`Self::insert_admitted_request`] recording where the request entered
+    /// the daemon — the plane and the kernel's view of the peer — in the same
+    /// INSERT, so no admitted row exists without it.
+    // One request row = one INSERT: every column the row needs at birth is an argument.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_admitted_request_from(
+        &self,
+        id: &str,
+        capability: &str,
+        repo: &str,
+        caller_agent: &str,
+        args_json: &str,
+        idempotency_key: Option<&str>,
+        expires_at_ms: i64,
+        origin: &RequestOrigin,
+    ) -> Result<(), StoreError> {
         self.insert_request_in_state(
             id,
             capability,
@@ -772,6 +941,7 @@ impl Store {
             idempotency_key,
             RequestState::Running,
             Some(expires_at_ms),
+            origin,
         )
         .await
     }
@@ -1048,6 +1218,7 @@ impl Store {
         idempotency_key: Option<&str>,
         state: RequestState,
         expires_at_ms: Option<i64>,
+        origin: &RequestOrigin,
     ) -> Result<(), StoreError> {
         let conn = self.lock().await?;
         let now = now_ts();
@@ -1055,11 +1226,12 @@ impl Store {
             "INSERT INTO request
                      (id, capability, repo, caller_agent, args_json,
                       idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms,
-                      authorization_revision)
+                      authorization_revision, ingress, peer_uid, peer_pid, relayed)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9,
                       CASE WHEN ?9 IS NOT NULL THEN
                         (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
-                      ELSE NULL END)",
+                      ELSE NULL END,
+                      ?10, ?11, ?12, ?13)",
             params![
                 id,
                 capability,
@@ -1069,7 +1241,11 @@ impl Store {
                 idempotency_key,
                 state.as_str(),
                 now,
-                expires_at_ms
+                expires_at_ms,
+                origin.ingress.as_str(),
+                origin.peer_uid.map(i64::from),
+                origin.peer_pid.map(i64::from),
+                i64::from(origin.relayed)
             ],
         )
         .await?;
@@ -1079,7 +1255,8 @@ impl Store {
     /// The `request` column list every row query selects, in the order
     /// [`Self::parse_request_row`] expects.
     const REQUEST_COLUMNS: &'static str = "id, capability, repo, caller_agent, args_json,
-         idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision, resume_at_ms";
+         idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision, resume_at_ms,
+         ingress, peer_uid, peer_pid, relayed";
 
     /// Builds a [`RequestRow`] from a row selected with
     /// [`Self::REQUEST_COLUMNS`].
@@ -1100,6 +1277,21 @@ impl Store {
             queue_authorized: row.get::<i64>(11)? == 1,
             authorization_revision: row.get(12)?,
             resume_at_ms: row.get(13)?,
+            origin: Self::parse_request_origin(row, 14)?,
+        })
+    }
+
+    /// The four origin columns starting at `first`, in
+    /// [`Self::REQUEST_COLUMNS`] order. A stored id outside `u32` (nothing
+    /// this code writes) reads as unrecorded rather than as another id.
+    fn parse_request_origin(row: &turso::Row, first: usize) -> Result<RequestOrigin, StoreError> {
+        let ingress: String = row.get(first)?;
+        let narrow = |value: Option<i64>| value.and_then(|value| u32::try_from(value).ok());
+        Ok(RequestOrigin {
+            ingress: RequestIngress::parse(&ingress)?,
+            peer_uid: narrow(row.get(first + 1)?),
+            peer_pid: narrow(row.get(first + 2)?),
+            relayed: row.get::<i64>(first + 3)? == 1,
         })
     }
 
@@ -1245,11 +1437,11 @@ impl Store {
          CASE WHEN LENGTH(CAST(state AS BLOB)) <= ?2 THEN state END, \
          CASE WHEN LENGTH(CAST(outcome AS BLOB)) <= ?2 THEN outcome END, \
          created_ts, updated_ts, expires_at_ms, queue_authorized, authorization_revision, \
-         resume_at_ms";
+         resume_at_ms, ingress, peer_uid, peer_pid, relayed";
 
     /// How many columns [`Self::RECOVERY_GUARDED_COLUMNS`] selects: the
     /// index of the first length column that follows them.
-    const RECOVERY_GUARDED_COUNT: usize = 14;
+    const RECOVERY_GUARDED_COUNT: usize = 18;
 
     /// Adds up the length columns starting at `first`. `None` when a length
     /// is negative: the row is refused, never guessed at.
@@ -2720,6 +2912,87 @@ impl Store {
             approvals,
             evidence_rows,
             evidence_bytes,
+        })
+    }
+
+    /// Counts what [`Self::prune_evidence_before`] followed by
+    /// [`Self::prune_requests_before`] would remove at these cutoffs,
+    /// without removing anything. A `None` cutoff means that window is
+    /// forever and contributes nothing.
+    ///
+    /// The filters are the prune statements' own, without their batch
+    /// order and limit, so the count is what a pass run right now would
+    /// delete: evidence older than `evidence_cutoff` that is not
+    /// `keep_kind` and hangs off a finished request, every evidence row of
+    /// a terminal request untouched since `request_cutoff` (counted once
+    /// when both apply), and those request records themselves. All of it
+    /// is read under one hold of the connection, so the figures describe
+    /// one moment. Read-only.
+    pub async fn retention_census(
+        &self,
+        evidence_cutoff: Option<i64>,
+        keep_kind: &str,
+        request_cutoff: Option<i64>,
+    ) -> Result<RetentionCensus, StoreError> {
+        // "Terminal", spelled as the request prune spells it.
+        const LEAVING: &str = "SELECT id FROM request \
+             WHERE state NOT IN ('queued','running','waiting_approval') AND updated_ts < ";
+        // The evidence prune's own filter over `?1` (cutoff) and `?2` (kept kind).
+        const AGED: &str = "e.ts < ?1 AND e.kind <> ?2 AND EXISTS \
+             (SELECT 1 FROM request r WHERE r.id = e.request_id \
+              AND r.state IN ('done','refused','failed'))";
+        let conn = self.lock().await?;
+        let (evidence, _) = Self::measure(&conn, "SELECT COUNT(*), 0 FROM evidence", ()).await?;
+        let (terminal, _) = Self::measure(
+            &conn,
+            "SELECT COUNT(*), 0 FROM request \
+             WHERE state NOT IN ('queued','running','waiting_approval')",
+            (),
+        )
+        .await?;
+        let mut eligible = 0u64;
+        if let Some(cutoff) = evidence_cutoff {
+            let (aged, _) = Self::measure(
+                &conn,
+                &format!("SELECT COUNT(*), 0 FROM evidence e WHERE {AGED}"),
+                params![cutoff, keep_kind],
+            )
+            .await?;
+            eligible = eligible.saturating_add(aged);
+        }
+        if let Some(cutoff) = request_cutoff {
+            let (requests, _) = Self::measure(
+                &conn,
+                &format!("SELECT COUNT(*), 0 FROM request WHERE id IN ({LEAVING}?1)"),
+                params![cutoff],
+            )
+            .await?;
+            let (with_request, _) = Self::measure(
+                &conn,
+                &format!("SELECT COUNT(*), 0 FROM evidence WHERE request_id IN ({LEAVING}?1)"),
+                params![cutoff],
+            )
+            .await?;
+            eligible = eligible
+                .saturating_add(requests)
+                .saturating_add(with_request);
+            if let Some(evidence_cutoff) = evidence_cutoff {
+                // Counted by both windows above: once is enough.
+                let (both, _) = Self::measure(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*), 0 FROM evidence e \
+                         WHERE {AGED} AND e.request_id IN ({LEAVING}?3)"
+                    ),
+                    params![evidence_cutoff, keep_kind, cutoff],
+                )
+                .await?;
+                eligible = eligible.saturating_sub(both);
+            }
+        }
+        Ok(RetentionCensus {
+            eligible_rows: eligible,
+            total_rows: evidence.saturating_add(terminal),
         })
     }
 

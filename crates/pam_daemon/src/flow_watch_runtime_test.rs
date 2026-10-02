@@ -458,6 +458,7 @@ impl Fixture {
         std::mem::forget(keep);
         let ctx = ExecContext {
             origin: crate::ingress::Origin::Public,
+            peer: pam_store::RequestOrigin::PUBLIC,
             status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
             budget,
             request_id: "watch".into(),

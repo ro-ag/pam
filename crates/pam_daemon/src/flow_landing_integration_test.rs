@@ -381,6 +381,7 @@ impl Fixture {
         let (cancel, rx) = watch::channel(false);
         let ctx = ExecContext {
             origin: crate::ingress::Origin::Public,
+            peer: pam_store::RequestOrigin::PUBLIC,
             status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
             budget,
             request_id: "landing-ticket".into(),

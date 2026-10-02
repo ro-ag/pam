@@ -125,6 +125,7 @@ fn every_frame_type_round_trips_under_its_documented_name() {
         Frame::Events {
             include_probes: true,
         },
+        Frame::Subscribed,
         Frame::error(cause::BAD_FRAME, "not JSON", "Upgrade pam."),
     ];
     let mut seen = Vec::new();
@@ -235,6 +236,23 @@ fn events_leaves_probes_out_unless_asked() {
 }
 
 #[test]
+fn subscribed_is_a_bare_marker_and_ignores_unknown_members() {
+    assert_eq!(
+        Frame::Subscribed.encode().unwrap(),
+        br#"{"t":"subscribed"}"#
+    );
+    assert_eq!(
+        Frame::decode(br#"{"t":"subscribed"}"#).unwrap(),
+        Frame::Subscribed
+    );
+    // A newer daemon may say more in it; this build still reads the marker.
+    assert_eq!(
+        Frame::decode(br#"{"t":"subscribed","replayed":0}"#).unwrap(),
+        Frame::Subscribed
+    );
+}
+
+#[test]
 fn decode_tells_the_ways_a_body_can_be_wrong_apart() {
     assert!(matches!(
         Frame::decode(b"not json"),
@@ -297,6 +315,7 @@ fn an_error_frame_names_cause_detail_and_recovery() {
         cause::DAEMON_SHUTTING_DOWN,
         cause::FOLLOW_EXPIRED,
         cause::SUBSCRIBER_LAGGED,
+        cause::SUBSCRIBER_CAPACITY_EXHAUSTED,
         cause::FOLLOWER_CAPACITY_EXHAUSTED,
     ] {
         assert!(name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));

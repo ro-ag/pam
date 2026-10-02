@@ -645,3 +645,49 @@ fn every_hub_has_its_own_epoch() {
     assert_ne!(first.epoch(), second.epoch());
     assert_eq!(EventHub::with_epoch("01TEST".to_owned()).epoch(), "01TEST");
 }
+
+/// A ticket that ends without a terminal event (a verdict parked for retry)
+/// must not hold a table slot until the table is full.
+#[tokio::test]
+async fn unregister_forgets_a_ticket_that_ended_without_a_terminal_event() {
+    let hub = EventHub::new();
+
+    // Nothing follows it: the entry goes at once, replay ring included.
+    hub.register("req_idle", meta("flow.run"));
+    hub.publish("req_idle", Event::Started).unwrap();
+    assert_eq!(hub.usage().entries, 1);
+    hub.unregister("req_idle");
+    assert_eq!(hub.usage().entries, 0);
+
+    // A follower is attached: it keeps its queue, and the entry goes with it.
+    hub.register("req_followed", meta("flow.run"));
+    hub.publish("req_followed", Event::Started).unwrap();
+    let mut follower = hub.attach("req_followed", 0).unwrap().follower;
+    hub.unregister("req_followed");
+    assert_eq!(hub.usage().entries, 1);
+    hub.publish("req_followed", public_progress(10)).unwrap();
+    assert_eq!(
+        next(&mut follower).await,
+        Followed::Event {
+            seq: 2,
+            event: public_progress(10)
+        }
+    );
+    drop(follower);
+    assert_eq!(
+        hub.usage(),
+        crate::event_hub::HubUsage {
+            entries: 0,
+            followers: 0,
+            subscribers: 0
+        }
+    );
+
+    // A ticket the hub never heard of, or already removed by its terminal
+    // event, is a no-op.
+    hub.unregister("req_unknown");
+    hub.register("req_done", meta("echo"));
+    hub.publish("req_done", Event::Done).unwrap();
+    hub.unregister("req_done");
+    assert_eq!(hub.usage().entries, 0);
+}

@@ -21,7 +21,8 @@
 //! ring of the last [`REPLAY_RING`] sanitised events, the optional metadata and
 //! the attached followers. An entry is created at first publish, first attach
 //! or [`EventHub::register`], and removed when its terminal event (`done` or
-//! `refused`) has been published. The table holds at most [`MAX_ENTRIES`]
+//! `refused`) has been published, or by [`EventHub::unregister`] for a ticket
+//! that ended without one. The table holds at most [`MAX_ENTRIES`]
 //! tickets; beyond that the oldest entry with no followers is dropped, which
 //! only loses replay.
 //!
@@ -212,6 +213,9 @@ struct Entry {
     ring: VecDeque<(u64, Event)>,
     meta: Option<Arc<TicketMeta>>,
     followers: Vec<(u64, Arc<FollowerShared>)>,
+    /// The ticket reached a terminal state without a terminal event
+    /// ([`EventHub::unregister`]): the entry goes with its last follower.
+    ended: bool,
 }
 
 #[derive(Debug, Default)]
@@ -308,6 +312,7 @@ impl Entry {
             ring: VecDeque::with_capacity(REPLAY_RING),
             meta: None,
             followers: Vec::new(),
+            ended: false,
         }
     }
 }
@@ -422,6 +427,25 @@ impl EventHub {
             entries, next_born, ..
         } = &mut *state;
         entry_mut(entries, next_born, ticket).meta = Some(Arc::new(meta));
+    }
+
+    /// Forgets a ticket that reached a terminal state: its metadata and,
+    /// once nothing follows it, its entry. A ticket whose terminal event was
+    /// published is already gone and this is a no-op; it exists for the
+    /// endings that publish none (a verdict parked for retry, a refusal
+    /// nobody is told about), which would otherwise hold a table slot until
+    /// the table is full. Followers still attached keep their queue and end
+    /// on their own re-check of the store.
+    pub fn unregister(&self, ticket: &str) {
+        let mut state = lock(&self.state);
+        let Some(entry) = state.entries.get_mut(ticket) else {
+            return;
+        };
+        entry.meta = None;
+        entry.ended = true;
+        if entry.followers.is_empty() {
+            state.entries.remove(ticket);
+        }
     }
 
     /// Publishes one event for `ticket`. Never waits: full queues drop by the
@@ -550,7 +574,10 @@ impl EventHub {
     }
 
     /// Subscribes to every event, unsanitised (administration plane only).
-    /// `status` and `query` traffic is left out unless `include_probes`.
+    /// `status` and `query` traffic is left out unless `include_probes`. The
+    /// filter reads the metadata given to [`Self::register`]; the daemon core
+    /// registers no control request and publishes nothing for one, so on a
+    /// running daemon there is no probe traffic for either setting to see.
     ///
     /// # Errors
     ///
@@ -621,7 +648,7 @@ impl EventHub {
         entry.followers.retain(|(follower, _)| *follower != id);
         // An entry that only ever existed for this follower has nothing to
         // replay and no terminal publish coming to remove it.
-        if entry.followers.is_empty() && entry.seq == 0 && entry.meta.is_none() {
+        if entry.followers.is_empty() && (entry.ended || (entry.seq == 0 && entry.meta.is_none())) {
             state.entries.remove(ticket);
         }
     }

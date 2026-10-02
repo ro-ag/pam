@@ -30,14 +30,24 @@
 //! closes the acceptor (which removes the socket or control file), signals the
 //! connection tasks, waits out the drain and aborts the rest.
 //!
-//! **Handshake.** [`read_hello`] and [`accept_hello`] are the server half:
-//! hello in, `hello_ack` out, then the one request frame, all before one
-//! deadline; a failure is answered with an `error` frame where the peer can
-//! read one. The version rule between the two steps is the policy's.
+//! **Handshake.** [`read_hello`], [`version_rule`] and [`accept_hello`] are
+//! the server half, in that order on both planes: hello in, the version rule,
+//! `hello_ack` out, then the one request frame, all before one deadline; a
+//! failure is answered with an `error` frame where the peer can read one.
+//! [`read_hello_within`] is [`read_hello`] for a plane that answers a
+//! pre-migration peer's larger first frame itself. A client writes its
+//! request behind its hello without waiting, so a hello that is refused after
+//! it was read whole is followed by [`discard_frame`]: closing a loopback TCP
+//! connection with that request still unread would reset it, and the reset
+//! can overtake the `error` frame.
 //!
-//! **Dial.** [`open`], [`call`], [`follow`] and [`read_daemon_frame`] are the
-//! client half over an already connected stream; [`connect_public`] connects
-//! the platform's public endpoint. They impose no timeout of their own.
+//! **Dial.** [`open`], [`open_encoded`], [`call`], [`follow`] and
+//! [`read_daemon_frame`] are the client half over an already connected stream;
+//! [`connect_public`] connects the platform's public endpoint. They impose no
+//! timeout of their own. A stream that is read under a timeout or in a
+//! `select!` uses [`FrameReader`], which keeps its place when dropped
+//! mid-frame ([`FrameReader::daemon_frame`] is the cancel-safe
+//! [`read_daemon_frame`]).
 
 use std::io;
 use std::pin::Pin;
@@ -56,7 +66,9 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use crate::image::{ImageWatch, VersionVerdict};
 use crate::ingress::PeerIdentity;
+use crate::lifecycle::LifecyclePhase;
 
 /// How long a peer has to deliver its hello and its request frame.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -313,6 +325,16 @@ pub async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
 }
 
+/// Resolves when the daemon's phase is no longer `Serving`, or when the
+/// daemon that owned the phase is gone, which is the same thing to a stream.
+/// What a follow or an all-events stream selects on beside [`stopped`].
+pub async fn left_serving(phase: &mut watch::Receiver<LifecyclePhase>) {
+    // An error means the sender was dropped: treat as leaving.
+    let _ = phase
+        .wait_for(|phase| *phase != LifecyclePhase::Serving)
+        .await;
+}
+
 /// Why the server half of the handshake did not produce a request.
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -382,8 +404,23 @@ pub async fn read_hello<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     deadline: Instant,
 ) -> Result<Hello, HandshakeError> {
-    let first =
-        tokio::time::timeout_at(deadline, read_inbound(stream, MAX_HELLO_BYTES, true)).await;
+    read_hello_within(stream, deadline, MAX_HELLO_BYTES).await
+}
+
+/// [`read_hello`] for a plane that still answers a pre-migration peer in its
+/// own shape: the first frame may be up to `untyped_bytes` long, so a bare
+/// envelope larger than a hello comes back whole as
+/// [`HandshakeError::Untyped`] instead of being refused for its length. A
+/// frame that carries a `"t"` is still held to the hello limit. Only a plane
+/// that has already authenticated its peer should raise the limit: the body
+/// is allocated before it is looked at.
+pub async fn read_hello_within<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    deadline: Instant,
+    untyped_bytes: usize,
+) -> Result<Hello, HandshakeError> {
+    let maximum = untyped_bytes.max(MAX_HELLO_BYTES);
+    let first = tokio::time::timeout_at(deadline, read_inbound(stream, maximum, true)).await;
     let body = match first {
         Err(_) => return Err(refuse_timeout(stream).await),
         Ok(Err(error)) => return Err(HandshakeError::Io(error)),
@@ -392,36 +429,137 @@ pub async fn read_hello<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(Ok(Inbound::Length(detail))) => return Err(refuse_bad_frame(stream, detail).await),
         Ok(Ok(Inbound::Body(body))) => body,
     };
-    let hello = match Frame::decode(&body) {
-        Ok(Frame::Hello(hello)) => hello,
-        Ok(other) => {
-            let detail = format!("expected hello, got {}", other.type_name());
-            return Err(refuse_bad_frame(stream, detail).await);
-        }
+    // From here on the first frame was read whole, so whatever refuses it
+    // also reads off the request the client wrote behind it (`discard_frame`).
+    let refused = match Frame::decode(&body) {
         Err(FrameError::Untyped) => return Err(HandshakeError::Untyped(body)),
-        Err(error) => return Err(refuse_bad_frame(stream, error.to_string()).await),
+        _ if body.len() > MAX_HELLO_BYTES => format!(
+            "frame length {} is outside 1..={MAX_HELLO_BYTES} bytes",
+            body.len()
+        ),
+        Ok(Frame::Hello(hello)) if hello.proto != WIRE_PROTOCOL => {
+            refuse(
+                stream,
+                cause::PROTOCOL_MISMATCH,
+                &format!(
+                    "this daemon speaks pam wire protocol {WIRE_PROTOCOL}; the client sent {}",
+                    hello.proto
+                ),
+                &format!(
+                    "Use the pam binary that matches the running daemon ({}).",
+                    crate::daemon::DAEMON_VERSION
+                ),
+            )
+            .await;
+            discard_frame(stream, deadline).await;
+            return Err(HandshakeError::ProtocolMismatch(hello.proto));
+        }
+        Ok(Frame::Hello(hello)) if hello.version.len() > MAX_VERSION_BYTES => {
+            format!("hello version exceeds {MAX_VERSION_BYTES} bytes")
+        }
+        Ok(Frame::Hello(hello)) => return Ok(hello),
+        Ok(other) => format!("expected hello, got {}", other.type_name()),
+        Err(error) => error.to_string(),
     };
-    if hello.proto != WIRE_PROTOCOL {
-        refuse(
-            stream,
-            cause::PROTOCOL_MISMATCH,
-            &format!(
-                "this daemon speaks pam wire protocol {WIRE_PROTOCOL}; the client sent {}",
-                hello.proto
-            ),
-            &format!(
-                "Use the pam binary that matches the running daemon ({}).",
-                crate::daemon::DAEMON_VERSION
-            ),
-        )
-        .await;
-        return Err(HandshakeError::ProtocolMismatch(hello.proto));
-    }
-    if hello.version.len() > MAX_VERSION_BYTES {
-        let detail = format!("hello version exceeds {MAX_VERSION_BYTES} bytes");
-        return Err(refuse_bad_frame(stream, detail).await);
-    }
-    Ok(hello)
+    let error = refuse_bad_frame(stream, refused).await;
+    discard_frame(stream, deadline).await;
+    Err(error)
+}
+
+/// Reads one frame off `stream` and throws it away without allocating its
+/// body: at most [`MAX_FRAME_BYTES`], and not past `deadline`. Every failure
+/// is ignored; the connection is being closed either way.
+///
+/// For the moment after an `error` frame refused a first frame that was read
+/// whole. The client wrote its one request behind its hello without waiting,
+/// and closing a loopback TCP connection with that request unread resets it;
+/// the reset can discard the `error` frame before the client reads it. A unix
+/// stream socket delivers the frame either way. Exactly one frame is read, so
+/// the close follows at once when the request is already there; a client
+/// that sent nothing more is waited for until it closes or `deadline`.
+pub async fn discard_frame<S: AsyncRead + Unpin>(stream: &mut S, deadline: Instant) {
+    let _ = tokio::time::timeout_at(deadline, async {
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).await?;
+        let announced = u64::from(u32::from_be_bytes(header));
+        let length = announced.min(u64::try_from(MAX_FRAME_BYTES).unwrap_or(u64::MAX));
+        tokio::io::copy(&mut (&mut *stream).take(length), &mut tokio::io::sink()).await
+    })
+    .await;
+}
+
+/// Server half, between the two steps: the version rule, the same on both
+/// planes (see [`crate::image`]).
+///
+/// A hello whose version equals the daemon's passes and nothing is checked.
+/// Any other version is refused, and what the refusal is depends only on the
+/// daemon's own binary on disk, never on what the client claims:
+///
+/// - replaced since boot: `error daemon_outdated`, and `phase` moves from
+///   `Serving` to `Restarting` (a daemon that is already draining keeps its
+///   phase);
+/// - unchanged: `error client_version_mismatch`, naming the daemon's version
+///   and path; the phase does not move.
+///
+/// Neither writes a request row. `Ok` means the connection may go on to
+/// [`accept_hello`]. On `Err` the `error` frame it carries has been written
+/// and the request frame behind the hello has been read off
+/// ([`discard_frame`]); the caller logs and closes.
+///
+/// # Errors
+///
+/// The `error` frame that refused the hello.
+pub async fn version_rule<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    hello: &Hello,
+    image: &ImageWatch,
+    phase: &watch::Sender<LifecyclePhase>,
+    deadline: Instant,
+) -> Result<(), ErrorFrame> {
+    let daemon_version = crate::daemon::DAEMON_VERSION;
+    let refusal = match image.verdict(&hello.version, daemon_version).await {
+        VersionVerdict::Match => return Ok(()),
+        VersionVerdict::Restart => {
+            tracing::info!(
+                client_version = %hello.version,
+                daemon_version,
+                "the daemon's binary was replaced on disk; restarting with it"
+            );
+            crate::daemon::request_restart(phase);
+            crate::daemon::outdated_refusal("hello", &hello.version, image.boot_path())
+        }
+        VersionVerdict::Mismatch => {
+            tracing::debug!(
+                client_version = %hello.version,
+                daemon_version,
+                "refused a client of a different build; the binary on disk is unchanged"
+            );
+            crate::daemon::version_mismatch_refusal("hello", &hello.version, image.boot_path())
+        }
+    };
+    // The pipeline's refusals carry the wording; a hello has no request to
+    // answer, so they travel as an `error` frame. Both builders return
+    // refusals; anything else still refuses, so this never fails open.
+    let error = match refusal {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => ErrorFrame {
+            cause,
+            detail,
+            recovery,
+        },
+        Response::Result { .. } | Response::Ticket { .. } => ErrorFrame::new(
+            cause::CLIENT_VERSION_MISMATCH,
+            "the client and the daemon are different builds",
+            "Use the pam binary this daemon was started from.",
+        ),
+    };
+    let _ = send(stream, &Frame::Error(error.clone()), MAX_FRAME_BYTES).await;
+    discard_frame(stream, deadline).await;
+    Err(error)
 }
 
 /// Server half, step two: writes `hello_ack`, then reads the one request
@@ -724,7 +862,15 @@ struct FollowRef<'a> {
     epoch: Option<&'a str>,
 }
 
-async fn open_encoded<S: AsyncRead + AsyncWrite + Unpin>(
+/// [`open`] over a request frame body the caller has already encoded (JSON,
+/// no length prefix), for a client that validates and sizes its request
+/// before it dials.
+///
+/// # Errors
+///
+/// As [`open`]; `InvalidData` before anything is written when `request` is
+/// empty or over the request limit.
+pub async fn open_encoded<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     hello: &Hello,
     request: &[u8],
@@ -788,17 +934,105 @@ pub async fn open<S: AsyncRead + AsyncWrite + Unpin>(
 /// Reads the next daemon frame of at most `maximum` bytes. An `error` frame
 /// is [`DialError::Refused`]; a frame whose type this build does not know is
 /// skipped, as a newer daemon may add one.
+///
+/// Not cancel-safe: a call dropped mid-frame loses what it had read. A
+/// stream read under a timeout or in a `select!` keeps one [`FrameReader`]
+/// and calls [`FrameReader::daemon_frame`] instead.
 pub async fn read_daemon_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     maximum: usize,
 ) -> Result<Frame, DialError> {
-    loop {
-        let body = read_frame(stream, maximum).await?;
-        match Frame::decode(&body) {
-            Ok(Frame::Error(error)) => return Err(DialError::Refused(error)),
-            Ok(frame) => return Ok(frame),
-            Err(FrameError::UnknownType(_)) => {}
-            Err(error) => return Err(DialError::Protocol(error.to_string())),
+    FrameReader::new(maximum).daemon_frame(stream).await
+}
+
+/// Reads frames one at a time and survives being dropped mid-frame.
+///
+/// [`read_frame`] loses the bytes it had read when its future is dropped, so
+/// a stream read under a timeout or inside a `select!` would lose its place.
+/// This reader keeps the partial header and body between calls: a
+/// [`Self::read`] that is cancelled resumes where it stopped on the next
+/// call. The length is checked before the body is allocated, as everywhere.
+#[derive(Debug)]
+pub struct FrameReader {
+    maximum: usize,
+    header: [u8; 4],
+    header_filled: usize,
+    /// The body being filled, once the header announced an acceptable length.
+    body: Option<Vec<u8>>,
+    body_filled: usize,
+}
+
+impl FrameReader {
+    /// A reader of frames of at most `maximum` bytes.
+    #[must_use]
+    pub const fn new(maximum: usize) -> Self {
+        Self {
+            maximum,
+            header: [0; 4],
+            header_filled: 0,
+            body: None,
+            body_filled: 0,
+        }
+    }
+
+    /// The next frame body from `stream`. Cancel-safe: call it again with the
+    /// same stream to continue a frame whose read was dropped.
+    ///
+    /// # Errors
+    ///
+    /// `UnexpectedEof` when the peer closed (between frames or inside one);
+    /// `InvalidData` for a zero or over-limit length, decided before any
+    /// buffer is allocated; otherwise the stream's error. After an error the
+    /// stream is no longer usable.
+    pub async fn read<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> io::Result<Vec<u8>> {
+        loop {
+            if let Some(body) = &mut self.body {
+                if self.body_filled == body.len() {
+                    self.header_filled = 0;
+                    self.body_filled = 0;
+                    return Ok(self.body.take().unwrap_or_default());
+                }
+                let count = stream.read(&mut body[self.body_filled..]).await?;
+                if count == 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                self.body_filled += count;
+            } else if self.header_filled == self.header.len() {
+                let length = body_length(self.header, self.maximum).map_err(invalid)?;
+                self.body = Some(vec![0; length]);
+            } else {
+                let count = stream.read(&mut self.header[self.header_filled..]).await?;
+                if count == 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                self.header_filled += count;
+            }
+        }
+    }
+
+    /// The next daemon frame from `stream`: [`read_daemon_frame`], cancel-safe.
+    /// An `error` frame is [`DialError::Refused`]; a frame whose type this
+    /// build does not know is skipped, as a newer daemon may add one. This is
+    /// what a follow or an all-events stream is read with when the read sits
+    /// under a timeout or in a `select!`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`], as [`DialError::Io`]; [`DialError::Refused`] for an
+    /// `error` frame; [`DialError::Protocol`] for a body that is not a frame.
+    /// After any error the stream is over.
+    pub async fn daemon_frame<S: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<Frame, DialError> {
+        loop {
+            let body = self.read(stream).await?;
+            match Frame::decode(&body) {
+                Ok(Frame::Error(error)) => return Err(DialError::Refused(error)),
+                Ok(frame) => return Ok(frame),
+                Err(FrameError::UnknownType(_)) => {}
+                Err(error) => return Err(DialError::Protocol(error.to_string())),
+            }
         }
     }
 }

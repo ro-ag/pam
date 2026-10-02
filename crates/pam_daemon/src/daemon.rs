@@ -38,6 +38,13 @@
 //! - **Caller registry**: every admitted request (bypass, laned, attached duplicate) upserts its
 //!   agent+repo pair into the `caller` table — advisory only, never authorization; admin envelopes
 //!   are excluded.
+//! - **Origin on the row**: admission writes where the request entered the daemon — the plane and,
+//!   for a connection the framed public listener accepted, the kernel's uid and pid of the peer
+//!   and the relay marker ([`crate::ingress::recorded`]) — in the same INSERT as the row. It is
+//!   attribution; nothing is authorized by it. A leased execution reads its origin back from the
+//!   row. A request whose lifecycle events are published is also registered with the event hub
+//!   (capability, repository, agent label, plane) for the administration plane's all-events
+//!   stream, and forgotten there when it ends.
 //! - **Boot order** ([`run_daemon_with`]): instance lock → store open → crash recovery
 //!   ([`crate::lifecycle::recover_stuck_rows`]) → lane rebuild → transport bind (safe to drop stale
 //!   sockets, lock already held) → serve.
@@ -47,7 +54,10 @@
 //!   cooperative cancellation, then the dispatcher stops. No explicit store flush is needed — every
 //!   write, audit included, is per-statement durable. A `waiting_approval` request is not drained;
 //!   crash recovery fails it on next boot.
-//! - **Version handshake and restart policy**: every envelope carries the client build version.
+//! - **Version handshake and restart policy**: every envelope carries the client build version
+//!   (on the framed listener the connection's hello carries it instead, and
+//!   [`crate::public_transport`] applies the same rule there before the request is read, so the
+//!   pipeline does not look at such an envelope's version again).
 //!   The daemon restarts itself for one reason — the binary it was started from was replaced on
 //!   disk — and a client's claimed version is only the occasion to look ([`crate::image`]). A
 //!   differing version with a replaced image is refused with [`CAUSE_DAEMON_OUTDATED`] and moves
@@ -109,13 +119,13 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
 use crate::connector_service::ConnectorService;
-use crate::event_hub::EventHub;
+use crate::event_hub::{EventHub, TicketMeta};
 use crate::executor::{
     BuiltinCapability, CapabilityFailure, CapabilityOutput, ExecContext, outcome_str,
 };
 use crate::flow_service::FlowService;
 use crate::image::{FsProbe, ImageProbe, ImageWatch, VersionVerdict};
-use crate::ingress::Origin;
+use crate::ingress::{Origin, PublicPeer};
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
@@ -414,6 +424,21 @@ impl DaemonHandle {
     #[must_use]
     pub fn admission_available(&self) -> AdmissionAvailable {
         self.admission.available()
+    }
+
+    /// The daemon's event hub: what every lifecycle event is published into
+    /// and what followers attach to. For embedding hosts and integration
+    /// tests; nothing on public IPC reaches it.
+    #[must_use]
+    pub fn event_hub(&self) -> Arc<EventHub> {
+        Arc::clone(self.transport.event_publisher().hub())
+    }
+
+    /// Connection permits the framed public listener has free right now, of
+    /// [`crate::framed::MAX_PUBLIC_CONNECTIONS`].
+    #[must_use]
+    pub fn public_connections_available(&self) -> usize {
+        self.transport.public_connections_available()
     }
 
     /// The queue manager, for in-crate tests that need to stall or inject.
@@ -750,9 +775,8 @@ fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Arc<SecretStor
 /// Builds the transport connector calls run over.
 ///
 /// Like the credential store, a missing `curl` degrades rather than stops:
-/// every HTTP connector then refuses with `connector_cli_missing` and the
-/// platform's install line, while AWS — which drives its own CLI — keeps
-/// working.
+/// every connector then refuses with `connector_cli_missing` and the
+/// platform's install line.
 fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<dyn HttpTransport>> {
     if injected.is_some() {
         return injected;
@@ -1076,7 +1100,7 @@ async fn dispatch_loop(
                 permit,
             );
             pipeline
-                .serve(request.envelope, request.origin, guard)
+                .serve(request.envelope, request.origin, request.peer, guard)
                 .await;
         });
     }
@@ -1323,14 +1347,20 @@ impl Pipeline {
     /// the module docs). The deadline wraps everything the handler does;
     /// when it elapses the caller is answered, the slot is released, and
     /// the request's terminal row is written by a detached task.
-    async fn serve(self: Arc<Self>, envelope: Envelope, origin: Origin, mut guard: ReplyGuard) {
+    async fn serve(
+        self: Arc<Self>,
+        envelope: Envelope,
+        origin: Origin,
+        peer: Option<PublicPeer>,
+        mut guard: ReplyGuard,
+    ) {
         let id = envelope.id.clone();
         let deadline_ms = envelope.deadline_ms;
         let class = classify(&envelope.capability);
         let limit = self.handler_limit(deadline_ms, class);
         let handled = tokio::time::timeout(
             limit,
-            Arc::clone(&self).handle(envelope, origin, &mut guard),
+            Arc::clone(&self).handle(envelope, origin, peer, &mut guard),
         )
         .await;
         if handled.is_ok() {
@@ -1392,6 +1422,24 @@ impl Pipeline {
             deadline_refusal_response(id, deadline_ms),
         )
         .await;
+        self.events.hub().unregister(id);
+    }
+
+    /// Tells the event hub what admission knows about a ticket whose
+    /// lifecycle events are about to be published, so the administration
+    /// plane's all-events stream can name it. The terminal event removes it
+    /// again; an ending that publishes none calls
+    /// [`EventHub::unregister`].
+    fn register_ticket(&self, envelope: &Envelope, origin: Origin) {
+        self.events.hub().register(
+            &envelope.id,
+            TicketMeta {
+                capability: envelope.capability.clone(),
+                repo: envelope.caller.repo.clone(),
+                agent: envelope.caller.agent.clone(),
+                ingress: origin.wire(),
+            },
+        );
     }
 
     /// Tells whoever follows `id` how it ended: the lifecycle event for
@@ -1408,8 +1456,10 @@ impl Pipeline {
     /// The gates that run before anything is recorded: the drain and the
     /// version handshake. `Some` is the refusal to answer with; neither
     /// gets a request row — the retry lands on the next (or new) daemon
-    /// and is recorded there.
-    async fn lifecycle_refusal(&self, envelope: &Envelope) -> Option<Response> {
+    /// and is recorded there. `greeted` says the request arrived on a
+    /// connection whose hello already went through the version rule: the
+    /// envelope's own version then decides nothing.
+    async fn lifecycle_refusal(&self, envelope: &Envelope, greeted: bool) -> Option<Response> {
         let id = &envelope.id;
         let phase = *self.phase.borrow();
         match phase {
@@ -1422,6 +1472,9 @@ impl Pipeline {
                 ));
             }
             LifecyclePhase::Draining => return Some(shutting_down_refusal(id)),
+        }
+        if greeted {
+            return None;
         }
         match self
             .image
@@ -1469,6 +1522,7 @@ impl Pipeline {
         self: Arc<Self>,
         mut envelope: Envelope,
         origin: Origin,
+        peer: Option<PublicPeer>,
         guard: &mut ReplyGuard,
     ) {
         if envelope.capability.starts_with(ADMIN_PREFIX) {
@@ -1478,7 +1532,7 @@ impl Pipeline {
         }
         let id = envelope.id.clone();
 
-        if let Some(refusal) = self.lifecycle_refusal(&envelope).await {
+        if let Some(refusal) = self.lifecycle_refusal(&envelope, peer.is_some()).await {
             guard.send(refusal);
             return;
         }
@@ -1514,13 +1568,14 @@ impl Pipeline {
 
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
+        let recorded = crate::ingress::recorded(origin, peer);
         let Some(class) = class else {
-            let response = self.refuse_unadmitted(&envelope).await;
+            let response = self.refuse_unadmitted(&envelope, origin, &recorded).await;
             guard.send(response);
             return;
         };
 
-        let admitted = match self.queue.admit(&envelope, class).await {
+        let admitted = match self.queue.admit_from(&envelope, class, &recorded).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 guard.send(queue_refusal(id, &error));
@@ -1544,6 +1599,9 @@ impl Pipeline {
             }
             AdmitOutcome::Bypass => {
                 let audience = Audience::of(Some(class));
+                if audience.follows_events() {
+                    self.register_ticket(&envelope, origin);
+                }
                 if envelope.wait {
                     let response = self.execute_bypass(&envelope, origin, audience).await;
                     guard.send(response);
@@ -1556,8 +1614,13 @@ impl Pipeline {
                     // Result reaches the store and event stream only.
                     let _ = self.execute_bypass(&envelope, origin, audience).await;
                 }
+                // A bypass ends in this handler. Its terminal event already
+                // removed it from the hub; an ending that published none
+                // (a verdict parked for retry) is forgotten here.
+                self.events.hub().unregister(&envelope.id);
             }
             AdmitOutcome::Admitted => {
+                self.register_ticket(&envelope, origin);
                 let response = Arc::clone(&self)
                     .gate_and_place(&envelope, Some(&mut *guard))
                     .await;
@@ -1850,6 +1913,7 @@ impl Pipeline {
                 cancel,
                 deadline,
                 origin,
+                row.origin,
             )
             .await;
         let ctx = match ctx {
@@ -2055,11 +2119,11 @@ impl Pipeline {
                         args,
                         cancel,
                         lease_deadline.into_std(),
-                        // A laned request's origin is not on its row yet
-                        // (it joins the row with the peer identity); the
-                        // only built-in that reads it, `cancel`, is never
-                        // laned.
-                        Origin::Public,
+                        // Recorded at admission: a request the private
+                        // plane submitted is still that plane's when its
+                        // lane reaches it.
+                        Origin::of_row(&row.origin),
+                        row.origin,
                     )
                     .await;
                 match ctx {
@@ -2317,6 +2381,7 @@ impl Pipeline {
         cancel: watch::Receiver<bool>,
         deadline: std::time::Instant,
         origin: Origin,
+        peer: pam_store::RequestOrigin,
     ) -> Result<ExecContext, CapabilityFailure> {
         let budget = crate::request_budget::RequestBudget::load_persistent(
             Arc::clone(&self.store),
@@ -2329,6 +2394,7 @@ impl Pipeline {
         })?;
         Ok(ExecContext {
             origin,
+            peer,
             status: Arc::clone(&self.status),
             budget,
             request_id,
@@ -2350,21 +2416,28 @@ impl Pipeline {
 
     /// Inserts the row for a request that never passed admission (an
     /// unknown capability) and refuses it through the gate.
-    async fn refuse_unadmitted(&self, envelope: &Envelope) -> Response {
+    async fn refuse_unadmitted(
+        &self,
+        envelope: &Envelope,
+        origin: Origin,
+        recorded: &pam_store::RequestOrigin,
+    ) -> Response {
         let inserted = self
             .store
-            .insert_request(
+            .insert_request_from(
                 &envelope.id,
                 &envelope.capability,
                 &envelope.caller.repo,
                 &envelope.caller.agent,
                 &envelope.args.to_string(),
                 envelope.idempotency_key.as_deref(),
+                recorded,
             )
             .await;
         if inserted.is_err() {
             return internal_refusal(&envelope.id);
         }
+        self.register_ticket(envelope, origin);
         match self.gate.evaluate(&envelope.id, &envelope.capability).await {
             Ok(GateDecision::Refuse {
                 cause,
@@ -2813,7 +2886,7 @@ pub(crate) fn version_mismatch_refusal(
 }
 
 /// Refusal for a daemon-side bookkeeping failure.
-fn internal_refusal(id: &str) -> Response {
+pub(crate) fn internal_refusal(id: &str) -> Response {
     Response::transient_refusal(
         id,
         CAUSE_INTERNAL_ERROR,
@@ -2877,7 +2950,7 @@ fn failure_refusal(id: &str, detail: String) -> Response {
 }
 
 /// Refusal for an elapsed deadline.
-fn deadline_refusal_response(id: &str, deadline_ms: u64) -> Response {
+pub(crate) fn deadline_refusal_response(id: &str, deadline_ms: u64) -> Response {
     Response::transient_refusal(
         id,
         CAUSE_DEADLINE_EXCEEDED,

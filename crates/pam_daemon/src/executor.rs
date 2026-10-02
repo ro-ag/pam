@@ -69,6 +69,15 @@ pub struct ExecContext {
     /// its audit actor and its ownership check from this, never from
     /// [`Caller::agent`](pam_proto::Caller::agent).
     pub origin: Origin,
+    /// The plane and the connection the request arrived on, exactly as its
+    /// request row records them at admission (`ingress`, `peer_uid`,
+    /// `peer_pid`, `relayed`): the kernel's view of the peer for a request
+    /// from the framed public listener, no peer for one the administration
+    /// plane submitted or the legacy listener carried. Read back from the
+    /// row, so a bypass and a leased execution see the same thing.
+    /// Attribution only: a pid names a short-lived process and can be
+    /// reused, and nothing may be authorized by it.
+    pub peer: pam_store::RequestOrigin,
     /// The cached slow half of the `status` body (see [`StatusCache`]).
     pub status: Arc<StatusCache>,
     /// Shared absolute deadline and cumulative work allowance.

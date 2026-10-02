@@ -261,6 +261,7 @@ impl Harness {
         assert_eq!(lease.request_id, ticket);
         ExecContext {
             origin: crate::ingress::Origin::Public,
+            peer: pam_store::RequestOrigin::PUBLIC,
             status: crate::status_cache::StatusCache::new(
                 self.models.clone(),
                 self.secrets.clone(),

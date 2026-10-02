@@ -974,13 +974,21 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
             .snapshot("req_run")
             .await
             .expect("a gated step's wait carries its resolved snapshot");
+        // `git` on Unix, `git.exe` on Windows: compare the stem, not the suffix.
+        let program = std::path::Path::new(&snapshot.program);
         assert!(
-            std::path::Path::new(&snapshot.program).is_absolute()
-                && snapshot.program.ends_with("git"),
+            program.is_absolute() && program.file_stem() == Some(std::ffi::OsStr::new("git")),
             "the resolved program, not the bare name: {snapshot:?}"
         );
         assert_eq!(snapshot.argv, ["--version"]);
-        assert_eq!(snapshot.cwd.as_deref(), Some(envelope.caller.repo.as_str()));
+        // The daemon records the directory in its canonical form (a verbatim
+        // `\\?\C:\...` path on Windows), so compare both sides canonicalized.
+        let recorded = snapshot.cwd.as_deref().expect("the snapshot records a cwd");
+        assert_eq!(
+            std::fs::canonicalize(recorded).expect("recorded cwd exists"),
+            std::fs::canonicalize(&envelope.caller.repo).expect("caller repo exists"),
+            "the step runs in the caller's repo: {snapshot:?}"
+        );
         assert_eq!(snapshot.digest.len(), 64);
         // An answer pinned to anything else resolves nothing.
         let stale = approvals

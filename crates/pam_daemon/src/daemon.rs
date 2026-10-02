@@ -10,10 +10,25 @@
 //! retention pruner ([`crate::retention`]), which prunes on its first tick (so a boot prunes right
 //! after crash recovery) and every [`PRUNE_INTERVAL`] after. **Ordering**: dedupe + row insert
 //! happen atomically in [`QueueManager::admit`] (audit needs the row to exist), the gate runs next,
-//! and only an allowed request reaches [`QueueManager::place_in_lane`]. A crash between admit and
-//! placement can resurrect an ungated `queued` row, which re-enters a lane and executes without a
-//! fresh gate pass on restart — accepted, since the capability was at worst one auto-grant away
-//! from allowed.
+//! and only an allowed request reaches [`QueueManager::place_in_lane`]. Admission inserts the row
+//! `running`; it becomes `queued` only through the atomic post-gate authorization write inside
+//! placement, so a crash between the two leaves a `running` row that crash recovery fails — never
+//! executable queued work.
+//! - **One admission point, bounded handlers** (ptrack issue 35): `dispatch_loop` is the only
+//!   place a request takes a slot. The pool comes from [`crate::policy::admission_pool`] — work,
+//!   status (the liveness answer has slots nothing else can take), control (`query`), cancel
+//!   (headroom of its own, so the remedy for a saturated daemon cannot be starved by polls) —
+//!   plus a pool for requests the private admin plane submits. The slot and the reply channel travel together in a `ReplyGuard`: when the handler
+//!   ends for any reason (answer, panic, abort, hard deadline) the caller is answered and the slot
+//!   is released, so a permit cannot outlive its handler. Every handler runs under one hard
+//!   deadline around all of it — admission, gate, execution, terminal write — of the envelope's
+//!   deadline (clamped to the lease ceiling; a control request to [`CONTROL_DEADLINE_CAP`]) plus a
+//!   grace. On expiry the caller gets [`CAUSE_DEADLINE_EXCEEDED`] at once, the slot is free, and
+//!   the terminal row is still written by a detached task through [`TerminalWriter`].
+//! - **`status` is a snapshot read**: answered straight from [`StatusCache`] on a ledger-free
+//!   path — no admission row, no audit row, no caller-registry write, no lifecycle events, no
+//!   model lane, no keychain. A poll leaves nothing behind. `query` and `cancel` stay audited
+//!   requests; none of the control class publishes lifecycle events.
 //! - **Admin surface (GUI-only)**: capabilities under [`crate::admin::ADMIN_PREFIX`] are refused on
 //!   public IPC regardless of caller labels; only [`crate::admin_transport`] may call them. Admin
 //!   ops have no `classify()` entry and are never granted/approved/queued; they record their own
@@ -32,11 +47,15 @@
 //!   cooperative cancellation, then the dispatcher stops. No explicit store flush is needed — every
 //!   write, audit included, is per-statement durable. A `waiting_approval` request is not drained;
 //!   crash recovery fails it on next boot.
-//! - **Version handshake**: every envelope carries the client build version; client and daemon ship
-//!   as one binary, so a mismatch means the on-disk binary was replaced under a running (older)
-//!   daemon. Checked first: a mismatch is refused with [`CAUSE_DAEMON_OUTDATED`] (no request row
-//!   recorded) and moves the daemon to [`LifecyclePhase::Restarting`], triggering the same drain;
-//!   `pam daemon` re-spawns the new binary after.
+//! - **Version handshake and restart policy**: every envelope carries the client build version.
+//!   The daemon restarts itself for one reason — the binary it was started from was replaced on
+//!   disk — and a client's claimed version is only the occasion to look ([`crate::image`]). A
+//!   differing version with a replaced image is refused with [`CAUSE_DAEMON_OUTDATED`] and moves
+//!   the daemon to [`LifecyclePhase::Restarting`], triggering the drain; `pam daemon` re-spawns
+//!   the path recorded at boot ([`DaemonHandle::boot_image_path`]). A differing version with the
+//!   image unchanged is refused with [`CAUSE_CLIENT_VERSION_MISMATCH`], naming the daemon's
+//!   version and path, and the phase does not move. Neither refusal records a request row. While
+//!   the phase is `Restarting` every public request is answered [`CAUSE_DAEMON_OUTDATED`].
 //! - **Replies**: `wait: true` parks the pipeline task on the [`CompletionRouter`] until execution
 //!   finishes; duplicate callers attached to the same request share the router entry and all get
 //!   the terminal [`Response`] (fan-out), with a short post-completion grace period for late
@@ -55,8 +74,14 @@
 //!   cancel action; bypass deadline → [`ACTION_DEADLINE_REFUSAL`]; internal bookkeeping failure →
 //!   [`ACTION_INTERNAL_FAILURE`]. A laned deadline writes [`ACTION_DEADLINE_REFUSAL`] in addition
 //!   to the lease-expiry row (outcome `lease_expired`, exposed as `deadline_exceeded`). A store
-//!   failure on a terminal write is logged at error level and left for next boot's crash recovery —
-//!   the store serializes all statements on its single connection (concurrent use is refused).
+//!   failure on a terminal write is never swallowed: [`TerminalWriter`] retries it, logs it, and
+//!   parks the verdict for the maintenance loop; a leased request whose terminal write keeps
+//!   failing gives its lane back at once (the result still reaches its waiters) instead of
+//!   stranding the lane until the lease deadline; and a row nothing ever finishes is closed by the
+//!   queue's reconciler once its deadline has passed ([`QueueManager::reconcile_expired`], every
+//!   couple of seconds and once at boot). An early bookkeeping failure writes its terminal row like any
+//!   other ending. Every refusal and internal failure of a laned request also releases attached
+//!   duplicate callers through the [`CompletionRouter`].
 //! - **Audit decisions/actors**: gate refusal → `refuse`/`policy` (unknown or ungranted
 //!   capability; denied, timed-out or cancelled approval); execute success → `allow`/`system`,
 //!   failure → `refuse`/`system`; cancel → `deny`/`system`; bypass deadline → `timeout`/`system`;
@@ -70,8 +95,7 @@
 //!   `wait: false` returns a ticket immediately while the wait runs in the background, bounded by
 //!   approval timeout and admission expiry.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,7 +103,7 @@ use pam_connectors::{CurlTransport, HttpTransport};
 use pam_proto::{Envelope, Event, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
@@ -89,17 +113,27 @@ use crate::executor::{
     BuiltinCapability, CapabilityFailure, CapabilityOutput, ExecContext, outcome_str,
 };
 use crate::flow_service::FlowService;
+use crate::image::{FsProbe, ImageProbe, ImageWatch, VersionVerdict};
+use crate::ingress::Origin;
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
-use crate::policy::{GateDecision, PolicyError, PolicyGate, classify};
+use crate::policy::{
+    AdmissionPool, CAP_STATUS, CapabilityClass, GateDecision, PolicyError, PolicyGate,
+    admission_pool, classify,
+};
 use crate::queue::{AdmitOutcome, CAUSE_CANCELLED, LeasedWork, QueueError, QueueManager};
 use crate::retention::{PRUNE_INTERVAL, RetentionService};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::{SecretBackend, SecretStore};
+use crate::status_cache::StatusCache;
+use crate::terminal::{TerminalWriter, Written};
 use crate::transport::{EventPublisher, IncomingRequest, Transport, TransportError};
+
+pub use crate::completion_router::{CompletionRouter, Registration};
+pub use crate::image::CAUSE_CLIENT_VERSION_MISMATCH;
 
 /// Refusal cause when a waiting caller's `deadline_ms` elapsed.
 pub const CAUSE_DEADLINE_EXCEEDED: &str = "deadline_exceeded";
@@ -118,8 +152,16 @@ pub const CAUSE_EXECUTION_FAILED: &str = "execution_failed";
 pub const CAUSE_INTERNAL_ERROR: &str = "internal_error";
 
 /// Refusal cause when the envelope's client version does not match the
-/// daemon's — the binary on disk is newer; the daemon restarts itself.
+/// daemon's **and** the daemon's binary on disk was replaced: the daemon
+/// restarts itself with the new binary. Also the answer to every public
+/// request while the daemon is in [`LifecyclePhase::Restarting`].
 pub const CAUSE_DAEMON_OUTDATED: &str = "daemon_outdated";
+
+/// Refusal cause when a dispatcher pool has no free slot.
+pub const CAUSE_REQUEST_CAPACITY: &str = "request_capacity_exhausted";
+
+/// Refusal cause when a dispatcher pool's rate window is spent.
+pub const CAUSE_REQUEST_RATE: &str = "request_rate_exhausted";
 
 /// Refusal cause for a request arriving while the daemon drains.
 pub const CAUSE_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
@@ -193,9 +235,51 @@ const RECOVERY_OUTDATED: &str = "The daemon is restarting with the new binary; r
 const RECOVERY_SHUTTING_DOWN: &str =
     "Retry shortly; the next pam command starts a fresh daemon automatically.";
 
-/// How long the completion router remembers a terminal response, to
-/// close the attach-after-finish race.
-const FINISHED_TTL: Duration = Duration::from_mins(1);
+/// Recovery line for [`CAUSE_CLIENT_VERSION_MISMATCH`] refusals.
+const RECOVERY_VERSION_MISMATCH: &str = "Use the pam binary this daemon was started from, or stop the daemon from the PAM GUI and start it with the build you intend to use.";
+
+/// Dispatcher slots for ordinary work.
+pub const WORK_SLOTS: usize = 128;
+/// Dispatcher slots reserved for `status`: a snapshot read holds one for
+/// microseconds, so these are never the bottleneck and never shared.
+pub const STATUS_SLOTS: usize = 16;
+/// Dispatcher slots reserved for `query`.
+pub const CONTROL_SLOTS: usize = 16;
+/// Dispatcher slots reserved for `cancel` alone; a cancel that finds them
+/// taken may still use a control slot.
+pub const CANCEL_SLOTS: usize = 8;
+/// Dispatcher slots for requests the private admin plane submits, so a
+/// public flood cannot refuse a run or a cancel the human asked for. The
+/// admin listener serves at most 32 connections, each one request.
+pub const ADMIN_SLOTS: usize = 32;
+/// Ordinary work admitted per second.
+const WORK_RATE: usize = 256;
+/// `status` admitted per second.
+const STATUS_RATE: usize = 64;
+/// `query` admitted per second.
+const CONTROL_RATE: usize = 64;
+/// `cancel` admitted per second from its own allowance.
+const CANCEL_RATE: usize = 16;
+
+/// How long past its deadline a handler may run before it is cut off (see
+/// the module docs), unless [`DaemonConfig::handler_grace`] says otherwise.
+pub const DEFAULT_HANDLER_GRACE: Duration = Duration::from_secs(30);
+
+/// The grace for a control request: it does bookkeeping, not work.
+const CONTROL_GRACE: Duration = Duration::from_secs(2);
+
+/// The longest deadline a control request (`status`, `query`, `cancel`) is
+/// given, whatever its envelope asks for: a control slot is held for at
+/// most this plus `CONTROL_GRACE`.
+pub const CONTROL_DEADLINE_CAP: Duration = Duration::from_secs(10);
+
+/// How much longer than the handler grace a row is left alone before the
+/// queue's reconciler closes it (see [`QueueManager::reconcile_expired`]).
+const RECONCILE_MARGIN: Duration = Duration::from_secs(15);
+
+/// How often the maintenance loop retries parked terminal writes and
+/// prunes the completion router.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the lease reaper sweeps.
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
@@ -246,90 +330,6 @@ pub enum DaemonError {
     Lifecycle(#[from] LifecycleError),
 }
 
-/// Routes each request's single terminal [`Response`] to every pipeline
-/// task waiting for it (the requester plus any attached duplicates).
-#[derive(Debug, Clone, Default)]
-pub struct CompletionRouter {
-    inner: Arc<Mutex<RouterInner>>,
-}
-
-#[derive(Debug, Default)]
-struct RouterInner {
-    /// request id → the waiters to answer on completion.
-    waiting: HashMap<String, Vec<oneshot::Sender<Response>>>,
-    /// Recently finished requests, kept for [`FINISHED_TTL`] so a waiter
-    /// registering just after the finish still gets its answer.
-    finished: HashMap<String, (Instant, Response)>,
-}
-
-/// What [`CompletionRouter::register`] handed back.
-#[derive(Debug)]
-pub enum Registration {
-    /// The request already finished; here is its response.
-    Ready(Box<Response>),
-    /// The request is still in flight; the receiver resolves with its
-    /// terminal response.
-    Pending(oneshot::Receiver<Response>),
-}
-
-impl CompletionRouter {
-    /// An empty router.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers interest in `request_id`'s terminal response.
-    pub async fn register(&self, request_id: &str) -> Registration {
-        let mut inner = self.inner.lock().await;
-        if let Some((_, response)) = inner.finished.get(request_id) {
-            return Registration::Ready(Box::new(response.clone()));
-        }
-        let (tx, rx) = oneshot::channel();
-        inner
-            .waiting
-            .entry(request_id.to_owned())
-            .or_default()
-            .push(tx);
-        Registration::Pending(rx)
-    }
-
-    /// Whether anyone is still waiting for `request_id`'s terminal
-    /// response. A reaped expiry reads this before choosing the refusal a
-    /// waiter receives: a caller that is still parked gets its elapsed
-    /// deadline, while an unobserved request records only the reaper's own
-    /// teardown. Entries whose receiver the caller dropped do not count —
-    /// nobody is listening, and the map entry itself only clears on
-    /// [`Self::finish`].
-    pub async fn has_waiters(&self, request_id: &str) -> bool {
-        self.inner
-            .lock()
-            .await
-            .waiting
-            .get(request_id)
-            .is_some_and(|waiters| waiters.iter().any(|tx| !tx.is_closed()))
-    }
-
-    /// Delivers `response` to every waiter registered for `request_id`
-    /// and remembers it for late registrants (see `FINISHED_TTL`).
-    pub async fn finish(&self, request_id: &str, response: Response) {
-        let mut inner = self.inner.lock().await;
-        if let Some(waiters) = inner.waiting.remove(request_id) {
-            for waiter in waiters {
-                // A dropped receiver (deadline elapsed) is fine.
-                let _ = waiter.send(response.clone());
-            }
-        }
-        let now = Instant::now();
-        inner
-            .finished
-            .insert(request_id.to_owned(), (now, response));
-        inner
-            .finished
-            .retain(|_, (finished_at, _)| now.duration_since(*finished_at) < FINISHED_TTL);
-    }
-}
-
 /// A running daemon: instance lock held, sockets bound, pipeline tasks
 /// pumping.
 #[derive(Debug)]
@@ -343,6 +343,14 @@ pub struct DaemonHandle {
     admin: Arc<AdminService>,
     tasks: Vec<JoinHandle<()>>,
     phase: watch::Sender<LifecyclePhase>,
+    /// The executable image recorded at boot (see [`crate::image`]).
+    image: Arc<ImageWatch>,
+    /// The dispatcher's pools, for inspection.
+    admission: Arc<Admission>,
+    #[cfg(test)]
+    queue: Arc<QueueManager>,
+    #[cfg(test)]
+    router: CompletionRouter,
     /// Held for the daemon's lifetime; dropping the handle releases it.
     _lock: InstanceLock,
 }
@@ -391,6 +399,34 @@ impl DaemonHandle {
         self.phase.subscribe()
     }
 
+    /// The path this daemon was started as, recorded at boot. A respawn
+    /// after [`LifecyclePhase::Restarting`] must execute **this** path, not
+    /// `std::env::current_exe()` at respawn time: after the usual
+    /// rename-into-place install the latter names a deleted file on Linux.
+    /// `None` only when the platform could not name the executable at boot.
+    #[must_use]
+    pub fn boot_image_path(&self) -> Option<PathBuf> {
+        self.image.boot_path().map(Path::to_path_buf)
+    }
+
+    /// Free dispatcher slots per pool, right now.
+    #[must_use]
+    pub fn admission_available(&self) -> AdmissionAvailable {
+        self.admission.available()
+    }
+
+    /// The queue manager, for in-crate tests that need to stall or inject.
+    #[cfg(test)]
+    pub(crate) fn queue(&self) -> Arc<QueueManager> {
+        Arc::clone(&self.queue)
+    }
+
+    /// The completion router, for in-crate tests of its bounds.
+    #[cfg(test)]
+    pub(crate) fn router(&self) -> CompletionRouter {
+        self.router.clone()
+    }
+
     /// Waits for the graceful drain, then stops the transport and joins
     /// every daemon task (see the module docs on the drain).
     ///
@@ -430,6 +466,13 @@ pub struct DaemonConfig {
     /// [`CurlTransport`] over the system `curl` (tests inject
     /// `pam_connectors::testing::FakeTransport`).
     pub http_transport: Option<Arc<dyn HttpTransport>>,
+    /// How the daemon reads its own executable's file facts; `None` uses
+    /// the filesystem ([`FsProbe`]). Tests script a replaced binary.
+    pub image_probe: Option<Arc<dyn ImageProbe>>,
+    /// How long past its deadline a non-control handler may run before it
+    /// is cut off (default [`DEFAULT_HANDLER_GRACE`]; tests inject a short
+    /// one). The stranded-row reconciler waits this plus a margin.
+    pub handler_grace: Duration,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -444,6 +487,8 @@ impl std::fmt::Debug for DaemonConfig {
             .field("drain_timeout", &self.drain_timeout)
             .field("secret_backend", &self.secret_backend.is_some())
             .field("http_transport", &self.http_transport.is_some())
+            .field("image_probe", &self.image_probe.is_some())
+            .field("handler_grace", &self.handler_grace)
             .finish()
     }
 }
@@ -456,6 +501,8 @@ impl Default for DaemonConfig {
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             secret_backend: None,
             http_transport: None,
+            image_probe: None,
+            handler_grace: DEFAULT_HANDLER_GRACE,
         }
     }
 }
@@ -516,6 +563,16 @@ pub async fn run_daemon_with(
     let gate = Arc::new(PolicyGate::new(Arc::clone(&store)).await?);
     let models = ModelService::new(Arc::clone(&store)).await?;
     models.set_engine_base(base.clone());
+    // A SIGKILLed daemon leaves its engine running; stop it now rather than
+    // on the first model op (idempotent, and a no-op with no engine).
+    let reaped = models.reap_orphan_engine().await;
+    tracing::debug!(?reaped, "checked for an engine left by a previous daemon");
+    // Record what this process was started from before anything can ask.
+    let image = ImageWatch::capture(
+        config
+            .image_probe
+            .unwrap_or_else(|| Arc::new(FsProbe) as Arc<dyn ImageProbe>),
+    );
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let secrets = open_secret_store(config.secret_backend);
     // macOS only inside: the first keychain touch of a session can be
@@ -527,8 +584,21 @@ pub async fn run_daemon_with(
         Some(Arc::clone(&secrets)),
         open_http_transport(config.http_transport),
     ));
-    let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
+    let queue = Arc::new(
+        QueueManager::new(Arc::clone(&store))
+            .with_reconcile_grace(config.handler_grace + RECONCILE_MARGIN),
+    );
     queue.rebuild_from_store().await?;
+    // Boot pass of the stranded-row reconciler: anything still in flight
+    // past its deadline (plus the grace) after recovery is closed now.
+    loop {
+        let closed = queue
+            .reconcile_expired(crate::queue::wall_clock_ms())
+            .await?;
+        if closed < usize::try_from(pam_store::MAX_EXPIRY_BATCH).unwrap_or(usize::MAX) {
+            break;
+        }
+    }
     // After recovery has settled every ticket's state and before any
     // request can run: a landing workspace no live ticket names is gone.
     crate::landing_sweep::sweep_orphaned_workspaces(&store).await;
@@ -567,6 +637,7 @@ pub async fn run_daemon_with(
         &base,
         Arc::clone(&admin),
         phase.clone(),
+        Arc::clone(&image),
     ) {
         Ok(listener) => listener,
         Err(error) => {
@@ -575,6 +646,9 @@ pub async fn run_daemon_with(
         }
     };
 
+    let status = StatusCache::new(Arc::clone(&models), Arc::clone(&secrets));
+    let admission = Admission::new();
+    let router = CompletionRouter::new();
     let pipeline = Arc::new(Pipeline {
         store: Arc::clone(&store),
         gate,
@@ -585,17 +659,31 @@ pub async fn run_daemon_with(
         models: Arc::clone(&models),
         secrets,
         events: transport.event_publisher(),
-        router: CompletionRouter::new(),
+        router: router.clone(),
         work: Notify::new(),
         started_at: Instant::now(),
         phase: phase.clone(),
+        image: Arc::clone(&image),
+        status: Arc::clone(&status),
+        // One writer for the whole daemon: the admin surface parks into
+        // the same queue the maintenance loop retries.
+        terminals: Arc::clone(&admin.terminals),
+        handler_grace: config.handler_grace,
     });
 
     let tasks = vec![
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
         RetentionService::new(Arc::clone(&store)).run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
+        status.spawn(drain_rx.clone()),
+        // Runs through the drain: a verdict parked while draining is still
+        // offered to the store before the daemon exits.
+        tokio::spawn(maintenance_loop(
+            Arc::clone(&pipeline),
+            dispatch_stop_rx.clone(),
+        )),
         tokio::spawn(dispatch_loop(
             Arc::clone(&pipeline),
+            Arc::clone(&admission),
             incoming_rx,
             dispatch_stop_rx,
         )),
@@ -621,6 +709,12 @@ pub async fn run_daemon_with(
         admin,
         tasks,
         phase,
+        image,
+        admission,
+        #[cfg(test)]
+        queue,
+        #[cfg(test)]
+        router,
         _lock: lock,
     })
 }
@@ -747,6 +841,159 @@ struct Pipeline {
     /// Read to refuse requests while draining; written to request the
     /// self-restart the version handshake calls for.
     phase: watch::Sender<LifecyclePhase>,
+    /// The boot image and the "was it replaced?" check behind the version
+    /// handshake.
+    image: Arc<ImageWatch>,
+    /// What `status` answers from.
+    status: Arc<StatusCache>,
+    /// The retrying, parking writer of terminal rows.
+    terminals: Arc<TerminalWriter>,
+    /// See [`DaemonConfig::handler_grace`].
+    handler_grace: Duration,
+}
+
+/// The dispatcher's admission pools (see the module docs). The rate
+/// windows live in [`dispatch_loop`]; the slots are shared so the daemon
+/// handle can report them.
+#[derive(Debug)]
+pub(crate) struct Admission {
+    work: Arc<Semaphore>,
+    status: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+    cancel: Arc<Semaphore>,
+    admin: Arc<Semaphore>,
+}
+
+/// Free dispatcher slots per pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionAvailable {
+    /// Of [`WORK_SLOTS`].
+    pub work: usize,
+    /// Of [`STATUS_SLOTS`].
+    pub status: usize,
+    /// Of [`CONTROL_SLOTS`].
+    pub control: usize,
+    /// Of [`CANCEL_SLOTS`].
+    pub cancel: usize,
+    /// Of [`ADMIN_SLOTS`].
+    pub admin: usize,
+}
+
+impl Admission {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            work: Arc::new(Semaphore::new(WORK_SLOTS)),
+            status: Arc::new(Semaphore::new(STATUS_SLOTS)),
+            control: Arc::new(Semaphore::new(CONTROL_SLOTS)),
+            cancel: Arc::new(Semaphore::new(CANCEL_SLOTS)),
+            admin: Arc::new(Semaphore::new(ADMIN_SLOTS)),
+        })
+    }
+
+    fn available(&self) -> AdmissionAvailable {
+        AdmissionAvailable {
+            work: self.work.available_permits(),
+            status: self.status.available_permits(),
+            control: self.control.available_permits(),
+            cancel: self.cancel.available_permits(),
+            admin: self.admin.available_permits(),
+        }
+    }
+}
+
+/// Why the dispatcher could not admit a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exhausted {
+    Rate,
+    Capacity,
+}
+
+/// One pool's admission: the rate window first, then a slot.
+fn take_slot(
+    slots: &Arc<Semaphore>,
+    rate: Option<&mut crate::admission_rate::RateWindow>,
+    now: Instant,
+) -> Result<OwnedSemaphorePermit, Exhausted> {
+    if let Some(rate) = rate
+        && !rate.admit(now)
+    {
+        return Err(Exhausted::Rate);
+    }
+    Arc::clone(slots)
+        .try_acquire_owned()
+        .map_err(|_| Exhausted::Capacity)
+}
+
+/// A request's reply channel and its dispatcher slot, tied together.
+///
+/// The handler answers through [`Self::send`]. Whatever else happens to the
+/// handler — it returns without answering, panics, is aborted at shutdown,
+/// or is cut off by the hard deadline — dropping the guard answers the
+/// caller (an internal refusal, or the shutting-down refusal while the
+/// daemon drains) and releases the slot. A slot therefore cannot outlive
+/// its handler, and a caller is never left without an answer the daemon
+/// could still send. When the caller's side of the channel is already gone
+/// the answer is simply dropped; the slot is released all the same.
+pub(crate) struct ReplyGuard {
+    id: String,
+    reply: Option<oneshot::Sender<Response>>,
+    phase: watch::Receiver<LifecyclePhase>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ReplyGuard {
+    pub(crate) fn new(
+        id: String,
+        reply: oneshot::Sender<Response>,
+        phase: watch::Receiver<LifecyclePhase>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            id,
+            reply: Some(reply),
+            phase,
+            _permit: permit,
+        }
+    }
+
+    /// Answers the caller. Only the first answer is sent.
+    pub(crate) fn send(&mut self, response: Response) {
+        if let Some(reply) = self.reply.take() {
+            // A closed channel means the caller stopped listening.
+            let _ = reply.send(response);
+        }
+    }
+
+    /// Resolves when nobody can receive the answer any more (the task
+    /// carrying the reply to the client has gone). Never resolves once the
+    /// request has been answered.
+    async fn caller_gone(&mut self) {
+        match self.reply.as_mut() {
+            Some(reply) => reply.closed().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Drop for ReplyGuard {
+    fn drop(&mut self) {
+        let Some(reply) = self.reply.take() else {
+            return;
+        };
+        if reply.is_closed() {
+            return;
+        }
+        let response = if *self.phase.borrow() == LifecyclePhase::Serving {
+            tracing::error!(
+                request = %self.id,
+                "a request handler ended without answering; the caller gets an internal refusal"
+            );
+            internal_refusal(&self.id)
+        } else {
+            shutting_down_refusal(&self.id)
+        };
+        let _ = reply.send(response);
+    }
 }
 
 /// Resolves when the shutdown flag flips to `true` (a dropped sender
@@ -755,61 +1002,132 @@ async fn signalled(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
-/// Receives transport requests and spawns one pipeline task each.
+/// Receives requests from every ingress and spawns one bounded pipeline
+/// task each: the single admission point (see the module docs).
 async fn dispatch_loop(
     pipeline: Arc<Pipeline>,
+    admission: Arc<Admission>,
     mut incoming: mpsc::Receiver<IncomingRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let work_slots = Arc::new(Semaphore::new(128));
-    let control_slots = Arc::new(Semaphore::new(16));
+    use crate::admission_rate::RateWindow;
     let mut tasks = JoinSet::new();
-    let mut work_rate = crate::admission_rate::RateWindow::new(256);
-    let mut control_rate = crate::admission_rate::RateWindow::new(64);
+    let mut work_rate = RateWindow::new(WORK_RATE);
+    let mut status_rate = RateWindow::new(STATUS_RATE);
+    let mut control_rate = RateWindow::new(CONTROL_RATE);
+    let mut cancel_rate = RateWindow::new(CANCEL_RATE);
     loop {
         let request = tokio::select! {
             () = signalled(&mut shutdown) => break,
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                log_handler_exit(joined);
+                continue;
+            }
             request = incoming.recv() => match request { Some(request) => request, None => break },
         };
-        let (slots, rate) = if matches!(
-            request.envelope.capability.as_str(),
-            "status" | "query" | "cancel"
-        ) {
-            (&control_slots, &mut control_rate)
-        } else {
-            (&work_slots, &mut work_rate)
+        let now = Instant::now();
+        let pool = admission_pool(&request.envelope.capability);
+        let admitted = match (request.origin, pool) {
+            // The private plane has its own connection cap; no rate here.
+            (Origin::Admin, _) => take_slot(&admission.admin, None, now),
+            (Origin::Public, AdmissionPool::Work) => {
+                take_slot(&admission.work, Some(&mut work_rate), now)
+            }
+            (Origin::Public, AdmissionPool::Status) => {
+                take_slot(&admission.status, Some(&mut status_rate), now)
+            }
+            (Origin::Public, AdmissionPool::Control) => {
+                take_slot(&admission.control, Some(&mut control_rate), now)
+            }
+            // Its own headroom first; a control slot when that is taken.
+            (Origin::Public, AdmissionPool::Cancel) => {
+                take_slot(&admission.cancel, Some(&mut cancel_rate), now)
+                    .or_else(|_| take_slot(&admission.control, Some(&mut control_rate), now))
+            }
         };
-        if !rate.admit(std::time::Instant::now()) {
-            let _ = request.reply.send(Response::Refusal {
-                id: request.envelope.id,
-                cause: "request_rate_exhausted".to_owned(),
-                detail: "PAM has reached its aggregate request rate limit".to_owned(),
-                recovery: "Back off before sending more requests".to_owned(),
-            });
-            continue;
-        }
-        let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
-            let _ = request.reply.send(Response::Refusal {
-                id: request.envelope.id,
-                cause: "request_capacity_exhausted".to_owned(),
-                detail: "PAM has reached its active request limit".to_owned(),
-                recovery: "Wait for work to finish or cancel an existing request".to_owned(),
-            });
-            continue;
+        let permit = match admitted {
+            Ok(permit) => permit,
+            Err(exhausted) => {
+                let _ = request
+                    .reply
+                    .send(exhausted_refusal(request.envelope.id, exhausted));
+                continue;
+            }
         };
         let pipeline = Arc::clone(&pipeline);
         tasks.spawn(async move {
-            let _permit = permit;
-            pipeline.handle(request.envelope, request.reply).await;
+            let guard = ReplyGuard::new(
+                request.envelope.id.clone(),
+                request.reply,
+                pipeline.phase.subscribe(),
+                permit,
+            );
+            pipeline
+                .serve(request.envelope, request.origin, guard)
+                .await;
         });
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            log_handler_exit(joined);
+        }
     })
     .await;
+    // Aborting drops each handler's reply guard: the caller is told the
+    // daemon is shutting down and the slot is released.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+/// A handler that panicked is a daemon bug nobody would otherwise see: its
+/// reply guard already answered the caller and released the slot, and the
+/// reconciler closes whatever row it left behind.
+fn log_handler_exit(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = joined
+        && error.is_panic()
+    {
+        tracing::error!(%error, "a request handler panicked");
+    }
+}
+
+/// The refusal for a request the dispatcher could not admit.
+fn exhausted_refusal(id: String, exhausted: Exhausted) -> Response {
+    match exhausted {
+        Exhausted::Rate => Response::transient_refusal(
+            id,
+            CAUSE_REQUEST_RATE,
+            "PAM has reached its aggregate request rate limit",
+            "Back off before sending more requests",
+        ),
+        Exhausted::Capacity => Response::transient_refusal(
+            id,
+            CAUSE_REQUEST_CAPACITY,
+            "PAM has reached its active request limit",
+            "Wait for work to finish or cancel an existing request",
+        ),
+    }
+}
+
+/// Housekeeping that must not depend on traffic: offers parked terminal
+/// verdicts to the store again and prunes the completion router.
+async fn maintenance_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = signalled(&mut shutdown) => break,
+            _ = ticker.tick() => {}
+        }
+        if pipeline.terminals.parked_count() != 0 {
+            pipeline.terminals.retry_parked().await;
+        }
+        pipeline.router.prune().await;
+    }
+    // One last offer: a verdict parked during the drain should not wait
+    // for the next boot's crash recovery if the store takes it now.
+    if pipeline.terminals.parked_count() != 0 {
+        pipeline.terminals.retry_parked().await;
+    }
 }
 
 /// Leases ready work off the lanes and spawns an execution task per
@@ -827,7 +1145,19 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
                 Ok(Some(work)) => {
                     let pipeline = Arc::clone(&pipeline);
                     tokio::spawn(async move {
-                        pipeline.execute_leased(work).await;
+                        // The execution runs in its own task so a panic in
+                        // a capability is seen here instead of leaving the
+                        // lease to hold its lane until the deadline.
+                        let id = work.request_id.clone();
+                        let executor = Arc::clone(&pipeline);
+                        let execution =
+                            tokio::spawn(async move { executor.execute_leased(work).await });
+                        if let Err(error) = execution.await
+                            && error.is_panic()
+                        {
+                            tracing::error!(request = %id, %error, "a leased execution panicked");
+                            pipeline.fail_panicked_lease(&id).await;
+                        }
                     });
                 }
                 Ok(None) => {}
@@ -863,6 +1193,9 @@ pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envel
         Ok(Ok(repository)) => repository,
         Ok(Err(error)) => {
             return Err(Response::Refusal {
+                // The blocking pool is busy or a worker died: neither
+                // says anything about the request itself.
+                retryable: true,
                 id: envelope.id,
                 cause: error.cause().to_owned(),
                 detail: error.to_string(),
@@ -884,6 +1217,7 @@ pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envel
 
 fn repository_deadline_refusal(id: String) -> Response {
     Response::Refusal {
+        retryable: true,
         id,
         cause: "deadline_exceeded".to_owned(),
         detail: "The request deadline expired while resolving its repository.".to_owned(),
@@ -891,74 +1225,292 @@ fn repository_deadline_refusal(id: String) -> Response {
     }
 }
 
+/// Who, besides the caller, has to be told how a request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    /// A laned request: subscribers follow its events and duplicate
+    /// callers may be attached to it through the completion router.
+    Laned,
+    /// A read-only bypass (or a request refused before it had a class):
+    /// a ticket holder may follow its events; nobody attaches.
+    Bypass,
+    /// A control request: nobody follows a poll, nobody attaches.
+    Control,
+}
+
+impl Audience {
+    fn of(class: Option<CapabilityClass>) -> Self {
+        match class {
+            Some(CapabilityClass::Control) => Self::Control,
+            Some(CapabilityClass::ReadOnly) | None => Self::Bypass,
+            Some(
+                CapabilityClass::NonDestructive
+                | CapabilityClass::Destructive
+                | CapabilityClass::External,
+            ) => Self::Laned,
+        }
+    }
+
+    /// Whether lifecycle events are published for the request.
+    fn follows_events(self) -> bool {
+        self != Self::Control
+    }
+
+    /// Whether duplicate callers can be attached to the request.
+    fn has_duplicates(self) -> bool {
+        self == Self::Laned
+    }
+}
+
+/// How a parked wait on the completion router ended.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Waited {
+    /// The request finished; here is its terminal response.
+    Answer(Response),
+    /// The wait's own deadline elapsed first.
+    TimedOut,
+    /// The router dropped the waiter without answering.
+    RouterDropped,
+    /// Nobody can receive the answer any more; the wait was abandoned and
+    /// the request it was waiting on is left alone.
+    CallerGone,
+}
+
+/// Parks on `registration` until the answer, `deadline`, or — when the
+/// handler's `guard` is given — the caller going away. A handler that is
+/// only waiting must not hold its slot for a caller that has left; the
+/// laned work continues under its lease either way.
+pub(crate) async fn wait_for_terminal(
+    registration: Registration,
+    deadline: tokio::time::Instant,
+    guard: Option<&mut ReplyGuard>,
+) -> Waited {
+    let rx = match registration {
+        Registration::Ready(response) => return Waited::Answer(*response),
+        Registration::Pending(rx) => rx,
+    };
+    let gone = async {
+        match guard {
+            Some(guard) => guard.caller_gone().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        answer = rx => match answer {
+            Ok(response) => Waited::Answer(response),
+            Err(_) => Waited::RouterDropped,
+        },
+        () = tokio::time::sleep_until(deadline) => Waited::TimedOut,
+        () = gone => Waited::CallerGone,
+    }
+}
+
 impl Pipeline {
+    /// Runs one request to its answer under the hard handler deadline (see
+    /// the module docs). The deadline wraps everything the handler does;
+    /// when it elapses the caller is answered, the slot is released, and
+    /// the request's terminal row is written by a detached task.
+    async fn serve(self: Arc<Self>, envelope: Envelope, origin: Origin, mut guard: ReplyGuard) {
+        let id = envelope.id.clone();
+        let deadline_ms = envelope.deadline_ms;
+        let class = classify(&envelope.capability);
+        let limit = self.handler_limit(deadline_ms, class);
+        let handled = tokio::time::timeout(
+            limit,
+            Arc::clone(&self).handle(envelope, origin, &mut guard),
+        )
+        .await;
+        if handled.is_ok() {
+            // Answered inside; a handler that returned without answering
+            // is answered by the guard's drop.
+            return;
+        }
+        tracing::error!(
+            request = %id,
+            limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            "a request handler exceeded its hard deadline; answering the caller and \
+             finishing the request in the background"
+        );
+        guard.send(deadline_refusal_response(&id, deadline_ms));
+        // The slot is free from here: persistence must not hold it.
+        drop(guard);
+        let audience = Audience::of(class);
+        tokio::spawn(async move {
+            self.finish_overdue(&id, deadline_ms, audience).await;
+        });
+    }
+
+    /// The hard bound on one handler: the envelope's deadline clamped to
+    /// the lease ceiling, plus the grace. A control request is bookkeeping,
+    /// so it gets the short cap and the short grace.
+    fn handler_limit(&self, deadline_ms: u64, class: Option<CapabilityClass>) -> Duration {
+        let asked = Duration::from_millis(deadline_ms).min(crate::queue::MAX_LEASE);
+        if class == Some(CapabilityClass::Control) {
+            asked.min(CONTROL_DEADLINE_CAP) + CONTROL_GRACE
+        } else {
+            asked + self.handler_grace
+        }
+    }
+
+    /// Finishes a request whose handler was cut off: the terminal row
+    /// through the store's choke point (first-wins, so a row its handler
+    /// did finish is untouched; no row, nothing to write), the `refused`
+    /// event, and any attached duplicates.
+    async fn finish_overdue(&self, id: &str, deadline_ms: u64, audience: Audience) {
+        let detail = serde_json::json!({ "deadline_ms": deadline_ms, "cause": "handler_deadline" })
+            .to_string();
+        self.terminals
+            .finish(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_DEADLINE_EXCEEDED),
+                AuditEntry {
+                    action: ACTION_DEADLINE_REFUSAL,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )
+            .await;
+        self.announce(
+            id,
+            audience,
+            Event::Refused,
+            deadline_refusal_response(id, deadline_ms),
+        )
+        .await;
+    }
+
+    /// Tells whoever follows `id` how it ended: the lifecycle event for
+    /// subscribers, the terminal response for attached duplicates.
+    async fn announce(&self, id: &str, audience: Audience, event: Event, response: Response) {
+        if audience.follows_events() {
+            let _ = self.events.publish(id, event).await;
+        }
+        if audience.has_duplicates() {
+            self.router.finish(id, response).await;
+        }
+    }
+
+    /// The gates that run before anything is recorded: the drain and the
+    /// version handshake. `Some` is the refusal to answer with; neither
+    /// gets a request row — the retry lands on the next (or new) daemon
+    /// and is recorded there.
+    async fn lifecycle_refusal(&self, envelope: &Envelope) -> Option<Response> {
+        let id = &envelope.id;
+        let phase = *self.phase.borrow();
+        match phase {
+            LifecyclePhase::Serving => {}
+            LifecyclePhase::Restarting => {
+                return Some(outdated_refusal(
+                    id,
+                    &envelope.client_version,
+                    self.image.boot_path(),
+                ));
+            }
+            LifecyclePhase::Draining => return Some(shutting_down_refusal(id)),
+        }
+        match self
+            .image
+            .verdict(&envelope.client_version, DAEMON_VERSION)
+            .await
+        {
+            VersionVerdict::Match => None,
+            VersionVerdict::Restart => {
+                // The binary this daemon was started from is no longer
+                // the one on disk. Answer this request, then hand over.
+                tracing::info!(
+                    client_version = %envelope.client_version,
+                    daemon_version = DAEMON_VERSION,
+                    "the daemon's binary was replaced on disk; restarting with it"
+                );
+                request_restart(&self.phase);
+                Some(outdated_refusal(
+                    id,
+                    &envelope.client_version,
+                    self.image.boot_path(),
+                ))
+            }
+            VersionVerdict::Mismatch => {
+                // A claimed version restarts nothing: the caller is a
+                // different build and is told so.
+                tracing::debug!(
+                    client_version = %envelope.client_version,
+                    daemon_version = DAEMON_VERSION,
+                    "refused a client of a different build; the binary on disk is unchanged"
+                );
+                Some(version_mismatch_refusal(
+                    id,
+                    &envelope.client_version,
+                    self.image.boot_path(),
+                ))
+            }
+        }
+    }
+
     /// Runs one request through classify → admit → gate → queue/execute
-    /// and answers `reply` with its single [`Response`]. Takes the
+    /// and answers through `guard` with its single [`Response`]. Takes the
     /// pipeline by `Arc` so the approval path can spawn a background
     /// wait for `wait: false` callers.
-    async fn handle(self: Arc<Self>, envelope: Envelope, reply: oneshot::Sender<Response>) {
+    async fn handle(
+        self: Arc<Self>,
+        mut envelope: Envelope,
+        origin: Origin,
+        guard: &mut ReplyGuard,
+    ) {
         if envelope.capability.starts_with(ADMIN_PREFIX) {
             let response = self.admin.handle_from_ingress(&envelope, false).await;
-            let _ = reply.send(response);
+            guard.send(response);
             return;
         }
         let id = envelope.id.clone();
 
-        // Lifecycle gates run before anything is recorded: neither a
-        // drain refusal nor a version-handshake refusal gets a request
-        // row — the retry lands on the next (or new) daemon and is
-        // recorded there.
-        if *self.phase.borrow() != LifecyclePhase::Serving {
-            let _ = reply.send(shutting_down_refusal(&id));
+        if let Some(refusal) = self.lifecycle_refusal(&envelope).await {
+            guard.send(refusal);
             return;
         }
-        if envelope.client_version != DAEMON_VERSION {
-            // The single binary ships client and daemon at the same
-            // version, so a mismatch means the binary on disk was
-            // replaced: the client is the newer build. Answer this
-            // request, then hand over to the new binary.
-            tracing::info!(
-                client_version = %envelope.client_version,
-                daemon_version = DAEMON_VERSION,
-                "client build differs; restarting with the binary on disk"
-            );
-            let _ = reply.send(outdated_refusal(&id, &envelope.client_version));
-            let _ = self.phase.send_if_modified(|current| {
-                if *current == LifecyclePhase::Serving {
-                    *current = LifecyclePhase::Restarting;
-                    true
-                } else {
-                    false
-                }
+
+        let class = classify(&envelope.capability);
+        if envelope.capability == CAP_STATUS {
+            // A snapshot read: no row, no audit, no events, nothing slow
+            // (see the module docs). Answered the same whether or not the
+            // caller asked to wait — there is nothing to hold a ticket for.
+            guard.send(Response::Result {
+                id,
+                outcome: pam_proto::Outcome::Verified,
+                body: self.status.body(&self.store, self.started_at).await,
+                evidence: Vec::new(),
             });
             return;
+        }
+        if class == Some(CapabilityClass::Control) {
+            // A control slot is held for bookkeeping, never for an hour:
+            // the row's own expiry carries the cap, so the bypass deadline
+            // and the reconciler both honour it.
+            let cap = u64::try_from(CONTROL_DEADLINE_CAP.as_millis()).unwrap_or(u64::MAX);
+            envelope.deadline_ms = envelope.deadline_ms.min(cap);
         }
 
         let envelope = match normalize_repository(envelope).await {
             Ok(envelope) => envelope,
             Err(response) => {
-                let _ = reply.send(response);
+                guard.send(response);
                 return;
             }
         };
 
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
-        let Some(class) = classify(&envelope.capability) else {
+        let Some(class) = class else {
             let response = self.refuse_unadmitted(&envelope).await;
-            let _ = reply.send(response);
+            guard.send(response);
             return;
         };
 
         let admitted = match self.queue.admit(&envelope, class).await {
             Ok(admitted) => admitted,
             Err(error) => {
-                let _ = reply.send(Response::Refusal {
-                    id,
-                    cause: error.cause().to_owned(),
-                    detail: error.to_string(),
-                    recovery: error.recovery().to_owned(),
-                });
+                guard.send(queue_refusal(id, &error));
                 return;
             }
         };
@@ -974,101 +1526,154 @@ impl Pipeline {
             AdmitOutcome::Attached {
                 existing_request_id,
             } => {
-                if envelope.wait {
-                    let registration = self.router.register(&existing_request_id).await;
-                    let response = await_registration(registration, envelope.deadline_ms)
-                        .await
-                        .unwrap_or_else(|timed_out| attach_refusal(&id, timed_out));
-                    let _ = reply.send(response);
-                } else {
-                    let _ = reply.send(Response::Ticket {
-                        id,
-                        ticket: existing_request_id,
-                        position: 0,
-                    });
-                }
+                self.answer_attached(&envelope, &existing_request_id, guard)
+                    .await;
             }
             AdmitOutcome::Bypass => {
+                let audience = Audience::of(Some(class));
                 if envelope.wait {
-                    let response = self.execute_bypass(&envelope).await;
-                    let _ = reply.send(response);
+                    let response = self.execute_bypass(&envelope, origin, audience).await;
+                    guard.send(response);
                 } else {
-                    let _ = reply.send(Response::Ticket {
+                    guard.send(Response::Ticket {
                         id: id.clone(),
                         ticket: id,
                         position: 0,
                     });
                     // Result reaches the store and event stream only.
-                    let _ = self.execute_bypass(&envelope).await;
+                    let _ = self.execute_bypass(&envelope, origin, audience).await;
                 }
             }
             AdmitOutcome::Admitted => {
-                let response = self.gate_and_place(&envelope).await;
-                let _ = reply.send(response);
+                let response = Arc::clone(&self)
+                    .gate_and_place(&envelope, Some(&mut *guard))
+                    .await;
+                guard.send(response);
             }
+        }
+    }
+
+    /// Answers a duplicate caller attached to an in-flight request: a
+    /// ticket for `wait: false`, otherwise the original's terminal response
+    /// when it arrives within this caller's own deadline.
+    async fn answer_attached(&self, envelope: &Envelope, existing: &str, guard: &mut ReplyGuard) {
+        let id = &envelope.id;
+        let ticket = || Response::Ticket {
+            id: id.clone(),
+            ticket: existing.to_owned(),
+            position: 0,
+        };
+        if !envelope.wait {
+            guard.send(ticket());
+            return;
+        }
+        let registration = self.router.register(existing).await;
+        // The original may have finished between the dedupe read and this
+        // registration with its answer no longer retained (the router's
+        // retention is bounded). Its terminal state is durable: hand the
+        // caller the ticket to read it with rather than park it on an
+        // answer that already left.
+        if matches!(registration, Registration::Pending(_))
+            && matches!(
+                self.store.request_status_meta(existing).await,
+                Ok(Some(row)) if row.state.is_terminal()
+            )
+        {
+            guard.send(ticket());
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(envelope.deadline_ms);
+        match wait_for_terminal(registration, deadline, Some(&mut *guard)).await {
+            Waited::Answer(response) => guard.send(response),
+            Waited::TimedOut => guard.send(attach_refusal(id, true)),
+            Waited::RouterDropped => guard.send(attach_refusal(id, false)),
+            // Nobody to answer; the original is left alone.
+            Waited::CallerGone => {}
         }
     }
 
     /// The laned path after admission: gate, then place (pausing for an
     /// approval when the gate requires one) and, for waiting callers,
-    /// park on the completion router under the deadline.
-    async fn gate_and_place(self: Arc<Self>, envelope: &Envelope) -> Response {
+    /// park on the completion router under the deadline. Every refusal
+    /// and internal failure here also releases attached duplicates.
+    async fn gate_and_place(
+        self: Arc<Self>,
+        envelope: &Envelope,
+        guard: Option<&mut ReplyGuard>,
+    ) -> Response {
         let id = &envelope.id;
         let Ok(decision) = self.gate.evaluate(id, &envelope.capability).await else {
             // Keep the not-yet-placed row out of the lanes forever.
-            return self.fail_internal(id).await;
+            return self.fail_internal(id, Audience::Laned).await;
         };
         match decision {
             GateDecision::Refuse {
                 cause,
                 detail,
                 recovery,
-            } => self.refuse(id, cause, detail, recovery).await,
-            GateDecision::RequireApproval { reason } => self.approval_pause(envelope, reason).await,
-            GateDecision::Allow { .. } => self.place_and_wait(envelope).await,
+            } => {
+                self.refuse(id, Audience::Laned, cause, detail, recovery)
+                    .await
+            }
+            GateDecision::RequireApproval { reason } => {
+                self.approval_pause(envelope, reason, guard).await
+            }
+            GateDecision::Allow { .. } => self.place_and_wait(envelope, guard).await,
         }
     }
 
     /// Places an allowed (or approved) request on its lane and, for a
     /// waiting caller, parks only until the persisted admission expiry.
     /// Gate, approval and placement time never renew the request clock.
-    async fn place_and_wait(&self, envelope: &Envelope) -> Response {
+    async fn place_and_wait(
+        &self,
+        envelope: &Envelope,
+        guard: Option<&mut ReplyGuard>,
+    ) -> Response {
         let id = &envelope.id;
         let deadline = match self.store.get_request(id).await {
             Ok(Some(row)) => request_deadline(&row),
-            _ => return internal_refusal(id),
+            // The row cannot be read: it still gets its terminal state.
+            _ => return self.fail_internal(id, Audience::Laned).await,
         };
         let Some(deadline) = deadline else {
-            return self.deadline_refusal(envelope).await;
+            return self.deadline_refusal(envelope, Audience::Laned).await;
         };
         // Register before placement so the completion cannot slip
         // between the two.
         let registration = self.router.register(id).await;
         let position = match self.queue.place_in_lane(id, &envelope.caller.repo).await {
             Ok(position) => position,
-            Err(QueueError::Expired) => return self.deadline_refusal(envelope).await,
+            Err(QueueError::Expired) => {
+                return self.deadline_refusal(envelope, Audience::Laned).await;
+            }
             Err(error) => {
-                let response = self
+                return self
                     .refuse(
                         id,
+                        Audience::Laned,
                         error.cause().to_owned(),
                         error.to_string(),
                         error.recovery().to_owned(),
                     )
                     .await;
-                self.router.finish(id, response.clone()).await;
-                return response;
             }
         };
         let _ = self.events.publish(id, Event::Queued).await;
         self.work.notify_one();
         if envelope.wait {
-            match await_registration_until(registration, tokio::time::Instant::from_std(deadline))
-                .await
+            match wait_for_terminal(
+                registration,
+                tokio::time::Instant::from_std(deadline),
+                guard,
+            )
+            .await
             {
-                Ok(response) => response,
-                Err(true) => self.deadline_refusal(envelope).await,
-                Err(false) => internal_refusal(id),
+                Waited::Answer(response) => response,
+                Waited::TimedOut => self.deadline_refusal(envelope, Audience::Laned).await,
+                // Never delivered (nobody is listening); the laned work
+                // continues under its lease and its result stays durable.
+                Waited::RouterDropped | Waited::CallerGone => internal_refusal(id),
             }
         } else {
             Response::Ticket {
@@ -1084,9 +1689,14 @@ impl Pipeline {
     /// refuses (denied, timed out, cancelled). A `wait: false` caller
     /// gets its ticket immediately while the wait runs in a background
     /// task bounded by both admission expiry and the approval timeout.
-    async fn approval_pause(self: Arc<Self>, envelope: &Envelope, reason: String) -> Response {
+    async fn approval_pause(
+        self: Arc<Self>,
+        envelope: &Envelope,
+        reason: String,
+        guard: Option<&mut ReplyGuard>,
+    ) -> Response {
         if envelope.wait {
-            return self.approval_wait_inline(envelope, &reason).await;
+            return self.approval_wait_inline(envelope, &reason, guard).await;
         }
         let ticket = Response::Ticket {
             id: envelope.id.clone(),
@@ -1097,7 +1707,7 @@ impl Pipeline {
         tokio::spawn(async move {
             // A ticket changes how the caller observes the request, not its
             // lifetime. The original admission expiry also bounds approval.
-            let _ = self.approval_wait_inline(&envelope, &reason).await;
+            let _ = self.approval_wait_inline(&envelope, &reason, None).await;
         });
         ticket
     }
@@ -1105,14 +1715,19 @@ impl Pipeline {
     /// Approval pause for both waiting and ticketed requests. The persisted
     /// admission expiry bounds the pause; expiry resolves the approval wait
     /// before recording the durable request timeout.
-    async fn approval_wait_inline(&self, envelope: &Envelope, reason: &str) -> Response {
+    async fn approval_wait_inline(
+        &self,
+        envelope: &Envelope,
+        reason: &str,
+        guard: Option<&mut ReplyGuard>,
+    ) -> Response {
         let id = &envelope.id;
         let deadline = match self.store.get_request(id).await {
             Ok(Some(row)) => request_deadline(&row),
-            _ => return internal_refusal(id),
+            _ => return self.fail_internal(id, Audience::Laned).await,
         };
         let Some(deadline) = deadline else {
-            return self.deadline_refusal(envelope).await;
+            return self.deadline_refusal(envelope, Audience::Laned).await;
         };
         let (cancel_tx, mut cancel) = watch::channel(false);
         let fut = self
@@ -1120,87 +1735,77 @@ impl Pipeline {
             .request_approval(id, &envelope.capability, &mut cancel);
         tokio::pin!(fut);
         tokio::select! {
-            outcome = &mut fut => self.conclude_approval(envelope, reason, outcome).await,
+            outcome = &mut fut => self.conclude_approval(envelope, reason, outcome, guard).await,
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 let _ = cancel_tx.send(true);
                 // Resolve any pending approval so the GUI cannot grant stale work.
                 let _ = fut.await;
-                self.deadline_refusal(envelope).await
+                self.deadline_refusal(envelope, Audience::Laned).await
             }
         }
     }
 
     /// Acts on an approval wait's outcome: approved requests move back
     /// to `queued` and continue under the original admission expiry;
-    /// everything else becomes a terminal refusal (audited
-    /// via [`Self::refuse`], released to attached waiters through the
-    /// router).
+    /// everything else becomes a terminal refusal (audited and released
+    /// to attached waiters through [`Self::refuse`] — they may have
+    /// attached during the long `waiting_approval` window).
     async fn conclude_approval(
         &self,
         envelope: &Envelope,
         reason: &str,
         outcome: Result<ApprovalOutcome, StoreError>,
+        guard: Option<&mut ReplyGuard>,
     ) -> Response {
         let id = &envelope.id;
         let capability = &envelope.capability;
-        match outcome {
-            Ok(ApprovalOutcome::Approved { .. }) => self.place_and_wait(envelope).await,
-            Ok(ApprovalOutcome::Denied) => {
-                self.refuse_approval(
-                    id,
-                    CAUSE_APPROVAL_DENIED,
-                    format!("approval for capability {capability:?} was denied ({reason})"),
-                    RECOVERY_APPROVAL_DENIED,
-                )
-                .await
+        let (cause, detail, recovery) = match outcome {
+            Ok(ApprovalOutcome::Approved { .. }) => {
+                return self.place_and_wait(envelope, guard).await;
             }
-            Ok(ApprovalOutcome::TimedOut) => {
-                self.refuse_approval(
-                    id,
-                    CAUSE_APPROVAL_TIMEOUT,
-                    format!("approval for capability {capability:?} expired unanswered ({reason})"),
-                    RECOVERY_APPROVAL_TIMEOUT,
-                )
-                .await
-            }
-            Ok(ApprovalOutcome::Cancelled) => {
-                self.refuse_approval(
-                    id,
-                    CAUSE_CANCELLED,
-                    format!(
-                        "request was cancelled while waiting for approval \
-                         of capability {capability:?}"
-                    ),
-                    RECOVERY_APPROVAL_CANCELLED,
-                )
-                .await
-            }
-            Err(_) => self.fail_internal(id).await,
-        }
+            Ok(ApprovalOutcome::Denied) => (
+                CAUSE_APPROVAL_DENIED,
+                format!("approval for capability {capability:?} was denied ({reason})"),
+                RECOVERY_APPROVAL_DENIED,
+            ),
+            Ok(ApprovalOutcome::TimedOut) => (
+                CAUSE_APPROVAL_TIMEOUT,
+                format!("approval for capability {capability:?} expired unanswered ({reason})"),
+                RECOVERY_APPROVAL_TIMEOUT,
+            ),
+            Ok(ApprovalOutcome::Cancelled) => (
+                CAUSE_CANCELLED,
+                format!(
+                    "request was cancelled while waiting for approval \
+                     of capability {capability:?}"
+                ),
+                RECOVERY_APPROVAL_CANCELLED,
+            ),
+            Err(_) => return self.fail_internal(id, Audience::Laned).await,
+        };
+        self.refuse(
+            id,
+            Audience::Laned,
+            cause.to_owned(),
+            detail,
+            recovery.to_owned(),
+        )
+        .await
     }
 
-    /// Refuses a request whose approval wait did not end in an approval,
-    /// and releases any attached duplicate callers with the same refusal
-    /// (they may have attached during the long `waiting_approval` window).
-    async fn refuse_approval(
+    /// Executes a bypass request inline, under the envelope's deadline,
+    /// and records its terminal state. A control request publishes no
+    /// lifecycle events (see [`Audience`]).
+    async fn execute_bypass(
         &self,
-        id: &str,
-        cause: &str,
-        detail: String,
-        recovery: &str,
+        envelope: &Envelope,
+        origin: Origin,
+        audience: Audience,
     ) -> Response {
-        let response = self
-            .refuse(id, cause.to_owned(), detail, recovery.to_owned())
-            .await;
-        self.router.finish(id, response.clone()).await;
-        response
-    }
-
-    /// Executes a read-only bypass request inline, under the envelope's
-    /// deadline, and records its terminal state.
-    async fn execute_bypass(&self, envelope: &Envelope) -> Response {
         let id = &envelope.id;
-        let _ = self.events.publish(id, Event::Started).await;
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Started).await;
+        }
         // No lease exists for a bypass; the sender is held so the cancel
         // signal simply never fires. The deadline timeout below dropping
         // the future is the cancellation mechanism on this path.
@@ -1209,23 +1814,36 @@ impl Pipeline {
             return self
                 .fail_bypass(
                     id,
+                    audience,
                     &envelope.capability,
                     "capability classified but not dispatchable",
                 )
                 .await;
         };
         let Ok(Some(row)) = self.store.get_request(id).await else {
-            return internal_refusal(id);
+            // The row cannot be read back: it still gets a terminal state
+            // (retried, then left to the reconciler), never a bare return.
+            return self.fail_internal(id, audience).await;
         };
         let Some(deadline) = request_deadline(&row) else {
-            return self.deadline_refusal(envelope).await;
+            return self.deadline_refusal(envelope, audience).await;
         };
-        let ctx = self.bypass_context(envelope, cancel, deadline).await;
+        let ctx = self
+            .exec_context(
+                envelope.id.clone(),
+                envelope.capability.clone(),
+                envelope.caller.clone(),
+                envelope.args.clone(),
+                cancel,
+                deadline,
+                origin,
+            )
+            .await;
         let ctx = match ctx {
             Ok(ctx) => ctx,
             Err(error) => {
                 return self
-                    .fail_bypass(id, &envelope.capability, &format!("{error:?}"))
+                    .fail_bypass(id, audience, &envelope.capability, &format!("{error:?}"))
                     .await;
             }
         };
@@ -1236,75 +1854,114 @@ impl Pipeline {
         .await
         {
             Ok(Ok(output)) => {
-                let detail = execute_success_detail(&envelope.capability, output.outcome);
-                let _ = self
-                    .store
-                    .finish_request(
-                        id,
-                        RequestState::Done,
-                        Some(outcome_str(output.outcome)),
-                        execute_success_entry(&detail),
-                    )
-                    .await;
-                let _ = self.events.publish(id, Event::Done).await;
-                Response::Result {
-                    id: id.clone(),
-                    outcome: output.outcome,
-                    body: output.body,
-                    evidence: output.evidence,
-                }
-            }
-            Ok(Err(CapabilityFailure::Cancelled)) => self.cancel_bypass(id).await,
-            Ok(Err(CapabilityFailure::Parked { .. })) => {
-                self.fail_bypass(id, &envelope.capability, "only a leased flow can park")
+                self.finish_bypass_done(id, audience, &envelope.capability, output)
                     .await
             }
+            Ok(Err(CapabilityFailure::Cancelled)) => self.cancel_bypass(id, audience).await,
+            Ok(Err(CapabilityFailure::Parked { .. })) => {
+                self.fail_bypass(
+                    id,
+                    audience,
+                    &envelope.capability,
+                    "only a leased flow can park",
+                )
+                .await
+            }
             Ok(Err(CapabilityFailure::Failed { detail })) => {
-                self.fail_bypass(id, &envelope.capability, &detail).await
+                self.fail_bypass(id, audience, &envelope.capability, &detail)
+                    .await
             }
             Ok(Err(CapabilityFailure::Refused {
                 cause,
                 detail,
                 recovery,
             })) => {
-                self.refuse_execution(id, &envelope.capability, cause, detail, recovery)
+                self.refuse_execution(id, audience, &envelope.capability, cause, detail, recovery)
                     .await
             }
             Err(_elapsed) => {
-                let detail = serde_json::json!({ "deadline_ms": envelope.deadline_ms }).to_string();
-                let _ = self
-                    .store
-                    .finish_request(
-                        id,
-                        RequestState::Failed,
-                        Some(CAUSE_DEADLINE_EXCEEDED),
-                        AuditEntry {
-                            action: ACTION_DEADLINE_REFUSAL,
-                            decision: Decision::Timeout,
-                            actor: Actor::System,
-                            detail: Some(&detail),
-                        },
-                    )
-                    .await;
-                let _ = self.events.publish(id, Event::Refused).await;
-                deadline_refusal_response(id, envelope.deadline_ms)
+                self.finish_bypass_deadline(id, audience, envelope.deadline_ms)
+                    .await
             }
         }
     }
 
-    async fn cancel_bypass(&self, id: &str) -> Response {
+    /// The success arm of [`Self::execute_bypass`].
+    async fn finish_bypass_done(
+        &self,
+        id: &str,
+        audience: Audience,
+        capability: &str,
+        output: CapabilityOutput,
+    ) -> Response {
+        let detail = execute_success_detail(capability, output.outcome);
+        let written = self
+            .terminals
+            .finish(
+                id,
+                RequestState::Done,
+                Some(outcome_str(output.outcome)),
+                execute_success_entry(&detail),
+            )
+            .await;
+        if written == Written::Parked {
+            // The audit invariant: nothing is reported as done whose
+            // terminal row is not durable. The verdict is parked and will
+            // be recorded; the caller retries.
+            return unrecorded_refusal(id);
+        }
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Done).await;
+        }
+        Response::Result {
+            id: id.to_owned(),
+            outcome: output.outcome,
+            body: output.body,
+            evidence: output.evidence,
+        }
+    }
+
+    /// The elapsed-deadline arm of [`Self::execute_bypass`].
+    async fn finish_bypass_deadline(
+        &self,
+        id: &str,
+        audience: Audience,
+        deadline_ms: u64,
+    ) -> Response {
+        let detail = serde_json::json!({ "deadline_ms": deadline_ms }).to_string();
+        self.terminals
+            .finish(
+                id,
+                RequestState::Failed,
+                Some(CAUSE_DEADLINE_EXCEEDED),
+                AuditEntry {
+                    action: ACTION_DEADLINE_REFUSAL,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )
+            .await;
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Refused).await;
+        }
+        deadline_refusal_response(id, deadline_ms)
+    }
+
+    async fn cancel_bypass(&self, id: &str, audience: Audience) -> Response {
         // Unreachable without a lease, but handled legibly.
         let detail = cancelled_detail();
-        let _ = self
-            .store
-            .finish_request(
+        self.terminals
+            .finish(
                 id,
                 RequestState::Failed,
                 Some(CAUSE_CANCELLED),
                 cancelled_entry(&detail),
             )
             .await;
-        let _ = self.events.publish(id, Event::Refused).await;
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Refused).await;
+        }
         cancelled_refusal(id)
     }
 
@@ -1320,7 +1977,12 @@ impl Pipeline {
             self.fail_vanished_row(&id).await;
             return;
         };
-        if self.store.grant_revocation_revision().await.ok() != row.authorization_revision {
+        // Scoped: only a revocation of a grant this request depends on voids
+        // it. A store that cannot answer is not permission to run.
+        if !matches!(
+            self.store.request_authorization_current(&id).await,
+            Ok(true)
+        ) {
             self.complete_leased(
                 &id,
                 &row.capability,
@@ -1380,6 +2042,11 @@ impl Pipeline {
                         args,
                         cancel,
                         lease_deadline.into_std(),
+                        // A laned request's origin is not on its row yet
+                        // (it joins the row with the peer identity); the
+                        // only built-in that reads it, `cancel`, is never
+                        // laned.
+                        Origin::Public,
                     )
                     .await;
                 match ctx {
@@ -1448,41 +2115,27 @@ impl Pipeline {
             }
             Err(CapabilityFailure::Cancelled) => {
                 let audit_detail = cancelled_detail();
-                let terminal = self
-                    .queue
-                    .complete(
-                        id,
-                        RequestState::Failed,
-                        Some(CAUSE_CANCELLED),
-                        cancelled_entry(&audit_detail),
-                    )
-                    .await;
-                log_terminal_failure(id, &terminal);
-                if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(id, Event::Refused).await;
-                    self.router.finish(id, cancelled_refusal(id)).await;
-                } else if matches!(terminal, Ok(false)) {
-                    self.finish_reaped(id).await;
-                }
+                self.finish_leased(
+                    id,
+                    RequestState::Failed,
+                    CAUSE_CANCELLED,
+                    cancelled_entry(&audit_detail),
+                    Event::Refused,
+                    cancelled_refusal(id),
+                )
+                .await;
             }
             Err(CapabilityFailure::Failed { detail }) => {
                 let audit_detail = execute_failure_detail(capability, &detail);
-                let terminal = self
-                    .queue
-                    .complete(
-                        id,
-                        RequestState::Failed,
-                        Some(CAUSE_EXECUTION_FAILED),
-                        execute_failure_entry(&audit_detail),
-                    )
-                    .await;
-                log_terminal_failure(id, &terminal);
-                if matches!(terminal, Ok(true)) {
-                    let _ = self.events.publish(id, Event::Refused).await;
-                    self.router.finish(id, failure_refusal(id, detail)).await;
-                } else if matches!(terminal, Ok(false)) {
-                    self.finish_reaped(id).await;
-                }
+                self.finish_leased(
+                    id,
+                    RequestState::Failed,
+                    CAUSE_EXECUTION_FAILED,
+                    execute_failure_entry(&audit_detail),
+                    Event::Refused,
+                    failure_refusal(id, detail),
+                )
+                .await;
             }
             Err(CapabilityFailure::Refused {
                 cause,
@@ -1491,6 +2144,56 @@ impl Pipeline {
             }) => {
                 self.complete_refused_leased(id, capability, cause, detail, recovery)
                     .await;
+            }
+        }
+    }
+
+    /// The one way a leased request ends: the row and its single audit
+    /// entry through the queue (which frees the lane), then the event and
+    /// the waiters' response.
+    ///
+    /// A terminal write the store refuses is retried briefly. If it still
+    /// fails, the lane is given back at once rather than held until the
+    /// lease deadline, the verdict is parked for the maintenance loop to
+    /// record, and the waiters still get the real result — the work
+    /// happened, and telling them `deadline_exceeded` an hour later would
+    /// be false.
+    async fn finish_leased(
+        &self,
+        id: &str,
+        state: RequestState,
+        outcome: &str,
+        audit: AuditEntry<'_>,
+        event: Event,
+        response: Response,
+    ) {
+        let mut terminal = self.queue.complete(id, state, Some(outcome), audit).await;
+        for pause in crate::terminal::RETRY_BACKOFF {
+            if terminal.is_ok() {
+                break;
+            }
+            tokio::time::sleep(pause).await;
+            terminal = self.queue.complete(id, state, Some(outcome), audit).await;
+        }
+        match terminal {
+            Ok(true) => {
+                let _ = self.events.publish(id, event).await;
+                self.router.finish(id, response).await;
+            }
+            // The lease was reaped first: the reaper wrote the terminal
+            // row and audit; release any waiters.
+            Ok(false) => self.finish_reaped(id).await,
+            Err(error) => {
+                tracing::error!(
+                    request = %id,
+                    %error,
+                    "could not record a leased request's terminal state; releasing its lane \
+                     and parking the verdict for retry"
+                );
+                self.terminals.park(id, state, Some(outcome), audit);
+                self.queue.abandon_lease(id).await;
+                let _ = self.events.publish(id, event).await;
+                self.router.finish(id, response).await;
             }
         }
     }
@@ -1504,32 +2207,21 @@ impl Pipeline {
         recovery: String,
     ) {
         let audit_detail = execution_refusal_detail(capability, &cause, &detail);
-        let terminal = self
-            .queue
-            .complete(
-                id,
-                RequestState::Refused,
-                Some(&cause),
-                execution_refusal_entry(&audit_detail),
-            )
-            .await;
-        log_terminal_failure(id, &terminal);
-        if matches!(terminal, Ok(true)) {
-            let _ = self.events.publish(id, Event::Refused).await;
-            self.router
-                .finish(
-                    id,
-                    Response::Refusal {
-                        id: id.to_owned(),
-                        cause,
-                        detail,
-                        recovery,
-                    },
-                )
-                .await;
-        } else if matches!(terminal, Ok(false)) {
-            self.finish_reaped(id).await;
-        }
+        self.finish_leased(
+            id,
+            RequestState::Refused,
+            &cause,
+            execution_refusal_entry(&audit_detail),
+            Event::Refused,
+            Response::Refusal {
+                id: id.to_owned(),
+                retryable: is_transient_cause(&cause),
+                cause: cause.clone(),
+                detail,
+                recovery,
+            },
+        )
+        .await;
     }
 
     async fn complete_parked(&self, id: &str, capability: &str, resume_at_ms: i64) {
@@ -1552,77 +2244,57 @@ impl Pipeline {
     /// The success arm of [`Self::complete_leased`].
     async fn complete_succeeded(&self, id: &str, capability: &str, output: CapabilityOutput) {
         let audit_detail = execute_success_detail(capability, output.outcome);
-        let terminal = self
-            .queue
-            .complete(
-                id,
-                RequestState::Done,
-                Some(outcome_str(output.outcome)),
-                execute_success_entry(&audit_detail),
-            )
-            .await;
-        log_terminal_failure(id, &terminal);
-        if matches!(terminal, Ok(true)) {
-            let _ = self.events.publish(id, Event::Done).await;
-            self.router
-                .finish(
-                    id,
-                    Response::Result {
-                        id: id.to_owned(),
-                        outcome: output.outcome,
-                        body: output.body,
-                        evidence: output.evidence,
-                    },
-                )
-                .await;
-        } else if matches!(terminal, Ok(false)) {
-            // The lease was reaped first: the reaper wrote the terminal
-            // row and audit; release any waiters.
-            self.finish_reaped(id).await;
-        }
+        self.finish_leased(
+            id,
+            RequestState::Done,
+            outcome_str(output.outcome),
+            execute_success_entry(&audit_detail),
+            Event::Done,
+            Response::Result {
+                id: id.to_owned(),
+                outcome: output.outcome,
+                body: output.body,
+                evidence: output.evidence,
+            },
+        )
+        .await;
     }
 
     /// A leased request whose row cannot be read is unanswerable: record
     /// the internal failure (logged if even that fails) and free the lane.
     async fn fail_vanished_row(&self, id: &str) {
         let detail = serde_json::json!({ "cause": "request row missing" }).to_string();
-        let terminal = self
-            .queue
-            .complete(
-                id,
-                RequestState::Failed,
-                Some(CAUSE_INTERNAL_ERROR),
-                internal_failure_entry(&detail),
-            )
-            .await;
-        log_terminal_failure(id, &terminal);
-        if matches!(terminal, Ok(true)) {
-            let _ = self.events.publish(id, Event::Refused).await;
-            self.router.finish(id, internal_refusal(id)).await;
-        } else if matches!(terminal, Ok(false)) {
-            self.finish_reaped(id).await;
-        }
+        self.finish_leased(
+            id,
+            RequestState::Failed,
+            CAUSE_INTERNAL_ERROR,
+            internal_failure_entry(&detail),
+            Event::Refused,
+            internal_refusal(id),
+        )
+        .await;
         self.work.notify_one();
     }
 
-    async fn bypass_context(
-        &self,
-        envelope: &Envelope,
-        cancel: watch::Receiver<bool>,
-        deadline: std::time::Instant,
-    ) -> Result<ExecContext, CapabilityFailure> {
-        self.exec_context(
-            envelope.id.clone(),
-            envelope.capability.clone(),
-            envelope.caller.clone(),
-            envelope.args.clone(),
-            cancel,
-            deadline,
+    /// A capability that panicked mid-lease: the request fails with the
+    /// internal cause and its lane is freed now, not at the lease deadline.
+    async fn fail_panicked_lease(&self, id: &str) {
+        let detail = serde_json::json!({ "cause": "capability panicked" }).to_string();
+        self.finish_leased(
+            id,
+            RequestState::Failed,
+            CAUSE_INTERNAL_ERROR,
+            internal_failure_entry(&detail),
+            Event::Refused,
+            internal_refusal(id),
         )
-        .await
+        .await;
+        self.work.notify_one();
     }
 
     /// Builds the execution context for one request.
+    // One argument per fact the context is born with.
+    #[allow(clippy::too_many_arguments)]
     async fn exec_context(
         &self,
         request_id: String,
@@ -1631,6 +2303,7 @@ impl Pipeline {
         args: serde_json::Value,
         cancel: watch::Receiver<bool>,
         deadline: std::time::Instant,
+        origin: Origin,
     ) -> Result<ExecContext, CapabilityFailure> {
         let budget = crate::request_budget::RequestBudget::load_persistent(
             Arc::clone(&self.store),
@@ -1642,6 +2315,8 @@ impl Pipeline {
             detail: error.to_string(),
         })?;
         Ok(ExecContext {
+            origin,
+            status: Arc::clone(&self.status),
             budget,
             request_id,
             args,
@@ -1682,26 +2357,37 @@ impl Pipeline {
                 cause,
                 detail,
                 recovery,
-            }) => self.refuse(&envelope.id, cause, detail, recovery).await,
+            }) => {
+                self.refuse(&envelope.id, Audience::Bypass, cause, detail, recovery)
+                    .await
+            }
             // classify() said None, so the gate must refuse; anything
-            // else is an internal inconsistency.
-            _ => internal_refusal(&envelope.id),
+            // else is an internal inconsistency — and the row just
+            // inserted still gets its terminal state.
+            _ => self.fail_internal(&envelope.id, Audience::Bypass).await,
         }
     }
 
     /// Marks a request refused — terminal state and gate-refusal audit
-    /// row in one transaction — publishes the `refused` event, and
-    /// builds the refusal response.
-    async fn refuse(&self, id: &str, cause: String, detail: String, recovery: String) -> Response {
+    /// row in one transaction — publishes the `refused` event, releases
+    /// any attached duplicates with the same refusal, and builds the
+    /// refusal response.
+    async fn refuse(
+        &self,
+        id: &str,
+        audience: Audience,
+        cause: String,
+        detail: String,
+        recovery: String,
+    ) -> Response {
         let audit_detail = serde_json::json!({
             "cause": cause,
             "detail": detail,
             "profile": self.gate.profile().as_str(),
         })
         .to_string();
-        let _ = self
-            .store
-            .finish_request(
+        self.terminals
+            .finish(
                 id,
                 RequestState::Refused,
                 Some(&cause),
@@ -1713,45 +2399,57 @@ impl Pipeline {
                 },
             )
             .await;
-        let _ = self.events.publish(id, Event::Refused).await;
-        Response::Refusal {
+        let response = Response::Refusal {
             id: id.to_owned(),
             cause,
             detail,
             recovery,
-        }
+            retryable: false,
+        };
+        self.announce(id, audience, Event::Refused, response.clone())
+            .await;
+        response
     }
 
     /// Terminal handling for a daemon-side bookkeeping failure: fail the
-    /// request with its [`ACTION_INTERNAL_FAILURE`] audit row and answer
-    /// with the internal refusal.
-    async fn fail_internal(&self, id: &str) -> Response {
+    /// request with its [`ACTION_INTERNAL_FAILURE`] audit row, tell
+    /// whoever follows it, and answer with the internal refusal.
+    async fn fail_internal(&self, id: &str, audience: Audience) -> Response {
         let detail = serde_json::json!({ "cause": CAUSE_INTERNAL_ERROR }).to_string();
-        let _ = self
-            .store
-            .finish_request(
+        self.terminals
+            .finish(
                 id,
                 RequestState::Failed,
                 Some(CAUSE_INTERNAL_ERROR),
                 internal_failure_entry(&detail),
             )
             .await;
-        internal_refusal(id)
+        let response = internal_refusal(id);
+        self.announce(id, audience, Event::Refused, response.clone())
+            .await;
+        response
     }
 
     /// Terminal handling for a bypass execution failure.
-    async fn fail_bypass(&self, id: &str, capability: &str, detail: &str) -> Response {
+    async fn fail_bypass(
+        &self,
+        id: &str,
+        audience: Audience,
+        capability: &str,
+        detail: &str,
+    ) -> Response {
         let audit_detail = execute_failure_detail(capability, detail);
-        let _ = self
-            .store
-            .finish_request(
+        self.terminals
+            .finish(
                 id,
                 RequestState::Failed,
                 Some(CAUSE_EXECUTION_FAILED),
                 execute_failure_entry(&audit_detail),
             )
             .await;
-        let _ = self.events.publish(id, Event::Refused).await;
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Refused).await;
+        }
         failure_refusal(id, detail.to_owned())
     }
 
@@ -1763,24 +2461,27 @@ impl Pipeline {
     async fn refuse_execution(
         &self,
         id: &str,
+        audience: Audience,
         capability: &str,
         cause: String,
         detail: String,
         recovery: String,
     ) -> Response {
         let audit_detail = execution_refusal_detail(capability, &cause, &detail);
-        let _ = self
-            .store
-            .finish_request(
+        self.terminals
+            .finish(
                 id,
                 RequestState::Refused,
                 Some(&cause),
                 execution_refusal_entry(&audit_detail),
             )
             .await;
-        let _ = self.events.publish(id, Event::Refused).await;
+        if audience.follows_events() {
+            let _ = self.events.publish(id, Event::Refused).await;
+        }
         Response::Refusal {
             id: id.to_owned(),
+            retryable: is_transient_cause(&cause),
             cause,
             detail,
             recovery,
@@ -1790,19 +2491,21 @@ impl Pipeline {
     /// Tears a deadline-expired request down: the queue records expiry before
     /// signalling the executor; then audit the refusal, notify subscribers,
     /// and answer the caller.
-    async fn deadline_refusal(&self, envelope: &Envelope) -> Response {
+    async fn deadline_refusal(&self, envelope: &Envelope, audience: Audience) -> Response {
         let id = &envelope.id;
         let terminal = self.queue.expire(id).await;
         log_terminal_failure(id, &terminal);
         if terminal.is_err() {
+            // Ownership stays with the queue: the reaper or the
+            // reconciler finishes the row and releases its waiters.
             return internal_refusal(id);
         }
         self.audit_deadline(id, envelope.deadline_ms).await;
-        let _ = self.events.publish(id, Event::Refused).await;
         let response = self
             .preserve_terminal_uncertainty(id, deadline_refusal_response(id, envelope.deadline_ms))
             .await;
-        self.router.finish(id, response.clone()).await;
+        self.announce(id, audience, Event::Refused, response.clone())
+            .await;
         response
     }
 
@@ -1818,6 +2521,7 @@ impl Pipeline {
             .preserve_terminal_uncertainty(
                 id,
                 Response::Refusal {
+                    retryable: true,
                     id: id.to_owned(),
                     cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
                     detail: format!("request {id} exceeded its admitted deadline"),
@@ -1858,6 +2562,7 @@ impl Pipeline {
                         )
                         .await;
                     Response::Refusal {
+                        retryable: true,
                         id: id.to_owned(),
                         cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
                         detail: format!("request {id} exceeded its admitted deadline"),
@@ -1865,6 +2570,7 @@ impl Pipeline {
                     }
                 } else {
                     Response::Refusal {
+                        retryable: false,
                         id: id.to_owned(),
                         cause: outcome,
                         detail: "The request stopped before execution resumed; this does not establish a remote job failure.".to_owned(),
@@ -1881,6 +2587,7 @@ impl Pipeline {
     async fn preserve_terminal_uncertainty(&self, id: &str, fallback: Response) -> Response {
         match self.store.request_status_meta(id).await {
             Ok(Some(row)) if row.outcome.as_deref() == Some("flow_effect_uncertain") => Response::Refusal {
+                retryable: false,
                 id: id.to_owned(),
                 cause: "flow_effect_uncertain".to_owned(),
                 detail: "A state-changing step may have executed without a durable completion receipt.".to_owned(),
@@ -2005,50 +2712,18 @@ fn internal_failure_entry(detail: &str) -> AuditEntry<'_> {
     }
 }
 
-/// Awaits a router registration under `deadline_ms`. `Err(true)` means
-/// the deadline elapsed; `Err(false)` means the router dropped the
-/// waiter without answering (internal failure).
-async fn await_registration(
-    registration: Registration,
-    deadline_ms: u64,
-) -> Result<Response, bool> {
-    await_registration_until(
-        registration,
-        tokio::time::Instant::now() + Duration::from_millis(deadline_ms),
-    )
-    .await
-}
-
-/// Shared wait primitive; original requests use persisted expiry, attached
-/// observers use their own timeout without cancelling the original request.
-pub(crate) async fn await_registration_until(
-    registration: Registration,
-    deadline: tokio::time::Instant,
-) -> Result<Response, bool> {
-    match registration {
-        Registration::Ready(response) => Ok(*response),
-        Registration::Pending(rx) => match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(false),
-            Err(_elapsed) => Err(true),
-        },
-    }
-}
-
 /// The refusal an *attached* caller gets when its own deadline elapses
 /// (`timed_out`) or the router fails. The attached caller has no request
 /// row of its own, so nothing is audited and the in-flight original is
 /// left alone — other callers may still be waiting on it.
 fn attach_refusal(id: &str, timed_out: bool) -> Response {
     if timed_out {
-        Response::Refusal {
-            id: id.to_owned(),
-            cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
-            detail: "the in-flight request this call attached to did not finish \
-                     within the deadline"
-                .to_owned(),
-            recovery: RECOVERY_DEADLINE.to_owned(),
-        }
+        Response::transient_refusal(
+            id,
+            CAUSE_DEADLINE_EXCEEDED,
+            "the in-flight request this call attached to did not finish within the deadline",
+            RECOVERY_DEADLINE,
+        )
     } else {
         internal_refusal(id)
     }
@@ -2056,66 +2731,146 @@ fn attach_refusal(id: &str, timed_out: bool) -> Response {
 
 /// Refusal for a request that arrived while the daemon drains.
 pub(crate) fn shutting_down_refusal(id: &str) -> Response {
-    Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_DAEMON_SHUTTING_DOWN.to_owned(),
-        detail: "the daemon is draining in-flight work before it exits".to_owned(),
-        recovery: RECOVERY_SHUTTING_DOWN.to_owned(),
-    }
+    Response::transient_refusal(
+        id,
+        CAUSE_DAEMON_SHUTTING_DOWN,
+        "the daemon is draining in-flight work before it exits",
+        RECOVERY_SHUTTING_DOWN,
+    )
 }
 
-/// Refusal for the version handshake: the client build is newer than
-/// this daemon, which restarts itself.
-pub(crate) fn outdated_refusal(id: &str, client_version: &str) -> Response {
-    Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_DAEMON_OUTDATED.to_owned(),
-        detail: format!(
+/// Moves a serving daemon to [`LifecyclePhase::Restarting`]; a daemon that
+/// is already draining keeps its phase.
+pub(crate) fn request_restart(phase: &watch::Sender<LifecyclePhase>) {
+    let _ = phase.send_if_modified(|current| {
+        if *current == LifecyclePhase::Serving {
+            *current = LifecyclePhase::Restarting;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// What a refusal says about where the daemon runs from.
+fn image_label(boot_path: Option<&Path>) -> String {
+    boot_path.map_or_else(
+        || "an unknown path".to_owned(),
+        |path| path.display().to_string(),
+    )
+}
+
+/// Refusal for the version handshake when the daemon's binary on disk was
+/// replaced: the daemon restarts itself, and the retry lands on the new one.
+pub(crate) fn outdated_refusal(
+    id: &str,
+    client_version: &str,
+    boot_path: Option<&Path>,
+) -> Response {
+    Response::transient_refusal(
+        id,
+        CAUSE_DAEMON_OUTDATED,
+        format!(
             "client version {client_version} does not match daemon version \
-             {DAEMON_VERSION}; the pam binary was replaced while this daemon ran"
+             {DAEMON_VERSION}; the pam binary at {} was replaced while this daemon ran",
+            image_label(boot_path)
         ),
-        recovery: RECOVERY_OUTDATED.to_owned(),
-    }
+        RECOVERY_OUTDATED,
+    )
+}
+
+/// Refusal for a client of a different build when the daemon's binary on
+/// disk is unchanged: nothing restarts, and sending the same request again
+/// would only repeat (so it is not `retryable`).
+pub(crate) fn version_mismatch_refusal(
+    id: &str,
+    client_version: &str,
+    boot_path: Option<&Path>,
+) -> Response {
+    Response::refusal(
+        id,
+        CAUSE_CLIENT_VERSION_MISMATCH,
+        format!(
+            "client version {client_version} does not match daemon version {DAEMON_VERSION} \
+             running from {}; that binary has not changed on disk, so the daemon keeps running",
+            image_label(boot_path)
+        ),
+        RECOVERY_VERSION_MISMATCH,
+    )
 }
 
 /// Refusal for a daemon-side bookkeeping failure.
 fn internal_refusal(id: &str) -> Response {
+    Response::transient_refusal(
+        id,
+        CAUSE_INTERNAL_ERROR,
+        "the daemon could not record the request",
+        RECOVERY_INTERNAL,
+    )
+}
+
+/// Refusal for a bypass request that ran but whose terminal row the store
+/// would not take: the verdict is parked for retry, and reporting success
+/// without a durable audit row would break the audit invariant.
+fn unrecorded_refusal(id: &str) -> Response {
+    Response::transient_refusal(
+        id,
+        CAUSE_INTERNAL_ERROR,
+        "the request ran but the daemon could not record its outcome yet; \
+         the outcome is queued to be recorded",
+        RECOVERY_INTERNAL,
+    )
+}
+
+/// The refusal for an admission the queue turned down. Capacity, an
+/// elapsed deadline and a store failure are all transient.
+fn queue_refusal(id: String, error: &QueueError) -> Response {
+    let retryable = matches!(
+        error,
+        QueueError::Capacity { .. } | QueueError::Expired | QueueError::Store(_)
+    );
     Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_INTERNAL_ERROR.to_owned(),
-        detail: "the daemon could not record the request".to_owned(),
-        recovery: RECOVERY_INTERNAL.to_owned(),
+        id,
+        cause: error.cause().to_owned(),
+        detail: error.to_string(),
+        recovery: error.recovery().to_owned(),
+        retryable,
     }
+}
+
+/// Whether a cause a capability refused with is transient: the request's
+/// own deadline ran out, or the daemon's blocking pool was full. Everything
+/// else a capability refuses with would only repeat.
+fn is_transient_cause(cause: &str) -> bool {
+    matches!(
+        cause,
+        CAUSE_DEADLINE_EXCEEDED | "blocking_capacity_exhausted"
+    )
 }
 
 /// Refusal for a request that was cancelled.
 fn cancelled_refusal(id: &str) -> Response {
-    Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_CANCELLED.to_owned(),
-        detail: format!("request {id} was cancelled"),
-        recovery: "Re-run the pam command to start a fresh request.".to_owned(),
-    }
+    Response::refusal(
+        id,
+        CAUSE_CANCELLED,
+        format!("request {id} was cancelled"),
+        "Re-run the pam command to start a fresh request.",
+    )
 }
 
 /// Refusal for a capability that ran and failed.
 fn failure_refusal(id: &str, detail: String) -> Response {
-    Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_EXECUTION_FAILED.to_owned(),
-        detail,
-        recovery: RECOVERY_FAILED.to_owned(),
-    }
+    Response::refusal(id, CAUSE_EXECUTION_FAILED, detail, RECOVERY_FAILED)
 }
 
 /// Refusal for an elapsed deadline.
 fn deadline_refusal_response(id: &str, deadline_ms: u64) -> Response {
-    Response::Refusal {
-        id: id.to_owned(),
-        cause: CAUSE_DEADLINE_EXCEEDED.to_owned(),
-        detail: format!("request exceeded its {deadline_ms} ms deadline"),
-        recovery: RECOVERY_DEADLINE.to_owned(),
-    }
+    Response::transient_refusal(
+        id,
+        CAUSE_DEADLINE_EXCEEDED,
+        format!("request exceeded its {deadline_ms} ms deadline"),
+        RECOVERY_DEADLINE,
+    )
 }
 
 /// Translate the original persisted expiry without granting time spent queued.

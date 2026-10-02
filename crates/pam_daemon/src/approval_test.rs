@@ -271,3 +271,301 @@ async fn a_second_resolution_of_the_same_request_is_not_found() {
     .await
     .expect("test within deadline");
 }
+
+fn snapshot(program: &str, argv: &[&str]) -> crate::approval::StepSnapshot {
+    crate::approval::StepSnapshot::new(
+        "flowdigest",
+        "flow.step:ship/push",
+        program.to_owned(),
+        argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        Some("/repo/a".to_owned()),
+        vec!["GIT_ASKPASS".to_owned()],
+    )
+}
+
+/// Spawns a wait that carries a step snapshot.
+fn spawn_step_wait(
+    service: &Arc<ApprovalService>,
+    id: &str,
+    step: crate::approval::StepSnapshot,
+) -> (
+    watch::Sender<bool>,
+    JoinHandle<Result<ApprovalOutcome, StoreError>>,
+) {
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let service = Arc::clone(service);
+    let id = id.to_owned();
+    let handle = tokio::spawn(async move {
+        service
+            .request_approval_with(&id, "flow.step:ship/push", Some(step), &mut cancel_rx)
+            .await
+    });
+    (cancel_tx, handle)
+}
+
+#[test]
+fn the_snapshot_digest_binds_the_flow_the_step_and_every_resolved_field() {
+    let base = snapshot("/usr/bin/git", &["push", "origin", "main"]);
+    assert_eq!(base.digest.len(), 64);
+    assert_eq!(base, snapshot("/usr/bin/git", &["push", "origin", "main"]));
+
+    let different = [
+        snapshot("/opt/evil/git", &["push", "origin", "main"]),
+        snapshot("/usr/bin/git", &["push", "origin", "main", "--force"]),
+        // The same words split differently are different arguments.
+        snapshot("/usr/bin/git", &["push", "origin main"]),
+        crate::approval::StepSnapshot::new(
+            "another-flow-digest",
+            "flow.step:ship/push",
+            base.program.clone(),
+            base.argv.clone(),
+            base.cwd.clone(),
+            base.env_keys.clone(),
+        ),
+        crate::approval::StepSnapshot::new(
+            "flowdigest",
+            "flow.step:ship/other",
+            base.program.clone(),
+            base.argv.clone(),
+            base.cwd.clone(),
+            base.env_keys.clone(),
+        ),
+        crate::approval::StepSnapshot::new(
+            "flowdigest",
+            "flow.step:ship/push",
+            base.program.clone(),
+            base.argv.clone(),
+            Some("/somewhere/else".to_owned()),
+            base.env_keys.clone(),
+        ),
+        crate::approval::StepSnapshot::new(
+            "flowdigest",
+            "flow.step:ship/push",
+            base.program.clone(),
+            base.argv.clone(),
+            base.cwd.clone(),
+            vec!["LD_PRELOAD".to_owned()],
+        ),
+    ];
+    for other in different {
+        assert_ne!(other.digest, base.digest, "{other:?}");
+    }
+
+    // The wire shape the approval card reads.
+    let wire = serde_json::to_value(&base).unwrap();
+    assert_eq!(wire["program"], "/usr/bin/git");
+    assert_eq!(wire["argv"], serde_json::json!(["push", "origin", "main"]));
+    assert_eq!(wire["cwd"], "/repo/a");
+    assert_eq!(wire["env_keys"], serde_json::json!(["GIT_ASKPASS"]));
+    assert_eq!(wire["digest"], base.digest);
+}
+
+/// The card shows what was captured when the wait began, and an answer is
+/// pinned to it: a digest that is not the pending wait's resolves nothing.
+#[tokio::test]
+async fn a_pinned_resolution_must_name_the_snapshot_that_is_pending() {
+    timeout(DEADLINE, async {
+        let (store, service, mut events) = service_with(LONG_TIMEOUT).await;
+        insert_request(&store, "req_pin").await;
+        let step = snapshot("/usr/bin/git", &["push", "origin", "main"]);
+        let (_cancel, wait) = spawn_step_wait(&service, "req_pin", step.clone());
+        expect_pending_event(&mut events, "req_pin").await;
+
+        assert_eq!(service.snapshot("req_pin").await, Some(step.clone()));
+        assert_eq!(service.snapshot("req_other").await, None);
+
+        // The human answered a card showing something else (an earlier
+        // step of this request, or the flow before it was edited).
+        let stale = snapshot("/usr/bin/git", &["status"]);
+        let error = service
+            .resolve_pinned(
+                "req_pin",
+                Resolution::Approve { remember: true },
+                Some(&stale.digest),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApprovalError::Changed { .. }), "{error:?}");
+        // Nothing was resolved, nothing granted, and the wait is intact.
+        assert!(!wait.is_finished());
+        assert!(!store.active_grant("flow.step:ship/push").await.unwrap());
+        let approval = store
+            .approval_for_request("req_pin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, None);
+        assert_eq!(service.snapshot("req_pin").await, Some(step.clone()));
+
+        // The digest of what is actually pending resolves it.
+        service
+            .resolve_pinned(
+                "req_pin",
+                Resolution::Approve { remember: false },
+                Some(&step.digest),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait.await.unwrap().unwrap(),
+            ApprovalOutcome::Approved { remember: false }
+        );
+        // The snapshot lives exactly as long as the wait.
+        assert_eq!(service.snapshot("req_pin").await, None);
+    })
+    .await
+    .unwrap();
+}
+
+/// A wait with no snapshot (a plain capability approval) cannot satisfy a
+/// pinned answer: the pin fails closed rather than being ignored.
+#[tokio::test]
+async fn a_pinned_resolution_of_a_wait_without_a_snapshot_is_refused() {
+    timeout(DEADLINE, async {
+        let (store, service, mut events) = service_with(LONG_TIMEOUT).await;
+        insert_request(&store, "req_plain").await;
+        let (_cancel, wait) = spawn_wait(&service, "req_plain");
+        expect_pending_event(&mut events, "req_plain").await;
+
+        let error = service
+            .resolve_pinned("req_plain", Resolution::Deny, Some("0".repeat(64).as_str()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApprovalError::Changed { .. }), "{error:?}");
+        assert!(!wait.is_finished());
+
+        service
+            .resolve("req_plain", Resolution::Deny)
+            .await
+            .unwrap();
+        assert_eq!(wait.await.unwrap().unwrap(), ApprovalOutcome::Denied);
+    })
+    .await
+    .unwrap();
+}
+
+/// `resolve` used to return as soon as the decision was handed over. It now
+/// returns once the waiter has recorded it, so "approved" is true the
+/// moment the human is told so.
+#[tokio::test]
+async fn resolve_returns_only_once_the_resolution_is_durable() {
+    timeout(DEADLINE, async {
+        let (store, service, mut events) = service_with(LONG_TIMEOUT).await;
+        insert_request(&store, "req_durable").await;
+        let (_cancel, wait) = spawn_wait(&service, "req_durable");
+        expect_pending_event(&mut events, "req_durable").await;
+
+        service
+            .resolve("req_durable", Resolution::Approve { remember: true })
+            .await
+            .unwrap();
+        // No polling: by the time resolve returns, the row, the audit row
+        // and the remembered grant are all there.
+        let approval = store
+            .approval_for_request("req_durable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Approved));
+        assert!(store.active_grant(CAPABILITY).await.unwrap());
+        let audit = store.audit_for_request("req_durable").await.unwrap();
+        assert!(audit.iter().any(|row| row.action == ACTION_APPROVAL));
+        assert!(
+            audit
+                .iter()
+                .any(|row| row.action == ACTION_GRANT_FROM_APPROVAL)
+        );
+        wait.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// The human must not be told "approved" for an approval the daemon did
+/// not record as approved. Here the approval row is resolved behind the
+/// service's back (the state a lost race with the timeout leaves): the
+/// waiter's write fails, and the resolver is told the approval is not
+/// pending instead of being handed a success.
+#[tokio::test]
+async fn a_resolution_the_daemon_could_not_record_is_not_reported_as_delivered() {
+    timeout(DEADLINE, async {
+        let (store, service, mut events) = service_with(LONG_TIMEOUT).await;
+        insert_request(&store, "req_lost").await;
+        let (_cancel, wait) = spawn_wait(&service, "req_lost");
+        expect_pending_event(&mut events, "req_lost").await;
+
+        store
+            .resolve_approval("req_lost", ApprovalResolution::Timeout, None)
+            .await
+            .unwrap();
+
+        let error = service
+            .resolve("req_lost", Resolution::Approve { remember: true })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApprovalError::NotFound { .. }), "{error:?}");
+        // The waiter reports the bookkeeping failure to its own caller...
+        assert!(wait.await.unwrap().is_err());
+        // ...and nothing the human "approved" took effect.
+        assert!(!store.active_grant(CAPABILITY).await.unwrap());
+        let approval = store
+            .approval_for_request("req_lost")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.resolution, Some(ApprovalResolution::Timeout));
+    })
+    .await
+    .unwrap();
+}
+
+/// The approval row and the request's `waiting_approval` state are one
+/// transaction: a request that already finished gets neither.
+#[tokio::test]
+async fn a_finished_request_cannot_be_parked_for_approval() {
+    timeout(DEADLINE, async {
+        let (store, service, _events) = service_with(LONG_TIMEOUT).await;
+        store
+            .insert_running_request("req_done", CAPABILITY, "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+        store
+            .finish_request(
+                "req_done",
+                RequestState::Failed,
+                Some("cancelled"),
+                pam_store::AuditEntry {
+                    action: "cancel",
+                    decision: Decision::Deny,
+                    actor: Actor::System,
+                    detail: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_cancel, mut cancel_rx) = watch::channel(false);
+        let error = service
+            .request_approval("req_done", CAPABILITY, &mut cancel_rx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::AlreadyTerminal { .. }),
+            "{error:?}"
+        );
+        assert!(
+            store
+                .approval_for_request("req_done")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get_request("req_done").await.unwrap().unwrap().state,
+            RequestState::Failed
+        );
+        assert!(service.pending().await.unwrap().is_empty());
+    })
+    .await
+    .unwrap();
+}

@@ -27,9 +27,11 @@
 //!   `failed`/[`CAUSE_LEASE_EXPIRED`], audited ([`ACTION_LEASE_REAPED`], decision `timeout`, actor
 //!   `system`), the holder's cancel signal fires, and the lane is freed.
 //! - **Cancellation**: [`QueueManager::cancel`] serves `pam cancel <ticket>` and the GUI, acting as
-//!   the caller-supplied [`Actor`]: the audit vocabulary has no per-agent identity, so the `cancel`
-//!   capability passes [`Actor::Human`] when the GUI asked (caller agent `pam-gui`) and
-//!   [`Actor::System`] for an agent's `pam cancel`; the drain at shutdown passes [`Actor::System`].
+//!   the caller-supplied [`Actor`]. The actor is decided by where the request entered the daemon,
+//!   never by a label: the `cancel` capability passes [`Actor::Human`] only for a request the
+//!   private admin plane submitted ([`crate::ingress::Origin::Admin`], `admin.requests.cancel`) and
+//!   [`Actor::System`] for every public `cancel`, whatever its `caller.agent` says; the drain at
+//!   shutdown passes [`Actor::System`].
 //!   A queued request is removed from its lane and terminal `failed`/[`CAUSE_CANCELLED`], audited
 //!   ([`ACTION_CANCEL`], `deny`). A running request is signalled cooperatively via the lease's
 //!   cancel signal; its terminal write/audit happen through [`QueueManager::complete`].
@@ -46,6 +48,17 @@
 //! - **Boot**: [`QueueManager::rebuild_from_store`] reloads `queued` rows into lanes, oldest first.
 //!   Crash recovery of `running`/`waiting_approval` rows left by a dead daemon (failed with cause
 //!   `daemon_restart`) happens elsewhere, not here.
+//! - **Stranded rows**: a row can outlive every in-memory owner — a terminal write the store
+//!   refused, a handler that was cut off, a panic. Such a row is `running` with a deadline in the
+//!   past and nothing that will ever finish it. Two things keep it from doing harm: admission
+//!   counts only rows whose deadline is still ahead ([`Store::admission_usage_at`]), so a stranded
+//!   row cannot hold one of the [`MAX_ADMITTED_REQUESTS`] slots; and
+//!   [`QueueManager::reconcile_expired`] (every couple of seconds from the reaper, and once at
+//!   boot) fails every
+//!   in-flight row whose deadline passed more than the reconcile grace ago, with the lease-expiry
+//!   outcome and audit row, drops it from the in-memory index and hands it to the executor loop to
+//!   release its waiters. The grace exists so a handler still writing its own verdict a moment
+//!   past the deadline wins.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -67,6 +80,13 @@ pub const MAX_ADMITTED_REQUESTS: u64 = 128;
 pub const MAX_ADMITTED_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum parked terminal tickets waiting for executor/router notification.
 pub const MAX_PARKED_TERMINALS: usize = 128;
+/// How often the reaper runs the stranded-row sweep.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long past its deadline an in-flight row is left alone before
+/// [`QueueManager::reconcile_expired`] fails it, unless the daemon sets
+/// another ([`QueueManager::with_reconcile_grace`]). It must exceed the
+/// handler grace so a handler that is merely late writes its own verdict.
+pub const DEFAULT_RECONCILE_GRACE: Duration = Duration::from_secs(45);
 
 /// `request.outcome` recorded when a queued request is cancelled.
 pub const CAUSE_CANCELLED: &str = "cancelled";
@@ -230,6 +250,11 @@ pub struct QueueManager {
     store: Arc<Store>,
     inner: Mutex<Inner>,
     work: Notify,
+    /// See [`DEFAULT_RECONCILE_GRACE`].
+    reconcile_grace: Duration,
+    /// Test seam: see `fail_next_completes`.
+    #[cfg(test)]
+    injected_complete_failures: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for QueueManager {
@@ -247,7 +272,18 @@ impl QueueManager {
             store,
             inner: Mutex::new(Inner::default()),
             work: Notify::new(),
+            reconcile_grace: DEFAULT_RECONCILE_GRACE,
+            #[cfg(test)]
+            injected_complete_failures: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Sets how long past its deadline a row is left to its own handler
+    /// before the reconciler fails it (see the module docs).
+    #[must_use]
+    pub fn with_reconcile_grace(mut self, grace: Duration) -> Self {
+        self.reconcile_grace = grace;
+        self
     }
 
     /// Admits `envelope` (classified as `class`) into the queue: dedupe
@@ -272,7 +308,7 @@ impl QueueManager {
         }
         let expires_at_ms =
             now.saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
-        if class != crate::policy::CapabilityClass::ReadOnly {
+        if !class.bypasses_lanes() {
             let existing = self
                 .store
                 .find_admitted_by_shape(
@@ -289,7 +325,9 @@ impl QueueManager {
                 });
             }
         }
-        let (count, bytes) = self.store.admission_usage().await?;
+        // Only admissions whose deadline is still ahead: a row stranded past
+        // its deadline can no longer run and must not hold a slot.
+        let (count, bytes) = self.store.admission_usage_at(now).await?;
         if count >= MAX_ADMITTED_REQUESTS {
             return Err(QueueError::Capacity {
                 cause: "queue_count_limit",
@@ -329,7 +367,7 @@ impl QueueManager {
                 expires_at_ms,
             )
             .await?;
-        Ok(if class == crate::policy::CapabilityClass::ReadOnly {
+        Ok(if class.bypasses_lanes() {
             AdmitOutcome::Bypass
         } else {
             AdmitOutcome::Admitted
@@ -602,6 +640,19 @@ impl QueueManager {
             return Ok(false);
         };
         let repo = lease.repo.clone();
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            if self
+                .injected_complete_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(QueueError::Store(StoreError::AbandonedTransaction));
+            }
+        }
         // A failed terminal write must retain ownership so completion can be
         // retried or reaped; it is not evidence that another writer finished.
         let finished = self
@@ -749,13 +800,102 @@ impl QueueManager {
         Ok(count)
     }
 
+    /// Fails every in-flight row whose admission deadline passed more than
+    /// the reconcile grace before `now_ms` (see the module docs on stranded
+    /// rows): terminal `failed`/[`CAUSE_LEASE_EXPIRED`], one
+    /// [`ACTION_LEASE_REAPED`] audit row each, removed from the lanes, the
+    /// parked set and the leases, and parked for the executor loop to
+    /// release its waiters. Returns how many rows it finished; call again
+    /// while it returns [`pam_store::MAX_EXPIRY_BATCH`].
+    ///
+    /// Bounded by the room left for terminal notices: with none, it does
+    /// nothing this tick rather than finish a row nobody would be told
+    /// about.
+    pub async fn reconcile_expired(&self, now_ms: i64) -> Result<usize, QueueError> {
+        let mut inner = self.inner.lock().await;
+        let room = MAX_PARKED_TERMINALS.saturating_sub(inner.parked_terminals.len());
+        if room == 0 {
+            self.work.notify_one();
+            return Ok(0);
+        }
+        let limit = u32::try_from(room)
+            .unwrap_or(u32::MAX)
+            .min(pam_store::MAX_EXPIRY_BATCH);
+        let grace_ms = i64::try_from(self.reconcile_grace.as_millis()).unwrap_or(i64::MAX);
+        let detail = serde_json::json!({ "cause": "reconciled_past_deadline" }).to_string();
+        let finished = self
+            .store
+            .fail_expired_requests(
+                now_ms.saturating_sub(grace_ms),
+                limit,
+                CAUSE_LEASE_EXPIRED,
+                AuditEntry {
+                    action: ACTION_LEASE_REAPED,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )
+            .await?;
+        let count = finished.len();
+        for id in finished {
+            if let Some(lease) = inner.leases.remove(&id) {
+                inner.busy.remove(&lease.repo);
+                let _ = lease.cancel_tx.send(true);
+            }
+            for lane in inner.lanes.values_mut() {
+                lane.retain(|entry| entry.id != id);
+            }
+            inner.lanes.retain(|_, lane| !lane.is_empty());
+            inner.parked.remove(&id);
+            tracing::warn!(request = %id, "closed an in-flight request stranded past its deadline");
+            inner.parked_terminals.push(id);
+        }
+        if count != 0 {
+            self.work.notify_one();
+        }
+        Ok(count)
+    }
+
+    /// Releases `request_id`'s lease and lane **without** a terminal write:
+    /// the last resort when the store keeps refusing the executor's
+    /// terminal row. The lane is free for the next request at once; the
+    /// row's verdict is the caller's to retry, and the reconciler closes it
+    /// if nothing ever does. Returns whether a lease was held.
+    pub async fn abandon_lease(&self, request_id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        let Some(lease) = inner.leases.remove(request_id) else {
+            return false;
+        };
+        inner.busy.remove(&lease.repo);
+        self.work.notify_one();
+        true
+    }
+
+    /// Holds the queue's mutex for as long as the returned guard lives:
+    /// every queue operation waits behind it. For tests of what the daemon
+    /// does when its bookkeeping is wedged.
+    #[cfg(test)]
+    pub(crate) async fn stall(&self) -> impl Drop + '_ {
+        self.inner.lock().await
+    }
+
+    /// Makes the next `count` [`Self::complete`] calls fail before they
+    /// reach the store, standing in for a store that refuses the write.
+    #[cfg(test)]
+    pub(crate) fn fail_next_completes(&self, count: usize) {
+        self.injected_complete_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Spawns the background reaper: every `interval` until `shutdown`
     /// changes (or its sender drops), reaps expired leases through
-    /// `Self::reap_expired_notifying` and wakes parked watches that are
-    /// due through [`Self::wake_due`].
+    /// `Self::reap_expired_notifying`, wakes parked watches that are due
+    /// through [`Self::wake_due`], and closes stranded rows through
+    /// [`Self::reconcile_expired`].
     ///
-    /// A store failure during one sweep is swallowed and retried on the
-    /// next tick — the daemon's tracing setup (a later task) will log it.
+    /// A store failure during one sweep is logged and retried on the next
+    /// tick.
     pub fn run_reaper(
         self: Arc<Self>,
         interval: Duration,
@@ -764,11 +904,25 @@ impl QueueManager {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // The stranded-row sweep is a backstop measured in tens of
+            // seconds; it does not need the lease reaper's cadence.
+            let reconcile_every = interval.max(RECONCILE_INTERVAL);
+            let mut reconciled_at: Option<Instant> = None;
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = self.reap_expired_notifying(Instant::now()).await;
-                        let _ = self.wake_due(Instant::now(), wall_clock_ms()).await;
+                        if let Err(error) = self.reap_expired_notifying(Instant::now()).await {
+                            tracing::error!(%error, "reaping expired leases failed; retrying next tick");
+                        }
+                        if let Err(error) = self.wake_due(Instant::now(), wall_clock_ms()).await {
+                            tracing::error!(%error, "waking due watches failed; retrying next tick");
+                        }
+                        if reconciled_at.is_none_or(|at| at.elapsed() >= reconcile_every) {
+                            reconciled_at = Some(Instant::now());
+                            if let Err(error) = self.reconcile_expired(wall_clock_ms()).await {
+                                tracing::error!(%error, "closing stranded requests failed; retrying next pass");
+                            }
+                        }
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -789,7 +943,6 @@ impl QueueManager {
         let mut inner = self.inner.lock().await;
         inner.lanes.clear();
         inner.parked.clear();
-        let revision = self.store.grant_revocation_revision().await?;
         let mut restored = 0;
         let mut retained_bytes = 0u64;
         let mut after: Option<(i64, String)> = None;
@@ -821,7 +974,9 @@ impl QueueManager {
                 .saturating_add(row.idempotency_key.as_ref().map_or(0, |v| v.len() as u64));
                 let cause = if !row.queue_authorized || row.expires_at_ms.is_none() {
                     Some("admission_invalid")
-                } else if row.authorization_revision != Some(revision) {
+                } else if !self.store.request_authorization_current(&row.id).await? {
+                    // Scoped: only a revocation of a grant this request
+                    // depends on voids it, and re-granting never restores.
                     Some("authorization_changed")
                 } else if remaining <= 0 {
                     Some(CAUSE_LEASE_EXPIRED)
@@ -877,7 +1032,7 @@ fn clamp_lease(deadline_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms).min(MAX_LEASE)
 }
 
-fn wall_clock_ms() -> i64 {
+pub(crate) fn wall_clock_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

@@ -81,7 +81,7 @@ async fn a_dropped_waiter_does_not_block_the_finish() {
 
 #[tokio::test(start_paused = true)]
 async fn absolute_deadline_wait_does_not_restore_time_spent_before_registration() {
-    use crate::daemon::await_registration_until;
+    use crate::daemon::{Waited, wait_for_terminal};
     use tokio::time::{Instant, advance};
 
     let router = CompletionRouter::new();
@@ -92,8 +92,8 @@ async fn absolute_deadline_wait_does_not_restore_time_spent_before_registration(
     let attached = router.register("absolute_deadline").await;
     let waiting_started = Instant::now();
     assert_eq!(
-        await_registration_until(original, admitted_deadline).await,
-        Err(true)
+        wait_for_terminal(original, admitted_deadline, None).await,
+        Waited::TimedOut
     );
     assert_eq!(Instant::now() - waiting_started, Duration::from_secs(1));
     // The wait primitive only observes: another observer retains its own wait,
@@ -102,10 +102,8 @@ async fn absolute_deadline_wait_does_not_restore_time_spent_before_registration(
         .finish("absolute_deadline", result("absolute_deadline"))
         .await;
     assert_eq!(
-        await_registration_until(attached, Instant::now() + Duration::from_secs(10))
-            .await
-            .unwrap(),
-        result("absolute_deadline")
+        wait_for_terminal(attached, Instant::now() + Duration::from_secs(10), None).await,
+        Waited::Answer(result("absolute_deadline"))
     );
 }
 
@@ -182,4 +180,731 @@ async fn deadline_expires_ticketed_approval_without_placing_or_executing_work() 
         daemon.stop().await;
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// A real daemon, driven through its ingress channel, with its internals in
+// reach. `pam_testkit` links the non-test build of this crate, so its
+// `TestDaemon` cannot hand back this build's `QueueManager` or router; these
+// tests need to stall and inject, so they start the daemon themselves.
+// ---------------------------------------------------------------------------
+
+mod live {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use pam_proto::{Envelope, Outcome, Response};
+    use pam_store::{RequestState, Store};
+    use tokio::sync::{oneshot, watch};
+
+    use crate::daemon::{
+        ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, CANCEL_SLOTS, CAUSE_DEADLINE_EXCEEDED,
+        CAUSE_INTERNAL_ERROR, CAUSE_REQUEST_CAPACITY, CONTROL_SLOTS, DaemonConfig, DaemonHandle,
+        Registration, STATUS_SLOTS, WORK_SLOTS, run_daemon_with,
+    };
+    use crate::ingress::Origin;
+    use crate::secrets::FakeSecretBackend;
+    use crate::transport::IncomingRequest;
+
+    const REPO: &str = "/repo/live";
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    struct Live {
+        handle: DaemonHandle,
+        shutdown: watch::Sender<bool>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl Live {
+        /// A daemon on a fresh private base with `profile` seeded
+        /// explicitly (the platform default differs off macOS), a fake
+        /// keychain, and whatever `mutate` changes.
+        async fn start(profile: &str, mutate: impl FnOnce(&mut DaemonConfig)) -> Self {
+            let tmp = pam_testkit::short_tempdir();
+            let store = pam_testkit::open_store(&tmp).await;
+            store
+                .set_setting(
+                    crate::policy::PROFILE_SETTING_KEY,
+                    &format!("\"{profile}\""),
+                )
+                .await
+                .unwrap();
+            drop(store);
+            let mut config = DaemonConfig {
+                base_dir: Some(pam_testkit::base_of(&tmp)),
+                secret_backend: Some(Arc::new(FakeSecretBackend::default())),
+                ..DaemonConfig::default()
+            };
+            mutate(&mut config);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let handle = tokio::time::timeout(PATIENCE, run_daemon_with(config, shutdown_rx))
+                .await
+                .expect("the daemon starts in time")
+                .expect("the daemon starts");
+            Self {
+                handle,
+                shutdown,
+                _tmp: tmp,
+            }
+        }
+
+        fn store(&self) -> Arc<Store> {
+            self.handle.store()
+        }
+
+        /// Sends one public request straight into the dispatcher.
+        async fn submit(&self, envelope: Envelope) -> oneshot::Receiver<Response> {
+            let (reply, answer) = oneshot::channel();
+            self.handle
+                .admin()
+                .submit
+                .send(IncomingRequest {
+                    identity: Vec::new(),
+                    origin: Origin::Public,
+                    envelope,
+                    reply,
+                })
+                .await
+                .expect("the dispatcher is running");
+            answer
+        }
+
+        async fn ask(&self, envelope: Envelope) -> Response {
+            let answer = self.submit(envelope).await;
+            tokio::time::timeout(PATIENCE, answer)
+                .await
+                .expect("an answer within the test's patience")
+                .expect("the daemon answers every admitted request")
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown.send(true);
+            tokio::time::timeout(Duration::from_secs(30), self.handle.shutdown())
+                .await
+                .expect("the daemon drains");
+        }
+    }
+
+    fn request(id: &str, capability: &str, args: serde_json::Value, wait: bool) -> Envelope {
+        pam_testkit::envelope_for_repo(REPO, id, capability, args, wait)
+    }
+
+    /// Polls `check` until it holds, panicking legibly when it never does.
+    async fn eventually<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while !check().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never happened: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn state_of(store: &Store, id: &str) -> Option<RequestState> {
+        store.get_request(id).await.unwrap().map(|row| row.state)
+    }
+
+    fn refusal(response: &Response) -> (&str, bool) {
+        match response {
+            Response::Refusal {
+                cause, retryable, ..
+            } => (cause.as_str(), *retryable),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// ptrack issue 35, the "never answered" path: only the execution was
+    /// under the deadline, so a handler wedged in its own bookkeeping held
+    /// its slot and its caller for as long as the wedge lasted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wedged_handler_is_cut_off_answered_and_still_gets_its_terminal_row() {
+        let live = Live::start("relaxed", |config| {
+            config.handler_grace = Duration::from_millis(300);
+        })
+        .await;
+        let store = live.store();
+        let queue = live.handle.queue();
+
+        // The lane is busy with a long echo...
+        let ticket = live
+            .ask(request(
+                "wedge_holder",
+                "echo",
+                serde_json::json!({ "delay_ms": 8_000 }),
+                false,
+            ))
+            .await;
+        assert!(matches!(ticket, Response::Ticket { .. }), "{ticket:?}");
+        eventually("the holder is leased", || async {
+            queue
+                .leased_ids()
+                .await
+                .contains(&"wedge_holder".to_owned())
+        })
+        .await;
+
+        // ...and a waiting request with a short deadline queues behind it.
+        let mut waiting = request("wedged", "echo", serde_json::json!({ "n": 2 }), true);
+        waiting.deadline_ms = 500;
+        let answer = live.submit(waiting).await;
+        eventually("the waiter is queued", || async {
+            state_of(&store, "wedged").await == Some(RequestState::Queued)
+        })
+        .await;
+        assert_eq!(live.handle.admission_available().work, WORK_SLOTS - 1);
+
+        // The queue wedges. At its deadline the handler tries to expire
+        // the request through the queue and blocks there.
+        let stall = queue.stall().await;
+        let response = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the caller is answered although the handler is wedged")
+            .unwrap();
+        assert_eq!(refusal(&response), (CAUSE_DEADLINE_EXCEEDED, true));
+
+        // The slot is free and the terminal row is written — both while
+        // the queue is still wedged.
+        eventually("the slot is released", || async {
+            live.handle.admission_available().work == WORK_SLOTS
+        })
+        .await;
+        eventually("the terminal row is written", || async {
+            state_of(&store, "wedged").await == Some(RequestState::Failed)
+        })
+        .await;
+        let row = store.get_request("wedged").await.unwrap().unwrap();
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_DEADLINE_EXCEEDED));
+        let audit = store.audit_for_request("wedged").await.unwrap();
+        assert_eq!(audit.len(), 1, "{audit:?}");
+        assert_eq!(audit[0].action, ACTION_DEADLINE_REFUSAL);
+
+        drop(stall);
+        let _ = queue.cancel("wedge_holder", pam_store::Actor::System).await;
+        live.stop().await;
+    }
+
+    /// A handler that is only parked on someone else's result must not hold
+    /// its slot for a caller that has gone away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_parked_handler_frees_its_slot_when_its_caller_goes_away() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let args = serde_json::json!({ "delay_ms": 6_000, "tag": "shared" });
+
+        let ticket = live
+            .ask(request("gone_original", "echo", args.clone(), false))
+            .await;
+        assert!(matches!(ticket, Response::Ticket { .. }), "{ticket:?}");
+
+        // An identical request attaches and waits for the original.
+        let mut duplicate = request("gone_duplicate", "echo", args, true);
+        duplicate.deadline_ms = 30_000;
+        let answer = live.submit(duplicate).await;
+        eventually("the duplicate is parked", || async {
+            live.handle.admission_available().work == WORK_SLOTS - 1
+        })
+        .await;
+
+        // Its caller disconnects.
+        drop(answer);
+        eventually("the parked handler lets go of its slot", || async {
+            live.handle.admission_available().work == WORK_SLOTS
+        })
+        .await;
+        // The original was left alone and is still in flight.
+        let state = state_of(&store, "gone_original").await.unwrap();
+        assert!(
+            !state.is_terminal(),
+            "the original was disturbed: {state:?}"
+        );
+
+        let _ = live
+            .handle
+            .queue()
+            .cancel("gone_original", pam_store::Actor::System)
+            .await;
+        live.stop().await;
+    }
+
+    /// A poll leaves nothing behind: it used to cost a request row, an
+    /// audit row and a caller-registry write, 86k rows a day from one GUI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_leaves_no_row_no_audit_and_no_caller_entry() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+
+        for index in 0..20 {
+            let id = format!("poll_{index}");
+            let mut envelope = request(&id, "status", serde_json::json!({}), index % 2 == 0);
+            envelope.caller.agent = "poller".to_owned();
+            let response = live.ask(envelope).await;
+            let Response::Result { outcome, body, .. } = &response else {
+                panic!("status answers a result whether or not asked to wait: {response:?}");
+            };
+            assert_eq!(*outcome, Outcome::Verified);
+            assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
+            assert!(body["snapshot"]["stale"].is_boolean(), "{body}");
+            assert_eq!(
+                body["active_requests"], 0,
+                "a poll is not an active request"
+            );
+            assert!(
+                store.get_request(&id).await.unwrap().is_none(),
+                "status wrote a request row"
+            );
+            assert!(store.audit_for_request(&id).await.unwrap().is_empty());
+        }
+        assert!(
+            !store
+                .list_callers()
+                .await
+                .unwrap()
+                .iter()
+                .any(|caller| caller.agent == "poller"),
+            "status wrote to the caller registry"
+        );
+        assert_eq!(store.count_inflight().await.unwrap(), 0);
+        let free = live.handle.admission_available();
+        assert_eq!((free.status, free.control), (STATUS_SLOTS, CONTROL_SLOTS));
+        live.stop().await;
+    }
+
+    /// The other half of issue 35: with every control slot pinned by polls
+    /// stuck behind slow bookkeeping, the daemon refused `status` and
+    /// `cancel` — the remedy its own refusal text recommends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn polls_stuck_behind_wedged_bookkeeping_cannot_starve_status_or_cancel() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let queue = live.handle.queue();
+        let stall = queue.stall().await;
+
+        // Sixteen queries block in admission and hold every control slot.
+        let mut stuck = Vec::new();
+        for index in 0..CONTROL_SLOTS {
+            stuck.push(
+                live.submit(request(
+                    &format!("stuck_{index}"),
+                    "query",
+                    serde_json::json!({ "ticket": "none" }),
+                    true,
+                ))
+                .await,
+            );
+        }
+        eventually("the control pool is exhausted", || async {
+            live.handle.admission_available().control == 0
+        })
+        .await;
+
+        // One more query is refused at once, and says it may be retried.
+        let refused = live
+            .ask(request(
+                "one_too_many",
+                "query",
+                serde_json::json!({ "ticket": "none" }),
+                true,
+            ))
+            .await;
+        assert_eq!(refusal(&refused), (CAUSE_REQUEST_CAPACITY, true));
+
+        // `status` still answers: it has its own slots and waits on nothing.
+        let status = tokio::time::timeout(
+            Duration::from_secs(4),
+            live.submit(request("alive", "status", serde_json::json!({}), true))
+                .await,
+        )
+        .await
+        .expect("status answers while the queue is wedged")
+        .unwrap();
+        assert!(matches!(status, Response::Result { .. }), "{status:?}");
+
+        // `cancel` is admitted from its own headroom instead of refused.
+        let cancel = live
+            .submit(request(
+                "still_cancellable",
+                "cancel",
+                serde_json::json!({ "ticket": "none" }),
+                true,
+            ))
+            .await;
+        eventually("cancel took its reserved slot", || async {
+            live.handle.admission_available().cancel == CANCEL_SLOTS - 1
+        })
+        .await;
+
+        drop(stall);
+        let cancelled = tokio::time::timeout(PATIENCE, cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(cancelled, Response::Result { .. }),
+            "{cancelled:?}"
+        );
+        for answer in stuck {
+            // Each stuck poll is answered (the ticket does not exist).
+            tokio::time::timeout(PATIENCE, answer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        eventually("every slot comes back", || async {
+            let free = live.handle.admission_available();
+            (free.control, free.cancel) == (CONTROL_SLOTS, CANCEL_SLOTS)
+        })
+        .await;
+        live.stop().await;
+    }
+
+    /// A duplicate attached to a request that the gate then refuses used to
+    /// wait out its whole deadline: only approval refusals went through the
+    /// router.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gate_refusal_releases_attached_duplicates_and_leaves_no_router_entry() {
+        // Standard profile, nothing granted: `echo` is refused at the gate.
+        let live = Live::start("standard", |_| {}).await;
+        let router = live.handle.router();
+
+        // An attached duplicate is a waiter registered on the original's id.
+        let Registration::Pending(attached) = router.register("refused_original").await else {
+            panic!("nothing has finished yet");
+        };
+        let response = live
+            .ask(request(
+                "refused_original",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+                true,
+            ))
+            .await;
+        assert_eq!(
+            refusal(&response),
+            (crate::policy::CAUSE_NOT_GRANTED, false)
+        );
+
+        let forwarded = tokio::time::timeout(Duration::from_secs(3), attached)
+            .await
+            .expect("the attached duplicate is released with the refusal")
+            .unwrap();
+        assert_eq!(forwarded, response);
+        assert_eq!(router.usage().await.waiting, 0);
+        live.stop().await;
+    }
+
+    /// `let _ = store.finish_request(..)`: a bypass whose terminal write
+    /// failed used to be answered as done, with no log line, leaving the
+    /// row `running` until the next boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bypass_whose_terminal_write_fails_is_not_reported_done_and_is_recorded_later() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let terminals = Arc::clone(&live.handle.admin().terminals);
+
+        // The store refuses all three attempts of the next terminal write.
+        terminals.fail_next(3);
+        let response = live
+            .ask(request(
+                "unrecorded",
+                "cancel",
+                serde_json::json!({ "ticket": "no_such_ticket" }),
+                true,
+            ))
+            .await;
+        assert_eq!(refusal(&response), (CAUSE_INTERNAL_ERROR, true));
+        assert_eq!(
+            state_of(&store, "unrecorded").await,
+            Some(RequestState::Running)
+        );
+        assert_eq!(terminals.parked_count(), 1);
+
+        // The maintenance loop records the verdict once the store takes it.
+        eventually("the parked verdict is recorded", || async {
+            state_of(&store, "unrecorded").await == Some(RequestState::Done)
+        })
+        .await;
+        assert_eq!(terminals.parked_count(), 0);
+        let audit = store.audit_for_request("unrecorded").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_EXECUTE);
+        live.stop().await;
+    }
+
+    /// A failed terminal write after a successful execution used to strand
+    /// the lane until the lease deadline and turn the real result into
+    /// `deadline_exceeded`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leased_request_whose_terminal_write_fails_frees_its_lane_and_keeps_its_result() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+
+        // Every attempt to complete the first lease fails.
+        live.handle.queue().fail_next_completes(3);
+        let mut first = request(
+            "unrecorded_lease",
+            "echo",
+            serde_json::json!({ "n": 1 }),
+            true,
+        );
+        first.deadline_ms = 30_000;
+        let response = live.ask(first).await;
+        let Response::Result { body, .. } = &response else {
+            panic!("the work ran; its waiter gets the result: {response:?}");
+        };
+        assert_eq!(body["echo"]["n"], 1);
+
+        // The lane is free at once: a second request on the same repo runs
+        // long before the first one's thirty-second lease would expire.
+        let mut second = request("next_on_lane", "echo", serde_json::json!({ "n": 2 }), true);
+        second.deadline_ms = 4_000;
+        let response = live.ask(second).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+
+        // And the first row is recorded as what it was, not as an expiry.
+        eventually("the parked verdict is recorded", || async {
+            state_of(&store, "unrecorded_lease").await == Some(RequestState::Done)
+        })
+        .await;
+        let audit = store.audit_for_request("unrecorded_lease").await.unwrap();
+        assert!(
+            audit.iter().any(|row| row.action == ACTION_EXECUTE),
+            "{audit:?}"
+        );
+        live.stop().await;
+    }
+}
+
+mod cancel_plane {
+    //! Who may cancel what, and who the audit says did it.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
+    use pam_store::{Actor, RequestState, Store};
+    use tokio::sync::{oneshot, watch};
+
+    use crate::admin::{ADMIN_CALLER_AGENT, OP_REQUESTS_CANCEL};
+    use crate::daemon::{DAEMON_VERSION, DaemonConfig, DaemonHandle, run_daemon_with};
+    use crate::ingress::Origin;
+    use crate::queue::CAUSE_CANCELLED;
+    use crate::secrets::FakeSecretBackend;
+    use crate::transport::IncomingRequest;
+
+    fn public(id: &str, repo: &str, capability: &str, args: serde_json::Value) -> Envelope {
+        pam_testkit::envelope_for_repo(repo, id, capability, args, true)
+    }
+
+    /// Sends one public request into the dispatcher and awaits its answer.
+    async fn ask(handle: &DaemonHandle, envelope: Envelope) -> Response {
+        let (reply, answer) = oneshot::channel();
+        handle
+            .admin()
+            .submit
+            .send(IncomingRequest {
+                identity: Vec::new(),
+                origin: Origin::Public,
+                envelope,
+                reply,
+            })
+            .await
+            .unwrap();
+        answer.await.unwrap()
+    }
+
+    /// The GUI's cancel, as it arrives on the private plane.
+    fn human_cancel(ticket: &str) -> Envelope {
+        Envelope {
+            v: PROTOCOL_VERSION,
+            id: "human_cancel".to_owned(),
+            capability: OP_REQUESTS_CANCEL.to_owned(),
+            client_version: DAEMON_VERSION.to_owned(),
+            caller: Caller {
+                agent: ADMIN_CALLER_AGENT.to_owned(),
+                repo: "gui".to_owned(),
+                pid: std::process::id(),
+            },
+            args: serde_json::json!({ "ticket": ticket }),
+            idempotency_key: None,
+            deadline_ms: 10_000,
+            wait: true,
+        }
+    }
+
+    async fn terminal_row(store: &Store, id: &str) -> pam_store::RequestRow {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = store.get_request(id).await.unwrap().unwrap();
+            if row.state.is_terminal() {
+                return row;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{id} never ended");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_public_cancel_is_bound_to_its_repository_and_the_admin_cancel_is_the_humans() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let tmp = pam_testkit::short_tempdir();
+            pam_testkit::seed_relaxed(&tmp).await;
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let handle = run_daemon_with(
+                DaemonConfig {
+                    base_dir: Some(pam_testkit::base_of(&tmp)),
+                    secret_backend: Some(Arc::new(FakeSecretBackend::default())),
+                    ..DaemonConfig::default()
+                },
+                shutdown_rx,
+            )
+            .await
+            .unwrap();
+            let store = handle.store();
+
+            // The victim's long-running request, under its own repository.
+            let mut victim = public(
+                "victim_run",
+                "/repo/victim",
+                "echo",
+                serde_json::json!({ "delay_ms": 20_000 }),
+            );
+            victim.wait = false;
+            assert!(matches!(
+                ask(&handle, victim).await,
+                Response::Ticket { .. }
+            ));
+
+            // Another repository learns the id from the public event socket
+            // and tries to cancel it, calling itself the GUI for good measure.
+            let mut forged = public(
+                "forged_cancel",
+                "/repo/attacker",
+                "cancel",
+                serde_json::json!({ "ticket": "victim_run" }),
+            );
+            forged.caller.agent = ADMIN_CALLER_AGENT.to_owned();
+            let Response::Result { outcome, body, .. } = ask(&handle, forged).await else {
+                panic!("cancel answers a result");
+            };
+            assert_eq!(outcome, Outcome::Unresolved);
+            assert_eq!(body["result"], "not_found");
+            let row = store.get_request("victim_run").await.unwrap().unwrap();
+            assert!(
+                !row.state.is_terminal(),
+                "a foreign cancel reached the ticket"
+            );
+            // The forged request is on record as a system-audited request
+            // that changed nothing: the label made nobody a human.
+            let forged_audit = store.audit_for_request("forged_cancel").await.unwrap();
+            assert_eq!(forged_audit.len(), 1);
+            assert_eq!(forged_audit[0].actor, Actor::System);
+
+            // The human cancels it from the GUI, over the private plane.
+            let response = handle.admin().handle(&human_cancel("victim_run")).await;
+            let Response::Result { body, .. } = &response else {
+                panic!("the admin cancel answers a result: {response:?}");
+            };
+            assert_eq!(body["ticket"], "victim_run");
+            assert!(
+                body["result"] == "signalled_running" || body["result"] == "cancelled_queued",
+                "{body}"
+            );
+
+            // The ticket ends cancelled, and the admin op is the human's.
+            let row = terminal_row(&store, "victim_run").await;
+            assert_eq!(row.state, RequestState::Failed);
+            assert_eq!(row.outcome.as_deref(), Some(CAUSE_CANCELLED));
+            let human = store.audit_for_request("human_cancel").await.unwrap();
+            assert_eq!(human.len(), 1);
+            assert_eq!(human[0].actor, Actor::Human);
+
+            let _ = shutdown.send(true);
+            handle.shutdown().await;
+        })
+        .await
+        .expect("test within deadline");
+    }
+}
+
+mod reply_guard {
+    use std::sync::Arc;
+
+    use pam_proto::Response;
+    use tokio::sync::{Semaphore, oneshot, watch};
+
+    use crate::daemon::{CAUSE_DAEMON_SHUTTING_DOWN, CAUSE_INTERNAL_ERROR, ReplyGuard};
+    use crate::lifecycle::LifecyclePhase;
+
+    fn guard(
+        slots: &Arc<Semaphore>,
+        phase: LifecyclePhase,
+    ) -> (ReplyGuard, oneshot::Receiver<Response>) {
+        let (reply, answer) = oneshot::channel();
+        let (phase, _) = watch::channel(phase);
+        let permit = Arc::clone(slots).try_acquire_owned().unwrap();
+        (
+            ReplyGuard::new("req_guard".to_owned(), reply, phase.subscribe(), permit),
+            answer,
+        )
+    }
+
+    /// A handler that ends without answering — a panic, an abort, a bug —
+    /// used to leave its caller waiting and, on the transport side, its
+    /// permit held. The guard answers and releases on drop.
+    #[test]
+    fn dropping_an_unanswered_guard_answers_the_caller_and_frees_the_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (guard, mut answer) = guard(&slots, LifecyclePhase::Serving);
+        assert_eq!(slots.available_permits(), 0);
+        drop(guard);
+        assert_eq!(slots.available_permits(), 1);
+        let Response::Refusal {
+            id,
+            cause,
+            retryable,
+            ..
+        } = answer.try_recv().expect("the caller is answered")
+        else {
+            panic!("a refusal");
+        };
+        assert_eq!(id, "req_guard");
+        assert_eq!(cause, CAUSE_INTERNAL_ERROR);
+        assert!(retryable);
+    }
+
+    #[test]
+    fn a_guard_dropped_while_draining_says_the_daemon_is_shutting_down() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (guard, mut answer) = guard(&slots, LifecyclePhase::Draining);
+        drop(guard);
+        let Response::Refusal { cause, .. } = answer.try_recv().unwrap() else {
+            panic!("a refusal");
+        };
+        assert_eq!(cause, CAUSE_DAEMON_SHUTTING_DOWN);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn only_the_first_answer_is_sent_and_a_closed_caller_still_frees_the_slot() {
+        let slots = Arc::new(Semaphore::new(2));
+        let (mut answered, mut answer) = guard(&slots, LifecyclePhase::Serving);
+        answered.send(Response::refusal("req_guard", "first", "d", "r"));
+        answered.send(Response::refusal("req_guard", "second", "d", "r"));
+        drop(answered);
+        let Response::Refusal { cause, .. } = answer.try_recv().unwrap() else {
+            panic!("a refusal");
+        };
+        assert_eq!(cause, "first");
+
+        // The caller hung up before any answer: nothing to send, and the
+        // slot is released all the same.
+        let (unheard, answer) = guard(&slots, LifecyclePhase::Serving);
+        drop(answer);
+        drop(unheard);
+        assert_eq!(slots.available_permits(), 2);
+    }
 }

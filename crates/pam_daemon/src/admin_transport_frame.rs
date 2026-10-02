@@ -4,6 +4,7 @@
 //! the owner-only nonce handshake on Windows); nothing here trusts the envelope.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::{Envelope, Response};
@@ -11,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::admin::AdminService;
+use crate::image::{ImageWatch, VersionVerdict};
 use crate::lifecycle::LifecyclePhase;
 
 /// Largest request frame an adapter reads.
@@ -26,29 +28,94 @@ pub(super) const MAX_CONNECTIONS: usize = 32;
 /// How long shutdown waits for in-flight admin connections.
 pub(super) const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Answers one already-admitted envelope: shutting-down and outdated-client
-/// refusals first, then the operation itself, owned through terminal persistence
-/// so a disconnected client cannot turn it into detached work.
+/// What the lifecycle branching around an admin request reads and may move:
+/// the daemon's phase, and the boot image behind the restart policy.
+#[derive(Clone)]
+pub(super) struct AdminLifecycle {
+    pub(super) phase: watch::Sender<LifecyclePhase>,
+    pub(super) image: Arc<ImageWatch>,
+}
+
+/// Answers one already-admitted envelope: the shutting-down refusal and the
+/// version handshake first, then the operation itself, owned through terminal
+/// persistence so a disconnected client cannot turn it into detached work.
+///
+/// The version rule is the public plane's (see [`crate::image`]): a differing
+/// `client_version` restarts the daemon only when its binary on disk was
+/// replaced; otherwise the client is refused and the phase does not move. The
+/// private plane authenticates its peer, but a stale GUI is still not a reason
+/// to drain running work.
 pub(super) async fn answer(
     envelope: &Envelope,
     admin: &AdminService,
-    phase: &watch::Sender<LifecyclePhase>,
+    lifecycle: &AdminLifecycle,
 ) -> Response {
-    if *phase.borrow() != LifecyclePhase::Serving {
+    if *lifecycle.phase.borrow() != LifecyclePhase::Serving {
         return crate::daemon::shutting_down_refusal(&envelope.id);
     }
-    if envelope.client_version != crate::daemon::DAEMON_VERSION {
-        phase.send_if_modified(|current| {
-            if *current == LifecyclePhase::Serving {
-                *current = LifecyclePhase::Restarting;
-                true
-            } else {
-                false
-            }
-        });
-        return crate::daemon::outdated_refusal(&envelope.id, &envelope.client_version);
+    match lifecycle
+        .image
+        .verdict(&envelope.client_version, crate::daemon::DAEMON_VERSION)
+        .await
+    {
+        VersionVerdict::Match => admin.handle(envelope).await,
+        VersionVerdict::Restart => {
+            crate::daemon::request_restart(&lifecycle.phase);
+            crate::daemon::outdated_refusal(
+                &envelope.id,
+                &envelope.client_version,
+                lifecycle.image.boot_path(),
+            )
+        }
+        VersionVerdict::Mismatch => crate::daemon::version_mismatch_refusal(
+            &envelope.id,
+            &envelope.client_version,
+            lifecycle.image.boot_path(),
+        ),
     }
-    admin.handle(envelope).await
+}
+
+/// Paces an accept loop through errors so it never ends on one.
+///
+/// A listener that stops accepting takes the whole private plane with it — the
+/// GUI loses approvals, grants and every other admin op while the daemon keeps
+/// serving public traffic, with nothing in the log. So accept errors are logged
+/// and retried: a peer that vanished mid-handshake (`ConnectionAborted`) or a
+/// signal (`Interrupted`) at once, anything else — descriptor or memory
+/// exhaustion, or an error this code does not know — after a pause that starts
+/// at [`Self::FIRST`] and doubles to [`Self::MAX`], so a persistent condition
+/// neither spins a core nor floods the log.
+#[derive(Debug)]
+pub(super) struct AcceptBackoff {
+    next: Duration,
+}
+
+impl AcceptBackoff {
+    /// The first pause after a resource error.
+    pub(super) const FIRST: Duration = Duration::from_millis(10);
+    /// The longest pause.
+    pub(super) const MAX: Duration = Duration::from_secs(1);
+
+    pub(super) fn new() -> Self {
+        Self { next: Self::FIRST }
+    }
+
+    /// An accept succeeded: the next error starts from the first pause.
+    pub(super) fn reset(&mut self) {
+        self.next = Self::FIRST;
+    }
+
+    /// How long to wait before accepting again after `error`.
+    pub(super) fn after(&mut self, error: &io::Error) -> Duration {
+        match error.kind() {
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted => Duration::ZERO,
+            _ => {
+                let pause = self.next;
+                self.next = (self.next * 2).min(Self::MAX);
+                pause
+            }
+        }
+    }
 }
 
 /// Reads the request frame, answers it, writes the reply: the shared body of every
@@ -56,14 +123,14 @@ pub(super) async fn answer(
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     admin: &AdminService,
-    phase: &watch::Sender<LifecyclePhase>,
+    lifecycle: &AdminLifecycle,
 ) -> io::Result<()> {
     let payload = tokio::time::timeout(HEADER_TIMEOUT, read_frame(stream, MAX_REQUEST_BYTES))
         .await
         .map_err(|_| timed_out())??;
     let envelope: Envelope = serde_json::from_slice(&payload).map_err(invalid)?;
     validate_envelope(&envelope)?;
-    let response = answer(&envelope, admin, phase).await;
+    let response = answer(&envelope, admin, lifecycle).await;
     let encoded = encode_reply(&envelope.id, &response)?;
     tokio::time::timeout(
         HEADER_TIMEOUT,
@@ -86,6 +153,7 @@ pub(super) fn encode_reply(request_id: &str, response: &Response) -> io::Result<
         return Ok(encoded);
     }
     let refusal = Response::Refusal {
+        retryable: false,
         id: request_id.to_owned(),
         cause: CAUSE_RESPONSE_TOO_LARGE.to_owned(),
         detail: format!(

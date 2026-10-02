@@ -5,8 +5,8 @@ use pam_store::{Actor, Decision, Store};
 use tokio::time::timeout;
 
 use crate::policy::{
-    CAUSE_NOT_GRANTED, CAUSE_UNKNOWN_CAPABILITY, CapabilityClass, GateDecision,
-    PROFILE_SETTING_KEY, PolicyError, PolicyGate, Profile, classify,
+    AdmissionPool, CAUSE_NOT_GRANTED, CAUSE_UNKNOWN_CAPABILITY, CapabilityClass, GateDecision,
+    PROFILE_SETTING_KEY, PolicyError, PolicyGate, Profile, admission_pool, classify,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -57,11 +57,114 @@ fn profile_round_trips_through_json() {
 
 #[test]
 fn known_capabilities_classify() {
-    assert_eq!(classify("status"), Some(CapabilityClass::ReadOnly));
-    assert_eq!(classify("cancel"), Some(CapabilityClass::ReadOnly));
-    assert_eq!(classify("query"), Some(CapabilityClass::ReadOnly));
+    assert_eq!(classify("status"), Some(CapabilityClass::Control));
+    assert_eq!(classify("cancel"), Some(CapabilityClass::Control));
+    assert_eq!(classify("query"), Some(CapabilityClass::Control));
+    assert_eq!(classify("flow.list"), Some(CapabilityClass::ReadOnly));
     assert_eq!(classify("echo"), Some(CapabilityClass::NonDestructive));
     assert_eq!(classify("frobnicate"), None);
+}
+
+#[test]
+fn the_admission_pool_comes_from_the_class_and_cancel_has_its_own() {
+    // The liveness answer has slots nothing else can take.
+    assert_eq!(admission_pool("status"), AdmissionPool::Status);
+    assert_eq!(admission_pool("query"), AdmissionPool::Control);
+    // The remedy for a saturated daemon never shares a pool with polls.
+    assert_eq!(admission_pool("cancel"), AdmissionPool::Cancel);
+    // Read-only work is still work: it does real reads and must not be
+    // able to spend the reserved control slots.
+    assert_eq!(admission_pool("flow.list"), AdmissionPool::Work);
+    assert_eq!(admission_pool("evidence.read"), AdmissionPool::Work);
+    assert_eq!(admission_pool("echo"), AdmissionPool::Work);
+    // Neither can a name the registry does not know, nor an admin op.
+    assert_eq!(admission_pool("statusx"), AdmissionPool::Work);
+    assert_eq!(admission_pool("admin.grants.list"), AdmissionPool::Work);
+    assert!(CapabilityClass::Control.bypasses_lanes());
+    assert!(CapabilityClass::ReadOnly.bypasses_lanes());
+    assert!(!CapabilityClass::NonDestructive.bypasses_lanes());
+}
+
+#[tokio::test]
+async fn control_is_allowed_under_every_profile_without_a_grant() {
+    timeout(DEADLINE, async {
+        for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
+            let store = fresh_store().await;
+            let gate = gate_with(&store, profile).await;
+            for capability in ["status", "query", "cancel"] {
+                assert_eq!(
+                    gate.evaluate("req_1", capability).await.unwrap(),
+                    GateDecision::Allow {
+                        auto_granted: false
+                    }
+                );
+                assert!(!store.active_grant(capability).await.unwrap());
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn set_profile_governs_the_next_evaluation_and_persists() {
+    timeout(DEADLINE, async {
+        let store = fresh_store().await;
+        let gate = gate_with(&store, Profile::Relaxed).await;
+        // Relaxed: first use of a non-destructive capability is auto-granted.
+        assert_eq!(
+            gate.evaluate("req_1", "echo").await.unwrap(),
+            GateDecision::Allow { auto_granted: true }
+        );
+
+        let previous = gate.set_profile(Profile::Strict).await.unwrap();
+        assert_eq!(previous, Profile::Relaxed);
+        // The live gate and the stored setting agree at once: there is no
+        // second source that still says relaxed.
+        assert_eq!(gate.profile(), Profile::Strict);
+        assert_eq!(
+            store
+                .get_setting(PROFILE_SETTING_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("\"strict\"")
+        );
+        // Without the swap the same gate would still allow this outright.
+        assert!(matches!(
+            gate.evaluate("req_1", "echo").await.unwrap(),
+            GateDecision::RequireApproval { .. }
+        ));
+        // And a gate built after a restart reads the same profile.
+        let rebuilt = PolicyGate::new(Arc::clone(&store)).await.unwrap();
+        assert_eq!(rebuilt.profile(), Profile::Strict);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_auto_grant_without_its_request_row_writes_neither_grant_nor_audit() {
+    timeout(DEADLINE, async {
+        let store = fresh_store().await;
+        let gate = gate_with(&store, Profile::Relaxed).await;
+        // The audit row's parent is missing, so the audit insert fails. The
+        // grant must roll back with it: no grant nobody audited.
+        let error = gate
+            .evaluate("req_missing", "echo")
+            .await
+            .expect_err("the audit row has no parent request");
+        assert!(!matches!(
+            error,
+            pam_store::StoreError::AlreadyTerminal { .. }
+        ));
+        assert!(
+            !store.active_grant("echo").await.unwrap(),
+            "a grant survived although its audit row could not be written"
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

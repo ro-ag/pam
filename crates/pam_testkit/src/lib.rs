@@ -53,13 +53,21 @@ const SUB_SETTLE: Duration = Duration::from_millis(300);
 pub const TEST_REPO: &str = "/repo/test";
 
 /// Bounds `fut` by [`TEST_DEADLINE`], panicking legibly on a hang.
-pub async fn with_deadline<F: Future>(fut: F) -> F::Output {
-    (tokio::time::timeout(TEST_DEADLINE, fut).await).unwrap_or_else(|_| {
-        panic!(
-            "await exceeded the {TEST_DEADLINE:?} wall deadline — a hang, \
-             not runner load (the budget tolerates loaded runners)"
-        )
-    })
+///
+/// The future is boxed here, once: a test body that spawns a daemon and
+/// drives a client is tens of kilobytes of state machine, and every caller
+/// would otherwise carry it inline in its own future (and trip
+/// `clippy::large_futures` at each call site).
+pub fn with_deadline<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    let fut = Box::pin(fut);
+    async move {
+        (tokio::time::timeout(TEST_DEADLINE, fut).await).unwrap_or_else(|_| {
+            panic!(
+                "await exceeded the {TEST_DEADLINE:?} wall deadline — a hang, \
+                 not runner load (the budget tolerates loaded runners)"
+            )
+        })
+    }
 }
 
 /// Temp dir with a short absolute path: macOS caps unix socket paths at

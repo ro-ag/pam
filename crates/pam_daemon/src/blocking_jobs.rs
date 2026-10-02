@@ -18,6 +18,9 @@ static JOBS: LazyLock<Arc<BlockingJobs>> = LazyLock::new(|| BlockingJobs::new(CA
 pub(crate) enum Kind {
     Keychain,
     ModelFilesystem,
+    /// Hashing a model file end to end (a multi-GB read): its own lane, so a verify never
+    /// holds up the registry scans every summary's model resolve runs on `ModelFilesystem`.
+    ModelHash,
     LogCompaction,
     AgentDetection,
     RepositoryIdentity,
@@ -88,6 +91,7 @@ pub(crate) struct BlockingJobs {
     admissions: Arc<Semaphore>,
     keychain: Arc<tokio::sync::Mutex<()>>,
     models: Arc<tokio::sync::Mutex<()>>,
+    model_hash: Arc<tokio::sync::Mutex<()>>,
     records: Mutex<Records>,
 }
 
@@ -99,6 +103,7 @@ impl BlockingJobs {
             admissions: Arc::new(Semaphore::new(ADMISSION_CAPACITY)),
             keychain: Arc::new(tokio::sync::Mutex::new(())),
             models: Arc::new(tokio::sync::Mutex::new(())),
+            model_hash: Arc::new(tokio::sync::Mutex::new(())),
             records: Mutex::new(Records::default()),
         })
     }
@@ -150,6 +155,7 @@ impl BlockingJobs {
         let lane = match kind {
             Kind::Keychain => Some(Arc::clone(&self.keychain).lock_owned().await),
             Kind::ModelFilesystem => Some(Arc::clone(&self.models).lock_owned().await),
+            Kind::ModelHash => Some(Arc::clone(&self.model_hash).lock_owned().await),
             Kind::LogCompaction | Kind::AgentDetection | Kind::RepositoryIdentity => None,
         };
         let execution = Arc::clone(&self.permits)

@@ -75,6 +75,11 @@ impl Fixture {
         cancel: watch::Receiver<bool>,
     ) -> ExecContext {
         ExecContext {
+            origin: crate::ingress::Origin::Public,
+            status: crate::status_cache::StatusCache::new(
+                Arc::clone(&self.models),
+                Arc::clone(&self.secrets),
+            ),
             budget: crate::request_budget::RequestBudget::new(
                 std::time::Instant::now() + std::time::Duration::from_hours(1),
             ),
@@ -169,6 +174,8 @@ async fn status_reports_versions_uptime_and_inflight_count() {
             .unwrap();
 
         let ctx = fx.ctx_uncancelled("req_status", serde_json::json!({}));
+        // The daemon's background task does this; a bare context has none.
+        ctx.status.refresh().await;
         let output = BuiltinCapability::Status.execute(ctx).await.unwrap();
 
         assert_eq!(output.outcome, Outcome::Verified);
@@ -176,6 +183,8 @@ async fn status_reports_versions_uptime_and_inflight_count() {
         assert_eq!(output.body["protocol"], PROTOCOL_VERSION);
         assert_eq!(output.body["active_requests"], 1);
         assert!(output.body["uptime_s"].is_u64());
+        assert_eq!(output.body["snapshot"]["stale"], false);
+        assert_eq!(output.body["keyring"]["state"], "reachable");
         assert!(output.evidence.is_empty());
     })
     .await
@@ -374,7 +383,10 @@ async fn cancel_of_a_queued_request_releases_waiters_and_tells_subscribers() {
             panic!("target must still be pending");
         };
 
-        let ctx = fx.ctx_uncancelled("req_cancel", serde_json::json!({ "ticket": "req_target" }));
+        let mut ctx =
+            fx.ctx_uncancelled("req_cancel", serde_json::json!({ "ticket": "req_target" }));
+        // The canceller is the ticket's own repository.
+        ctx.caller.repo.clone_from(&target.caller.repo);
         let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
         assert_eq!(output.outcome, Outcome::Solved);
         assert_eq!(output.body["result"], "cancelled_queued");
@@ -404,38 +416,173 @@ async fn cancel_of_a_queued_request_releases_waiters_and_tells_subscribers() {
     .expect("test within deadline");
 }
 
-/// The audit actor names who asked, as far as the vocabulary allows: a
-/// cancel the GUI sent (caller agent `pam-gui`) is a human's decision, an
-/// agent's `pam cancel` is the daemon acting for it.
+/// A queued `echo` under `/repo/a`, the repo [`envelope`] names.
+async fn queued_target(fx: &Fixture, id: &str) -> Envelope {
+    let target = envelope(id, serde_json::json!({ "n": 1 }));
+    assert_eq!(
+        fx.queue
+            .admit(&target, CapabilityClass::NonDestructive)
+            .await
+            .unwrap(),
+        AdmitOutcome::Admitted
+    );
+    fx.queue
+        .place_in_lane(&target.id, &target.caller.repo)
+        .await
+        .unwrap();
+    target
+}
+
+/// The audit actor is decided by where the request entered the daemon. A
+/// public `cancel` that calls itself the GUI used to be recorded as a
+/// human's decision; the label now changes nothing.
 #[tokio::test]
-async fn cancel_from_the_gui_audits_a_human_actor() {
+async fn a_public_cancel_is_audited_as_system_whatever_label_it_carries() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        let target = envelope("req_gui_target", serde_json::json!({ "n": 1 }));
-        assert_eq!(
-            fx.queue
-                .admit(&target, CapabilityClass::NonDestructive)
-                .await
-                .unwrap(),
-            AdmitOutcome::Admitted
-        );
-        fx.queue
-            .place_in_lane(&target.id, &target.caller.repo)
-            .await
-            .unwrap();
+        let target = queued_target(&fx, "req_label_target").await;
 
         let mut ctx = fx.ctx_uncancelled(
-            "req_gui_cancel",
-            serde_json::json!({ "ticket": "req_gui_target" }),
+            "req_label_cancel",
+            serde_json::json!({ "ticket": "req_label_target" }),
         );
         ctx.caller.agent = crate::admin::ADMIN_CALLER_AGENT.to_owned();
+        ctx.caller.repo.clone_from(&target.caller.repo);
         let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
         assert_eq!(output.body["result"], "cancelled_queued");
 
-        let audit = fx.store.audit_for_request("req_gui_target").await.unwrap();
+        let audit = fx
+            .store
+            .audit_for_request("req_label_target")
+            .await
+            .unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, ACTION_CANCEL);
+        assert_eq!(
+            audit[0].actor,
+            Actor::System,
+            "a label forged a human actor"
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The private admin plane's cancel is the human's: any ticket, whatever
+/// repository it runs under, audited as `human`.
+#[tokio::test]
+async fn an_admin_origin_cancel_is_audited_as_human_and_needs_no_repository() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        queued_target(&fx, "req_admin_target").await;
+
+        let mut ctx = fx.ctx_uncancelled(
+            "req_admin_cancel",
+            serde_json::json!({ "ticket": "req_admin_target" }),
+        );
+        ctx.origin = crate::ingress::Origin::Admin;
+        ctx.caller.repo = crate::admin::ADMIN_REPO.to_owned();
+        let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
+        assert_eq!(output.body["result"], "cancelled_queued");
+
+        let audit = fx
+            .store
+            .audit_for_request("req_admin_target")
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].actor, Actor::Human);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// Request ids are broadcast on the public event socket, so an id must not
+/// be a capability: a public cancel acts only on a ticket admitted under
+/// the caller's own repository, and a foreign ticket answers exactly like a
+/// missing one.
+#[tokio::test]
+async fn a_public_cancel_from_another_repository_cannot_touch_the_ticket() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        queued_target(&fx, "req_foreign_target").await;
+
+        // `ctx` runs under /repo/test; the target was admitted under /repo/a.
+        let ctx = fx.ctx_uncancelled(
+            "req_foreign_cancel",
+            serde_json::json!({ "ticket": "req_foreign_target" }),
+        );
+        let foreign = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
+        let ctx = fx.ctx_uncancelled(
+            "req_missing_cancel",
+            serde_json::json!({ "ticket": "req_does_not_exist" }),
+        );
+        let missing = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
+
+        assert_eq!(foreign.outcome, Outcome::Unresolved);
+        assert_eq!(foreign.body["result"], "not_found");
+        assert_eq!(foreign.body["result"], missing.body["result"]);
+        assert_eq!(foreign.outcome, missing.outcome);
+
+        // The victim's request is untouched: still queued, nothing audited.
+        let row = fx
+            .store
+            .get_request("req_foreign_target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert!(
+            fx.store
+                .audit_for_request("req_foreign_target")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// `echo` is a diagnostic. Without a cap, one caller could keep any
+/// repository's lane busy for the full hour a lease allows, or park a
+/// megabyte reply per request.
+#[tokio::test]
+async fn echo_refuses_a_delay_or_a_payload_beyond_the_diagnostic_limits() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+
+        let ctx = fx.ctx_uncancelled(
+            "req_long",
+            serde_json::json!({ "delay_ms": crate::executor::MAX_ECHO_DELAY_MS + 1 }),
+        );
+        let started = std::time::Instant::now();
+        let refused = BuiltinCapability::Echo.execute(ctx).await;
+        assert!(
+            matches!(&refused, Err(CapabilityFailure::Refused { cause, .. })
+                if cause == crate::executor::CAUSE_ECHO_LIMIT),
+            "got {refused:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused before waiting"
+        );
+
+        let ctx = fx.ctx_uncancelled(
+            "req_big",
+            serde_json::json!({ "pad": "x".repeat(crate::executor::MAX_ECHO_ARGS_BYTES) }),
+        );
+        let refused = BuiltinCapability::Echo.execute(ctx).await;
+        assert!(
+            matches!(&refused, Err(CapabilityFailure::Refused { cause, .. })
+                if cause == crate::executor::CAUSE_ECHO_LIMIT),
+            "got {refused:?}"
+        );
+
+        // The documented contract still works: a small object comes back.
+        let ctx = fx.ctx_uncancelled("req_ok", serde_json::json!({ "msg": "hi" }));
+        let output = BuiltinCapability::Echo.execute(ctx).await.unwrap();
+        assert_eq!(output.body["echo"]["msg"], "hi");
     })
     .await
     .expect("test within deadline");
@@ -550,7 +697,9 @@ async fn cancel_of_a_parked_ticket_is_cancelled_queued() {
         let Registration::Pending(waiter) = fx.router.register("req_parked").await else {
             panic!("target must still be pending");
         };
-        let ctx = fx.ctx_uncancelled("req_cancel", serde_json::json!({ "ticket": "req_parked" }));
+        let mut ctx =
+            fx.ctx_uncancelled("req_cancel", serde_json::json!({ "ticket": "req_parked" }));
+        ctx.caller.repo.clone_from(&target.caller.repo);
         let output = BuiltinCapability::Cancel.execute(ctx).await.unwrap();
         assert_eq!(output.outcome, Outcome::Solved);
         assert_eq!(output.body["result"], "cancelled_queued");

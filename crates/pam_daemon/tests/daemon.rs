@@ -75,6 +75,26 @@ impl TestDaemon {
         }
     }
 
+    /// A relaxed daemon whose view of its own executable is `image`.
+    async fn start_with_image(image: std::sync::Arc<ScriptedImage>) -> Self {
+        let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let config = DaemonConfig {
+            base_dir: Some(base_of(&tmp)),
+            image_probe: Some(image),
+            ..DaemonConfig::default()
+        };
+        let handle = run_daemon_with(config, shutdown_rx)
+            .await
+            .expect("daemon starts");
+        Self {
+            tmp,
+            handle,
+            shutdown,
+        }
+    }
+
     /// [`Self::start_at`] with a custom approval timeout.
     async fn start_at_with_approval_timeout(tmp: tempfile::TempDir, timeout: Duration) -> Self {
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -309,7 +329,10 @@ async fn status_bypasses_the_lanes_and_verifies() {
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(body["protocol"], PROTOCOL_VERSION);
         assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
-        assert!(body["active_requests"].as_i64().unwrap() >= 1);
+        // A poll is not an active request: nothing else is in flight.
+        assert_eq!(body["active_requests"], 0);
+        // The slow half comes from a snapshot; this one is fresh.
+        assert_eq!(body["snapshot"]["stale"], false);
         // The read-only model block: a fresh daemon has no weights, and
         // says so rather than failing or inventing figures.
         assert_eq!(body["model"]["state"], "idle");
@@ -333,14 +356,43 @@ async fn status_bypasses_the_lanes_and_verifies() {
         assert_eq!(body["model"]["readiness"]["light"]["cause"], "no_default");
         assert_eq!(body["model"]["readiness"]["heavy"]["stage"], "unconfigured");
 
+        // A poll leaves nothing behind: no request row, no audit row...
         let store = daemon.handle.store();
-        let row = store.get_request("req_status").await.unwrap().unwrap();
-        assert_eq!(row.state, RequestState::Done);
-        assert_eq!(row.outcome.as_deref(), Some("verified"));
+        assert!(store.get_request("req_status").await.unwrap().is_none());
+        assert!(
+            store
+                .audit_for_request("req_status")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
-        // Bypass: started and done, but never queued.
-        let events = events_until_terminal(&mut sub).await;
-        assert_eq!(events, [Event::Started, Event::Done]);
+        // ...and no lifecycle events. A control request that is audited
+        // (`query`) publishes none either: its row is terminal and the
+        // subscriber of its topic has heard nothing.
+        let mut query_sub = daemon.subscriber("req_query").await;
+        send(
+            &mut dealer,
+            &envelope(
+                "req_query",
+                "query",
+                serde_json::json!({ "ticket": "no_such_ticket" }),
+                true,
+            ),
+        )
+        .await;
+        let _ = recv_response(&mut dealer).await;
+        let row = store.get_request("req_query").await.unwrap().unwrap();
+        assert!(row.state.is_terminal(), "query stays an audited request");
+        assert_eq!(store.audit_for_request("req_query").await.unwrap().len(), 1);
+        for (topic, quiet) in [("req_status", &mut sub), ("req_query", &mut query_sub)] {
+            assert!(
+                timeout(Duration::from_millis(400), quiet.recv())
+                    .await
+                    .is_err(),
+                "a control request published a lifecycle event on {topic}"
+            );
+        }
 
         daemon.stop().await;
     })
@@ -950,12 +1002,134 @@ async fn crash_recovery_on_boot_fails_stuck_rows_and_rebuilds_lanes() {
     .expect("test within deadline");
 }
 
+/// A probe over one scripted file: the daemon's own executable as a test
+/// wants it to look.
+#[derive(Default)]
+struct ScriptedImage {
+    /// Bumped to make the file at every path look replaced.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl ScriptedImage {
+    fn replace_on_disk(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl pam_daemon::image::ImageProbe for ScriptedImage {
+    fn facts(&self, path: &std::path::Path) -> Option<pam_daemon::image::FileFacts> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        Some(pam_daemon::image::FileFacts {
+            canonical: path.to_path_buf(),
+            len: 1_000 + generation,
+            modified: None,
+            identity: Some((1, 42 + generation)),
+        })
+    }
+}
+
+/// Sends `status` under three claimed versions and asserts each is refused
+/// `client_version_mismatch` with the phase still `Serving` and no row.
+async fn assert_claims_are_refused(
+    daemon: &TestDaemon,
+    dealer: &mut DealerSocket,
+    boot_path: &std::path::Path,
+) {
+    let lifecycle = daemon.handle.lifecycle();
+    for (index, claimed) in ["999.0.0", "0.0.1", "not a version"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("req_claims_{index}");
+        let mut other = envelope(&id, "status", serde_json::json!({}), true);
+        other.client_version = claimed.to_owned();
+        send(dealer, &other).await;
+        let response = recv_response(dealer).await;
+        let Response::Refusal {
+            cause,
+            detail,
+            retryable,
+            ..
+        } = &response
+        else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, "client_version_mismatch");
+        assert!(detail.contains(claimed), "detail: {detail}");
+        assert!(
+            detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {detail}"
+        );
+        assert!(
+            detail.contains(&boot_path.display().to_string()),
+            "the refusal names the daemon's executable: {detail}"
+        );
+        assert!(!retryable, "sending it again would only repeat");
+        assert_eq!(*lifecycle.borrow(), LifecyclePhase::Serving);
+        assert!(
+            daemon
+                .handle
+                .store()
+                .get_request(&id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused handshake records no request row"
+        );
+    }
+}
+
+/// A claimed client version used to restart the daemon: any public caller
+/// could drain and restart it with one envelope, and two installed
+/// versions restarted each other forever. The claim is now only the
+/// occasion to look at the binary on disk.
 #[tokio::test]
-async fn version_mismatch_refuses_outdated_and_the_daemon_restarts_itself() {
+async fn a_claimed_version_never_restarts_the_daemon_but_a_replaced_binary_does() {
     timeout(DEADLINE, async {
-        let daemon = TestDaemon::start().await;
+        let image = std::sync::Arc::new(ScriptedImage::default());
+        let daemon = TestDaemon::start_with_image(image.clone()).await;
         let mut lifecycle = daemon.handle.lifecycle();
         let mut dealer = daemon.dealer().await;
+        let boot_path = daemon
+            .handle
+            .boot_image_path()
+            .expect("the platform names the test binary");
+
+        // An in-flight request that a restart would cancel.
+        send(
+            &mut dealer,
+            &envelope(
+                "req_survivor",
+                "echo",
+                serde_json::json!({ "delay_ms": 1_500 }),
+                false,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            recv_response(&mut dealer).await,
+            Response::Ticket { .. }
+        ));
+
+        // The binary on disk is the one that is running. Whatever a client
+        // claims — newer, older, nonsense — it is refused and nothing moves.
+        assert_claims_are_refused(&daemon, &mut dealer, &boot_path).await;
+        // The daemon is still serving and the in-flight work finishes.
+        let store = daemon.handle.store();
+        let survivor = loop {
+            let row = store.get_request("req_survivor").await.unwrap().unwrap();
+            if row.state.is_terminal() {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(survivor.state, RequestState::Done, "{survivor:?}");
+
+        // Now the binary really is replaced (the re-check is cached for a
+        // second, so the next mismatched request after that sees it).
+        image.replace_on_disk();
+        tokio::time::sleep(pam_daemon::image::RECHECK_INTERVAL + Duration::from_millis(100)).await;
 
         let mut newer = envelope(
             "req_newer",
@@ -972,6 +1146,7 @@ async fn version_mismatch_refuses_outdated_and_the_daemon_restarts_itself() {
             cause,
             detail,
             recovery,
+            retryable,
         } = response
         else {
             panic!("expected a refusal, got {response:?}");
@@ -984,6 +1159,7 @@ async fn version_mismatch_refuses_outdated_and_the_daemon_restarts_itself() {
             "detail: {detail}"
         );
         assert!(recovery.contains("retry"), "recovery: {recovery}");
+        assert!(retryable, "the retry lands on the replacement daemon");
 
         // No request row was recorded for the refused envelope.
         let store = daemon.handle.store();

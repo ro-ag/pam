@@ -17,10 +17,20 @@
 //! - **Profiles**: one policy engine, one [`Profile`] enum, no per-OS code paths — only the default
 //!   differs by platform ([`Profile::platform_default`]). The active profile persists in the
 //!   `setting` table under [`PROFILE_SETTING_KEY`] as a JSON string; changing it is GUI-only.
+//! - **One source of truth for the profile**: the gate reads the setting once, at construction,
+//!   and from then on the profile it holds is what every part of the daemon enforces, reports and
+//!   stamps (`admin.profile.get`, the flow step gate, the watch/landing authorization stamp).
+//!   [`PolicyGate::set_profile`] is the only way to change it: it persists the setting and then
+//!   swaps the live value, so a change made in the GUI governs from the next evaluation — there
+//!   is no window in which the stored profile refuses work the live one still admits.
+//! - **Classes and admission pools**: [`classify`] is the one registry. [`CapabilityClass::Control`]
+//!   names the daemon's own bookkeeping requests (`status`, `query`, `cancel`); [`admission_pool`]
+//!   derives the dispatcher pool from the class, so no other module matches capability names to
+//!   decide how a request is admitted.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use pam_store::{Actor, Decision, Store, StoreError};
+use pam_store::{Actor, AuditEntry, Decision, GrantChange, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -32,6 +42,9 @@ pub const CAUSE_UNKNOWN_CAPABILITY: &str = "unknown_capability";
 
 /// Refusal cause for a known capability without an active grant.
 pub const CAUSE_NOT_GRANTED: &str = "not_granted";
+
+/// `audit.action` for the grant a relaxed-profile first use inserts.
+pub const ACTION_AUTO_GRANT: &str = "auto_grant";
 
 /// GUI recovery line for [`CAUSE_UNKNOWN_CAPABILITY`] refusals.
 const RECOVERY_UNKNOWN_CAPABILITY: &str = "Open the PAM GUI to see available capabilities.";
@@ -83,6 +96,11 @@ impl Profile {
 /// registry ([`classify`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityClass {
+    /// The daemon's own bookkeeping surface (`status`, `query`, `cancel`):
+    /// like [`Self::ReadOnly`] it bypasses grants and lanes, and in addition
+    /// it is admitted from the reserved control pool and publishes no
+    /// lifecycle events — a poll is not work anyone follows.
+    Control,
     /// Observes state, changes nothing. Bypasses grants entirely.
     ReadOnly,
     /// Changes state the caller can trivially undo.
@@ -93,6 +111,53 @@ pub enum CapabilityClass {
     External,
 }
 
+impl CapabilityClass {
+    /// Whether this class skips grants, approvals, dedupe and lanes: the
+    /// request is executed inline by the task that admitted it.
+    #[must_use]
+    pub fn bypasses_lanes(self) -> bool {
+        matches!(self, Self::Control | Self::ReadOnly)
+    }
+}
+
+/// Which dispatcher pool admits a request (see [`admission_pool`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionPool {
+    /// Everything that is not daemon bookkeeping.
+    Work,
+    /// `status`: a snapshot read that cannot be slow. Slots of its own, so
+    /// the daemon's liveness answer is never refused because something
+    /// else — a `query` waiting on the store — took the control slots.
+    Status,
+    /// `query`: admitted from the reserved control pool.
+    Control,
+    /// `cancel`: headroom of its own, so the remedy for a saturated daemon
+    /// can never be refused because polls took every control slot.
+    Cancel,
+}
+
+/// The dispatcher pool for `capability`, derived from [`classify`]. An
+/// unknown capability is ordinary work: it is refused by the gate, and must
+/// not be able to spend the reserved control slots on the way there.
+#[must_use]
+pub fn admission_pool(capability: &str) -> AdmissionPool {
+    match classify(capability) {
+        Some(CapabilityClass::Control) if capability == CAP_STATUS => AdmissionPool::Status,
+        Some(CapabilityClass::Control) if capability == CAP_CANCEL => AdmissionPool::Cancel,
+        Some(CapabilityClass::Control) => AdmissionPool::Control,
+        _ => AdmissionPool::Work,
+    }
+}
+
+/// Wire name of the daemon health capability.
+pub const CAP_STATUS: &str = "status";
+
+/// Wire name of the ticket-state lookup.
+pub const CAP_QUERY: &str = "query";
+
+/// Wire name of the cancellation capability.
+pub const CAP_CANCEL: &str = "cancel";
+
 /// Static capability registry: what each known capability may do.
 ///
 /// Known capabilities: `status` (read-only), `query` (read-only ticket-state lookup backing `pam
@@ -101,10 +166,10 @@ pub enum CapabilityClass {
 /// not something a request can extend. An unknown capability classifies as `None` and the gate
 /// refuses with [`CAUSE_UNKNOWN_CAPABILITY`].
 ///
-/// `cancel` mutates state (it fails the target request) but is deliberately classed `ReadOnly`: a
-/// cancellation must never queue behind the very work it cancels, and the read-only class gives it
-/// the grant bypass and lane bypass. Its effect is bounded to pam's own bookkeeping — nothing
-/// outside the daemon changes.
+/// `cancel` mutates state (it fails the target request) but is deliberately classed `Control`
+/// beside `status` and `query`: a cancellation must never queue behind the very work it cancels,
+/// and the control class gives it the grant bypass and lane bypass. Its effect is bounded to pam's
+/// own bookkeeping — nothing outside the daemon changes.
 ///
 /// `flow.run` is `NonDestructive` for the opposite reason: a flow is a recipe, and running one
 /// changes nothing by itself. Every step that could change something is gated individually inside
@@ -113,10 +178,8 @@ pub enum CapabilityClass {
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {
-        "status"
-        | "cancel"
-        | "query"
-        | crate::flow_service::CAP_FLOW_LIST
+        CAP_STATUS | CAP_CANCEL | CAP_QUERY => Some(CapabilityClass::Control),
+        crate::flow_service::CAP_FLOW_LIST
         | crate::flow_service::CAP_FLOW_SHOW
         | crate::flow_service::CAP_FLOW_INSPECT
         | crate::flow_result_service::CAP_FLOW_RESULT
@@ -168,11 +231,15 @@ pub enum PolicyError {
 }
 
 /// The policy gate service. Constructed once from the store's persisted
-/// profile; consulted by the request pipeline before every enqueue.
+/// profile; consulted by the request pipeline before every enqueue. It is
+/// also the daemon's one live copy of the profile (see the module docs).
 #[derive(Debug)]
 pub struct PolicyGate {
     store: Arc<Store>,
-    profile: Profile,
+    /// Read on every evaluation, written only by [`Self::set_profile`]. A
+    /// sync lock: the critical section is one `Copy`, never held across an
+    /// await.
+    profile: RwLock<Profile>,
 }
 
 impl PolicyGate {
@@ -191,13 +258,41 @@ impl PolicyGate {
             store.set_setting(PROFILE_SETTING_KEY, &raw).await?;
             profile
         };
-        Ok(Self { store, profile })
+        Ok(Self {
+            store,
+            profile: RwLock::new(profile),
+        })
     }
 
-    /// The profile this gate enforces.
+    /// The profile this gate enforces — the daemon's one source of truth.
     #[must_use]
     pub fn profile(&self) -> Profile {
-        self.profile
+        *self
+            .profile
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Changes the enforced profile: persists it under
+    /// [`PROFILE_SETTING_KEY`], then swaps the live value. Returns the
+    /// profile it replaced.
+    ///
+    /// Persist first: a failed write leaves the live profile unchanged, so
+    /// the daemon never enforces something a restart would not.
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`StoreError`] when the setting cannot be written;
+    /// nothing changed.
+    pub async fn set_profile(&self, profile: Profile) -> Result<Profile, StoreError> {
+        let raw =
+            serde_json::to_string(&profile).expect("a Profile always serializes to a JSON string");
+        self.store.set_setting(PROFILE_SETTING_KEY, &raw).await?;
+        let mut live = self
+            .profile
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(std::mem::replace(&mut *live, profile))
     }
 
     /// Decides whether the request `request_id` may exercise
@@ -236,15 +331,18 @@ impl PolicyGate {
         capability: &str,
         class: CapabilityClass,
     ) -> Result<GateDecision, StoreError> {
-        // Read-only capabilities bypass grants on every profile (the
-        // queue exempts them from lanes for the same reason).
-        if class == CapabilityClass::ReadOnly {
+        // Read-only and control capabilities bypass grants on every
+        // profile (the queue exempts them from lanes for the same reason).
+        if class.bypasses_lanes() {
             return Ok(GateDecision::Allow {
                 auto_granted: false,
             });
         }
         let granted = self.store.active_grant(capability).await?;
-        let decision = match (self.profile, granted, class) {
+        // One read: the whole decision is made under the profile that was
+        // live when it started.
+        let profile = self.profile();
+        let decision = match (profile, granted, class) {
             // An active grant on relaxed means go; on standard it means
             // go for non-destructive work.
             (Profile::Relaxed, true, _)
@@ -255,7 +353,7 @@ impl PolicyGate {
             // use; the grant mutation is audited right here (see the
             // module docs for the audit split).
             (Profile::Relaxed, false, CapabilityClass::NonDestructive) => {
-                self.auto_grant(request_id, capability).await?;
+                self.auto_grant(request_id, capability, profile).await?;
                 GateDecision::Allow { auto_granted: true }
             }
             // Relaxed asks once per destructive/external capability; the
@@ -280,7 +378,7 @@ impl PolicyGate {
                 reason: format!(
                     "capability {capability:?} requires per-operation approval \
                      under the {} profile",
-                    self.profile.as_str()
+                    profile.as_str()
                 ),
             },
         };
@@ -288,22 +386,33 @@ impl PolicyGate {
     }
 
     /// Inserts the grant row and its audit row for a relaxed-profile
-    /// auto-grant. The audit detail records the active profile.
-    async fn auto_grant(&self, request_id: &str, capability: &str) -> Result<(), StoreError> {
-        self.store.insert_grant(capability).await?;
+    /// auto-grant, in one transaction: a crash cannot leave a grant nobody
+    /// audited. The audit detail records the active profile. A grant that
+    /// a concurrent evaluation inserted first is left alone (and audited
+    /// by whoever inserted it).
+    async fn auto_grant(
+        &self,
+        request_id: &str,
+        capability: &str,
+        profile: Profile,
+    ) -> Result<(), StoreError> {
         let detail = serde_json::json!({
             "capability": capability,
-            "profile": self.profile.as_str(),
+            "profile": profile.as_str(),
         })
         .to_string();
         self.store
-            .append_audit(
+            .apply_grant_change_audited(
                 request_id,
-                "auto_grant",
-                Decision::Allow,
-                Actor::Policy,
-                Some(&detail),
+                GrantChange::Add(capability),
+                AuditEntry {
+                    action: ACTION_AUTO_GRANT,
+                    decision: Decision::Allow,
+                    actor: Actor::Policy,
+                    detail: Some(&detail),
+                },
             )
             .await
+            .map(|_| ())
     }
 }

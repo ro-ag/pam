@@ -800,9 +800,11 @@ async fn grant_revocation_invalidates_queued_work_even_after_regrant_and_restart
         .unwrap()
         .authorization_revision;
     assert_eq!(revision, Some(0));
-    store.insert_grant("flow.example.run").await.unwrap();
-    store.revoke_grant("flow.example.run").await.unwrap();
-    store.insert_grant("flow.example.run").await.unwrap();
+    // The queued request is an `echo`: revoking the grant it depends on
+    // voids it, and granting it again does not bring it back.
+    store.insert_grant("echo").await.unwrap();
+    store.revoke_grant("echo").await.unwrap();
+    store.insert_grant("echo").await.unwrap();
     assert_eq!(store.grant_revocation_revision().await.unwrap(), 1);
     assert!(queue.take_next(REPO_A).await.unwrap().is_none());
     assert_eq!(
@@ -821,7 +823,7 @@ async fn grant_revocation_invalidates_queued_work_even_after_regrant_and_restart
         &envelope("restart", REPO_A, serde_json::json!({}), None),
     )
     .await;
-    store.revoke_grant("flow.example.run").await.unwrap();
+    store.revoke_grant("echo").await.unwrap();
     let restarted = QueueManager::new(Arc::clone(&store));
     assert_eq!(restarted.rebuild_from_store().await.unwrap(), 0);
     assert_eq!(
@@ -1152,9 +1154,9 @@ async fn wake_due_refuses_a_parked_ticket_whose_authorization_changed() {
         let lane = repo.path.as_str();
         let resume = wall_now_ms() + 30_000;
         assert!(queue.park("flow_1", resume).await.unwrap());
-        // A grant revoked while parked moves the revocation revision.
-        store.insert_grant("flow.parked.look").await.unwrap();
-        store.revoke_grant("flow.parked.look").await.unwrap();
+        // A step grant revoked while parked: a flow run depends on it.
+        store.insert_grant("flow.step:parked/look").await.unwrap();
+        store.revoke_grant("flow.step:parked/look").await.unwrap();
 
         assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 0);
         let row = store.get_request("flow_1").await.unwrap().unwrap();
@@ -1309,4 +1311,235 @@ async fn parked_terminal_backpressure_retains_admissions_until_the_executor_drai
     let mut notices = queue.take_parked_terminals().await;
     notices.sort();
     assert_eq!(notices, ["flow_1", "stale"]);
+}
+
+/// Revoking a capability the queued request never depended on used to void
+/// it (the revision was one global count). Only its own grant does now —
+/// both at the lease and across a restart.
+#[tokio::test]
+async fn an_unrelated_revocation_leaves_queued_and_parked_work_alone() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("keeps_running", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+        let repo = leased_flow(&store, &queue, "flow_keeps").await;
+        let resume = wall_now_ms() + 30_000;
+        assert!(queue.park("flow_keeps", resume).await.unwrap());
+
+        // Somebody revokes a grant neither request depends on.
+        store.insert_grant("some.other.capability").await.unwrap();
+        store.revoke_grant("some.other.capability").await.unwrap();
+        assert_eq!(store.grant_revocation_revision().await.unwrap(), 1);
+
+        // The parked flow wakes onto its lane instead of being refused.
+        assert_eq!(queue.wake_due(Instant::now(), resume).await.unwrap(), 1);
+        assert!(queue.take_parked_terminals().await.is_empty());
+        let woken = queue.take_next(&repo.path).await.unwrap().unwrap();
+        assert_eq!(woken.request_id, "flow_keeps");
+
+        // A restart restores the queued echo rather than failing it.
+        let restarted = QueueManager::new(Arc::clone(&store));
+        assert_eq!(restarted.rebuild_from_store().await.unwrap(), 1);
+        let leased = restarted.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(leased.request_id, "keeps_running");
+        assert_eq!(
+            store
+                .get_request("keeps_running")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RequestState::Running
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A row past its deadline with no owner in memory — a terminal write the
+/// store refused, a handler that was cut off — used to stay `running`
+/// forever and count against the 128-request admission cap.
+#[tokio::test]
+async fn a_row_stranded_past_its_deadline_is_closed_and_stops_counting() {
+    timeout(DEADLINE, async {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let queue =
+            QueueManager::new(Arc::clone(&store)).with_reconcile_grace(Duration::from_secs(5));
+        let now = wall_now_ms();
+        // Stranded: deadline a minute ago. Fresh: deadline a minute ahead.
+        // Late: past its deadline but inside the grace — its handler may
+        // still be writing its own verdict.
+        for (id, expires) in [
+            ("stranded", now - 60_000),
+            ("fresh", now + 60_000),
+            ("late", now - 1_000),
+        ] {
+            store
+                .insert_admitted_request(id, "query", REPO_A, "claude", "{}", None, expires)
+                .await
+                .unwrap();
+        }
+
+        // Admission already ignores what can no longer run...
+        let (live, _) = store.admission_usage_at(now).await.unwrap();
+        assert_eq!(live, 1, "only the fresh row holds an admission slot");
+        let (all, _) = store.admission_usage().await.unwrap();
+        assert_eq!(all, 3);
+
+        // ...and the reconciler gives the stranded row its terminal state.
+        assert_eq!(queue.reconcile_expired(now).await.unwrap(), 1);
+        let row = store.get_request("stranded").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+        let audit = store.audit_for_request("stranded").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_LEASE_REAPED);
+        assert_eq!(audit[0].decision, Decision::Timeout);
+        assert_eq!(audit[0].actor, Actor::System);
+        // Its waiters are released through the executor loop's drain.
+        assert_eq!(queue.take_parked_terminals().await, ["stranded"]);
+
+        // The other two are left alone, and a second pass finds nothing.
+        for id in ["fresh", "late"] {
+            assert_eq!(
+                store.get_request(id).await.unwrap().unwrap().state,
+                RequestState::Running,
+                "{id}"
+            );
+        }
+        assert_eq!(queue.reconcile_expired(now).await.unwrap(), 0);
+
+        // Once the grace has passed for the late row, it is closed too.
+        assert_eq!(queue.reconcile_expired(now + 10_000).await.unwrap(), 1);
+        assert_eq!(
+            store.get_request("late").await.unwrap().unwrap().state,
+            RequestState::Failed
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// Stranded rows used to be able to lock everyone out: 128 of them and
+/// every request, `status` and `cancel` included, was refused
+/// `queue_count_limit` until the daemon restarted.
+#[tokio::test]
+async fn rows_past_their_deadline_do_not_exhaust_the_admission_cap() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        let expired = wall_now_ms() - 60_000;
+        for index in 0..crate::queue::MAX_ADMITTED_REQUESTS {
+            store
+                .insert_admitted_request(
+                    &format!("stranded_{index}"),
+                    "query",
+                    REPO_A,
+                    "claude",
+                    "{}",
+                    None,
+                    expired,
+                )
+                .await
+                .unwrap();
+        }
+        // The cap is full of rows that can never run; a new request is
+        // admitted all the same.
+        let outcome = queue
+            .admit(
+                &envelope("still_admitted", REPO_A, serde_json::json!({}), None),
+                CapabilityClass::NonDestructive,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, AdmitOutcome::Admitted);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The reconciler also frees what the stranded row held in memory: its
+/// lease and its lane.
+#[tokio::test]
+async fn reconciling_a_leased_row_releases_its_lane_and_signals_the_holder() {
+    timeout(DEADLINE, async {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let queue =
+            QueueManager::new(Arc::clone(&store)).with_reconcile_grace(Duration::from_secs(1));
+        let mut short = envelope("held", REPO_A, serde_json::json!({}), None);
+        short.deadline_ms = 50;
+        enqueue(&queue, &short).await;
+        let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+        enqueue(
+            &queue,
+            &envelope("next", REPO_A, serde_json::json!({ "n": 2 }), None),
+        )
+        .await;
+        assert!(
+            queue.take_next(REPO_A).await.unwrap().is_none(),
+            "lane busy"
+        );
+
+        // Long past the deadline and the grace, as the reaper would see it
+        // if its own lease sweep had been failing.
+        let later = wall_now_ms() + 10_000;
+        assert_eq!(queue.reconcile_expired(later).await.unwrap(), 1);
+        assert!(*work.cancel.borrow(), "the holder is told to stop");
+        assert!(queue.leased_ids().await.is_empty());
+        let next = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(next.request_id, "next");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The last resort when the store keeps refusing a terminal write: the lane
+/// is handed back without one, instead of staying busy until the lease
+/// deadline.
+#[tokio::test]
+async fn abandoning_a_lease_frees_the_lane_without_a_terminal_write() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("first", REPO_A, serde_json::json!({ "n": 1 }), None),
+        )
+        .await;
+        enqueue(
+            &queue,
+            &envelope("second", REPO_A, serde_json::json!({ "n": 2 }), None),
+        )
+        .await;
+        let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "first");
+
+        // The store refuses the completion: ownership is retained...
+        queue.fail_next_completes(1);
+        assert!(
+            queue
+                .complete("first", RequestState::Done, Some("solved"), execute_entry())
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.leased_ids().await, ["first"]);
+        assert!(queue.take_next(REPO_A).await.unwrap().is_none());
+
+        // ...until the lease is abandoned, and the lane serves on.
+        assert!(queue.abandon_lease("first").await);
+        assert!(
+            !queue.abandon_lease("first").await,
+            "nothing left to abandon"
+        );
+        let next = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(next.request_id, "second");
+        // The row was not touched: its verdict is the caller's to record.
+        assert_eq!(
+            store.get_request("first").await.unwrap().unwrap().state,
+            RequestState::Running
+        );
+    })
+    .await
+    .expect("test within deadline");
 }

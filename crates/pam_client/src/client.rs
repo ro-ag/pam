@@ -428,15 +428,22 @@ impl Ensure<'_> {
     /// a booting daemon (for as long as a spawn would be given) and a
     /// restarting one (for the handover), and returns the first state that
     /// is neither.
+    ///
+    /// Each wait is measured from the moment its own state was first seen: a
+    /// restarting daemon that has drained for most of the handover passes
+    /// through a brief "lock held, endpoint gone" moment as it exits, which
+    /// is the start of a boot wait, not the end of the one before it.
     fn settled(&self, base_dir: &Path, dirs: &RuntimeDir) -> Result<DaemonState, ClientError> {
-        let started = Instant::now();
+        let mut booting_since: Option<Instant> = None;
+        let mut restarting_since: Option<Instant> = None;
         loop {
             let state = self.state(dirs)?;
-            let budget = match state {
-                DaemonState::Booting => self.wait * SPAWN_ATTEMPTS,
-                DaemonState::Restarting => self.handover,
+            let (since, budget) = match state {
+                DaemonState::Booting => (&mut booting_since, self.wait * SPAWN_ATTEMPTS),
+                DaemonState::Restarting => (&mut restarting_since, self.handover),
                 _ => return Ok(state),
             };
+            let started = *since.get_or_insert_with(Instant::now);
             if started.elapsed() >= budget {
                 return Err(never_ready(base_dir, dirs, budget));
             }

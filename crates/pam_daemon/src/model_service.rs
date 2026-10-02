@@ -1376,10 +1376,14 @@ impl ModelService {
 
     /// Drops the weights if the runtime has been idle long enough.
     async fn maybe_idle_unload(&self) {
-        let Ok(_operation) = self.operation.try_lock() else {
+        // The setting is read before the operation lock is taken: a store
+        // read suspends, and holding the lock across it would make a
+        // request arriving meanwhile answer `Busy` although nothing is
+        // being loaded or unloaded.
+        let Ok(idle_min) = self.idle_unload_min().await else {
             return;
         };
-        let Ok(idle_min) = self.idle_unload_min().await else {
+        let Ok(_operation) = self.operation.try_lock() else {
             return;
         };
         if self.busy.load(Ordering::Acquire) {

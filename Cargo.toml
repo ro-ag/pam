@@ -37,10 +37,14 @@ pam_testkit = { path = "crates/pam_testkit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# default features off: `mimalloc` bundles C, and the point of turso is a
-# pure-Rust engine. pure-rust-crypto keeps aegis pure Rust on every platform.
-# Same-version patches below remove mandatory SimSIMD C compilation and
-# the unused aegis cc build dependency; runtime cryptography stays upstream.
+# Real SQLite: the amalgamation shipped inside libsqlite3-sys, compiled by `cc`
+# and linked statically. A named exception to the no-C rule (owner decision
+# 2026-10-02, issue 38), like the Tauri/objc2 shims. Never the system library,
+# so every target runs the same engine.
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "cache", "limits"] }
+# No workspace member depends on turso any more (pam_store runs on rusqlite).
+# The entry, the two patches at the bottom of this file and the vendor
+# directories they point at are removed together in a follow-up change.
 turso = { version = "0.7", default-features = false, features = ["pure-rust-crypto"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 thiserror = "2"

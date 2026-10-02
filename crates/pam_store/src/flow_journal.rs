@@ -2,7 +2,8 @@
 //! statement; cancellation never leaves a transaction open. Authorization and
 //! protected checkpoint/evidence ownership remain the daemon's responsibility.
 use super::{Store, StoreError};
-use turso::params;
+use crate::db::Db;
+use rusqlite::params;
 
 /// Upper bound before JSON parsing or database persistence.
 pub const MAX_FLOW_CHECKPOINT_BYTES: usize = 131_072;
@@ -92,14 +93,19 @@ impl Store {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         identifier(request_id, 128)?;
         identifier(evidence_id, 128)?;
-        let conn = self.lock().await?;
-        let mut rows = conn.query("SELECT CASE WHEN length(content)<=1048576 THEN content ELSE NULL END FROM evidence WHERE id=?1 AND request_id=?2 AND kind='flow.checkpoint'",params![evidence_id,request_id]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        row.get::<Option<Vec<u8>>>(0)?
-            .map(Some)
-            .ok_or_else(|| invalid("protected checkpoint exceeds 1 MiB"))
+        let request_id = request_id.to_owned();
+        let evidence_id = evidence_id.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT CASE WHEN length(content)<=1048576 THEN content ELSE NULL END FROM evidence WHERE id=?1 AND request_id=?2 AND kind='flow.checkpoint'")?;
+            let mut rows = stmt.query(params![evidence_id,request_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            row.get::<Option<Vec<u8>>>(0)?
+                .map(Some)
+                .ok_or_else(|| invalid("protected checkpoint exceeds 1 MiB"))
+        })
+        .await
     }
 
     /// Bind once. Existing progress is never reset to the supplied initial value.
@@ -110,22 +116,25 @@ impl Store {
     ) -> Result<FlowJournalBegin, StoreError> {
         validate_identity(identity)?;
         checkpoint(initial_checkpoint)?;
-        let conn = self.lock().await?;
-        let changed = conn.execute(
-            "INSERT INTO flow_journal(request_id,schema_version,flow_digest,repository,input_fingerprint,revision,state,step_id,attempt,effectful,checkpoint_json,evidence_refs_json) VALUES (?1,1,?2,?3,?4,0,'ready',NULL,0,0,?5,'[]') ON CONFLICT(request_id) DO NOTHING",
-            params![identity.request_id.clone(),identity.flow_digest.clone(),identity.repository.clone(),identity.input_fingerprint.clone(),initial_checkpoint],
-        ).await?;
-        if changed == 1 {
-            return Ok(FlowJournalBegin::Inserted);
-        }
-        let existing = Self::flow_journal_locked(&conn, &identity.request_id)
-            .await?
-            .ok_or_else(|| invalid("conflicting journal disappeared"))?;
-        Ok(if existing.identity == *identity {
-            FlowJournalBegin::Existing
-        } else {
-            FlowJournalBegin::Conflict
+        let identity = identity.clone();
+        let initial_checkpoint = initial_checkpoint.to_owned();
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "INSERT INTO flow_journal(request_id,schema_version,flow_digest,repository,input_fingerprint,revision,state,step_id,attempt,effectful,checkpoint_json,evidence_refs_json) VALUES (?1,1,?2,?3,?4,0,'ready',NULL,0,0,?5,'[]') ON CONFLICT(request_id) DO NOTHING",
+                params![identity.request_id,identity.flow_digest,identity.repository,identity.input_fingerprint,initial_checkpoint],
+            )?;
+            if changed == 1 {
+                return Ok(FlowJournalBegin::Inserted);
+            }
+            let existing = Self::flow_journal_locked(conn, &identity.request_id)?
+                .ok_or_else(|| invalid("conflicting journal disappeared"))?;
+            Ok(if existing.identity == identity {
+                FlowJournalBegin::Existing
+            } else {
+                FlowJournalBegin::Conflict
+            })
         })
+        .await
     }
 
     /// Read limits are applied inside SQL before text is allocated in Rust.
@@ -134,8 +143,9 @@ impl Store {
         request_id: &str,
     ) -> Result<Option<FlowJournal>, StoreError> {
         identifier(request_id, 128)?;
-        let conn = self.lock().await?;
-        Self::flow_journal_locked(&conn, request_id).await
+        let request_id = request_id.to_owned();
+        self.run(move |conn| Self::flow_journal_locked(conn, &request_id))
+            .await
     }
 
     /// Commit intent before I/O. False means stale ownership or a non-ready
@@ -153,11 +163,15 @@ impl Store {
         if !(1..=256).contains(&attempt) {
             return Err(invalid("attempt must be within 1..256"));
         }
-        let conn = self.lock().await?;
-        Ok(conn.execute(
-            "UPDATE flow_journal SET revision=revision+1,state='prepared',step_id=?3,attempt=?4,effectful=?5 WHERE request_id=?1 AND revision=?2 AND state='ready' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
-            params![request_id,expected_revision,step_id,i64::from(attempt),i64::from(effectful)],
-        ).await? == 1)
+        let request_id = request_id.to_owned();
+        let step_id = step_id.to_owned();
+        self.run(move |conn| {
+            Ok(conn.execute(
+                "UPDATE flow_journal SET revision=revision+1,state='prepared',step_id=?3,attempt=?4,effectful=?5 WHERE request_id=?1 AND revision=?2 AND state='ready' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
+                params![request_id,expected_revision,step_id,i64::from(attempt),i64::from(effectful)],
+            )? == 1)
+        })
+        .await
     }
 
     /// Atomically settle the owned prepared attempt and publish its checkpoint.
@@ -174,11 +188,15 @@ impl Store {
         checkpoint(checkpoint_json)?;
         let refs = references(evidence_refs)?;
         let state = if completed { "completed" } else { "ready" };
-        let conn = self.lock().await?;
-        Ok(conn.execute(
-            "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
-            params![request_id,expected_revision,state,checkpoint_json,refs],
-        ).await? == 1)
+        let request_id = request_id.to_owned();
+        let checkpoint_json = checkpoint_json.to_owned();
+        self.run(move |conn| {
+            Ok(conn.execute(
+                "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
+                params![request_id,expected_revision,state,checkpoint_json,refs],
+            )? == 1)
+        })
+        .await
     }
 
     /// Persist uncertainty before completing the original request after a crash.
@@ -211,20 +229,22 @@ impl Store {
         state: &str,
     ) -> Result<bool, StoreError> {
         transition_args(request_id, revision)?;
-        let conn = self.lock().await?;
-        Ok(conn.execute("UPDATE flow_journal SET revision=revision+1,state=?4 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=?3",
-            params![request_id,revision,i64::from(effectful),state]).await? == 1)
+        let request_id = request_id.to_owned();
+        let state = state.to_owned();
+        self.run(move |conn| {
+            Ok(conn.execute("UPDATE flow_journal SET revision=revision+1,state=?4 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=?3",
+                params![request_id,revision,i64::from(effectful),state])? == 1)
+        })
+        .await
     }
 
-    async fn flow_journal_locked(
-        conn: &turso::Connection,
+    fn flow_journal_locked(
+        conn: Db<'_>,
         request_id: &str,
     ) -> Result<Option<FlowJournal>, StoreError> {
-        let mut rows = conn.query(
-            "SELECT schema_version,revision,CASE WHEN length(CAST(state AS BLOB))<=16 THEN state ELSE NULL END,attempt,effectful,CASE WHEN length(CAST(flow_digest AS BLOB))=64 THEN flow_digest ELSE NULL END,CASE WHEN length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096 THEN repository ELSE NULL END,CASE WHEN length(CAST(input_fingerprint AS BLOB))=64 THEN input_fingerprint ELSE NULL END,CASE WHEN length(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END,CASE WHEN length(CAST(evidence_refs_json AS BLOB))<=16384 THEN evidence_refs_json ELSE NULL END,CASE WHEN length(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256 THEN 1 ELSE 0 END FROM flow_journal WHERE request_id=?1",
-            params![request_id],
-        ).await?;
-        let Some(row) = rows.next().await? else {
+        let mut stmt = conn.prepare("SELECT schema_version,revision,CASE WHEN length(CAST(state AS BLOB))<=16 THEN state ELSE NULL END,attempt,effectful,CASE WHEN length(CAST(flow_digest AS BLOB))=64 THEN flow_digest ELSE NULL END,CASE WHEN length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096 THEN repository ELSE NULL END,CASE WHEN length(CAST(input_fingerprint AS BLOB))=64 THEN input_fingerprint ELSE NULL END,CASE WHEN length(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END,CASE WHEN length(CAST(evidence_refs_json AS BLOB))<=16384 THEN evidence_refs_json ELSE NULL END,CASE WHEN length(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256 THEN 1 ELSE 0 END FROM flow_journal WHERE request_id=?1")?;
+        let mut rows = stmt.query(params![request_id])?;
+        let Some(row) = rows.next()? else {
             return Ok(None);
         };
         let required = |index| -> Result<String, StoreError> {

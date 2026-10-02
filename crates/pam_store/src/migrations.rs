@@ -5,9 +5,9 @@
 //! its own transaction. A database stamped with a version newer than the
 //! binary knows is refused rather than guessed at.
 
-use turso::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
-use crate::error::StoreError;
+use crate::error::{StoreError, engine};
 
 /// One schema migration: the version it produces and the SQL that gets there.
 pub(crate) struct Migration {
@@ -147,13 +147,9 @@ pub(crate) fn latest_version() -> i64 {
 }
 
 /// Reads the schema version currently recorded in the database.
-pub(crate) async fn current_version(conn: &Connection) -> Result<i64, StoreError> {
-    let mut rows = conn.query("PRAGMA user_version", ()).await?;
-    // The pragma always yields one row; treat a missing row as a fresh db.
-    match rows.next().await? {
-        Some(row) => Ok(row.get(0)?),
-        None => Ok(0),
-    }
+pub(crate) fn current_version(conn: &Connection) -> Result<i64, StoreError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(engine)
 }
 
 /// Applies every migration newer than the database's recorded version.
@@ -161,8 +157,8 @@ pub(crate) async fn current_version(conn: &Connection) -> Result<i64, StoreError
 /// Idempotent on reopen: an up-to-date database is left untouched. A
 /// database whose version is newer than this binary knows is refused
 /// with [`StoreError::VersionTooNew`].
-pub(crate) async fn run(conn: &Connection) -> Result<(), StoreError> {
-    let current = current_version(conn).await?;
+pub(crate) fn run(conn: &mut Connection) -> Result<(), StoreError> {
+    let current = current_version(conn)?;
     let latest = latest_version();
     if current > latest {
         return Err(StoreError::VersionTooNew {
@@ -171,39 +167,24 @@ pub(crate) async fn run(conn: &Connection) -> Result<(), StoreError> {
         });
     }
     for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
-        apply(conn, migration).await?;
+        apply(conn, migration)?;
     }
     Ok(())
 }
 
-/// Applies one migration inside its own transaction, rolling back on
-/// failure so a botched migration never leaves a half-stamped database.
-async fn apply(conn: &Connection, migration: &Migration) -> Result<(), StoreError> {
-    conn.execute("BEGIN", ()).await?;
-    let version = migration.version;
-    let applied = async {
-        conn.execute_batch(migration.sql).await?;
-        conn.execute(&format!("PRAGMA user_version = {version}"), ())
-            .await?;
-        Ok::<(), StoreError>(())
-    }
-    .await;
-    match applied {
-        Ok(()) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                // A failed COMMIT leaves the transaction open; roll it
-                // back so the connection is not stuck inside it.
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(err.into())
-            }
-        },
-        Err(err) => {
-            // Best effort: the returned error is the one that matters.
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(err)
-        }
-    }
+/// Applies one migration inside its own transaction, so a botched migration
+/// never leaves a half-stamped database: the schema change and the version
+/// stamp commit together, and an error (or a failed `COMMIT`) rolls both
+/// back when the transaction is dropped.
+fn apply(conn: &mut Connection, migration: &Migration) -> Result<(), StoreError> {
+    let txn = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(engine)?;
+    txn.execute_batch(migration.sql).map_err(engine)?;
+    // An integer of ours, not caller text: the pragma takes no bound value.
+    txn.execute_batch(&format!("PRAGMA user_version = {}", migration.version))
+        .map_err(engine)?;
+    txn.commit().map_err(engine)
 }
 
 /// Migration 1: the full spine schema.

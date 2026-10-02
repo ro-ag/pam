@@ -1,7 +1,7 @@
 //! Public watch progress is a published metadata projection, never a checkpoint read.
 use super::{Store, StoreError};
+use rusqlite::params;
 use serde_json::{Value, json};
-use turso::params;
 
 impl Store {
     /// Only the journal-committed published observation, never a newer uncommitted row.
@@ -10,27 +10,33 @@ impl Store {
         ticket: &str,
         repository: &str,
     ) -> Result<Option<String>, StoreError> {
-        let conn = self.lock().await?;
-        let mut cursor_rows=conn.query("SELECT CASE WHEN LENGTH(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END FROM flow_journal WHERE request_id=?1",params![ticket]).await?;
-        let Some(cursor_row) = cursor_rows.next().await? else {
-            return Ok(None);
-        };
-        let Some(cursor_json) = cursor_row.get::<Option<String>>(0)? else {
-            return Ok(None);
-        };
-        let Some((id, schedule)) = committed_evidence(&cursor_json) else {
-            return Ok(None);
-        };
-        drop(cursor_rows);
-        let mut rows=conn.query("SELECT CASE WHEN LENGTH(CAST(e.meta_json AS BLOB))<=16384 THEN e.meta_json ELSE NULL END,e.id FROM evidence e JOIN evidence_view v ON v.evidence_id=e.id AND v.request_id=e.request_id JOIN request r ON r.id=e.request_id WHERE e.request_id=?1 AND v.repository=?2 AND r.repo=?2 AND e.kind='flow.watch' AND e.id=?3 AND v.expired_at IS NULL LIMIT 1",params![ticket,repository,id]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let Some(raw) = row.get::<Option<String>>(0)? else {
-            return Ok(None);
-        };
-        let id: String = row.get(1)?;
-        Ok(progress(&raw, &id, schedule))
+        let ticket = ticket.to_owned();
+        let repository = repository.to_owned();
+        self.run(move |conn| {
+            let mut cursor_rows_stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END FROM flow_journal WHERE request_id=?1")?;
+            let mut cursor_rows = cursor_rows_stmt.query(params![ticket])?;
+            let Some(cursor_row) = cursor_rows.next()? else {
+                return Ok(None);
+            };
+            let Some(cursor_json) = cursor_row.get::<Option<String>>(0)? else {
+                return Ok(None);
+            };
+            let Some((id, schedule)) = committed_evidence(&cursor_json) else {
+                return Ok(None);
+            };
+            drop(cursor_rows);
+            let mut stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(e.meta_json AS BLOB))<=16384 THEN e.meta_json ELSE NULL END,e.id FROM evidence e JOIN evidence_view v ON v.evidence_id=e.id AND v.request_id=e.request_id JOIN request r ON r.id=e.request_id WHERE e.request_id=?1 AND v.repository=?2 AND r.repo=?2 AND e.kind='flow.watch' AND e.id=?3 AND v.expired_at IS NULL LIMIT 1")?;
+            let mut rows = stmt.query(params![ticket,repository,id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let Some(raw) = row.get::<Option<String>>(0)? else {
+                return Ok(None);
+            };
+            let id: String = row.get(1)?;
+            Ok(progress(&raw, &id, schedule))
+        })
+        .await
     }
 }
 

@@ -1,4 +1,4 @@
-use turso::Builder;
+use rusqlite::{Connection, params};
 
 use crate::{Store, StoreError, migrations};
 
@@ -26,17 +26,13 @@ async fn all_nine_tables_exist() {
         "model_job",
         "connector",
     ] {
-        let mut rows = store
-            .lock()
-            .await
-            .unwrap()
-            .query(
+        let count: i64 = store
+            .raw_scalar(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 [table],
             )
             .await
             .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 1, "table {table} missing");
     }
 }
@@ -62,13 +58,9 @@ async fn newer_database_version_is_refused() {
     let path = dir.path().join("state.sqlite3");
     drop(Store::open(&path).await.unwrap());
 
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute("PRAGMA user_version = 999", ()).await.unwrap();
-    drop((conn, db));
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA user_version = 999").unwrap();
+    drop(conn);
 
     let err = Store::open(&path).await.unwrap_err();
     assert!(matches!(
@@ -90,16 +82,10 @@ async fn v1_database_upgrades_to_v2() {
 
     // Build a genuine v1 database by hand: apply only the first
     // migration and stamp its version.
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
-    conn.execute_batch(migrations::MIGRATIONS[0].sql)
-        .await
-        .unwrap();
-    conn.execute("PRAGMA user_version = 1", ()).await.unwrap();
-    drop((conn, db));
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(migrations::MIGRATIONS[0].sql).unwrap();
+    conn.execute_batch("PRAGMA user_version = 1").unwrap();
+    drop(conn);
 
     // Opening runs migrations 2 through 6: the idempotency column
     // exists, the model job table exists, the connector table exists,
@@ -125,16 +111,12 @@ async fn v3_database_gains_meta_json() {
 
     // Build a genuine v3 database by hand: apply migrations 1..=3 and
     // stamp their version, so the evidence table has no `meta_json`.
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = Connection::open(&path).unwrap();
     for migration in &migrations::MIGRATIONS[..3] {
-        conn.execute_batch(migration.sql).await.unwrap();
+        conn.execute_batch(migration.sql).unwrap();
     }
-    conn.execute("PRAGMA user_version = 3", ()).await.unwrap();
-    drop((conn, db));
+    conn.execute_batch("PRAGMA user_version = 3").unwrap();
+    drop(conn);
 
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.schema_version().await.unwrap(), 13);
@@ -165,39 +147,28 @@ async fn v4_database_upgrades_to_v5() {
 
     // Build a genuine v4 database by hand: apply migrations 1..=4 and
     // stamp their version, so the `connector` table does not exist yet.
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = Connection::open(&path).unwrap();
     for migration in &migrations::MIGRATIONS[..4] {
-        conn.execute_batch(migration.sql).await.unwrap();
+        conn.execute_batch(migration.sql).unwrap();
     }
-    conn.execute("PRAGMA user_version = 4", ()).await.unwrap();
-    drop((conn, db));
+    conn.execute_batch("PRAGMA user_version = 4").unwrap();
+    drop(conn);
 
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.schema_version().await.unwrap(), 13);
 
-    let mut rows = store
-        .lock()
-        .await
-        .unwrap()
-        .query(
+    let count: i64 = store
+        .raw_scalar(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'connector'",
             (),
         )
         .await
         .unwrap();
-    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 1, "migration 5 did not create the connector table");
 
     // `enabled` rejects anything but 0 or 1.
     let err = store
-        .lock()
-        .await
-        .unwrap()
-        .execute(
+        .raw_execute(
             "INSERT INTO connector (id, enabled, updated_ts) VALUES ('x', 2, 0)",
             (),
         )
@@ -210,10 +181,7 @@ async fn v4_database_upgrades_to_v5() {
 
     // `last_test_status` only accepts 'passed' or 'failed'.
     let err = store
-        .lock()
-        .await
-        .unwrap()
-        .execute(
+        .raw_execute(
             "INSERT INTO connector (id, enabled, last_test_status, updated_ts)
              VALUES ('y', 0, 'maybe', 0)",
             (),
@@ -228,18 +196,18 @@ async fn v4_database_upgrades_to_v5() {
 
 /// Column names of the `evidence` table, via `PRAGMA table_info`.
 async fn evidence_columns(store: &Store) -> Vec<String> {
-    let mut rows = store
-        .lock()
+    store
+        .raw(|conn| {
+            let mut stmt = conn.prepare("PRAGMA table_info(evidence)")?;
+            let mut rows = stmt.query(())?;
+            let mut names = Vec::new();
+            while let Some(row) = rows.next()? {
+                names.push(row.get(1)?);
+            }
+            Ok(names)
+        })
         .await
         .unwrap()
-        .query("PRAGMA table_info(evidence)", ())
-        .await
-        .unwrap();
-    let mut names = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        names.push(row.get(1).unwrap());
-    }
-    names
 }
 
 #[test]
@@ -255,17 +223,13 @@ fn migrations_are_strictly_ordered() {
 async fn v5_queued_requests_upgrade_without_authorization_or_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.sqlite3");
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = Connection::open(&path).unwrap();
     for migration in migrations::MIGRATIONS.iter().take(5) {
-        conn.execute_batch(migration.sql).await.unwrap();
+        conn.execute_batch(migration.sql).unwrap();
     }
-    conn.execute("INSERT INTO request(id,capability,repo,caller_agent,args_json,state,created_ts,updated_ts) VALUES ('old','echo','repo','agent','{}','queued',1,1)", ()).await.unwrap();
-    conn.execute("PRAGMA user_version = 5", ()).await.unwrap();
-    drop((conn, db));
+    conn.execute("INSERT INTO request(id,capability,repo,caller_agent,args_json,state,created_ts,updated_ts) VALUES ('old','echo','repo','agent','{}','queued',1,1)", ()).unwrap();
+    conn.execute_batch("PRAGMA user_version = 5").unwrap();
+    drop(conn);
     let store = Store::open(&path).await.unwrap();
     let row = store.get_request("old").await.unwrap().unwrap();
     assert_eq!(row.expires_at_ms, None);
@@ -274,16 +238,12 @@ async fn v5_queued_requests_upgrade_without_authorization_or_expiry() {
 
 /// A genuine v11 database: every migration up to 11, stamped 11, holding
 /// the grants, requests and audit row a daemon of that version leaves behind.
-async fn build_v11_database(path: &std::path::Path) {
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+fn build_v11_database(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
     for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 11) {
-        conn.execute_batch(migration.sql).await.unwrap();
+        conn.execute_batch(migration.sql).unwrap();
     }
-    conn.execute("PRAGMA user_version = 11", ()).await.unwrap();
+    conn.execute_batch("PRAGMA user_version = 11").unwrap();
     for (capability, granted, revoked) in [
         // Two revocations inside one second, a later one, and a live grant.
         ("echo", 10, Some(100)),
@@ -294,9 +254,8 @@ async fn build_v11_database(path: &std::path::Path) {
         conn.execute(
             "INSERT INTO \"grant\" (capability, scope, granted_ts, revoked_ts)
              VALUES (?1, 'global', ?2, ?3)",
-            turso::params![capability, granted, revoked],
+            params![capability, granted, revoked],
         )
-        .await
         .unwrap();
     }
     for (id, capability, revision) in [
@@ -312,9 +271,8 @@ async fn build_v11_database(path: &std::path::Path) {
             "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
                  created_ts, updated_ts, expires_at_ms, authorization_revision, queue_authorized)
              VALUES (?1, ?2, '/repo', 'agent', '{}', 'done', 1, 1, 9000000000000, ?3, 1)",
-            turso::params![id, capability, revision],
+            params![id, capability, revision],
         )
-        .await
         .unwrap();
     }
     conn.execute(
@@ -322,9 +280,8 @@ async fn build_v11_database(path: &std::path::Path) {
          VALUES ('echo_after', 'execute', 'allow', 'policy', 'kept', 5)",
         (),
     )
-    .await
     .unwrap();
-    drop((conn, db));
+    drop(conn);
 }
 
 #[tokio::test]
@@ -332,7 +289,7 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");
 
-    build_v11_database(&path).await;
+    build_v11_database(&path);
 
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.schema_version().await.unwrap(), 13);
@@ -340,21 +297,19 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
     // rather than trusted.
-    let conn = store.lock().await.unwrap();
-    let mut rows = conn
-        .query(
-            "SELECT capability, revoked_seq FROM \"grant\" ORDER BY id",
-            (),
-        )
+    let sequence = store
+        .raw(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT capability, revoked_seq FROM \"grant\" ORDER BY id")?;
+            let mut rows = stmt.query(())?;
+            let mut sequence = Vec::new();
+            while let Some(row) = rows.next()? {
+                sequence.push((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?));
+            }
+            Ok(sequence)
+        })
         .await
         .unwrap();
-    let mut sequence = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        sequence.push((
-            row.get::<String>(0).unwrap(),
-            row.get::<Option<i64>>(1).unwrap(),
-        ));
-    }
     assert_eq!(
         sequence,
         [
@@ -373,21 +328,19 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
         "audit_append_only",
         "evidence_view_immutable",
     ] {
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [name])
+        let count: i64 = store
+            .raw_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [name])
             .await
             .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 1, "{name} missing after the upgrade");
     }
     // The upgraded trail is append-only too, and kept its rows.
     assert!(
-        conn.execute("UPDATE audit SET detail = 'rewritten'", ())
+        store
+            .raw_execute("UPDATE audit SET detail = 'rewritten'", ())
             .await
             .is_err()
     );
-    drop(rows);
-    drop(conn);
     assert_eq!(
         store.audit_for_request("echo_after").await.unwrap()[0]
             .detail
@@ -428,16 +381,12 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
 /// A genuine v12 database (the version before the origin columns): every
 /// migration up to 12, stamped 12, holding rows a daemon of that version
 /// left behind in each lifecycle state.
-async fn build_v12_database(path: &std::path::Path) {
-    let db = Builder::new_local(path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
-    let conn = db.connect().unwrap();
+fn build_v12_database(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
     for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 12) {
-        conn.execute_batch(migration.sql).await.unwrap();
+        conn.execute_batch(migration.sql).unwrap();
     }
-    conn.execute("PRAGMA user_version = 12", ()).await.unwrap();
+    conn.execute_batch("PRAGMA user_version = 12").unwrap();
     for (id, capability, state) in [
         ("old_queued", "echo", "queued"),
         ("old_done", "flow.run", "done"),
@@ -447,9 +396,8 @@ async fn build_v12_database(path: &std::path::Path) {
             "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
                  created_ts, updated_ts, expires_at_ms, authorization_revision, queue_authorized)
              VALUES (?1, ?2, '/repo', 'agent', '{}', ?3, 1, 1, 9000000000000, 0, 1)",
-            turso::params![id, capability, state],
+            params![id, capability, state],
         )
-        .await
         .unwrap();
     }
     conn.execute(
@@ -457,9 +405,8 @@ async fn build_v12_database(path: &std::path::Path) {
          VALUES ('old_done', 'execute', 'allow', 'system', 'kept', 5)",
         (),
     )
-    .await
     .unwrap();
-    drop((conn, db));
+    drop(conn);
 }
 
 /// The upgrade from the previous version: existing rows survive, read back
@@ -472,7 +419,7 @@ async fn v12_database_gains_the_request_origin_columns() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");
-    build_v12_database(&path).await;
+    build_v12_database(&path);
 
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.schema_version().await.unwrap(), 13);
@@ -526,17 +473,17 @@ async fn v12_database_gains_the_request_origin_columns() {
 
     // The column constraints came with the upgrade: an ingress outside the
     // two planes, or a relayed flag that is not a flag, is refused.
-    let conn = store.lock().await.unwrap();
     for (ingress, relayed) in [("gui", 0), ("public", 2)] {
         assert!(
-            conn.execute(
-                "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
+            store
+                .raw_execute(
+                    "INSERT INTO request (id, capability, repo, caller_agent, args_json, state,
                      created_ts, updated_ts, ingress, relayed)
                  VALUES ('bad', 'echo', '/repo', 'agent', '{}', 'done', 1, 1, ?1, ?2)",
-                turso::params![ingress, relayed],
-            )
-            .await
-            .is_err(),
+                    (ingress, relayed),
+                )
+                .await
+                .is_err(),
             "ingress {ingress:?} relayed {relayed} was accepted"
         );
     }

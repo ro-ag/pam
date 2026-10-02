@@ -3,24 +3,27 @@
 //! they belong to the OS credential store. The store stays thin (open, migrate, a handful
 //! of typed helpers); richer queries belong to the services that own them.
 //!
-//! Engine: [Turso](https://docs.rs/turso) (formerly Limbo), a pure-Rust `SQLite` rewrite,
-//! file-format compatible; `mimalloc` (bundled C allocator) is disabled, `pure-rust-crypto`
-//! is enabled, and the workspace patches in a vendored `turso_core` whose vector distances
-//! are plain Rust, so `simsimd`'s C kernel is not linked (see `vendor/turso_core/PATCH.md`).
-//! WAL is native (nothing switches it on); `PRAGMA user_version`, CHECK constraints,
-//! triggers, and `PRAGMA foreign_keys = ON` all work. The API is async; Turso drives its
-//! own I/O, and this crate's only `tokio` dependency is the `sync` mutex that owns the one
-//! connection: every statement runs through its guard, and a `BEGIN`..`COMMIT` window that a
-//! dropped caller abandons is rolled back before the next statement (see `conn_gate`).
-//! Integrity is enforced twice — CHECK and foreign-key constraints in the database, typed enums in
-//! Rust — and the daemon still owns threading and task placement.
+//! Engine: `SQLite` itself, through the `rusqlite` client with the engine's
+//! source bundled and linked statically (never the system library, so every
+//! target runs the same engine). Write-ahead logging, a full sync per commit,
+//! foreign keys and the hardening settings are applied to the connection at
+//! open and read back (see `open`). The engine's client is synchronous; the
+//! public API is async. There is one connection: every call waits for it on an
+//! async gate and then runs its statements as one closure on a blocking thread
+//! of the caller's runtime, to completion, so a call whose future is dropped
+//! never leaves a transaction open, and a write it had started either
+//! committed whole or not at all (see `conn_gate`). Integrity is enforced
+//! twice — CHECK and foreign-key constraints in the database, typed enums in
+//! Rust.
 
 mod conn_gate;
+mod db;
 mod error;
 mod migrations;
+mod open;
 mod store;
 
-pub use error::StoreError;
+pub use error::{EngineError, StoreError};
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, CorrelationBind, CorrelationStep, DEFAULT_REQUEST_LIST_LIMIT,
@@ -38,9 +41,13 @@ pub use store::{
 #[cfg(test)]
 mod conn_gate_test;
 #[cfg(test)]
+mod error_test;
+#[cfg(test)]
 mod evidence_views_test;
 #[cfg(test)]
 mod migrations_test;
+#[cfg(test)]
+mod open_test;
 #[cfg(test)]
 mod store_integrity_test;
 #[cfg(test)]

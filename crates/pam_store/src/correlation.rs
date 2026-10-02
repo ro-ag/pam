@@ -1,6 +1,6 @@
 //! Immutable private workflow correlation. Authorization belongs to the daemon.
 use super::{Store, StoreError};
-use turso::params;
+use rusqlite::params;
 
 /// Result of binding one immutable identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,34 +47,37 @@ impl Store {
         canonical_json: &str,
     ) -> Result<CorrelationBind, StoreError> {
         validate(canonical_json, 16384)?;
-        let conn = self.lock().await?;
-        let mut rows = conn
-            .query("SELECT 1 FROM request WHERE id=?1", params![request_id])
-            .await?;
-        if rows.next().await?.is_none() {
-            return Err(StoreError::NotFound {
-                table: "request",
-                id: request_id.to_owned(),
-            });
-        }
-        drop(rows);
-        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target WHERE request_id=?1", params![request_id]).await?;
-        if let Some(row) = rows.next().await? {
-            return Ok(
-                if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json) {
-                    CorrelationBind::Existing
-                } else {
-                    CorrelationBind::Conflict
-                },
-            );
-        }
-        drop(rows);
-        conn.execute(
-            "INSERT INTO correlation_target(request_id,canonical_json) VALUES (?1,?2)",
-            params![request_id, canonical_json],
-        )
-        .await?;
-        Ok(CorrelationBind::Inserted)
+        let request_id = request_id.to_owned();
+        let canonical_json = canonical_json.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT 1 FROM request WHERE id=?1")?;
+            let mut rows = stmt.query(params![request_id])?;
+            if rows.next()?.is_none() {
+                return Err(StoreError::NotFound {
+                    table: "request",
+                    id: request_id.clone(),
+                });
+            }
+            drop(rows);
+            let mut stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target WHERE request_id=?1")?;
+            let mut rows = stmt.query(params![request_id])?;
+            if let Some(row) = rows.next()? {
+                return Ok(
+                    if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json.as_str()) {
+                        CorrelationBind::Existing
+                    } else {
+                        CorrelationBind::Conflict
+                    },
+                );
+            }
+            drop(rows);
+            conn.execute(
+                "INSERT INTO correlation_target(request_id,canonical_json) VALUES (?1,?2)",
+                params![request_id, canonical_json],
+            )?;
+            Ok(CorrelationBind::Inserted)
+        })
+        .await
     }
 
     /// Bind a step only after the target, with finite per-request capacity.
@@ -89,43 +92,49 @@ impl Store {
         if step_id.is_empty() || step_id.len() > 256 {
             return Err(invalid("step identifier must contain 1..256 bytes"));
         }
-        let conn = self.lock().await?;
-        let mut rows = conn.query("SELECT 1 FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
-        if rows.next().await?.is_none() {
-            return Err(StoreError::NotFound {
-                table: "correlation_target",
-                id: request_id.to_owned(),
-            });
-        }
-        drop(rows);
-        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step WHERE request_id=?1 AND step_id=?2", params![request_id,step_id]).await?;
-        if let Some(row) = rows.next().await? {
-            return Ok(
-                if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json) {
-                    CorrelationBind::Existing
-                } else {
-                    CorrelationBind::Conflict
-                },
-            );
-        }
-        drop(rows);
-        let mut rows = conn.query("SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_json AS BLOB))),0) FROM correlation_step WHERE request_id=?1", params![request_id]).await?;
-        let row = rows
-            .next()
-            .await?
-            .ok_or_else(|| invalid("missing capacity accounting"))?;
-        let bytes =
-            i64::try_from(canonical_json.len()).map_err(|_| invalid("JSON length overflow"))?;
-        if row.get::<i64>(0)? >= 64 || row.get::<i64>(1)?.saturating_add(bytes) > 524_288 {
-            return Err(invalid("step capacity exhausted"));
-        }
-        drop(rows);
-        conn.execute(
-            "INSERT INTO correlation_step(request_id,step_id,canonical_json) VALUES (?1,?2,?3)",
-            params![request_id, step_id, canonical_json],
-        )
-        .await?;
-        Ok(CorrelationBind::Inserted)
+        let request_id = request_id.to_owned();
+        let step_id = step_id.to_owned();
+        let canonical_json = canonical_json.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT 1 FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1")?;
+            let mut rows = stmt.query(params![request_id])?;
+            if rows.next()?.is_none() {
+                return Err(StoreError::NotFound {
+                    table: "correlation_target",
+                    id: request_id.clone(),
+                });
+            }
+            drop(rows);
+            let mut stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step WHERE request_id=?1 AND step_id=?2")?;
+            let mut rows = stmt.query(params![request_id,step_id])?;
+            if let Some(row) = rows.next()? {
+                return Ok(
+                    if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json.as_str()) {
+                        CorrelationBind::Existing
+                    } else {
+                        CorrelationBind::Conflict
+                    },
+                );
+            }
+            drop(rows);
+            let mut stmt = conn.prepare("SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_json AS BLOB))),0) FROM correlation_step WHERE request_id=?1")?;
+            let mut rows = stmt.query(params![request_id])?;
+            let row = rows
+                .next()?
+                .ok_or_else(|| invalid("missing capacity accounting"))?;
+            let bytes =
+                i64::try_from(canonical_json.len()).map_err(|_| invalid("JSON length overflow"))?;
+            if row.get::<i64>(0)? >= 64 || row.get::<i64>(1)?.saturating_add(bytes) > 524_288 {
+                return Err(invalid("step capacity exhausted"));
+            }
+            drop(rows);
+            conn.execute(
+                "INSERT INTO correlation_step(request_id,step_id,canonical_json) VALUES (?1,?2,?3)",
+                params![request_id, step_id, canonical_json],
+            )?;
+            Ok(CorrelationBind::Inserted)
+        })
+        .await
     }
 
     /// Private target read: bounded before allocation, no public authorization implied.
@@ -133,16 +142,20 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Option<String>, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let json = row
-            .get::<Option<String>>(0)?
-            .ok_or_else(|| invalid("stored target exceeds byte limit"))?;
-        validate(&json, 16384)?;
-        Ok(Some(json))
+        let request_id = request_id.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1")?;
+            let mut rows = stmt.query(params![request_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let json = row
+                .get::<Option<String>>(0)?
+                .ok_or_else(|| invalid("stored target exceeds byte limit"))?;
+            validate(&json, 16384)?;
+            Ok(Some(json))
+        })
+        .await
     }
 
     /// Private step read. Overflow refuses the complete set rather than a prefix.
@@ -150,30 +163,34 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Vec<CorrelationStep>, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step s JOIN request r ON r.id=s.request_id WHERE s.request_id=?1 ORDER BY step_id LIMIT 65", params![request_id]).await?;
-        let mut steps = Vec::new();
-        let mut bytes = 0usize;
-        while let Some(row) = rows.next().await? {
-            if steps.len() == 64 {
-                return Err(invalid("stored step capacity exceeded"));
+        let request_id = request_id.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT CASE WHEN LENGTH(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step s JOIN request r ON r.id=s.request_id WHERE s.request_id=?1 ORDER BY step_id LIMIT 65")?;
+            let mut rows = stmt.query(params![request_id])?;
+            let mut steps = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = rows.next()? {
+                if steps.len() == 64 {
+                    return Err(invalid("stored step capacity exceeded"));
+                }
+                let step_id = row
+                    .get::<Option<String>>(0)?
+                    .ok_or_else(|| invalid("stored step identifier oversized"))?;
+                let canonical_json = row
+                    .get::<Option<String>>(1)?
+                    .ok_or_else(|| invalid("stored step JSON oversized"))?;
+                validate(&canonical_json, 8192)?;
+                bytes = bytes.saturating_add(canonical_json.len());
+                if bytes > 524_288 {
+                    return Err(invalid("stored step bytes exceeded"));
+                }
+                steps.push(CorrelationStep {
+                    step_id,
+                    canonical_json,
+                });
             }
-            let step_id = row
-                .get::<Option<String>>(0)?
-                .ok_or_else(|| invalid("stored step identifier oversized"))?;
-            let canonical_json = row
-                .get::<Option<String>>(1)?
-                .ok_or_else(|| invalid("stored step JSON oversized"))?;
-            validate(&canonical_json, 8192)?;
-            bytes = bytes.saturating_add(canonical_json.len());
-            if bytes > 524_288 {
-                return Err(invalid("stored step bytes exceeded"));
-            }
-            steps.push(CorrelationStep {
-                step_id,
-                canonical_json,
-            });
-        }
-        Ok(steps)
+            Ok(steps)
+        })
+        .await
     }
 }

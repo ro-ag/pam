@@ -1,4 +1,16 @@
+use std::fmt;
 use std::path::PathBuf;
+
+/// Primary result codes of the engine this crate classifies. The values are
+/// part of `SQLite`'s stable C interface.
+const PRIMARY_BUSY: i32 = 5;
+const PRIMARY_LOCKED: i32 = 6;
+const PRIMARY_CORRUPT: i32 = 11;
+const PRIMARY_CONSTRAINT: i32 = 19;
+const PRIMARY_NOT_A_DATABASE: i32 = 26;
+
+/// Longest engine message kept on an error.
+const MESSAGE_LIMIT: usize = 512;
 
 /// Everything that can go wrong while opening or using the store.
 #[derive(Debug, thiserror::Error)]
@@ -83,9 +95,9 @@ pub enum StoreError {
         id: String,
     },
 
-    /// A store call was dropped inside a transaction and the rollback that
-    /// should have cleared it failed; the connection is refused rather than
-    /// reused inside somebody else's transaction.
+    /// A store call ended with its transaction still open and the rollback
+    /// that should have cleared it failed; the connection is refused from
+    /// then on rather than reused inside that transaction.
     #[error(
         "the store connection is stuck inside an abandoned transaction; \
          restart the pam daemon to recover it"
@@ -103,22 +115,110 @@ pub enum StoreError {
         detail: String,
     },
 
+    /// The call did not run to an answer: its work panicked, or the runtime
+    /// that carries the store's blocking work is shutting down. A write the
+    /// call was making either committed whole or not at all.
+    #[error(
+        "the store could not complete the call: {detail}; retry it, and \
+         restart the pam daemon if it keeps failing"
+    )]
+    Unavailable {
+        /// What stopped the call, bounded.
+        detail: String,
+    },
+
     /// Any underlying database engine failure.
     #[error("database error: {0}")]
-    Database(#[source] turso::Error),
+    Database(#[source] EngineError),
 }
 
-impl From<turso::Error> for StoreError {
-    /// The engine's own corruption verdicts become [`StoreError::Corrupt`]
-    /// wherever they surface, so a damaged file reads the same at open, in
-    /// the boot check, and half-way through a request; every other engine
-    /// failure stays [`StoreError::Database`].
-    fn from(error: turso::Error) -> Self {
-        match error {
-            turso::Error::Corrupt(detail) | turso::Error::NotAdb(detail) => Self::Corrupt {
-                detail: detail.chars().take(200).collect(),
-            },
-            other => Self::Database(other),
+/// A failure reported by the database engine, without naming the engine's
+/// own types: its result code, the message it gave, and the two questions a
+/// caller may reasonably ask of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineError {
+    code: i32,
+    message: String,
+}
+
+impl EngineError {
+    pub(crate) fn new(code: i32, message: &str) -> Self {
+        Self {
+            code,
+            message: message.chars().take(MESSAGE_LIMIT).collect(),
         }
+    }
+
+    /// The engine's extended result code (`SQLite`'s numbering), or `0` when
+    /// the failure came from the client layer rather than the engine: a
+    /// column read as the wrong type, a wrong number of bound values.
+    #[must_use]
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+
+    /// The engine's own words for the failure.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// A constraint refused the write: a primary key or unique index, a
+    /// foreign key, a `CHECK`, a `NOT NULL`, or a trigger's `RAISE(ABORT)`.
+    #[must_use]
+    pub fn is_constraint(&self) -> bool {
+        self.code & 0xff == PRIMARY_CONSTRAINT
+    }
+
+    /// Another connection held the database for longer than the busy
+    /// timeout. Nothing was written; the call can be repeated.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(self.code & 0xff, PRIMARY_BUSY | PRIMARY_LOCKED)
+    }
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_busy() {
+            // The engine's "database is locked" does not say who or what to do.
+            write!(
+                f,
+                "{} (another process held the database file past the busy timeout; \
+                 nothing was written, retry the call)",
+                self.message
+            )
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+/// Turns an engine failure into the store's own error.
+///
+/// The engine's corruption verdicts become [`StoreError::Corrupt`] wherever
+/// they surface, so a damaged file reads the same at open, in the boot check,
+/// and half-way through a request; every other failure is a
+/// [`StoreError::Database`] carrying the engine's code and message. A plain
+/// function, not a `From` impl: the conversion would put the engine's error
+/// type into this crate's public interface.
+pub(crate) fn engine(error: rusqlite::Error) -> StoreError {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, message) => {
+            let message = message.unwrap_or_else(|| failure.to_string());
+            if matches!(
+                failure.extended_code & 0xff,
+                PRIMARY_CORRUPT | PRIMARY_NOT_A_DATABASE
+            ) {
+                StoreError::Corrupt {
+                    detail: message.chars().take(200).collect(),
+                }
+            } else {
+                StoreError::Database(EngineError::new(failure.extended_code, &message))
+            }
+        }
+        other => StoreError::Database(EngineError::new(0, &other.to_string())),
     }
 }

@@ -2,7 +2,8 @@
 use std::collections::BTreeSet;
 
 use super::{Store, StoreError};
-use turso::params;
+use crate::db::Db;
+use rusqlite::params;
 
 const MAX_MEMBERS: usize = 256;
 const MAX_JSON_BYTES: usize = 16_384;
@@ -61,30 +62,34 @@ impl Store {
     ) -> Result<Option<Vec<u64>>, StoreError> {
         validate_binding(expected_binding_json)?;
         let incoming = members(observed)?;
-        let conn = self.lock().await?;
-        let Some(current) =
-            Self::membership_locked(&conn, request_id, step_id, expected_binding_json).await?
-        else {
-            return Ok(None);
-        };
-        let mut merged = members(&current)?;
-        merged.extend(incoming);
-        if merged.len() > MAX_MEMBERS {
-            return Err(invalid("job membership capacity exhausted"));
-        }
-        let merged: Vec<u64> = merged.into_iter().collect();
-        let encoded = serde_json::to_string(&merged)
-            .map_err(|_| invalid("membership serialization failed"))?;
-        if encoded.len() > MAX_JSON_BYTES {
-            return Err(invalid("membership exceeds byte limit"));
-        }
-        conn.execute(
-            "INSERT INTO correlation_membership(request_id,step_id,members_json) VALUES(?1,?2,?3)
-             ON CONFLICT(request_id,step_id) DO UPDATE SET members_json=excluded.members_json",
-            params![request_id, step_id, encoded],
-        )
-        .await?;
-        Ok(Some(merged))
+        let request_id = request_id.to_owned();
+        let step_id = step_id.to_owned();
+        let expected_binding_json = expected_binding_json.to_owned();
+        self.run(move |conn| {
+            let Some(current) =
+                Self::membership_locked(conn, &request_id, &step_id, &expected_binding_json)?
+            else {
+                return Ok(None);
+            };
+            let mut merged = members(&current)?;
+            merged.extend(incoming);
+            if merged.len() > MAX_MEMBERS {
+                return Err(invalid("job membership capacity exhausted"));
+            }
+            let merged: Vec<u64> = merged.into_iter().collect();
+            let encoded = serde_json::to_string(&merged)
+                .map_err(|_| invalid("membership serialization failed"))?;
+            if encoded.len() > MAX_JSON_BYTES {
+                return Err(invalid("membership exceeds byte limit"));
+            }
+            conn.execute(
+                "INSERT INTO correlation_membership(request_id,step_id,members_json) VALUES(?1,?2,?3)
+                 ON CONFLICT(request_id,step_id) DO UPDATE SET members_json=excluded.members_json",
+                params![request_id, step_id, encoded],
+            )?;
+            Ok(Some(merged))
+        })
+        .await
     }
 
     /// Restore membership only when its immutable parent still matches exactly.
@@ -96,25 +101,28 @@ impl Store {
         expected_binding_json: &str,
     ) -> Result<Option<Vec<u64>>, StoreError> {
         validate_binding(expected_binding_json)?;
-        let conn = self.lock().await?;
-        Self::membership_locked(&conn, request_id, step_id, expected_binding_json).await
+        let request_id = request_id.to_owned();
+        let step_id = step_id.to_owned();
+        let expected_binding_json = expected_binding_json.to_owned();
+        self.run(move |conn| {
+            Self::membership_locked(conn, &request_id, &step_id, &expected_binding_json)
+        })
+        .await
     }
 
-    async fn membership_locked(
-        conn: &turso::Connection,
+    fn membership_locked(
+        conn: Db<'_>,
         request_id: &str,
         step_id: &str,
         expected: &str,
     ) -> Result<Option<Vec<u64>>, StoreError> {
-        let mut rows = conn.query(
-            "SELECT CASE WHEN length(CAST(s.canonical_json AS BLOB))<=8192 THEN s.canonical_json ELSE NULL END,
+        let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(s.canonical_json AS BLOB))<=8192 THEN s.canonical_json ELSE NULL END,
              m.request_id,CASE WHEN length(CAST(m.members_json AS BLOB))<=16384 THEN m.members_json ELSE NULL END
              FROM correlation_step s LEFT JOIN correlation_membership m
              ON m.request_id=s.request_id AND m.step_id=s.step_id
-             WHERE s.request_id=?1 AND s.step_id=?2",
-            params![request_id, step_id],
-        ).await?;
-        let Some(row) = rows.next().await? else {
+             WHERE s.request_id=?1 AND s.step_id=?2")?;
+        let mut rows = stmt.query(params![request_id, step_id])?;
+        let Some(row) = rows.next()? else {
             return Ok(None);
         };
         if row.get::<Option<String>>(0)?.as_deref() != Some(expected) {

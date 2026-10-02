@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-turso.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 # evidence content hashing (sha256 hex) and the compression figures the
 # odometer aggregates out of `evidence.meta_json`.
@@ -15,9 +15,10 @@ sha2.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-# sync-only: the async mutex that owns the one connection (conn_gate.rs).
-# No runtime features — the daemon owns task placement.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# `sync`: the async mutex that owns the one connection (conn_gate.rs).
+# `rt`: `spawn_blocking` — the engine's client is synchronous, so the store
+# places its own blocking work, one job at a time, on the caller's runtime.
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
 
 [dev-dependencies]
 tokio.workspace = true

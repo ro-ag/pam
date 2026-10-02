@@ -100,6 +100,7 @@ const LONG_ADMIN_OPS: readonly string[] = [
   "admin.models.try",
   "admin.log.compress",
   "admin.models.engine.install",
+  "admin.models.engine.import",
 ];
 const LONG_TIMEOUT_MS = 150_000;
 
@@ -245,6 +246,9 @@ export type AdminOp =
   | "admin.models.settings.set"
   | "admin.models.engine.status"
   | "admin.models.engine.install"
+  | "admin.models.engine.import"
+  | "admin.models.engine.remove"
+  | "admin.models.import"
   | "admin.models.try"
   | "admin.curator.list"
   | "admin.curator.set"
@@ -584,6 +588,20 @@ export interface CatalogPreset {
    * see these — the part file is a dotfile — so the catalog reports them.
    */
   partial_bytes: number | null;
+  /**
+   * What a download of this preset would actually fetch, worked out by the daemon with the
+   * function the downloader uses: the host shown is the host requested. Absent on a daemon that
+   * predates network settings; the screen then falls back to the catalog `url`.
+   */
+  fetch?: PresetFetch;
+}
+
+/** Where a catalog download comes from, resolved against the network settings. */
+export interface PresetFetch {
+  url: string;
+  host: string;
+  /** `mirror` when the configured models mirror replaced the catalog host. */
+  source: "upstream" | "mirror";
 }
 
 /** Where the runtime is; `state` is the discriminant the daemon tags on. */
@@ -606,7 +624,7 @@ export type RuntimeState =
 /** One `model_job` row: a download or a digest run. */
 export interface ModelJob {
   id: string;
-  kind: "download" | "verify";
+  kind: "download" | "verify" | "import";
   model_id: string;
   source: string | null;
   state: "running" | "done" | "failed" | "cancelled";
@@ -639,7 +657,15 @@ export interface EngineManifest {
   bytes: number;
   version_line: string | null;
   installed_at_ms: number;
+  /** Absent in a manifest written by an older build: shown as "source not recorded". */
+  source?: EngineSource | null;
 }
+
+/** Where the installed archive came from (`pam_model::engine::EngineSource`). */
+export type EngineSource =
+  | { kind: "download"; host: string }
+  | { kind: "mirror"; host: string; url?: string }
+  | { kind: "import"; path: string; imported_at_ms?: number };
 
 /**
  * The pinned llama.cpp engine's install state (`admin.models.engine.status`
@@ -654,6 +680,33 @@ export interface EngineStatus {
   server_path: string | null;
   manifest: EngineManifest | null;
   cause: EngineCause;
+  /**
+   * What Install would do, computed by the daemon so the card cannot disagree with the request.
+   * All absent on a daemon that predates engine delivery, and null for an unsupported platform;
+   * the card then says less, never more.
+   */
+  expected_asset?: string | null;
+  expected_size?: number | null;
+  /** The compiled-in SHA-256 the archive is held to. */
+  expected_sha256?: string | null;
+  /** The exact address Install would fetch: upstream, or the mirror's when one is configured. */
+  download_url?: string | null;
+  download_host?: string | null;
+  mirror_in_use?: boolean;
+  mirror_host?: string | null;
+  upstream_host?: string;
+  /** What Remove deletes, and what to delete by hand. */
+  engine_dir?: string;
+  /** The unpacked release inside `engine_dir`. */
+  install_dir?: string;
+  /** Where the installed engine came from; null when not installed or not recorded. */
+  source?: EngineSource | null;
+  /** A model is loaded on the engine right now. */
+  loaded?: boolean;
+  /** `engine_dir` has content and nothing is loaded. */
+  removable?: boolean;
+  /** Present only when the stored network settings cannot be read. */
+  network_issue?: BridgeFailure;
 }
 
 /** Read-only: never installs anything. */
@@ -667,6 +720,31 @@ export function engineStatus(): Promise<EngineStatus> {
  */
 export function engineInstall(): Promise<EngineStatus> {
   return adminCall("admin.models.engine.install", { confirm: true });
+}
+
+/**
+ * Installs the pinned engine from a file already on this computer: the release archive, or a
+ * folder that holds it by its exact name. No network is used; the daemon copies the file, checks
+ * the copy against the SHA-256 built into PAM, and leaves the original untouched.
+ */
+export function engineImport(path: string): Promise<EngineStatus> {
+  return adminCall("admin.models.engine.import", { path, confirm: true });
+}
+
+/** What `admin.models.engine.remove` answers. */
+export interface EngineRemoveReply {
+  removed: boolean;
+  engine_dir: string;
+  entries_removed: number;
+  status: EngineStatus;
+}
+
+/**
+ * Removes everything under the engine directory (not the model files). Only ever called from an
+ * explicit two-tap confirmation; the daemon refuses with `engine_busy` while a model is loaded.
+ */
+export function engineRemove(): Promise<EngineRemoveReply> {
+  return adminCall("admin.models.engine.remove", { confirm: true });
 }
 
 /** The model the engine currently holds, as `admin.models.status` reports it. */
@@ -781,6 +859,8 @@ export function modelsList(): Promise<{ models: ModelEntry[]; models_dir: string
 export function modelsCatalog(): Promise<{
   presets: CatalogPreset[];
   host_ram_bytes: number;
+  /** Present only when the stored network settings cannot be read; `fetch` then shows upstream. */
+  network_issue?: BridgeFailure;
 }> {
   return adminCall("admin.models.catalog");
 }
@@ -807,6 +887,35 @@ export function modelsDownloadDiscard(
   source: { preset_id: string } | { url: string; vendor: string },
 ): Promise<{ model_id: string; discarded_bytes: number }> {
   return adminCall("admin.models.download.discard", { ...source });
+}
+
+/** What `admin.models.import` answers: the job that copies, and what will be trusted. */
+export interface ModelImportReply {
+  job_id: string;
+  model_id: string;
+  dest: string;
+  source: string;
+  size_bytes: number;
+  /** Set when the file's size matched a catalog model, which it is then checked against. */
+  catalog: { preset_id: string; label: string; sha256: string; size_bytes: number } | null;
+  expected_sha256: string | null;
+  verified_on_completion: boolean;
+  /** The daemon's plain sentence on what will be checked and what is left to Verify. */
+  note: string;
+}
+
+/**
+ * Copies a weights file from a path on this computer into the models directory, hashing as it
+ * copies. A file whose size matches a catalog model is checked against that model's digest; any
+ * other `.gguf` lands as an unverified, test-only model unless `expected_sha256` is given and
+ * equal. Answers with the job that does the copy; progress and cancel are the download's.
+ */
+export function modelsImport(source: {
+  path: string;
+  vendor?: string;
+  expected_sha256?: string;
+}): Promise<ModelImportReply> {
+  return adminCall("admin.models.import", { ...source, confirm: true });
 }
 
 export function modelsDelete(modelId: string): Promise<{ deleted: true }> {
@@ -1695,8 +1804,12 @@ export interface NetworkTestResult {
   target: string;
   host: string;
   route: NetworkRoute;
-  /** The furthest point reached. */
-  stage: "proxy" | "tunnel" | "tls" | "http";
+  /**
+   * The stage the probe reached or failed at. `connect` is the first connection itself, the one
+   * word that is not about a proxy; a daemon that still sends `proxy` for a route with no proxy
+   * is read as `connect` by the screen.
+   */
+  stage: "connect" | "proxy" | "tunnel" | "tls" | "http";
   ok: boolean;
   http_status: number | null;
   cause?: string | null;

@@ -711,6 +711,7 @@ describe("test network settings", () => {
         "dns_failed",
         "jenkins.corp.example did not resolve.",
         "direct, matched your no-proxy list",
+        "connecting, and the first connection did not complete",
       ],
     ],
     [
@@ -722,7 +723,22 @@ describe("test network settings", () => {
         detail: "The connection timed out after 5 seconds.",
         recovery: "Check that the host is reachable from this network.",
       },
-      ["jenkins · jenkins.corp.example · timeout", "The connection timed out after 5 seconds."],
+      [
+        "jenkins · jenkins.corp.example · timeout",
+        "The connection timed out after 5 seconds.",
+        "connecting, and the first connection did not complete",
+      ],
+    ],
+    [
+      "direct connection refused, reported with the explicit connect stage",
+      {
+        route: "direct",
+        stage: "connect",
+        cause: "connect_failed",
+        detail: "Nothing accepted the connection.",
+        recovery: "Check that the host is reachable from this network.",
+      },
+      ["connect_failed", "Nothing accepted the connection.", "Route: direct connection"],
     ],
   ])(
     "renders the %s failure as cause, sentence and recovery",

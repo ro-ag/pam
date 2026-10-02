@@ -23,6 +23,8 @@ import {
   daemonStatus,
   daemonStop,
   engineInstall,
+  engineImport,
+  engineRemove,
   engineStatus,
   evidenceGet,
   evidenceList,
@@ -44,6 +46,7 @@ import {
   modelsDefaultsSet,
   modelsDelete,
   modelsDownload,
+  modelsImport,
   modelsDownloadCancel,
   modelsList,
   modelsLoad,
@@ -404,6 +407,26 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     ["modelsUnload", () => modelsUnload(), "admin.models.unload", {}],
     ["engineStatus", () => engineStatus(), "admin.models.engine.status", {}],
     ["engineInstall", () => engineInstall(), "admin.models.engine.install", { confirm: true }],
+    [
+      "engineImport",
+      () => engineImport("/opt/pam/llama.tar.gz"),
+      "admin.models.engine.import",
+      { path: "/opt/pam/llama.tar.gz", confirm: true },
+    ],
+    ["engineRemove", () => engineRemove(), "admin.models.engine.remove", { confirm: true }],
+    [
+      "modelsImport (path only)",
+      () => modelsImport({ path: "/srv/m.gguf" }),
+      "admin.models.import",
+      { path: "/srv/m.gguf", confirm: true },
+    ],
+    [
+      "modelsImport (vendor and digest)",
+      () =>
+        modelsImport({ path: "/srv/x.gguf", vendor: "qwen", expected_sha256: "ab".repeat(32) }),
+      "admin.models.import",
+      { path: "/srv/x.gguf", vendor: "qwen", expected_sha256: "ab".repeat(32), confirm: true },
+    ],
     ["curatorList", () => curatorList(), "admin.curator.list", {}],
     ["curatorTest", () => curatorTest(), "admin.curator.test", {}],
     [

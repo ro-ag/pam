@@ -61,7 +61,9 @@ describe("a step's summary in the step table", () => {
     const label = cell.getByText(UNTRUSTED_SUMMARY_LABEL);
     const first = cell.getByText("The build failed in the link stage.");
     // The label comes before the text it qualifies, and each line stays a line.
-    expect(label.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      label.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(cell.getByText("Exit status 1.")).toBeInTheDocument();
     expect(first.parentElement?.parentElement?.querySelectorAll("br")).toHaveLength(1);
     // And what stands behind it is said in plain words: the bench, not the summary, was measured.
@@ -77,7 +79,9 @@ describe("a step's summary in the step table", () => {
       "Summaries are advisory and not separately measured.",
     );
     expect(
-      summaryProvenance(step({ summary: "x", summary_model: { id: "m", qualification: null } })),
+      summaryProvenance(
+        step({ summary: "x", summary_model: { id: "m", qualification: null } }),
+      ),
     ).toBe("Summaries are advisory and not separately measured.");
     expect(
       summaryProvenance(

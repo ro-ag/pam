@@ -385,11 +385,21 @@ const ROUTE_PHRASE: Record<NetworkRoute, string> = {
 };
 
 const STAGE_PHRASE: Record<NetworkTestResult["stage"], string> = {
+  connect: "connecting, and the first connection did not complete",
   proxy: "connected to the proxy, then stopped",
   tunnel: "the proxy tunnel opened, then stopped before TLS",
   tls: "the TLS handshake verified, then stopped before an answer",
   http: "an HTTP answer came back",
 };
+
+/**
+ * The stage word for a result. "Connected to the proxy" is only true on a proxy route, so a
+ * `proxy` stage on a direct or bypassed route is the first connection itself: say "connecting".
+ */
+function stagePhrase(result: NetworkTestResult): string {
+  const stage = result.stage === "proxy" && result.route !== "proxy" ? "connect" : result.stage;
+  return STAGE_PHRASE[stage];
+}
 
 /** The daemon's sentences end with a full stop and FailureNote adds one; keep a single one. */
 function noStop(sentence: string): string {
@@ -477,7 +487,7 @@ function ResultRow({
         label={`${result.target} · ${escapeInvisible(result.host)}`}
       >
         <p className="font-data text-xs text-ink-muted">
-          Route: {route}. Reached: {STAGE_PHRASE[result.stage]}.
+          Route: {route}. Reached: {stagePhrase(result)}.
         </p>
       </FailureNote>
     </li>

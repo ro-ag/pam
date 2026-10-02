@@ -52,8 +52,9 @@ Grants, approvals, and profiles are managed in the GUI (Settings › Security),
 not on the command line. The sidebar shows the PAM logo and installed version;
 Flows provides a searchable library and a canvas that stays usable in compact
 windows. Save and Discard changes stay visible above the flow editor; built-in
-flows can be duplicated to create editable copies. Activity shows requests and
-results; log compression runs internally.
+flows can be duplicated to create editable copies. Home spreads Ask Pam and the
+task starters across wide windows. Activity shows requests and results; log
+compression runs internally.
 
 ## CLI surface
 

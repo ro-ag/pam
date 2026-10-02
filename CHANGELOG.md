@@ -8,6 +8,16 @@ All notable changes to pam are documented in this file. The format follows
 
 - Nothing yet.
 
+## [0.4.3] - 2026-10-01
+
+### Fixed
+
+- Show the sidebar logo in installed builds. The release content security
+  policy blocked it because the build embedded it as an inline `data:` image;
+  it now ships as its own file.
+- Let Home use the full window width. Wide windows place Ask Pam and its
+  answers beside the task starters instead of keeping a narrow 960px column.
+
 ## [0.4.2] - 2026-09-18
 
 ### Fixed

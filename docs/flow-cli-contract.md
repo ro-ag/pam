@@ -19,6 +19,12 @@ Run these from the approved repository. A ticket is a reference, not authority.
 Run refuses inputs the flow does not declare (`input_unknown`) and input
 values that are not scalars (`input_invalid`) before a ticket exists; a
 declared input with neither a value nor a default refuses as `input_missing`.
+`pam flow run <id> --digest <sha256>` (`expected_digest` on the wire) pins the run
+to the digest `flow.inspect` returned: when the library's flow has changed, the run
+refuses `flow_changed` before any work, with a recovery line to inspect again, and
+a value that is not 64 hex characters refuses `input_invalid`. If the reply to a
+`flow run` is lost, the CLI prints the request id and `pam wait <id>` as the
+recovery; do not submit it again unless `pam wait` says the request is unavailable.
 List pages default to 20 entries and accept at most 50. Continue using the
 returned `next_offset`; a byte limit may end a page before its entry limit.
 
@@ -54,6 +60,19 @@ identifies the evidence's revision; product success is a separate observation.
 at most 16 KiB; combined observation text is at most 6,000 UTF-8 bytes. Limits
 account for JSON encoding. Excess detail is represented by omission counts and
 retained evidence references, never by cutting a JSON document in half.
+
+`workflow.outcome` alone does not say whether state changed, so the projection also
+carries `effects`, omitted when empty: one entry per state-changing step with its
+`step`, `kind`, `state` (`applied` for a step that succeeded, `possibly_applied` for
+one that started and failed, timed out or hit its output cap) and, for a landing
+step, the `landing` operation, so a `freeze, validate, push` prefix is
+distinguishable from a synced landing. A run that ended `unresolved` or `blocked`
+after a state change has `handoff.reason` `workflow_not_completed_after_state_change`
+and a last summary line naming the steps. Effects are never dropped to fit the size
+limit; when observations must be dropped to fit, succeeded and skipped ones go first
+(latest first) and a failed or blocked one only when nothing else is left.
+`pam flow result` prints the effects and labels a local-model summary
+`[untrusted local-model summary]`.
 
 The outer response references the full report. The projection includes bounded
 additional evidence references; the full redacted report retains step details.
@@ -93,7 +112,11 @@ triggers a durable recheck rather than being treated as proof of success.
 
 The CLI uses the same outcome mapping for synchronous execution and a completed
 wait: success 0, usage error 2, refusal 3, unresolved verification 4 and blocked
-work 5. Client/internal errors and observation timeout use 1. Cancellation and
+work 5. Client/internal errors and observation timeout use 1. Refusal 3 means a
+policy refusal: transient daemon conditions (capacity, rate, shutdown, restart,
+deadline, internal error) are retried with backoff until the observation timeout,
+a lost event stream is reconnected while the durable query keeps reconciling, and
+the follow then ends with exit 1 and `follow_timeout`. Cancellation and
 request expiry remain explicit terminal causes in JSON; observation timeout does
 not cancel the original request. Keep the ticket to inspect it later.
 
@@ -116,6 +139,9 @@ Use the existing `pam wait` and `pam flow result` commands after reconnecting;
 resumption does not create a new request. Completed steps are not executed again.
 A prepared state-changing step without a durable receipt stops with
 `flow_effect_uncertain`, including cancellation or lease expiry at that boundary.
+The intent is journaled only after the approval gate has passed, immediately
+before any I/O: a cancel, expiry or restart while the step waits for approval is
+`cancelled` or requeued, not uncertain.
 Inspect retained evidence and reconcile the effect before submitting new work.
 See [workflow recovery](workflow-recovery.md) for retention and authorization
 checks. Remote polling uses [durable parking](job-watches.md), which frees the

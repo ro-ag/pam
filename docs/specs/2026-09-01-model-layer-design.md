@@ -112,6 +112,16 @@ size_bytes, info, class, verified }`. `id` = `<vendor>/<file-stem>`.
 digest matched a catalog preset or the download checkpoint; a model the
 human copied in by hand is `unverified` until `verify` runs (digest
 recorded, compared to catalog when the file name matches a preset).
+**Changed 2026-10-02:** the verified record no longer lives beside the weights.
+The daemon keeps it under its private base, `<base>/model-trust/<sha256 of the
+canonical path>.json` (`0600` file in a `0700` directory, atomic write): sha256,
+size, verification time, catalog verdict, canonical path and a file fingerprint
+(size, mtime, ctime, device, inode). A sidecar next to the GGUF is never
+trusted; a leftover one only marks the entry "verify again" and `test_only`. The
+fingerprint is compared right before and after the engine loads the weights, and
+`verify` refuses a file that changed while it was being hashed. A registry with no
+trust directory trusts nothing and records nothing. Downloads write no record;
+the daemon records a finished download that carried an expected digest.
 `verify(path)` streams SHA-256 in 1 MiB chunks. `delete(entry)` refuses
 anything outside the models dir, and refuses while the model is loaded
 or downloading.
@@ -208,7 +218,15 @@ budget are refused `prompt_too_long` with the counts.
 `detect(path_env) -> Vec<AgentCli>`: looks for `claude`, `codex`,
 `copilot`, `gemini` executables on `PATH`, canonicalized, regular and
 executable; runs `<cli> --version` with a 5 s deadline and captures the
-first line. `AgentCli { id, path, version: Option<String> }`.
+first line. **Changed 2026-10-02:** `detect` takes trusted directories
+(`/usr/bin`, `/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, linuxbrew, and
+under `$HOME` `.local/bin`, `.cargo/bin`, `.claude/local`, `.npm-global/bin`,
+`.bun/bin`) and the daemon's `PATH` is only looked at: a CLI found there and
+nowhere trusted is reported untrusted (`admin.curator.list` carries
+`untrusted`) and never run. A candidate and every ancestor must be owned by
+root or the daemon's user and not group- or world-writable, checked again at
+`invoke`. The probe and the call run with a cleared environment (home, user, a
+fixed `PATH`, the call's temp directory, locale). `AgentCli { id, path, version: Option<String> }`.
 `invoke(cli, prompt, deadline) -> Result<String>`: non-interactive,
 tool-free, single-turn contract per CLI (claude: `--print
 --output-format text --max-turns 1 --tools ""`; codex: `exec --skip-git-repo-check`

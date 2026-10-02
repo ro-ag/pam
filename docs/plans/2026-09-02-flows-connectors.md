@@ -12,7 +12,7 @@
 
 - **C-free dependency tree**: after every dependency change run `cargo tree -e normal,build | grep -E '^(cc|cmake|onig_sys|esaxx-rs|ring|aws-lc-sys|openssl-sys|dbus|libdbus-sys) '` — must print nothing. No `reqwest`, no `rustls`, no `ring`. HTTPS is system `curl` only.
 - **Sibling tests**: unit tests in `module_test.rs`, declared `#[cfg(test)] mod module_test;` from the parent. Never `#[cfg(test)] mod tests` inline. Integration tests in `crates/<crate>/tests/*.rs`.
-- **turso concurrency rule**: every `Store` method takes `conn_lock` first; a transaction holds it across `BEGIN..COMMIT`.
+- **turso concurrency rule**: every `Store` method takes `conn_lock` first; a transaction holds it across `BEGIN..COMMIT`. Since 2026-10-02 the mutex owns the connection (`crates/pam_store/src/conn_gate.rs`): `Store::lock()` returns a guard that derefs to it, and a call that finds a transaction left open rolls it back first.
 - **Test harness rule**: daemon tests seed the relaxed profile (`pam_testkit::seed_relaxed`) explicitly; never assert unix-only lock/signal details; kill children in a platform-neutral way.
 - **Refusal legibility**: every failure = `{ cause, detail, recovery }`; recovery names the GUI screen ("open Pam → Settings → Connectors → …") or the concrete fix. Never a security command an agent could run.
 - **Secrets**: never in SQLite, logs, audit detail, argv, or evidence. curl gets headers through `--config -` on stdin. Env passed to commands is scrubbed of names matching `(?i)token|secret|password|passwd|credential|api_key|apikey|private_key`.

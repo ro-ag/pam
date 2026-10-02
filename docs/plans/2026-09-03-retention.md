@@ -15,7 +15,7 @@ Spec: `docs/specs/2026-09-03-retention-design.md` (approved 2026-09-03).
 - Branch first, PR + squash merge, no AI attribution in commits or PRs. Never commit to `main`.
 - Rust tests live in sibling `*_test.rs` files wired with `#[cfg(test)] mod x_test;` — never `mod tests` inside a source file.
 - No new dependencies, Rust or npm. No new CI workflows.
-- Every store method takes `conn_lock` at the top; a transaction holds it across `BEGIN..COMMIT` (turso forbids concurrent statements on one connection).
+- Every store method takes `conn_lock` at the top; a transaction holds it across `BEGIN..COMMIT` (turso forbids concurrent statements on one connection). Since 2026-10-02 the mutex owns the connection (`crates/pam_store/src/conn_gate.rs`): `Store::lock()` returns a guard that derefs to it, and a call that finds a transaction left open rolls it back first. The prunes below are no longer one transaction per pass: since 2026-10-02 each runs oldest first in bounded batches (64 evidence rows, 256 request records), one transaction per batch, with the lock released in between; totals are unchanged.
 - ESLint bans Tailwind arbitrary values; colors only via `@theme` tokens; copy in pam's first-person voice for the italic notes, data voice (`font-data`) for figures.
 - Test harnesses seed nothing platform-specific here; in-memory stores only.
 - Local gate before every PR: `tools/check.sh` (fmt, clippy -D warnings, cargo test, eslint, tsc + vite build, vitest). Foreground only — no background waits.

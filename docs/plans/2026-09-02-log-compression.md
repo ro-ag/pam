@@ -13,7 +13,7 @@
 - **No CLI, no agent capability**: nothing in `crates/pam/`, `pam_client`, `policy::classify`, or `executor::BuiltinCapability` changes. Every new op is `admin.*` (GUI-only).
 - **C-free dependency tree**: no new crates that run `cc`/`cmake`. Verify with `cargo tree -e normal,build | grep -E '^(cc|cmake|onig_sys|esaxx-rs) '` — must print nothing.
 - **Sibling tests**: unit tests in `module_test.rs`, declared `#[cfg(test)] mod module_test;` from the parent. Never `#[cfg(test)] mod tests` inline.
-- **turso concurrency rule**: every `Store` method takes `conn_lock` first; a transaction holds it across `BEGIN..COMMIT`.
+- **turso concurrency rule**: every `Store` method takes `conn_lock` first; a transaction holds it across `BEGIN..COMMIT`. Since 2026-10-02 the mutex owns the connection (`crates/pam_store/src/conn_gate.rs`): `Store::lock()` returns a guard that derefs to it, and a call that finds a transaction left open rolls it back first.
 - **Frontend**: Tailwind v4 semantic tokens only (ESLint bans arbitrary values), CVA variants, existing `Panel`/`Badge`/`Button`/`FailureNote`/`Section` furniture; `font-voice` serif for Pam sentences, `font-data` mono for facts and ids, `font-display` for the big number.
 - **Refusal legibility**: every failure = `{ cause, detail, recovery }`; recovery names the GUI screen or the concrete fix.
 - **Gates**: `tools/check.sh` (fmt, clippy `-D warnings` pedantic, tests, eslint, tsc+vite build, vitest) green on the settled tree before every PR; no `#[allow]` sprinkles — fix the code. Foreground gates only; never background a check.

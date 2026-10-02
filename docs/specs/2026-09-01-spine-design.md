@@ -107,8 +107,15 @@ pam <cmd> → parse/validate → envelope → pam.sock
   deny or timeout (default 15 min) → refusal, audited with resolution.
 - Every terminal state writes its own audit row: success, refusal,
   failure, timeout, denial, cancellation. No silent paths (v1 issue #49
-  lesson).
-- Cancellation: `pam cancel <ticket>` (and GUI) cancels queued requests
+  lesson). Since 2026-10-02 `status` is the exception: it is a snapshot read
+  that writes no request row, no audit row and no lifecycle event (it cannot
+  fail); `query` and `cancel` stay audited. A terminal write that fails is
+  retried and parked, and an in-flight row past its deadline is closed by a
+  reconciler, so no row stays "running" forever. Grant changes and approval
+  resolutions are written in one transaction with their audit rows.
+- Cancellation: `pam cancel <ticket>` (acting only on a ticket admitted under
+  the caller's own repository) and the GUI's `admin.requests.cancel` (audited
+  as the human's act) cancel queued requests
   outright and signals running executors cooperatively; a cancelled
   request is a terminal state (`failed`, cause `cancelled`), audited.
   Executors take work under a lease; a lease that outlives its deadline
@@ -122,7 +129,7 @@ pam <cmd> → parse/validate → envelope → pam.sock
 - **standard** (Linux/Windows default): grants manual in GUI;
   destructive operations per-operation approval.
 - **strict** (future corporate): everything manual and per-operation.
-- Profile changes are GUI-only. Audit rows record the active profile.
+- Profile changes are GUI-only and apply at once. Audit rows record the active profile.
 
 ## Store (SQLite)
 
@@ -183,6 +190,6 @@ declared `#[cfg(test)] mod module_test;` from the parent).
   real SQLite; driven through `pam_proto`; asserts states and audit rows.
   Deadline discipline per v1 testkit lesson (CPU-vs-wall classification).
 - Invariants: same-repo lane requests never interleave; every terminal
-  state has exactly one audit row.
+  state has exactly one audit row (except `status`, which writes none).
 - CI: cheap — Linux fmt/clippy/unit only; nothing added without an
   explicit request.

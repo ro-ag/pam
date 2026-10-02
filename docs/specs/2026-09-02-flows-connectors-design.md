@@ -100,7 +100,11 @@ naming the YAML path):
   declared arguments, all values strings or integers.
 - `needs` and every `when` reference name an **earlier** step (steps
   execute in file order; the graph is the designer's, the order is the
-  engine's). Duplicate ids rejected.
+  engine's). Duplicate ids rejected. The default `when` of a read-only step
+  with no `needs` depends on nothing. A **stateful** step with no `needs` and
+  the default `when` does not run after any earlier step failed (2026-10-02):
+  `needs` or an explicit `when` opts in. `Step::should_run` is the one
+  definition the engine and the tests share.
 - `effect: stateful` forces `approval: required`; `role` defaults to
   `observe` for read-only and `change` for stateful; `role: verify` is
   read-only only.
@@ -123,7 +127,13 @@ naming the YAML path):
   with `variable_unavailable`), `${steps.<id>.result.<json pointer>}`
   (connector JSON result field; `.exit_status` for commands). Unknown
   variables are validation errors; unresolvable ones at run time fail
-  the step. Substitution happens per argument string, never re-parsed.
+  the step. Substitution happens per argument string, never re-parsed, and
+  applies to `env:` values with the same variables (2026-10-02; an unfilled
+  reference fails the step `variable_unavailable`). An argument whose template
+  begins with a reference and whose finished value begins with `-` is refused at
+  run time (step `blocked`, cause `argument_option_refused`) unless a literal
+  `--` precedes it in the template; literal text in front, such as
+  `--since=${inputs.day}`, is the author's own option.
 
 ```rust
 pub struct Flow { pub schema: u16, pub id: String, pub name: String, pub description: String,
@@ -334,8 +344,13 @@ calls `pam_connectors::call`. Secrets live only inside the call.
    the step runs; on `Denied`/`TimedOut` the step is `blocked` and the
    flow stops with outcome `blocked`; `Cancelled` → `CapabilityFailure::Cancelled`.
    `Refuse` (strict profile without a grant) → step `blocked` with the
-   gate's cause/recovery. The remember checkbox therefore means "this
-   step in this flow", which is what a human wants to remember.
+   gate's cause/recovery. The remember checkbox grants the capability name
+   `flow.step:<flow>/<step>` for every repository and input value (the GUI says
+   so). Since 2026-10-02 saving or deleting a flow revokes the grant of every
+   step whose effective definition changed (the whole `Step` minus `note`, plus
+   the defaults of the inputs it reads), and an approval is pinned to the resolved
+   command shown to the human (`expected_digest`). A stateful step's effect
+   intent is journaled only after this gate allows it.
 5. **Command step.** Program must be in `flows.allowed_programs`
    (else `blocked`, cause `program_not_allowed`, recovery "open Pam →
    Settings → Flows → allowed programs"), resolved on
@@ -414,9 +429,9 @@ grandchildren are not chased in this plan.
 | --- | --- | --- |
 | `admin.flows.list` | — | `{ flows: [ { id, name, description, source, path?, valid, error?, digest, steps, inputs } ] }` |
 | `admin.flows.get` | `{ id }` | `{ id, source, path?, yaml, normalized_yaml, digest, valid, error?, flow: <Flow as JSON> }` |
-| `admin.flows.save` | `{ id, yaml }` | the list entry; refusals `flow_invalid` (message + path), `id_mismatch`, `library_unwritable` |
-| `admin.flows.delete` | `{ id }` | `{ id, revealed_builtin: bool }`; `not_found` for a builtin without a shadow |
-| `admin.flows.run` | `{ id, repo, inputs }` | `{ ticket, position }` — builds a `flow.run` envelope with caller `{ agent: "pam-gui", repo }`, `wait: false`, and submits it through the pipeline ingress (gate, lanes, audit all apply); the GUI follows the ticket's events |
+| `admin.flows.save` | `{ id, yaml }` | the list entry plus `grants_revoked` (the `flow.step:` capabilities whose remembered approval was removed) and `reapproval_required`; refusals `flow_invalid` (message + path), `id_mismatch`, `library_unwritable`. The audit row carries `digest`, `previous_digest` and `grants_revoked` |
+| `admin.flows.delete` | `{ id }` | `{ id, revealed_builtin: bool, grants_revoked, reapproval_required }`; `not_found` for a builtin without a shadow |
+| `admin.flows.run` | `{ id, repo, inputs, expected_digest? }` | `{ ticket, position }` — builds a `flow.run` envelope with caller `{ agent: "pam-gui", repo }`, `wait: false`, and submits it through the pipeline ingress (gate, lanes, audit all apply); the GUI follows the ticket's events |
 | `admin.flows.settings.get` / `.set` | — / `{ allowed_programs?, extra_path?, artifacts_root?, read_cache_roots? }` | `{ allowed_programs, extra_path, artifacts_root, read_cache_roots }`; shells refused with `program_not_allowed`, a relative `artifacts_root` with `artifacts_root_invalid`, `artifacts_root: null` clears it |
 | `admin.connectors.list` | — | `{ connectors: [ { id, name, auth, enabled, base_url, username, credential_present, store_available, last_test } ] }` |
 | `admin.connectors.configure` | `{ id, enabled?, base_url?, username?, credential?: { set: string } \| { clear: true } }` | the list entry; `bad_url`, `store_unavailable`, `store_denied` |

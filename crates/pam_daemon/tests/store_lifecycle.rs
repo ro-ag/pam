@@ -312,7 +312,10 @@ async fn boot_refuses_a_damaged_previous_engine_database_and_says_where_the_copy
             };
             let made = backups(&base);
             assert_eq!(made.len(), 1, "attempt {attempt}: {made:?}");
-            assert!(detail.contains(made[0].to_str().unwrap()), "{detail}");
+            // The daemon names its base by its canonical spelling, which on
+            // Windows is the `\\?\` form.
+            let named = std::fs::canonicalize(&made[0]).unwrap();
+            assert!(detail.contains(named.to_str().unwrap()), "{detail}");
             // What the human reads on the daemon's standard error.
             let shown = error.to_string();
             for part in [

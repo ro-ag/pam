@@ -91,7 +91,18 @@ impl AdminService {
         // future, the guard sends `true` so the transfer stops instead of
         // running detached behind a closed channel.
         let (_cancel_on_drop, cancel) = install_cancellation();
-        let status = engine::install(&base, cancel)
+        // The archive is fetched under the network profile downloads use;
+        // a profile that cannot be used refuses here, never falls back.
+        let net = self
+            .models
+            .network_settings()
+            .await
+            .map_err(|failure| AdminRefusal {
+                cause: failure.cause(),
+                detail: failure.sentence(),
+                recovery: failure.recovery(),
+            })?;
+        let status = engine::install(&base, cancel, net, None)
             .await
             .map_err(|error| refusal(&error))?;
         Ok(AdminOk {

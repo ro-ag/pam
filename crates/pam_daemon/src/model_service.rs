@@ -40,7 +40,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pam_model::download::{DownloadError, DownloadHandle, DownloadRequest, DownloadState};
+use pam_model::download::{
+    DownloadError, DownloadHandle, DownloadRequest, DownloadState, TransferLimits,
+};
 use pam_model::engine;
 use pam_model::engine_server::{EngineContract, EngineServer, EngineServerError, ServerOptions};
 use pam_model::qualification::{PromptContract, QUALIFIED, Qualification};
@@ -52,6 +54,7 @@ use pam_model::runtime::{
     RuntimeState, frame_evidence_with,
 };
 use pam_model::weights::{Control, WeightsError};
+use pam_net::{NetFailure, NetSettings, NetworkSource};
 use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
@@ -381,6 +384,15 @@ pub struct ModelService {
     /// the daemon from its base directory. Unset (tests) falls back to a
     /// private directory beside the models.
     engine_base: RwLock<Option<PathBuf>>,
+    /// Where a transfer's network profile (proxy, no-proxy list, CA
+    /// bundle) comes from, asked once per transfer start so a setting the
+    /// human saves applies to the next download. Until the daemon sets its
+    /// own, a direct connection with the platform's trust.
+    network: RwLock<Arc<dyn NetworkSource>>,
+    /// Lets the in-crate tests fetch from a plain-http loopback origin;
+    /// production has no such switch.
+    #[cfg(test)]
+    plain_http_for_tests: AtomicBool,
     /// The llama.cpp supervisor, built the first time an installed engine
     /// is needed and rebuilt if the installed binary changes.
     engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
@@ -457,6 +469,9 @@ impl ModelService {
             models_dir: RwLock::new(models_dir),
             qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
+            network: RwLock::new(Arc::new(Arc::new(NetSettings::direct()))),
+            #[cfg(test)]
+            plain_http_for_tests: AtomicBool::new(false),
             engine: std::sync::Mutex::new(None),
             busy: AtomicBool::new(false),
             resident: RwLock::new(None),
@@ -859,6 +874,43 @@ impl ModelService {
         }
     }
 
+    /// Points transfers at the daemon's network settings. Read per transfer
+    /// start, never cached: the next download runs under whatever the human
+    /// last saved.
+    pub fn set_network_source(&self, source: Arc<dyn NetworkSource>) {
+        *self
+            .network
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
+    }
+
+    /// The source transfers read their network profile from.
+    #[must_use]
+    pub fn network_source(&self) -> Arc<dyn NetworkSource> {
+        Arc::clone(
+            &self
+                .network
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The network profile the next transfer runs under, resolved now. A
+    /// source that cannot produce one refuses; nothing falls back to a
+    /// direct connection.
+    pub async fn network_settings(&self) -> Result<Arc<NetSettings>, NetFailure> {
+        let source = self.network_source();
+        source.settings().await
+    }
+
+    /// Lets this service's downloads fetch from a plain-`http` loopback
+    /// origin, the way the download suite's own fixtures are served. Test
+    /// builds only.
+    #[cfg(test)]
+    pub(crate) fn allow_plain_http_downloads_for_tests(&self) {
+        self.plain_http_for_tests.store(true, Ordering::Release);
+    }
+
     /// Stops an engine a previous daemon left running (SIGKILL, crash), once per
     /// engine base. The supervisor's pid file names the process; it is killed only when
     /// the live process with that pid has the recorded executable, was started with the
@@ -1193,8 +1245,10 @@ impl ModelService {
     ///
     /// Everything refusable is refused before the row exists: a second
     /// download of the same destination, a file already installed, a
-    /// missing `curl`. Only once curl is running does a `model_job` row
-    /// appear, so the history holds transfers, not rejected clicks.
+    /// missing `curl`, a plain-http address, network settings that cannot
+    /// be used. Only once curl is running does a `model_job` row appear, so
+    /// the history holds transfers, not rejected clicks. The network
+    /// profile is resolved here, for this transfer.
     pub async fn start_download(
         &self,
         request: DownloadRequest,
@@ -1207,11 +1261,28 @@ impl ModelService {
         if self.is_downloading(&dest).await {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
+        let net = self
+            .network_settings()
+            .await
+            .map_err(|failure| ModelServiceError::Download(DownloadError::Network(failure)))?;
         let source = request.url.clone();
         let total = request
             .expected_size
             .and_then(|bytes| i64::try_from(bytes).ok());
-        let handle = pam_model::download::start(request).map_err(|err| match err {
+        #[cfg(test)]
+        let started = if self.plain_http_for_tests.load(Ordering::Acquire) {
+            pam_model::download::start_over_plain_http_for_tests(
+                request,
+                net,
+                TransferLimits::default(),
+            )
+        } else {
+            pam_model::download::start_with_limits(request, net, TransferLimits::default())
+        };
+        #[cfg(not(test))]
+        let started =
+            pam_model::download::start_with_limits(request, net, TransferLimits::default());
+        let handle = started.map_err(|err| match err {
             DownloadError::AlreadyExists(_) => {
                 ModelServiceError::AlreadyInstalled(model_id.to_owned())
             }

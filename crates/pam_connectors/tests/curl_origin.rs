@@ -7,13 +7,20 @@
 //! wire — including the `Authorization` header that never appears in the
 //! child's argument vector.
 //!
+//! The transport runs under an explicit direct profile (no proxy, no CA
+//! bundle): what these tests see is what the daemon gets until the Network
+//! settings exist, and it must equal what the transport did before the
+//! launcher moved to `pam_net`.
+//!
 //! The whole file is skipped, with a printed line, when the trusted OS `curl` is unavailable.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pam_connectors::{CurlTransport, HttpRequest, HttpTransport, Method, TransportError};
+use pam_connectors::{
+    CurlTransport, HttpRequest, HttpTransport, Method, NetFailure, NetSettings, TransportError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
@@ -115,16 +122,23 @@ async fn a_refused_connection_is_a_network_failure() {
         .await
         .expect_err("a closed port cannot answer");
 
-    match error {
-        TransportError::Network(detail) => {
-            assert!(detail.contains("curl exited"), "{detail}");
-            assert!(
-                !detail.contains('\n'),
-                "control characters survived: {detail:?}"
-            );
+    match &error {
+        TransportError::Net(NetFailure::ConnectFailed { host }) => {
+            assert_eq!(host, "127.0.0.1");
         }
-        other => panic!("a closed port is a network failure, got {other:?}"),
+        other => panic!("a closed port is a connection failure, got {other:?}"),
     }
+    // What the connector records: the shared cause, one sentence, no
+    // control characters.
+    let detail = pam_connectors::ConnectorError::from(error).detail();
+    assert!(
+        detail.contains("Nothing accepted the connection"),
+        "{detail}"
+    );
+    assert!(
+        !detail.chars().any(char::is_control),
+        "control characters survived: {detail:?}"
+    );
 }
 
 /// One request aimed at the throwaway origin.
@@ -220,9 +234,10 @@ fn deadline(seconds: u64) -> Instant {
 }
 
 /// The transport over the qualified OS curl, independent of the test
-/// process PATH, speaking plain http to the loopback origin.
+/// process PATH, speaking plain http to the loopback origin under an
+/// explicit direct profile.
 fn curl_on_path() -> Option<CurlTransport> {
-    CurlTransport::trusted()
+    CurlTransport::trusted(Arc::new(Arc::new(NetSettings::direct())))
         .ok()
         .map(CurlTransport::allow_http_for_tests)
 }

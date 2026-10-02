@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::catalog::{CATALOG, find_preset};
+use crate::catalog::{CATALOG, UPSTREAM_PREFIX, find_preset};
 
 /// Where each vendor's entries are fetched from.
 ///
@@ -17,6 +17,23 @@ fn base_url(vendor: &str) -> &'static str {
 }
 
 const GB: u64 = 1_000_000_000;
+
+#[test]
+fn every_preset_is_fetched_from_the_upstream_a_mirror_replaces() {
+    for preset in CATALOG {
+        assert!(
+            preset.url.starts_with(UPSTREAM_PREFIX),
+            "{} is not under {UPSTREAM_PREFIX}: {}",
+            preset.id,
+            preset.url
+        );
+        assert!(
+            preset.url.ends_with(preset.file_name),
+            "{} is named as its source names it",
+            preset.id
+        );
+    }
+}
 
 #[test]
 fn every_preset_carries_the_digest_its_download_verifies() {

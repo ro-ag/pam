@@ -1003,3 +1003,134 @@ fn a_log_redirect_may_not_target_the_machines_own_network() {
         assert_eq!(redirect_target_refusal(&url(allowed)), None, "{allowed}");
     }
 }
+
+/// The proxy password the fake proxy is given and must never echo.
+const PROXY_PASSWORD: &str = "pr0xy-s3cret-\"quoted\"";
+const PROXY_USER: &str = "svc-pam";
+
+/// A real connector service over the trusted curl, routed through a fake
+/// proxy that refuses [`PROXY_PASSWORD`]; `None` when there is no curl.
+async fn service_behind_a_refusing_proxy(
+    store: &Arc<Store>,
+    origin: std::net::SocketAddr,
+) -> Option<(ConnectorService, pam_net::testing::FakeProxy)> {
+    use pam_connectors::{CurlTransport, NetSettings};
+    use pam_net::testing::{FakeProxy, ProxyMode};
+    use pam_net::{Proxy, ProxyAuth, ProxyPassword};
+    let proxy = FakeProxy::start(
+        ProxyMode::RequireAuth {
+            username: PROXY_USER.to_owned(),
+            password: "a different password".to_owned(),
+            offer: vec!["Basic realm=\"corp\"".to_owned()],
+        },
+        origin,
+    )
+    .await;
+    let settings = NetSettings::new(
+        Some(Proxy::parse(&proxy.url(), ProxyAuth::Basic, Some(PROXY_USER)).unwrap()),
+        Some(ProxyPassword::new(PROXY_PASSWORD).unwrap()),
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    let transport = match CurlTransport::trusted(Arc::new(Arc::new(settings))) {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("no trusted operating-system curl ({error}); skipping");
+            return None;
+        }
+    };
+    let backend = Arc::new(FakeSecretBackend::default());
+    let service = ConnectorService::new(
+        Arc::clone(store),
+        Arc::new(SecretStore::new(backend as Arc<_>)),
+        Arc::new(transport),
+    );
+    service
+        .configure(
+            ConnectorId::Github,
+            ConfigurePatch {
+                enabled: Some(true),
+                base_url: Some(Some(BASE_URL.to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .expect("configure");
+    Some((service, proxy))
+}
+
+/// A connector test through a proxy that refuses the stored proxy
+/// password: the verdict row, the refusal and the log name the proxy and
+/// the cause, and never the password, in any encoding.
+#[tokio::test]
+async fn a_proxy_password_never_reaches_a_verdict_row_a_refusal_or_a_log_line() {
+    use pam_net::testing::{Origin, OriginMode, base64};
+
+    let (log, _logging) = crate::test_log::Captured::start();
+    let origin = Origin::start(OriginMode::Json).await;
+    let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
+    let repo = tempfile::tempdir().expect("repo");
+    approve_connector_repo(&store, repo.path()).await;
+    let Some((service, proxy)) = service_behind_a_refusing_proxy(&store, origin.address()).await
+    else {
+        return;
+    };
+
+    let (passed, detail) = service.test(ConnectorId::Github).await.expect("a verdict");
+    assert!(!passed);
+    assert!(
+        detail.contains(&proxy.address().to_string()),
+        "the proxy is named: {detail}"
+    );
+    assert!(
+        detail.contains("refused the stored user name and password"),
+        "{detail}"
+    );
+    assert_eq!(
+        proxy.request_lines(),
+        vec!["CONNECT api.github.test:443 HTTP/1.1".to_owned()],
+        "the connector's host reached the proxy as a tunnel request"
+    );
+
+    let error = service
+        .invoke(
+            repo.path(),
+            ConnectorId::Github,
+            "runs",
+            &BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))]),
+            deadline(),
+        )
+        .await
+        .expect_err("the proxy refuses the call too");
+    assert_eq!(error.cause(), "connector_network");
+
+    let row = store
+        .get_connector("github")
+        .await
+        .unwrap()
+        .expect("the row");
+    let encoded = base64(format!("{PROXY_USER}:{PROXY_PASSWORD}").as_bytes());
+    for rendering in [
+        detail,
+        row.last_test_detail.clone().unwrap_or_default(),
+        error.detail(),
+        error.recovery(ConnectorId::Github),
+        format!("{error:?}"),
+        format!("{service:?}"),
+        log.text(),
+    ] {
+        assert!(!rendering.contains(PROXY_PASSWORD), "{rendering}");
+        assert!(!rendering.contains(&encoded), "{rendering}");
+        assert!(!rendering.contains("s3cret"), "{rendering}");
+        assert!(!rendering.contains(TOKEN), "{rendering}");
+    }
+    assert!(
+        origin.requests().is_empty(),
+        "nothing passed the proxy: {:?}",
+        origin.requests()
+    );
+}

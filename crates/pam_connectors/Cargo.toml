@@ -8,32 +8,41 @@ repository.workspace = true
 
 [features]
 # Exposes `pam_connectors::testing` — the recording fake transport the
-# daemon's flow tests drive connector steps through.
-testing = []
+# daemon's flow tests drive connector steps through — and lets
+# `CurlTransport::allow_http_for_tests` point real curl at a plain-http
+# loopback fixture (the launcher's own test-only allowance).
+testing = ["pam_net/testing"]
 
 [dependencies]
 pam_flow.workspace = true
+# the one curl launcher: trusted executable, stdin config, network settings
+# (proxy, no-proxy, CA bundle) and the typed failures.
+pam_net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # base URL validation and request building; pure Rust.
 url.workspace = true
-# `process` spawns curl, `io-util` bounds their output,
-# `time` carries deadlines, `rt` places the child readers. No runtime
-# flavor — the daemon owns task placement.
-tokio = { version = "1", default-features = false, features = ["process", "io-util", "time", "rt", "sync", "macros"] }
 
 [dev-dependencies]
 # temporary directories for the curl transport tests.
 tempfile.workspace = true
+# the origin, the fake forward proxy and the trusted-curl probe the
+# real-curl tests drive the transport against.
+pam_net = { workspace = true, features = ["testing"] }
 # `net` powers `tests/curl_origin.rs`: a throwaway HTTP/1.1 origin that real
 # curl is pointed at. The runtime features drive `#[tokio::test]`.
 tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time", "process", "sync"] }
 
-# The origin test needs `CurlTransport::allow_http_for_tests`, which only
-# exists outside the crate's own unit tests with the `testing` feature on.
+# The origin and proxy tests need `CurlTransport::allow_http_for_tests`,
+# which only exists outside the crate's own unit tests with the `testing`
+# feature on.
 [[test]]
 name = "curl_origin"
+required-features = ["testing"]
+
+[[test]]
+name = "curl_proxy"
 required-features = ["testing"]
 
 [lints]

@@ -54,6 +54,9 @@ async fn fixture() -> Fixture {
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
+    // The origin these tests download from is a plain-http loopback
+    // listener; production refuses `http://`.
+    models.allow_plain_http_downloads_for_tests();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
     let flows = crate::flow_service_test::flows_for_tests(

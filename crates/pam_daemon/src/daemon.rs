@@ -111,7 +111,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pam_connectors::{CurlTransport, HttpTransport};
+use pam_connectors::{CurlTransport, HttpTransport, NetSettings, NetworkSource};
 use pam_proto::{Envelope, Event, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
@@ -830,7 +830,10 @@ fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<d
     if injected.is_some() {
         return injected;
     }
-    match CurlTransport::trusted() {
+    // An explicit direct profile — no proxy, the platform's trust — until
+    // the daemon's network settings service supplies its own source.
+    let network: Arc<dyn NetworkSource> = Arc::new(Arc::new(NetSettings::direct()));
+    match CurlTransport::trusted(network) {
         Ok(transport) => Some(Arc::new(transport)),
         Err(error) => {
             tracing::warn!(

@@ -17,6 +17,9 @@ pam_flow.workspace = true
 # pack preflight decoding (`landing_pack.rs`): pure-Rust miniz_oxide backend.
 flate2.workspace = true
 pam_model.workspace = true
+# the network profile (proxy, no-proxy, CA bundle) connector calls and
+# downloads run under, and its `NetworkSource` seam.
+pam_net.workspace = true
 pam_proto.workspace = true
 pam_store.workspace = true
 serde.workspace = true
@@ -73,6 +76,9 @@ pam_model = { workspace = true, features = ["testing"] }
 # `FakeTransport`: the connector tests script HTTP answers instead of
 # reaching a network.
 pam_connectors = { workspace = true, features = ["testing"] }
+# the fake forward proxy a real connector test is driven through, to prove
+# a proxy password never reaches a row or a log line.
+pam_net = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # `start_paused` tests for lease/reaper timing need the paused clock.
 tokio = { workspace = true, features = ["test-util"] }

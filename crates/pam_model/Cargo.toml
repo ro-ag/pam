@@ -10,11 +10,15 @@ repository.workspace = true
 # Exposes `pam_model::testing` — the range-serving HTTP origin the download
 # suite drives real `curl` against. The daemon's admin-op tests run a
 # download end to end and need the same origin, so it ships behind a feature
-# instead of being copied. `tokio/net` is what the listener needs; nothing
-# else changes.
-testing = ["tokio/net"]
+# instead of being copied. `tokio/net` is what the listener needs. The
+# launcher's own fixtures and its plain-http allowance come with it, so a
+# download test can run over a loopback origin.
+testing = ["tokio/net", "pam_net/testing"]
 
 [dependencies]
+# the one curl launcher: trusted executable, stdin config, network settings
+# (proxy, no-proxy, CA bundle), mirror addresses and the typed failures.
+pam_net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -44,6 +48,9 @@ tokio = { version = "1", default-features = false, features = [
 tempfile.workspace = true
 
 [dev-dependencies]
+# the launcher's fixtures (fake proxy, test-only mirror base) and its
+# plain-http allowance, for the download suite.
+pam_net = { workspace = true, features = ["testing"] }
 # the download suite drives the real curl against a local range-serving
 # origin (`net` for the listener), the curator and runtime tests drive async
 # calls; `macros`/`rt-multi-thread`/`sync`/`time` are for the tests

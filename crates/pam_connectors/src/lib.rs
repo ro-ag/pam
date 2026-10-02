@@ -10,7 +10,9 @@
 //! connector action (JSON or a log); [`verify`] proves a stored credential works (the
 //! GUI's **Test** button). Both take a `&dyn HttpTransport`, so the daemon injects
 //! [`CurlTransport`] and tests inject `testing::FakeTransport` (behind the `testing`
-//! feature). The call table itself
+//! feature). The curl itself is started by `pam_net`, the one launcher pam has; the
+//! transport reads the proxy and certificate profile from a [`NetworkSource`] the daemon
+//! supplies, before every spawn. The call table itself
 //! lives in `pam_flow` — [`descriptor`] borrows it, so the flow validator and the
 //! dispatcher can never disagree about which calls exist or what arguments they take.
 //! ```
@@ -52,6 +54,7 @@ pub use curl::CurlTransport;
 pub use descriptor::{AuthKind, Descriptor, descriptor};
 pub use error::ConnectorError;
 pub use pam_flow::{ArgValue, ConnectorId};
+pub use pam_net::{NetFailure, NetSettings, NetworkSource};
 pub use transport::{
     Connection, HttpRequest, HttpResponse, HttpTransport, MAX_JSON_BYTES, MAX_LOG_BYTES, Method,
     Secret, TransportError, validate_base_url,

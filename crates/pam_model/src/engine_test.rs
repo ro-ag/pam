@@ -3,6 +3,22 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::fs;
 
+/// A direct profile: no proxy, the platform's trust.
+fn direct() -> Arc<NetSettings> {
+    Arc::new(NetSettings::direct())
+}
+
+/// The fake release, fetched over the plain-http origin: the test allowance.
+#[cfg(unix)]
+async fn install_fake(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    install_release_over_plain_http_for_tests(base, release, cancel, direct(), mirror).await
+}
+
 #[test]
 fn every_ci_runner_maps_to_exactly_one_pinned_asset() {
     let mut names: Vec<&str> = ENGINE_ASSETS.iter().map(|a| a.name).collect();
@@ -171,7 +187,7 @@ async fn install_downloads_unpacks_and_smoke_checks_the_server() {
     let base = tempfile::tempdir().unwrap();
     let (_cancel, rx) = tokio::sync::watch::channel(false);
 
-    let installed = install_release(base.path(), &release, rx.clone())
+    let installed = install_fake(base.path(), &release, rx.clone(), None)
         .await
         .expect("the fake release installs");
     let layout = EngineLayout::new(base.path());
@@ -213,7 +229,7 @@ async fn install_downloads_unpacks_and_smoke_checks_the_server() {
     );
     // A second install of the same release is a no-op read: no transfer.
     let requests_after_install = origin.requests().len();
-    let again = install_release(base.path(), &release, rx).await.unwrap();
+    let again = install_fake(base.path(), &release, rx, None).await.unwrap();
     assert_eq!(again.manifest, Some(manifest));
     assert_eq!(origin.requests().len(), requests_after_install);
 }
@@ -227,7 +243,7 @@ async fn a_tampered_archive_never_reaches_tar() {
     release.sha256 = "f".repeat(64);
     let base = tempfile::tempdir().unwrap();
     let (_cancel, rx) = tokio::sync::watch::channel(false);
-    let error = install_release(base.path(), &release, rx)
+    let error = install_fake(base.path(), &release, rx, None)
         .await
         .unwrap_err();
     assert!(
@@ -247,7 +263,7 @@ async fn a_server_that_reports_another_build_is_discarded() {
     let release = release_for(&origin, &bytes, 42);
     let base = tempfile::tempdir().unwrap();
     let (_cancel, rx) = tokio::sync::watch::channel(false);
-    let error = install_release(base.path(), &release, rx)
+    let error = install_fake(base.path(), &release, rx, None)
         .await
         .unwrap_err();
     assert!(matches!(error, EngineError::Verify { .. }), "{error:?}");
@@ -262,6 +278,93 @@ async fn a_server_that_reports_another_build_is_discarded() {
     }));
 }
 
+/// With a mirror the archive is asked for by its pinned name under the
+/// mirror directory, and held to the same digest; the local origin plays
+/// the mirror.
+#[cfg(unix)]
+#[tokio::test]
+async fn install_fetches_the_pinned_asset_name_from_the_mirror() {
+    let (_tree, bytes) = fake_archive("btest", "version: 0.0.0 (build 42, commit abc)");
+    let origin = crate::testing::serve(bytes.clone(), "\"etag\"").await;
+    let mut release = release_for(&origin, &bytes, 42);
+    // Upstream is unreachable on purpose: only the mirror can serve it.
+    release.url_base = "https://releases.pam-test.invalid/llama/btest/".to_owned();
+    let mirror = MirrorBase::for_tests(&origin.url("corp/llama.cpp/btest"));
+    assert_eq!(
+        release.url(Some(&mirror)).unwrap(),
+        origin.url("corp/llama.cpp/btest/release.tar.gz")
+    );
+    assert_eq!(
+        release.url(None).unwrap(),
+        "https://releases.pam-test.invalid/llama/btest/release.tar.gz"
+    );
+    let base = tempfile::tempdir().unwrap();
+    let (_cancel, rx) = tokio::sync::watch::channel(false);
+
+    let installed = install_fake(base.path(), &release, rx, Some(&mirror))
+        .await
+        .expect("the fake release installs from the mirror");
+    assert!(installed.installed);
+    assert_eq!(installed.manifest.unwrap().sha256, release.sha256);
+    assert!(
+        origin
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("GET /corp/llama.cpp/btest/release.tar.gz ")),
+        "the mirror is asked for the pinned asset name: {:?}",
+        origin.requests()
+    );
+}
+
+/// A mirror that serves other bytes is refused as a digest mismatch, and
+/// nothing reaches tar; the pinned digest is not the mirror's to change.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mirror_serving_other_bytes_is_a_digest_mismatch() {
+    let (_tree, bytes) = fake_archive("btest", "version: 0.0.0 (build 42, commit abc)");
+    let (_other, other_bytes) = fake_archive("btest", "version: 0.0.0 (build 42, commit xyz)");
+    let origin = crate::testing::serve(other_bytes, "\"etag\"").await;
+    let mut release = release_for(&origin, &bytes, 42);
+    release.bytes = 0;
+    release.url_base = "https://releases.pam-test.invalid/llama/btest/".to_owned();
+    let mirror = MirrorBase::for_tests(&origin.url(""));
+    let base = tempfile::tempdir().unwrap();
+    let (_cancel, rx) = tokio::sync::watch::channel(false);
+
+    let error = install_fake(base.path(), &release, rx, Some(&mirror))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Download { ref cause, .. } if cause == "size_mismatch" || cause == "digest_mismatch"),
+        "{error:?}"
+    );
+    let layout = EngineLayout::new(base.path());
+    assert!(!layout.install_dir("btest").exists());
+    assert!(!layout.manifest_path().exists());
+}
+
+/// A plain-http release address is refused by the production path before
+/// any transfer, with the launcher's cause carried through.
+#[cfg(unix)]
+#[tokio::test]
+async fn production_install_refuses_a_plain_http_release() {
+    let (_tree, bytes) = fake_archive("btest", "version: 0.0.0 (build 42, commit abc)");
+    let origin = crate::testing::serve(bytes.clone(), "\"etag\"").await;
+    let release = release_for(&origin, &bytes, 42);
+    let base = tempfile::tempdir().unwrap();
+    let (_cancel, rx) = tokio::sync::watch::channel(false);
+
+    let error = install_release(base.path(), &release, rx, direct(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Download { ref cause, ref detail }
+            if cause == "start" && detail.contains("only https addresses are downloaded")),
+        "{error:?}"
+    );
+    assert!(origin.requests().is_empty(), "curl never ran");
+}
+
 /// Opt-in: fetches the real pinned release from GitHub and proves the
 /// pinned digest, the OS tar and the real `llama-server --version` agree.
 /// `cargo test -p pam_model --lib -- engine --ignored --nocapture`.
@@ -270,7 +373,7 @@ async fn a_server_that_reports_another_build_is_discarded() {
 async fn the_pinned_release_installs_on_this_host() {
     let base = tempfile::tempdir().unwrap();
     let (_cancel, rx) = tokio::sync::watch::channel(false);
-    let installed = install(base.path(), rx)
+    let installed = install(base.path(), rx, direct(), None)
         .await
         .expect("the pinned release installs");
     assert!(installed.installed, "{installed:?}");

@@ -3,10 +3,12 @@
 //! PAM itself stays pure Rust; the engine is `llama-server` from one exact
 //! upstream GitHub release (`ENGINE_TAG`), one asset per supported target,
 //! each pinned by the SHA-256 digest the release API publishes. The archive
-//! is fetched with the same resumable curl transfer models use, unpacked by
-//! the operating system's own `tar` (which also reads the Windows zip), and
-//! the unpacked server must report the pinned build number before it is
-//! accepted. Nothing here runs a model; that is the supervisor's job.
+//! is fetched with the same resumable curl transfer models use — under the
+//! same network profile, from upstream or from an internal mirror that must
+//! serve the identical bytes — unpacked by the operating system's own `tar`
+//! (which also reads the Windows zip), and the unpacked server must report
+//! the pinned build number before it is accepted. Nothing here runs a model;
+//! that is the supervisor's job.
 //!
 //! Layout under the private base directory:
 //!
@@ -18,11 +20,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
+use pam_net::{MirrorBase, NetSettings};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+#[cfg(any(test, feature = "testing"))]
+use crate::download::TransferLimits;
 use crate::download::{self, DownloadRequest, DownloadState};
 use crate::registry::verified_sidecar_path;
 
@@ -164,8 +170,20 @@ impl EngineRelease {
         }
     }
 
-    fn url(&self) -> String {
-        format!("{}{}", self.url_base, self.asset_name)
+    /// Where the archive is fetched from: the pinned asset name under the
+    /// release base, or under `mirror` when one is set. Only the host
+    /// changes; the name, size and digest the bytes are held to do not.
+    pub fn url(&self, mirror: Option<&MirrorBase>) -> Result<String, EngineError> {
+        match mirror {
+            Some(mirror) => mirror
+                .join(&self.asset_name)
+                .map(String::from)
+                .map_err(|error| EngineError::Download {
+                    cause: "mirror_invalid".to_owned(),
+                    detail: error.to_string(),
+                }),
+            None => Ok(format!("{}{}", self.url_base, self.asset_name)),
+        }
     }
 }
 
@@ -353,17 +371,21 @@ fn status_for(base: &Path, tag: &str, build: u64, target: Option<Target>) -> Eng
 }
 
 /// Installs the pinned release for this platform under `base`, or reports
-/// the installed one. `cancel` stops the transfer; a cancelled transfer
-/// keeps its part file for a resume.
+/// the installed one. The archive is fetched under the network profile
+/// `net`, from upstream or from `mirror`; either way it must hash to the
+/// pinned digest. `cancel` stops the transfer; a cancelled transfer keeps
+/// its part file for a resume.
 pub async fn install(
     base: &Path,
     cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
 ) -> Result<EngineStatus, EngineError> {
     let target = Target::current().ok_or_else(|| EngineError::UnsupportedTarget {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
     })?;
-    install_release(base, &EngineRelease::pinned(target), cancel).await
+    install_release(base, &EngineRelease::pinned(target), cancel, net, mirror).await
 }
 
 /// [`install`] for an explicit release; production passes the pinned one.
@@ -371,6 +393,33 @@ pub async fn install_release(
     base: &Path,
     release: &EngineRelease,
     cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    install_with(base, release, cancel, net, mirror, false).await
+}
+
+/// [`install_release`] with the archive fetched over plain `http` from a
+/// loopback origin: the test allowance, for the fake-release tests here and
+/// in the daemon. Test builds and the `testing` feature only.
+#[cfg(any(test, feature = "testing"))]
+pub async fn install_release_over_plain_http_for_tests(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    install_with(base, release, cancel, net, mirror, true).await
+}
+
+async fn install_with(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+    plain_http: bool,
 ) -> Result<EngineStatus, EngineError> {
     let layout = EngineLayout::new(base);
     let current = status_for(base, &release.tag, release.build, Some(release.target));
@@ -383,7 +432,7 @@ pub async fn install_release(
         return Ok(current);
     }
     create_private_dir(layout.root())?;
-    let archive = fetch_archive(&layout, release, cancel).await?;
+    let archive = fetch_archive(&layout, release, cancel, net, mirror, plain_http).await?;
     let scratch = layout.root().join(format!(
         ".unpack-{}-{}",
         std::process::id(),
@@ -424,21 +473,40 @@ async fn fetch_archive(
     layout: &EngineLayout,
     release: &EngineRelease,
     mut cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+    plain_http: bool,
 ) -> Result<PathBuf, EngineError> {
     let archive = layout.archive_path(&release.asset_name);
     if archive.exists() {
         std::fs::remove_file(&archive).map_err(|e| io("remove stale archive", &e))?;
         let _ = std::fs::remove_file(verified_sidecar_path(&archive));
     }
-    let handle = download::start(DownloadRequest {
-        url: release.url(),
+    let request = DownloadRequest {
+        url: release.url(mirror)?,
         dest: archive.clone(),
         expected_size: Some(release.bytes),
         expected_sha256: Some(release.sha256.clone()),
         license_id: None,
-    })
-    .map_err(|e| EngineError::Download {
-        cause: "start".to_owned(),
+    };
+    #[cfg(any(test, feature = "testing"))]
+    let started = if plain_http {
+        download::start_over_plain_http_for_tests(request, net, TransferLimits::default())
+    } else {
+        download::start(request, net)
+    };
+    #[cfg(not(any(test, feature = "testing")))]
+    let started = {
+        // Production has no plain-http path: the flag is never set outside tests.
+        let _ = plain_http;
+        download::start(request, net)
+    };
+    let handle = started.map_err(|e| EngineError::Download {
+        cause: match &e {
+            download::DownloadError::Network(failure) => failure.cause().to_owned(),
+            download::DownloadError::CurlMissing => "curl_missing".to_owned(),
+            _ => "start".to_owned(),
+        },
         detail: e.to_string(),
     })?;
     let outcome = tokio::select! {

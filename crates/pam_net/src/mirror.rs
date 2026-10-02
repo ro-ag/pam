@@ -105,6 +105,24 @@ impl MirrorBase {
         Ok(Self(url))
     }
 
+    /// A loopback fixture as a mirror, the host and scheme rules waived.
+    ///
+    /// The download and engine suites drive real curl against a plain-http
+    /// `TcpListener` on this machine, which [`Self::parse`] rightly refuses;
+    /// this is how such an origin plays the mirror. Test builds and the
+    /// `testing` feature only, which no shipped binary turns on. The path
+    /// rules of [`Self::join`] still apply.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_tests(raw: &str) -> Self {
+        let mut url = Url::parse(raw).expect("the fixture's mirror address parses");
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Self(url)
+    }
+
     /// The normalized address, ending in `/`.
     #[must_use]
     pub fn as_str(&self) -> &str {

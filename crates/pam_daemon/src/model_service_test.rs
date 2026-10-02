@@ -11,11 +11,14 @@ use crate::model_service::{
 };
 use crate::test_log::Captured;
 
-/// A service over a fresh in-memory store, pointed at `dir`.
+/// A service over a fresh in-memory store, pointed at `dir`. Its
+/// downloads may fetch from the plain-http loopback origin the fixtures
+/// serve; production refuses `http://`.
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let service = ModelService::new(Arc::clone(&store)).await.unwrap();
     service.set_models_dir(dir).await.unwrap();
+    service.allow_plain_http_downloads_for_tests();
     service
 }
 
@@ -978,6 +981,7 @@ async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_c
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let service = ModelService::new(Arc::clone(&store)).await.unwrap();
     service.set_models_dir(dir.path()).await.unwrap();
+    service.allow_plain_http_downloads_for_tests();
     service.set_engine_base(dir.path().join("base"));
 
     // A verification that is still hashing when the shutdown comes (sparse:

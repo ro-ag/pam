@@ -1,28 +1,102 @@
+use std::pin::Pin;
+use std::sync::Arc;
+
+use pam_net::{NetFailure, NetSettings, NetworkSource};
 use url::Url;
 
 use crate::curl::parse_response;
 use crate::transport::{HttpRequest, Method};
 use crate::{CurlTransport, MAX_JSON_BYTES};
 
+/// A direct profile, as the daemon passes until the Network settings exist.
+fn direct() -> Arc<dyn NetworkSource> {
+    Arc::new(Arc::new(NetSettings::direct()))
+}
+
+/// A source that must never be asked: a request refused before the
+/// transport reads its profile proves nothing ran, because the refusal
+/// would otherwise be this source's own.
+struct NeverSource;
+
+impl NetworkSource for NeverSource {
+    fn settings(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<NetSettings>, NetFailure>> + Send + '_>> {
+        Box::pin(async {
+            Err(NetFailure::SettingsInvalid(
+                "the test's network source was consulted".to_owned(),
+            ))
+        })
+    }
+}
+
+/// The transport over the trusted curl, or `None` with a line when this
+/// machine has none.
+fn transport(source: Arc<dyn NetworkSource>) -> Option<CurlTransport> {
+    match CurlTransport::trusted(source) {
+        Ok(transport) => Some(transport),
+        Err(error) => {
+            eprintln!("no trusted operating-system curl ({error}); skipping");
+            None
+        }
+    }
+}
+
+/// The config lines, or `None` with a line when there is no curl to
+/// render them for.
+fn config_lines(request: &HttpRequest, deadline_secs: u64) -> Option<Vec<String>> {
+    match CurlTransport::config_for(&NetSettings::direct(), request, deadline_secs) {
+        Ok(config) => Some(config.lines().map(str::to_owned).collect()),
+        Err(error) => {
+            eprintln!("no trusted operating-system curl ({error}); skipping");
+            None
+        }
+    }
+}
+
 #[test]
 fn the_config_carries_the_url_the_deadline_and_every_header() {
-    let config = CurlTransport::config_for(&request(), 12);
-    let lines: Vec<&str> = config.lines().collect();
+    let Some(lines) = config_lines(&request(), 12) else {
+        return;
+    };
     assert_eq!(lines[0], "url = \"https://api.github.com/user\"");
-    assert_eq!(lines[1], "max-time = 12");
-    assert_eq!(lines[2], "header = \"Authorization: Bearer ghp_secret\"");
-    assert_eq!(lines[3], "header = \"Accept: application/json\"");
-    assert_eq!(lines.len(), 4);
+    assert!(lines.contains(&"max-time = 12".to_owned()), "{lines:?}");
+    assert!(
+        lines.contains(&"header = \"Authorization: Bearer ghp_secret\"".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"header = \"Accept: application/json\"".to_owned()),
+        "{lines:?}"
+    );
+    assert!(lines.contains(&"include".to_owned()), "{lines:?}");
+    assert!(
+        lines.contains(&format!("max-filesize = {MAX_JSON_BYTES}")),
+        "{lines:?}"
+    );
+    // Production is https only, for the request and for anything curl
+    // would follow; a direct profile says so about the proxy as well.
+    assert!(
+        lines.contains(&"proto = \"=https\"".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"proto-redir = \"=https\"".to_owned()),
+        "{lines:?}"
+    );
+    assert!(lines.contains(&"noproxy = \"*\"".to_owned()), "{lines:?}");
 }
 
 #[test]
 fn quotes_and_backslashes_in_a_header_are_escaped() {
     let mut request = request();
     request.headers = vec![("X-Odd".to_owned(), "a\"b\\c".to_owned())];
-    let config = CurlTransport::config_for(&request, 1);
+    let Some(lines) = config_lines(&request, 1) else {
+        return;
+    };
     assert!(
-        config.contains("header = \"X-Odd: a\\\"b\\\\c\""),
-        "{config}"
+        lines.contains(&"header = \"X-Odd: a\\\"b\\\\c\"".to_owned()),
+        "{lines:?}"
     );
 }
 
@@ -91,131 +165,30 @@ fn request() -> HttpRequest {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// The transport has no executable of its own to hold: the launcher
+/// resolves the operating system's curl itself, so there is no path a
+/// caller could hand in and nothing a PATH entry could substitute.
 #[test]
-fn connector_command_uses_only_trusted_curl_without_argv_credentials() {
-    let Ok(path) = CurlTransport::trusted_path() else {
+fn the_transport_holds_no_executable_path_of_its_own() {
+    let Some(transport) = transport(direct()) else {
         return;
     };
-    let transport = CurlTransport::trusted().unwrap();
-    let command = transport.command(&request(), 12).unwrap();
-    let command = command.as_std();
-    assert_eq!(command.get_program(), path.as_os_str());
-    let args: Vec<_> = command.get_args().collect();
-    assert_eq!(args[0], "-q");
-    assert_eq!(args[1], "--config");
-    assert_eq!(args[2], "-");
-    assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
-    assert!(command.get_envs().next().is_none());
-    assert!(
-        args.iter()
-            .all(|arg| !arg.to_string_lossy().contains("ghp_secret"))
-    );
-    assert!(
-        args.iter()
-            .all(|arg| !arg.to_string_lossy().contains("api.github.com"))
-    );
-}
-
-#[test]
-fn caller_supplied_executable_cannot_replace_the_connector_bridge() {
-    let transport = CurlTransport::new("/agent-controlled/curl".into());
-    assert!(matches!(
-        transport.command(&request(), 1),
-        Err(crate::TransportError::Policy {
-            cause: "trusted_curl_unavailable",
-            ..
-        })
-    ));
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn windows_resolves_the_operating_system_curl_from_system32() {
-    let path = CurlTransport::trusted_path().unwrap();
-    assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("curl.exe")));
-    assert_eq!(
-        path.parent().and_then(std::path::Path::file_name),
-        Some(std::ffi::OsStr::new("System32"))
-    );
-}
-
-#[cfg(target_os = "windows")]
-#[test]
-fn windows_child_keeps_the_os_roots_and_a_neutral_working_directory() {
-    let transport = CurlTransport::trusted().unwrap();
-    let command = transport.command(&request(), 12).unwrap();
-    let command = command.as_std();
-    assert!(
-        command
-            .get_envs()
-            .any(|(key, _)| key == std::ffi::OsStr::new("SystemRoot"))
-    );
-    assert!(
-        command
-            .get_current_dir()
-            .is_some_and(|dir| dir.has_root() && dir.parent().is_none())
-    );
+    let shown = format!("{transport:?}");
+    assert!(shown.starts_with("CurlTransport"), "{shown}");
+    assert!(!shown.contains("curl"), "{shown}");
+    assert!(!shown.contains('/'), "{shown}");
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[test]
 fn platforms_without_a_verified_system_binary_fail_closed() {
     assert!(matches!(
-        CurlTransport::trusted_path(),
+        CurlTransport::trusted(direct()),
         Err(crate::TransportError::Policy {
             cause: "trusted_curl_unavailable",
             ..
         })
     ));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn inherited_curl_home_cannot_enable_a_trace_file() {
-    if CurlTransport::trusted_path().is_err() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let trace = dir.path().join("forbidden-trace");
-    std::fs::write(
-        dir.path().join(".curlrc"),
-        format!("trace = \"{}\"\n", trace.display()),
-    )
-    .unwrap();
-    // A subprocess supplies hostile inherited variables without mutating this
-    // multithreaded test runner's environment.
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "curl_test::hostile_environment_child"])
-        .env("PAM_CURL_ENV_PROBE", "1")
-        .env("CURL_HOME", dir.path())
-        .env("HOME", dir.path())
-        .status()
-        .unwrap();
-    assert!(status.success());
-    assert!(!trace.exists(), "inherited curlrc wrote a host trace file");
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn hostile_environment_child() {
-    use tokio::io::AsyncWriteExt;
-    if std::env::var_os("PAM_CURL_ENV_PROBE").is_none() {
-        return;
-    }
-    let transport = CurlTransport::trusted().unwrap();
-    let mut child = transport.command(&request(), 1).unwrap().spawn().unwrap();
-    let mut input = child.stdin.take().unwrap();
-    input
-        .write_all(b"url = \"https://127.0.0.1:1/\"\n")
-        .await
-        .unwrap();
-    input.shutdown().await.unwrap();
-    drop(input);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 #[test]
@@ -223,35 +196,37 @@ fn mutation_body_and_credentials_stay_in_escaped_stdin_config() {
     let mut req = request();
     req.method = Method::Post;
     req.body = Some(b"{\n\"title\":\"secret body\\nurl = evil\"\n}".to_vec());
-    let config = CurlTransport::config_for(&req, 5);
-    assert!(config.contains("request = \"POST\""));
+    let Some(lines) = config_lines(&req, 5) else {
+        return;
+    };
+    assert!(
+        lines.contains(&"request = \"POST\"".to_owned()),
+        "{lines:?}"
+    );
     assert_eq!(
-        config
-            .lines()
+        lines
+            .iter()
             .filter(|line| line.starts_with("url ="))
             .count(),
         1
     );
-    assert!(config.contains("data-binary = \"{\\n"));
-    #[cfg(target_os = "macos")]
-    {
-        let transport = CurlTransport::trusted().unwrap();
-        let command = transport.command(&req, 5).unwrap();
-        let argv = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(!argv.contains("secret body"));
-        assert!(!argv.contains("ghp_secret"));
-    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("data-raw = \"{\\n")),
+        "{lines:?}"
+    );
+    // The launcher's argument vector is a constant; the body and the
+    // credential are on standard input only.
+    assert_eq!(pam_net::CURL_ARGV, ["-q", "--config", "-"]);
 }
 
 #[tokio::test]
 async fn mutation_invalid_body_or_redirect_policy_refuses_before_process_start() {
     use crate::HttpTransport;
-    let transport = CurlTransport::new(std::path::PathBuf::from("untrusted-unused"));
+    let Some(transport) = transport(Arc::new(NeverSource)) else {
+        return;
+    };
     for (body, follow) in [
         (Some(vec![b'x'; 16 * 1024 + 1]), false),
         (Some(b"[]".to_vec()), false),
@@ -404,12 +379,14 @@ fn upload_pack_packet_stays_exact_in_curl_stdin_config() {
     ));
     let sha = "a".repeat(40);
     req.body = Some(format!("0033want {sha} \n00000009done\n").into_bytes());
-    let config = CurlTransport::config_for(&req, 5);
-    assert!(
-        config
-            .lines()
-            .any(|line| line == format!("data-binary = \"0033want {sha} \\n00000009done\\n\""))
-    );
+    if let Some(lines) = config_lines(&req, 5) {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &format!("data-raw = \"0033want {sha} \\n00000009done\\n\"")),
+            "{lines:?}"
+        );
+    }
     for method in [Method::Put, Method::Get] {
         req.method = method;
         assert!(crate::curl::validate_request_body(&req).is_err());
@@ -423,9 +400,12 @@ fn upload_pack_packet_stays_exact_in_curl_stdin_config() {
 #[tokio::test]
 async fn a_header_with_a_line_break_is_refused_before_curl_is_started() {
     use crate::HttpTransport as _;
-    // Not the trusted curl: if the request got as far as choosing an executable the
-    // refusal would be `trusted_curl_unavailable`, so the cause proves nothing ran.
-    let transport = CurlTransport::new("/agent-controlled/curl".into());
+    // A source that fails when read: had the request got as far as
+    // reading its profile, the refusal would be `network_settings_invalid`,
+    // so the cause proves nothing ran.
+    let Some(transport) = transport(Arc::new(NeverSource)) else {
+        return;
+    };
     for value in ["Bearer abc\n", "Bearer abc\r\nX-Injected: 1", "Bearer a\0b"] {
         let mut request = request();
         request.headers = vec![("Authorization".to_owned(), value.to_owned())];
@@ -447,4 +427,34 @@ async fn a_header_with_a_line_break_is_refused_before_curl_is_started() {
             "{value:?}: {error:?}"
         );
     }
+}
+
+/// A source that cannot produce a profile refuses the request with the
+/// launcher's own cause and never falls back to a direct connection.
+#[tokio::test]
+async fn an_unusable_network_profile_refuses_the_request_closed() {
+    use crate::HttpTransport as _;
+    let Some(transport) = transport(Arc::new(NeverSource)) else {
+        return;
+    };
+    let error = transport
+        .send(
+            request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::TransportError::Policy {
+                cause: "network_settings_invalid",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let connector = crate::ConnectorError::from(error);
+    assert_eq!(connector.cause(), "network_settings_invalid");
+    assert!(!connector.retryable());
 }

@@ -7,14 +7,18 @@ import { LayoutGroup, motion } from "motion/react";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmButton } from "../components/ui/ConfirmButton";
+import { TypedConfirm } from "../components/ui/TypedConfirm";
 import { FailureNote } from "../components/ui/FailureNote";
 import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { Section } from "../components/ui/Section";
-import { DAEMON_STATUS_KEY } from "../components/shell/useDaemonStatus";
+import { DAEMON_STATUS_KEY, statusRefetchInterval } from "../components/shell/useDaemonStatus";
 import { formatBytes } from "../lib/bytes";
 import { cn } from "../lib/cn";
+import { backoffRefetchInterval } from "../lib/polling";
 import {
+  CONFIRM_GRANT,
+  CONFIRM_RELAXED,
   daemonStatus,
   daemonStop,
   grantsAdd,
@@ -73,10 +77,13 @@ function ProfilePanel() {
   const queryClient = useQueryClient();
   const profile = useQuery({ queryKey: ["profile"], queryFn: profileGet });
   const [applies, setApplies] = useState<string | null>(null);
+  // Relaxing the profile widens what agents may do: it asks for a typed confirmation first.
+  const [confirmingRelaxed, setConfirmingRelaxed] = useState(false);
 
   const setProfile = useMutation({
-    mutationFn: (next: Profile) => profileSet(next),
-    onMutate: async (next: Profile) => {
+    mutationFn: ({ next, confirmation }: { next: Profile; confirmation?: string }) =>
+      profileSet(next, confirmation),
+    onMutate: async ({ next }: { next: Profile; confirmation?: string }) => {
       await queryClient.cancelQueries({ queryKey: ["profile"] });
       const previous = queryClient.getQueryData<{ profile: Profile }>(["profile"]);
       queryClient.setQueryData(["profile"], { profile: next });
@@ -84,8 +91,8 @@ function ProfilePanel() {
       return { previous };
     },
     onSuccess: (reply) => {
-      // Surface the daemon's own caveat: the running gate keeps its
-      // profile; the change binds at the next daemon start.
+      // The daemon swaps the running gate at once ("now"). A daemon from
+      // before that change answers "next_daemon_start": surface its caveat.
       if (reply.applies === "next_daemon_start") {
         setApplies("applies at next daemon start — restart from the Daemon section below");
       }
@@ -124,7 +131,13 @@ function ProfilePanel() {
                 value={candidate}
                 checked={selected}
                 disabled={current === undefined || setProfile.isPending}
-                onChange={() => setProfile.mutate(candidate)}
+                onChange={() => {
+                  if (candidate === "relaxed") setConfirmingRelaxed(true);
+                  else {
+                    setConfirmingRelaxed(false);
+                    setProfile.mutate({ next: candidate });
+                  }
+                }}
                 className="mt-0.5 size-4.5 shrink-0 accent-accent-strong"
               />
               <span className="space-y-0.5">
@@ -139,6 +152,21 @@ function ProfilePanel() {
           );
         })}
       </div>
+      {confirmingRelaxed && (
+        <TypedConfirm
+          phrase={CONFIRM_RELAXED}
+          title="Switch to the relaxed profile?"
+          confirmLabel="Switch to relaxed"
+          busy={setProfile.isPending}
+          onCancel={() => setConfirmingRelaxed(false)}
+          onConfirm={(typed) => {
+            setConfirmingRelaxed(false);
+            setProfile.mutate({ next: "relaxed", confirmation: typed });
+          }}
+        >
+          <p>{PROFILE_SENTENCES.relaxed}</p>
+        </TypedConfirm>
+      )}
       {applies && (
         <p className="rounded-card bg-accent-soft px-3 py-2 font-data text-xs text-accent">
           {applies}
@@ -212,8 +240,12 @@ function GrantsPanel() {
 
   const settle = () => void queryClient.invalidateQueries({ queryKey: ["grants"] });
 
+  // A grant is global: it asks for a typed confirmation naming the capability first.
+  const [confirming, setConfirming] = useState<string | null>(null);
+
   const add = useMutation({
-    mutationFn: (capability: string) => grantsAdd(capability),
+    mutationFn: ({ capability, confirmation }: { capability: string; confirmation: string }) =>
+      grantsAdd(capability, confirmation),
     onMutate: () => setFailure(null),
     onSuccess: () => setDraft(""),
     onError: (error) => setFailure(toBridgeFailure(error)),
@@ -280,7 +312,7 @@ function GrantsPanel() {
         onSubmit={(event) => {
           event.preventDefault();
           const capability = draft.trim();
-          if (capability) add.mutate(capability);
+          if (capability) setConfirming(capability);
         }}
       >
         <label className="min-w-48 flex-1 space-y-1">
@@ -311,6 +343,26 @@ function GrantsPanel() {
         </Button>
       </form>
 
+      {confirming !== null && (
+        <TypedConfirm
+          phrase={CONFIRM_GRANT}
+          title={`Grant ${confirming} to every repository?`}
+          confirmLabel="Grant"
+          busy={add.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={(typed) => {
+            const capability = confirming;
+            setConfirming(null);
+            add.mutate({ capability, confirmation: typed });
+          }}
+        >
+          <p>
+            A grant is not scoped to one repository: every agent may then use this capability
+            wherever the active profile allows, until you revoke it here.
+          </p>
+        </TypedConfirm>
+      )}
+
       {failure && <FailureNote failure={failure} label="grants" />}
     </Panel>
   );
@@ -337,7 +389,7 @@ function DaemonPanel({ active }: { active: boolean }) {
     queryKey: DAEMON_STATUS_KEY,
     queryFn: daemonStatus,
     enabled: active,
-    refetchInterval: active ? 5_000 : false,
+    refetchInterval: active ? statusRefetchInterval : false,
   });
   const [note, setNote] = useState<string | null>(null);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
@@ -486,6 +538,21 @@ function DaemonPanel({ active }: { active: boolean }) {
               onConfirm={() => remove.mutate()}
             />
           )}
+        </div>
+      )}
+      {!bridgeDown && service.data?.stale && (
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="min-w-0 flex-1 break-all font-data text-xs text-warning">
+            {service.data.stale}
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={install.isPending}
+            onClick={() => install.mutate()}
+          >
+            Repoint to this binary
+          </Button>
         </div>
       )}
       {serviceNote && <p className="font-data text-xs text-ink-muted">{serviceNote}</p>}
@@ -708,6 +775,9 @@ export const LOG_LINE_CHOICES = [100, 500, 1000] as const;
 /** How often the auto-refresh re-reads the tail. */
 const LOG_REFRESH_MS = 5_000;
 
+/** The log tail's auto-refresh cadence; backs off while the read keeps failing. */
+const logRefetchInterval = backoffRefetchInterval<unknown>({ baseMs: LOG_REFRESH_MS });
+
 /**
  * Colorizes one log line by its level token — plain string matching on
  * the words tracing prints, nothing cleverer.
@@ -727,7 +797,7 @@ function LogsPanel({ active }: { active: boolean }) {
     queryKey: ["daemon-log", lineCount],
     queryFn: () => readDaemonLog(lineCount),
     enabled: active,
-    refetchInterval: active && auto ? LOG_REFRESH_MS : false,
+    refetchInterval: active && auto ? logRefetchInterval : false,
   });
 
   const failure = log.isError ? toBridgeFailure(log.error) : null;

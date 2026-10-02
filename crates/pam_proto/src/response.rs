@@ -43,6 +43,14 @@ pub enum Response {
         detail: String,
         /// Sentence pointing the human at the GUI to recover.
         recovery: String,
+        /// True when the cause is transient: the same request, sent again
+        /// later, may be admitted (capacity, rate, drain, restart, an
+        /// elapsed deadline, a daemon-side bookkeeping failure). False —
+        /// and absent on the wire — for every refusal that would only
+        /// repeat. Set by the daemon where it raises the refusal; a client
+        /// prefers it over any list of causes it keeps for older daemons.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retryable: bool,
     },
     /// The request was queued; sent when the envelope had `wait: false`.
     Ticket {
@@ -53,4 +61,59 @@ pub enum Response {
         /// Position in the queue at enqueue time.
         position: u64,
     },
+}
+
+/// `skip_serializing_if` predicate: a non-retryable refusal keeps the wire
+/// shape it always had.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+impl Response {
+    /// The id of the request this response answers.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Result { id, .. } | Self::Refusal { id, .. } | Self::Ticket { id, .. } => id,
+        }
+    }
+
+    /// A refusal that would only repeat if the request were sent again.
+    #[must_use]
+    pub fn refusal(
+        id: impl Into<String>,
+        cause: impl Into<String>,
+        detail: impl Into<String>,
+        recovery: impl Into<String>,
+    ) -> Self {
+        Self::Refusal {
+            id: id.into(),
+            cause: cause.into(),
+            detail: detail.into(),
+            recovery: recovery.into(),
+            retryable: false,
+        }
+    }
+
+    /// A refusal for a transient cause: `retryable` is set, so a client
+    /// may send the same request again after backing off.
+    #[must_use]
+    pub fn transient_refusal(
+        id: impl Into<String>,
+        cause: impl Into<String>,
+        detail: impl Into<String>,
+        recovery: impl Into<String>,
+    ) -> Self {
+        Self::Refusal {
+            id: id.into(),
+            cause: cause.into(),
+            detail: detail.into(),
+            recovery: recovery.into(),
+            retryable: true,
+        }
+    }
 }

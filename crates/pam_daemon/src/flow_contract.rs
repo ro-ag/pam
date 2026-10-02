@@ -28,12 +28,20 @@ pub struct AgentResult {
     pub diagnosis: Diagnosis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<CorrelationSummary>,
+    /// State changes the run made or may have made, whatever its outcome:
+    /// an `unresolved` or `blocked` run that pushed first says so here.
+    /// Absent (empty) when no state-changing step ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<crate::flow_exec::EffectRecord>,
     pub observations: Vec<Observation>,
     pub evidence: Vec<String>,
     pub omitted: Omissions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
 }
+
+/// Handoff reason for a run that did not complete after changing state.
+pub const REASON_STOPPED_AFTER_EFFECTS: &str = "workflow_not_completed_after_state_change";
 
 /// Reusable evidence handoff, with no generated diagnosis or inferred target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +85,23 @@ impl AgentResult {
             .into();
             handoff.target = target;
         }
+        fit_result(&mut self)?;
+        Ok(self)
+    }
+
+    /// Records the run's effects. They are never dropped to make the
+    /// projection fit; observations and evidence references give way first.
+    pub fn with_effects(
+        mut self,
+        effects: Vec<crate::flow_exec::EffectRecord>,
+    ) -> Result<Self, ContractError> {
+        if !effects.is_empty()
+            && let Some(handoff) = &mut self.handoff
+            && handoff.state == "escalation_required"
+        {
+            REASON_STOPPED_AFTER_EFFECTS.clone_into(&mut handoff.reason);
+        }
+        self.effects = effects;
         fit_result(&mut self)?;
         Ok(self)
     }
@@ -172,6 +197,7 @@ pub fn project_result(
             status: "not_attempted".to_owned(),
         },
         correlation: None,
+        effects: Vec::new(),
         observations: Vec::new(),
         evidence: Vec::new(),
         omitted: Omissions::default(),
@@ -289,9 +315,20 @@ fn handoff(report: &RunReport, result: &AgentResult) -> Handoff {
     }
 }
 
+/// Shrinks a projection to its byte limit. The steps that explain a run are
+/// the ones that did not succeed, and in a long flow those are usually the
+/// last: succeeded and skipped observations go first (latest first), and a
+/// failed or blocked one only when nothing else is left to drop.
 fn fit_result(result: &mut AgentResult) -> Result<(), ContractError> {
     while serialized_len(result)? > MAX_RESULT_BYTES {
-        if let Some(observation) = result.observations.pop() {
+        let quiet = result.observations.iter().rposition(|observation| {
+            matches!(observation.status.as_str(), "succeeded" | "skipped")
+        });
+        let dropped = match quiet {
+            Some(index) => Some(result.observations.remove(index)),
+            None => result.observations.pop(),
+        };
+        if let Some(observation) = dropped {
             result.omitted.observations += 1;
             result.omitted.observation_bytes += observation.text.len();
         } else if result.evidence.pop().is_some() {
@@ -394,7 +431,7 @@ pub(crate) fn inspect_gate(
     class: crate::policy::CapabilityClass,
 ) -> &'static str {
     use crate::policy::{CapabilityClass, Profile};
-    if class == CapabilityClass::ReadOnly {
+    if class.bypasses_lanes() {
         return "allowed";
     }
     match (profile, granted, class) {

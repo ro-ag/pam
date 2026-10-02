@@ -16,6 +16,7 @@
 pub mod bridge;
 pub mod events;
 pub mod logs;
+pub mod own_requests;
 pub mod service;
 
 #[cfg(test)]
@@ -24,6 +25,8 @@ mod bridge_test;
 mod events_test;
 #[cfg(test)]
 mod logs_test;
+#[cfg(test)]
+mod own_requests_test;
 #[cfg(test)]
 mod service_test;
 
@@ -42,7 +45,6 @@ pub fn run(context: tauri::Context) -> tauri::Result<()> {
         .invoke_handler(tauri::generate_handler![
             bridge::daemon_status,
             bridge::admin_call,
-            bridge::request_capability,
             bridge::daemon_stop,
             events::events_subscribe,
             logs::read_daemon_log,

@@ -174,6 +174,22 @@ impl RunState<'_> {
         }
         Ok(())
     }
+    /// Whether an earlier attempt of this landing step journaled a prepared
+    /// intent: its effect may already exist, so the step is never treated as
+    /// not started, gate or no gate.
+    pub(super) async fn landing_intent_outstanding(
+        &self,
+        step: &Step,
+    ) -> Result<bool, CapabilityFailure> {
+        if !matches!(step.action, Action::Landing { .. }) {
+            return Ok(false);
+        }
+        Ok(self.landing_session().await?.is_some_and(|(_, session)| {
+            session
+                .intent
+                .is_some_and(|intent| intent.step_id == step.id && intent.state == "prepared")
+        }))
+    }
     pub(super) async fn landing_approval_valid(
         &self,
         step: &Step,
@@ -741,12 +757,19 @@ impl RunState<'_> {
         let found = self.github(loaded, lookup, deadline).await?;
         if !found.is_null() {
             let pr: PullRequest = serde_json::from_value(found.clone()).map_err(|_| failure())?;
-            if pr.state == "open" && !pr.merged {
+            // The broker only returns a PR whose head is the frozen commit.
+            // One that is still open is the PR this stage ensures. One that
+            // is already merged is the same landing further along — an
+            // earlier ticket merged it and then ran out of polls, or a human
+            // pressed the button: the receipt records it as found, `merge`
+            // observes rather than requests it, and the remaining stages
+            // verify and synchronize the merge commit GitHub recorded.
+            if (pr.state == "open" && !pr.merged) || (pr.merged && pr.merge_sha.is_some()) {
                 return Ok(found);
             }
             return Err(refused(
                 "landing_pr_conflict",
-                "Matching PR is already closed",
+                "Matching PR was closed without being merged",
             ));
         }
         if has_intent(loaded, step, Op::EnsurePr)? {
@@ -1026,10 +1049,12 @@ impl RunState<'_> {
                     .await?,
                 )
                 .map_err(|_| failure())?;
-                if pr.state != "open" || pr.merged {
+                // Merged at the exact frozen head is what `merge` itself
+                // accepts as observed; only a PR closed unmerged conflicts.
+                if pr.state != "open" && !pr.merged {
                     return Err(refused(
                         "landing_pr_conflict",
-                        "The verified PR is no longer open at the exact frozen head",
+                        "The verified PR is no longer open and was not merged",
                     ));
                 }
             }

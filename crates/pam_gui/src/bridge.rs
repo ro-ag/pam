@@ -4,13 +4,23 @@
 //! `Refusal` wire shape, so the frontend renders every failure the same way whether the daemon
 //! refused, the transport broke, or the bridge itself said no.
 //!
-//! **One generic [`admin_call`]** replaces one command per op: the bridge whitelists the known
-//! `admin.*` op names before touching the socket, so a typo or smuggled op is refused client-side
-//! with the same shape the daemon would give. **[`daemon_status`] never errors on an unreachable
+//! **One generic [`admin_call`]** replaces one command per op: the bridge allowlists the known
+//! `admin.*` op names ([`ADMIN_OPS`], exactly the set the frontend's `AdminOp` type names — a test
+//! reads that file) before touching the socket, so a typo or smuggled op is refused client-side
+//! with the same shape the daemon would give. The webview is a full-admin root, so the ops that
+//! **expand what agents may do** ([`required_confirmation`]: switching to the relaxed profile, adding
+//! a grant, approving with "remember") additionally need a typed confirmation that the bridge
+//! checks in Rust before the op reaches the socket. Tauri's dialog plugin is not part of this
+//! binary and no dependency may be added, so the prompt itself is drawn by the frontend; a webview
+//! that is already compromised could supply the phrase itself, which is why this is a second wall
+//! against mistakes and blind one-click flows, not against a hostile frontend.
+//! **[`daemon_status`] never errors on an unreachable
 //! daemon** — it answers `{ connected: false }` and lazily starts the daemon via `send_request`
-//! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so
-//! [`request_capability`] can stay a thin escape hatch — administration goes only through
-//! [`admin_call`] and `send_admin`.
+//! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so the
+//! GUI sends no other public capability: cancelling a run is the admin op `admin.requests.cancel`,
+//! on the private channel like every other human act.
+//! The GUI's own status polls are marked in [`crate::own_requests`] before they are sent, so their
+//! lifecycle events never feed back into its refresh loop.
 //! Daemon refusals pass through verbatim; client-side errors are mapped onto the same shape here.
 //! The envelope carries the GUI process's own advisory (not authenticated) caller identity.
 
@@ -18,10 +28,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pam_client::client::{self, RequestError};
+use pam_client::request::new_request_id;
 use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_AUDIT_REQUEST,
     OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET,
-    OP_PROFILE_SET,
+    OP_PROFILE_SET, OP_REQUESTS_CANCEL,
 };
 use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
 use pam_daemon::admin_engine::OP_ENGINE_INSTALL;
@@ -35,6 +46,11 @@ use serde::Serialize;
 
 /// Deadline for the status poll: small so the beacon flips fast.
 const STATUS_DEADLINE_MS: u64 = 5_000;
+
+/// Hard client-side bound on one status poll, covering the lazy daemon start and the connect
+/// retries around the request's own deadline: a poll that outlives it is a daemon that is not
+/// answering, never a hung command that holds a control permit for good.
+const STATUS_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
@@ -57,7 +73,7 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The core admin surface (`pam_daemon::admin`): profile, grants,
 /// approvals, activity, callers, audit.
-const CORE_ADMIN_OPS: [&str; 10] = [
+const CORE_ADMIN_OPS: [&str; 11] = [
     OP_PROFILE_GET,
     OP_PROFILE_SET,
     OP_GRANTS_LIST,
@@ -68,6 +84,7 @@ const CORE_ADMIN_OPS: [&str; 10] = [
     OP_ACTIVITY_LIST,
     OP_CALLERS_LIST,
     OP_AUDIT_REQUEST,
+    OP_REQUESTS_CANCEL,
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model,
@@ -192,8 +209,8 @@ impl From<RequestError> for BridgeError {
             RequestError::AdminOnly { .. } | RequestError::NotAdmin { .. } => Self::new(
                 "wrong_channel",
                 detail,
-                "Admin operations go through admin_call; everything else through \
-                 request_capability.",
+                "Admin operations go through admin_call; the bridge sends no other \
+                 public capability.",
             ),
             RequestError::FollowRefused {
                 cause, recovery, ..
@@ -320,19 +337,32 @@ pub struct DaemonStatusReply {
 
 /// Daemon health for the beacon and the status views: ensures the daemon
 /// (lazy start) and asks the ordinary read-only `status` capability.
-/// An unreachable daemon is `{ connected: false }`, not an error.
+/// An unreachable daemon is `{ connected: false }`, not an error. The
+/// request id is generated here and registered as the GUI's own, so the
+/// daemon's `started`/`done` events for this poll are not forwarded back to
+/// the webview (see [`crate::own_requests`]), and the whole call is bounded
+/// by `STATUS_CLIENT_TIMEOUT`.
 #[tauri::command]
 pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
     let base = resolve_base_dir()?;
-    let sent = client::send_request(
-        &base,
-        "status",
-        serde_json::json!({}),
-        true,
-        STATUS_DEADLINE_MS,
-        None,
+    let id = new_request_id();
+    crate::own_requests::register(&id);
+    let sent = tokio::time::timeout(
+        STATUS_CLIENT_TIMEOUT,
+        client::send_request_with_id(
+            &base,
+            id,
+            "status",
+            serde_json::json!({}),
+            true,
+            STATUS_DEADLINE_MS,
+            None,
+        ),
     )
-    .await;
+    .await
+    .unwrap_or(Err(RequestError::ReplyTimeout {
+        waited: STATUS_CLIENT_TIMEOUT,
+    }));
     let base_dir = base.display().to_string();
     match sent {
         Ok(response) => Ok(DaemonStatusReply {
@@ -349,13 +379,74 @@ pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
     }
 }
 
+/// What the human must type to authorise `op` with `args`, or `None` when the op does not expand
+/// what agents may do. Fails closed: anything that is not clearly a narrowing needs the phrase.
+///
+/// - `admin.profile.set` to anything but `standard`/`strict` ([`CONFIRM_RELAXED`]): the relaxed
+///   profile lets safe capabilities grant themselves on first use.
+/// - `admin.grants.add` ([`CONFIRM_GRANT`]): a grant is global, not per repository.
+/// - `admin.approvals.resolve` with `remember` on anything but a denial ([`CONFIRM_GRANT`]):
+///   remembering an approval persists the same global grant.
+#[must_use]
+pub fn required_confirmation(op: &str, args: &serde_json::Value) -> Option<&'static str> {
+    match op {
+        OP_PROFILE_SET => match args.get("profile").and_then(serde_json::Value::as_str) {
+            Some("standard" | "strict") => None,
+            _ => Some(CONFIRM_RELAXED),
+        },
+        OP_GRANTS_ADD => Some(CONFIRM_GRANT),
+        OP_APPROVALS_RESOLVE => {
+            let remembered = !matches!(
+                args.get("remember"),
+                None | Some(serde_json::Value::Null | serde_json::Value::Bool(false))
+            );
+            let denied =
+                args.get("resolution").and_then(serde_json::Value::as_str) == Some("denied");
+            (remembered && !denied).then_some(CONFIRM_GRANT)
+        }
+        _ => None,
+    }
+}
+
+/// The phrase for switching to the relaxed profile.
+pub const CONFIRM_RELAXED: &str = "relaxed";
+
+/// The phrase for adding a global grant, directly or by approving with "remember".
+pub const CONFIRM_GRANT: &str = "grant";
+
+/// Checks `confirmation` against [`required_confirmation`] for this op.
+///
+/// # Errors
+///
+/// `confirmation_required` when the op needs a phrase and `confirmation` is not it.
+pub fn check_confirmation(
+    op: &str,
+    args: &serde_json::Value,
+    confirmation: Option<&str>,
+) -> Result<(), BridgeError> {
+    let Some(phrase) = required_confirmation(op, args) else {
+        return Ok(());
+    };
+    if confirmation.is_some_and(|given| given.trim().eq_ignore_ascii_case(phrase)) {
+        return Ok(());
+    }
+    Err(BridgeError::new(
+        "confirmation_required",
+        format!("{op} expands what agents may do and needs your typed confirmation"),
+        format!("Confirm in the prompt by typing {phrase:?}, then retry."),
+    ))
+}
+
 /// One generic admin command wrapping `pam_client::client::send_admin`:
-/// the op must be on the [`ADMIN_OPS`] whitelist. Returns the op's
+/// the op must be on the [`ADMIN_OPS`] allowlist, and an op that expands
+/// what agents may do needs its typed `confirmation` ([`required_confirmation`])
+/// — both checked before anything touches the socket. Returns the op's
 /// result body; refusals surface as [`BridgeError`].
 #[tauri::command]
 pub async fn admin_call(
     op: String,
     args: serde_json::Value,
+    confirmation: Option<String>,
 ) -> Result<serde_json::Value, BridgeError> {
     if !is_known_admin_op(&op) {
         return Err(BridgeError::new(
@@ -364,55 +455,12 @@ pub async fn admin_call(
             "Use one of the admin ops the GUI ships wrappers for.",
         ));
     }
+    check_confirmation(&op, &args, confirmation.as_deref())?;
     let base = resolve_base_dir()?;
     let response = client::send_admin(&base, &op, args, deadline_for(&op))
         .await
         .map_err(BridgeError::from)?;
     expect_result(response)
-}
-
-/// Thin wrapper over `send_request` for ordinary capabilities (echo and
-/// status today; future views grow from here). `admin.*` is refused by
-/// `send_request` itself — administration goes through [`admin_call`].
-/// Returns the full tagged response (`kind`: result or ticket) so a
-/// `wait: false` caller can follow its ticket.
-#[tauri::command]
-pub async fn request_capability(
-    capability: String,
-    args: serde_json::Value,
-    wait: bool,
-) -> Result<serde_json::Value, BridgeError> {
-    let base = resolve_base_dir()?;
-    let response = client::send_request(
-        &base,
-        &capability,
-        args,
-        wait,
-        pam_client::request::DEFAULT_DEADLINE_MS,
-        None,
-    )
-    .await
-    .map_err(BridgeError::from)?;
-    if let Response::Refusal {
-        cause,
-        detail,
-        recovery,
-        ..
-    } = response
-    {
-        return Err(BridgeError {
-            cause,
-            detail,
-            recovery,
-        });
-    }
-    serde_json::to_value(&response).map_err(|err| {
-        BridgeError::new(
-            "protocol_error",
-            format!("cannot serialize the daemon's response: {err}"),
-            "Retry; report this if it persists.",
-        )
-    })
 }
 
 /// What [`daemon_stop`] answers.

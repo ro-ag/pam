@@ -45,29 +45,35 @@ impl Store {
         if !(0..i64::MAX).contains(&expected_revision) {
             return Err(invalid());
         }
-        let _guard = self.conn_lock.lock().await;
-        if !self.landing_prepared_intent_locked(request_id).await? {
+        let conn = self.lock().await?;
+        if !Self::landing_prepared_intent_locked(&conn, request_id).await? {
             return Ok(false);
         }
-        Ok(self.conn.execute(
-            "UPDATE flow_journal SET state='ready',revision=revision+1
+        Ok(conn
+            .execute(
+                &format!(
+                    "UPDATE flow_journal SET state='ready',revision=revision+1
              WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=1
              AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND repo=flow_journal.repository
              AND capability='flow.run' AND state IN ('running','waiting_approval')
              AND queue_authorized=1 AND expires_at_ms>?3
-             AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL))",
-            params![request_id,expected_revision,now_ms],
-        ).await? == 1)
+             AND {admission})",
+                    admission = super::ADMISSION_STANDS
+                ),
+                params![request_id, expected_revision, now_ms],
+            )
+            .await?
+            == 1)
     }
 
-    /// Caller owns `conn_lock`, including during terminal-write transactions.
+    /// `conn` is the caller's locked connection, including inside terminal-write transactions.
     /// Recognizes the retained uncertain effect across the ready/requeue handoff;
     /// it does not authorize recovery and deliberately does not require live admission.
     pub(super) async fn landing_prepared_intent_locked(
-        &self,
+        conn: &turso::Connection,
         request_id: &str,
     ) -> Result<bool, StoreError> {
-        let mut rows = self.conn.query(
+        let mut rows = conn.query(
             "SELECT CASE WHEN length(CAST(s.document AS BLOB))<=131072 THEN s.document ELSE NULL END,
              j.flow_digest, j.repository, j.step_id FROM landing_session s
              JOIN flow_journal j ON j.request_id=s.request_id
@@ -116,9 +122,8 @@ impl Store {
     /// documents are refused rather than silently dropped, since dropping
     /// one would make its workspace look orphaned.
     pub async fn live_landing_session_documents(&self) -> Result<Vec<String>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query(
                 "SELECT CASE WHEN length(CAST(s.document AS BLOB))<=131072 THEN s.document ELSE NULL END
                  FROM landing_session s JOIN request r ON r.id=s.request_id
@@ -140,8 +145,8 @@ impl Store {
         request_id: &str,
     ) -> Result<Option<LandingSession>, StoreError> {
         validate(request_id, "{}")?;
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT revision, CASE WHEN length(CAST(document AS BLOB))<=131072 THEN document ELSE NULL END FROM landing_session WHERE request_id=?1", params![request_id]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT revision, CASE WHEN length(CAST(document AS BLOB))<=131072 THEN document ELSE NULL END FROM landing_session WHERE request_id=?1", params![request_id]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -166,10 +171,10 @@ impl Store {
         if expected_revision.is_some_and(|revision| revision < 0 || revision == i64::MAX) {
             return Err(invalid());
         }
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         let changed = match expected_revision {
-            None => self.conn.execute("INSERT INTO landing_session(request_id,revision,document) SELECT id,0,?2 FROM request WHERE id=?1 AND state='running' AND capability='flow.run' AND expires_at_ms>?3 AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL) ON CONFLICT(request_id) DO NOTHING", params![request_id,document,now_ms]).await?,
-            Some(revision) => self.conn.execute("UPDATE landing_session SET document=?3,revision=revision+1 WHERE request_id=?1 AND revision=?2 AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state='running' AND capability='flow.run' AND expires_at_ms>?4 AND authorization_revision=(SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL))",params![request_id,revision,document,now_ms]).await?,
+            None => conn.execute(&format!("INSERT INTO landing_session(request_id,revision,document) SELECT id,0,?2 FROM request WHERE id=?1 AND state='running' AND capability='flow.run' AND expires_at_ms>?3 AND {admission} ON CONFLICT(request_id) DO NOTHING", admission = super::ADMISSION_STANDS), params![request_id,document,now_ms]).await?,
+            Some(revision) => conn.execute(&format!("UPDATE landing_session SET document=?3,revision=revision+1 WHERE request_id=?1 AND revision=?2 AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state='running' AND capability='flow.run' AND expires_at_ms>?4 AND {admission})", admission = super::ADMISSION_STANDS),params![request_id,revision,document,now_ms]).await?,
         };
         Ok(changed == 1)
     }

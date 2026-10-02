@@ -283,6 +283,19 @@ pub fn validate_base_url(id: ConnectorId, raw: &str) -> Result<Url, ConnectorErr
 /// `https://host/jenkins/` plus `["api", "json"]` is
 /// `https://host/jenkins/api/json`.
 pub(crate) fn endpoint(base: &Url, segments: &[&str]) -> Result<Url, ConnectorError> {
+    // The `url` crate silently drops `.` and `..` when extending a path, so a value like
+    // `team/../secret` would be fetched as `/job/team/job/secret` while the step reports
+    // `team/../secret`: the resource fetched would differ from the identity audited.
+    // Refuse them (and control characters) outright rather than dropping them.
+    if let Some(bad) = segments
+        .iter()
+        .find(|segment| matches!(**segment, "." | "..") || segment.chars().any(char::is_control))
+    {
+        return Err(ConnectorError::BadArgs(format!(
+            "`{}` is not a valid path segment; `.`, `..` and control characters are refused",
+            bad.escape_debug()
+        )));
+    }
     let mut url = base.clone();
     {
         let mut path = url
@@ -324,10 +337,22 @@ pub(crate) fn request(
 fn authorization(id: ConnectorId, conn: &Connection) -> Result<(String, String), ConnectorError> {
     let name = "Authorization".to_owned();
     let secret = || {
-        conn.secret
+        let secret = conn
+            .secret
             .as_ref()
             .map(Secret::expose)
-            .ok_or(ConnectorError::Auth)
+            .ok_or(ConnectorError::Auth)?;
+        // A credential stored before saves were validated may carry a trailing
+        // newline: sending it would split or corrupt the header (and hide in the
+        // Basic base64), reading as a bogus rejection. Say what is wrong instead.
+        if secret.chars().any(char::is_control) || secret != secret.trim() {
+            return Err(ConnectorError::BadArgs(
+                "the stored credential has a line break, control character or surrounding \
+                 space in it; set it again on the Connectors screen"
+                    .to_owned(),
+            ));
+        }
+        Ok(secret)
     };
     let value = match descriptor(id).auth {
         AuthKind::Bearer => format!("Bearer {}", secret()?),

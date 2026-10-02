@@ -9,11 +9,18 @@
 //! criterion. Verified is not yet qualified: [`ModelEntry::qualification`] is set only when
 //! the verified digest matches a [`crate::qualification`] record measured on the pinned
 //! engine and the current target, and only a qualified entry may serve a job.
-//! [`Registry::verify`] streams SHA-256 to a `.<file>.pam-model.verified`
-//! sidecar; against a matching catalog preset it records `Some(true)` (expected bytes),
-//! `Some(false)` (wrong bytes under that name), or `None` (nothing to compare); an
-//! unreadable or stale sidecar counts as absent, not an error. All calls hit the
-//! filesystem synchronously; async callers wrap them in `spawn_blocking`.
+//! [`Registry::verify`] streams SHA-256 and records the result in the registry's **private
+//! trust directory** (under the daemon's `0700` base, never in the models directory, which
+//! anything running as the user may be able to write); against a matching catalog preset it
+//! records `Some(true)` (expected bytes), `Some(false)` (wrong bytes under that name), or
+//! `None` (nothing to compare). A record binds the digest to the file's canonical path and
+//! its [`FileFingerprint`] (size, mtime, ctime, device, inode): a rewritten file stops being
+//! verified at the next scan and a load re-checks the fingerprint ([`Registry::recheck`]).
+//! A `.<file>.pam-model.verified` sidecar beside the file — what older versions wrote — is
+//! never trusted; it only produces a "verify again" hint on the entry
+//! ([`ModelEntry::verification_issue`]). A registry without a trust directory trusts
+//! nothing. All calls hit the filesystem synchronously; async callers wrap them in
+//! `spawn_blocking`.
 //! A model dropped into the directory by hand and one PAM downloaded are the same kind of entry.
 
 use std::io::Read;
@@ -25,14 +32,19 @@ use sha2::{Digest, Sha256};
 use crate::catalog::{CATALOG, find_preset};
 use crate::engine::Target;
 use crate::gguf::{self, GgufError, GgufInfo};
+use crate::private::write_private_file;
 use crate::qualification::{self, Qualification};
 
 /// Chunk size for [`sha256_file`]. Big enough that the syscall overhead
 /// disappears, small enough to stay off the stack and out of the way.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Suffix of the verification sidecar written next to a model file.
+/// Suffix of the legacy verification sidecar older versions wrote next to a model
+/// file. It is only ever looked for, to hint "verify again"; never trusted.
 const VERIFIED_SIDECAR_SUFFIX: &str = ".pam-model.verified";
+
+/// Version of the private trust record's layout.
+const TRUST_RECORD_VERSION: u32 = 1;
 
 /// What a model on disk is allowed to be used for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,8 +79,18 @@ pub struct ModelEntry {
     pub info_error: Option<String>,
     /// Engine or test-only, from [`classify`].
     pub class: ModelClass,
-    /// The last verification, read back from the sidecar.
+    /// The last verification, read back from the private trust directory and only
+    /// when the file still matches the fingerprint it was verified at.
     pub verified: Option<VerifiedRecord>,
+    /// Why this file is not verified although something says it once was: a trust
+    /// record whose fingerprint no longer matches (the file changed), or only a legacy
+    /// sidecar beside it (not trusted). Carries its own recovery line; `None` for a
+    /// file that was simply never verified.
+    pub verification_issue: Option<String>,
+    /// The file's identity at scan time; [`Registry::recheck`] compares it again right
+    /// before a load.
+    #[serde(skip)]
+    pub fingerprint: FileFingerprint,
     /// The admission evidence for this exact digest on this target, when there is
     /// any. `None` for an unverified file, a verified file nobody has measured, or a
     /// measured file on a target it was not measured on.
@@ -77,7 +99,69 @@ pub struct ModelEntry {
     pub catalog_id: Option<&'static str>,
 }
 
-/// A verification result, persisted next to the model.
+/// What identifies one file's current bytes without reading them: a changed size,
+/// modification time, change time (which a writer cannot set back), device or inode
+/// means the verified digest no longer describes the file. `ctime`, `dev` and `ino` are
+/// Unix-only and `0` elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FileFingerprint {
+    /// Size in bytes.
+    pub size_bytes: u64,
+    /// Modification time, nanoseconds since the epoch.
+    pub mtime_ns: u64,
+    /// Inode change time, nanoseconds since the epoch.
+    pub ctime_ns: u64,
+    /// Device the file lives on.
+    pub dev: u64,
+    /// Inode number.
+    pub ino: u64,
+}
+
+impl FileFingerprint {
+    /// The fingerprint of a file's metadata.
+    #[must_use]
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+            .unwrap_or(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let ctime_ns = u64::try_from(metadata.ctime())
+                .ok()
+                .and_then(|secs| secs.checked_mul(1_000_000_000))
+                .and_then(|nanos| nanos.checked_add(u64::try_from(metadata.ctime_nsec()).ok()?))
+                .unwrap_or(0);
+            Self {
+                size_bytes: metadata.len(),
+                mtime_ns,
+                ctime_ns,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                size_bytes: metadata.len(),
+                mtime_ns,
+                ctime_ns: 0,
+                dev: 0,
+                ino: 0,
+            }
+        }
+    }
+
+    /// The fingerprint of the file at `path`, following symlinks.
+    pub fn read(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::of(&std::fs::metadata(path)?))
+    }
+}
+
+/// A verification result, persisted in the private trust directory.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedRecord {
     /// Lowercase hex SHA-256 of the file.
@@ -130,6 +214,18 @@ pub enum RegistryError {
     #[error("{0:?} is not a plain name; pam only writes under <models dir>/<vendor>/<file>")]
     InvalidName(String),
 
+    /// The file is not the one that was verified: it changed on disk after the
+    /// verification (or after the scan a load was based on).
+    #[error(
+        "model {id} changed on disk after it was verified ({what}); verify it again before loading"
+    )]
+    Changed {
+        /// The model id.
+        id: String,
+        /// What differs, for the human.
+        what: String,
+    },
+
     /// A header could not be read at all. Per-file parse failures land on
     /// [`ModelEntry::info_error`] instead; this is for the callers that
     /// asked about one specific file.
@@ -144,6 +240,9 @@ pub struct Registry {
     /// The qualification table entries are matched against; the compiled-in
     /// one outside tests.
     qualifications: &'static [Qualification],
+    /// Where verification records live: a directory under the daemon's private base,
+    /// never inside the models directory. `None` trusts nothing.
+    trust_dir: Option<PathBuf>,
 }
 
 impl Registry {
@@ -163,7 +262,23 @@ impl Registry {
         Self {
             dir: dir.into(),
             qualifications,
+            trust_dir: None,
         }
+    }
+
+    /// Keeps this registry's verification records in `dir`, which must be private to
+    /// the daemon's user and outside the models directory. Without it nothing is ever
+    /// verified.
+    #[must_use]
+    pub fn with_trust_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.trust_dir = Some(dir.into());
+        self
+    }
+
+    /// The private directory verification records live in, when one is set.
+    #[must_use]
+    pub fn trust_dir(&self) -> Option<&Path> {
+        self.trust_dir.as_deref()
     }
 
     /// The models directory this registry covers.
@@ -247,6 +362,7 @@ impl Registry {
                     &file_name,
                     &metadata,
                     self.qualifications,
+                    self.trust_dir.as_deref(),
                 ));
             }
         }
@@ -275,7 +391,17 @@ impl Registry {
             return Err(RegistryError::NotFound(entry.id.clone()));
         }
 
+        // The file must be the same file at both ends of the hash: a writer racing the
+        // verification would otherwise get its new bytes recorded under the old digest.
+        let before = FileFingerprint::read(&entry.path)?;
         let (sha256, size_bytes) = sha256_file(&entry.path)?;
+        let after = FileFingerprint::read(&entry.path)?;
+        if before != after {
+            return Err(RegistryError::Changed {
+                id: entry.id.clone(),
+                what: "it was modified while being hashed".to_owned(),
+            });
+        }
         let matches_catalog = entry
             .catalog_id
             .and_then(find_preset)
@@ -287,7 +413,7 @@ impl Registry {
             verified_ts: now_unix_seconds(),
             matches_catalog,
         };
-        self.record_verified(&entry.path, &record)?;
+        self.record_with(&entry.path, &record, before)?;
 
         Ok(VerifyOutcome {
             sha256,
@@ -296,29 +422,98 @@ impl Registry {
         })
     }
 
-    /// Writes a verification sidecar next to `path`.
+    /// Records a verification of the file at `path` in the private trust directory.
     ///
-    /// A finished download calls this directly: it already hashed the bytes
-    /// on the way in, and re-reading the whole file to learn what it just
+    /// The record binds `record` to the file's canonical path and its fingerprint as of
+    /// this call, so the caller must have hashed these exact bytes; [`Registry::verify`]
+    /// checks that itself. A finished download calls this directly: it already hashed
+    /// the bytes on the way in, and re-reading the whole file to learn what it just
     /// computed would be absurd.
     ///
-    /// The write goes to a temp file and is renamed into place, so a crash
-    /// mid-write leaves the old sidecar rather than a truncated one.
+    /// The write is atomic and owner-only. A registry with no trust directory refuses:
+    /// writing the record beside the file would make it forgeable by whoever can write
+    /// the models directory.
     pub fn record_verified(
         &self,
         path: &Path,
         record: &VerifiedRecord,
     ) -> Result<(), RegistryError> {
-        let sidecar = verified_sidecar_path(path);
-        let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+        let fingerprint = FileFingerprint::read(path)?;
+        self.record_with(path, record, fingerprint)
+    }
 
-        let temp = sidecar.with_extension("verified.tmp");
-        std::fs::write(&temp, &json)?;
-        std::fs::rename(&temp, &sidecar)?;
+    /// Records the verification a finished download already knows: it hashed the bytes
+    /// on the way in and, when the request carried an expected digest, checked them.
+    /// Call it only for such a download, from the owner of the private trust store.
+    pub fn record_download(
+        &self,
+        dest: &Path,
+        sha256: &str,
+        size_bytes: u64,
+    ) -> Result<(), RegistryError> {
+        let file_name = dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let matches_catalog = CATALOG
+            .iter()
+            .find(|preset| preset.file_name == file_name)
+            .map(|preset| preset.sha256 == sha256 && preset.size_bytes == size_bytes);
+        self.record_verified(
+            dest,
+            &VerifiedRecord {
+                sha256: sha256.to_owned(),
+                size_bytes,
+                verified_ts: now_unix_seconds(),
+                matches_catalog,
+            },
+        )
+    }
+
+    fn record_with(
+        &self,
+        path: &Path,
+        record: &VerifiedRecord,
+        fingerprint: FileFingerprint,
+    ) -> Result<(), RegistryError> {
+        let trust_dir = self.trust_dir.as_deref().ok_or_else(|| {
+            std::io::Error::other("no private verification store is configured for this registry")
+        })?;
+        let canonical = path.canonicalize()?;
+        let trust = TrustRecord {
+            version: TRUST_RECORD_VERSION,
+            path: canonical.to_string_lossy().into_owned(),
+            record: record.clone(),
+            fingerprint,
+        };
+        let json = serde_json::to_vec_pretty(&trust).map_err(std::io::Error::other)?;
+        write_private_file(&trust_record_path(trust_dir, &canonical), &json)?;
         Ok(())
     }
 
-    /// Deletes a model file and its verification sidecar.
+    /// Refuses unless the file at `entry.path` is still the file the entry was built
+    /// from. Called right before (and right after) a load: the registry's
+    /// verification is a claim about those bytes, and a swap between the scan and the
+    /// engine opening the file would otherwise run unverified weights under a verified
+    /// name. Only entries that carry a verification are checked.
+    pub fn recheck(&self, entry: &ModelEntry) -> Result<(), RegistryError> {
+        if entry.verified.is_none() {
+            return Ok(());
+        }
+        let now = FileFingerprint::read(&entry.path).map_err(|_| RegistryError::Changed {
+            id: entry.id.clone(),
+            what: "it is no longer readable".to_owned(),
+        })?;
+        match fingerprint_difference(&entry.fingerprint, &now) {
+            None => Ok(()),
+            Some(what) => Err(RegistryError::Changed {
+                id: entry.id.clone(),
+                what,
+            }),
+        }
+    }
+
+    /// Deletes a model file and its verification records.
     ///
     /// Refuses anything that does not resolve to a path inside the models
     /// directory. The check canonicalizes both sides, so a `..` in the
@@ -347,6 +542,9 @@ impl Registry {
 
         let sidecar = verified_sidecar_path(&target);
         std::fs::remove_file(&target)?;
+        if let Some(trust_dir) = &self.trust_dir {
+            let _ = std::fs::remove_file(trust_record_path(trust_dir, &target));
+        }
         if sidecar.exists() {
             std::fs::remove_file(&sidecar)?;
         }
@@ -354,21 +552,20 @@ impl Registry {
     }
 }
 
-/// Builds the entry for one file, reading its header and its sidecar.
+/// Builds the entry for one file, reading its header and its trust record.
 fn describe(
     path: &Path,
     vendor: &str,
     file_name: &str,
     metadata: &std::fs::Metadata,
     qualifications: &'static [Qualification],
+    trust_dir: Option<&Path>,
 ) -> ModelEntry {
     let size_bytes = metadata.len();
     let stem = file_name.strip_suffix(".gguf").unwrap_or(file_name);
-    let (info, info_error) = match gguf::read_info(path) {
-        Ok(info) => (Some(info), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let verified = read_verified(path, metadata);
+    let fingerprint = FileFingerprint::of(metadata);
+    let (info, info_error) = read_header_cached(path, &fingerprint);
+    let (verified, verification_issue) = read_verified(path, &fingerprint, trust_dir);
     let qualification = qualify(verified.as_ref(), qualifications);
 
     ModelEntry {
@@ -381,6 +578,8 @@ fn describe(
         info_error,
         class: classify(verified.as_ref()),
         verified,
+        verification_issue,
+        fingerprint,
         qualification,
         catalog_id: CATALOG
             .iter()
@@ -389,30 +588,148 @@ fn describe(
     }
 }
 
-/// Reads a verification sidecar, treating anything unreadable or stale as
-/// absent.
+type HeaderCache = std::sync::Mutex<
+    std::collections::HashMap<PathBuf, (FileFingerprint, Result<GgufInfo, String>)>,
+>;
+
+/// How many files' parsed headers are remembered.
+const HEADER_CACHE_MAX: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// Header parses this thread has done, so a test can tell a cache hit from a parse.
+    pub(crate) static HEADER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The parsed header of `path`, from a cache keyed by path and [`FileFingerprint`].
 ///
-/// A sidecar written by a newer pam, half-written by a crash, or edited by
-/// a curious human should cost one re-verification, not a broken listing.
-/// So should a sidecar that no longer describes the file beside it: one
-/// whose recorded size differs from the file's, or that was written before
-/// the file was last modified. A GGUF rewritten under a verified name would
-/// otherwise keep the old digest's `Engine` class and qualification.
-fn read_verified(path: &Path, file: &std::fs::Metadata) -> Option<VerifiedRecord> {
-    let sidecar = verified_sidecar_path(path);
-    let bytes = std::fs::read(&sidecar).ok()?;
-    let record: VerifiedRecord = serde_json::from_slice(&bytes).ok()?;
-    if record.size_bytes != file.len() {
-        return None;
-    }
-    if let (Ok(sidecar_mtime), Ok(file_mtime)) = (
-        std::fs::metadata(&sidecar).and_then(|meta| meta.modified()),
-        file.modified(),
-    ) && sidecar_mtime < file_mtime
+/// Every `find` is a full scan (and every job summary resolves its model by `find`), so
+/// without this each one re-parsed every header in the directory — megabytes for a real
+/// model, up to the parser's cap for a planted file. A changed size, mtime, ctime or
+/// inode misses the cache, so an edited file is parsed afresh.
+fn read_header_cached(
+    path: &Path,
+    fingerprint: &FileFingerprint,
+) -> (Option<GgufInfo>, Option<String>) {
+    static CACHE: std::sync::OnceLock<HeaderCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(HeaderCache::default);
+    if let Some((cached, outcome)) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        && cached == fingerprint
     {
+        return match outcome {
+            Ok(info) => (Some(info.clone()), None),
+            Err(error) => (None, Some(error.clone())),
+        };
+    }
+    #[cfg(test)]
+    HEADER_PARSES.with(|count| count.set(count.get() + 1));
+    let outcome = gguf::read_info(path).map_err(|error| error.to_string());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() >= HEADER_CACHE_MAX {
+        guard.clear();
+    }
+    guard.insert(path.to_path_buf(), (*fingerprint, outcome.clone()));
+    match outcome {
+        Ok(info) => (Some(info), None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
+/// The private trust record for a verification, as persisted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct TrustRecord {
+    version: u32,
+    /// Canonical path of the file the record is about; a record copied under another
+    /// path's name does not verify that other file.
+    path: String,
+    record: VerifiedRecord,
+    fingerprint: FileFingerprint,
+}
+
+/// Where the trust record for the file at canonical path `canonical` lives: a file
+/// named by the SHA-256 of the path, so no model name ever becomes a path segment.
+fn trust_record_path(trust_dir: &Path, canonical: &Path) -> PathBuf {
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    trust_dir.join(format!("{}.json", hex::encode(digest)))
+}
+
+/// What differs between the fingerprint a record vouched for and the file's
+/// current one, in words; `None` when they match.
+fn fingerprint_difference(recorded: &FileFingerprint, now: &FileFingerprint) -> Option<String> {
+    if recorded == now {
         return None;
     }
-    Some(record)
+    let mut changed = Vec::new();
+    if recorded.size_bytes != now.size_bytes {
+        changed.push("size");
+    }
+    if recorded.mtime_ns != now.mtime_ns {
+        changed.push("modification time");
+    }
+    if recorded.ctime_ns != now.ctime_ns {
+        changed.push("change time");
+    }
+    if recorded.dev != now.dev || recorded.ino != now.ino {
+        changed.push("file identity");
+    }
+    Some(format!("its {} differs", changed.join(", ")))
+}
+
+/// The verification this file is entitled to, and why not when it is not.
+///
+/// Only the private trust record counts, and only while the file still has the
+/// fingerprint it was verified at. Anything unreadable is "not verified" rather than a
+/// broken listing — a record written by a newer pam, half-written by a crash, or
+/// edited by a curious human should cost one re-verification. A legacy sidecar beside
+/// the file is *never* trusted — anything that can write the models directory can write
+/// one — but its presence explains to the human why a once-verified model needs a
+/// second verification.
+fn read_verified(
+    path: &Path,
+    fingerprint: &FileFingerprint,
+    trust_dir: Option<&Path>,
+) -> (Option<VerifiedRecord>, Option<String>) {
+    let legacy = verified_sidecar_path(path).exists();
+    let legacy_hint = || {
+        legacy.then(|| {
+            "an old verification sidecar sits beside this file but sidecars are no longer \
+             trusted; verify again"
+                .to_owned()
+        })
+    };
+    let Some(trust_dir) = trust_dir else {
+        return (None, legacy_hint());
+    };
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Ok(bytes) = std::fs::read(trust_record_path(trust_dir, &canonical)) else {
+        return (None, legacy_hint());
+    };
+    let Ok(trust) = serde_json::from_slice::<TrustRecord>(&bytes) else {
+        return (
+            None,
+            Some("the verification record could not be read; verify again".to_owned()),
+        );
+    };
+    if trust.version != TRUST_RECORD_VERSION || trust.path != canonical.to_string_lossy() {
+        return (
+            None,
+            Some("the verification record does not describe this file; verify again".to_owned()),
+        );
+    }
+    match fingerprint_difference(&trust.fingerprint, fingerprint) {
+        None => (Some(trust.record), None),
+        Some(what) => (
+            None,
+            Some(format!(
+                "the file changed after it was verified ({what}); verify again"
+            )),
+        ),
+    }
 }
 
 /// Whether `name` is one plain path segment: non-empty, not hidden, not
@@ -484,8 +801,9 @@ pub fn default_models_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("llm"))
 }
 
-/// The verification sidecar for a model file: `.<file name>.pam-model.verified`
-/// beside it.
+/// The legacy verification sidecar for a model file: `.<file name>.pam-model.verified`
+/// beside it. Nothing writes it any more and nothing trusts it; it is looked for to
+/// hint "verify again" and removed with the model it sat beside.
 ///
 /// Hidden, so it never shows up in a listing of the vendor directory, and
 /// prefixed by the model's own name, so two models in one directory cannot

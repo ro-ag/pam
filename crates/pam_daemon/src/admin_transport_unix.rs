@@ -11,10 +11,23 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::frame::{
-    DRAIN_TIMEOUT, MAX_CONNECTIONS, denied, encode_request, exchange_on, invalid, serve, timed_out,
+    AcceptBackoff, AdminLifecycle, DRAIN_TIMEOUT, MAX_CONNECTIONS, denied, encode_request,
+    exchange_on, invalid, serve, timed_out,
 };
 use crate::admin::AdminService;
-use crate::lifecycle::LifecyclePhase;
+
+/// Where connections come from. The production acceptor is the bound
+/// [`UnixListener`]; a test wraps one to script accept errors.
+pub(super) trait Accept: Send + 'static {
+    /// The next connection, or the error the kernel reported.
+    fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send;
+}
+
+impl Accept for UnixListener {
+    async fn accept(&mut self) -> io::Result<UnixStream> {
+        UnixListener::accept(self).await.map(|(stream, _)| stream)
+    }
+}
 
 pub(super) struct Listener {
     stop: watch::Sender<bool>,
@@ -25,7 +38,18 @@ impl Listener {
     pub(super) fn bind(
         base: &Path,
         admin: Arc<AdminService>,
-        phase: watch::Sender<LifecyclePhase>,
+        lifecycle: AdminLifecycle,
+    ) -> io::Result<Self> {
+        Self::bind_with(base, admin, lifecycle, |listener| listener)
+    }
+
+    /// [`Self::bind`] with the bound listener handed through `wrap` first,
+    /// so a test can put a scripted acceptor in front of the real socket.
+    pub(super) fn bind_with<A: Accept>(
+        base: &Path,
+        admin: Arc<AdminService>,
+        lifecycle: AdminLifecycle,
+        wrap: impl FnOnce(UnixListener) -> A,
     ) -> io::Result<Self> {
         let uid = owner()?;
         let path = endpoint(base, uid, true)?;
@@ -36,7 +60,7 @@ impl Listener {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(accept(listener, admin, phase, receiver, uid));
+        let task = tokio::spawn(accept(wrap(listener), admin, lifecycle, receiver, uid));
         Ok(Self {
             stop,
             task: Some(task),
@@ -166,24 +190,47 @@ fn validate_socket(metadata: &std::fs::Metadata, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-async fn accept(
-    listener: UnixListener,
+async fn accept<A: Accept>(
+    mut listener: A,
     admin: Arc<AdminService>,
-    phase: watch::Sender<LifecyclePhase>,
+    lifecycle: AdminLifecycle,
     mut stop: watch::Receiver<bool>,
     uid: u32,
 ) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut tasks = JoinSet::new();
-    let mut lifecycle = phase.subscribe();
+    let mut phase = lifecycle.phase.subscribe();
+    let mut backoff = AcceptBackoff::new();
     loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break,
-            _ = lifecycle.changed() => break,
+            _ = phase.changed() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { break; };
+                let stream = match accepted {
+                    Ok(stream) => {
+                        backoff.reset();
+                        stream
+                    }
+                    // An accept error never ends the listener (see
+                    // `AcceptBackoff`): log it, pause, accept again.
+                    Err(error) => {
+                        let pause = backoff.after(&error);
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            %error,
+                            pause_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+                            "private admin accept failed; retrying"
+                        );
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            _ = phase.changed() => break,
+                            () = tokio::time::sleep(pause) => {}
+                        }
+                        continue;
+                    }
+                };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { continue; };
                 if let Err(error) = verify_peer(&stream, uid) {
                     // Who knocked is worth a line: a wrong uid on the
@@ -200,11 +247,11 @@ async fn accept(
                     continue;
                 }
                 let admin = Arc::clone(&admin);
-                let phase = phase.clone();
+                let lifecycle = lifecycle.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     let mut stream = stream;
-                    if let Err(error) = serve(&mut stream, &admin, &phase).await {
+                    if let Err(error) = serve(&mut stream, &admin, &lifecycle).await {
                         tracing::debug!(kind = ?error.kind(), "private admin connection ended");
                     }
                 });

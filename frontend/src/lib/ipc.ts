@@ -58,10 +58,52 @@ export function toBridgeFailure(err: unknown): BridgeFailure {
   };
 }
 
-/** Invoke guarded by bridge detection, shared by every wrapper. */
-function bridged<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+/**
+ * Longest an ordinary bridge call may take before the webview stops waiting. The Rust side
+ * bounds every admin request at 30 s, so this only fires for a call that is truly stuck. The
+ * Rust call itself cannot be aborted: a poller must therefore never start a second one while
+ * the first is in flight (react-query's dedupe, and `useEventRefresh`, guarantee that).
+ */
+export const BRIDGE_TIMEOUT_MS = 45_000;
+
+/** The status poll's own bound: the bridge gives up on the daemon after 15 s. */
+export const STATUS_TIMEOUT_MS = 20_000;
+
+/** Daemon stop (10 s drain wait) and login-unit changes (stop wait plus manager commands). */
+const STOP_TIMEOUT_MS = 30_000;
+const SERVICE_TIMEOUT_MS = 60_000;
+
+/** The three admin ops that run for minutes by design (model run, compaction, engine install). */
+const LONG_ADMIN_OPS: readonly string[] = [
+  "admin.models.try",
+  "admin.log.compress",
+  "admin.models.engine.install",
+];
+const LONG_TIMEOUT_MS = 150_000;
+
+/** Rejects with the uniform failure shape when `promise` outlives `ms`. */
+function withTimeout<T>(promise: Promise<T>, ms: number, command: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject({
+        cause: "reply_timeout",
+        detail: `${command} did not answer within ${Math.round(ms / 1000)} s`,
+        recovery: "Retry; the daemon may be busy or restarting.",
+      } satisfies BridgeFailure);
+    }, ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+/** Invoke guarded by bridge detection and a client-side timeout, shared by every wrapper. */
+function bridged<T>(
+  command: string,
+  args?: Record<string, unknown>,
+  timeoutMs: number = BRIDGE_TIMEOUT_MS,
+): Promise<T> {
   if (!isTauri()) return Promise.reject(new BridgeUnavailable());
-  return invoke<T>(command, args);
+  return withTimeout(invoke<T>(command, args), timeoutMs, command);
 }
 
 // --- daemon status ---------------------------------------------------------
@@ -103,7 +145,7 @@ export interface DaemonStatusReply {
 
 /** Daemon health; ensures (lazily starts) the daemon as a side effect. */
 export function daemonStatus(): Promise<DaemonStatusReply> {
-  return bridged<DaemonStatusReply>("daemon_status");
+  return bridged<DaemonStatusReply>("daemon_status", undefined, STATUS_TIMEOUT_MS);
 }
 
 export interface DaemonStopReply {
@@ -113,7 +155,7 @@ export interface DaemonStopReply {
 
 /** Stops the daemon; the next status poll lazily restarts it. */
 export function daemonStop(): Promise<DaemonStopReply> {
-  return bridged<DaemonStopReply>("daemon_stop");
+  return bridged<DaemonStopReply>("daemon_stop", undefined, STOP_TIMEOUT_MS);
 }
 
 // --- login-start service ---------------------------------------------------
@@ -127,24 +169,29 @@ export type ServiceState =
 /** What `pam service …` and the three service commands answer. */
 export interface ServiceReport {
   platform: string;
+  /** The binary this process is (what an install would pin). */
   exe: string;
+  /** The executable the installed unit runs, read back from the unit; null when unknown. */
+  pinned_exe?: string | null;
+  /** Why the pinned executable is stale (missing, or not this binary); null when it is current. */
+  stale?: string | null;
   state: ServiceState;
   note: string | null;
 }
 
 /** Whether the login-start unit exists and is loaded. */
 export function serviceStatus(): Promise<ServiceReport> {
-  return bridged<ServiceReport>("service_status");
+  return bridged<ServiceReport>("service_status", undefined, SERVICE_TIMEOUT_MS);
 }
 
 /** Registers the unit and starts the managed daemon (a loose one is stopped first). */
 export function serviceInstall(): Promise<ServiceReport> {
-  return bridged<ServiceReport>("service_install");
+  return bridged<ServiceReport>("service_install", undefined, SERVICE_TIMEOUT_MS);
 }
 
 /** Unregisters and removes the unit; the daemon keeps running. */
 export function serviceUninstall(): Promise<ServiceReport> {
-  return bridged<ServiceReport>("service_uninstall");
+  return bridged<ServiceReport>("service_uninstall", undefined, SERVICE_TIMEOUT_MS);
 }
 
 // --- admin operations ------------------------------------------------------
@@ -161,6 +208,7 @@ export type AdminOp =
   | "admin.activity.list"
   | "admin.callers.list"
   | "admin.audit.request"
+  | "admin.requests.cancel"
   | "admin.models.list"
   | "admin.models.catalog"
   | "admin.models.download"
@@ -204,10 +252,26 @@ export type AdminOp =
   | "admin.retention.set"
   | "admin.retention.prune";
 
-/** One generic admin call; prefer the typed wrappers below. */
-export function adminCall<T>(op: AdminOp, args: Record<string, unknown> = {}): Promise<T> {
-  return bridged<T>("admin_call", { op, args });
+/**
+ * One generic admin call; prefer the typed wrappers below. `confirmation` is the phrase the
+ * human typed for an op that expands what agents may do: the bridge checks it in Rust
+ * (`required_confirmation`) and refuses with `confirmation_required` without it.
+ */
+export function adminCall<T>(
+  op: AdminOp,
+  args: Record<string, unknown> = {},
+  confirmation?: string,
+): Promise<T> {
+  const timeout = LONG_ADMIN_OPS.includes(op) ? LONG_TIMEOUT_MS : BRIDGE_TIMEOUT_MS;
+  return bridged<T>("admin_call", { op, args, confirmation }, timeout);
 }
+
+/**
+ * The phrases the bridge demands for authority-expanding ops (`pam_gui::bridge`): switching to
+ * the relaxed profile, and any global grant — added directly or by approving with "remember".
+ */
+export const CONFIRM_RELAXED = "relaxed";
+export const CONFIRM_GRANT = "grant";
 
 export type Profile = "relaxed" | "standard" | "strict";
 
@@ -233,6 +297,35 @@ export interface PendingApproval {
   repository: string | null;
   /** The gated flow step's declared effect; null for a plain request. */
   effect: FlowEffect | null;
+  /**
+   * What the gated step will actually execute once its inputs are substituted, when the daemon
+   * snapshots it into the approval (absent or null on a daemon that does not). The card renders
+   * it verbatim; without it the card shows only the request as submitted.
+   */
+  resolved?: ResolvedStep | null;
+}
+
+/** The resolved program, arguments, directory and environment names of a gated flow step. */
+export interface ResolvedStep {
+  program: string;
+  /** Every argument after the program, one element each. */
+  argv: string[];
+  cwd?: string | null;
+  /** The names (never the values) of the environment variables the step sets. */
+  env_keys?: string[];
+  /**
+   * The digest of the flow the step belongs to, as it was when the approval was raised. Sent back
+   * on approve so a flow edited since the card was shown is refused instead of approved. The
+   * daemon may name it `digest` or `flow_digest`; either is accepted.
+   */
+  digest?: string | null;
+  flow_digest?: string | null;
+}
+
+/** The flow digest a pending approval's snapshot carries, when it carries one. */
+export function snapshotDigest(approval: PendingApproval): string | null {
+  const resolved = approval.resolved;
+  return resolved?.digest || resolved?.flow_digest || null;
 }
 
 /** `pam_store::RequestState`, exactly — the store knows no other states. */
@@ -270,16 +363,20 @@ export function profileGet(): Promise<{ profile: Profile }> {
 
 export function profileSet(
   profile: Profile,
-): Promise<{ profile: Profile; applies: "next_daemon_start" }> {
-  return adminCall("admin.profile.set", { profile });
+  confirmation?: string,
+): Promise<{ profile: Profile; applies: "now" | "next_daemon_start" }> {
+  return adminCall("admin.profile.set", { profile }, confirmation);
 }
 
 export function grantsList(): Promise<{ grants: GrantRow[] }> {
   return adminCall("admin.grants.list");
 }
 
-export function grantsAdd(capability: string): Promise<{ capability: string; granted: true }> {
-  return adminCall("admin.grants.add", { capability });
+export function grantsAdd(
+  capability: string,
+  confirmation?: string,
+): Promise<{ capability: string; granted: true }> {
+  return adminCall("admin.grants.add", { capability }, confirmation);
 }
 
 export function grantsRevoke(
@@ -295,13 +392,25 @@ export function approvalsPending(): Promise<{ pending: PendingApproval[] }> {
 export function approvalsResolve(
   requestId: string,
   resolution: "approved" | "denied",
-  options: { remember?: boolean; note?: string } = {},
+  options: {
+    remember?: boolean;
+    note?: string;
+    confirmation?: string;
+    /** The flow digest the card showed; the daemon refuses `flow_changed` when it differs. */
+    expectedDigest?: string;
+  } = {},
 ): Promise<{ request_id: string; resolution: string; remember: boolean }> {
-  return adminCall("admin.approvals.resolve", {
-    request_id: requestId,
-    resolution,
-    ...options,
-  });
+  const { confirmation, expectedDigest, ...rest } = options;
+  return adminCall(
+    "admin.approvals.resolve",
+    {
+      request_id: requestId,
+      resolution,
+      ...rest,
+      ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+    },
+    confirmation,
+  );
 }
 
 /**
@@ -1188,6 +1297,18 @@ export interface FlowResult {
   outcome: OutcomeName;
   summary: string;
   steps: FlowStepReport[];
+  /** Every state-changing step that ran; absent when none did. */
+  effects?: FlowEffectRecord[];
+}
+
+/** One state change a run made, or may have made (`pam_daemon::flow_exec::EffectRecord`). */
+export interface FlowEffectRecord {
+  step: string;
+  kind: "command" | "connector" | "landing";
+  /** `possibly_applied`: the step started and then failed, so how much it changed is unknown. */
+  state: "applied" | "possibly_applied";
+  /** The landing operation (`push`, `merge`, ...) when the step is a landing step. */
+  landing?: string;
 }
 
 export function flowsList(): Promise<{ flows: FlowListEntry[] }> {
@@ -1207,13 +1328,35 @@ export function flowsSave(
   id: string,
   yaml: string,
   options: { create_only?: boolean; allow_builtin_override?: boolean } = {},
-): Promise<FlowListEntry> {
+): Promise<FlowListEntry & GrantRevocation> {
   return adminCall("admin.flows.save", { id, yaml, ...options });
 }
 
 /** Removes one library file; deleting a shadow reveals its builtin. */
-export function flowsDelete(id: string): Promise<{ id: string; revealed_builtin: boolean }> {
+export function flowsDelete(
+  id: string,
+): Promise<{ id: string; revealed_builtin: boolean } & GrantRevocation> {
   return adminCall("admin.flows.delete", { id });
+}
+
+/**
+ * What a save or delete did to remembered approvals: a step whose definition changed loses its
+ * "always allow", so it asks again. Absent fields mean nothing was revoked (or an older daemon).
+ */
+export interface GrantRevocation {
+  /** The `flow.step:<flow>/<step>` capabilities whose remembered approval was removed. */
+  grants_revoked?: string[];
+  reapproval_required?: boolean;
+}
+
+/**
+ * How many steps lost their remembered approval, or null when none did. A daemon that says
+ * `reapproval_required` without listing them counts as one so the human is still told.
+ */
+export function revokedStepCount(reply: GrantRevocation | null | undefined): number | null {
+  const listed = reply?.grants_revoked?.length ?? 0;
+  if (listed > 0) return listed;
+  return reply?.reapproval_required === true ? 1 : null;
 }
 
 /**
@@ -1227,13 +1370,23 @@ export function flowsNormalize(
   return adminCall("admin.flows.normalize", { ...input });
 }
 
-/** Starts a run and answers with the ticket its events arrive under. */
+/**
+ * Starts a run and answers with the ticket its events arrive under. `expectedDigest` pins the run
+ * to the flow the human was looking at (`flow.digest` of the list entry or inspection): the daemon
+ * refuses `flow_changed` instead of running a flow edited since. Sent only when given.
+ */
 export function flowsRun(
   id: string,
   repo: string,
   inputs: Record<string, string> = {},
+  expectedDigest?: string,
 ): Promise<{ ticket: string; position: number }> {
-  return adminCall("admin.flows.run", { id, repo, inputs });
+  return adminCall("admin.flows.run", {
+    id,
+    repo,
+    inputs,
+    ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+  });
 }
 
 /** One declared input as `admin.flows.inspect` reports it. */
@@ -1442,28 +1595,6 @@ export interface DaemonLogTail {
  */
 export function readDaemonLog(lines: number): Promise<DaemonLogTail> {
   return bridged<DaemonLogTail>("read_daemon_log", { lines });
-}
-
-// --- ordinary capabilities -------------------------------------------------
-
-/** The daemon's tagged response for a non-admin capability request. */
-export type CapabilityResponse =
-  | {
-      kind: "result";
-      id: string;
-      outcome: string;
-      body: Record<string, unknown>;
-      evidence: string[];
-    }
-  | { kind: "ticket"; id: string; ticket: string; position: number };
-
-/** Thin wrapper for future views; `admin.*` is refused structurally. */
-export function requestCapability(
-  capability: string,
-  args: Record<string, unknown> = {},
-  wait = true,
-): Promise<CapabilityResponse> {
-  return bridged<CapabilityResponse>("request_capability", { capability, args, wait });
 }
 
 // --- event stream ----------------------------------------------------------

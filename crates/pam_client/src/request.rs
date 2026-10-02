@@ -77,9 +77,33 @@ pub fn build_envelope(
     deadline_ms: u64,
     idempotency_key: Option<String>,
 ) -> Envelope {
+    build_envelope_with_id(
+        new_request_id(),
+        capability,
+        args,
+        wait,
+        deadline_ms,
+        idempotency_key,
+    )
+}
+
+/// [`build_envelope`] with the request id chosen by the caller, so the id
+/// is known **before** anything is sent: a CLI can print it when the reply
+/// never arrives (the daemon uses it as the ticket), and the GUI can mark
+/// its own control requests so their lifecycle events are not fed back
+/// into its refresh loop.
+#[must_use]
+pub fn build_envelope_with_id(
+    id: String,
+    capability: &str,
+    args: serde_json::Value,
+    wait: bool,
+    deadline_ms: u64,
+    idempotency_key: Option<String>,
+) -> Envelope {
     Envelope {
         v: PROTOCOL_VERSION,
-        id: new_request_id(),
+        id,
         capability: capability.to_owned(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
         caller: detect_caller(),

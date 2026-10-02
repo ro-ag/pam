@@ -173,7 +173,6 @@ impl ConnectorService {
             .request_status_meta(ticket)
             .await?
             .ok_or_else(denied)?;
-        let current = self.store.grant_revocation_revision().await?;
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -184,7 +183,7 @@ impl ConnectorService {
         if request.state != pam_store::RequestState::Running
             || request.capability != "flow.run"
             || request.repository != repo.to_string_lossy()
-            || request.authorization_revision != Some(current)
+            || !request.authorization_current
             || self.store.request_admission_expired(ticket, now).await?
         {
             return Err(denied());

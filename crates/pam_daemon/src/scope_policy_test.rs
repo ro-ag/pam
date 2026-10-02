@@ -565,6 +565,11 @@ async fn invalid_redirect_targets_and_a_second_redirect_are_not_followed() {
         "http://storage.example/log",
         "https://user:password@storage.example/log",
         "https://storage.example/log#fragment",
+        // Internal and non-default-port targets: refused before a second physical request.
+        "https://10.0.0.5:8443/secret",
+        "https://169.254.169.254/latest/meta-data",
+        "https://localhost/log",
+        "https://storage.example:8443/log",
         "https://storage.example/log",
     ] {
         let root = tempfile::tempdir().unwrap();

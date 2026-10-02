@@ -26,6 +26,10 @@ const EXIT_USAGE: u8 = 2;
 /// How long `pam daemon stop` waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(15);
 
+/// How long the read of an already-terminal ticket keeps asking through a
+/// busy or restarting daemon before it gives up.
+const RESULT_PATIENCE: Duration = Duration::from_secs(60);
+
 /// Default deadline for `pam flow run`, in milliseconds (30 minutes): a
 /// flow that runs `cargo test` is not a 60 s request.
 const FLOW_DEADLINE_MS: u64 = 1_800_000;
@@ -153,12 +157,18 @@ enum DaemonCmd {
 /// `pam service`: the login-start unit for the daemon.
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Register the unit and start the managed daemon now (a loose
-    /// daemon is stopped first so the managed one takes over).
+    /// Register the unit and start the managed daemon now (the unit is
+    /// written first; a loose daemon is then stopped so the managed one
+    /// takes over). Refuses a binary in a temp dir, a cargo `target/`
+    /// directory, or a group/world-writable location.
     Install {
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Pin this base directory into the unit. Without it the unit uses
+        /// `~/.pam`: `$PAM_BASE_DIR` is deliberately not carried over.
+        #[arg(long, value_name = "DIR")]
+        base_dir: Option<PathBuf>,
     },
     /// Unregister and remove the unit. On macOS and Linux the manager
     /// stops the managed daemon with it; the next pam command starts one.
@@ -230,6 +240,10 @@ enum FlowCmd {
         /// Deadline for the run, in milliseconds (default 30 minutes).
         #[arg(long, default_value_t = FLOW_DEADLINE_MS)]
         deadline_ms: u64,
+        /// Run only if the flow still has this digest (64 hex characters, as
+        /// `pam flow inspect` prints it); a flow edited since is refused.
+        #[arg(long)]
+        digest: Option<String>,
         /// Print the raw response JSON.
         #[arg(long)]
         json: bool,
@@ -471,22 +485,36 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
 
 /// `pam service …`: the shared mechanics live in
 /// [`pam_client::service`]; this prints the report and maps failures.
+///
+/// The login unit never inherits the caller's `$PAM_BASE_DIR`: an agent-set
+/// variable would otherwise be baked into something that starts at every
+/// login. `--base-dir` is the explicit way to pin one.
 fn service_command(action: &ServiceCmd) -> ExitCode {
     use pam_client::service::{self, CommandRunner, ServiceEnv};
-    let Some(base) = base_dir() else {
-        eprintln!("pam service: cannot resolve the home directory; set $HOME");
-        return ExitCode::FAILURE;
+    let requested = match action {
+        ServiceCmd::Install { base_dir, .. } => base_dir.as_deref(),
+        ServiceCmd::Uninstall { .. } | ServiceCmd::Status { .. } => None,
     };
-    let env = match ServiceEnv::detect(&base) {
+    let env = match ServiceEnv::detect(requested) {
         Ok(env) => env,
         Err(err) => {
             eprintln!("pam service: {err}\n  {}", err.recovery());
             return ExitCode::FAILURE;
         }
     };
+    if matches!(action, ServiceCmd::Install { .. })
+        && requested.is_none()
+        && pam::default_base_dir().is_some_and(|base| base != env.base)
+    {
+        eprintln!(
+            "pam service: ignoring $PAM_BASE_DIR; the login unit uses {} \
+             (pass --base-dir to pin another)",
+            env.base.display()
+        );
+    }
     let runner = CommandRunner;
     let (result, json) = match *action {
-        ServiceCmd::Install { json } => (service::install(&env, &runner), json),
+        ServiceCmd::Install { json, .. } => (service::install(&env, &runner), json),
         ServiceCmd::Uninstall { json } => (service::uninstall(&env, &runner), json),
         ServiceCmd::Status { json } => (service::status(&env, &runner), json),
     };
@@ -570,6 +598,7 @@ async fn run_flow_command(base: &Path, action: FlowCmd) -> ExitCode {
             inputs,
             no_wait,
             deadline_ms,
+            digest,
             json,
         } => {
             let inputs = match render::parse_flow_inputs(&inputs) {
@@ -579,7 +608,7 @@ async fn run_flow_command(base: &Path, action: FlowCmd) -> ExitCode {
                     return ExitCode::from(EXIT_USAGE);
                 }
             };
-            let args = serde_json::json!({ "id": id, "inputs": inputs });
+            let args = render::flow_run_args(&id, &inputs, digest.as_deref());
             request(base, "flow.run", args, !no_wait, Some(deadline_ms), json).await
         }
     }
@@ -594,11 +623,57 @@ async fn request(
     deadline_ms: Option<u64>,
     json: bool,
 ) -> ExitCode {
+    request_patiently(base, capability, args, wait, deadline_ms, json, None).await
+}
+
+/// [`request`] that, with `patience`, keeps asking through transient daemon
+/// refusals (capacity, rate, draining, restarting) for up to that long
+/// instead of reporting them as a refusal.
+///
+/// The request id is generated here, before anything is sent. A reply that
+/// never arrives does not mean the request never ran, so when a stateful
+/// request (`flow.run`) times out or loses its transport, the id is printed
+/// with the exact recovery line, and with `--json` it is the `id` of the
+/// refusal object ([`render::render_unanswered_json`]): the caller follows
+/// the original instead of submitting a duplicate.
+async fn request_patiently(
+    base: &Path,
+    capability: &str,
+    args: serde_json::Value,
+    wait: bool,
+    deadline_ms: Option<u64>,
+    json: bool,
+    patience: Option<Duration>,
+) -> ExitCode {
     let deadline_ms = deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS);
-    match client::send_request(base, capability, args, wait, deadline_ms, None).await {
+    let id = pam::request::new_request_id();
+    let sent = match patience {
+        Some(budget) => {
+            client::send_request_patient(base, capability, args, wait, deadline_ms, budget).await
+        }
+        None => {
+            client::send_request_with_id(
+                base,
+                id.clone(),
+                capability,
+                args,
+                wait,
+                deadline_ms,
+                None,
+            )
+            .await
+        }
+    };
+    match sent {
         Ok(response) => print_response(capability, &response, json),
         Err(err) => {
-            eprintln!("pam {capability}: {err}");
+            let report = render::render_request_failure(capability, &id, &err, json);
+            if let Some(object) = report.stdout {
+                println!("{object}");
+            }
+            if !report.stderr.is_empty() {
+                eprintln!("{}", report.stderr);
+            }
             ExitCode::FAILURE
         }
     }
@@ -638,6 +713,9 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
         }
         Response::Result { body, .. } if capability == "flow.show" => {
             println!("{}", render::render_flow_show(body));
+        }
+        Response::Result { body, .. } if capability == "flow.inspect" => {
+            println!("{}", render::render_flow_inspect(body));
         }
         Response::Result { body, .. } if matches!(capability, "flow.run" | "flow.result") => {
             println!("{}", render::render_flow_result(body));
@@ -697,12 +775,32 @@ async fn follow(
 }
 
 async fn terminal_result(base: &Path, subcommand: &str, ticket: &str, json: bool) -> ExitCode {
+    // The ticket is already terminal here: a daemon that is momentarily busy
+    // (capacity, rate, restarting) must not turn that into a "refused".
     let args = serde_json::json!({"ticket": ticket});
-    match client::send_request(base, "query", args.clone(), true, DEFAULT_DEADLINE_MS, None).await {
+    match client::send_request_patient(
+        base,
+        "query",
+        args.clone(),
+        true,
+        DEFAULT_DEADLINE_MS,
+        RESULT_PATIENCE,
+    )
+    .await
+    {
         Ok(response) => {
             if matches!(&response, Response::Result { body, .. } if body.get("capability").and_then(serde_json::Value::as_str) == Some("flow.run"))
             {
-                request(base, "flow.result", args, true, None, json).await
+                request_patiently(
+                    base,
+                    "flow.result",
+                    args,
+                    true,
+                    None,
+                    json,
+                    Some(RESULT_PATIENCE),
+                )
+                .await
             } else {
                 print_response("query", &response, json)
             }
@@ -798,6 +896,7 @@ fn daemon_mode() -> ExitCode {
 /// disk).
 async fn serve(base: PathBuf) -> ExitCode {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let respawn_base = base.clone();
     let handle = match run_daemon(Some(base), shutdown_rx).await {
         Ok(handle) => handle,
         Err(DaemonError::Lifecycle(LifecycleError::AlreadyRunning { pid, .. })) => {
@@ -823,11 +922,15 @@ async fn serve(base: PathBuf) -> ExitCode {
             result.is_ok()
         }
     };
+    // The executable recorded at boot: after a rename-into-place install
+    // `current_exe()` can name a deleted file, the recorded path names the
+    // replacement.
+    let respawn_exe = handle.boot_image_path();
     // Graceful drain; the instance lock is released when the handle is
     // consumed, so the respawned binary can take it.
     handle.shutdown().await;
 
-    if restarting && let Err(err) = respawn_daemon() {
+    if restarting && let Err(err) = respawn_daemon(&respawn_base, respawn_exe.as_deref()) {
         eprintln!("pam daemon: cannot respawn the new binary: {err}");
         return ExitCode::FAILURE;
     }
@@ -856,17 +959,16 @@ async fn shutdown_signal() {
     }
 }
 
-/// Spawns `current_exe() daemon` detached: the binary on disk is the
-/// newer build that triggered the restart.
-fn respawn_daemon() -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_child| ())
+/// Spawns `current_exe() daemon` for `base` as an isolated background
+/// process (own process group, fixed cwd, environment allowlist — see
+/// [`client::spawn_daemon_process`]): the binary on disk is the newer build
+/// that triggered the restart.
+fn respawn_daemon(base: &Path, boot_exe: Option<&Path>) -> std::io::Result<()> {
+    let exe = match boot_exe {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?,
+    };
+    client::spawn_daemon_process(&exe, base)
 }
 
 #[cfg(test)]

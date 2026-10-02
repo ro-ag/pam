@@ -4,6 +4,16 @@ use sha2::{Digest, Sha256};
 use turso::params;
 
 pub(crate) const META_LIMIT: usize = 16 * 1024;
+/// Most segments a stored provenance map may hold. A producer with a finer
+/// map coarsens it to this many segments before publishing, and says so in
+/// the view's identity; the store never drops a view for being detailed.
+pub const MAX_EVIDENCE_MAP_SEGMENTS: usize = 8192;
+/// Byte ceiling of a stored `map_json`. One serialized segment is at most
+/// 113 bytes (two 8-digit ranges and the longest relation name), so
+/// [`MAX_EVIDENCE_MAP_SEGMENTS`] of them always fit with room to spare. The
+/// map is parsed on every page read, which is why it is bounded well below
+/// the 64 MiB a view itself may reach.
+pub const MAX_EVIDENCE_MAP_BYTES: usize = 1024 * 1024;
 const VIEW_LIMIT: usize = 64 * 1024 * 1024;
 const RANGE_LIMIT: u32 = 64 * 1024;
 
@@ -31,8 +41,14 @@ pub struct EvidenceViewInsert {
 /// Metadata only; no blob is read by the authorization lookup.
 #[derive(Debug)]
 pub struct EvidenceViewMeta {
-    /// Originating admission revision, for revocation checks.
+    /// Originating admission revision: the global revocation count the
+    /// request captured. Prefer [`Self::authorization_current`].
     pub authorization_revision: Option<i64>,
+    /// Whether the originating request's admission still stands, read in the
+    /// same statement as the rest of this metadata: false once a grant that
+    /// request depended on was revoked after it was admitted (see
+    /// [`Store::request_authorization_current`]).
+    pub authorization_current: bool,
     /// Safe identity packet.
     pub identity_json: String,
     /// Private origin used for current-scope authorization.
@@ -127,21 +143,27 @@ impl Store {
         if view.view_bytes.len() > VIEW_LIMIT
             || view.view_id.is_empty()
             || view.view_id.len() > 256
-            || [&view.origin_json, &view.identity_json, &view.map_json]
-                .iter()
-                .any(|s| {
-                    s.len() > META_LIMIT || serde_json::from_str::<serde_json::Value>(s).is_err()
-                })
+            || [&view.origin_json, &view.identity_json].iter().any(|s| {
+                s.len() > META_LIMIT || serde_json::from_str::<serde_json::Value>(s).is_err()
+            })
+            || view.map_json.len() > MAX_EVIDENCE_MAP_BYTES
+            || !serde_json::from_str::<serde_json::Value>(&view.map_json).is_ok_and(|map| {
+                map.as_array()
+                    .is_some_and(|m| m.len() <= MAX_EVIDENCE_MAP_SEGMENTS)
+            })
         {
             return Err(invalid());
         }
+        // Hash before taking the connection: up to 64 MiB of CPU work that
+        // no other store call should queue behind.
+        let view_sha256 = hex::encode(Sha256::digest(&view.view_bytes));
         let mut identity: serde_json::Value =
             serde_json::from_str(&view.identity_json).map_err(|_| invalid())?;
         let identity_fields = identity.as_object_mut().ok_or_else(invalid)?;
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         // Only bounded metadata is loaded; the protected source may be a large
         // serialized compact rather than the logical text passed to redaction.
-        let mut rows = self.conn.query(
+        let mut rows = conn.query(
             "SELECT substr(content_hash,1,65),LENGTH(content) FROM evidence WHERE id=?1 AND request_id=?2",
             params![view.evidence_id.clone(), view.request_id.clone()],
         ).await?;
@@ -160,9 +182,9 @@ impl Store {
         if identity_json.len() > META_LIMIT {
             return Err(invalid());
         }
-        let affected = self.conn.execute(
+        let affected = conn.execute(
             "INSERT INTO evidence_view (evidence_id,request_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,view_blob) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
-            params![view.evidence_id.clone(),view.request_id.clone(),view.repository.clone(),view.origin_json.clone(),identity_json,view.map_json.clone(),view.view_id.clone(),hex::encode(Sha256::digest(&view.view_bytes)), i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes.clone()],
+            params![view.evidence_id.clone(),view.request_id.clone(),view.repository.clone(),view.origin_json.clone(),identity_json,view.map_json.clone(),view.view_id.clone(),view_sha256, i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes.clone()],
         ).await?;
         Ok(affected > 0)
     }
@@ -175,13 +197,14 @@ impl Store {
         evidence_id: &str,
         repository: &str,
     ) -> Result<Option<EvidenceViewMeta>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT v.identity_json,v.origin_json,v.map_json,v.view_id,v.view_sha256,v.view_bytes,v.expired_at,r.authorization_revision FROM evidence_view v JOIN request r ON r.id=v.request_id WHERE v.evidence_id=?1 AND v.request_id=?2 AND v.repository=?3", params![evidence_id,request_id,repository]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query(&format!("SELECT v.identity_json,v.origin_json,v.map_json,v.view_id,v.view_sha256,v.view_bytes,v.expired_at,request.authorization_revision,CASE WHEN {admission} THEN 1 ELSE 0 END FROM evidence_view v JOIN request ON request.id=v.request_id WHERE v.evidence_id=?1 AND v.request_id=?2 AND v.repository=?3", admission = super::ADMISSION_STANDS), params![evidence_id,request_id,repository]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
         Ok(Some(EvidenceViewMeta {
             authorization_revision: row.get(7)?,
+            authorization_current: row.get::<i64>(8)? == 1,
             identity_json: row.get(0)?,
             origin_json: row.get(1)?,
             map_json: row.get(2)?,
@@ -199,17 +222,17 @@ impl Store {
         &self,
         request: &EvidenceRangeRequest,
     ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let _guard = self.conn_lock.lock().await;
+        let conn = self.lock().await?;
         // Each write autocommits: dropping this future cannot leave a BEGIN open
         // or roll back a charged attempt. The lock prevents local interleaving.
-        self.evidence_range_locked(request).await
+        Self::evidence_range_locked(&conn, request).await
     }
 
     async fn evidence_range_locked(
-        &self,
+        conn: &turso::Connection,
         r: &EvidenceRangeRequest,
     ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let mut rows = self.conn.query("SELECT view_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5",params![r.evidence_id.clone(),r.request_id.clone(),r.repository.clone(),r.expected_view_id.clone(),r.expected_sha256.clone()]).await?;
+        let mut rows = conn.query("SELECT view_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5",params![r.evidence_id.clone(),r.request_id.clone(),r.repository.clone(),r.expected_view_id.clone(),r.expected_sha256.clone()]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(EvidenceRangeOutcome::Unavailable);
         };
@@ -218,22 +241,36 @@ impl Store {
             return Ok(EvidenceRangeOutcome::Expired);
         }
         drop(rows);
-        // `offset == total` is past the last byte: nothing to return, so
-        // it must not charge a page and a length against the allowance.
-        if r.length == 0 || r.length > RANGE_LIMIT || r.offset >= total {
+        if r.length == 0 || r.length > RANGE_LIMIT || r.offset > total {
             return Ok(EvidenceRangeOutcome::InvalidRange);
+        }
+        if r.offset == total {
+            // Exactly at the end, which for an empty view is also the start:
+            // a legitimate read with nothing left to return. It answers an
+            // empty end-of-view page instead of an error, and charges
+            // nothing, since no bytes and no page were delivered.
+            return Self::end_of_view(conn, r, total)
+                .await
+                .map(EvidenceRangeOutcome::Range);
         }
         let Some(expires) = r.now.checked_add(3600) else {
             return Err(invalid());
         };
-        self.conn.execute("INSERT OR IGNORE INTO evidence_read_allowance (request_id,repository,started_at,expires_at,remaining_bytes,remaining_pages) VALUES (?1,?2,?3,?4,67108864,4096)",params![r.request_id.clone(),r.repository.clone(),r.now,expires]).await?;
-        let changed = self.conn.execute("UPDATE evidence_read_allowance SET remaining_bytes=remaining_bytes-?3,remaining_pages=remaining_pages-1 WHERE request_id=?1 AND repository=?2 AND expires_at>?4 AND remaining_bytes>=?3 AND remaining_pages>0",params![r.request_id.clone(),r.repository.clone(),i64::from(r.length),r.now]).await?;
+        conn.execute("INSERT OR IGNORE INTO evidence_read_allowance (request_id,repository,started_at,expires_at,remaining_bytes,remaining_pages) VALUES (?1,?2,?3,?4,67108864,4096)",params![r.request_id.clone(),r.repository.clone(),r.now,expires]).await?;
+        let changed = conn.execute("UPDATE evidence_read_allowance SET remaining_bytes=remaining_bytes-?3,remaining_pages=remaining_pages-1 WHERE request_id=?1 AND repository=?2 AND expires_at>?4 AND remaining_bytes>=?3 AND remaining_pages>0",params![r.request_id.clone(),r.repository.clone(),i64::from(r.length),r.now]).await?;
         if changed == 0 {
             return Ok(EvidenceRangeOutcome::BudgetExhausted);
         }
-        let mut rows = self.conn.query("SELECT substr(v.view_blob,?3,?4),a.expires_at,a.remaining_bytes,a.remaining_pages FROM evidence_view v JOIN evidence_read_allowance a ON a.request_id=v.request_id AND a.repository=v.repository WHERE v.evidence_id=?1 AND v.request_id=?2",params![r.evidence_id.clone(),r.request_id.clone(),i64::try_from(r.offset).map_err(|_| invalid())? + 1,i64::from(r.length)]).await?;
+        let mut rows = conn.query("SELECT substr(v.view_blob,?3,?4),a.expires_at,a.remaining_bytes,a.remaining_pages FROM evidence_view v JOIN evidence_read_allowance a ON a.request_id=v.request_id AND a.repository=v.repository WHERE v.evidence_id=?1 AND v.request_id=?2",params![r.evidence_id.clone(),r.request_id.clone(),i64::try_from(r.offset).map_err(|_| invalid())? + 1,i64::from(r.length)]).await?;
         let row = rows.next().await?.ok_or_else(invalid)?;
         let bytes = blob_column(&row, 0)?;
+        if bytes.is_empty() {
+            // `offset < total` yet no bytes: the blob is gone without a
+            // retention tombstone. Answering an empty page would hand the
+            // reader the same `next_offset` forever, a page charged each
+            // time; say the view is unavailable instead.
+            return Ok(EvidenceRangeOutcome::Unavailable);
+        }
         let next = r.offset + u64::try_from(bytes.len()).map_err(|_| invalid())?;
         Ok(EvidenceRangeOutcome::Range(EvidenceRange {
             view_id: r.expected_view_id.clone(),
@@ -246,5 +283,45 @@ impl Store {
             remaining_bytes: u64::try_from(row.get::<i64>(2)?).map_err(|_| invalid())?,
             remaining_pages: u32::try_from(row.get::<i64>(3)?).map_err(|_| invalid())?,
         }))
+    }
+
+    /// The uncharged empty page at `offset == total`. The allowance figures
+    /// are the persisted ones when a read already started the allowance, and
+    /// the untouched first-read figures when none has: reading the end of a
+    /// view does not start the clock.
+    async fn end_of_view(
+        conn: &turso::Connection,
+        r: &EvidenceRangeRequest,
+        total: u64,
+    ) -> Result<EvidenceRange, StoreError> {
+        let mut rows = conn
+            .query(
+                "SELECT expires_at,remaining_bytes,remaining_pages FROM evidence_read_allowance WHERE request_id=?1 AND repository=?2",
+                params![r.request_id.clone(), r.repository.clone()],
+            )
+            .await?;
+        let (allowance_expires_at, remaining_bytes, remaining_pages) = match rows.next().await? {
+            Some(row) => (
+                row.get::<i64>(0)?,
+                u64::try_from(row.get::<i64>(1)?.max(0)).map_err(|_| invalid())?,
+                u32::try_from(row.get::<i64>(2)?.max(0)).map_err(|_| invalid())?,
+            ),
+            None => (
+                r.now.checked_add(3600).ok_or_else(invalid)?,
+                67_108_864,
+                4096,
+            ),
+        };
+        Ok(EvidenceRange {
+            view_id: r.expected_view_id.clone(),
+            view_sha256: r.expected_sha256.clone(),
+            offset: r.offset,
+            bytes: Vec::new(),
+            total_bytes: total,
+            next_offset: None,
+            allowance_expires_at,
+            remaining_bytes,
+            remaining_pages,
+        })
     }
 }

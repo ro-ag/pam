@@ -24,7 +24,7 @@ enum Op {
 async fn run(op: Op) -> Result<ServiceReport, BridgeError> {
     let base = crate::bridge::resolve_base_dir()?;
     tauri::async_runtime::spawn_blocking(move || {
-        let env = ServiceEnv::detect(&base).map_err(|err| bridge_error(&err))?;
+        let env = ServiceEnv::detect(Some(&base)).map_err(|err| bridge_error(&err))?;
         let runner = CommandRunner;
         let result = match op {
             Op::Status => service::status(&env, &runner),

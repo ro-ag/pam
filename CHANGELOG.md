@@ -6,7 +6,161 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
-- Nothing yet.
+### Added
+
+- `pam flow run --digest <sha256>` runs a flow only if it still has the digest
+  `pam flow inspect` reported; a flow edited in between refuses as
+  `flow_changed`. `pam flow inspect` now prints the digest on its first line.
+  The GUI pins Run to the flow it shows in the same way.
+- Flow results list `effects` (step, kind, `applied` or `possibly_applied`, and
+  the landing operation for landing steps) beside the outcome. They are kept
+  when the outcome is `unresolved` or `blocked`, where the handoff reason is
+  `workflow_not_completed_after_state_change`. `pam flow result` and the GUI
+  run card print them.
+- Refusals carry a `retryable` flag for momentary daemon conditions. Clients
+  retry on the flag and keep their own list of causes for older daemons.
+- `admin.requests.cancel`: the GUI cancels a ticket over the private
+  administration channel, and the audit records it as the human's act. The
+  public `request_capability` bridge command is removed.
+- `admin.flows.save` and `admin.flows.delete` replies list `grants_revoked`
+  and `reapproval_required`, and the GUI tells the human which steps lost
+  their remembered approval.
+- Pending approvals for a flow step show the resolved command: program, one
+  token per argument, directory and the names of the variables it sets.
+  Approving is pinned to that snapshot (`expected_digest`); a flow edited
+  while the approval waited refuses as `flow_changed` and stays pending.
+- `pam status` gains `snapshot` (`stale`, `model_age_ms`, `keyring_age_ms`).
+- The daemon checks the store's integrity at boot (files up to 256 MiB) and
+  reports a damaged file with a cause and recovery line instead of an engine
+  error.
+- `pam service status` reports the binary the unit pins and whether it is
+  stale; Settings offers "Repoint to this binary".
+- `pam flow result` labels local-model summaries `[untrusted local-model
+  summary]` and escapes control characters in them.
+
+### Changed
+
+- `pam cancel` only acts on a ticket submitted from the caller's own
+  repository; another repository's ticket answers `not_found`, like a missing
+  one. Run it from the repository the ticket was submitted from. A public
+  cancel is always recorded as `system`, whatever the caller's label says.
+- Saving an edited flow removes the remembered approvals of every step whose
+  definition changed, and deleting a flow removes those of its steps. The
+  changed steps ask again.
+- `admin.profile.set` applies immediately; the reply says `"applies": "now"`.
+  It used to apply at the next daemon start.
+- A client of a different version no longer restarts the daemon. The daemon
+  restarts only when its own binary was replaced on disk; otherwise it
+  refuses with `client_version_mismatch`, naming its version and path. While it
+  restarts, every request is answered `daemon_outdated`.
+- `status` is served from a snapshot refreshed in the background, and a poll
+  is no longer a request: it leaves no request or audit row, no caller entry
+  and no lifecycle events. `active_requests` excludes the poll. `query` and
+  `cancel` stay audited but publish no lifecycle events.
+- Admission pools are separate per class: 128 work, 16 `status`, 16 `query`,
+  8 `cancel` and 32 for requests the GUI submits, at 256, 64, 64 and 16 per
+  second for the first four. Every request handler has a hard deadline.
+- `pam wait` and `pam subscribe` retry transient refusals and reconnect a lost
+  event stream until `--timeout-ms`, then exit `1` with `follow_timeout`.
+  Exit `3` now means a policy refusal only.
+- A daemon started lazily by a client runs with a reduced environment (home,
+  user, locale, temp and absolute `PATH` entries, plus `PAM_BASE_DIR`), in its
+  own process group, with `/` as its directory. Flow steps no longer inherit
+  the first caller's variables; add tool directories through the flow
+  settings' `extra_path`.
+- `pam service install` refuses binaries in temp directories, in cargo build
+  output and ones writable by group or others; it writes the unit before it
+  stops a loose daemon; and it pins `PAM_BASE_DIR` only when given
+  `--base-dir`, ignoring the caller's variable.
+- Model verification is recorded privately under `<base>/model-trust` and
+  checked again whenever a model loads. A sidecar next to the weights no longer
+  makes a model verified, so each existing model needs "Verify" once after
+  upgrading. A model with a leftover sidecar says so.
+- Local summaries are bounded to two minutes in the engine and five minutes
+  in all, and a cancelled flow step cancels its summary.
+- The local engine's API key is passed as a private file, not on the command
+  line.
+- The curator runs agent CLIs only from trusted install directories, owned by
+  root or the daemon's user and not writable by others, with a minimal
+  environment. A CLI found only through `PATH` is listed as untrusted and never
+  run. `admin.curator.list` gains `untrusted`.
+- Connector credentials are trimmed when saved, and a value containing a line
+  break is refused. Connector paths containing `.` or `..` are refused. A log
+  redirect may only go to a public host on port 443.
+- Model downloads run curl with a cleared environment that keeps only the
+  proxy and certificate variables.
+- A stateful flow step can no longer write Git hooks or Git configuration in
+  the repository it runs in, so `git config`, `git remote add`, a tracking
+  `git checkout -b`, `git submodule add` and `git init` fail in such steps.
+- A state-changing step with no `needs` and the default `when` no longer runs
+  after an earlier step failed; add `needs` or an explicit `when` to opt in.
+- A supplied value that would become a command-line option blocks the step
+  (`argument_option_refused`) unless a literal `--` precedes it.
+- `${...}` in a step's `env:` values is now substituted, like in arguments.
+- `${repo.origin}` resolves only for a remote whose host is exactly
+  `github.com`.
+- `echo` refuses a delay over 60 seconds or arguments over 64 KiB
+  (`echo_limit_exceeded`).
+- Retention prunes in bounded batches, treats a stored window outside 1 to
+  3650 days as forever, and saves both windows in one write.
+- The GUI asks for a typed confirmation, checked in Rust, before switching to
+  the relaxed profile, adding a grant or approving with Remember. Approval
+  cards show each argument as its own token and escape hidden characters.
+
+### Fixed
+
+- The daemon no longer stops answering `status` and `cancel` when something
+  behind it is slow: handlers have a hard deadline, `status` is a snapshot
+  read and cancel has reserved capacity. The GUI's status polls no longer feed
+  back into themselves, event refreshes are throttled and polling backs off
+  while the daemon is busy or down.
+- Requests whose final state could not be written are retried and then closed
+  instead of staying "running" and filling the admission limit, and a failed
+  write is never answered as success.
+- A duplicate request attached to one that was refused is released at once
+  instead of waiting for its own deadline.
+- A store call cancelled inside a transaction no longer wedges the database;
+  the abandoned transaction is rolled back before the next call.
+- Grant changes, approvals and their audit rows are written in one
+  transaction.
+- A finished request can no longer be moved back to an in-flight state.
+- Revoking a capability no longer makes unrelated older tickets' evidence
+  unreadable.
+- Noisy failing logs keep their evidence views; a ticket no longer turns
+  `unavailable` because a provenance map was too detailed.
+- Reading at the end of an evidence view returns an empty page marked `eof`
+  instead of an error.
+- Activity shows refused `admin.*` attempts even with probes hidden.
+- The admin channel and `pam listen` survive transient accept errors; the
+  relay caps concurrent connections at 64 per socket.
+- A killed flow step (timeout, cancel, output limit) takes its whole process
+  group with it.
+- Cancelling, or restarting the daemon, while a step waits for approval no
+  longer reports `flow_effect_uncertain`.
+- `guarded-land`: a new ticket finishes a landing whose pull request an
+  earlier ticket already merged, and `sync` refuses `.git` directories swapped
+  for symlinks.
+- Compact flow results keep failed and blocked steps when they must drop
+  observations.
+- A lost `pam flow run` reply prints the request id and the `pam wait`
+  recovery, also with `--json`.
+- Lazy start waits for a booting daemon instead of racing it, and the version
+  handshake waits for the replacement daemon before its single retry.
+- The model engine's death is noticed and the next request reloads it, a
+  leftover engine of a killed daemon is stopped, a stranger on the engine's
+  loopback port is refused, and only a successful generation counts as use.
+- The structured diagnosis dispatches an operation by its full target, and an
+  authority tag counts only for a substantive quote.
+- An unanswered keychain prompt no longer stalls every connector: reads give up
+  after 20 seconds.
+- The AWS adapter refuses to start a process by itself, not only behind the
+  daemon's check.
+
+### Compatibility
+
+- Schema version 12 adds indexes for Activity and retention and makes audit
+  rows append-only and evidence views immutable. A store upgraded by this
+  version is refused by older binaries.
 
 ## [0.4.3] - 2026-10-01
 

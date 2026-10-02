@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::fs;
 

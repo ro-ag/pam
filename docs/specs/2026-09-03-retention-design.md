@@ -51,19 +51,25 @@ pub struct RequestPrune { pub requests: u64, pub audit_rows: u64, pub approvals:
 
 impl Store {
     /// Deletes evidence rows with `ts < cutoff_ts` whose kind is not
-    /// `keep_kind` and whose request is terminal. One transaction under
-    /// `conn_lock`; counts and blob bytes are measured before the delete.
+    /// `keep_kind` and whose request is terminal. One transaction per batch
+    /// under the connection lock (see below); counts and blob bytes are measured before the delete.
     pub async fn prune_evidence_before(&self, cutoff_ts: i64, keep_kind: &str) -> Result<EvidencePrune, StoreError>;
 
     /// Deletes terminal requests (`done|refused|failed`) with
     /// `updated_ts < cutoff_ts` together with their audit, approval and
-    /// evidence rows — children first, one transaction under `conn_lock`.
+    /// evidence rows — children first, in bounded batches (see below).
     pub async fn prune_requests_before(&self, cutoff_ts: i64) -> Result<RequestPrune, StoreError>;
 }
 ```
 
-Both hold `conn_lock` across `BEGIN..COMMIT` (memento law: one turso
-connection, one statement at a time). Counts come from `SELECT
+Both hold the connection lock across `BEGIN..COMMIT` (memento law: one turso
+connection, one statement at a time). Since 2026-10-02 the lock is the store's
+`ConnGate` (the mutex owns the connection; an abandoned transaction is rolled
+back before the next call), and each prune runs oldest first in bounded batches
+(64 evidence rows, 256 request records), one transaction per batch with the lock
+released in between, instead of one transaction per pass; totals are unchanged.
+A stored window outside 1 to 3650 days reads as forever (a stored `0` no longer
+prunes everything), and a save writes both windows in one transaction. Counts come from `SELECT
 COUNT(*), COALESCE(SUM(LENGTH(content)),0)` before each `DELETE` so the
 report is exact whatever the engine's `changes()` says about
 multi-table deletes.

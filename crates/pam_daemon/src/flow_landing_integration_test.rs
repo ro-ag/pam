@@ -50,6 +50,8 @@ struct Github {
     remote: PathBuf,
     existing: AtomicBool,
     merged: AtomicBool,
+    /// The PR was closed by hand without a merge.
+    abandoned: AtomicBool,
     requests: Mutex<Vec<Recorded>>,
 }
 impl Github {
@@ -86,12 +88,14 @@ impl Github {
             remote,
             existing: AtomicBool::new(false),
             merged: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
         }
     }
     fn pr(&self) -> Value {
         let merged = self.merged.load(Ordering::SeqCst);
-        json!({"number":7,"state":if merged{"closed"}else{"open"},"merged":merged,"merge_commit_sha":if merged{Some(self.merge.as_str())}else{None},
+        let closed = merged || self.abandoned.load(Ordering::SeqCst);
+        json!({"number":7,"state":if closed{"closed"}else{"open"},"merged":merged,"merge_commit_sha":if merged{Some(self.merge.as_str())}else{None},
             "head":{"ref":"feature/work","sha":self.sha,"repo":{"full_name":"team/repo"}},
             "base":{"ref":"main","sha":self.base,"repo":{"full_name":"team/repo"}}})
     }
@@ -376,6 +380,8 @@ impl Fixture {
         let budget = admitted_budget(&store, &repo, &flow).await;
         let (cancel, rx) = watch::channel(false);
         let ctx = ExecContext {
+            origin: crate::ingress::Origin::Public,
+            status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
             budget,
             request_id: "landing-ticket".into(),
             args: json!({"id":"landing"}),
@@ -539,6 +545,7 @@ impl Fixture {
                 RunArgs {
                     id: "landing".into(),
                     inputs: BTreeMap::new(),
+                    expected_digest: None,
                 },
             )
             .await
@@ -723,6 +730,81 @@ async fn gated_local_prefix_and_fake_github_land_verify_the_exact_merge_sha() {
     .unwrap();
 }
 
+/// Finding 3 of the 2026-10 design review: a ticket that merged and then ran
+/// out of polls left the landing stranded, because every later ticket for the
+/// same commit refused at `ensure_pr` on the PR it found merged.
+#[tokio::test]
+async fn a_new_ticket_finishes_a_landing_whose_pull_request_is_already_merged() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, true).await;
+            fixture.prefix(3).await;
+            // What the earlier ticket left on GitHub: the PR, merged.
+            fixture.github.existing.store(true, Ordering::SeqCst);
+            fixture.github.merged.store(true, Ordering::SeqCst);
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Changed);
+            // Nothing was created or merged again.
+            assert_eq!(fixture.github.count(Method::Put), 0);
+            assert!(
+                !fixture
+                    .github
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|call| call.method == Method::Post && call.path.ends_with("/pulls")),
+                "the merged PR must not be recreated"
+            );
+            let (_, session) = fixture.session().await;
+            let receipts = &session["receipts"];
+            assert_eq!(receipts["ensure_pr"]["number"], 7);
+            assert_eq!(receipts["ensure_pr"]["merged"], true);
+            assert_eq!(receipts["merge"]["confirmed_by"], "observed_merged");
+            assert_eq!(receipts["merge"]["sha"], fixture.github.merge.as_str());
+            assert_eq!(
+                receipts["verify_main"]["sha"],
+                fixture.github.merge.as_str()
+            );
+            assert_eq!(receipts["sync"]["commit"], fixture.github.merge.as_str());
+            // The stranded local base branch is finally synchronized.
+            assert_eq!(
+                git(&fixture.repo, &["rev-parse", "refs/heads/main"]),
+                fixture.github.merge
+            );
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_request_closed_without_a_merge_still_conflicts() {
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(3).await;
+            fixture.github.existing.store(true, Ordering::SeqCst);
+            fixture.github.abandoned.store(true, Ordering::SeqCst);
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Blocked);
+            let ensure = output.body["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|observation| observation["step"] == "ensure-pr")
+                .expect("ensure-pr is reported");
+            assert_eq!(ensure["status"], "blocked", "{}", output.body);
+            assert_eq!(fixture.github.count(Method::Post), 0);
+            assert_eq!(fixture.github.count(Method::Put), 0);
+        }),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn failed_local_check_stops_before_any_remote_operation() {
     tokio::time::timeout(
@@ -845,7 +927,7 @@ async fn revocation_during_first_check_prevents_second_check_spawn() {
             {"name":"second","argv":[program,"--exact","flow_service::landing_integration_test::forbidden_second_check_child","--nocapture"],"timeout_seconds":10}
         ]);
         fixture.ctx.store.set_setting("flows.landing_policy",&policy.to_string()).await.unwrap();
-        let running=fixture.ctx.flows.run(&fixture.ctx,RunArgs{id:"landing".into(),inputs:BTreeMap::new()});tokio::pin!(running);
+        let running=fixture.ctx.flows.run(&fixture.ctx,RunArgs{id:"landing".into(),inputs:BTreeMap::new(),expected_digest:None});tokio::pin!(running);
         let waiting=async {
             loop {
                 if let Some(row)=fixture.ctx.store.read_landing_session(&fixture.ctx.request_id).await.unwrap() {
@@ -961,6 +1043,7 @@ async fn run_refused(fixture: &Fixture) -> String {
             RunArgs {
                 id: "landing".into(),
                 inputs: BTreeMap::new(),
+                expected_digest: None,
             },
         )
         .await;

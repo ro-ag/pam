@@ -153,7 +153,7 @@ line.
   `KeepAlive { SuccessfulExit = false }` (crash restarts, clean exits and
   `already running` exits stay down), `ProcessType Background`,
   `StandardOutPath`/`StandardErrorPath` `<base>/log/launchd.log`,
-  `EnvironmentVariables { PAM_BASE_DIR }` only when overridden.
+  `EnvironmentVariables { PAM_BASE_DIR }` only for an explicit `--base-dir`.
   Commands: install = `launchctl bootout gui/<uid>/<label>` (ignored
   when absent), write plist, `launchctl bootstrap gui/<uid> <plist>`;
   status = plist exists → installed, `launchctl print gui/<uid>/<label>`
@@ -161,7 +161,7 @@ line.
   `id -u` through the runner.
 - **Linux**: `~/.config/systemd/user/pam-daemon.service`. `[Service]
   ExecStart=<exe> daemon`, `Restart=on-failure`, `RestartSec=2`,
-  optional `Environment=PAM_BASE_DIR=…`; `[Install]
+  optional `Environment=PAM_BASE_DIR=…` (only for `--base-dir`; `%` and `$` in paths are escaped); `[Install]
   WantedBy=default.target`. install = write, `systemctl --user
   daemon-reload`, `systemctl --user enable --now pam-daemon.service`;
   status = file exists → installed, `is-active` exit 0 → loaded;
@@ -175,8 +175,12 @@ line.
   override is refused with a legible `Unsupported` (scheduled tasks
   carry no environment); the `unit` path reported is the task name.
 
-Install semantics on every platform: if a loose daemon holds the
-instance lock, stop it first (`client::stop_daemon`, bounded) so the
+Install semantics on every platform (order changed 2026-10-02: validate the
+binary, write the unit, stop a loose daemon, register; a failed write no longer
+leaves no daemon; a binary in a temp directory, cargo `target/` output or a
+group/world-writable location is refused; `PAM_BASE_DIR` is pinned only for an
+explicit `--base-dir`, never copied from the caller's environment): if a loose
+daemon holds the instance lock, stop it (`client::stop_daemon`, bounded) so the
 managed instance takes over; on Windows, where stopping is not supported
 yet, the loose daemon keeps running and the task starts at the next
 logon (the report says so). Uninstall unregisters the unit; on macOS
@@ -191,8 +195,8 @@ instance.
 ### CLI
 
 `pam service install | uninstall | status [--json]`. Human output: one
-line per fact (`platform`, `state`, `unit`, `exe`) and a closing
-sentence; `--json` prints the `ServiceReport`. Exit codes: 0 success,
+line per fact (`platform`, `state`, `unit`, `exe`, and since 2026-10-02 the
+pinned binary and whether it is stale) and a closing sentence; `--json` prints the `ServiceReport`. Exit codes: 0 success,
 1 failure, 2 usage. Documented in `crates/pam/src/lib.rs`'s subcommand
 list and in README.
 

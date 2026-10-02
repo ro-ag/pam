@@ -253,3 +253,52 @@ async fn shutdown_stops_all_tasks_and_publisher_errors_after() {
         .expect("publish returns within deadline");
     assert!(err.is_err(), "publishing after shutdown must fail");
 }
+
+/// `client_version` is caller-chosen text the daemon quotes in a refusal
+/// and a log line; like every other identity field it is bounded at ingress.
+/// The transport also takes no admission permit of its own: a valid request
+/// reaches the daemon core carrying its public origin.
+#[tokio::test]
+async fn an_oversized_client_version_is_refused_before_the_daemon_core() {
+    let tmp = short_tempdir();
+    let dirs = RuntimeDir::at_base(tmp.path()).expect("runtime dir");
+    let (transport, mut incoming) = bind_transport(&dirs).await;
+    let mut dealer = connected_dealer(&dirs).await;
+
+    let mut oversized = envelope("req_long_version");
+    oversized.client_version = "9".repeat(129);
+    let payload = serde_json::to_vec(&oversized).unwrap();
+    timeout(DEADLINE, dealer.send(ZmqMessage::from(payload)))
+        .await
+        .expect("send within deadline")
+        .expect("send ok");
+    let answer = timeout(DEADLINE, dealer.recv())
+        .await
+        .expect("refusal within deadline")
+        .expect("recv ok");
+    let received: Response = serde_json::from_slice(&answer.into_vec()[0]).expect("parse refusal");
+    assert!(
+        matches!(&received, Response::Refusal { cause, .. } if cause == "bad_request"),
+        "{received:?}"
+    );
+    assert!(incoming.try_recv().is_err(), "nothing reached the core");
+
+    // At the limit it is carried, with the origin the pipeline decides by.
+    let mut carried = envelope("req_ok_version");
+    carried.client_version = "9".repeat(128);
+    let payload = serde_json::to_vec(&carried).unwrap();
+    timeout(DEADLINE, dealer.send(ZmqMessage::from(payload)))
+        .await
+        .expect("send within deadline")
+        .expect("send ok");
+    let request = timeout(DEADLINE, incoming.recv())
+        .await
+        .expect("request within deadline")
+        .expect("request forwarded");
+    assert_eq!(request.envelope.id, "req_ok_version");
+    assert_eq!(request.origin, pam_daemon::ingress::Origin::Public);
+
+    timeout(DEADLINE, transport.shutdown())
+        .await
+        .expect("shutdown within deadline");
+}

@@ -183,7 +183,7 @@ impl GitGuard {
         if request.state != pam_store::RequestState::Running
             || request.capability != "flow.run"
             || request.repository != self.repo.to_string_lossy()
-            || request.authorization_revision != Some(self.store.grant_revocation_revision().await?)
+            || !request.authorization_current
             || self
                 .store
                 .request_admission_expired(&self.ticket, now)

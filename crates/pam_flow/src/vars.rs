@@ -112,6 +112,67 @@ pub fn substitute(text: &str, vars: &Vars) -> Result<String, VarError> {
     Ok(out)
 }
 
+/// Why a command line could not be built from its template.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ArgvError {
+    /// A `${…}` reference in `run[position]` had no value.
+    #[error("run[{position}]: {source}")]
+    Unresolved {
+        /// Index into the step's `run` array.
+        position: usize,
+        /// The reference that could not be filled in.
+        source: VarError,
+    },
+    /// A substituted value would have become a command-line option.
+    #[error(
+        "run[{position}] would start with `-` once its variables are filled in, so the \
+         program would read a supplied value as an option"
+    )]
+    Option {
+        /// Index into the step's `run` array.
+        position: usize,
+    },
+}
+
+/// Fills in a command step's `run` array, refusing option injection.
+///
+/// A value that arrives from outside the flow file — an input, a connector
+/// result, an earlier step — must not be able to turn an operand into an
+/// option (`rev=--output=/path`, `script=-e …`). An argument is refused when
+/// its template *begins* with a reference and the finished argument begins
+/// with `-`, unless the template marks the position itself:
+///
+/// - a literal `--` earlier in `run` ends option parsing, so everything after
+///   it is an operand whatever it looks like;
+/// - literal text in front of the reference (`--since=${inputs.day}`,
+///   `-${inputs.level}`) is the author spelling the option, with the value
+///   confined to its argument.
+///
+/// The program name (`run[0]`) never carries a reference; validation refuses
+/// one.
+///
+/// # Errors
+///
+/// [`ArgvError::Unresolved`] for a reference with no value, and
+/// [`ArgvError::Option`] for the refusal above.
+pub fn substitute_argv(argv: &[String], vars: &Vars) -> Result<Vec<String>, ArgvError> {
+    let mut operands_only = false;
+    let mut out = Vec::with_capacity(argv.len());
+    for (position, template) in argv.iter().enumerate() {
+        let argument = substitute(template, vars)
+            .map_err(|source| ArgvError::Unresolved { position, source })?;
+        if !operands_only && template.starts_with("${") && argument.starts_with('-') {
+            return Err(ArgvError::Option { position });
+        }
+        // Only the author's own `--` counts; a substituted one is data.
+        if template == "--" {
+            operands_only = true;
+        }
+        out.push(argument);
+    }
+    Ok(out)
+}
+
 /// Walks `pointer` (`result.jobs[0].id`) into a JSON value.
 fn walk<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
     let mut current = value;

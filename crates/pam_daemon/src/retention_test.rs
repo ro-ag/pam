@@ -5,7 +5,7 @@ use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
 
 use crate::retention::{
     MAX_DAYS, PruneReport, RetentionPatch, RetentionRefusal, RetentionService, RetentionSettings,
-    SETTING_EVIDENCE_DAYS, validate,
+    SETTING_AUDIT_DAYS, SETTING_EVIDENCE_DAYS, validate,
 };
 
 const DAY: i64 = 86_400;
@@ -269,4 +269,72 @@ async fn scheduler_prunes_on_its_first_tick_and_stops_on_shutdown() {
         .expect("stops on drain")
         .unwrap();
     drop(store);
+}
+
+#[tokio::test]
+async fn a_stored_window_out_of_range_reads_as_forever_and_prunes_nothing() {
+    let (store, service) = service().await;
+    finished_request(&store, "kept").await;
+    // Not reachable through a save (validate refuses it): a hand-edited or
+    // damaged setting. A zero window would make every finished record old.
+    for raw in ["0", "999999"] {
+        store.set_setting(SETTING_AUDIT_DAYS, raw).await.unwrap();
+        store.set_setting(SETTING_EVIDENCE_DAYS, raw).await.unwrap();
+        assert_eq!(
+            service.settings().await.unwrap(),
+            RetentionSettings::default(),
+            "stored {raw}"
+        );
+        let report = service.prune(i64::MAX / 4).await.unwrap();
+        assert_eq!(report.requests, 0, "stored {raw}");
+        assert!(store.get_request("kept").await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_save_writes_both_windows_as_one_validated_pair() {
+    let (store, service) = service().await;
+    // A stale evidence window left behind by an earlier state: on its own
+    // it would outlive the audit window this save sets.
+    store
+        .set_setting(SETTING_EVIDENCE_DAYS, "90")
+        .await
+        .unwrap();
+    let refused = service
+        .set_settings(RetentionPatch {
+            audit_days: Some(Some(30)),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, RetentionRefusal::Invalid { .. }));
+    assert_eq!(store.get_setting(SETTING_AUDIT_DAYS).await.unwrap(), None);
+
+    // Naming one window stores the pair: the untouched one is written as
+    // the value the validation saw, in the same transaction.
+    let saved = service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(7)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.evidence_days, Some(7));
+    assert_eq!(
+        store
+            .get_setting(SETTING_EVIDENCE_DAYS)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        store
+            .get_setting(SETTING_AUDIT_DAYS)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("null")
+    );
+    assert_eq!(service.settings().await.unwrap(), saved);
 }

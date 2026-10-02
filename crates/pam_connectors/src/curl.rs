@@ -312,6 +312,7 @@ impl HttpTransport for CurlTransport {
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>> {
         Box::pin(async move {
             validate_request_body(&request)?;
+            validate_headers(&request)?;
             let deadline_secs = deadline
                 .saturating_duration_since(Instant::now())
                 .as_secs()
@@ -472,6 +473,25 @@ fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), TransportErro
         .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
         .collect();
     Ok((status, headers))
+}
+
+/// Refuses a header whose name or value holds a control character. `escape` turns a
+/// line break into the two characters `\n`, which curl's config parser turns back into a
+/// real line break inside the header value: one `Authorization` value with an embedded
+/// newline would send an injected header line. Nothing legitimate needs one.
+pub(crate) fn validate_headers(request: &HttpRequest) -> Result<(), TransportError> {
+    if request
+        .headers
+        .iter()
+        .any(|(name, value)| name.chars().chain(value.chars()).any(char::is_control))
+    {
+        return Err(TransportError::Policy {
+            cause: "header_invalid",
+            detail: "A request header holds a control character or line break; the request was not sent."
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_request_body(request: &HttpRequest) -> Result<(), TransportError> {

@@ -92,8 +92,8 @@ impl Store {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         identifier(request_id, 128)?;
         identifier(evidence_id, 128)?;
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT CASE WHEN length(content)<=1048576 THEN content ELSE NULL END FROM evidence WHERE id=?1 AND request_id=?2 AND kind='flow.checkpoint'",params![evidence_id,request_id]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT CASE WHEN length(content)<=1048576 THEN content ELSE NULL END FROM evidence WHERE id=?1 AND request_id=?2 AND kind='flow.checkpoint'",params![evidence_id,request_id]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -110,16 +110,15 @@ impl Store {
     ) -> Result<FlowJournalBegin, StoreError> {
         validate_identity(identity)?;
         checkpoint(initial_checkpoint)?;
-        let _guard = self.conn_lock.lock().await;
-        let changed = self.conn.execute(
+        let conn = self.lock().await?;
+        let changed = conn.execute(
             "INSERT INTO flow_journal(request_id,schema_version,flow_digest,repository,input_fingerprint,revision,state,step_id,attempt,effectful,checkpoint_json,evidence_refs_json) VALUES (?1,1,?2,?3,?4,0,'ready',NULL,0,0,?5,'[]') ON CONFLICT(request_id) DO NOTHING",
             params![identity.request_id.clone(),identity.flow_digest.clone(),identity.repository.clone(),identity.input_fingerprint.clone(),initial_checkpoint],
         ).await?;
         if changed == 1 {
             return Ok(FlowJournalBegin::Inserted);
         }
-        let existing = self
-            .flow_journal_locked(&identity.request_id)
+        let existing = Self::flow_journal_locked(&conn, &identity.request_id)
             .await?
             .ok_or_else(|| invalid("conflicting journal disappeared"))?;
         Ok(if existing.identity == *identity {
@@ -135,8 +134,8 @@ impl Store {
         request_id: &str,
     ) -> Result<Option<FlowJournal>, StoreError> {
         identifier(request_id, 128)?;
-        let _guard = self.conn_lock.lock().await;
-        self.flow_journal_locked(request_id).await
+        let conn = self.lock().await?;
+        Self::flow_journal_locked(&conn, request_id).await
     }
 
     /// Commit intent before I/O. False means stale ownership or a non-ready
@@ -154,8 +153,8 @@ impl Store {
         if !(1..=256).contains(&attempt) {
             return Err(invalid("attempt must be within 1..256"));
         }
-        let _guard = self.conn_lock.lock().await;
-        Ok(self.conn.execute(
+        let conn = self.lock().await?;
+        Ok(conn.execute(
             "UPDATE flow_journal SET revision=revision+1,state='prepared',step_id=?3,attempt=?4,effectful=?5 WHERE request_id=?1 AND revision=?2 AND state='ready' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
             params![request_id,expected_revision,step_id,i64::from(attempt),i64::from(effectful)],
         ).await? == 1)
@@ -175,8 +174,8 @@ impl Store {
         checkpoint(checkpoint_json)?;
         let refs = references(evidence_refs)?;
         let state = if completed { "completed" } else { "ready" };
-        let _guard = self.conn_lock.lock().await;
-        Ok(self.conn.execute(
+        let conn = self.lock().await?;
+        Ok(conn.execute(
             "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
             params![request_id,expected_revision,state,checkpoint_json,refs],
         ).await? == 1)
@@ -212,16 +211,16 @@ impl Store {
         state: &str,
     ) -> Result<bool, StoreError> {
         transition_args(request_id, revision)?;
-        let _guard = self.conn_lock.lock().await;
-        Ok(self.conn.execute("UPDATE flow_journal SET revision=revision+1,state=?4 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=?3",
+        let conn = self.lock().await?;
+        Ok(conn.execute("UPDATE flow_journal SET revision=revision+1,state=?4 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND effectful=?3",
             params![request_id,revision,i64::from(effectful),state]).await? == 1)
     }
 
     async fn flow_journal_locked(
-        &self,
+        conn: &turso::Connection,
         request_id: &str,
     ) -> Result<Option<FlowJournal>, StoreError> {
-        let mut rows = self.conn.query(
+        let mut rows = conn.query(
             "SELECT schema_version,revision,CASE WHEN length(CAST(state AS BLOB))<=16 THEN state ELSE NULL END,attempt,effectful,CASE WHEN length(CAST(flow_digest AS BLOB))=64 THEN flow_digest ELSE NULL END,CASE WHEN length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096 THEN repository ELSE NULL END,CASE WHEN length(CAST(input_fingerprint AS BLOB))=64 THEN input_fingerprint ELSE NULL END,CASE WHEN length(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END,CASE WHEN length(CAST(evidence_refs_json AS BLOB))<=16384 THEN evidence_refs_json ELSE NULL END,CASE WHEN length(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256 THEN 1 ELSE 0 END FROM flow_journal WHERE request_id=?1",
             params![request_id],
         ).await?;

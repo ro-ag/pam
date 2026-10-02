@@ -132,7 +132,7 @@ impl Store {
 ```
 
 Evidence ids are `ev_<ulid>`, minted by the daemon. Every statement runs
-behind the existing `conn_lock` (turso concurrency rule).
+behind the store's connection lock (turso concurrency rule; since 2026-10-02 the mutex owns the connection, `pam_store/src/conn_gate.rs`).
 
 ## Daemon (`pam_daemon`)
 

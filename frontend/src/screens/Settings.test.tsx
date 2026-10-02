@@ -132,7 +132,7 @@ beforeEach(() => {
   mocks.activityList.mockResolvedValue({ requests: [] });
   mocks.callersList.mockResolvedValue({ callers: [] });
   mocks.profileGet.mockResolvedValue({ profile: "standard" });
-  mocks.profileSet.mockResolvedValue({ profile: "strict", applies: "next_daemon_start" });
+  mocks.profileSet.mockResolvedValue({ profile: "strict", applies: "now" });
   mocks.grantsList.mockResolvedValue({
     grants: [
       grant({ id: 1, capability: "echo" }),
@@ -370,16 +370,58 @@ describe("profile", () => {
     }
   });
 
-  it("sets a new profile and surfaces the applies-next-start note", async () => {
+  it("sets a new profile with no restart note when the daemon applies it now", async () => {
+    renderSettings("security");
+    await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled());
+    mocks.profileGet.mockResolvedValue({ profile: "strict" });
+    fireEvent.click(screen.getByRole("radio", { name: /strict/ }));
+    await waitFor(() => expect(mocks.profileSet).toHaveBeenCalledWith("strict", undefined));
+    await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeChecked());
+    expect(screen.queryByText(/applies at next daemon start/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces the applies-next-start note from a daemon that defers the change", async () => {
+    mocks.profileSet.mockResolvedValue({ profile: "strict", applies: "next_daemon_start" });
     renderSettings("security");
     // The radios enable once profileGet answers.
     await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled());
     // After the set, the daemon reports the new profile on refetch.
     mocks.profileGet.mockResolvedValue({ profile: "strict" });
     fireEvent.click(screen.getByRole("radio", { name: /strict/ }));
-    await waitFor(() => expect(mocks.profileSet).toHaveBeenCalledWith("strict"));
+    // Narrowing the profile is one click: no confirmation phrase.
+    await waitFor(() => expect(mocks.profileSet).toHaveBeenCalledWith("strict", undefined));
     expect(await screen.findByText(/applies at next daemon start/)).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /strict/ })).toBeChecked();
+  });
+
+  it("does not relax the profile on one click: it takes a typed confirmation", async () => {
+    renderSettings("security");
+    await waitFor(() => expect(screen.getByRole("radio", { name: /relaxed/ })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: /relaxed/ }));
+
+    // Nothing was sent, and the radio did not move.
+    expect(mocks.profileSet).not.toHaveBeenCalled();
+    expect(screen.getByRole("radio", { name: /relaxed/ })).not.toBeChecked();
+    const prompt = within(
+      screen.getByRole("group", { name: "Switch to the relaxed profile?" }),
+    );
+    expect(prompt.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    const confirm = prompt.getByRole("button", { name: "Switch to relaxed" });
+    expect(confirm).toBeDisabled();
+    fireEvent.change(prompt.getByRole("textbox", { name: "type relaxed to confirm" }), {
+      target: { value: "relaxed" },
+    });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(mocks.profileSet).toHaveBeenCalledWith("relaxed", "relaxed"));
+  });
+
+  it("cancelling the relax prompt changes nothing", async () => {
+    renderSettings("security");
+    await waitFor(() => expect(screen.getByRole("radio", { name: /relaxed/ })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: /relaxed/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("group", { name: "Switch to the relaxed profile?" })).toBeNull();
+    expect(mocks.profileSet).not.toHaveBeenCalled();
   });
 });
 
@@ -419,7 +461,16 @@ describe("grants", () => {
     const input = await screen.findByLabelText("capability to grant");
     fireEvent.change(input, { target: { value: "query" } });
     fireEvent.click(screen.getByRole("button", { name: "Grant" }));
-    await waitFor(() => expect(mocks.grantsAdd).toHaveBeenCalledWith("query"));
+    // A grant is global: the form opens a typed confirmation instead of sending.
+    expect(mocks.grantsAdd).not.toHaveBeenCalled();
+    const prompt = within(
+      screen.getByRole("group", { name: "Grant query to every repository?" }),
+    );
+    fireEvent.change(prompt.getByRole("textbox", { name: "type grant to confirm" }), {
+      target: { value: "grant" },
+    });
+    fireEvent.click(prompt.getByRole("button", { name: "Grant" }));
+    await waitFor(() => expect(mocks.grantsAdd).toHaveBeenCalledWith("query", "grant"));
     await waitFor(() => expect(input).toHaveValue(""));
   });
 
@@ -754,6 +805,27 @@ describe("daemon", () => {
     expect(
       await card.findByText(/the manager stopped the managed daemon along with its unit/),
     ).toBeInTheDocument();
+  });
+
+  it("warns when the login unit pins a binary that is gone, and offers to repoint it", async () => {
+    mocks.serviceStatus.mockResolvedValue({
+      platform: "linux",
+      exe: "/usr/bin/pam",
+      pinned_exe: "/tmp/old/pam",
+      stale:
+        "the unit runs /tmp/old/pam, which no longer exists; run `pam service install` from the current binary",
+      state: {
+        kind: "installed",
+        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        loaded: false,
+      },
+      note: null,
+    });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText(/which no longer exists/)).toBeInTheDocument();
+    fireEvent.click(card.getByRole("button", { name: "Repoint to this binary" }));
+    await waitFor(() => expect(mocks.serviceInstall).toHaveBeenCalledTimes(1));
   });
 
   it("explains an unsupported platform instead of offering buttons", async () => {

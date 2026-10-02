@@ -2,8 +2,8 @@
 
 PAM evidence reads use the normal CLI, internal socket, admission and audit path.
 An evidence ID is a reference, not permission. Each read checks its original
-request, canonical repository, current repository/product scope and grant
-revocation revision. Administration and protected source inspection stay in the
+request, canonical repository, current repository/product scope and the grant
+revocation revision scoped to the grants that request depends on. Administration and protected source inspection stay in the
 GUI. Existing evidence without a safe view is explicitly unavailable to agents;
 PAM does not export a raw legacy blob as a fallback.
 
@@ -27,7 +27,14 @@ separate from the completed workflow's execution deadline.
 
 The response includes the immutable view digest, source identity, capture time,
 redaction policy, byte ranges, provenance and the next offset. EOF means the
-view ended; it does not prove the collected evidence explains the failure.
+view ended; it does not prove the collected evidence explains the failure. A
+read at the end of a view, including of a zero-byte view, returns an empty page
+marked `eof` rather than `invalid_evidence_range`. When a producer's provenance
+map was too detailed to keep (more than 8,192 segments), runs of adjacent
+segments are merged without claiming byte identity and the view identity
+carries `provenance_map` with the resolution, the segment counts and the number
+merged. If preparing a view fails after the source is filed, a short notice view
+saying why is published so the ticket stays readable.
 Completeness remains explicit. Retention removes view content but preserves a
 scoped tombstone until request retention, allowing `evidence_expired` to be
 distinguished from unknown evidence only after authorization.

@@ -636,6 +636,21 @@ pub fn resolve_citation_offsets(raw: &str, task: &DiagnosisTask) -> ResolvedResp
     }
 }
 
+/// The shortest quote that earns its evidence item's authority tags, in bytes.
+///
+/// [`resolve_citation_offsets`] derives a span from the quote, so any substring of an
+/// item satisfies the byte check; one byte of a `runner`-tagged item must not satisfy an
+/// authority bar that asks for runner evidence. A shorter quote still counts when it is
+/// the whole item.
+pub const MIN_AUTHORITY_QUOTE_BYTES: usize = 12;
+
+/// Whether `quote`, cited from an item of `item_bytes`, is long enough to carry the
+/// item's authority tags: at least [`MIN_AUTHORITY_QUOTE_BYTES`], or the whole item.
+#[must_use]
+pub fn is_substantive_quote(quote: &str, item_bytes: usize) -> bool {
+    quote.len() >= MIN_AUTHORITY_QUOTE_BYTES || (!quote.is_empty() && quote.len() == item_bytes)
+}
+
 /// Validates one raw completion against the task's contract.
 ///
 /// Order of refusal: whitespace-trim, parse as exactly one JSON object,

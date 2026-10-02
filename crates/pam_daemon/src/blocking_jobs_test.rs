@@ -92,6 +92,58 @@ async fn conflicting_mutation_waits_after_first_caller_is_cancelled() {
     second.await.unwrap().unwrap();
 }
 
+/// A multi-GB hash holds only its own lane: a registry scan (`ModelFilesystem`) runs while it
+/// does, and a second hash waits behind the first.
+#[tokio::test]
+async fn a_held_model_hash_does_not_block_a_model_filesystem_job() {
+    let jobs = BlockingJobs::new(4);
+    let hash_jobs = Arc::clone(&jobs);
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, blocked) = mpsc::channel();
+    let hash = tokio::spawn(async move {
+        hash_jobs
+            .run(Kind::ModelHash, move || {
+                let _ = started.send(());
+                blocked
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("released");
+            })
+            .await
+    });
+    running.await.expect("the hash started");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        jobs.run(Kind::ModelFilesystem, || ()),
+    )
+    .await
+    .expect("a scan is not queued behind the hash")
+    .unwrap();
+
+    let second_jobs = Arc::clone(&jobs);
+    let (second_started, mut second_running) = tokio::sync::oneshot::channel();
+    let second = tokio::spawn(async move {
+        second_jobs
+            .run(Kind::ModelHash, move || {
+                let _ = second_started.send(());
+            })
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut second_running)
+            .await
+            .is_err(),
+        "hashes still serialize with each other"
+    );
+    release.send(()).expect("release the hash");
+    tokio::time::timeout(Duration::from_secs(2), second_running)
+        .await
+        .unwrap()
+        .unwrap();
+    hash.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn panics_release_capacity_and_completion_history_is_bounded() {
     let jobs = BlockingJobs::new(1);

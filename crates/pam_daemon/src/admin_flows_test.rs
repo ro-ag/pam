@@ -463,6 +463,7 @@ async fn a_gate_refusal_reaches_the_gui_verbatim() {
         request
             .reply
             .send(Response::Refusal {
+                retryable: false,
                 id: request.envelope.id.clone(),
                 cause: "not_granted".to_owned(),
                 detail: "capability \"flow.run\" has no active grant".to_owned(),
@@ -840,4 +841,280 @@ async fn settings_carry_the_artifacts_root_and_a_null_clears_it() {
         Outcome::Changed,
     );
     assert_eq!(body["artifacts_root"], serde_json::Value::Null);
+}
+
+/// A two-step flow whose `change` step runs `argument`, reads the `target`
+/// input (default `default`) and carries `note`.
+fn two_step_yaml(id: &str, argument: &str, default: &str, note: &str) -> String {
+    format!(
+        "schema: 1\nid: {id}\nname: Two steps {id}\n\
+         inputs:\n  target:\n    description: what to build\n    default: {default}\n\
+         steps:\n  - id: look\n    run: [git, status, --short]\n    note: {note}\n  \
+         - id: change\n    run: [make, {argument}, \"${{inputs.target}}\"]\n    effect: stateful\n"
+    )
+}
+
+/// The capabilities with an active grant, sorted.
+async fn active_grants(store: &Store) -> Vec<String> {
+    let mut active: Vec<String> = store
+        .list_grants()
+        .await
+        .expect("grants list")
+        .into_iter()
+        .filter(|grant| grant.revoked_ts.is_none())
+        .map(|grant| grant.capability)
+        .collect();
+    active.sort();
+    active
+}
+
+async fn save(admin: &AdminService, request: &str, id: &str, yaml: &str) -> serde_json::Value {
+    body_of(
+        admin
+            .handle(&admin_envelope(
+                request,
+                OP_FLOWS_SAVE,
+                json!({ "id": id, "yaml": yaml }),
+            ))
+            .await,
+        Outcome::Changed,
+    )
+}
+
+/// Finding 2 of the 2026-10 design review: a remembered approval is a grant
+/// on the step's *name*, so editing what the step runs must take it away.
+#[tokio::test]
+async fn saving_a_changed_step_revokes_its_remembered_approval_and_says_so() {
+    let (_tmp, store, admin, _ingress) = service().await;
+    let first = save(
+        &admin,
+        "save1",
+        "local",
+        &two_step_yaml("local", "build", "all", "one"),
+    )
+    .await;
+    assert_eq!(first["grants_revoked"], json!([]));
+    assert_eq!(first["reapproval_required"], false);
+    for step in ["look", "change"] {
+        store
+            .insert_grant(&crate::flow_service::step_capability("local", step))
+            .await
+            .unwrap();
+    }
+    store
+        .insert_grant("flow.step:locality/change")
+        .await
+        .unwrap();
+    store.insert_grant("flow.run").await.unwrap();
+
+    // Only a note changed: both approvals still describe what runs.
+    let noted = save(
+        &admin,
+        "save2",
+        "local",
+        &two_step_yaml("local", "build", "all", "two"),
+    )
+    .await;
+    assert_eq!(noted["grants_revoked"], json!([]));
+    assert_eq!(active_grants(&store).await.len(), 4);
+
+    // The approved `make build` now runs `make deploy`.
+    let edited = save(
+        &admin,
+        "save3",
+        "local",
+        &two_step_yaml("local", "deploy", "all", "two"),
+    )
+    .await;
+    assert_eq!(edited["grants_revoked"], json!(["flow.step:local/change"]));
+    assert_eq!(edited["reapproval_required"], true);
+    assert_eq!(
+        active_grants(&store).await,
+        [
+            "flow.run",
+            "flow.step:local/look",
+            "flow.step:locality/change"
+        ],
+        "only the edited step of this flow loses its grant"
+    );
+    let audit = store.audit_for_request("save3").await.unwrap();
+    let detail: serde_json::Value =
+        serde_json::from_str(audit.last().unwrap().detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["grants_revoked"], json!(["flow.step:local/change"]));
+    assert_eq!(detail["digest"], edited["digest"]);
+    assert_eq!(detail["previous_digest"], noted["digest"]);
+    assert_ne!(detail["digest"], detail["previous_digest"]);
+
+    // A default the step reads is part of the command line that was approved.
+    store.insert_grant("flow.step:local/change").await.unwrap();
+    let defaulted = save(
+        &admin,
+        "save4",
+        "local",
+        &two_step_yaml("local", "deploy", "production", "two"),
+    )
+    .await;
+    assert_eq!(
+        defaulted["grants_revoked"],
+        json!(["flow.step:local/change"])
+    );
+    assert!(!store.active_grant("flow.step:local/change").await.unwrap());
+    assert!(store.active_grant("flow.step:local/look").await.unwrap());
+}
+
+#[tokio::test]
+async fn a_shadow_keeps_only_the_grants_of_steps_identical_to_the_builtin() {
+    let (_tmp, store, admin, _ingress) = service().await;
+    let builtin = pam_flow::builtin_yaml("after-merge-checks").unwrap();
+    for step in ["fetch", "clean-tree", "recent-commits", "left-behind"] {
+        store
+            .insert_grant(&crate::flow_service::step_capability(
+                "after-merge-checks",
+                step,
+            ))
+            .await
+            .unwrap();
+    }
+    // The shadow keeps the builtin's text except for what `fetch` runs.
+    let shadow = builtin.replace("[git, fetch, --prune]", "[git, fetch, --all]");
+    assert_ne!(shadow, builtin);
+    let created = body_of(
+        admin
+            .handle(&admin_envelope(
+                "shadow",
+                OP_FLOWS_SAVE,
+                json!({"id":"after-merge-checks","yaml":shadow,"create_only":true,"allow_builtin_override":true}),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(
+        created["grants_revoked"],
+        json!([
+            "flow.step:after-merge-checks/fetch",
+            "flow.step:after-merge-checks/left-behind"
+        ]),
+        "the changed step and a grant no step answers to are both revoked"
+    );
+    assert_eq!(
+        active_grants(&store).await,
+        [
+            "flow.step:after-merge-checks/clean-tree",
+            "flow.step:after-merge-checks/recent-commits"
+        ]
+    );
+
+    // Deleting the shadow reveals the builtin: `fetch` changes back, so a
+    // grant given to the shadow's `fetch` does not carry over to it.
+    store
+        .insert_grant("flow.step:after-merge-checks/fetch")
+        .await
+        .unwrap();
+    let deleted = body_of(
+        admin
+            .handle(&admin_envelope(
+                "unshadow",
+                OP_FLOWS_DELETE,
+                json!({"id":"after-merge-checks"}),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(deleted["revealed_builtin"], true);
+    assert_eq!(
+        deleted["grants_revoked"],
+        json!(["flow.step:after-merge-checks/fetch"])
+    );
+    assert_eq!(deleted["reapproval_required"], true);
+}
+
+#[tokio::test]
+async fn deleting_a_flow_revokes_every_step_grant_and_a_refused_save_revokes_none() {
+    let (_tmp, store, admin, _ingress) = service().await;
+    let yaml = two_step_yaml("local", "build", "all", "one");
+    save(&admin, "save", "local", &yaml).await;
+    for step in ["look", "change"] {
+        store
+            .insert_grant(&crate::flow_service::step_capability("local", step))
+            .await
+            .unwrap();
+    }
+    // Refused before anything is written: the existing flow keeps its approvals.
+    let changed = two_step_yaml("local", "deploy", "all", "one");
+    assert_eq!(
+        cause_of(
+            admin
+                .handle(&admin_envelope(
+                    "collide",
+                    OP_FLOWS_SAVE,
+                    json!({"id":"local","yaml":changed,"create_only":true}),
+                ))
+                .await
+        ),
+        CAUSE_ID_MISMATCH
+    );
+    assert_eq!(
+        cause_of(
+            admin
+                .handle(&admin_envelope(
+                    "invalid",
+                    OP_FLOWS_SAVE,
+                    json!({"id":"local","yaml":"schema: 1\nid: local\nname: Broken\nsteps: []\n"}),
+                ))
+                .await
+        ),
+        CAUSE_FLOW_INVALID
+    );
+    assert_eq!(active_grants(&store).await.len(), 2);
+
+    let deleted = body_of(
+        admin
+            .handle(&admin_envelope(
+                "del",
+                OP_FLOWS_DELETE,
+                json!({"id":"local"}),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(
+        deleted["grants_revoked"],
+        json!(["flow.step:local/change", "flow.step:local/look"])
+    );
+    assert!(active_grants(&store).await.is_empty());
+    // A new flow under the old id starts with no approval of its own.
+    let again = save(&admin, "again", "local", &yaml).await;
+    assert_eq!(again["grants_revoked"], json!([]));
+    assert!(active_grants(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn run_forwards_the_digest_the_human_was_shown() {
+    let (_tmp, _store, admin, mut ingress) = service().await;
+    let pipeline = tokio::spawn(async move {
+        let request = ingress.recv().await.expect("the run reaches the ingress");
+        let ticket = request.envelope.id.clone();
+        request
+            .reply
+            .send(Response::Ticket {
+                id: ticket.clone(),
+                ticket,
+                position: 0,
+            })
+            .expect("the reply is delivered");
+        request.envelope
+    });
+    let digest = "a".repeat(64);
+    body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_run",
+                OP_FLOWS_RUN,
+                json!({"id":"after-merge-checks","repo":"/work/pam","expected_digest":digest}),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    let envelope = pipeline.await.unwrap();
+    assert_eq!(envelope.args["expected_digest"], digest);
 }

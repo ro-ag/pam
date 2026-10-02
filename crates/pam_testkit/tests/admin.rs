@@ -71,7 +71,8 @@ async fn admin_profile_round_trips_over_the_real_socket() {
             ))
             .await;
         let body = body_of(response, Outcome::Changed);
-        assert_eq!(body["applies"], "next_daemon_start");
+        // The running gate is the one source of truth: it changed now.
+        assert_eq!(body["applies"], "now");
 
         let response = client
             .request(&admin_envelope(
@@ -414,11 +415,15 @@ async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is
     .await;
 }
 
+/// A different client build on the private plane is refused before the
+/// mutation runs — and, the daemon's binary being unchanged on disk, the
+/// daemon does not restart on the client's say-so.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
-async fn native_version_mismatch_refuses_mutation_and_requests_restart() {
+async fn native_version_mismatch_refuses_mutation_and_does_not_restart() {
     with_deadline(async {
         let daemon = TestDaemon::spawn().await;
+        let lifecycle = daemon.handle().lifecycle();
         let mut request = admin_envelope(
             "native_bad_version",
             OP_PROFILE_SET,
@@ -428,7 +433,11 @@ async fn native_version_mismatch_refuses_mutation_and_requests_restart() {
         let response = pam_daemon::admin_transport::exchange(&daemon.base_dir(), &request)
             .await
             .unwrap();
-        assert!(matches!(response, Response::Refusal { cause, .. } if cause == "daemon_outdated"));
+        assert!(
+            matches!(&response, Response::Refusal { cause, retryable, .. }
+                if cause == "client_version_mismatch" && !retryable),
+            "{response:?}"
+        );
         assert!(
             daemon
                 .store()
@@ -437,6 +446,19 @@ async fn native_version_mismatch_refuses_mutation_and_requests_restart() {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            *lifecycle.borrow(),
+            pam_daemon::lifecycle::LifecyclePhase::Serving,
+            "a claimed version moved the daemon's phase"
+        );
+        // The same plane still serves a matching client.
+        let response = pam_daemon::admin_transport::exchange(
+            &daemon.base_dir(),
+            &admin_envelope("native_good_version", OP_PROFILE_GET, serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
         daemon.stop().await;
     })
     .await;

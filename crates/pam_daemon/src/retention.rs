@@ -20,8 +20,9 @@
 //!   save and the GUI's Prune now button also prune at once ([`crate::admin_retention`]). Every
 //!   pass writes [`SETTING_LAST_RUN`], even a no-op one.
 //! - **Concurrency**: the service is a handle over the shared [`Store`]; each prune is two store
-//!   calls, each holding the store's connection lock across its own `BEGIN`..`COMMIT` (the store
-//!   refuses concurrent use of one connection). Nothing here holds a lock of its own.
+//!   calls, each working oldest first in bounded batches — one transaction per batch, the store's
+//!   connection lock released between them — so a pass over a long backlog never holds every
+//!   other store call behind it. Nothing here holds a lock of its own.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -144,12 +145,23 @@ impl RetentionService {
         })
     }
 
-    /// One window setting, or `None` when it is unset or unreadable.
+    /// One window setting, or `None` when it is unset, unreadable, or out
+    /// of range. A save can only store `1..=MAX_DAYS`, so anything else got
+    /// there some other way; a stored `0` in particular would make every
+    /// finished record "older than the window" and delete it at once.
     async fn window(&self, key: &str) -> Result<Option<u32>, StoreError> {
         let Some(raw) = self.store.get_setting(key).await? else {
             return Ok(None);
         };
         match serde_json::from_str::<Option<u32>>(&raw) {
+            Ok(Some(days)) if !(1..=MAX_DAYS).contains(&days) => {
+                tracing::warn!(
+                    setting = key,
+                    days,
+                    "the stored retention window is out of range; treating it as forever"
+                );
+                Ok(None)
+            }
             Ok(days) => Ok(days),
             Err(error) => {
                 tracing::warn!(
@@ -165,7 +177,10 @@ impl RetentionService {
     /// Applies `patch` and answers the windows as they now stand.
     ///
     /// The merged pair is validated before anything is written, so a
-    /// refusal leaves the stored settings exactly as they were.
+    /// refusal leaves the stored settings exactly as they were. Both
+    /// windows are then written in one transaction, the untouched one
+    /// included: the stored pair is always one that passed [`validate`]
+    /// as a whole, even when two saves race or the daemon stops mid-save.
     pub async fn set_settings(
         &self,
         patch: RetentionPatch,
@@ -179,16 +194,13 @@ impl RetentionService {
             audit_days: patch.audit_days.unwrap_or(current.audit_days),
         };
         validate(merged).map_err(|detail| RetentionRefusal::Invalid { detail })?;
-        for (key, days) in [
-            (SETTING_EVIDENCE_DAYS, patch.evidence_days),
-            (SETTING_AUDIT_DAYS, patch.audit_days),
-        ] {
-            let Some(days) = days else { continue };
-            self.store
-                .set_setting(key, &encode(days))
-                .await
-                .map_err(|error| store_refusal(&error))?;
-        }
+        self.store
+            .set_settings(&[
+                (SETTING_EVIDENCE_DAYS, &encode(merged.evidence_days)),
+                (SETTING_AUDIT_DAYS, &encode(merged.audit_days)),
+            ])
+            .await
+            .map_err(|error| store_refusal(&error))?;
         Ok(merged)
     }
 

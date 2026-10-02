@@ -444,3 +444,32 @@ fn connection(profile: Option<&str>) -> Connection {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(20)
 }
+
+/// The daemon refuses AWS before it reaches this crate, but the adapter must hold the
+/// line on its own: with no stand-in binary named, an allowlisted call spawns nothing
+/// and never searches `PATH` for an `aws` to run.
+#[tokio::test]
+async fn the_adapter_refuses_to_start_the_cli_on_its_own() {
+    clear_binary_for_tests();
+    let args = cli_args("sts", "get-caller-identity", None);
+
+    let call_error = call_once(&connection(Some("default")), &args, "cli")
+        .await
+        .unwrap_err();
+    let verify_error = verify(
+        ConnectorId::Aws,
+        &connection(Some("default")),
+        &FakeTransport::new(),
+        deadline(),
+    )
+    .await
+    .unwrap_err();
+
+    for error in [call_error, verify_error] {
+        assert_eq!(
+            error.cause(),
+            "command_containment_unavailable",
+            "{error:?}"
+        );
+    }
+}

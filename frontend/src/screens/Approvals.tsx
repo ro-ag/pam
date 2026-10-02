@@ -2,23 +2,28 @@ import { TextField } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Hand } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { useEventRefresh } from "../lib/useEventRefresh";
 import { APPROVALS_PENDING_KEY } from "../components/shell/useDaemonStatus";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
+import { SafeText } from "../components/ui/SafeText";
+import { TypedConfirm } from "../components/ui/TypedConfirm";
 import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
 import { cn } from "../lib/cn";
 import {
+  CONFIRM_GRANT,
   approvalsPending,
   approvalsResolve,
-  subscribeEvents,
+  snapshotDigest,
   toBridgeFailure,
   type BridgeFailure,
   type FlowEffect,
   type PendingApproval,
 } from "../lib/ipc";
+import { escapeInvisible } from "../lib/safeText";
 import { repoTail } from "../lib/repo";
 import { exactTime, relativeTime, useNow } from "../lib/time";
 
@@ -34,8 +39,8 @@ import { exactTime, relativeTime, useNow } from "../lib/time";
  * minute 10 the clock switches to the warning token and counts down.
  */
 
-/** Trailing debounce for event-driven refetches: bursts coalesce. */
-export const EVENT_REFRESH_MS = 300;
+/** The queries an event refreshes: the pending list (and anything else under `approvals`). */
+const APPROVALS_KEYS = [["approvals"]] as const;
 
 /** Daemon default before an unanswered hand times out (approval.rs). */
 export const APPROVAL_TIMEOUT_S = 15 * 60;
@@ -74,7 +79,8 @@ export function approvalMeaning(capability: string): { before: string; after: st
   if (capability.startsWith(FLOW_STEP_PREFIX)) {
     return {
       before: "The flow asks to run a gated step, ",
-      after: ". Approving runs that step this once; remember keeps it for this flow.",
+      after:
+        ". Approving runs that step this once; remember grants the capability to every repository.",
     };
   }
   switch (capability.split(".")[0]) {
@@ -139,24 +145,55 @@ export function effectLabel(effect: FlowEffect): string {
   return effect === "read_only" ? "read only" : "stateful";
 }
 
+/** How a request's recorded args are laid out on the card. */
+export type CommandView =
+  /** An argument vector: every element is its own token, so a space inside one is unmistakable. */
+  | { kind: "argv"; argv: string[] }
+  /** A bare command string, or the compact JSON of args that are not a command. */
+  | { kind: "text"; text: string };
+
 /**
- * What the request will actually run, read off its recorded args: an
- * `argv` array joins into the command line; anything else renders as one
- * compact JSON line so the human sees the exact payload, not a paraphrase.
+ * What the request will run, read off its recorded args exactly as recorded. An `argv` array
+ * stays an array — it is **not** joined with spaces, which would make `["echo","a b"]` look like
+ * `["echo","a","b"]` — and anything else renders as one compact JSON line, so the human sees the
+ * exact payload, not a paraphrase.
  */
-export function commandLine(args: unknown): string | null {
+export function commandView(args: unknown): CommandView | null {
   if (typeof args !== "object" || args === null) return null;
   const body = args as Record<string, unknown>;
   const argv = body.argv ?? body.run ?? body.command;
   if (Array.isArray(argv) && argv.every((part) => typeof part === "string")) {
-    return argv.join(" ");
+    return { kind: "argv", argv };
   }
-  if (typeof argv === "string") return argv;
+  if (typeof argv === "string") return { kind: "text", text: argv };
   const line = JSON.stringify(args);
-  return line === "{}" ? null : line;
+  return line === "{}" ? null : { kind: "text", text: line };
+}
+
+/** Each argument as its own visibly delimited token; empty arguments say so. */
+function ArgvTokens({ argv, label }: { argv: string[]; label: string }) {
+  return (
+    <ol aria-label={label} className="flex min-w-0 flex-wrap gap-1">
+      {argv.map((part, index) => (
+        <li
+          key={index}
+          className="min-w-0 rounded-badge border border-line bg-inset px-1.5 py-0.5 text-ink"
+        >
+          {part === "" ? (
+            <span className="text-ink-faint">(empty)</span>
+          ) : (
+            <SafeText value={part} />
+          )}
+        </li>
+      ))}
+    </ol>
+  );
 }
 
 // --- one raised hand -------------------------------------------------------
+
+/** What a card hands to the screen when the human answers. */
+type ResolveOptions = { remember?: boolean; note?: string; confirmation?: string };
 
 function ApprovalCard({
   approval,
@@ -169,18 +206,30 @@ function ApprovalCard({
   now: number;
   busy: boolean;
   failure: BridgeFailure | undefined;
-  onResolve: (
-    resolution: "approved" | "denied",
-    options: { remember?: boolean; note?: string },
-  ) => void;
+  onResolve: (resolution: "approved" | "denied", options: ResolveOptions) => void;
 }) {
   const [remember, setRemember] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [noteOpen, setNoteOpen] = useState(false);
   const [note, setNote] = useState("");
+  const rememberHint = useId();
   const meaning = approvalMeaning(approval.capability);
   const clock = waitingClock(approval.requested_ts, now);
-  const command = commandLine(approval.args);
+  const command = commandView(approval.args);
+  const resolved = approval.resolved ?? null;
   const options = () => ({ remember, ...(note.trim() ? { note: note.trim() } : {}) });
+
+  // One answer per card: a second click (a double click, a held Enter) must never submit the
+  // same decision twice, whatever the optimistic state has caught up with yet.
+  const answered = useRef(false);
+  useEffect(() => {
+    if (!busy) answered.current = false;
+  }, [busy]);
+  const submit = (resolution: "approved" | "denied", extra: ResolveOptions) => {
+    if (answered.current) return;
+    answered.current = true;
+    onResolve(resolution, { ...options(), ...extra });
+  };
 
   return (
     <Panel
@@ -196,13 +245,21 @@ function ApprovalCard({
           <Hand className="size-4 text-warning" />
         </span>
         <div className="min-w-0 flex-1 space-y-1.5">
-          <p className="truncate font-data text-base font-medium text-ink">
-            {approval.capability}
+          <p className="font-data text-base font-medium text-ink">
+            <SafeText value={approval.capability} />
           </p>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <Badge tone="neutral">{approval.agent}</Badge>
-            <span className="truncate font-data text-xs text-ink-faint" title={approval.repo}>
-              {repoTail(approval.repo)}
+            <Badge
+              tone="neutral"
+              title="The agent's own label for itself: the daemon does not verify it"
+            >
+              <SafeText value={approval.agent} />
+            </Badge>
+            <span
+              className="min-w-0 font-data text-xs text-ink-faint"
+              title={escapeInvisible(approval.repo)}
+            >
+              <SafeText value={repoTail(approval.repo)} />
             </span>
           </div>
         </div>
@@ -221,19 +278,67 @@ function ApprovalCard({
       <p className="max-w-md font-sans text-sm text-ink-muted">
         {meaning.before}
         <span className="font-data text-sm text-ink not-italic">
-          {capabilityLabel(approval.capability)}
+          <SafeText value={capabilityLabel(approval.capability)} />
         </span>
         {meaning.after}
       </p>
 
       <dl aria-label="what will run" className="space-y-1 font-data text-xs text-ink-muted">
+        {resolved !== null && (
+          <>
+            <div className="flex gap-3">
+              <dt className="w-20 shrink-0 text-ink-faint">Program</dt>
+              <dd className="min-w-0 text-ink">
+                <SafeText value={resolved.program} />
+              </dd>
+            </div>
+            <div className="flex gap-3">
+              <dt className="w-20 shrink-0 text-ink-faint">Arguments</dt>
+              <dd className="min-w-0 flex-1">
+                {resolved.argv.length === 0 ? (
+                  <span className="text-ink-faint">none</span>
+                ) : (
+                  <ArgvTokens argv={resolved.argv} label="resolved arguments" />
+                )}
+              </dd>
+            </div>
+            {resolved.cwd && (
+              <div className="flex gap-3">
+                <dt className="w-20 shrink-0 text-ink-faint">Directory</dt>
+                <dd className="min-w-0 text-ink">
+                  <SafeText value={resolved.cwd} />
+                </dd>
+              </div>
+            )}
+            {(resolved.env_keys?.length ?? 0) > 0 && (
+              <div className="flex gap-3">
+                <dt className="w-20 shrink-0 text-ink-faint">Sets env</dt>
+                <dd className="min-w-0">
+                  <SafeText value={(resolved.env_keys ?? []).join(", ")} />
+                </dd>
+              </div>
+            )}
+          </>
+        )}
         <div className="flex gap-3">
-          <dt className="w-20 shrink-0 text-ink-faint">Command</dt>
-          <dd className="min-w-0 break-all text-ink">{command ?? "no arguments recorded"}</dd>
+          <dt className="w-20 shrink-0 text-ink-faint">
+            {resolved === null ? "Command" : "Submitted"}
+          </dt>
+          <dd className="min-w-0 flex-1 text-ink">
+            {command === null ? (
+              "no arguments recorded"
+            ) : command.kind === "argv" ? (
+              <ArgvTokens argv={command.argv} label="command arguments" />
+            ) : (
+              <SafeText value={command.text} />
+            )}
+          </dd>
         </div>
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-ink-faint">Repository</dt>
-          <dd className="min-w-0 break-all">{approval.repository ?? approval.repo}</dd>
+          <dd className="min-w-0">
+            <SafeText value={approval.repository ?? approval.repo} />
+          </dd>
         </div>
         {approval.effect !== null && (
           <div className="flex gap-3">
@@ -246,26 +351,43 @@ function ApprovalCard({
       {failure && <FailureNote failure={failure} label="resolve failed" />}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-line pt-4">
-        <Button size="sm" disabled={busy} onClick={() => onResolve("approved", options())}>
+        <Button
+          size="sm"
+          disabled={busy}
+          onClick={() => {
+            // Remembering widens what agents may do for good: it asks for a typed confirmation.
+            if (remember) setConfirming(true);
+            else submit("approved", {});
+          }}
+        >
           Approve
         </Button>
         <Button
           size="sm"
           variant="secondary"
           disabled={busy}
-          onClick={() => onResolve("denied", options())}
+          onClick={() => submit("denied", {})}
         >
           Deny
         </Button>
-        <label className="flex min-h-8 cursor-pointer items-center gap-2 font-sans text-xs text-ink-muted">
-          <input
-            type="checkbox"
-            checked={remember}
-            onChange={(event) => setRemember(event.target.checked)}
-            className="size-4.5 accent-accent-strong"
-          />
-          Remember this capability
-        </label>
+        <span className="flex min-h-8 flex-wrap items-center gap-x-2">
+          <label className="flex cursor-pointer items-center gap-2 font-sans text-xs text-ink-muted">
+            <input
+              type="checkbox"
+              checked={remember}
+              aria-describedby={rememberHint}
+              onChange={(event) => {
+                setRemember(event.target.checked);
+                if (!event.target.checked) setConfirming(false);
+              }}
+              className="size-4.5 accent-accent-strong"
+            />
+            Remember this capability
+          </label>
+          <span id={rememberHint} className="font-sans text-xs text-ink-faint">
+            grants it for every repository, not just this one
+          </span>
+        </span>
         {!noteOpen && (
           <Button
             size="sm"
@@ -277,6 +399,28 @@ function ApprovalCard({
           </Button>
         )}
       </div>
+
+      {confirming && remember && (
+        <TypedConfirm
+          phrase={CONFIRM_GRANT}
+          title="Approve and grant this capability everywhere?"
+          confirmLabel="Approve and remember"
+          busy={busy}
+          onCancel={() => setConfirming(false)}
+          onConfirm={(typed) => {
+            setConfirming(false);
+            submit("approved", { confirmation: typed });
+          }}
+        >
+          <p>
+            Remembering turns this answer into a standing grant of{" "}
+            <span className="font-data text-ink">
+              <SafeText value={capabilityLabel(approval.capability)} />
+            </span>{" "}
+            for every repository and every agent, until you revoke it in Settings.
+          </p>
+        </TypedConfirm>
+      )}
 
       {noteOpen && (
         <label className="block space-y-1">
@@ -328,14 +472,24 @@ function RaisedSkeleton() {
 interface ResolveVars {
   requestId: string;
   resolution: "approved" | "denied";
-  options: { remember?: boolean; note?: string };
+  options: ResolveOptions;
+  /** The flow digest the card showed; only an approval is pinned to it. */
+  expectedDigest?: string;
 }
+
+/** The daemon's refusal when the flow behind a card was edited after the card was shown. */
+const CAUSE_FLOW_CHANGED = "flow_changed";
+
+/** What the human is told when a card they answered no longer describes what would run. */
+const CHANGED_SINCE_SHOWN =
+  "A request changed after it was shown, so your answer was not applied. The list is refreshed; review it again before answering.";
 
 export function ApprovalsScreen() {
   const queryClient = useQueryClient();
   const now = useNow(CLOCK_TICK_MS);
   const [resolving, setResolving] = useState<Record<string, "approved" | "denied">>({});
   const [failures, setFailures] = useState<Record<string, BridgeFailure>>({});
+  const [changedNotice, setChangedNotice] = useState(false);
 
   const approvals = useQuery({ queryKey: APPROVALS_PENDING_KEY, queryFn: approvalsPending });
 
@@ -347,37 +501,18 @@ export function ApprovalsScreen() {
     if (approvals.data) firstPaintDone.current = true;
   }, [approvals.data]);
 
-  // The event stream nudges the query: one trailing ~300ms window per
-  // burst, then a single refetch (same contract as Activity's tide).
-  useEffect(() => {
-    let timer: number | undefined;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    subscribeEvents(() => {
-      if (timer !== undefined) return;
-      timer = window.setTimeout(() => {
-        timer = undefined;
-        void queryClient.invalidateQueries({ queryKey: ["approvals"] });
-      }, EVENT_REFRESH_MS);
-    })
-      .then((stop) => {
-        if (cancelled) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {
-        // No bridge (browser dev) or no stream: nothing to keep live.
-      });
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      unlisten?.();
-    };
-  }, [queryClient]);
+  // The event stream is a hint: the shared trailing throttle coalesces a burst into one
+  // refetch and never cancels one in flight (same contract as Activity's tide).
+  useEventRefresh(APPROVALS_KEYS);
 
   const resolve = useMutation({
-    mutationFn: ({ requestId, resolution, options }: ResolveVars) =>
-      approvalsResolve(requestId, resolution, options),
+    mutationFn: ({ requestId, resolution, options, expectedDigest }: ResolveVars) =>
+      approvalsResolve(requestId, resolution, {
+        ...options,
+        ...(resolution === "approved" && expectedDigest ? { expectedDigest } : {}),
+      }),
     onMutate: async ({ requestId, resolution }) => {
+      setChangedNotice(false);
       // Optimistic exit: the card leaves the moment the human answers.
       setResolving((prev) => ({ ...prev, [requestId]: resolution }));
       setFailures((prev) => {
@@ -397,9 +532,15 @@ export function ApprovalsScreen() {
       return { previous };
     },
     onError: (error, { requestId }, context) => {
+      const failure = toBridgeFailure(error);
+      if (failure.cause === CAUSE_FLOW_CHANGED) {
+        // The card is stale: it stays gone, the refetch below brings back what is true now.
+        setChangedNotice(true);
+        return;
+      }
       // The hand comes back, carrying the uniform failure shape inline.
       if (context?.previous) queryClient.setQueryData(APPROVALS_PENDING_KEY, context.previous);
-      setFailures((prev) => ({ ...prev, [requestId]: toBridgeFailure(error) }));
+      setFailures((prev) => ({ ...prev, [requestId]: failure }));
     },
     onSettled: (_reply, _error, { requestId }) => {
       setResolving((prev) => {
@@ -449,6 +590,15 @@ export function ApprovalsScreen() {
 
         {!failure && approvals.isPending && <RaisedSkeleton />}
 
+        {changedNotice && (
+          <p
+            role="status"
+            className="mt-2 max-w-content rounded-card border border-line p-3 font-sans text-sm text-ink-muted"
+          >
+            {CHANGED_SINCE_SHOWN}
+          </p>
+        )}
+
         {!failure && !approvals.isPending && pending.length === 0 && (
           <div className="flex flex-1 flex-col items-start justify-center gap-4 py-16">
             <span
@@ -491,7 +641,12 @@ export function ApprovalsScreen() {
                       busy={resolving[hand.request_id] !== undefined}
                       failure={failures[hand.request_id]}
                       onResolve={(resolution, options) =>
-                        resolve.mutate({ requestId: hand.request_id, resolution, options })
+                        resolve.mutate({
+                          requestId: hand.request_id,
+                          resolution,
+                          options,
+                          expectedDigest: snapshotDigest(hand) ?? undefined,
+                        })
                       }
                     />
                   </motion.li>

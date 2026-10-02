@@ -695,6 +695,65 @@ fn resolve_validated(segments: &[Segment], requested: ByteRange) -> Vec<Segment>
         .collect()
 }
 
+/// Reduce a map to at most `maximum` segments so it can be stored, without
+/// ever dropping the view it describes. A map that already fits is returned
+/// unchanged. Otherwise every run of `ceil(len / maximum)` consecutive
+/// segments becomes one segment that covers the same view bytes and maps to
+/// the hull of the run's parent ranges: byte-exact authority is given up for
+/// that run, coverage is not. A run of one relation keeps it (a run of
+/// omission markers is still an omission); a mixed run is a
+/// [`Relation::CoveringRecord`], or [`Relation::Synthetic`] when none of it
+/// has a parent. The split depends only on the input, so the same map always
+/// coarsens the same way.
+pub fn coarsen_segments(segments: &[Segment], maximum: usize) -> Result<Vec<Segment>, ViewError> {
+    if maximum == 0 {
+        return Err(ViewError::TooManySegments);
+    }
+    if segments.len() <= maximum {
+        return Ok(segments.to_vec());
+    }
+    // Merging is only sound over a contiguous, well-formed map.
+    validate_segments(segments)?;
+    let run = segments.len().div_ceil(maximum);
+    let coarse: Vec<Segment> = segments
+        .chunks(run)
+        .filter_map(|chunk| {
+            let (first, last) = (chunk.first()?, chunk.last()?);
+            if chunk.len() == 1 {
+                return Some(first.clone());
+            }
+            let hull = chunk
+                .iter()
+                .filter_map(|segment| segment.parent)
+                .reduce(|hull, range| ByteRange {
+                    start: hull.start.min(range.start),
+                    end: hull.end.max(range.end),
+                });
+            let uniform = chunk
+                .iter()
+                .all(|segment| segment.relation == first.relation);
+            let relation = match hull {
+                None => Relation::Synthetic,
+                // Identity promises equal lengths on both sides, which a
+                // merged run cannot: its parent hull spans whatever lay
+                // between the pieces.
+                Some(_) if uniform && first.relation != Relation::Identity => first.relation,
+                Some(_) => Relation::CoveringRecord,
+            };
+            Some(Segment {
+                view: ByteRange {
+                    start: first.view.start,
+                    end: last.view.end,
+                },
+                parent: hull,
+                relation,
+            })
+        })
+        .collect();
+    validate_segments(&coarse)?;
+    Ok(coarse)
+}
+
 /// Compose view→intermediate and intermediate→source edges. Identity may split
 /// at parent boundaries. A coarse child keeps its whole view range and maps to
 /// the covering hull of source ranges; it never acquires byte-exact authority.

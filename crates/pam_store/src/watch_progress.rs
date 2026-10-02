@@ -10,8 +10,8 @@ impl Store {
         ticket: &str,
         repository: &str,
     ) -> Result<Option<String>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut cursor_rows=self.conn.query("SELECT CASE WHEN LENGTH(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END FROM flow_journal WHERE request_id=?1",params![ticket]).await?;
+        let conn = self.lock().await?;
+        let mut cursor_rows=conn.query("SELECT CASE WHEN LENGTH(CAST(checkpoint_json AS BLOB))<=131072 THEN checkpoint_json ELSE NULL END FROM flow_journal WHERE request_id=?1",params![ticket]).await?;
         let Some(cursor_row) = cursor_rows.next().await? else {
             return Ok(None);
         };
@@ -22,7 +22,7 @@ impl Store {
             return Ok(None);
         };
         drop(cursor_rows);
-        let mut rows=self.conn.query("SELECT CASE WHEN LENGTH(CAST(e.meta_json AS BLOB))<=16384 THEN e.meta_json ELSE NULL END,e.id FROM evidence e JOIN evidence_view v ON v.evidence_id=e.id AND v.request_id=e.request_id JOIN request r ON r.id=e.request_id WHERE e.request_id=?1 AND v.repository=?2 AND r.repo=?2 AND e.kind='flow.watch' AND e.id=?3 AND v.expired_at IS NULL LIMIT 1",params![ticket,repository,id]).await?;
+        let mut rows=conn.query("SELECT CASE WHEN LENGTH(CAST(e.meta_json AS BLOB))<=16384 THEN e.meta_json ELSE NULL END,e.id FROM evidence e JOIN evidence_view v ON v.evidence_id=e.id AND v.request_id=e.request_id JOIN request r ON r.id=e.request_id WHERE e.request_id=?1 AND v.repository=?2 AND r.repo=?2 AND e.kind='flow.watch' AND e.id=?3 AND v.expired_at IS NULL LIMIT 1",params![ticket,repository,id]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };

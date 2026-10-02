@@ -25,6 +25,7 @@ fn refusal_round_trips() {
         cause: "approval_required".to_owned(),
         detail: "capability needs a human approval".to_owned(),
         recovery: "Open the pam GUI and approve the pending request.".to_owned(),
+        retryable: false,
     });
 }
 
@@ -59,6 +60,7 @@ fn refusal_wire_format_is_pinned() {
         cause: "approval_required".to_owned(),
         detail: "capability needs a human approval".to_owned(),
         recovery: "Open the pam GUI and approve the pending request.".to_owned(),
+        retryable: false,
     };
     assert_eq!(
         serde_json::to_value(&refusal).unwrap(),
@@ -82,4 +84,28 @@ fn outcome_is_snake_case_on_the_wire() {
         serde_json::to_value(Outcome::Unresolved).unwrap(),
         json!("unresolved")
     );
+}
+
+#[test]
+fn a_retryable_refusal_says_so_on_the_wire_and_round_trips() {
+    let refusal = Response::transient_refusal("req_r", "request_capacity_exhausted", "d", "r");
+    let wire = serde_json::to_value(&refusal).unwrap();
+    assert_eq!(wire["retryable"], json!(true));
+    round_trip(&refusal);
+}
+
+#[test]
+fn a_refusal_from_an_older_daemon_reads_as_not_retryable() {
+    // No `retryable` key: the field did not exist before, and its absence
+    // must never be read as permission to retry.
+    let wire = json!({
+        "kind": "refusal",
+        "id": "req_o",
+        "cause": "not_granted",
+        "detail": "d",
+        "recovery": "r"
+    });
+    let back: Response = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, Response::refusal("req_o", "not_granted", "d", "r"));
+    assert_eq!(back.id(), "req_o");
 }

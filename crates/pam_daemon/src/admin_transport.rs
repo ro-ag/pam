@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::admin::AdminService;
+use crate::image::ImageWatch;
 use crate::lifecycle::LifecyclePhase;
 
 #[path = "admin_transport_frame.rs"]
@@ -33,6 +34,10 @@ mod platform;
 
 #[cfg(all(test, windows))]
 #[path = "admin_transport_windows_test.rs"]
+mod platform_test;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "admin_transport_unix_test.rs"]
 mod platform_test;
 
 /// Whether this build has a validated native administration adapter.
@@ -61,16 +66,18 @@ impl AdminTransport {
         base: &Path,
         admin: Arc<AdminService>,
         phase: watch::Sender<LifecyclePhase>,
+        image: Arc<ImageWatch>,
     ) -> io::Result<Self> {
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
+            let lifecycle = frame::AdminLifecycle { phase, image };
             Ok(Self {
-                inner: platform::Listener::bind(base, admin, phase)?,
+                inner: platform::Listener::bind(base, admin, lifecycle)?,
             })
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
-            let _ = (base, admin, phase);
+            let _ = (base, admin, phase, image);
             Ok(Self {})
         }
     }

@@ -61,10 +61,9 @@ impl Store {
     ) -> Result<Option<Vec<u64>>, StoreError> {
         validate_binding(expected_binding_json)?;
         let incoming = members(observed)?;
-        let _guard = self.conn_lock.lock().await;
-        let Some(current) = self
-            .membership_locked(request_id, step_id, expected_binding_json)
-            .await?
+        let conn = self.lock().await?;
+        let Some(current) =
+            Self::membership_locked(&conn, request_id, step_id, expected_binding_json).await?
         else {
             return Ok(None);
         };
@@ -79,11 +78,12 @@ impl Store {
         if encoded.len() > MAX_JSON_BYTES {
             return Err(invalid("membership exceeds byte limit"));
         }
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO correlation_membership(request_id,step_id,members_json) VALUES(?1,?2,?3)
              ON CONFLICT(request_id,step_id) DO UPDATE SET members_json=excluded.members_json",
             params![request_id, step_id, encoded],
-        ).await?;
+        )
+        .await?;
         Ok(Some(merged))
     }
 
@@ -96,18 +96,17 @@ impl Store {
         expected_binding_json: &str,
     ) -> Result<Option<Vec<u64>>, StoreError> {
         validate_binding(expected_binding_json)?;
-        let _guard = self.conn_lock.lock().await;
-        self.membership_locked(request_id, step_id, expected_binding_json)
-            .await
+        let conn = self.lock().await?;
+        Self::membership_locked(&conn, request_id, step_id, expected_binding_json).await
     }
 
     async fn membership_locked(
-        &self,
+        conn: &turso::Connection,
         request_id: &str,
         step_id: &str,
         expected: &str,
     ) -> Result<Option<Vec<u64>>, StoreError> {
-        let mut rows = self.conn.query(
+        let mut rows = conn.query(
             "SELECT CASE WHEN length(CAST(s.canonical_json AS BLOB))<=8192 THEN s.canonical_json ELSE NULL END,
              m.request_id,CASE WHEN length(CAST(m.members_json AS BLOB))<=16384 THEN m.members_json ELSE NULL END
              FROM correlation_step s LEFT JOIN correlation_membership m

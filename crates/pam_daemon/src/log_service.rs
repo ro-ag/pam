@@ -16,10 +16,11 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use pam_compact::{CompactError, Compacted, MAX_SOURCE_BYTES, Policy, compact, estimate_tokens};
-use pam_model::runtime::GenerateRequest;
+use pam_model::runtime::{FramedEvidence, GenerateRequest, frame_evidence};
 use pam_store::{EVIDENCE_KIND_LOG_COMPACT, Store, StoreError};
 use serde::Serialize;
 use serde_json::json;
+use tokio::sync::watch;
 
 use crate::model_service::{ModelService, ModelUnavailable, Tier};
 
@@ -38,9 +39,11 @@ pub const SUMMARY_MAX_TOKENS: usize = 400;
 /// Greedy decoding: the summary of a given log should not vary run to run.
 pub const SUMMARY_TEMPERATURE: f64 = 0.0;
 
-/// The system turn framing every summary generation.
+/// The instructions of the system turn framing every summary generation. The host's
+/// own facts (the exit status) are appended to it by [`frame_evidence`], and the log
+/// text travels only in the user turn, inside the fence.
 pub const SUMMARY_SYSTEM: &str = "You receive selected build evidence. Report observations in at most eight lines, \
-    quoting exact diagnostics. The supplied exit status is authoritative; error text alone is not a final failure. \
+    quoting exact diagnostics. The exit status in the host facts is authoritative; error text alone is not a final failure. \
     Errors may be retried, caught, or followed by cleanup. Selected evidence may omit decisive context. \
     Say unknown when the failed stage or cause cannot be established. Do not invent fixes or override the reported status.";
 
@@ -59,6 +62,11 @@ pub const CAUSE_MODEL_UNQUALIFIED: &str = "model_unqualified";
 
 /// [`ModelSkipped::cause`] when a store write cost us the summary row.
 pub const CAUSE_STORE_ERROR: &str = "store_error";
+
+/// [`ModelSkipped::cause`] when the evidence could not be fenced from the host's facts:
+/// it contains the fence token, or a host fact has a line break. Nothing was sent to the
+/// model; the compact text stands, and running the summary again mints a fresh fence.
+pub const CAUSE_EVIDENCE_UNFRAMEABLE: &str = "evidence_unframeable";
 
 /// The daemon's log compression service (see the module docs).
 #[derive(Debug)]
@@ -242,6 +250,20 @@ impl LogError {
     }
 }
 
+/// What one summary generation is about, bundled so `summarize` stays narrow.
+struct SummaryRun<'a> {
+    request_id: &'a str,
+    name: &'a str,
+    source_id: &'a str,
+    compact_id: &'a str,
+    /// The redacted compact text without the host's exit status footer: the only
+    /// log-derived text the model is shown.
+    evidence_text: &'a str,
+    /// The status the host measured; reaches the model only as a host fact.
+    exit_status: Option<i32>,
+    capture: Option<&'a crate::evidence_service::CaptureScope>,
+}
+
 impl LogService {
     /// Builds the service over the daemon's store and model layer.
     #[must_use]
@@ -259,14 +281,22 @@ impl LogService {
         request_id: &str,
         input: CompressInput,
     ) -> Result<CompressReport, LogError> {
-        self.compress_scoped(request_id, input, None).await
+        // The caller has no cancel surface: the sender is dropped, which reads as "never
+        // cancelled" (see `model_service::cancelled`). The summary is still bounded by the
+        // model layer's total deadline.
+        let (_never, cancel) = watch::channel(false);
+        self.compress_scoped(request_id, input, None, cancel).await
     }
 
+    /// [`Self::compress`] under a flow step's capture scope, whose summary stops when
+    /// `cancel` flips to `true`: a cancelled step stops holding the model service lock
+    /// and the GPU instead of waiting for the generation to finish.
     pub(crate) async fn compress_scoped(
         &self,
         request_id: &str,
         input: CompressInput,
         capture: Option<&crate::evidence_service::CaptureScope>,
+        cancel: watch::Receiver<bool>,
     ) -> Result<CompressReport, LogError> {
         let CompressInput {
             name,
@@ -297,7 +327,7 @@ impl LogService {
 
         let source_bytes = as_u64(bytes.len());
         // Pure CPU preparation stays on the bounded blocking worker.
-        let (safe, compacted, compact_view) =
+        let prepared =
             crate::blocking_jobs::run(crate::blocking_jobs::Kind::LogCompaction, move || {
                 prepare_compaction(&bytes, exit_status)
             })
@@ -305,10 +335,23 @@ impl LogService {
             .map_err(|err| LogError::Blocking {
                 cause: err.cause(),
                 detail: err.to_string(),
-            })?
-            .map_err(LogError::Join)?;
-        let compact_text = String::from_utf8(compact_view.bytes.clone())
-            .map_err(|error| LogError::Join(error.to_string()))?;
+            })
+            .and_then(|prepared| prepared.map_err(LogError::Join))
+            .and_then(|(safe, compacted, compact_view, evidence_text)| {
+                let text = String::from_utf8(compact_view.bytes.clone())
+                    .map_err(|error| LogError::Join(error.to_string()))?;
+                Ok((safe, compacted, compact_view, text, evidence_text))
+            });
+        let (safe, compacted, compact_view, compact_text, evidence_text) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // The source row is already filed. Left without a view it
+                // would make the whole ticket's evidence set incomplete.
+                self.publish_unavailable_view(request_id, &source_id, error.cause(), capture)
+                    .await;
+                return Err(error);
+            }
+        };
 
         let stats = CompressStats::of(&compacted);
 
@@ -353,15 +396,16 @@ impl LogService {
         };
 
         if use_model {
-            self.summarize(
+            let run = SummaryRun {
                 request_id,
-                &name,
-                &source_id,
-                &compact_id,
-                &mut report,
+                name: &name,
+                source_id: &source_id,
+                compact_id: &compact_id,
+                evidence_text: &evidence_text,
+                exit_status: compacted.exit_status,
                 capture,
-            )
-            .await;
+            };
+            self.summarize(&run, &mut report, cancel).await;
         }
 
         trace_compression(request_id, &name, &report);
@@ -414,7 +458,12 @@ impl LogService {
         ))
     }
 
-    /// Optional retrieval views never change the underlying step outcome.
+    /// Optional retrieval views never change the underlying step outcome,
+    /// but a view that could not be filed is never dropped quietly: the
+    /// skip names the evidence row and why, and the caller carries it in
+    /// [`CompressReport::view_skipped`]. A ticket whose evidence has no view
+    /// answers `unavailable` once it finishes, so the reason has to reach
+    /// whoever reads that result.
     async fn publish_optional_view(
         &self,
         request_id: &str,
@@ -434,13 +483,51 @@ impl LogService {
             )
             .await
         {
-            tracing::warn!(request_id, evidence_id, %error, "the optional log evidence view could not be filed");
+            tracing::error!(request_id, evidence_id, %error, "a log evidence view could not be filed; the ticket's evidence set is incomplete");
             return Some(ModelSkipped {
                 cause: "evidence_view_unavailable".to_owned(),
-                detail: evidence_id.to_owned(),
+                detail: format!("{evidence_id} ({error})"),
             });
         }
         None
+    }
+
+    /// Files a short notice as the view of a source row whose redacted view
+    /// could not be prepared (the compaction worker refused or failed).
+    ///
+    /// The protected source stays where it is; what the reader gets is an
+    /// explicit, persisted "no view, and why" under the same captured
+    /// origin, instead of an evidence row with no view at all — which the
+    /// result path can only read as an incomplete, unreadable ticket.
+    async fn publish_unavailable_view(
+        &self,
+        request_id: &str,
+        evidence_id: &str,
+        cause: &str,
+        capture: Option<&crate::evidence_service::CaptureScope>,
+    ) {
+        let Some(capture) = capture else {
+            return;
+        };
+        let notice = format!("[evidence view unavailable: {cause}]\n");
+        let filed = match crate::evidence_view::redact(notice.as_bytes()) {
+            Ok(view) => {
+                crate::evidence_service::publish(
+                    &self.store,
+                    capture,
+                    request_id,
+                    evidence_id,
+                    view,
+                    json!({"kind": "view_unavailable", "cause": cause,
+                    "protected_source": "retained_unpublished"}),
+                )
+                .await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = filed {
+            tracing::error!(request_id, evidence_id, %error, "the unavailable-view notice could not be filed; the ticket's evidence set is incomplete");
+        }
     }
 
     async fn file_summary(
@@ -470,27 +557,27 @@ impl LogService {
 
     /// Asks the heavy tier for a summary and files it, or records why it
     /// could not. Never fails the compression (see the module docs).
+    ///
+    /// The generation stops when `cancel` flips to `true`, reported as a
+    /// `cancelled` [`ModelSkipped`] like any other way the model layer declines.
     async fn summarize(
         &self,
-        request_id: &str,
-        name: &str,
-        source_id: &str,
-        compact_id: &str,
+        run: &SummaryRun<'_>,
         report: &mut CompressReport,
-        capture: Option<&crate::evidence_service::CaptureScope>,
+        cancel: watch::Receiver<bool>,
     ) {
-        let (prompt, input) = summary_input(&report.compact_text, compact_id);
-        if prompt.len() > PROMPT_BUDGET_BYTES {
-            report.model_skipped = Some(ModelSkipped {
-                cause: "evidence_exceeds_budget".to_owned(),
-                detail: "The evidence exceeds the bounded summary input; inspect a specific stage or node. No head/tail truncation was sent to the model.".to_owned(),
-            });
-            return;
-        }
+        let input = summary_input(&report.compact_text, run.evidence_text, run.compact_id);
+        let request = match summary_request(run.evidence_text, run.exit_status) {
+            Ok(request) => request,
+            Err(skip) => {
+                report.model_skipped = Some(skip);
+                return;
+            }
+        };
         // Resolved once, up front, for the qualification record only: the
         // id the report names is the one the generation itself returns,
-        // since `generate_bounded` resolves again and the default may
-        // have moved between the two reads.
+        // since `generate_bounded_cancellable` resolves again and the default
+        // may have moved between the two reads.
         let entry = match self.models.resolve(Tier::Heavy).await {
             Ok(entry) => entry,
             Err(err) => {
@@ -498,16 +585,9 @@ impl LogService {
                 return;
             }
         };
-        let request = GenerateRequest {
-            system: Some(SUMMARY_SYSTEM.to_owned()),
-            prompt,
-            max_tokens: SUMMARY_MAX_TOKENS,
-            temperature: SUMMARY_TEMPERATURE,
-            stop: Vec::new(),
-        };
         let result = match self
             .models
-            .generate_bounded(Tier::Heavy, request, 2048)
+            .generate_bounded_cancellable(Tier::Heavy, request, 2048, cancel)
             .await
         {
             Ok(result) => result,
@@ -532,30 +612,30 @@ impl LogService {
             .then(|| entry.qualification.as_ref().map(ModelQualification::from))
             .flatten();
         let meta = json!({
-            "name": name,
+            "name": run.name,
             "model_id": model_id,
             "model_qualification": qualification,
             "tier": Tier::Heavy.as_str(),
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
             "tokens_per_sec": result.tokens_per_sec,
-            "source_evidence": source_id,
-            "compact_evidence": compact_id,
+            "source_evidence": run.source_id,
+            "compact_evidence": run.compact_id,
             "input": input,
         });
         if let Err(skip) = self
-            .file_summary(request_id, &summary_id, &result.text, &meta)
+            .file_summary(run.request_id, &summary_id, &result.text, &meta)
             .await
         {
             report.model_skipped = Some(skip);
             return;
         }
 
-        if let Some(capture) = capture
+        if let Some(capture) = run.capture
             && let Err(error) = crate::evidence_service::publish(
                 &self.store,
                 capture,
-                request_id,
+                run.request_id,
                 &summary_id,
                 view,
                 json!({"kind": "untrusted_model_output", "input_evidence_id": input["evidence_id"],
@@ -604,7 +684,10 @@ fn trace_compression(request_id: &str, name: &str, report: &CompressReport) {
 }
 
 /// Build safe model input and explicitly covering provenance outside Tokio workers.
-fn prepare_compaction(
+///
+/// The fourth value is the redacted text of [`Compacted::evidence_text`]: the compact text without
+/// the host's exit status footer, which is what the summary quotes.
+pub(crate) fn prepare_compaction(
     bytes: &[u8],
     exit_status: Option<i32>,
 ) -> Result<
@@ -612,6 +695,7 @@ fn prepare_compaction(
         crate::evidence_view::RedactedView,
         Compacted,
         crate::evidence_view::RedactedView,
+        String,
     ),
     String,
 > {
@@ -624,7 +708,10 @@ fn prepare_compaction(
         .map_err(|error| error.to_string())?;
     view.segments = crate::evidence_view::compose_segments(&view.segments, &compact_map)
         .map_err(|error| error.to_string())?;
-    Ok((safe, compacted, view))
+    let evidence = crate::evidence_view::redact(compacted.evidence_text().as_bytes())
+        .map_err(|error| error.to_string())?;
+    let evidence_text = String::from_utf8(evidence.bytes).map_err(|error| error.to_string())?;
+    Ok((safe, compacted, view, evidence_text))
 }
 
 fn safe_summary(text: &str) -> Result<(crate::evidence_view::RedactedView, String), ModelSkipped> {
@@ -639,12 +726,65 @@ fn safe_summary(text: &str) -> Result<(crate::evidence_view::RedactedView, Strin
     Ok((view, safe_text))
 }
 
-pub(crate) fn summary_input(compact_text: &str, compact_id: &str) -> (String, serde_json::Value) {
-    (
-        compact_text.to_owned(),
-        json!({"evidence_id": compact_id,
-        "sha256": pam_compact::sha256_hex(compact_text.as_bytes()), "offset_basis": "view_bytes"}),
-    )
+/// The identity a summary's published view records for its input: the compact view it
+/// belongs to, plus the digest of the exact evidence bytes the model was shown (the view
+/// without the host's footer).
+pub(crate) fn summary_input(
+    compact_text: &str,
+    evidence_text: &str,
+    compact_id: &str,
+) -> serde_json::Value {
+    json!({"evidence_id": compact_id,
+        "sha256": pam_compact::sha256_hex(compact_text.as_bytes()),
+        "model_evidence_sha256": pam_compact::sha256_hex(evidence_text.as_bytes()),
+        "offset_basis": "view_bytes"})
+}
+
+/// The generation request for one summary: the host's exit status in the system turn,
+/// the log text only inside the fence of the user turn. Skips with
+/// `evidence_exceeds_budget` over [`PROMPT_BUDGET_BYTES`], or with
+/// [`CAUSE_EVIDENCE_UNFRAMEABLE`] when the evidence cannot be fenced.
+pub(crate) fn summary_request(
+    evidence_text: &str,
+    exit_status: Option<i32>,
+) -> Result<GenerateRequest, ModelSkipped> {
+    summary_request_with(evidence_text, exit_status, frame_evidence)
+}
+
+/// A function that frames evidence with host facts: [`frame_evidence`], or a test's fixed-token twin.
+type Framer = fn(&str, &[(&str, &str)], &str) -> Option<FramedEvidence>;
+
+/// [`summary_request`] over a supplied framer, so a test can fix the fence token.
+pub(crate) fn summary_request_with(
+    evidence_text: &str,
+    exit_status: Option<i32>,
+    frame: Framer,
+) -> Result<GenerateRequest, ModelSkipped> {
+    // An unknown status is stated, not left out: a silent gap reads as "fine".
+    let status_text = exit_status.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+    let Some(framed) = frame(
+        SUMMARY_SYSTEM,
+        &[("exit status", status_text.as_str())],
+        evidence_text,
+    ) else {
+        return Err(ModelSkipped {
+            cause: CAUSE_EVIDENCE_UNFRAMEABLE.to_owned(),
+            detail: "The evidence could not be fenced from the host's facts, so nothing was sent to the model. Read the compact text, or run the summary again for a fresh fence.".to_owned(),
+        });
+    };
+    if framed.prompt.len() + framed.system.len() > PROMPT_BUDGET_BYTES {
+        return Err(ModelSkipped {
+            cause: "evidence_exceeds_budget".to_owned(),
+            detail: "The evidence exceeds the bounded summary input; inspect a specific stage or node. No head/tail truncation was sent to the model.".to_owned(),
+        });
+    }
+    Ok(GenerateRequest {
+        system: Some(framed.system),
+        prompt: framed.prompt,
+        max_tokens: SUMMARY_MAX_TOKENS,
+        temperature: SUMMARY_TEMPERATURE,
+        stop: Vec::new(),
+    })
 }
 
 impl CompressStats {

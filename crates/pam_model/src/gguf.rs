@@ -24,6 +24,11 @@ pub const GGUF_MAX_HEADER_BYTES: u64 = 256 * 1024 * 1024;
 /// Hard cap on one metadata string.
 pub const GGUF_MAX_STRING_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hard cap on a metadata key. Real keys are a few dozen bytes
+/// (`tokenizer.ggml.token_type`); a longer one is a planted file making the scan read
+/// and allocate up to [`GGUF_MAX_STRING_BYTES`] for a name nobody uses.
+pub const GGUF_MAX_KEY_BYTES: u64 = 1024;
+
 /// Hard cap on a tensor name; ggml itself allows 64, llama.cpp writes far
 /// less.
 pub const GGUF_MAX_TENSOR_NAME_BYTES: u64 = 127;
@@ -560,7 +565,7 @@ fn read_metadata<R: Read + Seek>(
 ) -> Result<Vec<(String, Scalar)>, GgufError> {
     let mut kept = Vec::new();
     for _ in 0..kv_count {
-        let key = r.string(GGUF_MAX_STRING_BYTES, "metadata key")?;
+        let key = r.string(GGUF_MAX_KEY_BYTES, "metadata key")?;
         let value = r.metadata_value()?;
         if let Some(value) = value
             && is_interesting(&key)

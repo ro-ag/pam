@@ -1,8 +1,8 @@
 use pam_compact::{Policy, compact, sha256_hex};
 
 use crate::evidence_view::{
-    ByteRange, MAX_SEGMENTS, POLICY_VERSION, Relation, Segment, ViewError, compact_segments,
-    compose_segments, redact, resolve,
+    ByteRange, MAX_SEGMENTS, POLICY_VERSION, Relation, Segment, ViewError, coarsen_segments,
+    compact_segments, compose_segments, redact, resolve,
 };
 
 fn span(start: usize, end: usize) -> ByteRange {
@@ -280,5 +280,115 @@ fn evidence_view_json_rejects_excessive_depth_without_serializing_it() {
     assert_eq!(
         crate::evidence_view::redact_json(&nested),
         Err(ViewError::TooManySegments)
+    );
+}
+
+/// A contiguous map of `count` two-byte segments cycling through the
+/// relations a compacted, redacted log produces.
+fn fragmented_map(count: usize) -> Vec<Segment> {
+    (0..count)
+        .map(|index| {
+            let view = span(index * 2, index * 2 + 2);
+            let (parent, relation) = match index % 4 {
+                0 => (Some(span(index * 10, index * 10 + 2)), Relation::Identity),
+                1 => (Some(span(index * 10, index * 10 + 9)), Relation::Redacted),
+                2 => (Some(span(index * 10, index * 10 + 7)), Relation::Omitted),
+                _ => (None, Relation::Synthetic),
+            };
+            Segment {
+                view,
+                parent,
+                relation,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_map_that_fits_is_stored_exactly_as_it_is() {
+    let map = fragmented_map(100);
+    assert_eq!(coarsen_segments(&map, 100).unwrap(), map);
+    assert_eq!(coarsen_segments(&map, 8192).unwrap(), map);
+}
+
+#[test]
+fn an_oversized_map_is_coarsened_to_the_ceiling_without_losing_coverage() {
+    let map = fragmented_map(MAX_SEGMENTS);
+    let view_end = map.last().unwrap().view.end;
+    let coarse = coarsen_segments(&map, 8192).unwrap();
+    assert!(coarse.len() <= 8192, "{} segments", coarse.len());
+    assert!(coarse.len() > 4096, "coarser than it needed to be");
+    // Still one contiguous, valid map over the same view bytes.
+    assert_eq!(coarse.first().unwrap().view.start, 0);
+    assert_eq!(coarse.last().unwrap().view.end, view_end);
+    resolve(&coarse, span(0, usize::try_from(view_end).unwrap())).unwrap();
+    // The same input always coarsens the same way.
+    assert_eq!(coarsen_segments(&map, 8192).unwrap(), coarse);
+
+    // Every coarse segment covers the parent range of every segment it
+    // replaced, and never claims byte-exact identity for a merged run.
+    let mut fine = map.iter().peekable();
+    for segment in &coarse {
+        let mut merged = 0;
+        while let Some(part) = fine.next_if(|part| part.view.end <= segment.view.end) {
+            merged += 1;
+            if let Some(parent) = part.parent {
+                let hull = segment.parent.expect("a covered parent keeps a hull");
+                assert!(hull.start <= parent.start && parent.end <= hull.end);
+            }
+        }
+        assert!(merged >= 1);
+        if merged > 1 {
+            assert_ne!(segment.relation, Relation::Identity);
+        }
+    }
+    assert!(fine.next().is_none(), "view bytes fell out of the map");
+}
+
+#[test]
+fn a_merged_run_keeps_a_uniform_relation_and_names_a_mixed_one_as_covering() {
+    let omitted: Vec<Segment> = (0..4)
+        .map(|index| Segment {
+            view: span(index * 3, index * 3 + 3),
+            parent: Some(span(index * 100, index * 100 + 50)),
+            relation: Relation::Omitted,
+        })
+        .collect();
+    let coarse = coarsen_segments(&omitted, 2).unwrap();
+    assert_eq!(coarse.len(), 2);
+    assert_eq!(coarse[0].relation, Relation::Omitted);
+    assert_eq!(coarse[0].parent, Some(span(0, 150)));
+
+    let identity: Vec<Segment> = (0..4)
+        .map(|index| Segment {
+            view: span(index * 3, index * 3 + 3),
+            parent: Some(span(index * 100, index * 100 + 3)),
+            relation: Relation::Identity,
+        })
+        .collect();
+    let coarse = coarsen_segments(&identity, 2).unwrap();
+    assert_eq!(coarse[0].relation, Relation::CoveringRecord);
+    assert_eq!(coarse[0].view, span(0, 6));
+    assert_eq!(coarse[0].parent, Some(span(0, 103)));
+
+    let synthetic: Vec<Segment> = (0..4)
+        .map(|index| Segment {
+            view: span(index, index + 1),
+            parent: None,
+            relation: Relation::Synthetic,
+        })
+        .collect();
+    let coarse = coarsen_segments(&synthetic, 1).unwrap();
+    assert_eq!(coarse.len(), 1);
+    assert_eq!(coarse[0].relation, Relation::Synthetic);
+    assert_eq!(coarse[0].parent, None);
+
+    // A map that is not contiguous is refused rather than merged into
+    // something that looks valid.
+    let mut broken = fragmented_map(10);
+    broken[5].view.start += 1;
+    assert_eq!(
+        coarsen_segments(&broken, 3).unwrap_err(),
+        ViewError::InvalidMap
     );
 }

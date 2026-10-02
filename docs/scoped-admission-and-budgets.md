@@ -56,9 +56,14 @@ Admission persists an absolute expiry and the current grant-revocation revision.
 Requests enter `running` before gating; they become `queued` only through an
 atomic post-gate authorization write. A crash cannot convert an unapproved row
 into executable queued work. Placement requires the revision captured before
-gating to remain unchanged, including during an approval wait. Revocation
-invalidates stale admissions even if a grant is subsequently restored. This is
-conservative: an unrelated grant revocation can also require a fresh submission.
+gating to remain unchanged, including during an approval wait. The revision is
+scoped: a request is void only when a grant it depends on was revoked after its
+admission, meaning its own capability or, for a `flow.run` ticket, any
+`flow.step:` capability. Revocation invalidates those admissions even if the
+grant is subsequently restored; a revocation a request does not depend on
+leaves queued, parked and finished work alone. Because the store cannot tell
+which flow a run belongs to, a step revocation of any flow still voids every
+`flow.run` ticket.
 
 Startup recovery reads pages of at most 16 rows and 8 MiB of text. SQL byte guards refuse oversized legacy fields before materializing them; the rows remain intact and startup gives an explicit backup/repair error. Recovery preserves the original expiry and rejects stale or legacy queued rows
 without authorization metadata. Running/interrupted work is not automatically
@@ -73,6 +78,18 @@ use `deadline_exceeded`; the queue records `lease_expired` internally, separatel
 from an explicit `cancelled` request. An attached caller's observation timeout
 does not cancel the underlying work.
 
+Every request handler runs under one hard deadline around admission, the gate,
+execution and the terminal write: the request deadline (clamped to the one-hour
+ceiling) plus a 30-second grace, and for `status`, `query` and `cancel` the
+smaller of the deadline and 10 seconds plus 2 seconds. When it elapses the caller
+is answered `deadline_exceeded` at once, the slot is released and the terminal
+row is written in a detached task. A handler that is only parked on the
+completion router lets go when its caller disconnects; the laned work continues.
+A terminal write that fails is retried and then parked for the maintenance loop,
+and a reconciler fails any in-flight row whose deadline passed (plus the handler
+grace and 15 seconds) and drops it from the lanes, so a stranded row cannot hold
+admission capacity.
+
 ## Enforced limits
 
 | Resource | Ceiling |
@@ -83,10 +100,13 @@ does not cancel the underlying work.
 | Inbound handshake | Five seconds |
 | Request ID, capability, caller label, idempotency key | 128 bytes each |
 | Caller repository spelling | 4,096 bytes |
-| Active admitted requests | 128 |
+| Active admitted requests | 128; a row past its deadline stops counting |
 | Persisted fields of active admitted requests | 8 MiB cumulative |
-| Public dispatcher/reply slots | 128 work; 16 reserved control |
-| Aggregate admission rate | 256 work/second; 64 control/second |
+| Public dispatcher slots | 128 work; 16 `status`; 16 `query`; 8 `cancel` (falls back to a control slot); 32 for requests the private admin plane submits. The transport holds none |
+| Aggregate admission rate | 256 work/second; 64 `status`/second; 64 `query`/second; 16 `cancel`/second |
+| Request handler | Request deadline plus 30 seconds; control class: the smaller of deadline and 10 seconds, plus 2 seconds |
+| Finished replies kept for attached duplicates | 256 entries, 8 MiB, 60 seconds; the oldest is evicted first |
+| `echo` diagnostic | Delay at most 60 seconds; arguments at most 64 KiB |
 | Request wall time | One hour, including admission and queue wait |
 | Command/connector attempts per request | 256 |
 | Physical HTTP calls per request | 128 |

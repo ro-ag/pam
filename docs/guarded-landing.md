@@ -45,8 +45,8 @@ profile and per-stage approval rules still apply at execution time.
 | `freeze` | Clean ordinary Git checkout, exact HEAD/branch/base/remote, bounded verified source manifest and private sealed checktree |
 | `validate` | Every GUI-configured command succeeds against that checktree, with command identity, retained output and manifest binding |
 | `push` | Fresh unchanged source and policy; exact authorized remote ref receives the frozen SHA, with an explicit old-ref lease |
-| `ensure_pr` | One matching same-repository PR has the exact head, base and frozen head SHA |
-| `verify_pr` | Every declared required check is successful for that exact head SHA |
+| `ensure_pr` | One matching same-repository PR has the exact head, base and frozen head SHA: open, or already merged at that exact head |
+| `verify_pr` | Every declared required check is successful for that exact head SHA; a PR merged at that head is accepted, one closed without a merge conflicts |
 | `merge` | Fresh PR and check evidence, separate permission and GitHub's expected-head-SHA merge condition |
 | `verify_main` | Every declared main check succeeds for the merge SHA returned by GitHub |
 | `sync` | The verified merge commit fetched as a bounds-proven thin pack through the HTTP broker, indexed privately, installed into the source object store, and the base branch fast-forwarded under an exact old-value lease; working tree untouched |
@@ -54,7 +54,16 @@ profile and per-stage approval rules still apply at execution time.
 The YAML parser accepts only this ordered sequence or an ordered prefix, with
 successful direct prerequisites. It rejects custom commands, URLs, retries or
 effect overrides on landing stages. A successful prefix is not a landed branch.
-Tags, publishing and branch deletion are outside this recipe.
+Tags, publishing and branch deletion are outside this recipe. The flow result
+lists each completed mutation under `effects` with its landing operation, so a
+`freeze, validate, push` prefix reads as exactly that and not as a landing.
+
+A new ticket can finish a landing that an earlier ticket merged and then ran out
+of polls on: `ensure_pr` accepts a PR already merged at the exact frozen head,
+`verify_pr` still requires the checks for that head, and the ticket continues
+through `verify_main` and `sync` without a new POST or PUT. One wrinkle remains:
+if GitHub deleted the head branch on merge, the new ticket's `push` stage
+re-creates it at the frozen commit before `ensure_pr` finds the merged PR.
 
 GitHub's merge API atomically checks the head SHA. The observed base SHA is not
 an atomic base guard. PAM must not claim otherwise or treat a preceding GET as
@@ -117,6 +126,13 @@ budget are checked again before work. Git credentials are supplied only to the
 fixed broker operation; source Git configuration, hooks and credential helpers
 are not evaluated by the network process. Its private object store is disconnected
 from source objects before credentials are supplied.
+
+Before each write to the source repository, `sync` walks `.git/objects/pack`,
+the ref's directory and the reflog directory one component at a time and refuses
+anything that is not a real directory (an existing reflog must be a regular
+file), so a directory swapped for a symlink stops the write. A swap in the
+instants between that walk and the write is not excluded: the workspace has no
+`openat`-style handle API.
 
 PR and main verification each allow at most 20 polls at five-second intervals,
 within the original request deadline and budget. Waiting releases the repository

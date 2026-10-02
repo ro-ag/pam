@@ -457,6 +457,8 @@ impl Fixture {
         // read as cancellation.
         std::mem::forget(keep);
         let ctx = ExecContext {
+            origin: crate::ingress::Origin::Public,
+            status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
             budget,
             request_id: "watch".into(),
             args: json!({"id":"watched"}),
@@ -736,4 +738,26 @@ async fn a_retry_after_beyond_the_request_deadline_blocks_after_committing_the_p
         [watch["last_evidence"].as_str().unwrap()],
         "the blocked report cites the committed sample"
     );
+}
+
+#[tokio::test]
+async fn an_unrelated_revocation_keeps_the_watch_stamp_and_a_flow_grant_revocation_voids_it() {
+    let fx = Fixture::new(Answer::Pending, budget(Duration::from_secs(3600), 128)).await;
+    let state = fx.state().await;
+    let (profile, revision) = state.watch_stamp().await.unwrap();
+    // The stamp hashes the gate's live profile as the JSON the setting stores.
+    let live = serde_json::to_string(&fx.service().gate.profile()).unwrap();
+    assert_eq!(profile, pam_compact::sha256_hex(live.as_bytes()));
+    // A revocation the flow run does not depend on neither moves the stamp
+    // nor kills the parked run.
+    fx.store.insert_grant("echo").await.unwrap();
+    fx.store.revoke_grant("echo").await.unwrap();
+    assert_eq!(
+        state.watch_stamp().await.unwrap(),
+        (profile.clone(), revision)
+    );
+    // Revoking a flow step grant voids the ticket's admission: fail closed.
+    fx.store.insert_grant("flow.step:other/step").await.unwrap();
+    fx.store.revoke_grant("flow.step:other/step").await.unwrap();
+    assert!(state.watch_stamp().await.is_err());
 }

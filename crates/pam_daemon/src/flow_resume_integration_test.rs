@@ -98,6 +98,7 @@ fn args() -> RunArgs {
     RunArgs {
         id: "resumable".to_owned(),
         inputs: BTreeMap::new(),
+        expected_digest: None,
     }
 }
 
@@ -129,7 +130,7 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         store.insert_admitted_request("resume","flow.run",root.to_str().unwrap(),"fixture","{\"id\":\"resumable\"}",None,expiry).await.unwrap();
         let original_deadline=Instant::now()+Duration::from_secs(25);
         let budget=crate::request_budget::RequestBudget::load_persistent(store.clone(),"resume",original_deadline).await.unwrap();
-        let mut ctx=ExecContext{budget,request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
+        let mut ctx=ExecContext{origin:crate::ingress::Origin::Public,status:crate::status_cache::StatusCache::new(models.clone(),secrets.clone()),budget,request_id:"resume".to_owned(),args:json!({"id":"resumable"}),cancel:rx,events,store:store.clone(),queue:queue.clone(),models,router:CompletionRouter::new(),approvals,flows:flows.clone(),secrets,caller:Caller{agent:"fixture".to_owned(),repo:root.to_string_lossy().into_owned(),pid:std::process::id()},capability:"flow.run".to_owned(),started_at:Instant::now()};
         assert!(store.authorize_queued_request("resume",root.to_str().unwrap(),now()).await.unwrap());
         assert!(store.start_queued_request("resume",now()).await.unwrap());
         {
@@ -162,4 +163,210 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         assert!(crate::evidence_service::read(&read_ctx).await.is_ok());
         drain.abort();
     })).await.unwrap();
+}
+
+const GATED: &str = "schema: 1\nid: gated\nname: Gated\nsteps:\n  - id: change\n    run: [git, --version]\n    effect: stateful\n";
+
+/// A real engine over one admitted, started `gated` ticket whose only step
+/// needs an approval nobody has given.
+struct Gated {
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    root: std::path::PathBuf,
+    store: Arc<Store>,
+    approvals: Arc<ApprovalService>,
+    flows: Arc<FlowService>,
+    queue: Arc<QueueManager>,
+    ctx: ExecContext,
+    _cancel: tokio::sync::watch::Sender<bool>,
+    drain: tokio::task::JoinHandle<()>,
+}
+
+impl Gated {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture, assembled in the order the daemon assembles it"
+    )]
+    async fn new() -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(base.path().join("flows")).unwrap();
+        std::fs::write(base.path().join("flows/gated.yaml"), GATED).unwrap();
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        store
+            .set_setting("policy.profile", "\"relaxed\"")
+            .await
+            .unwrap();
+        let scope = json!({"version":1,"repositories":[{"root":root,"connectors":[]}]});
+        store
+            .set_setting("flows.scope_policy", &scope.to_string())
+            .await
+            .unwrap();
+        let (events, mut receiver) = EventPublisher::for_tests();
+        let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        let approvals = Arc::new(ApprovalService::new(
+            store.clone(),
+            events.clone(),
+            Duration::from_secs(20),
+        ));
+        let models = ModelService::new(store.clone()).await.unwrap();
+        let logs = LogService::new(store.clone(), models.clone());
+        let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
+        let connectors = Arc::new(ConnectorService::new(
+            store.clone(),
+            secrets.clone(),
+            Arc::new(Reads::default()),
+        ));
+        let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
+        let flows = Arc::new(FlowService::new(
+            base.path(),
+            store.clone(),
+            approvals.clone(),
+            connectors,
+            logs,
+            gate,
+        ));
+        let queue = Arc::new(QueueManager::new(store.clone()));
+        let (cancel, rx) = tokio::sync::watch::channel(false);
+        let repository = root.to_str().unwrap();
+        store
+            .insert_admitted_request(
+                "gated",
+                "flow.run",
+                repository,
+                "fixture",
+                "{\"id\":\"gated\"}",
+                None,
+                now() + 25000,
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let budget =
+            crate::request_budget::RequestBudget::load_persistent(store.clone(), "gated", deadline)
+                .await
+                .unwrap();
+        let ctx = ExecContext {
+            origin: crate::ingress::Origin::Public,
+            status: crate::status_cache::StatusCache::new(models.clone(), secrets.clone()),
+            budget,
+            request_id: "gated".to_owned(),
+            args: json!({"id":"gated"}),
+            cancel: rx,
+            events,
+            store: store.clone(),
+            queue: queue.clone(),
+            models,
+            router: CompletionRouter::new(),
+            approvals: approvals.clone(),
+            flows: flows.clone(),
+            secrets,
+            caller: Caller {
+                agent: "fixture".to_owned(),
+                repo: root.to_string_lossy().into_owned(),
+                pid: std::process::id(),
+            },
+            capability: "flow.run".to_owned(),
+            started_at: Instant::now(),
+        };
+        assert!(
+            store
+                .authorize_queued_request("gated", repository, now())
+                .await
+                .unwrap()
+        );
+        assert!(store.start_queued_request("gated", now()).await.unwrap());
+        Self {
+            _dirs: (base, repo),
+            root,
+            store,
+            approvals,
+            flows,
+            queue,
+            ctx,
+            _cancel: cancel,
+            drain,
+        }
+    }
+
+    /// Runs until the step is waiting for a human, then drops the run: a
+    /// process interruption with no terminal handler.
+    async fn run_until_waiting(&self) {
+        let args = RunArgs {
+            id: "gated".to_owned(),
+            inputs: BTreeMap::new(),
+            expected_digest: None,
+        };
+        let executing = self.flows.run(&self.ctx, args);
+        tokio::pin!(executing);
+        let waiting = async {
+            while self.approvals.pending().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut executing => panic!("expected an approval wait: {result:?}"),
+            () = waiting => {}
+        }
+    }
+}
+
+/// Finding 6 of the 2026-10 design review: a daemon that died while a human
+/// was still deciding used to come back reporting `flow_effect_uncertain`
+/// for a step that never started. The journal now says "not started", so the
+/// original ticket is requeued and asks again.
+#[tokio::test]
+async fn a_restart_during_the_approval_wait_requeues_instead_of_reporting_an_effect() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        Box::pin(async {
+            let fx = Gated::new().await;
+            let store = &fx.store;
+            fx.run_until_waiting().await;
+            let row = store.get_request("gated").await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::WaitingApproval);
+            let journal = store.read_flow_journal("gated").await.unwrap().unwrap();
+            assert_eq!(journal.state, pam_store::FlowJournalState::Prepared);
+            assert!(
+                !journal.effectful,
+                "nothing ran while the approval was pending"
+            );
+
+            assert_eq!(
+                crate::lifecycle::recover_stuck_rows(store).await.unwrap(),
+                1
+            );
+            let row = store.get_request("gated").await.unwrap().unwrap();
+            assert_eq!(row.state, RequestState::Queued, "{:?}", row.outcome);
+            assert_eq!(row.outcome, None, "no uncertain effect was recorded");
+            assert_eq!(
+                store
+                    .read_flow_journal("gated")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                pam_store::FlowJournalState::Ready
+            );
+            assert!(
+                fx.approvals.pending().await.unwrap().is_empty(),
+                "the old question expired"
+            );
+
+            // The original ticket resumes and asks the human again.
+            assert_eq!(fx.queue.rebuild_from_store().await.unwrap(), 1);
+            assert!(store.start_queued_request("gated", now()).await.unwrap());
+            fx.run_until_waiting().await;
+            let pending = fx.approvals.pending().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].capability,
+                crate::flow_service::step_capability("gated", "change")
+            );
+            assert!(fx.root.is_dir());
+            fx.drain.abort();
+        }),
+    )
+    .await
+    .unwrap();
 }

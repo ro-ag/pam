@@ -16,6 +16,9 @@ pub mod approval;
 pub mod command_containment;
 #[cfg(test)]
 mod command_containment_test;
+pub mod completion_router;
+#[cfg(test)]
+mod completion_router_test;
 pub mod connector_service;
 mod context_summary;
 #[cfg(test)]
@@ -41,6 +44,10 @@ mod flow_result_service;
 #[cfg(test)]
 mod flow_result_service_test;
 pub mod flow_service;
+pub mod image;
+#[cfg(test)]
+mod image_test;
+pub mod ingress;
 pub mod lifecycle;
 pub mod log_service;
 pub mod model_readiness;
@@ -50,6 +57,12 @@ pub mod queue;
 pub mod retention;
 pub mod runtime_dir;
 pub mod secrets;
+pub mod status_cache;
+#[cfg(test)]
+mod status_cache_test;
+pub mod terminal;
+#[cfg(test)]
+mod terminal_test;
 pub mod transport;
 
 #[cfg(test)]

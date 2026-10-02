@@ -424,9 +424,8 @@ pub async fn install_release(
     ));
     let verified = unpack_and_verify(&archive, &scratch, release).await;
     let _ = std::fs::remove_file(&archive);
-    // The downloader records a verification sidecar beside anything it
-    // fetched with a digest; for a model that is the registry's evidence,
-    // for an archive that is about to be deleted it is litter.
+    // The downloader no longer writes a verification sidecar, but an older pam
+    // did; one left beside an archive that is about to be deleted is litter.
     let _ = std::fs::remove_file(verified_sidecar_path(&archive));
     let (server_dir, version_line) = match verified {
         Ok(found) => found,
@@ -581,9 +580,9 @@ pub fn trusted_tar_path() -> Result<PathBuf, EngineError> {
         if path.is_file() {
             return Ok(path);
         }
-        return Err(EngineError::Unpack {
+        Err(EngineError::Unpack {
             detail: format!("{} is missing", path.display()),
-        });
+        })
     }
     #[cfg(not(windows))]
     {

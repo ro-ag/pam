@@ -15,7 +15,6 @@ fn main() {
     let manifest = tauri_build::AppManifest::new().commands(&[
         "daemon_status",
         "admin_call",
-        "request_capability",
         "daemon_stop",
         "events_subscribe",
         "read_daemon_log",

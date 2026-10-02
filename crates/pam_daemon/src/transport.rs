@@ -10,20 +10,26 @@
 //! a constant before enqueueing; task, product, repository and evidence details require scoped
 //! result reads. Shutdown is a `tokio::sync::watch` flag: [`Transport::shutdown`] flips it, joins
 //! the three socket tasks, and dropping the sockets removes the `ipc` files.
+//!
+//! The transport takes no admission permits: the dispatcher
+//! ([`crate::daemon`]) is the single admission point, and it classifies requests through
+//! [`crate::policy::admission_pool`]. A per-request forwarder lives exactly as long as that
+//! request's `oneshot`, which the dispatcher's reply guard always resolves, so forwarders are
+//! bounded by the dispatcher's own pools plus the ingress channel.
 
 use std::io;
 use std::path::PathBuf;
 
 use pam_proto::{Envelope, Event, Response};
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use zeromq::{
     PubSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, Socket, SocketRecv, SocketSend,
     ZmqMessage,
 };
 
+use crate::ingress::Origin;
 use crate::runtime_dir::{RuntimeDir, remove_stale};
 
 /// Capacity of the internal reply and event channels.
@@ -63,11 +69,13 @@ pub struct PublishError;
 /// A validated request received from a client.
 ///
 /// The daemon core answers by sending exactly one [`Response`] into
-/// `reply`; dropping it unanswered leaves the client to its own deadline.
+/// `reply`; the dispatcher's reply guard makes sure it always does.
 #[derive(Debug)]
 pub struct IncomingRequest {
     /// zmq routing identity of the requesting peer.
     pub identity: Vec<u8>,
+    /// Which plane the request arrived on (see [`crate::ingress`]).
+    pub origin: Origin,
     /// The parsed request envelope.
     pub envelope: Envelope,
     /// Channel for this request's single response.
@@ -210,8 +218,6 @@ async fn recv_loop(
     reply_tx: mpsc::Sender<(Vec<u8>, Response)>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let work_replies = Arc::new(Semaphore::new(128));
-    let control_replies = Arc::new(Semaphore::new(16));
     loop {
         let message = tokio::select! {
             () = signalled(&mut shutdown) => break,
@@ -224,14 +230,7 @@ async fn recv_loop(
                 }
             },
         };
-        handle_frames(
-            message,
-            &incoming,
-            &reply_tx,
-            &work_replies,
-            &control_replies,
-        )
-        .await;
+        handle_frames(message, &incoming, &reply_tx).await;
     }
 }
 
@@ -239,8 +238,6 @@ async fn handle_frames(
     message: ZmqMessage,
     incoming: &mpsc::Sender<IncomingRequest>,
     reply_tx: &mpsc::Sender<(Vec<u8>, Response)>,
-    work_replies: &Arc<Semaphore>,
-    control_replies: &Arc<Semaphore>,
 ) {
     // `ROUTER` prepends the peer identity, so a well-formed request is
     // exactly [identity, payload].
@@ -272,6 +269,7 @@ async fn handle_frames(
             if envelope.id.is_empty()
                 || envelope.id.len() > 128
                 || envelope.capability.len() > 128
+                || envelope.client_version.len() > 128
                 || envelope.caller.agent.len() > 128
                 || envelope.caller.repo.len() > 4096
                 || envelope
@@ -290,24 +288,10 @@ async fn handle_frames(
                     .await;
                 return;
             }
-            let slots = if matches!(envelope.capability.as_str(), "status" | "query" | "cancel") {
-                control_replies
-            } else {
-                work_replies
-            };
-            let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
-                let response = Response::Refusal {
-                    id: envelope.id,
-                    cause: "request_capacity_exhausted".to_owned(),
-                    detail: "PAM has reached its waiting reply limit".to_owned(),
-                    recovery: "Wait for work to finish or cancel an existing request".to_owned(),
-                };
-                let _ = reply_tx.send((identity, response)).await;
-                return;
-            };
             let (tx, rx) = oneshot::channel();
             let request = IncomingRequest {
                 identity: identity.clone(),
+                origin: Origin::Public,
                 envelope,
                 reply: tx,
             };
@@ -319,7 +303,6 @@ async fn handle_frames(
             // the ROUTER send half via the shared reply channel.
             let reply_tx = reply_tx.clone();
             tokio::spawn(async move {
-                let _permit = permit;
                 if let Ok(response) = rx.await {
                     let _ = reply_tx.send((identity, response)).await;
                 }
@@ -338,6 +321,7 @@ async fn handle_frames(
 /// Builds the immediate refusal for a payload the transport cannot parse.
 fn bad_request(id: String, detail: &str) -> Response {
     Response::Refusal {
+        retryable: false,
         id,
         cause: "bad_request".to_owned(),
         detail: detail.to_owned(),
@@ -438,6 +422,7 @@ pub(crate) fn bounded_response(response: &Response) -> Result<Vec<u8>, serde_jso
     let (Response::Result { id, .. } | Response::Refusal { id, .. } | Response::Ticket { id, .. }) =
         response;
     serde_json::to_vec(&Response::Refusal {
+        retryable: false,
         id: if id.len() <= 128 {
             id.clone()
         } else {

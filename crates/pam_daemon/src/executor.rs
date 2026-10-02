@@ -7,44 +7,70 @@
 //! and return a [`CapabilityOutput`] (outcome + body + evidence ids) or [`CapabilityFailure`]; they
 //! never touch the `request` row or audit trail themselves — terminal bookkeeping is the daemon
 //! pipeline's ([`crate::daemon`]), which owns exactly one audit write per terminal path.
-//! - `status` (read-only): daemon version, protocol version, uptime, in-flight request count.
-//!   Outcome `verified`.
-//! - `query` (read-only): the lifecycle state of `args.ticket`'s request, straight from the store —
+//! - `status` (control): daemon version, protocol version, uptime, in-flight request count, and
+//!   the model and keyring blocks, served from [`crate::status_cache::StatusCache`] so a poll never
+//!   waits behind a slow lane. Outcome `verified`.
+//! - `query` (control): the lifecycle state of `args.ticket`'s request, straight from the store —
 //!   the authoritative answer `pam wait`/`pam subscribe` reconcile against, since zmq `PUB` has no
 //!   replay and a late subscriber would otherwise wait forever on an already-finished ticket.
 //!   Outcome `verified`.
 //! - `echo` (non-destructive): mirrors its args back; optional `delay_ms` sleeps first, honoring
 //!   the cancel signal (used by integration tests as a controllable long-running capability);
 //!   optional `fail: true` fails (after any delay) with [`CapabilityFailure::Failed`], a documented
-//!   test/diagnostic surface for the execution-failure path. Outcome `solved`.
-//! - `cancel` (read-only class — see [`crate::policy::classify`]): backs `pam cancel <ticket>`,
+//!   test/diagnostic surface for the execution-failure path. Outcome `solved`. It is a diagnostic,
+//!   so what it can hold is capped: a delay over [`MAX_ECHO_DELAY_MS`] or arguments over
+//!   [`MAX_ECHO_ARGS_BYTES`] are refused ([`CAUSE_ECHO_LIMIT`]) before anything waits — an echo
+//!   cannot be used to keep a repository's lane busy for an hour or to park a megabyte reply.
+//! - `cancel` (control class — see [`crate::policy::classify`]): backs `pam cancel <ticket>`,
 //!   cancelling the queued or running request via [`crate::queue::QueueManager::cancel`]. For a
 //!   still-queued cancellation (the queue writes the terminal row/audit) it also releases attached
 //!   waiters with a refusal and publishes `refused`; a running request's own executor does that
-//!   instead.
+//!   instead. A public cancel acts only on a ticket admitted under the caller's own repository and
+//!   is audited as `system`; the private admin plane's cancel ([`Origin::Admin`]) may cancel any
+//!   ticket and is audited as `human`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use pam_model::runtime::RuntimeState;
-use pam_proto::{Caller, Event, Outcome, PROTOCOL_VERSION, Response};
+use pam_proto::{Caller, Event, Outcome, Response};
 use pam_store::Store;
 use tokio::sync::watch;
 
 use crate::approval::ApprovalService;
 use crate::daemon::CompletionRouter;
 use crate::flow_service::{FlowService, RunArgs};
+use crate::ingress::Origin;
 use crate::model_service::ModelService;
 use crate::queue::{CAUSE_CANCELLED, CancelOutcome, QueueManager};
 use crate::secrets::SecretStore;
+use crate::status_cache::StatusCache;
 use crate::transport::EventPublisher;
 
 /// Recovery line offered when a request was cancelled.
 const RECOVERY_CANCELLED: &str = "Re-run the pam command to start a fresh request.";
 
+/// Longest delay `echo` accepts, in milliseconds.
+pub const MAX_ECHO_DELAY_MS: u64 = 60_000;
+
+/// Largest `echo` argument object, as serialized JSON bytes.
+pub const MAX_ECHO_ARGS_BYTES: usize = 64 * 1024;
+
+/// Refusal cause for an `echo` that asks for more than the diagnostic allows.
+pub const CAUSE_ECHO_LIMIT: &str = "echo_limit_exceeded";
+
+/// Recovery line for [`CAUSE_ECHO_LIMIT`].
+const RECOVERY_ECHO_LIMIT: &str =
+    "echo is a diagnostic: send at most 64 KiB of arguments and a delay_ms of at most 60000.";
+
 /// Everything a capability may need while executing one request.
 #[derive(Debug)]
 pub struct ExecContext {
+    /// Which plane the request arrived on. The `cancel` built-in decides
+    /// its audit actor and its ownership check from this, never from
+    /// [`Caller::agent`](pam_proto::Caller::agent).
+    pub origin: Origin,
+    /// The cached slow half of the `status` body (see [`StatusCache`]).
+    pub status: Arc<StatusCache>,
     /// Shared absolute deadline and cumulative work allowance.
     pub budget: Arc<crate::request_budget::RequestBudget>,
     /// Id of the request being executed.
@@ -255,98 +281,18 @@ pub fn outcome_str(outcome: Outcome) -> &'static str {
 }
 
 /// `status`: daemon version, protocol version, uptime, in-flight count,
-/// and the model block.
+/// and the model and keyring blocks.
 ///
-/// The in-flight count includes the `status` request itself — its bypass
-/// row is `running` while it executes.
-///
-/// The `model` block is read-only and degrades to `idle` with null
-/// figures on a machine with no weights: nothing in PAM breaks without a
-/// model, and the honest answer is that nothing is loaded. A settings
-/// read that fails leaves the defaults null rather than failing the
-/// whole status answer.
+/// Everything slow comes from the [`StatusCache`] snapshot a background
+/// task keeps fresh; this path reads it and never waits on the model lane
+/// or the keychain. The body's `snapshot.stale` says when a figure is older
+/// than its bound. `status` cannot fail: a store that will not answer the
+/// in-flight count in time yields the last count read, flagged stale.
 async fn status(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    let active_requests =
-        ctx.store
-            .count_inflight()
-            .await
-            .map_err(|err| CapabilityFailure::Failed {
-                detail: format!("cannot count in-flight requests: {err}"),
-            })?;
     Ok(CapabilityOutput {
         outcome: Outcome::Verified,
-        body: serde_json::json!({
-            "daemon_version": env!("CARGO_PKG_VERSION"),
-            "protocol": PROTOCOL_VERSION,
-            "uptime_s": ctx.started_at.elapsed().as_secs(),
-            "active_requests": active_requests,
-            "blocking_jobs": crate::blocking_jobs::snapshot(),
-            "model": model_block(ctx).await,
-            "keyring": ctx.secrets.keyring_health().await,
-        }),
+        body: ctx.status.body(&ctx.store, ctx.started_at).await,
         evidence: Vec::new(),
-    })
-}
-
-/// The `status` body's read-only `model` block.
-///
-/// The sibling `keyring` block comes straight from
-/// [`SecretStore::keyring_health`]: whether the platform credential store
-/// answers, and what to do when it does not. It is cached for
-/// [`crate::secrets::PROBE_TTL`], so a polling GUI does not wake the
-/// keychain on every tick.
-async fn model_block(ctx: &ExecContext) -> serde_json::Value {
-    // The llama.cpp engine, when installed, is what holds the weights;
-    // `snapshot` already reports the engine's loaded model directly.
-    let snapshot = ctx.models.snapshot();
-    let (state, id, tokens_per_sec) = match &snapshot.state {
-        RuntimeState::Idle => ("idle", None, None),
-        RuntimeState::Loading { id, .. } => ("loading", Some(id.clone()), None),
-        RuntimeState::Loaded(loaded) => (
-            "loaded",
-            Some(loaded.id.clone()),
-            loaded.last_tokens_per_sec,
-        ),
-    };
-    let engine = pam_model::engine::status(&ctx.models.engine_base());
-    let engine_model = ctx.models.engine_server().and_then(|server| server.model());
-    let (light, heavy) = ctx.models.defaults().await.unwrap_or((None, None));
-    // The same verdict the GUI shows, reduced to what an agent acts on: the
-    // stage and, when blocked, the cause. Absent when the store cannot answer.
-    let resident = engine_model.as_ref().map(|model| model.id.clone());
-    let mut readiness = serde_json::Map::new();
-    for tier in [
-        crate::model_service::Tier::Light,
-        crate::model_service::Tier::Heavy,
-    ] {
-        let verdict = ctx
-            .models
-            .readiness(tier, &engine, resident.as_deref())
-            .await
-            .ok()
-            .map(|readiness| {
-                serde_json::json!({
-                    "stage": readiness.stage,
-                    "cause": readiness.blocker.map(|blocker| blocker.cause),
-                })
-            });
-        readiness.insert(
-            tier.as_str().to_owned(),
-            verdict.unwrap_or(serde_json::Value::Null),
-        );
-    }
-    serde_json::json!({
-        "state": state,
-        "id": id,
-        "tokens_per_sec": tokens_per_sec,
-        "defaults": { "light": light, "heavy": heavy },
-        "readiness": serde_json::Value::Object(readiness),
-        "engine": {
-            "installed": engine.installed,
-            "tag": engine.expected_tag,
-            "cause": engine.cause,
-            "build_info": engine_model.as_ref().map(|model| model.build_info.clone()),
-        },
     })
 }
 
@@ -364,9 +310,23 @@ async fn query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure>
 
 /// `echo`: mirror the args back; `args.delay_ms` sleeps first, honoring
 /// the cancel signal, and `args.fail: true` fails after any delay (the
-/// test/diagnostic surface for the execution-failure path).
+/// test/diagnostic surface for the execution-failure path). Both the delay
+/// and the payload are capped (see the module docs).
 async fn echo(mut ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
-    if let Some(delay_ms) = ctx.args.get("delay_ms").and_then(serde_json::Value::as_u64) {
+    let delay_ms = ctx.args.get("delay_ms").and_then(serde_json::Value::as_u64);
+    let args_bytes = ctx.args.to_string().len();
+    if delay_ms.is_some_and(|delay| delay > MAX_ECHO_DELAY_MS) || args_bytes > MAX_ECHO_ARGS_BYTES {
+        return Err(CapabilityFailure::Refused {
+            cause: CAUSE_ECHO_LIMIT.to_owned(),
+            detail: format!(
+                "echo was asked to hold {args_bytes} bytes of arguments for {} ms; the limits \
+                 are {MAX_ECHO_ARGS_BYTES} bytes and {MAX_ECHO_DELAY_MS} ms",
+                delay_ms.unwrap_or(0)
+            ),
+            recovery: RECOVERY_ECHO_LIMIT.to_owned(),
+        });
+    }
+    if let Some(delay_ms) = delay_ms {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
             // An Err means the lease is gone (sender dropped): the
@@ -390,27 +350,37 @@ async fn echo(mut ctx: ExecContext) -> Result<CapabilityOutput, CapabilityFailur
 
 /// `cancel`: cancel the request named by `args.ticket`.
 ///
-/// The audit actor is the caller as the audit vocabulary can name it: a
-/// human when the GUI asked (caller agent `pam-gui`), otherwise the daemon
-/// acting for an agent's `pam cancel` — there is no per-agent actor.
+/// Who may cancel what, and who the audit says did it, both follow from
+/// where the request entered the daemon ([`ExecContext::origin`]):
+/// - [`Origin::Public`]: the ticket must have been admitted under the
+///   caller's own repository — the same binding a ticket read enforces
+///   (`query`, `flow.result`): the stored admission repository, compared
+///   as the immutable canonical string it was recorded as, against the
+///   caller's canonicalized repository. Request ids are broadcast on the
+///   public event socket, so an id alone must not be a capability. A
+///   ticket that is not the caller's answers exactly like one that does
+///   not exist. The audit actor is `system`, whatever `caller.agent` says.
+/// - [`Origin::Admin`]: the human's surface; any ticket, audited `human`.
 async fn cancel(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let Some(ticket) = ctx.args.get("ticket").and_then(serde_json::Value::as_str) else {
         return Err(CapabilityFailure::Failed {
             detail: "cancel needs args.ticket naming the request to cancel".to_owned(),
         });
     };
-    let actor = if ctx.caller.agent == crate::admin::ADMIN_CALLER_AGENT {
-        pam_store::Actor::Human
-    } else {
-        pam_store::Actor::System
+    let actor = match ctx.origin {
+        Origin::Admin => pam_store::Actor::Human,
+        Origin::Public => pam_store::Actor::System,
     };
-    let outcome =
+    let outcome = if ctx.origin == Origin::Public && !caller_owns_ticket(ctx, ticket).await? {
+        CancelOutcome::NotFound
+    } else {
         ctx.queue
             .cancel(ticket, actor)
             .await
             .map_err(|err| CapabilityFailure::Failed {
                 detail: format!("cannot cancel {ticket}: {err}"),
-            })?;
+            })?
+    };
     let (result, request_outcome) = match outcome {
         CancelOutcome::CancelledQueued => {
             // The queue already wrote the terminal row and the audit row;
@@ -420,6 +390,7 @@ async fn cancel(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
                 .finish(
                     ticket,
                     Response::Refusal {
+                        retryable: false,
                         id: ticket.to_owned(),
                         cause: CAUSE_CANCELLED.to_owned(),
                         detail: format!("request {ticket} was cancelled while queued"),
@@ -442,4 +413,21 @@ async fn cancel(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure
         body: serde_json::json!({ "ticket": ticket, "result": result }),
         evidence: Vec::new(),
     })
+}
+
+/// Whether `ticket` was admitted under the caller's repository (see
+/// [`cancel`]). A missing row is "not the caller's": the answer the caller
+/// gets is the same `not_found` either way.
+async fn caller_owns_ticket(ctx: &ExecContext, ticket: &str) -> Result<bool, CapabilityFailure> {
+    if ticket.is_empty() || ticket.len() > 128 {
+        return Ok(false);
+    }
+    let status =
+        ctx.store
+            .request_status_meta(ticket)
+            .await
+            .map_err(|err| CapabilityFailure::Failed {
+                detail: format!("cannot read {ticket}: {err}"),
+            })?;
+    Ok(status.is_some_and(|status| status.repository == ctx.caller.repo))
 }

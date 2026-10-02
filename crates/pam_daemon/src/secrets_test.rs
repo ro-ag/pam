@@ -256,3 +256,72 @@ async fn worker_capacity_failure_keeps_its_cause_and_is_not_cached_as_os_health(
         "blocking_job_failed"
     );
 }
+
+/// A keychain whose read waits on a prompt nobody answers until released.
+struct HungBackend {
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SecretBackend for HungBackend {
+    fn get(&self, _account: &str) -> Result<Option<String>, SecretError> {
+        // Bounded so a failing test cannot wedge the shared keychain lane for others.
+        let started = std::time::Instant::now();
+        while !self.released.load(std::sync::atomic::Ordering::Acquire)
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(Some("token".to_owned()))
+    }
+
+    fn set(&self, _account: &str, _secret: &str) -> Result<(), SecretError> {
+        Ok(())
+    }
+
+    fn delete(&self, _account: &str) -> Result<bool, SecretError> {
+        Ok(false)
+    }
+}
+
+/// One unanswered keychain prompt must not stall every connector for as long as it
+/// lives: reads report the store unavailable promptly, and work again once it clears.
+#[tokio::test]
+async fn a_hung_keychain_read_reports_unavailable_instead_of_stalling_every_reader() {
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = SecretStore::new(Arc::new(HungBackend {
+        released: Arc::clone(&released),
+    }))
+    .with_read_deadline(std::time::Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        store.get("github").await.unwrap_err(),
+        SecretError::Unavailable
+    );
+    // Queued behind the hung call on the one keychain lane: bounded too.
+    assert_eq!(
+        store.get("jenkins").await.unwrap_err(),
+        SecretError::Unavailable
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "each read gave up on its own deadline"
+    );
+
+    released.store(true, std::sync::atomic::Ordering::Release);
+    let secret = loop {
+        match store.get("github").await {
+            Ok(secret) => break secret,
+            Err(SecretError::Unavailable)
+                if started.elapsed() < std::time::Duration::from_secs(10) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    };
+    assert!(
+        secret.is_some(),
+        "the store works again once the prompt clears"
+    );
+}

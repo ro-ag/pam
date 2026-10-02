@@ -6,13 +6,16 @@
 //! arrival order. Four things end a run — exit, timeout, output past [`MAX_SOURCE_BYTES`], or
 //! cancellation — and the last three kill the child. On unix the child sits in its own process
 //! group (`process_group(0)`), detached from the daemon's, so a signal aimed at pam never reaches a
-//! flow's `cargo test`; the kill path signals **the child only** (`Child::start_kill`,
-//! `kill_on_drop` on early return) — a program that forks and detaches its own grandchildren leaks
-//! them, like a shell's `Ctrl-C` would, but the step still ends on time regardless. All descendants
+//! flow's `cargo test`; the kill path signals **that whole group** before it reaps the child
+//! (`ProcessGroup`), on timeout, output limit, cancellation, and when the run's future is dropped
+//! mid-step — `cargo` dying while its `rustc` children keep writing the repository is exactly what
+//! a killed step must not leave behind. The workspace forbids `unsafe` and carries no signalling
+//! crate, so the group signal is the system `kill -KILL -- -<pgid>` (the same route `pam daemon
+//! stop` takes); when that program is missing the child alone is killed, as before. A descendant
+//! that calls `setsid`/`setpgid` to leave the group is not chased down, and a child that exits on
+//! its own leaves its group alone: by then its pid may no longer name the group. All descendants
 //! still inherit the OS containment profile: detaching cannot gain network, private PAM access, or
-//! host write authority.
-//! Detached grandchildren are not chased down: that needs per-OS process-group or job-object code
-//! this crate does not carry.
+//! host write authority. On Windows the child alone is killed (`Child::start_kill`).
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -21,9 +24,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use pam_compact::MAX_SOURCE_BYTES;
-use pam_flow::{Effect, Flow, Role};
+use pam_flow::{Action, Effect, Flow, Role};
 use pam_proto::Outcome;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
@@ -221,6 +224,95 @@ pub fn outcome_for(steps: &[StepReport], flow: &Flow) -> Outcome {
     Outcome::Solved
 }
 
+/// Effect state: the state-changing step ran and reported success.
+pub const EFFECT_APPLIED: &str = "applied";
+
+/// Effect state: the state-changing step started and then failed (a non-zero
+/// exit, a timeout, the output cap); how much it changed first is unknown.
+pub const EFFECT_POSSIBLY_APPLIED: &str = "possibly_applied";
+
+/// One state change a run made, or may have made. Reported beside the
+/// outcome rather than through it: `unresolved` and `blocked` say how the run
+/// ended, never that nothing was changed on the way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectRecord {
+    /// The step id, as the flow file spells it.
+    pub step: String,
+    /// `"command"`, `"connector"` or `"landing"`.
+    pub kind: String,
+    /// [`EFFECT_APPLIED`] or [`EFFECT_POSSIBLY_APPLIED`].
+    pub state: String,
+    /// The typed landing operation (`push`, `merge`, `sync`, …), so a prefix
+    /// of the landing sequence cannot be read as a landed branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<String>,
+}
+
+/// Every state-changing step that ran, in file order, with what is known of
+/// its effect. A stateful step that never started — skipped, blocked at its
+/// gate, refused before its program was spawned — is not an effect.
+#[must_use]
+pub fn effects_for(steps: &[StepReport], flow: &Flow) -> Vec<EffectRecord> {
+    flow.steps
+        .iter()
+        .filter(|step| step.effect == Effect::Stateful)
+        .filter_map(|step| {
+            let report = steps.iter().find(|report| report.id == step.id)?;
+            let state = match report.status {
+                StepStatus::Succeeded => EFFECT_APPLIED,
+                // `attempts` counts spawned attempts only; a program that
+                // could not be started changed nothing.
+                StepStatus::Failed
+                    if report.attempts > 0
+                        && report.error.as_ref().is_none_or(|error| {
+                            error.cause != crate::flow_service::CAUSE_SPAWN_FAILED
+                        }) =>
+                {
+                    EFFECT_POSSIBLY_APPLIED
+                }
+                _ => return None,
+            };
+            let landing = match &step.action {
+                Action::Landing { operation } => serde_json::to_value(operation)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned)),
+                Action::Command { .. } | Action::Connector { .. } => None,
+            };
+            Some(EffectRecord {
+                step: step.id.clone(),
+                kind: step.kind().to_owned(),
+                state: state.to_owned(),
+                landing,
+            })
+        })
+        .collect()
+}
+
+/// The sentence appended to a run's summary when it changed state and then
+/// did not complete, so the change is never left out of the headline.
+#[must_use]
+pub fn effects_note(outcome: Outcome, effects: &[EffectRecord]) -> Option<String> {
+    if effects.is_empty() || !matches!(outcome, Outcome::Unresolved | Outcome::Blocked) {
+        return None;
+    }
+    let listed: Vec<String> = effects
+        .iter()
+        .map(|effect| {
+            let certainty = if effect.state == EFFECT_APPLIED {
+                "applied"
+            } else {
+                "possibly applied"
+            };
+            format!("{} ({certainty})", effect.step)
+        })
+        .collect();
+    Some(format!(
+        "state was changed before the run stopped: {}",
+        listed.join(", ")
+    ))
+}
+
 /// The run's summary sentence: `"7 steps: 6 succeeded, 1 failed (clippy,
 /// exit 101)"`.
 ///
@@ -355,6 +447,9 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
         Ok(child) => child,
         Err(error) => return CommandOutcome::SpawnFailed(error.to_string()),
     };
+    // Declared after `child`, so it drops first: an abandoned run signals
+    // the group while the unreaped child still pins the group id.
+    let mut group = ProcessGroup::of(&child);
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let (chunks, mut incoming) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE);
@@ -391,7 +486,7 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
     }
 
     if ending != Ending::Eof {
-        kill(&mut child).await;
+        kill(&mut child, &mut group).await;
         return match ending {
             Ending::TimedOut => CommandOutcome::TimedOut { output },
             Ending::OutputLimit => CommandOutcome::OutputLimit { output },
@@ -405,22 +500,26 @@ pub async fn run_command(spec: CommandSpec, cancel: &mut watch::Receiver<bool>) 
     tokio::select! {
         biased;
         () = cancelled(cancel) => {
-            kill(&mut child).await;
+            kill(&mut child, &mut group).await;
             CommandOutcome::Cancelled
         }
         () = &mut deadline => {
-            kill(&mut child).await;
+            kill(&mut child, &mut group).await;
             CommandOutcome::TimedOut { output }
         }
-        status = child.wait() => match status {
-            Ok(status) => CommandOutcome::Exited {
-                status: status.code().unwrap_or(SIGNALLED_EXIT_STATUS),
-                output,
-            },
-            Err(error) => CommandOutcome::WaitFailed {
-                detail: error.to_string(),
-                output,
-            },
+        status = child.wait() => {
+            // Reaped (or unreapable): the pid no longer pins the group id.
+            group.disarm();
+            match status {
+                Ok(status) => CommandOutcome::Exited {
+                    status: status.code().unwrap_or(SIGNALLED_EXIT_STATUS),
+                    output,
+                },
+                Err(error) => CommandOutcome::WaitFailed {
+                    detail: error.to_string(),
+                    output,
+                },
+            }
         }
     }
 }
@@ -469,10 +568,91 @@ pub async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     let _ = cancel.wait_for(|flag| *flag).await;
 }
 
-/// Signals the child and reaps it, so no zombie outlives the step.
-async fn kill(child: &mut tokio::process::Child) {
+/// Signals the child's whole process group, then the child, and reaps it, so
+/// neither a zombie nor a still-writing descendant outlives the step.
+async fn kill(child: &mut tokio::process::Child, group: &mut ProcessGroup) {
+    group.kill().await;
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// Where the system `kill` lives; the first that exists is used.
+#[cfg(unix)]
+const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+
+/// The process group `process_group(0)` gave the child, while the child is
+/// still unreaped. An unreaped child (running or zombie) keeps its pid, and
+/// therefore the group id, from being reused, so a signal sent in that window
+/// cannot reach an unrelated group; once the child is reaped the guard is
+/// disarmed and never signals. Dropping an armed guard signals the group
+/// synchronously — the abandoned-future path `kill_on_drop` alone covered for
+/// the child only.
+struct ProcessGroup {
+    /// The group id (the child's pid), or `None` once disarmed.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    id: Option<u32>,
+}
+
+impl ProcessGroup {
+    /// Arms the guard for a freshly spawned child. A pid of 0 or 1 is never
+    /// armed: negated, those address the caller's own group and every process.
+    fn of(child: &tokio::process::Child) -> Self {
+        Self {
+            id: child.id().filter(|pid| *pid > 1),
+        }
+    }
+
+    /// Forgets the group: its leader has been reaped.
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+
+    /// The `kill -KILL -- -<pgid>` invocation, when a `kill` is installed.
+    #[cfg(unix)]
+    fn command(id: u32) -> Option<(&'static str, [String; 3])> {
+        let program = KILL_PROGRAMS
+            .iter()
+            .find(|path| Path::new(path).is_file())?;
+        Some((
+            program,
+            ["-KILL".to_owned(), "--".to_owned(), format!("-{id}")],
+        ))
+    }
+
+    /// Signals the group without blocking the runtime, then disarms.
+    #[cfg_attr(not(unix), allow(clippy::unused_async))]
+    async fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some((program, args)) = self.id.and_then(Self::command) {
+            // Disarm only after the signal was sent: a cancelled await falls
+            // back to the synchronous signal in `Drop`.
+            let _ = Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env_clear()
+                .status()
+                .await;
+        }
+        self.disarm();
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some((program, args)) = self.id.take().and_then(Self::command) {
+            // A few milliseconds of fork/exec on an already-abandoned run.
+            let _ = std::process::Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env_clear()
+                .status();
+        }
+    }
 }
 
 /// Reads one pipe to end of file, handing every chunk to the collector.

@@ -120,7 +120,7 @@ impl Drop for InstanceLock {
 }
 
 impl InstanceLock {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn duplicate_handle_for_test(&self) -> io::Result<File> {
         self.file.try_clone()
     }

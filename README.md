@@ -67,18 +67,18 @@ error, `3` refused, `4` unresolved, `5` blocked.
 | Subcommand | What it does |
 | --- | --- |
 | `pam playbook` | The agent guide as static text: the discover/run/read loop, refusal handling, exit codes, and the sandbox case. No daemon needed. |
-| `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). |
-| `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. |
-| `pam cancel <ticket> [--json]` | Cancels a queued or running request. |
-| `pam wait <ticket> [--timeout-ms N] [--json]` | Blocks quietly until the ticket's terminal event, then prints its durable result. Past the timeout (default 10 minutes) it exits `1` and keeps the request running; with `--json` the refusal or timeout is a `kind: refusal` object on stdout. |
+| `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). It is served from a snapshot refreshed in the background: `snapshot.stale` says when a part is out of date, `active_requests` does not count the poll itself, and a poll leaves no request or audit row. |
+| `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. A delay over 60 s or arguments over 64 KiB are refused. |
+| `pam cancel <ticket> [--json]` | Cancels a queued or running request. Run it from the repository the ticket was submitted from: another repository's ticket answers `not_found`. |
+| `pam wait <ticket> [--timeout-ms N] [--json]` | Blocks quietly until the ticket's terminal event, then prints its durable result. Transient daemon refusals are retried and a lost event stream is reconnected until the timeout (default 10 minutes), when it exits `1` and keeps the request running; exit `3` means a policy refusal only. With `--json` the refusal or timeout is a `kind: refusal` object on stdout. |
 | `pam subscribe <ticket> [--timeout-ms N] [--json]` | Like `wait`, but prints each event as it streams. |
 | `pam evidence read <evidence-id> --request <ticket> [--offset N] [--length N] [--view ID --digest SHA] [--json]` | Reads one byte range of retained evidence; continue with the returned view, digest and `next_offset`. |
 | `pam flow list [--offset N] [--limit 1..=50] [--json]` | The flows this machine has: id, source, steps, name. |
 | `pam flow show <id>` | One flow's canonical YAML. |
-| `pam flow inspect <id> [key=value…] [--json]` | Inputs and readiness (including whether a model summary will be available) without running. |
-| `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. |
-| `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket. |
-| `pam service install\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
+| `pam flow inspect <id> [key=value…] [--json]` | Inputs and readiness (including whether a model summary will be available) without running. The first line carries the flow's digest. |
+| `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--digest <sha256>] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. `--digest` runs it only if the flow still has the digest `pam flow inspect` printed; otherwise it refuses as `flow_changed`. If the reply is lost, the request id and the `pam wait` recovery are printed. |
+| `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket, including the state-changing steps that ran (`effects`). Local-model summaries are labelled `[untrusted local-model summary]`. |
+| `pam service install [--base-dir DIR]\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
 | `pam listen <dir>` (unix) | Serves a session socket relay: binds `pam.sock`/`events.sock` in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). |
 | `pam daemon` | Runs the daemon in the foreground. |
 | `pam daemon stop` | Signals the running daemon to drain and exit. |
@@ -104,7 +104,7 @@ error, `3` refused, `4` unresolved, `5` blocked.
 
 ```sh
 pam service install     # register the unit and start the managed daemon now
-pam service status      # show whether the unit exists and is loaded
+pam service status      # show whether the unit exists and is loaded, and whether it pins this binary
 pam service uninstall   # unregister and remove the unit; the manager stops the managed daemon, the next pam command starts one lazily
 ```
 
@@ -116,7 +116,18 @@ Each platform gets one user-scope unit, never sudo or admin:
 | Linux | systemd user unit at `~/.config/systemd/user/pam-daemon.service` |
 | Windows | scheduled task `pam\daemon` |
 
-Settings › Daemon in the GUI shows the same state with Install and Remove.
+`install` writes the unit first and then stops a loose daemon so the managed one
+takes over. It refuses a binary in a temporary directory, in cargo build output
+or writable by group or others, because the unit pins that binary's path. It
+uses `~/.pam` unless given `--base-dir`; `$PAM_BASE_DIR` is not carried over.
+`status` reports the pinned binary and whether it is stale.
+
+Settings › Daemon in the GUI shows the same state with Install, Remove and
+"Repoint to this binary".
+
+A daemon that a command starts lazily runs with a reduced environment, in its
+own process group, and does not inherit the caller's variables; add tool
+directories for flows through the flow settings, not the shell.
 
 ## Build from source
 
@@ -137,7 +148,8 @@ For PAM contributors, `pam flow run pam-pr-readiness` from this repository
 runs a clean-tree assertion followed by the gates in `tools/check.sh`.
 The same flow is listed as **PAM PR readiness** in the GUI. Install frontend
 dependencies first with `npm --prefix frontend ci`. Failed gates remain
-unresolved and stop dependent gates. The generic **Rust PR readiness** starter
+unresolved and stop dependent gates, and a state-changing step that names no
+`needs` does not run after any earlier failure. The generic **Rust PR readiness** starter
 covers Rust checks only; customize it for another project's required gates.
 Both flows retain the configured program allowlist and approval policy.
 

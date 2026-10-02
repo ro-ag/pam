@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use pam_proto::Event;
 
-use crate::events::{BACKOFF_MAX, BACKOFF_MIN, decode_event_frames, next_backoff};
+use crate::events::{BACKOFF_MAX, BACKOFF_MIN, decode_event_frames, is_own_event, next_backoff};
 
 #[test]
 fn backoff_doubles_and_caps() {
@@ -49,4 +49,24 @@ fn malformed_frames_are_dropped_not_fatal() {
     assert_eq!(decode_event_frames(&junk), None);
     let wrong_shape: Vec<&[u8]> = vec![b"req_1", br#"{"kind":"nope"}"#];
     assert_eq!(decode_event_frames(&wrong_shape), None);
+}
+
+/// The feedback-loop guard: the GUI's own control requests are marked before they are sent, and
+/// the event pump drops their lifecycle events instead of forwarding them to the webview.
+#[test]
+fn events_of_the_guis_own_control_requests_are_not_forwarded() {
+    crate::own_requests::register("req_gui_status_1");
+    let own: Vec<&[u8]> = vec![b"req_gui_status_1", br#"{"kind":"done"}"#];
+    let own = decode_event_frames(&own).expect("decodes");
+    assert!(
+        is_own_event(&own),
+        "a status poll's `done` must not wake the poller"
+    );
+
+    let foreign: Vec<&[u8]> = vec![b"req_agent_flow_9", br#"{"kind":"done"}"#];
+    let foreign = decode_event_frames(&foreign).expect("decodes");
+    assert!(
+        !is_own_event(&foreign),
+        "other callers' events still reach the GUI"
+    );
 }

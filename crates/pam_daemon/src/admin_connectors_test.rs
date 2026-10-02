@@ -558,3 +558,47 @@ async fn denied_and_malformed_admin_requests_never_persist_credential_args() {
         None
     );
 }
+
+/// A pasted token nearly always ends in a newline. Stored as is it would ride inside
+/// the Authorization header; the save trims it, and a line break in the middle (a
+/// corrupt paste) is refused with nothing stored.
+#[tokio::test]
+async fn a_pasted_credential_is_trimmed_and_a_multiline_one_is_refused() {
+    let fixture = fixture().await;
+    let (_, response) = fixture
+        .run(
+            OP_CONNECTORS_CONFIGURE,
+            json!({ "id": "github", "base_url": BASE_URL, "credential": { "set": format!("  {TOKEN}\r\n") } }),
+        )
+        .await;
+    body_of(response, Outcome::Changed);
+    assert_eq!(
+        fixture
+            .backend
+            .get(&account_for("github"))
+            .expect("backend ok")
+            .as_deref(),
+        Some(TOKEN),
+        "the stored credential is the bare token"
+    );
+
+    for bad in ["ghp_part1\nX-Injected: 1", "ghp\u{0}nul", "   \n  "] {
+        let (_, response) = fixture
+            .run(
+                OP_CONNECTORS_CONFIGURE,
+                json!({ "id": "github", "credential": { "set": bad } }),
+            )
+            .await;
+        let (cause, _, _) = refusal_of(response);
+        assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS, "{bad:?}");
+    }
+    assert_eq!(
+        fixture
+            .backend
+            .get(&account_for("github"))
+            .expect("backend ok")
+            .as_deref(),
+        Some(TOKEN),
+        "a refused save leaves the stored credential alone"
+    );
+}

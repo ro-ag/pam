@@ -47,9 +47,8 @@ impl Store {
         canonical_json: &str,
     ) -> Result<CorrelationBind, StoreError> {
         validate(canonical_json, 16384)?;
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self
-            .conn
+        let conn = self.lock().await?;
+        let mut rows = conn
             .query("SELECT 1 FROM request WHERE id=?1", params![request_id])
             .await?;
         if rows.next().await?.is_none() {
@@ -59,7 +58,7 @@ impl Store {
             });
         }
         drop(rows);
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target WHERE request_id=?1", params![request_id]).await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target WHERE request_id=?1", params![request_id]).await?;
         if let Some(row) = rows.next().await? {
             return Ok(
                 if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json) {
@@ -70,12 +69,11 @@ impl Store {
             );
         }
         drop(rows);
-        self.conn
-            .execute(
-                "INSERT INTO correlation_target(request_id,canonical_json) VALUES (?1,?2)",
-                params![request_id, canonical_json],
-            )
-            .await?;
+        conn.execute(
+            "INSERT INTO correlation_target(request_id,canonical_json) VALUES (?1,?2)",
+            params![request_id, canonical_json],
+        )
+        .await?;
         Ok(CorrelationBind::Inserted)
     }
 
@@ -91,8 +89,8 @@ impl Store {
         if step_id.is_empty() || step_id.len() > 256 {
             return Err(invalid("step identifier must contain 1..256 bytes"));
         }
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT 1 FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT 1 FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
         if rows.next().await?.is_none() {
             return Err(StoreError::NotFound {
                 table: "correlation_target",
@@ -100,7 +98,7 @@ impl Store {
             });
         }
         drop(rows);
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step WHERE request_id=?1 AND step_id=?2", params![request_id,step_id]).await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step WHERE request_id=?1 AND step_id=?2", params![request_id,step_id]).await?;
         if let Some(row) = rows.next().await? {
             return Ok(
                 if row.get::<Option<String>>(0)?.as_deref() == Some(canonical_json) {
@@ -111,7 +109,7 @@ impl Store {
             );
         }
         drop(rows);
-        let mut rows = self.conn.query("SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_json AS BLOB))),0) FROM correlation_step WHERE request_id=?1", params![request_id]).await?;
+        let mut rows = conn.query("SELECT COUNT(*),COALESCE(SUM(LENGTH(CAST(canonical_json AS BLOB))),0) FROM correlation_step WHERE request_id=?1", params![request_id]).await?;
         let row = rows
             .next()
             .await?
@@ -122,12 +120,11 @@ impl Store {
             return Err(invalid("step capacity exhausted"));
         }
         drop(rows);
-        self.conn
-            .execute(
-                "INSERT INTO correlation_step(request_id,step_id,canonical_json) VALUES (?1,?2,?3)",
-                params![request_id, step_id, canonical_json],
-            )
-            .await?;
+        conn.execute(
+            "INSERT INTO correlation_step(request_id,step_id,canonical_json) VALUES (?1,?2,?3)",
+            params![request_id, step_id, canonical_json],
+        )
+        .await?;
         Ok(CorrelationBind::Inserted)
     }
 
@@ -136,8 +133,8 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Option<String>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=16384 THEN canonical_json ELSE NULL END FROM correlation_target t JOIN request r ON r.id=t.request_id WHERE t.request_id=?1", params![request_id]).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -153,8 +150,8 @@ impl Store {
         &self,
         request_id: &str,
     ) -> Result<Vec<CorrelationStep>, StoreError> {
-        let _guard = self.conn_lock.lock().await;
-        let mut rows = self.conn.query("SELECT CASE WHEN LENGTH(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step s JOIN request r ON r.id=s.request_id WHERE s.request_id=?1 ORDER BY step_id LIMIT 65", params![request_id]).await?;
+        let conn = self.lock().await?;
+        let mut rows = conn.query("SELECT CASE WHEN LENGTH(CAST(step_id AS BLOB))<=256 THEN step_id ELSE NULL END,CASE WHEN LENGTH(CAST(canonical_json AS BLOB))<=8192 THEN canonical_json ELSE NULL END FROM correlation_step s JOIN request r ON r.id=s.request_id WHERE s.request_id=?1 ORDER BY step_id LIMIT 65", params![request_id]).await?;
         let mut steps = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next().await? {

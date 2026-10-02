@@ -977,3 +977,36 @@ async fn aws_containment_refusal_precedes_credentials_transport_and_cli_validati
     assert_eq!(secrets.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(transport.requests().is_empty());
 }
+
+/// The one redirect hop of a job log goes to a signed storage URL, not wherever a
+/// hostile response points.
+#[test]
+fn a_log_redirect_may_not_target_the_machines_own_network() {
+    use crate::connector_service::redirect_target_refusal;
+    let url = |raw: &str| pam_connectors::Url::parse(raw).unwrap();
+    for refused in [
+        "https://10.0.0.5:8443/secret",
+        "https://10.0.0.5/secret",
+        "https://169.254.169.254/latest/meta-data",
+        "https://127.0.0.1/x",
+        "https://[::1]/x",
+        "https://localhost/x",
+        "https://intranet-box/x",
+        "https://files.corp.local/x",
+        "https://storage.example:8443/log",
+        "https://2130706433/x",
+    ] {
+        assert!(
+            redirect_target_refusal(&url(refused)).is_some(),
+            "{refused} was allowed"
+        );
+    }
+    for allowed in [
+        "https://pipelines.actions.githubusercontent.com/log?sig=abc",
+        "https://productionresultssa1.blob.core.windows.net/log",
+        "https://storage.example/log?signature=test",
+        "https://storage.example:443/log",
+    ] {
+        assert_eq!(redirect_target_refusal(&url(allowed)), None, "{allowed}");
+    }
+}

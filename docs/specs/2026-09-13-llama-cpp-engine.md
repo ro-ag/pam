@@ -75,20 +75,47 @@ version line `version: 0.4.0-dev (build 10938, commit f1e44dcc1)`).
   server log under the engine directory, and `kill_on_drop`.
 - Arguments: `-m <gguf> --host <endpoint> [--port N] --no-webui --jinja -np 1
   -c <context> --reasoning-budget <n> --log-file <log> [-t threads] [-ngl
-  layers] --api-key <fresh key>`. The GGUF's own chat template owns framing;
+  layers] --api-key-file <runtime>/engine/api.key`. The GGUF's own chat template owns framing;
   the reasoning budget is 0 for bounded tasks.
 - Endpoint: the private Unix socket `<run>/engine.sock` where the platform has
   them; a free loopback TCP port on Windows. Either way the per-load API key
   (SHA-256 over the model path, pid, time and 32 bytes of OS entropy) gates the
-  peer and never leaves the process.
+  peer. It reaches the server as a key file (`0600` in a `0700` directory), not
+  on the command line where `ps` would show it; the file is removed as soon as
+  the server is healthy and on every path out of `load`, and the supervisor
+  keeps the key in memory only. A server that ignored the flag would run
+  unauthenticated and be refused by the peer proof below; the pinned build's
+  acceptance of `--api-key-file` is for the opt-in real-engine test to confirm,
+  and it has not been run since this change.
 - Load polls `/health` until `{"status":"ok"}`, refuses with the log tail when
   the process exits first, and times out on the load deadline; `/props`
   supplies `build_info`. Unload kills the process and removes the socket.
+- Peer proof (2026-10-02): the supervisor polls the child with `try_wait` on every
+  health check, and a healthy reply counts only after the child has lived 500 ms.
+  The peer must reject a wrong key on `/props` (a real server enforces the key),
+  name our model path, and the child must still be alive afterwards. A child
+  that exits early, or a stranger answering on the loopback endpoint, is retried
+  on a fresh port, up to three attempts; with every port taken the load fails
+  `Crashed` and nothing is trusted. Unix keeps `engine.sock`, with the same
+  checks.
+- Dead engine: `model()`, `generate()` and an HTTP failure poll the child. A dead
+  one clears the live state, endpoint, socket and pid file and records its exit
+  (`engine.exited` in `admin.models.status`); `generate` fails `engine_exited`
+  and the next generation reloads on its own. Last-used time moves only after a
+  successful generation.
+- Orphans: a pid file `<runtime>/engine/engine.pid` (pid, exe, model path, start
+  time) lets the daemon stop a leftover engine of a killed daemon at boot and
+  before a load, but only when the executable path, `-m <model>`, `--api-key-file`
+  and the start time all match; otherwise the stale record is cleared and
+  nothing is killed.
 - Generation: `/apply-template` then `/tokenize` count the framed prompt and
   refuse above the caller's input limit before any decoding; then one
   non-streaming `/v1/chat/completions` with `max_tokens`, `temperature` and
   `stop`. A cancel drops the connection, which stops decoding on the server.
-  Results carry the server's token counts and timings.
+  Results carry the server's token counts and timings. A bounded call has a total
+  deadline of five minutes from the call (lock wait, cold load and completion)
+  and the engine completion itself two minutes; a cancel is honoured while
+  waiting for the service lock too.
 - Transport: `pam_model::engine_http`, a minimal HTTP/1.1 client (one request
   per connection, JSON bodies, 4 MiB response cap, no redirects).
 

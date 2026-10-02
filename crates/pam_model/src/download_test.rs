@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
-    TransferLimits, curl_path, curl_recovery_line, discard_partial, failure_cause,
+    TransferLimits, curl_env, curl_path, curl_recovery_line, discard_partial, failure_cause,
     failure_recovery, inspect_partial, sidecar_paths, start, start_with_limits,
 };
 use crate::registry::verified_sidecar_path;
@@ -160,13 +160,11 @@ async fn a_whole_transfer_lands_and_clears_its_sidecars() {
     let vendor = fixture.dest.parent().unwrap();
     assert_eq!(
         dir_entries(vendor),
-        vec![
-            ".Qwen3.gguf.pam-model.verified".to_owned(),
-            "Qwen3.gguf".to_owned()
-        ],
-        "a finished download leaves the model and its verification, nothing else"
+        vec!["Qwen3.gguf".to_owned()],
+        "a finished download leaves the model, nothing else: the verification is the \
+         caller's to record in its private store, never a file beside the weights"
     );
-    assert!(verified_sidecar_path(&fixture.dest).exists());
+    assert!(!verified_sidecar_path(&fixture.dest).exists());
 }
 
 #[tokio::test]
@@ -901,4 +899,31 @@ fn terminal_publication_unlocks_even_while_a_duplicate_handle_survives() {
     );
     drop(duplicate);
     assert_eq!(discard_partial(&fixture.dest).unwrap(), 7);
+}
+
+#[test]
+fn a_downloads_curl_keeps_only_the_named_network_variables() {
+    let vars = [
+        ("SSLKEYLOGFILE", "/tmp/keys"),
+        ("CURL_HOME", "/tmp/planted"),
+        ("HOME", "/Users/someone"),
+        ("PATH", "/tmp/agent-bin"),
+        ("LD_PRELOAD", "/tmp/evil.so"),
+        ("HTTPS_PROXY", "http://proxy.corp:3128"),
+        ("CURL_CA_BUNDLE", "/etc/corp-ca.pem"),
+        ("SystemRoot", "C:\\Windows"),
+    ]
+    .map(|(name, value)| {
+        (
+            std::ffi::OsString::from(name),
+            std::ffi::OsString::from(value),
+        )
+    });
+
+    let kept: Vec<String> = curl_env(vars.into_iter())
+        .into_iter()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(kept, vec!["HTTPS_PROXY", "CURL_CA_BUNDLE", "SystemRoot"]);
 }

@@ -29,11 +29,10 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::frame::{
-    DRAIN_TIMEOUT, HEADER_TIMEOUT, MAX_CONNECTIONS, denied, encode_request, exchange_on, invalid,
-    serve, timed_out,
+    AcceptBackoff, AdminLifecycle, DRAIN_TIMEOUT, HEADER_TIMEOUT, MAX_CONNECTIONS, denied,
+    encode_request, exchange_on, invalid, serve, timed_out,
 };
 use crate::admin::AdminService;
-use crate::lifecycle::LifecyclePhase;
 
 /// Bytes in the nonce and in every handshake message.
 pub(super) const NONCE_BYTES: usize = 32;
@@ -66,7 +65,7 @@ impl Listener {
     pub(super) fn bind(
         base: &Path,
         admin: Arc<AdminService>,
-        phase: watch::Sender<LifecyclePhase>,
+        lifecycle: AdminLifecycle,
     ) -> io::Result<Self> {
         let control = control_path(base, true)?;
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -76,7 +75,7 @@ impl Listener {
         let nonce = fresh_nonce()?;
         write_control(&control, port, &nonce)?;
         let (stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(accept(listener, admin, phase, receiver, nonce));
+        let task = tokio::spawn(accept(listener, admin, lifecycle, receiver, nonce));
         Ok(Self {
             stop,
             task: Some(task),
@@ -196,29 +195,52 @@ fn is_loopback(address: SocketAddr) -> bool {
 async fn accept(
     listener: TcpListener,
     admin: Arc<AdminService>,
-    phase: watch::Sender<LifecyclePhase>,
+    lifecycle: AdminLifecycle,
     mut stop: watch::Receiver<bool>,
     nonce: [u8; NONCE_BYTES],
 ) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let pending = Arc::new(Semaphore::new(MAX_PENDING_ADMISSIONS));
     let mut tasks = JoinSet::new();
-    let mut lifecycle = phase.subscribe();
+    let mut phase = lifecycle.phase.subscribe();
+    let mut backoff = AcceptBackoff::new();
     loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break,
-            _ = lifecycle.changed() => break,
+            _ = phase.changed() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { break; };
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => {
+                        backoff.reset();
+                        accepted
+                    }
+                    // An accept error never ends the listener (see
+                    // `AcceptBackoff`): log it, pause, accept again.
+                    Err(error) => {
+                        let pause = backoff.after(&error);
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            %error,
+                            pause_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+                            "private admin accept failed; retrying"
+                        );
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            _ = phase.changed() => break,
+                            () = tokio::time::sleep(pause) => {}
+                        }
+                        continue;
+                    }
+                };
                 if !is_loopback(peer) { continue; }
                 // Only the small pre-admission budget is spent before the
                 // peer proves itself; a served permit is taken once it has.
                 let Ok(pending_permit) = Arc::clone(&pending).try_acquire_owned() else { continue; };
                 let permits = Arc::clone(&permits);
                 let admin = Arc::clone(&admin);
-                let phase = phase.clone();
+                let lifecycle = lifecycle.clone();
                 tasks.spawn(async move {
                     let mut stream = stream;
                     let served = async {
@@ -227,7 +249,7 @@ async fn accept(
                         let _permit = permits
                             .try_acquire_owned()
                             .map_err(|_| busy())?;
-                        serve(&mut stream, &admin, &phase).await
+                        serve(&mut stream, &admin, &lifecycle).await
                     };
                     if let Err(error) = served.await {
                         tracing::debug!(kind = ?error.kind(), "private admin connection ended");

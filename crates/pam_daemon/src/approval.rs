@@ -25,6 +25,23 @@
 //! - Every resolution writes an [`ACTION_APPROVAL`] row: approve → `approve`/`human`; deny →
 //!   `deny`/`human`; timeout → `timeout`/`system`; cancelled-while-waiting → `deny`/`system`
 //!   (approval row resolved `denied`, note `cancelled`).
+//! - **Atomic bookkeeping**: the approval row and the request's move to `waiting_approval` are one
+//!   transaction ([`Store::insert_approval_waiting`]); the resolution, its audit row and — for a
+//!   remembered approval — the grant and its audit row are another
+//!   ([`Store::resolve_approval_audited`]). A crash cannot leave a resolved approval without its
+//!   audit row, or a remembered grant nobody audited.
+//! - **One decider**: the waiting [`ApprovalService::request_approval`] call decides how the wait
+//!   ended and records it; [`ApprovalService::resolve`] hands a decision over and then waits for
+//!   the waiter's acknowledgement. A resolution that loses the race to the timeout or to a
+//!   cancellation is reported as not pending — the human is never told "approved" for a request
+//!   the daemon recorded as timed out.
+//! - **What is being approved**: a flow step's approval carries a [`StepSnapshot`] taken when the
+//!   wait began — the resolved program, arguments, working directory and environment names of the
+//!   run that is actually waiting, not a re-reading of the flow file at display time — plus a
+//!   digest binding all of it to the flow's own digest and the step's capability name. The GUI
+//!   shows the snapshot and returns the digest ([`ApprovalService::resolve_pinned`]); a digest that
+//!   is not the pending wait's refuses with [`ApprovalError::Changed`], so an answer given to a
+//!   stale card (an edited flow, or an earlier step of the same request) authorizes nothing.
 //!
 //! [`GateDecision::RequireApproval`]: crate::policy::GateDecision::RequireApproval
 //! [`DaemonHandle::approvals`]: crate::daemon::DaemonHandle::approvals
@@ -34,7 +51,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_proto::Event;
-use pam_store::{Actor, ApprovalResolution, Decision, PendingApproval, Store, StoreError};
+use pam_store::{
+    Actor, ApprovalResolution, AuditEntry, Decision, PendingApproval, Store, StoreError,
+};
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot, watch};
 
@@ -94,6 +114,73 @@ pub enum ApprovalError {
         /// The id that had no pending approval.
         request_id: String,
     },
+    /// The resolution was pinned to a snapshot digest that is not the
+    /// pending wait's: what the human was shown is not what is waiting.
+    #[error("the pending approval for request {request_id} is not the one that was shown")]
+    Changed {
+        /// The id whose pending approval differs from the pinned digest.
+        request_id: String,
+    },
+}
+
+/// What a gated flow step will run, captured when its approval wait began
+/// (see the module docs). Serialized as the `resolved` object of an
+/// `admin.approvals.pending` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StepSnapshot {
+    /// The program as resolved on this machine (an absolute path when it
+    /// was found), or `connector:<id>` / `landing:<operation>` for a step
+    /// that runs no local program.
+    pub program: String,
+    /// The arguments after the program, one element each, every `${…}`
+    /// filled in. For a connector step: the call name, then `name=value`
+    /// per argument.
+    pub argv: Vec<String>,
+    /// The directory the step runs in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The environment variable names the step sets — names only, never
+    /// values.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_keys: Vec<String>,
+    /// SHA-256 over the flow's digest, the step's capability name and
+    /// every field above: what an approval of this card authorizes.
+    pub digest: String,
+}
+
+impl StepSnapshot {
+    /// Builds the snapshot and its digest. `flow_digest` is
+    /// [`pam_flow::digest`] of the flow the request is running;
+    /// `capability` is the step's `flow.step:<flow>/<step>` name.
+    #[must_use]
+    pub fn new(
+        flow_digest: &str,
+        capability: &str,
+        program: String,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env_keys: Vec<String>,
+    ) -> Self {
+        // An array, not an object: the encoding is positional, so two
+        // different snapshots cannot serialize to the same bytes.
+        let bound = serde_json::json!([flow_digest, capability, program, argv, cwd, env_keys]);
+        Self {
+            digest: pam_compact::sha256_hex(bound.to_string().as_bytes()),
+            program,
+            argv,
+            cwd,
+            env_keys,
+        }
+    }
+}
+
+/// One live approval wait: how to reach the waiter, and what it waits on.
+#[derive(Debug)]
+struct PendingWait {
+    /// The decision, with the channel the waiter acknowledges it on once
+    /// the resolution is durable.
+    tx: oneshot::Sender<(Resolution, oneshot::Sender<ApprovalOutcome>)>,
+    snapshot: Option<StepSnapshot>,
 }
 
 /// The approval service. One per daemon; see the module docs.
@@ -103,8 +190,8 @@ pub struct ApprovalService {
     events: EventPublisher,
     timeout: Duration,
     /// request id → the waiting `request_approval` call's resolution
-    /// channel. Entries live exactly as long as the wait.
-    pending: Mutex<HashMap<String, oneshot::Sender<Resolution>>>,
+    /// channel and step snapshot. Entries live exactly as long as the wait.
+    pending: Mutex<HashMap<String, PendingWait>>,
 }
 
 impl ApprovalService {
@@ -121,10 +208,11 @@ impl ApprovalService {
         }
     }
 
-    /// Parks `request_id` until its approval is resolved: inserts the unresolved `approval` row,
-    /// moves the request to `waiting_approval`, publishes [`Event::ApprovalPending`], and waits for
-    /// a resolution, the timeout, or `cancel` flipping to `true` (a closed `cancel` channel counts
-    /// as cancellation — the caller lost its right to wait).
+    /// Parks `request_id` until its approval is resolved: inserts the unresolved `approval` row
+    /// and moves the request to `waiting_approval` (one transaction), publishes
+    /// [`Event::ApprovalPending`], and waits for a resolution, the timeout, or `cancel` flipping
+    /// to `true` (a closed `cancel` channel counts as cancellation — the caller lost its right to
+    /// wait).
     ///
     /// Whatever ends the wait is recorded on the approval row and audited before this returns; the
     /// caller owns the request-state transition that follows (see the module docs for the split).
@@ -139,16 +227,36 @@ impl ApprovalService {
         capability: &str,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<ApprovalOutcome, StoreError> {
-        self.store.insert_approval(request_id, capability).await?;
+        self.request_approval_with(request_id, capability, None, cancel)
+            .await
+    }
+
+    /// [`Self::request_approval`] for a gated flow step: `snapshot` is what the step will run,
+    /// kept for exactly as long as the wait and shown to the human through
+    /// [`Self::snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request_approval`].
+    pub async fn request_approval_with(
+        &self,
+        request_id: &str,
+        capability: &str,
+        snapshot: Option<StepSnapshot>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<ApprovalOutcome, StoreError> {
         self.store
-            .update_request_state(request_id, pam_store::RequestState::WaitingApproval, None)
+            .insert_approval_waiting(request_id, capability)
             .await?;
 
         // Register the resolution channel before the event goes out, so
         // a GUI reacting to the event can always deliver its resolution.
         let rx = {
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().await.insert(request_id.to_owned(), tx);
+            self.pending
+                .lock()
+                .await
+                .insert(request_id.to_owned(), PendingWait { tx, snapshot });
             rx
         };
         let _ = self
@@ -156,12 +264,18 @@ impl ApprovalService {
             .publish(request_id, Event::ApprovalPending)
             .await;
 
+        let mut acknowledge = None;
         let outcome = tokio::select! {
             // Biased: a resolution that raced the timeout wins.
             biased;
             resolution = rx => match resolution {
-                Ok(Resolution::Approve { remember }) => ApprovalOutcome::Approved { remember },
-                Ok(Resolution::Deny) => ApprovalOutcome::Denied,
+                Ok((resolution, ack)) => {
+                    acknowledge = Some(ack);
+                    match resolution {
+                        Resolution::Approve { remember } => ApprovalOutcome::Approved { remember },
+                        Resolution::Deny => ApprovalOutcome::Denied,
+                    }
+                }
                 // The sender vanished without resolving (service torn
                 // down); treat it as a cancellation.
                 Err(_) => ApprovalOutcome::Cancelled,
@@ -175,6 +289,12 @@ impl ApprovalService {
 
         self.record_resolution(request_id, capability, outcome)
             .await?;
+        // Only now is the human's answer true: the resolution is durable.
+        // A failed write above returned early and dropped the channel, so
+        // the resolver is told the approval is not pending.
+        if let Some(ack) = acknowledge {
+            let _ = ack.send(outcome);
+        }
         Ok(outcome)
     }
 
@@ -183,31 +303,78 @@ impl ApprovalService {
     /// for why nothing agent-facing reaches this).
     ///
     /// The waiting [`Self::request_approval`] call performs the store
-    /// writes and audit on receipt; this only hands the decision over.
+    /// writes and audit on receipt, and this returns once it has: `Ok`
+    /// means the resolution is what the daemon recorded.
     ///
     /// # Errors
     ///
     /// [`ApprovalError::NotFound`] when no wait is pending for
     /// `request_id` — unknown id, already resolved, timed out, or
-    /// cancelled.
+    /// cancelled — including a wait that timed out or was cancelled at
+    /// the same moment.
     pub async fn resolve(
         &self,
         request_id: &str,
         resolution: Resolution,
     ) -> Result<(), ApprovalError> {
-        let sender = self
-            .pending
+        self.resolve_pinned(request_id, resolution, None).await
+    }
+
+    /// [`Self::resolve`] pinned to what the human was shown:
+    /// `expected_digest` is the [`StepSnapshot::digest`] of the card that
+    /// was answered.
+    ///
+    /// # Errors
+    ///
+    /// [`ApprovalError::Changed`] when a digest is given and the pending
+    /// wait has a different snapshot or none — the wait is left pending,
+    /// nothing is resolved. Otherwise as [`Self::resolve`].
+    pub async fn resolve_pinned(
+        &self,
+        request_id: &str,
+        resolution: Resolution,
+        expected_digest: Option<&str>,
+    ) -> Result<(), ApprovalError> {
+        let not_found = || ApprovalError::NotFound {
+            request_id: request_id.to_owned(),
+        };
+        let wait = {
+            let mut pending = self.pending.lock().await;
+            let wait = pending.get(request_id).ok_or_else(not_found)?;
+            if let Some(expected) = expected_digest
+                && wait
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.digest.as_str())
+                    != Some(expected)
+            {
+                return Err(ApprovalError::Changed {
+                    request_id: request_id.to_owned(),
+                });
+            }
+            pending.remove(request_id).ok_or_else(not_found)?
+        };
+        let (ack, acknowledged) = oneshot::channel();
+        wait.tx.send((resolution, ack)).map_err(|_| not_found())?;
+        // The waiter acknowledges only a resolution it acted on and
+        // recorded. A dropped channel means it had already chosen the
+        // timeout or the cancellation, or its bookkeeping failed.
+        let recorded = acknowledged.await.map_err(|_| not_found())?;
+        let as_decided = matches!(
+            (resolution, recorded),
+            (Resolution::Approve { .. }, ApprovalOutcome::Approved { .. })
+                | (Resolution::Deny, ApprovalOutcome::Denied)
+        );
+        if as_decided { Ok(()) } else { Err(not_found()) }
+    }
+
+    /// The step snapshot of `request_id`'s pending wait, when it has one.
+    pub async fn snapshot(&self, request_id: &str) -> Option<StepSnapshot> {
+        self.pending
             .lock()
             .await
-            .remove(request_id)
-            .ok_or_else(|| ApprovalError::NotFound {
-                request_id: request_id.to_owned(),
-            })?;
-        sender
-            .send(resolution)
-            .map_err(|_| ApprovalError::NotFound {
-                request_id: request_id.to_owned(),
-            })
+            .get(request_id)
+            .and_then(|wait| wait.snapshot.clone())
     }
 
     /// The GUI's pending list: every unresolved approval, joined with
@@ -255,10 +422,6 @@ impl ApprovalService {
                 Actor::System,
             ),
         };
-        self.store
-            .resolve_approval(request_id, resolution, note)
-            .await?;
-
         let remember = matches!(outcome, ApprovalOutcome::Approved { remember: true });
         let mut detail = serde_json::json!({
             "capability": capability,
@@ -270,29 +433,32 @@ impl ApprovalService {
         if let Some(note) = note {
             detail["note"] = serde_json::Value::String(note.to_owned());
         }
+        let detail = detail.to_string();
+        let grant_detail = serde_json::json!({ "capability": capability }).to_string();
+        // One transaction: the resolution, its audit row and (remembered)
+        // the grant with its own audit row.
         self.store
-            .append_audit(
+            .resolve_approval_audited(
                 request_id,
-                ACTION_APPROVAL,
-                decision,
-                actor,
-                Some(&detail.to_string()),
+                resolution,
+                note,
+                AuditEntry {
+                    action: ACTION_APPROVAL,
+                    decision,
+                    actor,
+                    detail: Some(&detail),
+                },
+                remember.then_some((
+                    capability,
+                    AuditEntry {
+                        action: ACTION_GRANT_FROM_APPROVAL,
+                        decision: Decision::Allow,
+                        actor: Actor::Human,
+                        detail: Some(&grant_detail),
+                    },
+                )),
             )
             .await?;
-
-        if remember {
-            self.store.insert_grant(capability).await?;
-            let grant_detail = serde_json::json!({ "capability": capability }).to_string();
-            self.store
-                .append_audit(
-                    request_id,
-                    ACTION_GRANT_FROM_APPROVAL,
-                    Decision::Allow,
-                    Actor::Human,
-                    Some(&grant_detail),
-                )
-                .await?;
-        }
         Ok(())
     }
 }

@@ -49,6 +49,45 @@ async fn status_authorization_denies_cross_repo_legacy_and_revoked_tickets() {
     assert!(authorized_metadata(&store, &repo, "r").await.is_err());
 }
 
+#[tokio::test]
+async fn an_unrelated_revocation_does_not_void_a_tickets_status() {
+    let (_dir, store, repo) = fixture().await;
+    // Revocations of grants the `echo` ticket does not depend on, including
+    // another flow's step grant, leave its result readable.
+    for unrelated in ["curl", "flow.run", "flow.step:other/step"] {
+        store.insert_grant(unrelated).await.unwrap();
+        store.revoke_grant(unrelated).await.unwrap();
+        assert!(
+            authorized_metadata(&store, &repo, "r").await.is_ok(),
+            "revoking {unrelated} must not void an echo ticket"
+        );
+    }
+    // Re-granting the revoked capability never restores a voided ticket.
+    store.insert_grant("echo").await.unwrap();
+    store.revoke_grant("echo").await.unwrap();
+    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    store.insert_grant("echo").await.unwrap();
+    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+}
+
+#[tokio::test]
+async fn a_flow_run_ticket_is_voided_only_by_flow_grants() {
+    let (_dir, store, repo) = fixture().await;
+    store
+        .insert_admitted_request("f", "flow.run", &repo, "test", "{}", None, i64::MAX)
+        .await
+        .unwrap();
+    assert!(store.request_authorization_current("f").await.unwrap());
+    store.insert_grant("echo").await.unwrap();
+    store.revoke_grant("echo").await.unwrap();
+    assert!(store.request_authorization_current("f").await.unwrap());
+    store.insert_grant("flow.step:other/step").await.unwrap();
+    store.revoke_grant("flow.step:other/step").await.unwrap();
+    assert!(!store.request_authorization_current("f").await.unwrap());
+    // The echo ticket was voided by its own revocation above.
+    assert!(!store.request_authorization_current("r").await.unwrap());
+}
+
 #[test]
 fn raw_legacy_projection_and_oversized_response_are_refused() {
     assert!(validated_projection(&json!({"steps":[{"stdout":"secret"}]}), "r").is_err());

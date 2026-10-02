@@ -783,6 +783,10 @@ pub(crate) fn validate_retry(retry: Option<RawRetry>, at: &str) -> Result<Retry,
     })
 }
 
+/// Environment additions: a name's shape, no secret-looking value, and only
+/// references the run can fill in. The engine substitutes `${…}` in every
+/// value before the step starts, exactly as it does for `run` arguments, so
+/// an input an environment value reads is genuinely read.
 fn validate_env(env: &BTreeMap<String, String>, at: &str, scope: &Scope) -> Result<(), FlowError> {
     for (name, value) in env {
         let path = format!("{at}.env.{name}");

@@ -1,8 +1,12 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::curator::{AgentCli, AgentId, CuratorError, detect, invoke, invoke_args};
+#[cfg(unix)]
+use crate::curator::{trusted_dirs, untrusted_reason};
 
 /// Long enough that a script which answers immediately always makes it,
 /// short enough that a hung one does not stall the suite.
@@ -100,23 +104,30 @@ async fn invoke_fresh(
     invoke(cli, prompt, deadline).await
 }
 
-/// [`detect`] with the ETXTBSY harness race retried: a script this test
+/// [`detect`] over `dirs` as the trusted set (an empty `PATH`), found CLIs only.
+fn detect_in(dirs: &[&Path], deadline: Duration) -> Vec<AgentCli> {
+    let trusted: Vec<PathBuf> = dirs.iter().map(|dir| dir.to_path_buf()).collect();
+    detect(&trusted, OsStr::new(""), deadline).found
+}
+
+/// [`detect_in`] with the ETXTBSY harness race retried: a script this test
 /// just wrote can still be held open by another test thread's
 /// forked-but-not-yet-exec'd child, and `probe_version` reports that
 /// spawn failure as `None`. Retry briefly until every version is known;
 /// a real probe failure still surfaces after the bound.
-fn detect_fresh(path_env: &OsStr, deadline: Duration) -> Vec<AgentCli> {
+fn detect_fresh(dirs: &[&Path], deadline: Duration) -> Vec<AgentCli> {
     for _ in 0..50 {
-        let found = detect(path_env, deadline);
+        let found = detect_in(dirs, deadline);
         if found.iter().all(|cli| cli.version.is_some()) {
             return found;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    detect(path_env, deadline)
+    detect_in(dirs, deadline)
 }
 
 /// A `PATH` value covering exactly `dirs`.
+#[cfg(unix)]
 fn path_env(dirs: &[&Path]) -> OsString {
     std::env::join_paths(dirs).unwrap()
 }
@@ -135,7 +146,7 @@ fn detect_finds_a_cli_and_keeps_the_first_version_line() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_fake(dir.path(), "claude", Fake::Version);
 
-    let found = detect_fresh(&path_env(&[dir.path()]), PROBE_DEADLINE);
+    let found = detect_fresh(&[dir.path()], PROBE_DEADLINE);
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, AgentId::Claude);
@@ -150,7 +161,7 @@ fn detect_finds_every_installed_agent_in_order() {
     write_fake(dir.path(), "claude", Fake::Version);
     write_fake(dir.path(), "copilot", Fake::Version);
 
-    let found = detect(&path_env(&[dir.path()]), PROBE_DEADLINE);
+    let found = detect_in(&[dir.path()], PROBE_DEADLINE);
 
     let ids: Vec<AgentId> = found.iter().map(|cli| cli.id).collect();
     assert_eq!(
@@ -166,7 +177,7 @@ fn detect_skips_a_file_the_os_would_not_run() {
     // No executable bit on Unix; no executable extension on Windows.
     std::fs::write(dir.path().join("claude"), "#!/bin/sh\necho 1.2.3\n").unwrap();
 
-    assert!(detect(&path_env(&[dir.path()]), PROBE_DEADLINE).is_empty());
+    assert!(detect_in(&[dir.path()], PROBE_DEADLINE).is_empty());
 }
 
 #[test]
@@ -174,25 +185,25 @@ fn detect_skips_a_directory_wearing_the_name() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(fake_name("codex"))).unwrap();
 
-    assert!(detect(&path_env(&[dir.path()]), PROBE_DEADLINE).is_empty());
+    assert!(detect_in(&[dir.path()], PROBE_DEADLINE).is_empty());
 }
 
 #[test]
-fn detect_takes_the_first_match_on_path() {
+fn detect_takes_the_first_match_in_trust_order() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     let winner = write_fake(first.path(), "codex", Fake::Version);
     write_fake(second.path(), "codex", Fake::Version);
 
-    let found = detect(&path_env(&[first.path(), second.path()]), PROBE_DEADLINE);
+    let found = detect_in(&[first.path(), second.path()], PROBE_DEADLINE);
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].path, winner.canonicalize().unwrap());
 }
 
 #[test]
-fn detect_on_an_empty_path_finds_nothing() {
-    assert!(detect(OsStr::new(""), PROBE_DEADLINE).is_empty());
+fn detect_with_no_trusted_directories_finds_nothing() {
+    assert!(detect_in(&[], PROBE_DEADLINE).is_empty());
 }
 
 #[test]
@@ -200,7 +211,7 @@ fn detect_reports_a_cli_that_will_not_say_its_version() {
     let dir = tempfile::tempdir().unwrap();
     write_fake(dir.path(), "copilot", Fake::Fail);
 
-    let found = detect(&path_env(&[dir.path()]), PROBE_DEADLINE);
+    let found = detect_in(&[dir.path()], PROBE_DEADLINE);
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, AgentId::Copilot);
@@ -215,7 +226,7 @@ fn detect_does_not_wait_forever_for_a_version() {
     let dir = tempfile::tempdir().unwrap();
     write_fake(dir.path(), "gemini", Fake::Sleep);
 
-    let found = detect(&path_env(&[dir.path()]), Duration::from_millis(200));
+    let found = detect_in(&[dir.path()], Duration::from_millis(200));
 
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].version, None);
@@ -407,4 +418,183 @@ fn agent_cli_serializes_for_the_gui_list() {
     assert_eq!(json["id"], "codex");
     assert_eq!(json["version"], "codex-cli 0.151.0");
     assert!(json["path"].is_string());
+}
+
+/// A stand-in that leaves a marker file when it runs, so a test can prove an
+/// untrusted candidate was never executed (not even for `--version`).
+#[cfg(unix)]
+fn write_marking_fake(dir: &Path, stem: &str, marker: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(stem);
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ntouch '{}'\necho 9.9.9\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The daemon may have been started by an agent: a `claude` that exists only in a
+/// directory from the inherited `PATH` is neither offered nor run.
+#[cfg(unix)]
+#[test]
+fn a_cli_found_only_on_the_inherited_path_is_reported_and_never_run() {
+    let trusted = tempfile::tempdir().unwrap();
+    let planted = tempfile::tempdir().unwrap();
+    let marker = planted.path().join("ran");
+    write_marking_fake(planted.path(), "claude", &marker);
+
+    let detection = detect(
+        &[trusted.path().to_path_buf()],
+        &path_env(&[planted.path()]),
+        PROBE_DEADLINE,
+    );
+
+    assert!(detection.found.is_empty(), "{detection:?}");
+    assert_eq!(detection.untrusted.len(), 1);
+    assert_eq!(detection.untrusted[0].id, AgentId::Claude);
+    assert!(
+        detection.untrusted[0]
+            .reason
+            .contains("outside the directories"),
+        "{}",
+        detection.untrusted[0].reason
+    );
+    assert!(
+        !marker.exists(),
+        "an untrusted candidate must never be executed"
+    );
+}
+
+/// Being in the trusted list is not enough: a directory the agent's user could
+/// let others write is refused with the reason, and nothing is executed.
+#[cfg(unix)]
+#[test]
+fn a_trusted_listed_directory_that_others_can_write_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    write_marking_fake(dir.path(), "codex", &marker);
+    set_mode(dir.path(), 0o777);
+
+    let detection = detect(&[dir.path().to_path_buf()], OsStr::new(""), PROBE_DEADLINE);
+
+    assert!(detection.found.is_empty(), "{detection:?}");
+    assert_eq!(detection.untrusted.len(), 1);
+    assert!(
+        detection.untrusted[0]
+            .reason
+            .contains("writable by group or others"),
+        "{}",
+        detection.untrusted[0].reason
+    );
+    assert!(!marker.exists());
+    set_mode(dir.path(), 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_group_writable_executable_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let script = write_marking_fake(dir.path(), "gemini", &marker);
+    set_mode(&script, 0o775);
+
+    let detection = detect(&[dir.path().to_path_buf()], OsStr::new(""), PROBE_DEADLINE);
+
+    assert!(detection.found.is_empty());
+    assert!(
+        detection.untrusted[0]
+            .reason
+            .contains("writable by group or others")
+    );
+    assert!(!marker.exists());
+}
+
+/// Trust is checked again at use: a CLI that was fine at detection and then had its
+/// directory opened up is refused by `invoke`.
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_rechecks_trust_at_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let script = write_marking_fake(dir.path(), "claude", &marker);
+    let cli = cli_at(AgentId::Claude, &script);
+    assert!(untrusted_reason(&script).is_none(), "trusted to begin with");
+
+    set_mode(dir.path(), 0o777);
+    let failure = invoke_fresh(&cli, "anything", PROBE_DEADLINE)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(failure, CuratorError::Untrusted(AgentId::Claude, _)),
+        "{failure:?}"
+    );
+    assert!(!marker.exists());
+    set_mode(dir.path(), 0o700);
+}
+
+/// The child sees the user's identity and a fixed few variables, not the daemon's
+/// environment (this test process has plenty: `CARGO_*`, `RUST_*`, ...).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_child_gets_a_minimal_environment_and_nothing_inherited() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("claude");
+    std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
+    set_mode(&script, 0o755);
+    let cli = cli_at(AgentId::Claude, &script);
+    assert!(
+        std::env::vars().count() > 6,
+        "the test process has a fuller environment than the allowlist"
+    );
+
+    let dump = invoke_fresh(&cli, "anything", PROBE_DEADLINE)
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = dump
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        .collect();
+    // `PWD`, `SHLVL`, `_` and `OLDPWD` are the shell's own.
+    let allowed = [
+        "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "PWD", "SHLVL", "_", "OLDPWD",
+    ];
+    for name in &names {
+        assert!(
+            allowed.contains(name),
+            "unexpected variable {name} in {names:?}"
+        );
+    }
+    assert!(names.contains(&"PATH") && names.contains(&"TMPDIR") && names.contains(&"LANG"));
+    let path_line = dump.lines().find(|line| line.starts_with("PATH=")).unwrap();
+    assert!(
+        path_line.contains("/usr/bin") && !path_line.contains("/tmp/agent"),
+        "{path_line}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_dirs_are_fixed_locations_plus_the_homes_install_dirs() {
+    let home = Path::new("/home/dev");
+    let with = trusted_dirs(Some(home));
+    let without = trusted_dirs(None);
+    assert!(with.contains(&home.join(".local/bin")));
+    assert!(with.contains(&home.join(".cargo/bin")));
+    assert!(!without.iter().any(|dir| dir.starts_with(home)));
+    assert!(with.iter().chain(&without).all(|dir| dir.is_absolute()));
+    assert_eq!(
+        trusted_dirs(Some(Path::new("relative/home"))),
+        without,
+        "a relative home adds nothing"
+    );
 }

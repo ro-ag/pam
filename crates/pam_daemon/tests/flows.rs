@@ -28,9 +28,10 @@ use pam_daemon::daemon::{
 };
 use pam_daemon::flow_exec::{CommandOutcome, CommandSpec, run_command};
 use pam_daemon::flow_service::{
-    CAP_FLOW_INSPECT, CAP_FLOW_LIST, CAP_FLOW_RUN, CAP_FLOW_SHOW, CAUSE_ARTIFACTS_ROOT_UNSET,
-    CAUSE_FLOW_NOT_FOUND, CAUSE_OUTPUT_LIMIT, CAUSE_PROGRAM_NOT_ALLOWED, CAUSE_REPO_MISSING,
-    CAUSE_TIMEOUT, EVIDENCE_KIND_CONNECTOR_RESULT, EVIDENCE_KIND_FLOW_RESULT, step_capability,
+    CAP_FLOW_INSPECT, CAP_FLOW_LIST, CAP_FLOW_RUN, CAP_FLOW_SHOW, CAUSE_ARGUMENT_OPTION,
+    CAUSE_ARTIFACTS_ROOT_UNSET, CAUSE_FLOW_CHANGED, CAUSE_FLOW_NOT_FOUND, CAUSE_OUTPUT_LIMIT,
+    CAUSE_PROGRAM_NOT_ALLOWED, CAUSE_REPO_MISSING, CAUSE_TIMEOUT, EVIDENCE_KIND_CONNECTOR_RESULT,
+    EVIDENCE_KIND_FLOW_RESULT, step_capability,
 };
 use pam_daemon::log_service::{EVIDENCE_KIND_LOG_SOURCE, EVIDENCE_KIND_LOG_SUMMARY};
 use pam_daemon::model_service::SETTING_DEFAULT_HEAVY;
@@ -301,7 +302,7 @@ steps:\n\
 
 #[tokio::test]
 async fn flow_list_and_show_answer_for_the_builtins() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[]).await;
         let mut client = flows.daemon.client().await;
 
@@ -355,13 +356,13 @@ async fn flow_list_and_show_answer_for_the_builtins() {
         );
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_library_flow_shadows_a_builtin_of_the_same_id() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let shadow = "schema: 1\nid: pr-readiness\nname: My readiness\n\
                       steps:\n  - id: look\n    run: [git, --version]\n";
         let flows = FlowDaemon::spawn(&[("pr-readiness", shadow)]).await;
@@ -387,13 +388,13 @@ async fn a_library_flow_shadows_a_builtin_of_the_same_id() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
 
@@ -497,13 +498,13 @@ async fn a_two_step_run_is_verified_and_files_its_verdict_as_evidence() {
             .await;
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_failing_step_is_unresolved_with_its_exit_status_and_attempts() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: failing\nname: Failing\n\
                     steps:\n\
                     \x20 - id: bad\n    run: [pam-flow-helper, exit, '3']\n\
@@ -539,13 +540,13 @@ async fn a_failing_step_is_unresolved_with_its_exit_status_and_attempts() {
             .await;
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_when_failed_step_runs_only_after_a_failure() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: conditional\nname: Conditional\n\
                     steps:\n\
                     \x20 - id: bad\n    run: [pam-flow-helper, exit, '1']\n\
@@ -566,13 +567,13 @@ async fn a_when_failed_step_runs_only_after_a_failure() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_step_that_outlives_its_timeout_ends_the_run_unresolved() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: slow\nname: Slow\n\
                     steps:\n\
                     \x20 - id: nap\n    run: [pam-flow-helper, sleep, '600000']\n\
@@ -599,13 +600,13 @@ async fn a_step_that_outlives_its_timeout_ends_the_run_unresolved() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_step_past_the_output_cap_is_killed() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let bytes = MAX_SOURCE_BYTES + 1;
         let yaml = format!(
             "schema: 1\nid: loud\nname: Loud\n\
@@ -627,13 +628,13 @@ async fn a_step_past_the_output_cap_is_killed() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn cancelling_mid_step_stops_the_run_and_the_child() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: napping\nname: Napping\n\
                     steps:\n\
                     \x20 - id: nap\n    run: [pam-flow-helper, sleep, '600000']\n\
@@ -679,13 +680,13 @@ async fn cancelling_mid_step_stops_the_run_and_the_child() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_program_that_is_not_allowed_blocks_the_run() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: forbidden\nname: Forbidden\n\
                     steps:\n\
                     \x20 - id: build\n    run: [cargo, --version]\n\
@@ -707,13 +708,13 @@ async fn a_program_that_is_not_allowed_blocks_the_run() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_build_tool_step_is_blocked_until_a_private_artifacts_root_is_configured() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: build\nname: Build\n\
                     steps:\n\
                     \x20 - id: build\n    run: [cargo, --version]\n";
@@ -772,13 +773,13 @@ async fn a_build_tool_step_is_blocked_until_a_private_artifacts_root_is_configur
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_configured_artifacts_root_gives_every_command_step_a_private_cargo_target() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: target\nname: Target\n\
                     steps:\n\
                     \x20 - id: show\n    run: [pam-flow-helper, echo-env, CARGO_TARGET_DIR]\n";
@@ -830,13 +831,13 @@ async fn a_configured_artifacts_root_gives_every_command_step_a_private_cargo_ta
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_missing_repo_refuses_before_anything_runs() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
         let mut envelope = envelope_for_repo(
@@ -861,13 +862,13 @@ async fn a_missing_repo_refuses_before_anything_runs() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn an_existing_but_unapproved_repo_runs_no_steps() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         flows
             .daemon
@@ -891,13 +892,13 @@ async fn an_existing_but_unapproved_repo_runs_no_steps() {
         );
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
         let mut events = flows.daemon.subscribe(&["req_run"]).await;
@@ -923,7 +924,7 @@ async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
@@ -938,7 +939,7 @@ steps:\n\
 
 #[tokio::test]
 async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("stateful", STATEFUL)]).await;
         let mut client = flows.daemon.client().await;
         let mut events = flows.daemon.subscribe(&["req_run"]).await;
@@ -965,11 +966,51 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
             step_capability("stateful", "change"),
             "the human is asked about the step, not the flow"
         );
-        flows
-            .daemon
-            .handle()
-            .approvals()
-            .resolve("req_run", Resolution::Approve { remember: true })
+        // The wait carries what this run resolved, for the approval card:
+        // the program as found on this machine, one element per argument,
+        // the directory it runs in, and the digest an answer must return.
+        let approvals = flows.daemon.handle().approvals();
+        let snapshot = approvals
+            .snapshot("req_run")
+            .await
+            .expect("a gated step's wait carries its resolved snapshot");
+        // `git` on Unix, `git.exe` on Windows: compare the stem, not the suffix.
+        let program = std::path::Path::new(&snapshot.program);
+        assert!(
+            program.is_absolute() && program.file_stem() == Some(std::ffi::OsStr::new("git")),
+            "the resolved program, not the bare name: {snapshot:?}"
+        );
+        assert_eq!(snapshot.argv, ["--version"]);
+        // The daemon records the directory in its canonical form (a verbatim
+        // `\\?\C:\...` path on Windows), so compare both sides canonicalized.
+        let recorded = snapshot.cwd.as_deref().expect("the snapshot records a cwd");
+        assert_eq!(
+            std::fs::canonicalize(recorded).expect("recorded cwd exists"),
+            std::fs::canonicalize(&envelope.caller.repo).expect("caller repo exists"),
+            "the step runs in the caller's repo: {snapshot:?}"
+        );
+        assert_eq!(snapshot.digest.len(), 64);
+        // An answer pinned to anything else resolves nothing.
+        let stale = approvals
+            .resolve_pinned(
+                "req_run",
+                Resolution::Approve { remember: true },
+                Some(&"0".repeat(64)),
+            )
+            .await;
+        assert!(
+            matches!(
+                stale,
+                Err(pam_daemon::approval::ApprovalError::Changed { .. })
+            ),
+            "{stale:?}"
+        );
+        approvals
+            .resolve_pinned(
+                "req_run",
+                Resolution::Approve { remember: true },
+                Some(&snapshot.digest),
+            )
             .await
             .expect("the approval is delivered");
 
@@ -1004,13 +1045,13 @@ async fn a_stateful_step_pauses_and_a_remembered_approval_spares_the_next_run() 
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_denied_approval_blocks_the_run_with_one_terminal_row() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("stateful", STATEFUL)]).await;
         let mut client = flows.daemon.client().await;
 
@@ -1074,7 +1115,7 @@ async fn a_denied_approval_blocks_the_run_with_one_terminal_row() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
@@ -1118,7 +1159,7 @@ async fn enable_github(client: &mut TestClient) {
 
 #[tokio::test]
 async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let backend = Arc::new(FakeSecretBackend::default());
         let transport = Arc::new(FakeTransport::new().json(
             200,
@@ -1175,13 +1216,13 @@ async fn a_connector_step_files_its_result_and_feeds_the_next_step() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn a_disabled_connector_blocks_the_step_with_the_settings_line() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let backend = Arc::new(FakeSecretBackend::default());
         let transport = Arc::new(FakeTransport::new());
         let flows = FlowDaemon::spawn_with(&[("connected", CONNECTED)], move |config| {
@@ -1204,13 +1245,13 @@ async fn a_disabled_connector_blocks_the_step_with_the_settings_line() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn admin_flows_run_submits_through_the_pipeline_as_the_gui() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
 
@@ -1248,13 +1289,13 @@ async fn admin_flows_run_submits_through_the_pipeline_as_the_gui() {
         flows.daemon.assert_single_terminal_audit(&ticket).await;
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn admin_flows_save_get_and_delete_reach_the_library_the_daemon_reads() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let flows = FlowDaemon::spawn(&[]).await;
         let mut client = flows.daemon.client().await;
 
@@ -1321,7 +1362,301 @@ async fn admin_flows_save_get_and_delete_reach_the_library_the_daemon_reads() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
+    .await;
+}
+
+// --- the 2026-10 design review: pins, gates, conditions, effects, argv ----
+
+#[tokio::test]
+async fn a_pinned_run_refuses_a_flow_edited_after_it_was_inspected() {
+    Box::pin(with_deadline(async {
+        let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
+        let mut client = flows.daemon.client().await;
+        let inspected = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "two-step" }),
+                    true,
+                ))
+                .await,
+        );
+        let digest = inspected["flow"]["digest"]
+            .as_str()
+            .expect("inspect reports the digest")
+            .to_owned();
+        assert_eq!(digest.len(), 64);
+
+        // Pinned to what was inspected: the run is admitted as usual.
+        let mut pinned = flows.run_envelope("req_pinned", "two-step", &serde_json::json!({}));
+        pinned.args["expected_digest"] = serde_json::json!(digest);
+        let admitted = result_body(client.request(&pinned).await);
+        assert_eq!(admitted["flow"]["digest"], digest);
+
+        // A human (or anything else with the admin surface) edits the flow.
+        let edited = TWO_STEP.replace(
+            "[git, --version]\n\x20   role",
+            "[git, version]\n\x20   role",
+        );
+        assert_ne!(edited, TWO_STEP);
+        result_body(
+            client
+                .request(&admin_envelope(
+                    "req_edit",
+                    OP_FLOWS_SAVE,
+                    serde_json::json!({ "id": "two-step", "yaml": edited }),
+                ))
+                .await,
+        );
+        let mut stale = flows.run_envelope("req_stale", "two-step", &serde_json::json!({}));
+        stale.args["expected_digest"] = serde_json::json!(digest);
+        let (cause, detail, recovery) = refusal_parts(client.request(&stale).await);
+        assert_eq!(cause, CAUSE_FLOW_CHANGED);
+        assert!(detail.contains(&digest), "{detail}");
+        assert!(recovery.contains("pam flow inspect"), "{recovery}");
+        assert!(
+            flows
+                .daemon
+                .store()
+                .list_evidence("req_stale")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused pin runs nothing and files nothing"
+        );
+
+        // A pin that could never match is a usage error, not "the flow changed".
+        let mut malformed = flows.run_envelope("req_malformed", "two-step", &serde_json::json!({}));
+        malformed.args["expected_digest"] = serde_json::json!("latest");
+        let (cause, _, _) = refusal_parts(client.request(&malformed).await);
+        assert_eq!(cause, "input_invalid");
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn cancelling_during_the_approval_wait_is_not_an_uncertain_effect() {
+    Box::pin(with_deadline(async {
+        let flows = FlowDaemon::spawn(&[("stateful", STATEFUL)]).await;
+        let mut client = flows.daemon.client().await;
+        let mut envelope = flows.run_envelope("req_run", "stateful", &serde_json::json!({}));
+        envelope.wait = false;
+        client.request(&envelope).await;
+        flows
+            .daemon
+            .wait_for_row("req_run", |row| row.state == RequestState::WaitingApproval)
+            .await;
+        // The step is journaled, but as an attempt that has not started.
+        let journal = flows
+            .daemon
+            .store()
+            .read_flow_journal("req_run")
+            .await
+            .unwrap()
+            .expect("the run is journaled");
+        assert_eq!(journal.state, pam_store::FlowJournalState::Prepared);
+        assert_eq!(journal.step_id.as_deref(), Some("change"));
+        assert!(!journal.effectful, "nothing has run while a human decides");
+
+        let mut cancel_client = flows.daemon.client().await;
+        cancel_client
+            .request(&envelope_for_repo(
+                &flows.repo(),
+                "req_cancel",
+                "cancel",
+                serde_json::json!({ "ticket": "req_run" }),
+                true,
+            ))
+            .await;
+        let row = flows
+            .daemon
+            .wait_for_row("req_run", |row| row.state.is_terminal())
+            .await;
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("cancelled"),
+            "no step ran, so there is no effect to reconcile"
+        );
+        let journal = flows
+            .daemon
+            .store()
+            .read_flow_journal("req_run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(journal.state, pam_store::FlowJournalState::Uncertain);
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn a_stateful_step_without_needs_does_not_follow_a_failure() {
+    Box::pin(with_deadline(async {
+        let yaml = "schema: 1\nid: guarded\nname: Guarded\n\
+                    steps:\n\
+                    \x20 - id: build\n    run: [pam-flow-helper, exit, '3']\n\
+                    \x20 - id: deploy\n    run: [git, --version]\n    effect: stateful\n\
+                    \x20 - id: report\n    run: [git, --version]\n\
+                    \x20 - id: cleanup\n    run: [git, --version]\n    effect: stateful\n\
+                    \x20   when: always\n";
+        let flows = FlowDaemon::spawn(&[("guarded", yaml)]).await;
+        for id in ["deploy", "cleanup"] {
+            flows.grant(&step_capability("guarded", id)).await;
+        }
+        let mut client = flows.daemon.client().await;
+        let body = flows.run(&mut client, "req_run", "guarded").await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.stop().await;
+            return;
+        }
+        assert_eq!(body["outcome"], "unresolved");
+        assert_eq!(step(&body, "build")["status"], "failed");
+        assert_eq!(
+            step(&body, "deploy")["status"],
+            "skipped",
+            "a change never follows a failure it did not opt into"
+        );
+        // Read-only steps stay independent, and `when: always` is the opt-in.
+        assert_eq!(step(&body, "report")["status"], "succeeded");
+        assert_eq!(step(&body, "cleanup")["status"], "succeeded");
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn a_run_that_changed_state_and_then_failed_reports_the_change() {
+    Box::pin(with_deadline(async {
+        let yaml = "schema: 1\nid: half-done\nname: Half done\n\
+                    steps:\n\
+                    \x20 - id: change\n    run: [git, --version]\n    effect: stateful\n\
+                    \x20 - id: broken\n    run: [pam-flow-helper, exit, '3']\n    effect: stateful\n\
+                    \x20   needs: [change]\n\
+                    \x20 - id: later\n    run: [git, --version]\n    effect: stateful\n\
+                    \x20   needs: [broken]\n";
+        let flows = FlowDaemon::spawn(&[("half-done", yaml)]).await;
+        for id in ["change", "broken", "later"] {
+            flows.grant(&step_capability("half-done", id)).await;
+        }
+        let mut client = flows.daemon.client().await;
+        let response = client
+            .request(&flows.run_envelope("req_run", "half-done", &serde_json::json!({})))
+            .await;
+        let (outcome, projection, _) = result_parts(response.clone());
+        let body = flows.full_report(&mut client, "req_run", response).await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.stop().await;
+            return;
+        }
+        // The outcome (and so the exit code) is unchanged: the run did not resolve.
+        assert_eq!(outcome, Outcome::Unresolved);
+        assert_eq!(projection["workflow"]["outcome"], "unresolved");
+        let expected = serde_json::json!([
+            {"step": "change", "kind": "command", "state": "applied"},
+            {"step": "broken", "kind": "command", "state": "possibly_applied"},
+        ]);
+        assert_eq!(projection["effects"], expected, "{projection}");
+        assert_eq!(body["effects"], expected);
+        assert_eq!(
+            projection["handoff"]["reason"],
+            "workflow_not_completed_after_state_change"
+        );
+        let summary = body["summary"].as_str().unwrap();
+        assert!(
+            summary.contains(
+                "state was changed before the run stopped: change (applied), broken (possibly applied)"
+            ),
+            "{summary}"
+        );
+        assert_eq!(step(&body, "later")["status"], "skipped");
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn a_supplied_value_that_would_become_an_option_blocks_the_step() {
+    Box::pin(with_deadline(async {
+        let yaml = "schema: 1\nid: history\nname: History\n\
+                    inputs:\n  rev:\n    description: what to log\n    default: HEAD\n\
+                    steps:\n\
+                    \x20 - id: log\n    run: [git, log, \"${inputs.rev}\"]\n\
+                    \x20 - id: after\n    run: [git, --version]\n    when: always\n";
+        let flows = FlowDaemon::spawn(&[("history", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        let response = client
+            .request(&flows.run_envelope(
+                "req_run",
+                "history",
+                &serde_json::json!({ "rev": "--output=planted" }),
+            ))
+            .await;
+        let body = flows.full_report(&mut client, "req_run", response).await;
+        // Refused before containment is even consulted, on every platform.
+        assert_eq!(body["outcome"], "blocked", "{body}");
+        let log = step(&body, "log");
+        assert_eq!(log["status"], "blocked");
+        assert_eq!(log["error"]["cause"], CAUSE_ARGUMENT_OPTION);
+        assert_eq!(log["attempts"], 0, "the program was never started");
+        assert!(
+            body["steps"].as_array().unwrap().len() == 1,
+            "a blocked step stops the run"
+        );
+        assert!(!flows.repo.path().join("planted").exists());
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn an_environment_value_is_substituted_like_an_argument() {
+    Box::pin(with_deadline(async {
+        let yaml = "schema: 1\nid: greeting\nname: Greeting\n\
+                    inputs:\n  word:\n    description: what to say\n\
+                    steps:\n\
+                    \x20 - id: say\n    run: [pam-flow-helper, echo-env, GREETING]\n\
+                    \x20   env: { GREETING: \"said-${inputs.word}\" }\n";
+        let flows = FlowDaemon::spawn(&[("greeting", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+        let response = client
+            .request(&flows.run_envelope(
+                "req_run",
+                "greeting",
+                &serde_json::json!({ "word": "hello" }),
+            ))
+            .await;
+        let body = flows.full_report(&mut client, "req_run", response).await;
+        if assert_unsupported_flow(&body) {
+            flows.daemon.stop().await;
+            return;
+        }
+        assert_eq!(step(&body, "say")["status"], "succeeded");
+        let store = flows.daemon.store();
+        let mut output = String::new();
+        for meta in store.list_evidence("req_run").await.unwrap() {
+            if meta.kind == EVIDENCE_KIND_LOG_SOURCE
+                && let Some(row) = store.get_evidence(&meta.id).await.unwrap()
+            {
+                output.push_str(&String::from_utf8_lossy(&row.content));
+            }
+        }
+        assert!(output.contains("said-hello"), "{output}");
+        assert!(!output.contains("${inputs.word}"), "{output}");
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
     .await;
 }
 
@@ -1404,7 +1739,7 @@ fn assert_unsupported_flow(body: &serde_json::Value) -> bool {
 
 #[tokio::test]
 async fn run_command_kills_a_child_that_outlives_its_timeout() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let (_alive, mut cancel) = live_cancel();
         let (_fixture, spec) = helper_spec(&["sleep", "600000"], Duration::from_millis(200));
         let outcome = run_command(spec, &mut cancel).await;
@@ -1415,13 +1750,13 @@ async fn run_command_kills_a_child_that_outlives_its_timeout() {
             matches!(outcome, CommandOutcome::TimedOut { .. }),
             "expected a timeout, got {outcome:?}"
         );
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn run_command_stops_a_child_past_the_output_cap() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let bytes = MAX_SOURCE_BYTES + 1;
         let (_fixture, spec) = helper_spec(&["spew", &bytes.to_string()], Duration::from_mins(2));
         let outcome = run_command(spec, &mut live_cancel().1).await;
@@ -1432,13 +1767,13 @@ async fn run_command_stops_a_child_past_the_output_cap() {
             CommandOutcome::OutputLimit { output } => assert_eq!(output.len(), MAX_SOURCE_BYTES),
             other => panic!("expected the output cap, got {other:?}"),
         }
-    })
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn run_command_stops_on_the_cancel_signal() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let (alive, mut cancel) = live_cancel();
         let _unsupported_alive = if cfg!(target_os = "macos") {
             tokio::spawn(async move {
@@ -1455,13 +1790,135 @@ async fn run_command_stops_on_the_cancel_signal() {
             return;
         }
         assert_eq!(outcome, CommandOutcome::Cancelled);
-    })
+    }))
+    .await;
+}
+
+/// Whether `pid` still names a process, asked the way the workspace signals
+/// (`kill`, no `unsafe`); signal 0 only probes.
+#[cfg(unix)]
+fn process_alive(pid: &str) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A step whose child started a process of its own, ended three ways. Each
+/// ending must take the grandchild with it: finding 8 of the 2026-10 design
+/// review was `cargo` dying while its children kept writing the repository.
+#[cfg(unix)]
+async fn grandchild_after(ending: &str) -> Option<(String, CommandOutcome)> {
+    let (alive, mut cancel) = live_cancel();
+    let timeout = if ending == "timeout" {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_mins(5)
+    };
+    let (fixture, mut spec) = helper_spec(&["spawn-sleeper", "60000"], timeout);
+    // The helper records its child's pid in the repository.
+    spec.containment.allow_repository_writes = true;
+    let pid_file = fixture.path().join("repository/grandchild.pid");
+    let run = run_command(spec, &mut cancel);
+    let recorded = async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && !pid.is_empty()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::pin!(run);
+    let outcome = if cfg!(target_os = "macos") {
+        // The grandchild exists before any ending is provoked.
+        let pid = tokio::select! {
+            outcome = &mut run => panic!("the helper ended early: {outcome:?}"),
+            pid = recorded => pid,
+        };
+        assert!(process_alive(&pid), "the grandchild {pid} never ran");
+        match ending {
+            "cancel" => {
+                alive.send(true).unwrap();
+                run.await
+            }
+            "drop" => return Some((pid, CommandOutcome::Cancelled)),
+            _ => run.await,
+        }
+    } else {
+        run.await
+    };
+    if assert_unsupported_command(&outcome) {
+        return None;
+    }
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    Some((pid, outcome))
+}
+
+/// Polls until `pid` is gone; a survivor fails the test and is cleaned up.
+#[cfg(unix)]
+async fn assert_reaped(pid: &str, ending: &str) {
+    for _ in 0..100 {
+        if !process_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-KILL", pid])
+        .status();
+    panic!("the grandchild {pid} outlived the step's {ending}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_a_command_kills_its_whole_process_group() {
+    Box::pin(with_deadline(async {
+        let Some((pid, outcome)) = grandchild_after("cancel").await else {
+            return;
+        };
+        assert_eq!(outcome, CommandOutcome::Cancelled);
+        assert_reaped(&pid, "cancellation").await;
+    }))
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_timed_out_command_takes_its_process_group_with_it() {
+    Box::pin(with_deadline(async {
+        let Some((pid, outcome)) = grandchild_after("timeout").await else {
+            return;
+        };
+        assert!(
+            matches!(outcome, CommandOutcome::TimedOut { .. }),
+            "{outcome:?}"
+        );
+        assert_reaped(&pid, "timeout").await;
+    }))
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_running_command_kills_its_whole_process_group() {
+    Box::pin(with_deadline(async {
+        // `grandchild_after` returns out of the pinned run without finishing
+        // it, which drops the future mid-step: the abandoned-run path.
+        let Some((pid, _)) = grandchild_after("drop").await else {
+            return;
+        };
+        assert_reaped(&pid, "abandonment").await;
+    }))
     .await;
 }
 
 #[tokio::test]
 async fn the_helper_reads_the_environment_a_step_gives_it() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let (_fixture, mut spec) = helper_spec(&["echo-env", "PAM_FLOW"], Duration::from_secs(30));
         spec.env = vec![("PAM_FLOW".to_owned(), "two-step".to_owned())];
         let outcome = run_command(spec, &mut live_cancel().1).await;
@@ -1475,7 +1932,7 @@ async fn the_helper_reads_the_environment_a_step_gives_it() {
             }
             other => panic!("expected a clean exit, got {other:?}"),
         }
-    })
+    }))
     .await;
 }
 
@@ -1486,7 +1943,7 @@ async fn the_helper_reads_the_environment_a_step_gives_it() {
 /// for a flow that never asks the model.
 #[tokio::test]
 async fn inspect_reports_whether_the_summary_will_come_from_the_heavy_tier() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let summarized = "schema: 1\nid: summarized\nname: Summarized\n\
                           steps:\n\
                           \x20 - id: version\n    run: [git, --version]\n    output: summarize\n";
@@ -1543,7 +2000,7 @@ async fn inspect_reports_whether_the_summary_will_come_from_the_heavy_tier() {
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
@@ -1557,7 +2014,7 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
         eprintln!("PAM_BENCH_MODEL is unset; skipping the summarize test");
         return;
     };
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: summarized\nname: Summarized\n\
                     steps:\n\
                     \x20 - id: version\n    run: [git, --version]\n    output: summarize\n";
@@ -1594,7 +2051,7 @@ async fn summarize_asks_the_model_when_pam_bench_model_names_one() {
         );
 
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
@@ -1713,7 +2170,7 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
             Some("connector_remote"),
         ),
     ] {
-        with_deadline(async {
+        Box::pin(with_deadline(async {
             let transport = Arc::new(
                 FakeTransport::new()
                     .json(http, response)
@@ -1752,14 +2209,14 @@ async fn sonar_gate_verification_requires_explicit_ok_and_retains_failure_eviden
             assert_sonar_evidence(&flows, &body, status).await;
             flows.daemon.assert_invariant_clean().await;
             flows.daemon.stop().await;
-        })
+        }))
         .await;
     }
 }
 
 #[tokio::test]
 async fn sonar_failed_status_assertion_retries_before_issues() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let transport = Arc::new(
             FakeTransport::new()
                 .json(
@@ -1786,7 +2243,7 @@ async fn sonar_failed_status_assertion_retries_before_issues() {
         assert!(transport.url(3).contains("/api/issues/search"));
         assert_sonar_evidence(&flows, &body, Some("OK")).await;
         flows.daemon.stop().await;
-    })
+    }))
     .await;
 }
 
@@ -1811,7 +2268,7 @@ fn readiness_failure_fixture(fail_at: Option<usize>) -> String {
 #[tokio::test]
 async fn pam_readiness_any_gate_failure_prevents_verified_and_skips_dependents() {
     for fail_at in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)] {
-        with_deadline(async {
+        Box::pin(with_deadline(async {
             let yaml = readiness_failure_fixture(fail_at);
             let flows = FlowDaemon::spawn(&[("pam-pr-readiness", &yaml)]).await;
             let mut client = flows.daemon.client().await;
@@ -1850,7 +2307,7 @@ async fn pam_readiness_any_gate_failure_prevents_verified_and_skips_dependents()
             );
             flows.daemon.assert_invariant_clean().await;
             flows.daemon.stop().await;
-        })
+        }))
         .await;
     }
 }
@@ -1940,7 +2397,7 @@ async fn pam_readiness_runs_all_real_project_gates() {
 
 #[tokio::test]
 async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_failed_build() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let transport = Arc::new(FakeTransport::new()
             .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
             .json(200, r##"{"name":"#41","status":"FAILED","stages":[{"id":"5","name":"Test","status":"FAILED"}]}"##)
@@ -1978,7 +2435,7 @@ async fn jenkins_investigation_files_structured_evidence_and_does_not_hide_a_fai
         assert_eq!(transport.requests().len(),4);
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    }).await;
+    })).await;
 }
 
 #[tokio::test]
@@ -1993,7 +2450,7 @@ async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() 
             "{outcome:?}"
         );
     }
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: retained-retry\nname: Retained retry\nsteps:\n  - id: failing\n    run: [pam-flow-helper, unknown-operation]\n    retry: { attempts: 2, backoff: 10s }\n";
         let flows = FlowDaemon::spawn(&[("retained-retry", yaml)]).await;
         let mut client = flows.daemon.client().await;
@@ -2013,12 +2470,12 @@ async fn a_deadline_during_backoff_keeps_the_previous_failed_attempt_evidence() 
         let source = flows.daemon.store().get_evidence(&source.id).await.unwrap().unwrap();
         assert!(String::from_utf8(source.content).unwrap().contains("unknown-operation"));
         flows.daemon.stop().await;
-    }).await;
+    })).await;
 }
 
 #[tokio::test]
 async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: safe-evidence\nname: Safe evidence\nsteps:\n  - id: failing\n    run: [pam-flow-helper, 'password=private-sentinel-726']\n";
         let flows = FlowDaemon::spawn(&[("safe-evidence", yaml)]).await;
         let mut client = flows.daemon.client().await;
@@ -2064,14 +2521,14 @@ async fn flow_source_is_protected_while_public_pages_preserve_the_redacted_view(
         let hash = pam_compact::compact(&collected, None, &pam_compact::Policy::default()).unwrap().source_sha256;
         assert_eq!(digest.as_deref(), Some(hash.as_str()));
         flows.daemon.stop().await;
-    }).await;
+    })).await;
 }
 
 const SONAR_ISSUES_CONTRACT: &str = r#"{"webServices":[{"path":"api/issues","actions":[{"key":"search","params":[{"key":"components"},{"key":"resolved"},{"key":"ps"}]}]}]}"#;
 
 #[tokio::test]
 async fn explicit_jenkins_node_read_retains_failure_without_claiming_build_verification() {
-    with_deadline(async {
+    Box::pin(with_deadline(async {
         let transport = Arc::new(FakeTransport::new()
             .json(200, r#"{"number":41,"building":false,"result":"FAILURE"}"#)
             .json(200, r#"{"id":"6","name":"Cleanup","status":"SUCCESS","parentNodes":[],"_links":{"log":{"href":"https://attacker.invalid/ignored"}}}"#)
@@ -2106,7 +2563,7 @@ async fn explicit_jenkins_node_read_retains_failure_without_claiming_build_verif
         assert!(requests[1].url.path().ends_with("/41/execution/node/6/wfapi/describe"));
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;
-    }).await;
+    })).await;
 }
 
 fn public_step_evidence(rows: &[pam_store::EvidenceMeta]) -> Vec<&pam_store::EvidenceMeta> {

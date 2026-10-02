@@ -45,6 +45,12 @@ service still target the real base.
   and never inspects frames; the daemon sees ordinary connections and applies
   the same admission, repository scope, grant revision and budgets. A ticket
   or a relayed connection is a reference, not authority.
+- **A transient accept error does not end the relay.** Any accept error
+  (descriptor exhaustion, an aborted connection) is retried with backoff,
+  10 ms doubling to one second. Each socket serves at most 64 concurrent
+  connections; an excess connection is closed at once, and the dial to the
+  daemon is bounded to five seconds. The symlink and check-then-act hardening of
+  the socket directory's preparation is not part of this.
 - **Placement is the trade.** A listening socket inside a writable directory
   can be unlinked and rebound by another process of the same user, which lets
   it impersonate the daemon to the agent — deception, not escalation, since a

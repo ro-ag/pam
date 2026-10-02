@@ -509,11 +509,24 @@ where
             }
             // `validate` admitted the pair, so the bound exists; dispatch
             // carries the pre-bound operation only.
-            let bound = inputs
-                .reads
-                .iter()
-                .find(|bound| bound.operation_id == *operation_id)
-                .expect("the offered pair names a bound read");
+            // The pair is (operation, `target_<index>`): the index selects the bound
+            // read, and the operation must agree with it. Selecting by operation alone
+            // dispatched the first read that shared a name, whatever target the model
+            // had named, and let one dispatch run again as a "different" pair.
+            let Some(bound) = target_ref
+                .strip_prefix("target_")
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| inputs.reads.get(index))
+                .filter(|bound| bound.operation_id == *operation_id)
+            else {
+                return unresolved(
+                    "read_failed",
+                    format!("the pair {operation_id}/{target_ref} names no offered read"),
+                    Some(advisory),
+                    &use_,
+                    reads_used,
+                );
+            };
             let outcome = match read(bound.dispatch.clone()).await {
                 Ok(outcome) => outcome,
                 Err(detail) => {
@@ -580,13 +593,16 @@ where
                 reads_used,
             );
         }
+        // An item's authority tag counts only when the model quoted something
+        // substantive from it: a one-byte quote of a `runner`-tagged item would
+        // otherwise satisfy an `infra` bar the evidence does not support.
         let cited_tags: HashSet<&str> = evidence
             .iter()
             .filter(|item| {
-                verdict
-                    .citations
-                    .iter()
-                    .any(|citation| citation.evidence == item.id)
+                verdict.citations.iter().any(|citation| {
+                    citation.evidence == item.id
+                        && diagnosis::is_substantive_quote(&citation.quote, item.text.len())
+                })
             })
             .flat_map(|item| item.tags.iter().map(String::as_str))
             .collect();

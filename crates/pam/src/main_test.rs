@@ -1,4 +1,6 @@
-use super::{Cli, Cmd, EvidenceCmd, EvidenceReadArgs, evidence_read_args, render_evidence};
+use super::{
+    Cli, Cmd, EvidenceCmd, EvidenceReadArgs, ServiceCmd, evidence_read_args, render_evidence,
+};
 use clap::Parser;
 use serde_json::json;
 
@@ -189,4 +191,39 @@ fn the_last_of_echo_wait_and_no_wait_wins() {
     assert!(!flags(&["--no-wait"]));
     assert!(flags(&["--no-wait", "--wait"]));
     assert!(!flags(&["--wait", "--no-wait"]));
+}
+
+/// The login unit only ever carries a base directory somebody typed on the command line:
+/// `--base-dir` exists on `install` alone, and is optional.
+#[test]
+fn only_service_install_takes_an_explicit_base_dir() {
+    let Cmd::Service {
+        action: ServiceCmd::Install { base_dir, .. },
+    } = Cli::try_parse_from(["pam", "service", "install"])
+        .unwrap()
+        .command
+    else {
+        panic!("expected service install");
+    };
+    assert_eq!(
+        base_dir, None,
+        "no flag means the default base, not $PAM_BASE_DIR"
+    );
+
+    let Cmd::Service {
+        action: ServiceCmd::Install { base_dir, .. },
+    } = Cli::try_parse_from(["pam", "service", "install", "--base-dir", "/srv/pam"])
+        .unwrap()
+        .command
+    else {
+        panic!("expected service install");
+    };
+    assert_eq!(base_dir.as_deref(), Some(std::path::Path::new("/srv/pam")));
+
+    for action in ["status", "uninstall"] {
+        assert!(
+            Cli::try_parse_from(["pam", "service", action, "--base-dir", "/srv/pam"]).is_err(),
+            "service {action} has no base override"
+        );
+    }
 }
